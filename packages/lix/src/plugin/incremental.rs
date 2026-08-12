@@ -18,7 +18,7 @@ use tracing::Instrument as _;
 use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanFingerprint};
 use crate::common::{RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
-use crate::live_state::MaterializedLiveStateBatch;
+use crate::hot_state::MaterializedHotStateBatch;
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedEntityBatch,
@@ -1281,7 +1281,7 @@ impl WasmEntitySource for VecEntitySource {
 /// component boundary.
 #[derive(Debug)]
 pub(crate) struct LiveBatchEntitySource {
-    rows: MaterializedLiveStateBatch,
+    rows: MaterializedHotStateBatch,
     ordinals: VecDeque<u32>,
     pending: Option<WasmHostEntity>,
     state: VecSourceState,
@@ -1289,7 +1289,7 @@ pub(crate) struct LiveBatchEntitySource {
 
 impl LiveBatchEntitySource {
     pub(crate) fn new(
-        rows: MaterializedLiveStateBatch,
+        rows: MaterializedHotStateBatch,
         ordinals: Vec<u32>,
         limits: WasmTransitionLimits,
     ) -> Result<Self, LixError> {

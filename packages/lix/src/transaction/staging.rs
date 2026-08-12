@@ -27,13 +27,13 @@ use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
 use crate::gc::CheckpointPublication;
 #[cfg(test)]
-use crate::live_state::LiveStateRowRequest;
+use crate::hot_state::HotStateRowRequest;
 #[cfg(test)]
-use crate::live_state::MaterializedLiveStateRow;
-use crate::live_state::{
-    CertifiedCurrentStatePredecessor, LiveStateExactBatchRequest, LiveStateExactRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
-    MaterializedLiveStateExactBatch,
+use crate::hot_state::MaterializedHotStateRow;
+use crate::hot_state::{
+    CertifiedCurrentStatePredecessor, HotStateExactBatchRequest, HotStateExactRowRequest,
+    HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateBatchBuilder,
+    MaterializedHotStateExactBatch,
 };
 use crate::transaction::staged_commit_changes::StagedCommitChangeBatch;
 use crate::transaction::staged_commit_changes::StagedCommitChangeRefs;
@@ -803,7 +803,7 @@ impl StagedScanCandidateIndex {
     /// matcher afterwards.
     fn slots_for_filter<'a>(
         &'a self,
-        filter: &crate::live_state::LiveStateFilter,
+        filter: &crate::hot_state::HotStateFilter,
     ) -> Option<Cow<'a, [RowSlot]>> {
         if filter.schema_keys.is_empty() {
             return None;
@@ -2283,7 +2283,7 @@ impl TransactionWriteBuffer {
     /// key probes committed state, then extends the same compact journal.
     fn append_only_exact_batch_is_definitely_absent(
         &self,
-        request: &LiveStateExactBatchRequest,
+        request: &HotStateExactBatchRequest,
     ) -> Result<bool, LixError> {
         let guard = self.rows.lock().map_err(|_| {
             LixError::new(
@@ -2313,7 +2313,7 @@ impl TransactionWriteBuffer {
     /// filter includes `NULL`, which is the minimum file component.
     fn append_only_scan_is_definitely_absent(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
     ) -> Result<bool, LixError> {
         let guard = self.rows.lock().map_err(|_| {
             LixError::new(
@@ -3375,7 +3375,7 @@ fn compare_tracked_key_to_row(
 
 fn compare_tracked_key_to_exact_request(
     left: &TrackedStateKey,
-    right: &LiveStateExactRowRequest,
+    right: &HotStateExactRowRequest,
 ) -> std::cmp::Ordering {
     compare_tracked_key_to_parts(
         left,
@@ -3446,7 +3446,7 @@ pub(crate) struct PreparedStateRowOverlay {
 
 #[cfg(test)]
 pub(crate) struct StagedScanParts {
-    pub(crate) rows: Vec<MaterializedLiveStateRow>,
+    pub(crate) rows: Vec<MaterializedHotStateRow>,
 }
 
 impl PreparedStateRowOverlay {
@@ -3454,13 +3454,13 @@ impl PreparedStateRowOverlay {
     #[cfg(test)]
     pub(crate) fn scan(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        Ok(crate::live_state::resolve_visible_batch(
+        request: &HotStateScanRequest,
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
+        Ok(crate::hot_state::resolve_visible_batch(
             self.scan_batch(request)?,
-            MaterializedLiveStateBatch::default(),
-            &crate::live_state::VisibilityRequest {
-                branch_scope: crate::live_state::VisibilityBranchScope::BranchIds {
+            MaterializedHotStateBatch::default(),
+            &crate::hot_state::VisibilityRequest {
+                branch_scope: crate::hot_state::VisibilityBranchScope::BranchIds {
                     branch_ids: request.filter.branch_ids.clone(),
                 },
                 include_tombstones: request.filter.include_tombstones,
@@ -3477,7 +3477,7 @@ impl PreparedStateRowOverlay {
     #[cfg(test)]
     pub(crate) fn scan_parts(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
     ) -> Result<StagedScanParts, LixError> {
         Ok(StagedScanParts {
             rows: self.scan_batch(request)?.into_rows(),
@@ -3486,16 +3486,16 @@ impl PreparedStateRowOverlay {
 
     fn scan_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         if matches!(
             request.filter.rows,
-            crate::live_state::LiveStateRowFilter::None
+            crate::hot_state::HotStateRowFilter::None
         ) {
-            return Ok(MaterializedLiveStateBatch::default());
+            return Ok(MaterializedHotStateBatch::default());
         }
 
-        let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(0);
+        let mut rows = MaterializedHotStateBatchBuilder::with_capacity(0);
         append_matching_ordered_mutations(&mut rows, &self.staged_writes, request)?;
 
         if self
@@ -3559,7 +3559,7 @@ impl PreparedStateRowOverlay {
 
     /// Returns a staged exact-row answer, if this transaction has one.
     #[cfg(test)]
-    pub(crate) fn load_exact(&self, request: &LiveStateRowRequest) -> Option<StagedExactRow> {
+    pub(crate) fn load_exact(&self, request: &HotStateRowRequest) -> Option<StagedExactRow> {
         let identity = PreparedStateRowIdentity::from_row_request(request)?;
         if let Some(row) = self.load_state_slot(&identity) {
             return Some(if row.deleted {
@@ -3575,7 +3575,7 @@ impl PreparedStateRowOverlay {
     fn load_state_slot(
         &self,
         identity: &PreparedStateRowIdentity,
-    ) -> Option<MaterializedLiveStateRow> {
+    ) -> Option<MaterializedHotStateRow> {
         self.staged_writes.ensure_identity_index(false).ok()?;
         let rows_guard = self.staged_writes.rows.lock().ok()?;
         let StagedPreparedRows::Indexed {
@@ -3587,33 +3587,33 @@ impl PreparedStateRowOverlay {
         let Some(RowSlot::State(index)) = by_identity.get(identity).copied() else {
             return None;
         };
-        rows.get(index).map(MaterializedLiveStateRow::from)
+        rows.get(index).map(MaterializedHotStateRow::from)
     }
 }
 
-impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
+impl crate::hot_state::StagedHotStateRows for PreparedStateRowOverlay {
     fn staged_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         self.scan_batch(request)
     }
 
     fn load_exact_batch(
         &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         if request.rows.is_empty() {
-            return Ok(MaterializedLiveStateExactBatch::default());
+            return Ok(MaterializedHotStateExactBatch::default());
         }
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(request.rows.len());
         let mut slots =
             load_ordered_mutation_exact_batch(&mut builder, &self.staged_writes, request)?;
         if self
             .staged_writes
             .append_only_exact_batch_is_definitely_absent(request)?
         {
-            return MaterializedLiveStateExactBatch::new(builder.finish(), slots);
+            return MaterializedHotStateExactBatch::new(builder.finish(), slots);
         }
         self.staged_writes.ensure_identity_index(false)?;
         let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
@@ -3628,7 +3628,7 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
             } => (rows, by_identity),
             StagedPreparedRows::AppendOnly { rows, .. } => {
                 debug_assert!(rows.is_empty(), "nonempty reads must promote the journal");
-                return MaterializedLiveStateExactBatch::new(builder.finish(), slots);
+                return MaterializedHotStateExactBatch::new(builder.finish(), slots);
             }
         };
         for (request_index, request_row) in request.rows.iter().enumerate() {
@@ -3657,7 +3657,7 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
                 );
             }
         }
-        MaterializedLiveStateExactBatch::new(builder.finish(), slots)
+        MaterializedHotStateExactBatch::new(builder.finish(), slots)
     }
 
     fn collection_replaced(
@@ -3738,7 +3738,7 @@ fn ordered_mutation_journal_row<'a>(
 }
 
 fn push_ordered_mutation_materialized(
-    output: &mut MaterializedLiveStateBatchBuilder,
+    output: &mut MaterializedHotStateBatchBuilder,
     journal: &OrderedMutationJournal,
     chunk: &ImmutableMutationJournalChunk,
     row_index: usize,
@@ -3801,9 +3801,9 @@ fn push_ordered_mutation_materialized(
 }
 
 fn append_matching_ordered_mutations(
-    output: &mut MaterializedLiveStateBatchBuilder,
+    output: &mut MaterializedHotStateBatchBuilder,
     staged_writes: &TransactionWriteBuffer,
-    request: &LiveStateScanRequest,
+    request: &HotStateScanRequest,
 ) -> Result<(), LixError> {
     let ordered = staged_writes.ordered_mutations.lock().map_err(|_| {
         LixError::new(
@@ -3862,9 +3862,9 @@ fn append_matching_ordered_mutations(
 }
 
 fn load_ordered_mutation_exact_batch(
-    output: &mut MaterializedLiveStateBatchBuilder,
+    output: &mut MaterializedHotStateBatchBuilder,
     staged_writes: &TransactionWriteBuffer,
-    request: &LiveStateExactBatchRequest,
+    request: &HotStateExactBatchRequest,
 ) -> Result<Vec<Option<u32>>, LixError> {
     let ordered = staged_writes.ordered_mutations.lock().map_err(|_| {
         LixError::new(
@@ -3955,7 +3955,7 @@ fn ordered_schema_row_range(rows: &PreparedStateBatch, schema_key: &str) -> std:
 
 #[cfg(test)]
 pub(crate) enum StagedExactRow {
-    Row(MaterializedLiveStateRow),
+    Row(MaterializedHotStateRow),
     Tombstone,
 }
 
@@ -3977,7 +3977,7 @@ impl PreparedStateRowIdentity {
         }
     }
 
-    fn from_exact_request(request: &LiveStateExactRowRequest) -> Self {
+    fn from_exact_request(request: &HotStateExactRowRequest) -> Self {
         Self {
             schema_key: request.schema_key.as_str().into(),
             entity_pk: request.entity_pk.clone(),
@@ -3987,7 +3987,7 @@ impl PreparedStateRowIdentity {
     }
 
     #[cfg(test)]
-    fn from_row_request(request: &LiveStateRowRequest) -> Option<Self> {
+    fn from_row_request(request: &HotStateRowRequest) -> Option<Self> {
         let file_id = match &request.file_id {
             NullableKeyFilter::Null => None,
             NullableKeyFilter::Value(value) => Some(value.clone()),
@@ -4028,8 +4028,8 @@ impl From<&PreparedStateRowRef<'_>> for PreparedStateRowIdentity {
 }
 
 #[cfg(test)]
-impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
-    fn from(row: &MaterializedLiveStateRow) -> Self {
+impl From<&MaterializedHotStateRow> for PreparedStateRowIdentity {
+    fn from(row: &MaterializedHotStateRow) -> Self {
         Self {
             schema_key: row.schema_key.as_str().into(),
             entity_pk: row.entity_pk.clone(),
@@ -4278,10 +4278,10 @@ fn remove_row_from_commit_change_refs(
 }
 
 fn append_matching_staged_rows(
-    output: &mut MaterializedLiveStateBatchBuilder,
+    output: &mut MaterializedHotStateBatchBuilder,
     slots: impl IntoIterator<Item = RowSlot>,
     staged_rows: &PreparedStateBatch,
-    request: &LiveStateScanRequest,
+    request: &HotStateScanRequest,
     candidate_index_matched_schema_and_entity: bool,
 ) {
     for slot in slots {
@@ -4297,7 +4297,7 @@ fn append_matching_staged_rows(
 }
 
 fn push_prepared_materialized(
-    output: &mut MaterializedLiveStateBatchBuilder,
+    output: &mut MaterializedHotStateBatchBuilder,
     row: PreparedStateRowRef<'_>,
 ) -> usize {
     output.push_materialized_ref(
@@ -4321,7 +4321,7 @@ fn push_prepared_materialized(
 
 fn staged_row_identity_matches_scan(
     row: PreparedStateRowRef<'_>,
-    request: &LiveStateScanRequest,
+    request: &HotStateScanRequest,
     candidate_index_matched_schema_and_entity: bool,
 ) -> bool {
     if !candidate_index_matched_schema_and_entity
@@ -4363,7 +4363,7 @@ fn nullable_key_matches_filters(
             .any(|filter| nullable_key_matches_filter(value, filter))
 }
 
-fn staged_branch_matches_scan(branch_id: &str, request: &LiveStateScanRequest) -> bool {
+fn staged_branch_matches_scan(branch_id: &str, request: &HotStateScanRequest) -> bool {
     request.filter.branch_ids.is_empty()
         || request
             .filter
@@ -4389,9 +4389,9 @@ fn nullable_key_matches_filter(value: Option<&str>, filter: &NullableKeyFilter<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live_state::{
-        LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateRowRequest,
-        StagedLiveStateRows,
+    use crate::hot_state::{
+        HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateRowRequest,
+        StagedHotStateRows,
     };
 
     macro_rules! prepared_rows {
@@ -4637,7 +4637,7 @@ mod tests {
         let overlay = staged_writes
             .staging_overlay()
             .expect("ordered journal overlay should build");
-        let exact = |entity: &str| LiveStateExactRowRequest {
+        let exact = |entity: &str| HotStateExactRowRequest {
             schema_key: "lix_key_value".into(),
             branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
             entity_pk: EntityPk::single(entity),
@@ -4653,9 +4653,9 @@ mod tests {
             "a keyed scan after the journal tail must not materialize read indexes"
         );
 
-        let future = StagedLiveStateRows::load_exact_batch(
+        let future = StagedHotStateRows::load_exact_batch(
             &overlay,
-            &LiveStateExactBatchRequest {
+            &HotStateExactBatchRequest {
                 rows: vec![exact("entity-b")],
                 ..Default::default()
             },
@@ -4678,9 +4678,9 @@ mod tests {
             "future exact absence proof must preserve append-only staging"
         );
 
-        let overlap = StagedLiveStateRows::load_exact_batch(
+        let overlap = StagedHotStateRows::load_exact_batch(
             &overlay,
-            &LiveStateExactBatchRequest {
+            &HotStateExactBatchRequest {
                 rows: vec![exact("entity-a")],
                 ..Default::default()
             },
@@ -4707,7 +4707,7 @@ mod tests {
             .staging_overlay()
             .expect("ordinary overlay should build");
         assert!(
-            !StagedLiveStateRows::collection_replaced(
+            !StagedHotStateRows::collection_replaced(
                 &ordinary_overlay,
                 branch_id,
                 "json_pointer",
@@ -4737,7 +4737,7 @@ mod tests {
             .staging_overlay()
             .expect("marker overlay should build");
         assert!(
-            StagedLiveStateRows::collection_replaced(
+            StagedHotStateRows::collection_replaced(
                 &marker_overlay,
                 branch_id,
                 "json_pointer",
@@ -5186,7 +5186,7 @@ mod tests {
             .staging_overlay()
             .expect("overlay should build from staged rows");
         let row = overlay
-            .load_exact(&LiveStateRowRequest {
+            .load_exact(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
                 entity_pk: EntityPk::single("sql2-duplicate-key"),
@@ -5219,14 +5219,14 @@ mod tests {
         let overlay = staged_writes
             .staging_overlay()
             .expect("overlay should build");
-        let exact = |entity: &str, file_id: &str| LiveStateExactRowRequest {
+        let exact = |entity: &str, file_id: &str| HotStateExactRowRequest {
             schema_key: "lix_key_value".into(),
             branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".into(),
             entity_pk: EntityPk::single(entity),
             file_id: Some(file_id.to_string()),
         };
         let cross_pair = exact("entity-a", "01920000-0000-7000-8000-0000000000b2");
-        let exact_request = LiveStateExactBatchRequest {
+        let exact_request = HotStateExactBatchRequest {
             rows: vec![
                 cross_pair.clone(),
                 exact("entity-a", "01920000-0000-7000-8000-0000000000a2"),
@@ -5237,7 +5237,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let batch = StagedLiveStateRows::load_exact_batch(&overlay, &exact_request)
+        let batch = StagedHotStateRows::load_exact_batch(&overlay, &exact_request)
             .expect("exact staged batch should load directly");
         let first = batch.row(0).expect("first exact row");
         let duplicate = batch.row(3).expect("duplicate exact row");
@@ -5248,7 +5248,7 @@ mod tests {
         assert!(batch.row(4).is_none());
         assert!(batch.row(5).is_none());
 
-        let rows = StagedLiveStateRows::load_exact_batch(&overlay, &exact_request)
+        let rows = StagedHotStateRows::load_exact_batch(&overlay, &exact_request)
             .expect("exact staged rows should load")
             .into_rows();
 
@@ -5259,9 +5259,9 @@ mod tests {
         assert_eq!(rows[4], None);
         assert_eq!(rows[5], None, "tombstone should be hidden by default");
 
-        let tombstone = StagedLiveStateRows::load_exact_batch(
+        let tombstone = StagedHotStateRows::load_exact_batch(
             &overlay,
-            &LiveStateExactBatchRequest {
+            &HotStateExactBatchRequest {
                 rows: vec![exact("deleted", "deleted")],
                 include_tombstones: true,
                 ..Default::default()
@@ -5978,7 +5978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staging_overlay_identity_matches_live_state_conflict_key() {
+    async fn staging_overlay_identity_matches_hot_state_conflict_key() {
         let staged_writes = test_staged_writes();
 
         staged_writes
@@ -6005,13 +6005,13 @@ mod tests {
             .staging_overlay()
             .expect("overlay should build from staged rows");
         let rows = overlay
-            .scan(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+            .scan(&HotStateScanRequest {
+                filter: HotStateFilter {
                     entity_pks: vec![EntityPk::single("shared-entity")],
                     include_tombstones: true,
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                ..LiveStateScanRequest::default()
+                ..HotStateScanRequest::default()
             })
             .expect("overlay scan should succeed");
 
@@ -6049,16 +6049,16 @@ mod tests {
             .staging_overlay()
             .expect("overlay should build from staged rows");
         let rows = overlay
-            .scan_parts(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+            .scan_parts(&HotStateScanRequest {
+                filter: HotStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
                     entity_pks: vec![EntityPk::single("selected")],
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones: true,
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                ..LiveStateScanRequest::default()
+                ..HotStateScanRequest::default()
             })
             .expect("keyed scan should succeed")
             .rows;
@@ -6103,15 +6103,15 @@ mod tests {
             .staging_overlay()
             .expect("overlay should build from staged rows");
         let rows = overlay
-            .scan_parts(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+            .scan_parts(&HotStateScanRequest {
+                filter: HotStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     file_ids: vec![NullableKeyFilter::Value("selected-file".to_string())],
                     include_tombstones: true,
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                ..LiveStateScanRequest::default()
+                ..HotStateScanRequest::default()
             })
             .expect("file scan should succeed")
             .rows;
@@ -6137,14 +6137,14 @@ mod tests {
         index.insert(state_row("first", "one").borrowed(), RowSlot::State(4));
         index.insert(state_row("second", "two").borrowed(), RowSlot::State(9));
 
-        let filter = LiveStateFilter {
+        let filter = HotStateFilter {
             schema_keys: vec!["lix_key_value".to_string(), "lix_key_value".to_string()],
             entity_pks: vec![
                 EntityPk::single("second"),
                 EntityPk::single("first"),
                 EntityPk::single("first"),
             ],
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         };
         let Some(Cow::Owned(slots)) = index.slots_for_filter(&filter) else {
             panic!("multi-key filter should use the candidate index");
@@ -6167,14 +6167,14 @@ mod tests {
             RowSlot::State(9),
         );
 
-        let filter = LiveStateFilter {
+        let filter = HotStateFilter {
             schema_keys: vec!["lix_key_value".to_string(), "lix_key_value".to_string()],
             file_ids: vec![
                 NullableKeyFilter::Value("other".to_string()),
                 NullableKeyFilter::Value("selected".to_string()),
                 NullableKeyFilter::Value("selected".to_string()),
             ],
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         };
         let Some(Cow::Owned(slots)) = index.slots_for_filter(&filter) else {
             panic!("multi-key file filter should use the candidate index");
@@ -6192,20 +6192,20 @@ mod tests {
             RowSlot::State(9),
         );
 
-        let null_filter = LiveStateFilter {
+        let null_filter = HotStateFilter {
             schema_keys: vec!["lix_key_value".to_string()],
             file_ids: vec![NullableKeyFilter::Null],
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         };
         let Some(Cow::Borrowed(null_slots)) = index.slots_for_filter(&null_filter) else {
             panic!("single null file filter should borrow indexed candidates");
         };
         assert_eq!(null_slots, &[RowSlot::State(4)]);
 
-        let any_filter = LiveStateFilter {
+        let any_filter = HotStateFilter {
             schema_keys: vec!["lix_key_value".to_string()],
             file_ids: vec![NullableKeyFilter::Any],
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         };
         let Some(Cow::Borrowed(any_slots)) = index.slots_for_filter(&any_filter) else {
             panic!("an Any file filter should use schema candidates");
@@ -6228,13 +6228,13 @@ mod tests {
             RowSlot::State(9),
         );
 
-        let filter = LiveStateFilter {
+        let filter = HotStateFilter {
             schema_keys: vec![
                 "other_schema".to_string(),
                 "lix_key_value".to_string(),
                 "lix_key_value".to_string(),
             ],
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         };
         let Some(Cow::Owned(slots)) = index.slots_for_filter(&filter) else {
             panic!("multi-schema filter should use the candidate index");
@@ -6288,16 +6288,16 @@ mod tests {
         let overlay = staged_writes
             .staging_overlay()
             .expect("overlay should build from staged rows");
-        let request = LiveStateScanRequest {
-            filter: LiveStateFilter {
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
                 entity_pks: vec![EntityPk::single("selected")],
                 branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones: true,
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
-            ..LiveStateScanRequest::default()
+            ..HotStateScanRequest::default()
         };
         overlay
             .scan_parts(&request)
@@ -6459,8 +6459,8 @@ mod tests {
         row
     }
 
-    fn exact_request_for_key(key: &str) -> LiveStateRowRequest {
-        LiveStateRowRequest {
+    fn exact_request_for_key(key: &str) -> HotStateRowRequest {
+        HotStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             entity_pk: EntityPk::single(key),
@@ -6468,8 +6468,8 @@ mod tests {
         }
     }
 
-    fn exact_request_for_branch_key(branch_id: &str, key: &str) -> LiveStateRowRequest {
-        LiveStateRowRequest {
+    fn exact_request_for_branch_key(branch_id: &str, key: &str) -> HotStateRowRequest {
+        HotStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             branch_id: branch_id.to_string(),
             entity_pk: EntityPk::single(key),
@@ -6516,17 +6516,17 @@ mod tests {
         );
     }
 
-    fn scan_request_for_key(key: &str, include_tombstones: bool) -> LiveStateScanRequest {
-        LiveStateScanRequest {
-            filter: LiveStateFilter {
+    fn scan_request_for_key(key: &str, include_tombstones: bool) -> HotStateScanRequest {
+        HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
                 entity_pks: vec![EntityPk::single(key)],
                 branch_ids: vec!["ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones,
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
-            ..LiveStateScanRequest::default()
+            ..HotStateScanRequest::default()
         }
     }
 

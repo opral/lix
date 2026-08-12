@@ -7905,11 +7905,11 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
 // A space id has exactly one value semantics, declared once in the engine
 // registry. These read it back instead of restating id, name and semantics.
 fn certified_entity_batch_space() -> StorageSpace {
-    lix::storage_bench::storage_space_by_name("live_state.certified_entity_batch.v1")
+    lix::storage_bench::storage_space_by_name("hot_state.certified_entity_batch.v1")
 }
 
 fn certified_entity_batch_page_space() -> StorageSpace {
-    lix::storage_bench::storage_space_by_name("live_state.certified_entity_batch_page.v1")
+    lix::storage_bench::storage_space_by_name("hot_state.certified_entity_batch_page.v1")
 }
 const CEB2_FIXTURE_PATH: &str = "/ceb2-hard-cut.excalidraw";
 const CEB2_FIXTURE_BYTES: &[u8] = br#"{"type":"excalidraw","version":2,"elements":[{"id":"a","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}]}"#;

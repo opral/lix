@@ -49,7 +49,7 @@ pub(crate) use context::{
     CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
     DiffCommandOutcome, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextBranchRefReader, WriteContextLiveStateReader,
+    WriteContextBranchRefReader, WriteContextHotStateReader,
 };
 pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
 pub(crate) use entity_columnar_layout::{

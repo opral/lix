@@ -4,9 +4,9 @@
 mod tests {
     use crate::common::serialize_row_metadata;
     use crate::entity_pk::EntityPk;
-    use crate::live_state::{
-        LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateBatch,
-        MaterializedLiveStateRowRef,
+    use crate::hot_state::{
+        HotStateFilter, HotStateScanRequest, MaterializedHotStateBatch,
+        MaterializedHotStateRowRef,
     };
     use crate::session::CreateBranchOptions;
     use crate::sql2::test_support::generators::{
@@ -505,7 +505,7 @@ mod tests {
     ) -> Option<ProbeSnapshot> {
         match probe {
             DifferentialProbe::RegisteredSchemaByBranch { branch_ids } => {
-                let rows = scan_transaction_live_state(
+                let rows = scan_transaction_hot_state(
                     transaction,
                     "lix_registered_schema",
                     &[],
@@ -522,16 +522,16 @@ mod tests {
         }
     }
 
-    async fn scan_transaction_live_state(
+    async fn scan_transaction_hot_state(
         transaction: &mut crate::session::SessionTransaction,
         schema_key: &str,
         entity_pks: &[&str],
         branch_ids: &[&str],
         active_branch_id: &str,
-    ) -> MaterializedLiveStateBatch {
+    ) -> MaterializedHotStateBatch {
         transaction
-        .scan_live_state_for_test(&LiveStateScanRequest {
-            filter: LiveStateFilter {
+        .scan_hot_state_for_test(&HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec![schema_key.to_string()],
                 entity_pks: entity_pks
                     .iter()
@@ -541,9 +541,9 @@ mod tests {
                     .iter()
                     .map(|branch_id| resolve_probe_branch_id(branch_id, active_branch_id))
                     .collect(),
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
-            ..LiveStateScanRequest::default()
+            ..HotStateScanRequest::default()
         })
         .await
         .unwrap_or_else(|error| {
@@ -554,7 +554,7 @@ mod tests {
     }
 
     fn registered_schema_by_branch_rows(
-        rows: MaterializedLiveStateBatch,
+        rows: MaterializedHotStateBatch,
         active_branch_id: &str,
     ) -> Vec<Vec<Value>> {
         let mut ordinals = (0..rows.len()).collect::<Vec<_>>();
@@ -598,7 +598,7 @@ mod tests {
             .collect()
     }
 
-    fn entity_pk_value(row: MaterializedLiveStateRowRef<'_>) -> Value {
+    fn entity_pk_value(row: MaterializedHotStateRowRef<'_>) -> Value {
         Value::Text(
             row.entity_pk()
                 .as_json_array_text()

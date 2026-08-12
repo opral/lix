@@ -5,7 +5,7 @@
 //! That matters here because one of the layout invariants is *structural*: a
 //! derived view may read the canonical store, and the canonical store may not
 //! read the derived view. `tracked_state` (canonical state) sitting below
-//! `live_state` (the hot plane) is what makes "derived views are caches, never
+//! `hot_state` (the hot plane) is what makes "derived views are caches, never
 //! the correctness authority" checkable rather than merely conventional.
 //!
 //! [`MODULE_LAYERS`] is the declared order — the artifact itself, reviewable in
@@ -56,13 +56,13 @@ const MODULE_LAYERS: &[&[&str]] = &[
     &["commit_graph"],
     // Branch-head control authority. It resolves heads over commit topology and
     // the hot plane reads branch heads back, which pins it to exactly this
-    // position: above `commit_graph`, below `live_state`.
+    // position: above `commit_graph`, below `hot_state`.
     &["branch"],
     // The derived serving plane — a rebuildable cache over the canonical state.
     // Sole writer of every hot-plane storage space. Its position above
     // `tracked_state` is the structural half of the "derived views are caches"
     // invariant: the compiler now rejects a canonical-side read of the cache.
-    &["live_state"],
+    &["hot_state"],
     // Entity-level overlays over the state planes. None of them is read by any
     // module below, and none reads another: `checkpoint` and `plugin` both use
     // `branch`, `undo_redo` only needs `changelog`.
@@ -80,7 +80,7 @@ const MODULE_LAYERS: &[&[&str]] = &[
 /// [`MODULE_LAYERS`] as a result — ten mutual cycles became six. What remains
 /// is `session` ↔ `transaction` (the `EXECUTE_IDEMPOTENCY_RECEIPT_SPACE`
 /// ownership inversion), `gc` ↔ `session` (correct by design), `filesystem` ↔
-/// `live_state`, and the two upward references `transaction_types` still makes
+/// `hot_state`, and the two upward references `transaction_types` still makes
 /// of its own — into `sql2` and `collection_generation`.
 const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("catalog", "not yet analysed"),
@@ -141,9 +141,9 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     (
         "transaction_types",
         "the shared write-row vocabulary, now its own module. It cannot be \
-         layered yet because it names `live_state`'s materialized row types \
-         while `live_state` reads `branch`, which reads this module — so \
-         layering it would have to place it both above and below `live_state`. \
+         layered yet because it names `hot_state`'s materialized row types \
+         while `hot_state` reads `branch`, which reads this module — so \
+         layering it would have to place it both above and below `hot_state`. \
          Deduplicating the `Materialized*Row` DTOs downward unblocks it",
     ),
     ("wasm", "plugin ABI vocabulary, not yet analysed"),
@@ -484,7 +484,7 @@ fn no_module_is_declared_twice() {
 
 /// The guard itself: no layered module may reference its own layer or above.
 ///
-/// The canonical case is `tracked_state` → `live_state`. Nine such references
+/// The canonical case is `tracked_state` → `hot_state`. Nine such references
 /// existed before the layering was declared; the cache-may-read-canonical
 /// direction is only an invariant while this test is green.
 #[test]
@@ -537,13 +537,13 @@ fn the_scanner_finds_the_references_it_is_supposed_to() {
     assert!(
         references
             .iter()
-            .any(|reference| reference.from == "live_state" && reference.to == "tracked_state"),
+            .any(|reference| reference.from == "hot_state" && reference.to == "tracked_state"),
         "the hot plane is supposed to read canonical state; the scanner missed it",
     );
     assert!(
         !references
             .iter()
-            .any(|reference| reference.from == "tracked_state" && reference.to == "live_state"),
+            .any(|reference| reference.from == "tracked_state" && reference.to == "hot_state"),
         "canonical state must not read the hot plane",
     );
 }

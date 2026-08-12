@@ -45,27 +45,26 @@ pub const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace =
     crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE;
 pub const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace =
     crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE;
-pub const HOT_ROW_SPACE: StorageSpace = crate::live_state::HOT_ROW_SPACE;
-pub const HOT_FILE_SPACE: StorageSpace = crate::live_state::HOT_FILE_SPACE;
-pub const HOT_DIFF_SPACE: StorageSpace = crate::live_state::HOT_DIFF_SPACE;
+pub const HOT_ROW_SPACE: StorageSpace = crate::hot_state::ROW_SPACE;
+pub const HOT_FILE_SPACE: StorageSpace = crate::hot_state::FILE_SPACE;
+pub const HOT_DIFF_SPACE: StorageSpace = crate::hot_state::DIFF_SPACE;
 pub const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace =
-    crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE;
+    crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE;
 pub const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace =
-    crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE;
+    crate::hot_state::CERTIFIED_ENTITY_BATCH_SPACE;
 pub const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = crate::branch::BRANCH_HEAD_CONTROL_SPACE;
 pub const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace =
-    crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE;
+    crate::hot_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE;
 pub const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace =
-    crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE;
-pub const HOT_COLLECTION_CONTROL_SPACE: StorageSpace =
-    crate::live_state::HOT_COLLECTION_CONTROL_SPACE;
-pub const PACKED_CURRENT_BASE_SPACE: StorageSpace = crate::live_state::PACKED_CURRENT_BASE_SPACE;
+    crate::hot_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE;
+pub const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = crate::hot_state::COLLECTION_CONTROL_SPACE;
+pub const PACKED_CURRENT_BASE_SPACE: StorageSpace = crate::hot_state::PACKED_CURRENT_BASE_SPACE;
 pub const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace =
-    crate::live_state::PACKED_CURRENT_BASE_CONTROL_SPACE;
+    crate::hot_state::PACKED_CURRENT_BASE_CONTROL_SPACE;
 pub const PLUGIN_CHECKPOINT_SPACE: StorageSpace = crate::transaction::PLUGIN_CHECKPOINT_SPACE;
 pub const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace =
-    crate::live_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE;
-pub const ROOT_CURRENT_BASE_SPACE: StorageSpace = crate::live_state::ROOT_CURRENT_BASE_SPACE;
+    crate::hot_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE;
+pub const ROOT_CURRENT_BASE_SPACE: StorageSpace = crate::hot_state::ROOT_CURRENT_BASE_SPACE;
 pub const ROW_GROUP_MANIFEST_SPACE: StorageSpace =
     crate::columnar_row_group::ROW_GROUP_MANIFEST_SPACE;
 pub const ROW_GROUP_COLUMN_SPACE: StorageSpace = crate::columnar_row_group::ROW_GROUP_COLUMN_SPACE;
@@ -82,7 +81,7 @@ pub const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace =
 pub const SCOPED_RANGE_NODE_SPACE: StorageSpace = crate::tracked_state::SCOPED_RANGE_NODE_SPACE;
 /// Declared-column access path over the hot rows. Disposable: derived from the
 /// hot rows and reclaimed with its generation.
-pub const HOT_INDEX_SPACE: StorageSpace = crate::live_state::HOT_INDEX_SPACE;
+pub const HOT_INDEX_SPACE: StorageSpace = crate::hot_state::INDEX_SPACE;
 pub const BINARY_CAS_MANIFEST_SPACE: StorageSpace = crate::binary_cas::BINARY_CAS_MANIFEST_SPACE;
 pub const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace =
     crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE;

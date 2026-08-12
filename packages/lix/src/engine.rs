@@ -8,8 +8,8 @@ use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
-use crate::live_state::LiveStateContext;
-use crate::live_state::LiveStateRowRequest;
+use crate::hot_state::HotStateContext;
+use crate::hot_state::HotStateRowRequest;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{
@@ -35,7 +35,7 @@ use crate::{LixError, NullableKeyFilter};
 pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
     tracked_state: Arc<TrackedStateContext>,
-    live_state: Arc<LiveStateContext>,
+    hot_state: Arc<HotStateContext>,
     branch_ctx: Arc<BranchContext>,
     binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
@@ -161,12 +161,12 @@ where
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let commit_graph = CommitGraphContext::new();
-        let live_state = Arc::new(LiveStateContext::new(
+        let hot_state = Arc::new(HotStateContext::new(
             tracked_state.as_ref().clone(),
             commit_graph,
         ));
         let branch_ctx = Arc::new(BranchContext::new());
-        assert_initialized(storage.clone(), live_state.as_ref()).await?;
+        assert_initialized(storage.clone(), hot_state.as_ref()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one
         // execution-scoped SQL context, optionally wrapped by a transaction
@@ -182,7 +182,7 @@ where
             binary_cas: Arc::new(BinaryCasContext::new()),
             storage,
             tracked_state,
-            live_state,
+            hot_state,
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
             sql_planning_cache: Arc::new(SqlPlanningCache::default()),
@@ -204,7 +204,7 @@ where
     ///
     /// This is the public engine-level form of the typed `branch_ref` context:
     /// callers should not need to know that branch heads are represented as
-    /// untracked `lix_branch_ref` rows in live_state.
+    /// untracked `lix_branch_ref` rows in hot_state.
     pub async fn load_branch_head_commit_id(
         &self,
         branch_id: &str,
@@ -242,7 +242,7 @@ where
             active_branch_id.into(),
             active_account_id,
             self.storage(),
-            Arc::clone(&self.live_state),
+            Arc::clone(&self.hot_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
@@ -273,7 +273,7 @@ where
         SessionContext::open_workspace(
             active_account_id,
             self.storage(),
-            Arc::clone(&self.live_state),
+            Arc::clone(&self.hot_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
@@ -381,9 +381,9 @@ where
                 .await?,
         );
         let row = self
-            .live_state
+            .hot_state
             .reader(read)
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: "lix_account".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: account_pk,
@@ -420,7 +420,7 @@ where
 
 async fn assert_initialized<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
-    live_state: &LiveStateContext,
+    hot_state: &HotStateContext,
 ) -> Result<(), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -432,9 +432,9 @@ where
         // spaces keep their physical IDs across hard layout cuts, so an old
         // group value could otherwise be decoded before we reject it.
         crate::init::RepositoryProtocolStatus::Current => {
-            let reader = live_state.reader(read);
+            let reader = hot_state.reader(read);
             let initialized = reader
-                .load_row(&LiveStateRowRequest {
+                .load_row(&HotStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
                     entity_pk: EntityPk::single("lix_id"),
@@ -1519,7 +1519,7 @@ mod tests {
         );
 
         use std::sync::atomic::Ordering;
-        let hits = &crate::live_state::WORKING_DIFF_PATH_HITS;
+        let hits = &crate::hot_state::WORKING_DIFF_PATH_HITS;
         let index_before = hits.index_scan.load(Ordering::Relaxed);
         let broad = session
             .execute(
@@ -1610,7 +1610,7 @@ mod tests {
 
     /// `WHERE lixcol_file_id = ?` is now an exact provider constraint, so
     /// DataFusion drops its residual filter and the answer rests entirely on
-    /// `LiveStateFilter::file_ids`. Rows can live in four authorities — the
+    /// `HotStateFilter::file_ids`. Rows can live in four authorities — the
     /// branch-local `HOT_ROW` overlay, a packed current base, a certified
     /// entity batch, and the root current base — and a file-scoped seek is
     /// only sound if every one of them applies the same filter. The checkpoint
@@ -1907,9 +1907,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("working-diff inventory read should open");
-        let before_sparse = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
+        let before_sparse = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         let before_packed =
-            scan_test_space(&read, crate::live_state::PACKED_CURRENT_BASE_SPACE).await;
+            scan_test_space(&read, crate::hot_state::PACKED_CURRENT_BASE_SPACE).await;
         assert!(
             !before_sparse.entries.is_empty() || !before_packed.entries.is_empty(),
             "tracked mutation must persist a sparse or packed physical dirty epoch"
@@ -1925,7 +1925,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("post-checkpoint inventory read should open");
-        let after = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
+        let after = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
             after.entries.len(),
             1,
@@ -1940,7 +1940,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("second checkpoint inventory read should open");
-        let after_second = scan_test_space(&read, crate::live_state::HOT_DIFF_SPACE).await;
+        let after_second = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
             after_second.entries.len(),
             2,
@@ -2041,7 +2041,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read initialized hot rows");
-        let hot_rows = scan_test_space(&read, crate::live_state::HOT_ROW_SPACE)
+        let hot_rows = scan_test_space(&read, crate::hot_state::ROW_SPACE)
             .await
             .entries;
         assert!(
@@ -2057,7 +2057,7 @@ mod tests {
         );
         for hot_row in hot_rows {
             writes.put(
-                crate::live_state::HOT_ROW_SPACE,
+                crate::hot_state::ROW_SPACE,
                 hot_row.key,
                 StorageValue {
                     bytes: Bytes::from_static(b"predecessor-head-bytes"),
@@ -2242,7 +2242,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read the index plane");
-        let entries = scan_test_space(&read, crate::live_state::HOT_INDEX_SPACE)
+        let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE)
             .await
             .entries;
         let witnesses = entries

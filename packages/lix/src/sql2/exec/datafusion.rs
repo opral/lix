@@ -3336,7 +3336,7 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::functions::FunctionProviderHandle;
     use crate::json_store::JsonStoreContext;
-    use crate::live_state::{LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow};
+    use crate::hot_state::{HotStateReader, HotStateScanRequest, MaterializedHotStateRow};
     use crate::sql2::{
         ChangelogQuerySource, EntitySnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
         SqlHistoryQuerySource,
@@ -3466,16 +3466,16 @@ mod tests {
     struct StaticBlobReader {
         bytes: Vec<u8>,
     }
-    struct DummyLiveStateReader;
-    struct RowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct DummyHotStateReader;
+    struct RowsHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
-    struct CapturingRowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
-        requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+    struct CapturingRowsHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
+        requests: Arc<Mutex<Vec<HotStateScanRequest>>>,
     }
-    struct CountingRowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct CountingRowsHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
         scans: Arc<AtomicUsize>,
     }
     struct CountingBatchStream {
@@ -3575,7 +3575,7 @@ mod tests {
     }
     struct RecordingEntitySnapshotReader {
         snapshots: Vec<Option<Bytes>>,
-        requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
+        requests: Arc<Mutex<Vec<HotStateScanRequest>>>,
     }
     struct DummyCommitGraphReader;
     struct DummyBranchRefReader;
@@ -3739,7 +3739,7 @@ mod tests {
     struct DummySqlExecutionContext<'a> {
         active_branch_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
-        live_state: Arc<dyn LiveStateReader>,
+        hot_state: Arc<dyn HotStateReader>,
         entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
         schema_definitions: Vec<JsonValue>,
     }
@@ -3752,8 +3752,8 @@ mod tests {
             self.active_branch_id
         }
 
-        fn live_state(&self) -> Arc<dyn LiveStateReader> {
-            Arc::clone(&self.live_state)
+        fn hot_state(&self) -> Arc<dyn HotStateReader> {
+            Arc::clone(&self.hot_state)
         }
 
         fn entity_snapshot_reader(&self) -> Option<Arc<dyn EntitySnapshotReader>> {
@@ -3762,7 +3762,7 @@ mod tests {
 
         fn filesystem_path_index(&self) -> Arc<dyn crate::filesystem::FilesystemPathIndexReader> {
             Arc::new(crate::filesystem::UncachedFilesystemPathIndexReader::new(
-                Arc::clone(&self.live_state),
+                Arc::clone(&self.hot_state),
             ))
         }
 
@@ -3813,7 +3813,7 @@ mod tests {
     struct DummySqlWriteExecutionContext<'a> {
         active_branch_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
-        live_state: Arc<dyn LiveStateReader>,
+        hot_state: Arc<dyn HotStateReader>,
         staged_writes: Arc<Mutex<CapturingStagedWrites>>,
         schema_definitions: Vec<JsonValue>,
     }
@@ -3850,18 +3850,18 @@ mod tests {
             self.blob_reader.load_bytes_many(hashes).await
         }
 
-        async fn scan_live_state_batch(
+        async fn scan_hot_state_batch(
             &mut self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
-            self.live_state.scan_batch(request).await
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
+            self.hot_state.scan_batch(request).await
         }
 
-        async fn load_exact_live_state_batch(
+        async fn load_exact_hot_state_batch(
             &mut self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            self.live_state.load_exact_batch(request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            self.hot_state.load_exact_batch(request).await
         }
 
         async fn load_branch_head(
@@ -3956,18 +3956,18 @@ mod tests {
             self.inner.load_bytes_many(hashes).await
         }
 
-        async fn scan_live_state_batch(
+        async fn scan_hot_state_batch(
             &mut self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
-            self.inner.scan_live_state_batch(request).await
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
+            self.inner.scan_hot_state_batch(request).await
         }
 
-        async fn load_exact_live_state_batch(
+        async fn load_exact_hot_state_batch(
             &mut self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            self.inner.load_exact_live_state_batch(request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            self.inner.load_exact_hot_state_batch(request).await
         }
 
         async fn load_branch_head(
@@ -4185,7 +4185,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(StaticBlobReader { bytes: Vec::new() }),
-            live_state: Arc::new(CapturingRowsLiveStateReader {
+            hot_state: Arc::new(CapturingRowsHotStateReader {
                 rows: Vec::new(),
                 requests: Arc::new(Mutex::new(Vec::new())),
             }),
@@ -4279,29 +4279,29 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateReader for DummyLiveStateReader {
+    impl HotStateReader for DummyHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            _request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             Ok(vec![].into())
         }
     }
 
-    fn filter_live_state_rows(
-        rows: &[MaterializedLiveStateRow],
-        request: &LiveStateScanRequest,
-    ) -> Vec<MaterializedLiveStateRow> {
+    fn filter_hot_state_rows(
+        rows: &[MaterializedHotStateRow],
+        request: &HotStateScanRequest,
+    ) -> Vec<MaterializedHotStateRow> {
         if matches!(
             request.filter.rows,
-            crate::live_state::LiveStateRowFilter::None
+            crate::hot_state::HotStateRowFilter::None
         ) {
             return Vec::new();
         }
@@ -4341,58 +4341,58 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateReader for RowsLiveStateReader {
+    impl HotStateReader for RowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
-            Ok(filter_live_state_rows(&self.rows, request).into())
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
+            Ok(filter_hot_state_rows(&self.rows, request).into())
         }
     }
 
     #[async_trait]
-    impl LiveStateReader for CapturingRowsLiveStateReader {
+    impl HotStateReader for CapturingRowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             self.requests
                 .lock()
                 .expect("captured live-state requests lock")
                 .push(request.clone());
-            Ok(filter_live_state_rows(&self.rows, request).into())
+            Ok(filter_hot_state_rows(&self.rows, request).into())
         }
     }
 
     #[async_trait]
-    impl LiveStateReader for CountingRowsLiveStateReader {
+    impl HotStateReader for CountingRowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             self.scans.fetch_add(1, Ordering::SeqCst);
-            Ok(filter_live_state_rows(&self.rows, request).into())
+            Ok(filter_hot_state_rows(&self.rows, request).into())
         }
     }
 
@@ -4400,7 +4400,7 @@ mod tests {
     impl EntitySnapshotReader for RecordingEntitySnapshotReader {
         async fn scan_entity_snapshots(
             &self,
-            request: LiveStateScanRequest,
+            request: HotStateScanRequest,
         ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
             self.requests
                 .lock()
@@ -4438,8 +4438,8 @@ mod tests {
         }
     }
 
-    fn live_entity_row(entity_pk: &str, branch_id: &str, value: &str) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    fn live_entity_row(entity_pk: &str, branch_id: &str, value: &str) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
@@ -4461,7 +4461,7 @@ mod tests {
         branch_id: &str,
         value: &str,
         untracked: bool,
-    ) -> MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
         let mut row = live_entity_row(entity_pk, branch_id, value);
         row.snapshot_content = Some(
             json!({ "id": entity_pk, "value": value })
@@ -4477,8 +4477,8 @@ mod tests {
         branch_id: &str,
         parent_id: Option<&str>,
         name: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
                 .expect("fixture directory ID should be a UUID"),
             schema_key: "lix_directory_descriptor".to_string(),
@@ -4509,8 +4509,8 @@ mod tests {
         branch_id: &str,
         directory_id: Option<&str>,
         name: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
                 .expect("fixture file ID should be a UUID"),
             schema_key: "lix_file_descriptor".to_string(),
@@ -4540,8 +4540,8 @@ mod tests {
         entity_pk: &str,
         branch_id: &str,
         bytes: &[u8],
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
                 .expect("fixture blob-ref ID should be a UUID"),
             schema_key: "lix_binary_blob_ref".to_string(),
@@ -4572,7 +4572,7 @@ mod tests {
     }
 
     fn counting_write_context(
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<MaterializedHotStateRow>,
     ) -> (
         DummySqlWriteExecutionContext<'static>,
         Arc<Mutex<CapturingStagedWrites>>,
@@ -4582,7 +4582,7 @@ mod tests {
     }
 
     fn counting_write_context_with_blob_reader(
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<MaterializedHotStateRow>,
         blob_reader: Arc<dyn BlobDataReader>,
     ) -> (
         DummySqlWriteExecutionContext<'static>,
@@ -4590,7 +4590,7 @@ mod tests {
         Arc<AtomicUsize>,
     ) {
         let scans = Arc::new(AtomicUsize::new(0));
-        let live_state: Arc<dyn LiveStateReader> = Arc::new(CountingRowsLiveStateReader {
+        let hot_state: Arc<dyn HotStateReader> = Arc::new(CountingRowsHotStateReader {
             rows,
             scans: Arc::clone(&scans),
         });
@@ -4599,7 +4599,7 @@ mod tests {
             DummySqlWriteExecutionContext {
                 active_branch_id: "01920000-0000-7000-8000-0000000000a1",
                 blob_reader,
-                live_state,
+                hot_state,
                 staged_writes: Arc::clone(&staged_writes),
                 schema_definitions: vec![],
             },
@@ -4608,7 +4608,7 @@ mod tests {
         )
     }
 
-    fn mark_untracked(mut row: MaterializedLiveStateRow) -> MaterializedLiveStateRow {
+    fn mark_untracked(mut row: MaterializedHotStateRow) -> MaterializedHotStateRow {
         row.untracked = true;
         row
     }
@@ -4629,19 +4629,19 @@ mod tests {
 
     #[tokio::test]
     #[expect(trivial_casts)]
-    async fn sql_execution_context_exposes_live_state_and_blob_reader() {
+    async fn sql_execution_context_exposes_hot_state_and_blob_reader() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::clone(&blob_reader),
-            live_state: Arc::clone(&live_state) as Arc<dyn LiveStateReader>,
+            hot_state: Arc::clone(&hot_state) as Arc<dyn HotStateReader>,
             entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
-        let actual = ctx.live_state();
-        let expected = live_state as Arc<dyn LiveStateReader>;
+        let actual = ctx.hot_state();
+        let expected = hot_state as Arc<dyn HotStateReader>;
         assert_eq!(
             ctx.active_branch_id(),
             "01920000-0000-7000-8000-0000000000a1"
@@ -4653,11 +4653,11 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_uses_execution_context_boundary() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
@@ -4669,7 +4669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integer_primary_key_read_pushes_exact_identity_to_live_state() {
+    async fn integer_primary_key_read_pushes_exact_identity_to_hot_state() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
         let component_types = [crate::entity_pk::EntityPkComponentType::Integer];
         let entity_pk = crate::entity_pk::EntityPk::from_external_parts(
@@ -4685,7 +4685,7 @@ mod tests {
         let ctx = DummySqlExecutionContext {
             active_branch_id: branch_id,
             blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(CapturingRowsLiveStateReader {
+            hot_state: Arc::new(CapturingRowsHotStateReader {
                 rows: vec![row],
                 requests: Arc::clone(&requests),
             }),
@@ -4726,7 +4726,7 @@ mod tests {
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(RowsLiveStateReader {
+            hot_state: Arc::new(RowsHotStateReader {
                 rows: vec![
                     live_test_state_row(
                         "entity-b",
@@ -4791,7 +4791,7 @@ mod tests {
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(CountingRowsLiveStateReader {
+            hot_state: Arc::new(CountingRowsHotStateReader {
                 rows: vec![
                     live_test_state_row(
                         "entity-b",
@@ -4865,7 +4865,7 @@ mod tests {
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(RowsLiveStateReader {
+            hot_state: Arc::new(RowsHotStateReader {
                 rows: vec![
                     row("bundle", "b1", r#"{"id":"b1"}"#),
                     // Stored JSON can violate a registered string type. The
@@ -4944,11 +4944,11 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_collects_union_all_partitions() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
@@ -5006,11 +5006,11 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_rejects_extra_parameters() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
@@ -5042,11 +5042,11 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_exposes_datafusion_information_schema() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
@@ -5829,12 +5829,12 @@ mod tests {
             "DELETE FROM TEST_STATE_SCHEMA_HISTORY",
         ] {
             let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-            let live_state = Arc::new(DummyLiveStateReader);
+            let hot_state = Arc::new(DummyHotStateReader);
             let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
             let mut ctx = DummySqlWriteExecutionContext {
                 active_branch_id: "01920000-0000-7000-8000-0000000000a1",
                 blob_reader,
-                live_state,
+                hot_state,
                 staged_writes,
                 schema_definitions: vec![json!({
                     "x-lix-key": "test_state_schema",
@@ -5864,12 +5864,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_lix_file_select_without_data_stages_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -5899,12 +5899,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_entity_by_branch_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -5948,12 +5948,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_entity_by_branch_accepts_parameterized_branch_id() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -5991,12 +5991,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_active_entity_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -6039,12 +6039,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_default_values_uses_the_native_entity_writer() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "default_values_probe",
@@ -6101,12 +6101,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_active_entity_does_not_probe_active_head_during_lowering() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "missing-branch",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -6141,12 +6141,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_noop_active_entity_write_does_not_probe_active_head() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "missing-branch",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -6181,7 +6181,7 @@ mod tests {
     async fn execute_sql_entity_upsert_conflict_scan_is_narrowed_to_inserted_identity() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(CapturingRowsLiveStateReader {
+        let hot_state = Arc::new(CapturingRowsHotStateReader {
             rows: vec![
                 live_test_state_row(
                     "target",
@@ -6202,7 +6202,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -6292,7 +6292,7 @@ mod tests {
             let mut ctx = DummySqlWriteExecutionContext {
                 active_branch_id: branch_id,
                 blob_reader: Arc::new(DummyBlobReader),
-                live_state: Arc::new(CapturingRowsLiveStateReader {
+                hot_state: Arc::new(CapturingRowsHotStateReader {
                     rows: vec![row],
                     requests: Arc::clone(&requests),
                 }),
@@ -6331,7 +6331,7 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(StaticBlobReader {
             bytes: b"old".to_vec(),
         });
-        let live_state = Arc::new(CapturingRowsLiveStateReader {
+        let hot_state = Arc::new(CapturingRowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -6368,7 +6368,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6491,12 +6491,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_directory_by_branch_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6539,12 +6539,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_active_directory_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6580,7 +6580,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_directory_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -6600,7 +6600,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6645,7 +6645,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_directory_stages_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -6657,7 +6657,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6696,7 +6696,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_directory_by_branch_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -6716,7 +6716,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6752,12 +6752,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_file_by_branch_stages_descriptor_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6803,12 +6803,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_active_file_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let hot_state = Arc::new(DummyHotStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -6844,7 +6844,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_file_with_data_stages_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000b1",
@@ -6856,7 +6856,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -7577,7 +7577,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_file_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -7603,7 +7603,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -7849,7 +7849,7 @@ mod tests {
             DummySqlWriteExecutionContext {
                 active_branch_id: "missing-branch",
                 blob_reader: Arc::new(DummyBlobReader),
-                live_state: Arc::new(RowsLiveStateReader { rows: Vec::new() }),
+                hot_state: Arc::new(RowsHotStateReader { rows: Vec::new() }),
                 staged_writes,
                 schema_definitions: vec![],
             }
@@ -8170,7 +8170,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_file_stages_data_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -8190,7 +8190,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -8232,7 +8232,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_file_stages_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -8252,7 +8252,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -8288,7 +8288,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_file_by_branch_stages_descriptor_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
@@ -8320,7 +8320,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
@@ -8356,7 +8356,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_entity_surface_stages_rewritten_snapshot() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
                 live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000a1", "B"),
@@ -8366,7 +8366,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -8412,7 +8412,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_entity_by_branch_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader {
+        let hot_state = Arc::new(RowsHotStateReader {
             rows: vec![
                 live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
                 live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000b1", "B"),
@@ -8422,7 +8422,7 @@ mod tests {
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -8506,12 +8506,12 @@ mod tests {
     #[tokio::test]
     async fn bound_public_write_supports_only_supported_entity_shapes() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let hot_state = Arc::new(RowsHotStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -8547,12 +8547,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_unsupported_target_contradiction_still_falls_back_and_errors() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let hot_state = Arc::new(RowsHotStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -8585,12 +8585,12 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_unsupported_target_false_predicate_still_errors() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let hot_state = Arc::new(RowsHotStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader,
-            live_state,
+            hot_state,
             staged_writes,
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
@@ -8632,7 +8632,7 @@ mod tests {
             blob_reader: Arc::new(StaticBlobReader {
                 bytes: vec![0x41, 0x42],
             }),
-            live_state: Arc::new(RowsLiveStateReader {
+            hot_state: Arc::new(RowsHotStateReader {
                 rows: vec![
                     live_entity_row("entity-a", "01920000-0000-7000-8000-0000000000a1", "A"),
                     live_entity_row("entity-b", "01920000-0000-7000-8000-0000000000b1", "B"),

@@ -1,6 +1,6 @@
 //! Does one untracked mutation cost O(1) or O(total untracked rows)?
 //!
-//! `HotWriter::stage_untracked_generation` (`live_state/tracked_head/hot.rs`)
+//! `HotWriter::stage_untracked_generation` (`hot_state/tracked_head/hot.rs`)
 //! loads the whole previous untracked generation, applies the deltas, and
 //! stages a *complete* new generation under a fresh generation UUID. If that
 //! is what actually happens on the SQL path, then the lane that exists for

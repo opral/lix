@@ -15,7 +15,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-use crate::live_state::{
+use crate::hot_state::{
     CurrentStateDeltaRef, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_tracked_working_diff_epoch,
 };
@@ -320,7 +320,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 ///
 /// The pure seed planner decides which bootstrap facts exist. This function is
 /// only responsible for durably writing those facts to their owning stores:
-/// changelog for tracked changes, and live_state for the serving state
+/// changelog for tracked changes, and hot_state for the serving state
 /// plus untracked moving refs.
 pub(crate) async fn initialize<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,

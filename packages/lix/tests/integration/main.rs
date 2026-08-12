@@ -8,7 +8,7 @@ mod checkpoint_gc;
 mod code_structure;
 mod commit_graph;
 mod constraint_fuzz;
-mod correlated_live_state_perf;
+mod correlated_hot_state_perf;
 mod corruption_fuzz;
 mod durable_function_fast_path;
 mod engine;

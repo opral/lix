@@ -11,9 +11,9 @@ use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef,
+use crate::hot_state::{
+    HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateRow,
+    MaterializedHotStateRowRef,
 };
 
 use super::keys::{
@@ -99,7 +99,7 @@ impl FilesystemDescriptorKey {
     }
 
     pub(crate) fn from_live_row(
-        row: &MaterializedLiveStateRow,
+        row: &MaterializedHotStateRow,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -112,7 +112,7 @@ impl FilesystemDescriptorKey {
     }
 
     pub(crate) fn from_live_row_ref(
-        row: MaterializedLiveStateRowRef<'_>,
+        row: MaterializedHotStateRowRef<'_>,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -125,7 +125,7 @@ impl FilesystemDescriptorKey {
     }
 
     pub(crate) fn from_file_descriptor_live_row(
-        row: &MaterializedLiveStateRow,
+        row: &MaterializedHotStateRow,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -138,7 +138,7 @@ impl FilesystemDescriptorKey {
     }
 
     pub(crate) fn from_file_descriptor_live_row_ref(
-        row: MaterializedLiveStateRowRef<'_>,
+        row: MaterializedHotStateRowRef<'_>,
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -228,14 +228,14 @@ impl FilesystemBlobRefKey {
     }
 
     pub(crate) fn from_live_row(
-        row: &MaterializedLiveStateRow,
+        row: &MaterializedHotStateRow,
         blob_ref_id: impl Into<String>,
     ) -> Self {
         Self(FilesystemDescriptorKey::from_live_row(row, blob_ref_id))
     }
 
     pub(crate) fn from_live_row_ref(
-        row: MaterializedLiveStateRowRef<'_>,
+        row: MaterializedHotStateRowRef<'_>,
         blob_ref_id: impl Into<String>,
     ) -> Self {
         Self(FilesystemDescriptorKey::from_live_row_ref(row, blob_ref_id))
@@ -1402,7 +1402,7 @@ pub(crate) fn plan_recursive_directory_delete(
 }
 
 pub(crate) fn directory_path_resolvers_from_state_batch(
-    rows: &crate::live_state::MaterializedLiveStateBatch,
+    rows: &crate::hot_state::MaterializedHotStateBatch,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
     let mut file_rows = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
@@ -1480,13 +1480,13 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
     Ok(resolvers)
 }
 
-pub(crate) async fn directory_path_resolvers_from_live_state(
-    live_state: Arc<dyn LiveStateReader>,
+pub(crate) async fn directory_path_resolvers_from_hot_state(
+    hot_state: Arc<dyn HotStateReader>,
     branch_binding: Option<&str>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
-    let rows = live_state
-        .scan_batch(&LiveStateScanRequest {
-            filter: LiveStateFilter {
+    let rows = hot_state
+        .scan_batch(&HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec![
                     DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
                     FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -1662,7 +1662,7 @@ fn append_tombstone_row(
 /// untracked delete never reaches tracked children. This is the same asymmetry
 /// the file -> rows cascade already applies one level down (see
 /// `apply_incremental_file_delete_cascade` and
-/// `apply_complete_file_delete_cascade` in `live_state::tracked_head::hot`,
+/// `apply_complete_file_delete_cascade` in `hot_state::tracked_head::hot`,
 /// both spelled `if (cascade.untracked && !existing.untracked) { continue }`).
 ///
 /// Without the downward crossing a tracked directory delete leaves untracked
@@ -1762,7 +1762,7 @@ mod tests {
     use crate::filesystem::VisibleFilesystem;
     use crate::{
         entity_pk::EntityPk,
-        live_state::{MaterializedLiveStateBatch, MaterializedLiveStateRow},
+        hot_state::{MaterializedHotStateBatch, MaterializedHotStateRow},
     };
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
@@ -2626,7 +2626,7 @@ mod tests {
 
     #[test]
     fn directory_path_resolvers_from_state_batch_derives_nested_paths() {
-        let rows = MaterializedLiveStateBatch::from_rows(vec![
+        let rows = MaterializedHotStateBatch::from_rows(vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -2661,7 +2661,7 @@ mod tests {
 
     #[test]
     fn directory_path_resolvers_from_state_batch_handles_parent_cycles() {
-        let rows = MaterializedLiveStateBatch::from_rows(vec![
+        let rows = MaterializedHotStateBatch::from_rows(vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000a3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -2717,7 +2717,7 @@ mod tests {
             ),
         ];
 
-        let rows = MaterializedLiveStateBatch::from_rows(rows);
+        let rows = MaterializedHotStateBatch::from_rows(rows);
         let resolvers = super::directory_path_resolvers_from_state_batch(&rows)
             .expect("scoped rows should seed distinct resolvers");
 
@@ -3138,7 +3138,7 @@ mod tests {
         entity_pk: &str,
         branch_id: &str,
         snapshot_content: &str,
-    ) -> MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
         live_directory_row_with_scope(entity_pk, branch_id, false, false, None, snapshot_content)
     }
 
@@ -3149,8 +3149,8 @@ mod tests {
         untracked: bool,
         file_id: Option<String>,
         snapshot_content: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id,

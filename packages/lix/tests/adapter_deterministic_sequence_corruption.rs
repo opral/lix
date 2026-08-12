@@ -9,7 +9,7 @@ use lix::storage::{
 };
 
 const HOT_ROW_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0004_001b), "live_state.hot_row.v21");
+    StorageSpace::mutable(SpaceId(0x0004_001b), "hot_state.row.v21");
 const SEQUENCE_IDENTITY: &[u8] = b"lix_deterministic_sequence_number";
 const UNRELATED_IDENTITY: &[u8] = b"lix_unrelated_sequence_substitute";
 

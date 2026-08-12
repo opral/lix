@@ -42,7 +42,7 @@ pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_arch
 pub(crate) use manifest::{
     PluginContentMatcher, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
 };
-pub(crate) use materializer::plugin_state_live_state_projection;
+pub(crate) use materializer::plugin_state_hot_state_projection;
 pub(crate) use registry::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginCatalogCache,
     PluginFileOwner, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,

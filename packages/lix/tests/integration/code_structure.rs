@@ -41,15 +41,15 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "diagnostics",
             "execution",
             "init",
-            "live_state",
+            "hot_state",
             "schema",
             "session",
             "sql",
         ],
     },
     ForbiddenDependencyRule {
-        from_scope: "live_state",
-        reason: "live_state is the generic projection engine and must not reacquire services sidecars or write orchestration owners",
+        from_scope: "hot_state",
+        reason: "hot_state is the generic projection engine and must not reacquire services sidecars or write orchestration owners",
         forbidden_scopes: &["execution", "services"],
     },
     ForbiddenDependencyRule {
@@ -76,7 +76,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
 ];
 
-const TARGET_CORE_MODULES: &[&str] = &["storage", "live_state", "session", "sql2", "transaction"];
+const TARGET_CORE_MODULES: &[&str] = &["storage", "hot_state", "session", "sql2", "transaction"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineDependencyGraph {
@@ -1936,7 +1936,7 @@ fn current_services_sibling_dependency_violations() -> Vec<ImportPathViolation> 
 }
 
 fn is_engine_owned_persistence_path(relative_path: &str) -> bool {
-    let in_scope_owner_root = relative_path.starts_with("live_state")
+    let in_scope_owner_root = relative_path.starts_with("hot_state")
         || relative_path.starts_with("canonical")
         || relative_path.starts_with("binary_cas")
         || relative_path.starts_with("session/branch_ops");
@@ -2021,7 +2021,7 @@ fn current_engine_owned_persistence_raw_storage_type_violations() -> Vec<RawStor
 }
 
 fn is_owner_persistence_root_path(relative_path: &str) -> bool {
-    relative_path.starts_with("live_state")
+    relative_path.starts_with("hot_state")
         || relative_path.starts_with("canonical")
         || relative_path.starts_with("binary_cas")
 }
@@ -2166,7 +2166,6 @@ fn is_allowed_raw_execute_boundary_path(relative_path: &str) -> bool {
         || relative_path.starts_with("sql")
         || relative_path.starts_with("execution")
         || relative_path == "transaction/buffered_write_transaction.rs"
-        || relative_path == "transaction/live_state_write_transaction.rs"
 }
 
 fn current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations()
@@ -2869,7 +2868,7 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
         relative,
         write_registration,
         &[
-            "ctx.live_state()",
+            "ctx.hot_state()",
             "ctx.branch_ref()",
             "PublicCatalog::from_visible_schemas",
             "register_lix_branch_provider",

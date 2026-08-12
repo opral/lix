@@ -2525,7 +2525,7 @@ where
             return Ok(entries);
         }
         if self
-            .exact_current_state_scope_has_equal_live_state(
+            .exact_current_state_scope_has_equal_hot_state(
                 left_commit_id,
                 right_commit_id,
                 request,
@@ -2606,7 +2606,7 @@ where
     /// This proof belongs to semantic diff, which normalizes tombstones to
     /// absence. Raw tree-entry diff must retain tombstone rows for merge and
     /// history consumers and therefore never calls this helper.
-    pub(crate) async fn exact_current_state_scope_has_equal_live_state(
+    pub(crate) async fn exact_current_state_scope_has_equal_hot_state(
         &self,
         left_commit_id: &str,
         right_commit_id: &str,
@@ -4862,7 +4862,7 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::branch::BranchHeadControl;
     use crate::changelog::CommitRecord;
-    use crate::live_state::CertifiedEntityBatchFileRef;
+    use crate::hot_state::CertifiedEntityBatchFileRef;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::wasm::{WasmCertifiedEntityBatch, WasmCreateContext};
@@ -9040,7 +9040,7 @@ mod tests {
             .await
             .expect("certified batch read should open");
         let mut writes = storage.new_write_set();
-        crate::live_state::stage_certified_entity_batches(
+        crate::hot_state::stage_certified_entity_batches(
             &read,
             &mut writes,
             &files,
@@ -9069,7 +9069,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("certified authority read should open");
-        let certified = crate::live_state::scan_certified_history_rows(
+        let certified = crate::hot_state::scan_certified_history_rows(
             &read,
             &BTreeSet::from([commit_id]),
             &TrackedStateScanRequest {
