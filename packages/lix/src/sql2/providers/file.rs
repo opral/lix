@@ -85,7 +85,7 @@ use crate::filesystem::{
     BlobRefRowInput, DirectoryPathRecord, DirectoryPathResolver, FileDeleteInput,
     FileDescriptorWriteInput, FileDescriptorWriteIntent, FilesystemBlobRefKey,
     FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
-    append_blob_ref_tombstone_row, derive_directory_paths,
+    append_blob_ref_tombstone_row, derive_directory_paths, directory_path_resolvers_for_paths,
     directory_path_resolvers_from_hot_state, directory_path_resolvers_from_path_index,
     directory_path_resolvers_from_state_batch, filesystem_storage_scope_key, plan_file_delete,
     plan_file_descriptor_write, plan_parsed_file_path_update_with_resolvers,
@@ -2653,31 +2653,74 @@ async fn execute_fast_lix_file_id_path_writes_inner(
     let active_branch_id = ctx.active_branch_id().to_string();
     let parsed_writes = parse_fast_lix_file_path_writes(writes)?;
 
+    // Boxed: this function keeps the whole-branch fallback below live in the
+    // same state machine, so inlining the indexed route's futures here makes
+    // one `lix_file` write frame large enough to overflow libtest's 2 MiB
+    // worker stack in a debug build.
     let indexed = if conflict.targets_id() {
-        indexed_file_id_writes(ctx, &active_branch_id, &parsed_writes).await?
-    } else if conflict.updates_existing() {
-        indexed_file_path_writes(ctx, &active_branch_id, &parsed_writes).await?
+        Box::pin(indexed_file_id_writes(
+            ctx,
+            &active_branch_id,
+            &parsed_writes,
+        ))
+        .await?
+    } else if conflict.updates_existing() || conflict == FastLixFilePathWriteConflict::None {
+        // A plain INSERT is a create; it needs the same path lookup an upsert
+        // does and nothing more. Routing it through the path index removes the
+        // whole-branch descriptor scan the fallback below performs.
+        Box::pin(indexed_file_path_writes(
+            ctx,
+            &active_branch_id,
+            &parsed_writes,
+            conflict,
+        ))
+        .await?
     } else {
         None
     };
     if let Some(indexed) = indexed {
-        return stage_indexed_file_path_writes(
+        return Box::pin(stage_indexed_file_path_writes(
             ctx,
             &active_branch_id,
             parsed_writes,
             indexed,
             conflict,
             mutation_identity,
-        )
+        ))
         .await
         .map(Some);
     }
 
+    // Extracted and boxed so the whole-branch fallback's locals are not part of
+    // this function's poll frame. At `opt-level = 0` a single async fn keeps a
+    // stack slot for every local across every branch, and holding both routes
+    // in one frame overflows libtest's 2 MiB worker stack.
+    Box::pin(stage_scanning_file_path_writes(
+        ctx,
+        &active_branch_id,
+        parsed_writes,
+        conflict,
+        mutation_identity,
+    ))
+    .await
+}
+
+/// The canonical fallback: rebuild the branch's filesystem view from a
+/// whole-branch descriptor scan. Taken only when the path index cannot answer
+/// the write (occupied path on a plain INSERT, ambiguous multi-scope entry,
+/// constraint violation while seeding resolvers).
+async fn stage_scanning_file_path_writes(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    active_branch_id: &str,
+    parsed_writes: Vec<FastLixFilePathWrite>,
+    conflict: FastLixFilePathWriteConflict,
+    mutation_identity: Option<MutationIdentity>,
+) -> Result<Option<u64>, LixError> {
     let live_rows = ctx
         .scan_hot_state_batch(&HotStateScanRequest {
             filter: HotStateFilter {
                 schema_keys: filesystem_schema_keys(),
-                branch_ids: vec![active_branch_id.clone()],
+                branch_ids: vec![active_branch_id.to_string()],
                 include_tombstones: false,
                 ..HotStateFilter::default()
             },
@@ -2694,7 +2737,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
         Err(error) => return Err(error),
     };
     let mut path_resolvers = directory_path_resolvers_from_state_batch(&live_rows)?;
-    let resolver_key = filesystem_storage_scope_key(&active_branch_id, false, false, None);
+    let resolver_key = filesystem_storage_scope_key(active_branch_id, false, false, None);
     path_resolvers.entry(resolver_key).or_default();
     let mut staged = LixFileStagedBatch::with_row_capacity(parsed_writes.len().saturating_mul(3));
 
@@ -2715,7 +2758,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                 FastLixFilePathWriteConflict::None => {
                     let file_id = fast_file_write_id(&write, ctx);
                     let context = FilesystemRowContext {
-                        branch_id: active_branch_id.clone(),
+                        branch_id: active_branch_id.to_string(),
                         global: false,
                         untracked: false,
                         file_id: None,
@@ -2797,7 +2840,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
         } else {
             let file_id = fast_file_write_id(&write, ctx);
             let context = FilesystemRowContext {
-                branch_id: active_branch_id.clone(),
+                branch_id: active_branch_id.to_string(),
                 global: false,
                 untracked: false,
                 file_id: None,
@@ -2830,7 +2873,9 @@ async fn execute_fast_lix_file_id_path_writes_inner(
         | FastLixFilePathWriteConflict::IdUpdateContent
         | FastLixFilePathWriteConflict::IdUpdateContentAndMetadata => TransactionWriteMode::Replace,
     };
-    stage_lix_file_fast_batch(ctx, mode, staged).await.map(Some)
+    Box::pin(stage_lix_file_fast_batch(ctx, mode, staged))
+        .await
+        .map(Some)
 }
 
 struct IndexedFilePathWrites {
@@ -2842,12 +2887,12 @@ async fn indexed_file_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
     active_branch_id: &str,
     writes: &[FastLixFilePathWrite],
+    conflict: FastLixFilePathWriteConflict,
 ) -> Result<Option<IndexedFilePathWrites>, LixError> {
-    let index = ctx
-        .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
-            active_branch_id.to_string(),
-        ]))
-        .await?;
+    let index = Box::pin(ctx.filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+        active_branch_id.to_string(),
+    ])))
+    .await?;
     let mut existing = Vec::with_capacity(writes.len());
     for write in writes {
         let entries = index.exact_entries(&write.parsed.path);
@@ -2863,6 +2908,12 @@ async fn indexed_file_path_writes(
                 existing.push(None);
             }
             [entry] if entry.kind == FilesystemPathKind::File => {
+                // A plain INSERT onto an occupied path must raise the unique
+                // violation the whole-branch route already produces. Decline
+                // rather than duplicate that error construction here.
+                if conflict == FastLixFilePathWriteConflict::None {
+                    return Ok(None);
+                }
                 existing.push(Some(Arc::clone(entry)));
             }
             _ => return Ok(None),
@@ -2874,7 +2925,12 @@ async fn indexed_file_path_writes(
         .zip(&existing)
         .any(|(write, entry)| entry.is_none() && write.parsed.parsed_path.segments().count() > 1);
     let path_resolvers = if has_missing_nested {
-        match directory_path_resolvers_from_path_index(&index, Some(active_branch_id)) {
+        let missing_paths = writes
+            .iter()
+            .zip(&existing)
+            .filter(|(_, entry)| entry.is_none())
+            .map(|(write, _)| &write.parsed.parsed_path);
+        match directory_path_resolvers_for_paths(&index, missing_paths, Some(active_branch_id)) {
             Ok(resolvers) => Some(resolvers),
             Err(error) if error.code == LixError::CODE_CONSTRAINT_VIOLATION => return Ok(None),
             Err(error) => return Err(error),
@@ -2898,11 +2954,10 @@ async fn indexed_file_id_writes(
     active_branch_id: &str,
     writes: &[FastLixFilePathWrite],
 ) -> Result<Option<IndexedFilePathWrites>, LixError> {
-    let index = ctx
-        .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
-            active_branch_id.to_string(),
-        ]))
-        .await?;
+    let index = Box::pin(ctx.filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+        active_branch_id.to_string(),
+    ])))
+    .await?;
     let mut unique_ids = BTreeSet::new();
     let mut existing = Vec::with_capacity(writes.len());
     for write in writes {
@@ -2921,11 +2976,16 @@ async fn indexed_file_id_writes(
         }
     }
     let has_missing = existing.iter().any(Option::is_none);
-    // An ID miss says nothing about path availability. Seed the resolver from
-    // the complete index even for root paths so a different file already at a
-    // proposed path still raises the normal uniqueness error.
+    // An ID miss says nothing about path availability. Seed the resolver with
+    // the proposed paths' own leaves even at root level, so a different file
+    // already at a proposed path still raises the normal uniqueness error.
     let path_resolvers = if has_missing {
-        match directory_path_resolvers_from_path_index(&index, Some(active_branch_id)) {
+        let missing_paths = writes
+            .iter()
+            .zip(&existing)
+            .filter(|(_, entry)| entry.is_none())
+            .map(|(write, _)| &write.parsed.parsed_path);
+        match directory_path_resolvers_for_paths(&index, missing_paths, Some(active_branch_id)) {
             Ok(resolvers) => Some(resolvers),
             Err(error) if error.code == LixError::CODE_CONSTRAINT_VIOLATION => return Ok(None),
             Err(error) => return Err(error),
@@ -2949,8 +3009,21 @@ async fn stage_indexed_file_path_writes(
 ) -> Result<u64, LixError> {
     debug_assert_eq!(writes.len(), indexed.existing.len());
     debug_assert!(
-        conflict.updates_existing() || conflict == FastLixFilePathWriteConflict::IdDoNothing
+        conflict.updates_existing()
+            || conflict == FastLixFilePathWriteConflict::IdDoNothing
+            || conflict == FastLixFilePathWriteConflict::None
     );
+    // `indexed_file_path_writes` declines every plain INSERT that would collide,
+    // so a `None` conflict reaching here is a pure create and stages as one.
+    debug_assert!(
+        conflict != FastLixFilePathWriteConflict::None
+            || indexed.existing.iter().all(Option::is_none)
+    );
+    let write_mode = if conflict == FastLixFilePathWriteConflict::None {
+        TransactionWriteMode::Insert
+    } else {
+        TransactionWriteMode::Replace
+    };
     for (write, entry) in writes.iter().zip(&indexed.existing) {
         if !conflict.targets_id()
             && let Some(entry) = entry
@@ -2970,7 +3043,8 @@ async fn stage_indexed_file_path_writes(
     } else {
         Vec::new()
     };
-    let existing_materializations = load_exact_existing_materializations(ctx, &existing).await?;
+    let existing_materializations =
+        Box::pin(load_exact_existing_materializations(ctx, &existing)).await?;
     let mut staged = LixFileStagedBatch::with_row_capacity(writes.len().saturating_mul(3));
 
     for (write, entry) in writes.into_iter().zip(indexed.existing) {
@@ -3073,7 +3147,7 @@ async fn stage_indexed_file_path_writes(
         }
     }
 
-    stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
+    Box::pin(stage_lix_file_fast_batch(ctx, write_mode, staged)).await
 }
 
 #[derive(Debug, Clone, Copy, Default)]

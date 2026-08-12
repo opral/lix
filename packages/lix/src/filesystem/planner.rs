@@ -1568,6 +1568,107 @@ pub(crate) fn directory_path_resolvers_from_path_index(
     Ok(resolvers)
 }
 
+/// Seeds directory path resolvers from **only the ancestor chains** of the
+/// paths a statement is about to write, instead of from every entry in the
+/// filesystem path index.
+///
+/// Planning a path write consults the resolver at exactly two kinds of key:
+/// `(parent_id, segment_name)` along the path's own ancestor chain, and
+/// `(directory_id, leaf_name)` for the leaf uniqueness reservation. Nothing
+/// else in the repository can be observed, so seeding the whole index makes
+/// the cost of creating one file linear in the number of resident files *and*
+/// directories. This walks `depth` prefixes per write with an O(log n) index
+/// lookup each.
+///
+/// The leaf path is seeded too, so whatever already occupies the target name —
+/// a file or a directory — is still rejected by the resolver's own uniqueness
+/// check rather than slipping past it.
+pub(crate) fn directory_path_resolvers_for_paths<'a>(
+    index: &super::path_index::FilesystemPathIndex,
+    paths: impl IntoIterator<Item = &'a LixPath>,
+    branch_binding: Option<&str>,
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
+    let mut seeds = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
+    let mut files = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
+    let mut seen_paths = BTreeSet::<String>::new();
+
+    let absorb = |entry: &super::path_index::FilesystemPathEntry,
+                      seeds: &mut BTreeMap<String, BTreeMap<String, DirectoryDescriptorSeed>>,
+                      files: &mut BTreeMap<String, Vec<(Option<String>, String, String)>>| {
+        let key = &entry.key;
+        let storage_branch_id = if key.global() {
+            GLOBAL_BRANCH_ID
+        } else {
+            key.branch_id()
+        };
+        let resolver_key = filesystem_storage_scope_key(
+            storage_branch_id,
+            key.global(),
+            key.is_untracked(),
+            key.file_id(),
+        );
+        match entry.kind {
+            super::path_index::FilesystemPathKind::Directory => {
+                seeds.entry(resolver_key).or_default().insert(
+                    entry.id().to_string(),
+                    DirectoryDescriptorSeed {
+                        id: entry.id().to_string(),
+                        parent_id: entry.parent_id.clone(),
+                        name: entry.name.clone(),
+                    },
+                );
+            }
+            super::path_index::FilesystemPathKind::File => {
+                files.entry(resolver_key).or_default().push((
+                    entry.parent_id.clone(),
+                    entry.name.clone(),
+                    entry.id().to_string(),
+                ));
+            }
+        }
+    };
+
+    for path in paths {
+        let segments = path.segments().map(ToOwned::to_owned).collect::<Vec<_>>();
+        if segments.is_empty() {
+            continue;
+        }
+        // Ancestor directories, then the leaf itself. Directory and file
+        // entries share the same unsuffixed path spelling in the index, so one
+        // lookup per prefix returns whichever kind occupies it — which is what
+        // makes the leaf lookup a namespace-conflict check as well.
+        for depth in 1..=segments.len() {
+            let prefix = directory_path_from_segments(&segments[..depth]);
+            if !seen_paths.insert(prefix.clone()) {
+                continue;
+            }
+            for entry in index.exact_entries(&prefix) {
+                absorb(&entry, &mut seeds, &mut files);
+            }
+        }
+    }
+
+    let mut resolvers = BTreeMap::new();
+    for (resolver_key, records) in seeds {
+        let scoped_files = files.remove(&resolver_key).unwrap_or_default();
+        resolvers.insert(
+            resolver_key,
+            DirectoryPathResolver::from_existing_descriptors(records.into_values(), scoped_files)?,
+        );
+    }
+    for (resolver_key, scoped_files) in files {
+        resolvers.insert(
+            resolver_key,
+            DirectoryPathResolver::from_existing_descriptors(std::iter::empty(), scoped_files)?,
+        );
+    }
+    if let Some(branch_id) = branch_binding {
+        let key = filesystem_storage_scope_key(branch_id, false, false, None);
+        resolvers.entry(key).or_default();
+    }
+    Ok(resolvers)
+}
+
 pub(crate) fn filesystem_storage_scope_key(
     branch_id: &str,
     global: bool,
