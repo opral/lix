@@ -3488,21 +3488,31 @@ async fn scan_root_current_base_rows(
     let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
     let tracked =
         Box::pin(reader.scan_batch_at_commit(&base_commit_id.to_string(), request)).await?;
-    let scopes = tracked
-        .iter()
-        .filter(|row| {
-            row.schema_key() != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-        })
-        .flat_map(|row| {
-            [
-                Some((row.schema_key().to_owned(), None)),
-                row.file_id()
-                    .map(|file_id| (row.schema_key().to_owned(), Some(file_id.to_owned()))),
-            ]
-            .into_iter()
-            .flatten()
-        })
-        .collect::<BTreeSet<_>>();
+    // Tracked rows arrive ordered by `(schema_key, file_id, entity_pk)`, so a
+    // scope repeats across a contiguous run and the set this builds is the
+    // number of collections in the base — one, for an ordinary collection scan.
+    // Allocating the identity per row to insert a duplicate is O(base) heap
+    // traffic for an O(scopes) answer, so skip a row whose scope equals the one
+    // before it. Comparing borrowed `&str` is allocation-free, and the skip is
+    // sound irrespective of ordering: an equal scope is already in the set.
+    let mut scopes = BTreeSet::<(String, Option<String>)>::new();
+    let mut previous_scope: Option<(String, Option<String>)> = None;
+    for row in tracked.iter() {
+        if row.schema_key() == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
+            continue;
+        }
+        if previous_scope.as_ref().is_some_and(|(schema_key, file_id)| {
+            schema_key == row.schema_key() && file_id.as_deref() == row.file_id()
+        }) {
+            continue;
+        }
+        let scope = (row.schema_key().to_owned(), row.file_id().map(str::to_owned));
+        scopes.insert((scope.0.clone(), None));
+        if scope.1.is_some() {
+            scopes.insert(scope.clone());
+        }
+        previous_scope = Some(scope);
+    }
     let scope_refs = scopes
         .iter()
         .map(
@@ -3524,8 +3534,15 @@ async fn scan_root_current_base_rows(
         .filter_map(|(scope, control)| control.map(|control| (scope, control)))
         .collect::<BTreeMap<_, _>>();
     let mut rows = MaterializedHotStateBatchBuilder::with_capacity(tracked.len());
+    let mut scope_memo = RootScopeMemo::default();
     for row in tracked.iter() {
-        if !root_tracked_row_is_active(row, generation, &active_generations, &stored_controls) {
+        if !root_tracked_row_is_active(
+            row,
+            generation,
+            &active_generations,
+            &stored_controls,
+            &mut scope_memo,
+        ) {
             continue;
         }
         push_root_current_base_row(&mut rows, row, branch_id, active_checkpoint_commit_id);
@@ -3729,6 +3746,7 @@ async fn load_root_current_base_exact(
         .collect::<BTreeMap<_, _>>();
     let mut rows = MaterializedHotStateBatchBuilder::with_capacity(keys.len());
     let mut slots = Vec::with_capacity(keys.len());
+    let mut scope_memo = RootScopeMemo::default();
     for index in 0..tracked.len() {
         slots.push(
             tracked
@@ -3739,6 +3757,7 @@ async fn load_root_current_base_exact(
                         generation,
                         &active_generations,
                         &stored_controls,
+                        &mut scope_memo,
                     )
                 })
                 .map(|row| {
@@ -3825,36 +3844,115 @@ struct RootCollectionGeneration {
     created_at: LixTimestamp,
 }
 
+/// The part of [`root_tracked_row_is_active`] that depends only on the scope.
+///
+/// Neither the stored-control mismatch nor the collection-generation floors
+/// depend on the row, and `all(|scope| row.created_at() >= scope.created_at)`
+/// is one comparison against the largest floor. So the whole per-row decision
+/// reduces to a flag and one timestamp compare once the scope is known.
+#[derive(Clone, Copy, Default)]
+struct RootScopeVerdict {
+    /// A stored collection control disagrees with the root's active
+    /// generation, which retires every row of the scope regardless of age.
+    disqualified: bool,
+    /// `max` over the scope's collection-generation `created_at` values.
+    floor: Option<LixTimestamp>,
+}
+
+/// One-entry memo over [`RootScopeVerdict`].
+///
+/// The verdict used to be recomputed per row, and computing it needed the
+/// scope as an owned `(String, Option<String>)` — two heap allocations per row
+/// to probe a map that holds one entry for an ordinary collection scan. Tracked
+/// rows arrive ordered by `(schema_key, file_id, entity_pk)`, so remembering
+/// the previous scope collapses that to one computation per scope run. The
+/// memo is keyed on the full scope, so a cache hit is an exact scope match and
+/// a miss simply recomputes — it cannot serve another scope's verdict even if
+/// the rows were unordered.
+#[derive(Default)]
+struct RootScopeMemo {
+    schema_key: String,
+    file_id: Option<String>,
+    primed: bool,
+    verdict: RootScopeVerdict,
+}
+
+impl RootScopeMemo {
+    fn verdict(
+        &mut self,
+        schema_key: &str,
+        file_id: Option<&str>,
+        branch_generation: CommitId,
+        active_generations: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
+        stored_controls: &BTreeMap<(String, Option<String>), HotCollectionControl>,
+    ) -> RootScopeVerdict {
+        if self.primed && self.schema_key == schema_key && self.file_id.as_deref() == file_id {
+            return self.verdict;
+        }
+        let mut verdict = RootScopeVerdict::default();
+        for scope in [
+            Some((schema_key.to_owned(), None)),
+            file_id.map(|file_id| (schema_key.to_owned(), Some(file_id.to_owned()))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let root_generation = active_generations
+                .get(&scope)
+                .map_or(branch_generation, |generation| generation.commit_id);
+            if stored_controls
+                .get(&scope)
+                .is_some_and(|control| control.active_generation != root_generation)
+            {
+                verdict.disqualified = true;
+            }
+            if let Some(generation) = active_generations.get(&scope) {
+                verdict.floor = Some(match verdict.floor {
+                    Some(floor) if floor >= generation.created_at => floor,
+                    _ => generation.created_at,
+                });
+            }
+        }
+        // Reuse the buffers rather than reallocating them per scope run.
+        self.schema_key.clear();
+        self.schema_key.push_str(schema_key);
+        match file_id {
+            Some(file_id) => {
+                let buffer = self.file_id.get_or_insert_with(String::new);
+                buffer.clear();
+                buffer.push_str(file_id);
+            }
+            None => self.file_id = None,
+        }
+        self.primed = true;
+        self.verdict = verdict;
+        verdict
+    }
+}
+
 fn root_tracked_row_is_active(
     row: crate::tracked_state::MaterializedTrackedStateRowRef<'_>,
     branch_generation: CommitId,
     active_generations: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
     stored_controls: &BTreeMap<(String, Option<String>), HotCollectionControl>,
+    memo: &mut RootScopeMemo,
 ) -> bool {
     if row.schema_key() == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
         return true;
     }
-    [
-        Some((row.schema_key().to_owned(), None)),
-        row.file_id()
-            .map(|file_id| (row.schema_key().to_owned(), Some(file_id.to_owned()))),
-    ]
-    .into_iter()
-    .flatten()
-    .all(|scope| {
-        let root_generation = active_generations
-            .get(&scope)
-            .map_or(branch_generation, |generation| generation.commit_id);
-        if stored_controls
-            .get(&scope)
-            .is_some_and(|control| control.active_generation != root_generation)
-        {
-            return false;
-        }
-        active_generations
-            .get(&scope)
-            .is_none_or(|generation| row.created_at() >= generation.created_at)
-    })
+    let verdict = memo.verdict(
+        row.schema_key(),
+        row.file_id(),
+        branch_generation,
+        active_generations,
+        stored_controls,
+    );
+    if verdict.disqualified {
+        return false;
+    }
+    verdict
+        .floor
+        .is_none_or(|floor| row.created_at() >= floor)
 }
 
 fn materialize_packed_slot(
@@ -12463,6 +12561,144 @@ mod tests {
         StorageGetManyResult, StorageKeyRange, StorageReadOptions, StorageScanCursor,
         StorageWriteOptions,
     };
+
+    /// The memo replaced a per-row recomputation with a per-scope one, and it
+    /// also replaced `all(|scope| created_at >= scope.floor)` with a single
+    /// comparison against the largest floor. Both rewrites are only sound if
+    /// the verdict is a pure function of the scope, so check it directly
+    /// against the rule it encodes, including the cases that used to be
+    /// separate scopes: a filed row is governed by its unfiled scope *and* its
+    /// filed scope, and either can disqualify it or raise its floor.
+    #[test]
+    fn root_scope_memo_reproduces_the_per_scope_rule() {
+        let branch_generation = CommitId::for_test_label("memo-branch-generation");
+        let root_generation = CommitId::for_test_label("memo-root-generation");
+        let unfiled = ("s".to_owned(), None);
+        let filed = ("s".to_owned(), Some("f".to_owned()));
+
+        // Reference implementation: the pre-memo predicate, verbatim.
+        let reference = |created_at: LixTimestamp,
+                         file_id: Option<&str>,
+                         active: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
+                         stored: &BTreeMap<(String, Option<String>), HotCollectionControl>| {
+            [
+                Some(("s".to_owned(), None)),
+                file_id.map(|file_id| ("s".to_owned(), Some(file_id.to_owned()))),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|scope| {
+                let root = active
+                    .get(&scope)
+                    .map_or(branch_generation, |generation| generation.commit_id);
+                if stored
+                    .get(&scope)
+                    .is_some_and(|control| control.active_generation != root)
+                {
+                    return false;
+                }
+                active
+                    .get(&scope)
+                    .is_none_or(|generation| created_at >= generation.created_at)
+            })
+        };
+
+        let stamp = |text: &str| LixTimestamp::expect_parse("memo test timestamp", text);
+        let low = stamp("2026-01-01T00:00:00Z");
+        let high = stamp("2026-03-01T00:00:00Z");
+        let control = |generation: CommitId| HotCollectionControl {
+            active_generation: generation,
+            live_count: 0,
+            ordered_identity_digest: None,
+        };
+
+        let mut cases: Vec<(
+            BTreeMap<(String, Option<String>), RootCollectionGeneration>,
+            BTreeMap<(String, Option<String>), HotCollectionControl>,
+        )> = Vec::new();
+        cases.push((BTreeMap::new(), BTreeMap::new()));
+        // Floor on the unfiled scope only.
+        cases.push((
+            BTreeMap::from([(
+                unfiled.clone(),
+                RootCollectionGeneration {
+                    commit_id: root_generation,
+                    created_at: high,
+                },
+            )]),
+            BTreeMap::new(),
+        ));
+        // Two floors, the larger on the filed scope — the `max` case.
+        cases.push((
+            BTreeMap::from([
+                (
+                    unfiled.clone(),
+                    RootCollectionGeneration {
+                        commit_id: root_generation,
+                        created_at: low,
+                    },
+                ),
+                (
+                    filed.clone(),
+                    RootCollectionGeneration {
+                        commit_id: root_generation,
+                        created_at: high,
+                    },
+                ),
+            ]),
+            BTreeMap::new(),
+        ));
+        // Disqualifying control on the filed scope only.
+        cases.push((
+            BTreeMap::new(),
+            BTreeMap::from([(filed.clone(), control(root_generation))]),
+        ));
+        // Agreeing control: must not disqualify.
+        cases.push((
+            BTreeMap::new(),
+            BTreeMap::from([(unfiled.clone(), control(branch_generation))]),
+        ));
+
+        for (index, (active, stored)) in cases.iter().enumerate() {
+            for file_id in [None, Some("f")] {
+                let mut memo = RootScopeMemo::default();
+                for created_at in [
+                    stamp("2025-01-01T00:00:00Z"),
+                    stamp("2026-01-01T00:00:00Z"),
+                    stamp("2026-03-01T00:00:00Z"),
+                    stamp("2027-01-01T00:00:00Z"),
+                ] {
+                    let verdict =
+                        memo.verdict("s", file_id, branch_generation, active, stored);
+                    let actual = !verdict.disqualified
+                        && verdict.floor.is_none_or(|floor| created_at >= floor);
+                    assert_eq!(
+                        actual,
+                        reference(created_at, file_id, active, stored),
+                        "case {index}, file_id {file_id:?}, created_at {created_at:?}"
+                    );
+                }
+            }
+        }
+
+        // A primed memo must not answer for a different scope.
+        let active = BTreeMap::from([(
+            filed.clone(),
+            RootCollectionGeneration {
+                commit_id: root_generation,
+                created_at: high,
+            },
+        )]);
+        let stored = BTreeMap::new();
+        let mut memo = RootScopeMemo::default();
+        let filed_verdict = memo.verdict("s", Some("f"), branch_generation, &active, &stored);
+        let unfiled_verdict = memo.verdict("s", None, branch_generation, &active, &stored);
+        assert_eq!(filed_verdict.floor, Some(high));
+        assert_eq!(
+            unfiled_verdict.floor, None,
+            "the unfiled scope has no collection generation and must not inherit the filed floor"
+        );
+    }
 
     #[test]
     fn certified_batch_reader_rejects_legacy_ceb1_magic() {
