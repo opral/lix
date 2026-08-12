@@ -232,12 +232,10 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
         .as_ref()
         .map(|parent| vec![parent.clone()])
         .unwrap_or_default();
-    let commit_change_id = format!("{commit_id_text}:commit");
     let staged = stage_test_changelog_commit(
         read,
         writes,
         &commit_id_text,
-        &commit_change_id,
         &parent_ids,
         rows,
         false,
@@ -331,7 +329,6 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
         read,
         writes,
         &commit_id_text,
-        &format!("{commit_id_text}:commit"),
         &parent_id_texts,
         rows,
         true,
@@ -404,12 +401,10 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         .iter()
         .map(tracked_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
-    let commit_change_id = format!("{commit_id_text}:commit");
     let staged = stage_test_changelog_commit(
         read,
         writes,
         &commit_id_text,
-        &commit_change_id,
         &parent_id_texts,
         rows,
         false,
@@ -568,12 +563,10 @@ pub(crate) async fn stage_empty_changelog_commit(
         .as_ref()
         .map(|parent| vec![parent.clone()])
         .unwrap_or_default();
-    let commit_change_id = format!("{commit_id_text}:commit");
     let staged = stage_test_changelog_commit(
         read,
         writes,
         &commit_id_text,
-        &commit_change_id,
         &parent_ids,
         &[],
         false,
@@ -610,12 +603,10 @@ pub(crate) async fn stage_empty_changelog_commit_with_parents(
         .iter()
         .map(|parent| test_commit_id(parent).to_string())
         .collect::<Vec<_>>();
-    let commit_change_id = format!("{commit_id_text}:commit");
     let staged = stage_test_changelog_commit(
         read,
         writes,
         &commit_id_text,
-        &commit_change_id,
         &parent_id_texts,
         &[],
         false,
@@ -645,7 +636,6 @@ async fn stage_test_changelog_commit(
     mut read: &mut (impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     commit_id: &str,
-    commit_change_id: &str,
     parent_ids: &[String],
     rows: &[MaterializedTrackedStateRow],
     tracked_state_rootless: bool,

@@ -8176,7 +8176,6 @@ mod tests {
             prepared_normal_global_commit(
                 "stale-normal-change",
                 "stale-normal-commit",
-                "stale-normal-commit-change",
                 "stale-normal-branch-ref-change",
             ),
         )
@@ -8202,7 +8201,6 @@ mod tests {
             prepared_normal_global_commit(
                 "winner-normal-change",
                 "winner-normal-commit",
-                "winner-normal-commit-change",
                 "winner-normal-branch-ref-change",
             ),
         )
@@ -8278,7 +8276,6 @@ mod tests {
                 payload,
                 "ordinary-publish-row",
                 "ordinary-publish-commit",
-                "ordinary-publish-commit-change",
                 "ordinary-publish-branch-change",
             ),
         )
@@ -8341,7 +8338,6 @@ mod tests {
                 payload,
                 "ordinary-stale-row",
                 "ordinary-stale-commit",
-                "ordinary-stale-commit-change",
                 "ordinary-stale-branch-change",
             ),
         )
@@ -8391,7 +8387,6 @@ mod tests {
                 payload,
                 "ordinary-retry-row",
                 "ordinary-retry-commit",
-                "ordinary-retry-commit-change",
                 "ordinary-retry-branch-change",
             ),
         )
