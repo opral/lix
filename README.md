@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Version control system and SQL database in one</h3>
+<h3 align="center">Repository backend for AI products</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,16 +11,16 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-AI applications span files, a SQL database, and version control. Lix combines those three requirements in one system, avoiding three separate layers of infrastructure that need to be kept in sync. One storage, one transaction boundary, one API. Much simpler to manage.
+AI products want a repository: files for agents, a SQL database for your app, and version control over both. Lix provides all three in one system:
 
-<img src="./website/public/assets/lix-triad.svg" alt="Lix is a filesystem, a SQL database, and version control in one system" width="760" />
+<img src="./website/public/assets/lix-repo.svg" alt="A Lix repo holds files, a SQL database, and version control in one system" width="760" />
 
-- 📄 **Works with any file format.** Plugins map DOCX, CSV, Markdown, or your own format to versioned entities.
-- 🔍 **Semantic changes.** Review the clause, cell, or row that changed, not lines of bytes.
-- 🗄️ **SQL and transactions.** Query file content, app data, and history; update files and rows in one ACID transaction.
-- 👥 **Real-time collaboration.** People and agents share a repository and see changes live.
-- 🔌 **Pluggable storage.** An S3 bucket, the local filesystem, or OPFS in the browser: Lix is easy to embed and scale, in contrast to existing VCS like Git that assume a local POSIX filesystem.
-- 🔐 **Permissions (soon).** Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.
+- 📄 **Files, in any format.** Text and Markdown, but also DOCX, XLSX, and CAD. Plugins map any format to versioned entities.
+- 🗄️ **SQL database.** File content, app data, and history live in an ACID OLTP database. Query millions of rows with SQL.
+- 🔀 **Version control.** Semantic changes: the clause, cell, or row that changed, not a byte blob. Review, merge, and roll back.
+- ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
+- 🧩 **Pluggable storage.** Local filesystem, S3, or OPFS in the browser. Lix runs wherever your product runs.
+- 🔒 **Permissions (soon).** Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.
 
 ## Getting started
 
@@ -134,7 +134,7 @@ Git tracks files but has no SQL. PostgreSQL/SQLite have SQL but no files and no 
 
 | Capability                    | Lix            | Git                | PostgreSQL / SQLite |
 | ----------------------------- | -------------- | ------------------ | ------------------- |
-| Files                         | ✅             | ✅                 | ❌                  |
+| Normal files                  | ✅             | ✅                 | ❌                  |
 | SQL and transactions          | ✅             | ❌                 | ✅                  |
 | Branches and merging          | ✅             | ✅                 | ❌                  |
 | Diffs by cell, clause, or row | ✅ via plugins | ❌ text lines only | ❌                  |
