@@ -319,3 +319,4 @@ mod assume_send_future_proofs {
         assert_send::<ObserveEvents<S>>();
     }
 }
+

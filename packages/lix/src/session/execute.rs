@@ -11160,3 +11160,88 @@ mod assume_send_future_proofs {
         assert_send::<crate::storage::GetManyResult>();
     }
 }
+
+
+/// Borrowing-adapter half of the `AssumeSendFuture` proofs.
+///
+/// # What this covers, and the limit
+///
+/// `assume_send_future_proofs` instantiates the wrapped futures at `Memory`,
+/// where `Read<'a> = MemoryRead` is lifetime-independent. That collapses the
+/// higher-ranked obstruction and lets rustc walk the *complete* suspension
+/// state. The shipping RocksDB adapter is `Read<'a> = RocksDBRead<'a>`, so that
+/// proof covers the easy case.
+///
+/// **A whole-future proof at a lifetime-dependent `Read<'a>` is not achievable,
+/// even for a fully concrete adapter.** Measured against `BorrowingStorage`
+/// below: five of the six remaining wrapper sites fail with the same
+/// `implementation of 'Send' is not general enough` diagnostic that forces the
+/// wrapper generically. The borrowing shape *is* the obstruction; making the
+/// adapter concrete does not remove it. That is a rustc limitation on
+/// higher-ranked auto-trait obligations, not a property of this code.
+///
+/// So the borrowing case is covered in two pieces instead:
+///
+/// 1. `read_file_content_inner` — which carries no wrapper since its
+///    `with_static_session_sql_read` bound was relaxed — is proven `Send`
+///    against the borrowing adapter directly, and generically for every
+///    `StorageImpl` by its own `+ Send` signature.
+/// 2. Every type rustc names in the remaining obstructions is proven `Sync`
+///    below, **universally quantified over the lifetime**. `&'x T: Send` holds
+///    exactly when `T: Sync`, so these discharge the named obligations for all
+///    lifetimes; rustc simply cannot assemble them inside a generator. Combined
+///    with the `Memory` walk — which enumerates the complete suspension state,
+///    and finds no `Rc`, `RefCell` guard, or raw pointer anywhere — this is the
+///    tightest statement the type system supports.
+#[cfg(test)]
+mod assume_send_future_proofs_borrowing {
+    use super::*;
+    use crate::session::borrowing_proof_storage::{BorrowingRead, BorrowingStorage};
+
+    fn is_send<T: Send>(_: &T) {}
+    fn assert_send<T: Send + ?Sized>() {}
+    fn assert_sync<T: Sync + ?Sized>() {}
+
+    /// Whole-future proof, borrowing adapter. This site has no wrapper.
+    #[allow(dead_code)]
+    fn read_file_content_inner_is_send(session: &SessionContext<BorrowingStorage>) {
+        is_send(&session.read_file_content_inner(String::new(), None));
+    }
+
+    /// The shared read wrapper is `Send + Sync` for every storage adapter and
+    /// **every lifetime** — `'a` is a free parameter here, so this is a genuine
+    /// `for<'a>` proof of the obligation rustc reports as "not general enough".
+    #[allow(dead_code)]
+    fn shared_read_is_send_for_every_storage_and_lifetime<'a, S>()
+    where
+        S: Storage + Clone + Send + Sync + 'a,
+    {
+        assert_send::<SharedStorageAdapterRead<S::Read<'a>>>();
+        assert_sync::<SharedStorageAdapterRead<S::Read<'a>>>();
+        assert_send::<S::Read<'a>>();
+        assert_sync::<S::Read<'a>>();
+    }
+
+    /// The same, pinned at the concrete borrowing adapter.
+    #[allow(dead_code)]
+    fn shared_read_is_send_for_borrowing_adapter<'a>() {
+        assert_send::<SharedStorageAdapterRead<BorrowingRead<'a>>>();
+        assert_sync::<SharedStorageAdapterRead<BorrowingRead<'a>>>();
+    }
+
+    /// Every remaining type named by a "not general enough" obstruction, proven
+    /// `Sync` — which is exactly `for<'x> &'x T: Send`.
+    #[allow(dead_code)]
+    fn obstruction_pointees_are_sync<S>()
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        assert_sync::<str>();
+        assert_sync::<[Value]>();
+        assert_sync::<[ExecuteBatchStatement]>();
+        assert_sync::<SessionContext<S>>();
+        assert_sync::<crate::Lix<S>>();
+        assert_sync::<crate::storage_adapter::Memory>();
+        assert_sync::<tokio::sync::Mutex<()>>();
+    }
+}
