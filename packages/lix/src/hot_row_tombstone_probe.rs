@@ -956,6 +956,16 @@ async fn retention_fence_durability_across_supported_operations() {
 
         let census = row_census(&storage).await;
         let result = untracked_insert(&session, "fencerow").await;
+        // Every route, including the one that removes the tombstone the fence
+        // used to ride on, must refuse. Before the narrowed fence landed,
+        // `tombstone_dropped` SUCCEEDED here while the other four refused —
+        // that gap is what the fence closes, and this assertion is what proves
+        // it rather than restating it.
+        assert!(
+            result.is_err(),
+            "route '{route}' let an untracked row take a tracked-deleted identity; \
+             the retention fence does not survive this state"
+        );
         let verdict = match &result {
             Ok(()) => "SUCCEEDED".to_string(),
             Err(message) => format!("refused: {}", message.replace(',', ";")),
