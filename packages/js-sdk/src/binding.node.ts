@@ -74,13 +74,10 @@ export function openLixBinding(
 		: undefined;
 	switch (storage.kind) {
 		case "memory":
-			if (storage.snapshot !== undefined) {
-				throw new Error(
-					"Memory snapshots are only available in the browser binding",
-				);
-			}
 			if (nativeTelemetry) return addon.Lix.openMemory(nativeTelemetry);
 			return addon.Lix.openMemory();
+		case "indexedDb":
+			throw new Error("IndexedDbStorage is only available in browsers");
 		case "localFilesystem":
 			if (nativeTelemetry) {
 				return addon.Lix.openLocalFilesystem(

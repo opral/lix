@@ -407,6 +407,60 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    checkpoint_does_not_rehome_untracked_rows,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+                 VALUES ('untracked-across-checkpoint', 'one', true)",
+                &[],
+            )
+            .await
+            .expect("untracked insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('tracked-across-checkpoint', 'one')",
+                &[],
+            )
+            .await
+            .expect("tracked insert should succeed");
+
+        // A checkpoint re-homes every live tracked row onto the checkpoint
+        // commit. Tracked and untracked rows now share one serving
+        // generation, so this is the fence that proves the checkpoint's
+        // selection is driven by the working diff -- which untracked rows
+        // never enter -- rather than by "everything in the generation".
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
+
+        assert_untracked_current_state(&session, "untracked-across-checkpoint").await;
+        assert_eq!(
+            change_count_for_key(&session, "untracked-across-checkpoint").await,
+            0,
+            "a checkpoint must not give an untracked row a change record"
+        );
+        assert!(
+            !current_tracked_change_id(&session, "tracked-across-checkpoint")
+                .await
+                .is_empty(),
+            "the tracked row beside it must still be re-homed by the checkpoint"
+        );
+    }
+);
+
 async fn branch_head(
     session: &crate::support::simulation_test::engine::SimSession,
     branch_id: &str,

@@ -120,21 +120,36 @@ jobs:
       # benches — so it was minutes of CI spent compiling a dependency nothing
       # here executes. The crate is still compiled and tested below with every
       # feature its tests actually require.
+      #
+      # That feature list is exhaustive, not a guess: every `[[test]]` target in
+      # `packages/engine-benchmarks/Cargo.toml` declares `required-features`
+      # within {storage-benches, slatedb, rocksdb}, and `storage-benches`
+      # implies `rocksdb`. `root-replay-trace` carries no test of its own but
+      # gates instrumentation sources, so it is listed to keep them compiling —
+      # dropping it would recreate exactly the `storage_bench.rs` blind spot
+      # described above.
       - name: Compile Rust workspace tests
         if: matrix.task == 'test'
         run: |
           cargo test --profile test --workspace --exclude lix_benchmarks --all-features --no-run
-          cargo test --profile test -p lix_benchmarks --features storage-benches,slatedb --no-run
+          cargo test --profile test -p lix_benchmarks --features storage-benches,slatedb,root-replay-trace --no-run
 
       - name: Run Rust workspace tests
+        # Deliberately no RUST_MIN_STACK here. Tests that need more than
+        # libtest's 2 MiB worker-stack default must size their own thread
+        # (see `run_on_sized_stack` in the CRUD public-result parity test), so
+        # that the command a developer runs by hand behaves like CI's.
+        #
+        # `--no-fail-fast` is required, not cosmetic. Without it cargo stops at
+        # the first failing target and never runs the rest, so a single red
+        # crate hides every later one. #1329 broke two tests; the second sat
+        # invisible behind the first for hours because CI could only ever
+        # report one, and it appeared in the logs as a compiled executable that
+        # never ran.
         if: matrix.task == 'test'
-        env:
-          # The CRUD public-result parity test exercises every adapter in one
-          # libtest worker and can exceed Rust's 2 MiB worker-stack default.
-          RUST_MIN_STACK: 8388608
         run: |
-          cargo test --profile test --workspace --exclude lix_benchmarks --all-features
-          cargo test --profile test -p lix_benchmarks --features storage-benches,slatedb
+          cargo test --profile test --workspace --exclude lix_benchmarks --all-features --no-fail-fast
+          cargo test --profile test -p lix_benchmarks --features storage-benches,slatedb,root-replay-trace --no-fail-fast
 
       - name: Verify the packaged plugin API contract
         if: matrix.task == 'test'

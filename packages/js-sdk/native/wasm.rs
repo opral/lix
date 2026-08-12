@@ -18,14 +18,16 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
 use wasm_bindgen::prelude::*;
 
-type BrowserLix = RsLix<Memory>;
-type BrowserTransaction = RsLixTransaction<Memory>;
-type BrowserObserveEvents = RsObserveEvents<Memory>;
+use crate::indexeddb::{BrowserStorage, IndexedDb, IndexedDbBackend};
+
+type BrowserLix = RsLix<BrowserStorage>;
+type BrowserTransaction = RsLixTransaction<BrowserStorage>;
+type BrowserObserveEvents = RsObserveEvents<BrowserStorage>;
 
 #[wasm_bindgen]
 pub struct WasmLix {
     inner: BrowserLix,
-    storage: Memory,
+    storage: BrowserStorage,
 }
 
 #[wasm_bindgen]
@@ -42,7 +44,7 @@ pub struct WasmObserveEvents {
 
 #[wasm_bindgen(js_name = openMemory)]
 pub async fn open_memory(telemetry_dispatch: Option<Function>) -> Result<WasmLix, JsValue> {
-    open_memory_from_snapshot(telemetry_dispatch, None).await
+    open_browser_storage(BrowserStorage::Memory(Memory::new()), telemetry_dispatch).await
 }
 
 #[wasm_bindgen(js_name = openMemoryFromSnapshot)]
@@ -50,13 +52,38 @@ pub async fn open_memory_from_snapshot(
     telemetry_dispatch: Option<Function>,
     snapshot: Option<Vec<u8>>,
 ) -> Result<WasmLix, JsValue> {
-    console_error_panic_hook::set_once();
     let storage = match snapshot {
         Some(snapshot) => {
             Memory::from_snapshot(&snapshot).map_err(|error| lix_error_to_js(error.into()))?
         }
         None => Memory::new(),
     };
+    open_browser_storage(BrowserStorage::Memory(storage), telemetry_dispatch).await
+}
+
+#[wasm_bindgen(js_name = openIndexedDb)]
+pub async fn open_indexed_db(
+    backend: IndexedDbBackend,
+    telemetry_dispatch: Option<Function>,
+) -> Result<WasmLix, JsValue> {
+    let storage = IndexedDb::open(backend)
+        .await
+        .map_err(|error| lix_error_to_js(error.into()))?;
+    let browser_storage = BrowserStorage::IndexedDb(storage);
+    match open_browser_storage(browser_storage.clone(), telemetry_dispatch).await {
+        Ok(lix) => Ok(lix),
+        Err(error) => {
+            let _ = browser_storage.close().await;
+            Err(error)
+        }
+    }
+}
+
+async fn open_browser_storage(
+    storage: BrowserStorage,
+    telemetry_dispatch: Option<Function>,
+) -> Result<WasmLix, JsValue> {
+    console_error_panic_hook::set_once();
     let telemetry = telemetry_dispatch.map(|dispatch| {
         let dispatch = BrowserTelemetryDispatch(dispatch);
         let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
@@ -99,9 +126,14 @@ pub fn parse_sql_script(sql: String, provided_param_count: usize) -> Result<JsVa
 impl WasmLix {
     #[wasm_bindgen(js_name = exportSnapshot)]
     pub async fn export_snapshot(&self) -> Result<Vec<u8>, JsValue> {
-        self.storage
-            .export_snapshot()
-            .map_err(|error| lix_error_to_js(error.into()))
+        match &self.storage {
+            BrowserStorage::Memory(storage) => storage
+                .export_snapshot()
+                .map_err(|error| lix_error_to_js(error.into())),
+            BrowserStorage::IndexedDb(_) => Err(JsValue::from_str(
+                "snapshot export is only available for memory storage",
+            )),
+        }
     }
 
     #[wasm_bindgen(js_name = execute)]
@@ -319,7 +351,11 @@ impl WasmLix {
 
     #[wasm_bindgen(js_name = close)]
     pub async fn close(&self) -> Result<(), JsValue> {
-        self.inner.close().await.map_err(lix_error_to_js)
+        self.inner.close().await.map_err(lix_error_to_js)?;
+        self.storage
+            .close()
+            .await
+            .map_err(|error| lix_error_to_js(error.into()))
     }
 }
 

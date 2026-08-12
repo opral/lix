@@ -461,12 +461,6 @@ async fn seed_visible_schema_rows<StorageImpl>(
     StorageImpl: Storage + Clone,
 {
     let mut writes = StorageWriteSet::new();
-    // Repository initialization seeds the authenticated GC queue before any
-    // benchmark transaction opens. Keep this low-level fixture on that same
-    // public protocol; unlike unit tests, benchmark binaries are not built
-    // with `cfg(test)` and therefore cannot use the test-only repair hook.
-    crate::gc::stage_reachability_queue_seed(&mut writes)
-        .expect("benchmark GC reachability queue should seed");
     let mut schemas = crate::schema::seed_schema_definitions()
         .into_iter()
         .cloned()
@@ -605,7 +599,6 @@ async fn seed_visible_schema_rows<StorageImpl>(
         let mut control = BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -678,14 +671,15 @@ mod tests {
         let point_update = fixture.update_one_by_pk_accounting().await;
         assert_eq!(point_update.logical_rows, 1);
         // The point write keeps the compact current-state certificate,
-        // publishes its authenticated branch/control and reachability state,
-        // and rotates the mandatory binary-CAS publication/reclamation epoch.
-        // The write set touches eleven spaces, not twelve: the binary-CAS
-        // epoch and the tracked mutation fence are now two keys in the one
-        // revision space rather than two separate spaces.
-        assert_eq!(point_update.staged_puts, 12, "{point_update:?}");
-        assert_eq!(point_update.touched_spaces, 11, "{point_update:?}");
-        assert_eq!(point_update.put_batches, 11, "{point_update:?}");
+        // publishes its authenticated branch control, and rotates the mandatory
+        // binary-CAS publication/reclamation epoch. It touches nine spaces, not
+        // eleven: the binary-CAS epoch and the tracked mutation fence are two
+        // keys in the one revision space, and the retirement candidates a
+        // sweep needs are now derived from the commit graph instead of being
+        // published into a reachability delta row plus its queue control.
+        assert_eq!(point_update.staged_puts, 10, "{point_update:?}");
+        assert_eq!(point_update.touched_spaces, 9, "{point_update:?}");
+        assert_eq!(point_update.put_batches, 9, "{point_update:?}");
 
         // A sparse overlay deliberately invalidates the complete-generation
         // digest, so use a fresh fixture to exercise exact bulk replacement

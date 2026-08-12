@@ -249,10 +249,6 @@ static ENTITY_HISTORY_SYSTEM_COLS: ColumnTable<EntityHistoryRow> = ColumnTable {
             Col::Utf8(|row| row.change.file_id.as_deref()),
         ),
         (
-            "lixcol_snapshot_content",
-            Col::Utf8(|row| row.change.snapshot_content.as_deref()),
-        ),
-        (
             "lixcol_metadata",
             Col::Utf8Owned(|row| row.change.metadata.as_deref().map(serialize_row_metadata)),
         ),

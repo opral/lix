@@ -47,21 +47,9 @@ pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::mut
 pub(crate) const CHECKPOINT_GC_STATE_NAMESPACE: &str = "checkpoint.gc_state.v1";
 pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
-/// Authenticated publication deltas are the sole ordinary-GC input.  The
-/// queue is mutable because its head/tail are CAS-protected, while each
-/// record is immutable after publication and addressed by a monotonic slot.
-pub(crate) const GC_REACHABILITY_DELTA_NAMESPACE: &str = "gc.reachability_delta.v1";
-pub(crate) const GC_REACHABILITY_DELTA_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0003), GC_REACHABILITY_DELTA_NAMESPACE);
-pub(crate) const GC_REACHABILITY_QUEUE_NAMESPACE: &str = "gc.reachability_queue.v1";
-pub(crate) const GC_REACHABILITY_QUEUE_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0008_0004), GC_REACHABILITY_QUEUE_NAMESPACE);
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
 const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;
 const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
-const GC_REACHABILITY_FORMAT_VERSION: u32 = 2;
-const GC_REACHABILITY_QUEUE_KEY: &[u8] = b"queue";
-const GC_REACHABILITY_BATCH_LIMIT: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthenticatedControlCommitReachability {
     chronology_roots: BTreeSet<CommitId>,
@@ -207,73 +195,13 @@ struct StoredCheckpointGcState {
     collectible_interval_count: u64,
 }
 
-/// One branch-root transition.  The digest fields bind the delta to the
-/// exact control bytes observed by the publisher; a queue record with a
-/// forged root or stale CAS token is rejected before any physical delete is
-/// staged.
-#[derive(Clone, musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct StoredRootReachabilityDelta {
-    branch_id: String,
-    #[musli(with = storage_codec::option)]
-    old_root: Option<CommitId>,
-    #[musli(with = storage_codec::option)]
-    new_root: Option<CommitId>,
-    #[musli(with = storage_codec::option)]
-    old_control: Option<BranchHeadControl>,
-    #[musli(with = storage_codec::option)]
-    new_control: Option<BranchHeadControl>,
-    old_control_digest: [u8; 32],
-    new_control_digest: [u8; 32],
-}
-
-#[derive(musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct StoredRootReachabilityBatch {
-    format_version: u32,
-    sequence: u64,
-    deltas: Vec<StoredRootReachabilityDelta>,
-    checkpoint_roots: Vec<CommitId>,
-    digest: [u8; 32],
-}
-
-#[derive(musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct StoredRootReachabilityBatchBody {
-    format_version: u32,
-    sequence: u64,
-    deltas: Vec<StoredRootReachabilityDelta>,
-    checkpoint_roots: Vec<CommitId>,
-}
-
-#[derive(musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct StoredReachabilityQueue {
-    format_version: u32,
-    head_sequence: u64,
-    tail_sequence: u64,
-    next_sequence: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RootReachabilityDelta {
-    pub(crate) branch_id: String,
-    pub(crate) old_root: Option<CommitId>,
-    pub(crate) new_root: Option<CommitId>,
-    pub(crate) old_control: Option<BranchHeadControl>,
-    pub(crate) new_control: Option<BranchHeadControl>,
-    pub(crate) old_control_digest: [u8; 32],
-    pub(crate) new_control_digest: [u8; 32],
-}
-
 /// One authenticated checkpoint replacement that is still pending physical
 /// retirement.
 ///
-/// Callers receive only the typed canonical replacement. The queue remains
-/// GC-owned maintenance state and never becomes a merge-time chronology
-/// reader. A caller may use this proof only while publishing from the same
-/// coherent read: the ordinary reachability-batch writer then CASes the exact
-/// queue row observed by this resolver.
+/// The replacement is read straight off the branch's canonical recovery ref,
+/// which the checkpoint transaction rotates in the same atomic write set that
+/// publishes the checkpoint commit. There is no separate publication ledger to
+/// consult, and therefore no second place a stale replacement can survive.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct PendingCheckpointReplacement {
     pub(crate) checkpoint_commit_id: CommitId,
@@ -354,371 +282,17 @@ pub(crate) fn stage_checkpoint_gc_state(
     Ok(())
 }
 
-/// Seeds the empty authenticated frontier during repository initialization.
-/// There is deliberately no reader-side migration: a repository without this
-/// control is an old protocol and ordinary GC fails closed.
-pub(crate) fn stage_reachability_queue_seed(writes: &mut StorageWriteSet) -> Result<(), LixError> {
-    let value = storage_codec::encode(
-        "GC reachability queue",
-        &StoredReachabilityQueue {
-            format_version: GC_REACHABILITY_FORMAT_VERSION,
-            head_sequence: 0,
-            tail_sequence: 0,
-            next_sequence: 1,
-        },
-    )?;
-    writes.put(
-        GC_REACHABILITY_QUEUE_SPACE,
-        StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        StorageValue {
-            bytes: Bytes::from(value),
-        },
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) async fn ensure_reachability_queue_for_test(
-    read: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-) -> Result<bool, LixError> {
-    let result = PointReadPlan::new(
-        GC_REACHABILITY_QUEUE_SPACE,
-        &[StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY))],
-    )
-    .materialize(read, StorageGetOptions::default())
-    .await?;
-    if result.value.into_iter().next().flatten().is_none() {
-        stage_reachability_queue_seed(writes)?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn reachability_sequence_key(sequence: u64) -> StorageKey {
-    StorageKey(Bytes::copy_from_slice(&sequence.to_be_bytes()))
-}
-
-async fn load_reachability_queue(
-    store: &(impl StorageAdapterRead + ?Sized),
-) -> Result<(StoredReachabilityQueue, Bytes), LixError> {
-    let result = PointReadPlan::new(
-        GC_REACHABILITY_QUEUE_SPACE,
-        &[StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY))],
-    )
-    .materialize(store, StorageGetOptions::default())
-    .await?;
-    let Some(Some(StorageProjectedValue::FullValue(bytes))) = result.value.into_iter().next()
-    else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "authenticated GC reachability queue is missing",
-        ));
-    };
-    let queue: StoredReachabilityQueue = storage_codec::decode("GC reachability queue", &bytes)?;
-    if queue.format_version != GC_REACHABILITY_FORMAT_VERSION
-        || queue.next_sequence == 0
-        || (queue.head_sequence == 0) != (queue.tail_sequence == 0)
-        || (queue.head_sequence != 0 && queue.head_sequence > queue.tail_sequence)
-        || queue.tail_sequence >= queue.next_sequence
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "authenticated GC reachability queue has invalid bounds",
-        ));
-    }
-    Ok((queue, bytes))
-}
-
-fn root_control_digest(raw: Option<&Bytes>) -> [u8; 32] {
-    match raw {
-        Some(raw) => *blake3::hash(raw.as_ref()).as_bytes(),
-        None => *blake3::hash(b"lix.gc.root.absent.v1").as_bytes(),
-    }
-}
-
-fn validate_stored_root_reachability_delta(
-    delta: &StoredRootReachabilityDelta,
-) -> Result<(), LixError> {
-    if delta.branch_id.is_empty()
-        || delta.old_control_digest == [0; 32]
-        || delta.new_control_digest == [0; 32]
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "GC reachability delta has an invalid branch or control digest",
-        ));
-    }
-    if root_control_digest_for_control(delta.old_control.as_ref())? != delta.old_control_digest
-        || root_control_digest_for_control(delta.new_control.as_ref())? != delta.new_control_digest
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "GC reachability delta for branch '{}' has a control digest mismatch",
-                delta.branch_id
-            ),
-        ));
-    }
-    match (delta.old_root, delta.old_control) {
-        (Some(root), Some(control)) if control.head_commit_id == root => {}
-        (None, None) => {}
-        _ => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "GC reachability delta for branch '{}' has an invalid old-root binding",
-                    delta.branch_id
-                ),
-            ));
-        }
-    }
-    match (delta.new_root, delta.new_control) {
-        (Some(root), Some(control)) if control.head_commit_id == root => {}
-        (None, None) => {}
-        _ => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "GC reachability delta for branch '{}' has an invalid new-root binding",
-                    delta.branch_id
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn root_control_digest_for_control(
-    control: Option<&BranchHeadControl>,
-) -> Result<[u8; 32], LixError> {
-    let Some(control) = control else {
-        return Ok(root_control_digest(None));
-    };
-    let bytes = storage_codec::encode("branch-head control", control)?;
-    Ok(root_control_digest(Some(&Bytes::from(bytes))))
-}
-
-fn encode_reachability_batch_body(
-    sequence: u64,
-    deltas: Vec<StoredRootReachabilityDelta>,
-    checkpoint_roots: Vec<CommitId>,
-) -> Result<(StoredRootReachabilityBatchBody, [u8; 32]), LixError> {
-    let body = StoredRootReachabilityBatchBody {
-        format_version: GC_REACHABILITY_FORMAT_VERSION,
-        sequence,
-        deltas,
-        checkpoint_roots,
-    };
-    let encoded = storage_codec::encode("GC reachability delta body", &body)?;
-    Ok((body, *blake3::hash(&encoded).as_bytes()))
-}
-
-/// Appends one transaction's complete root transition set.  A single queue
-/// CAS makes branch advance/delete and checkpoint pin publication atomic with
-/// their controls; consumers never infer liveness from semantic parent rows.
-pub(crate) async fn stage_reachability_delta_batch(
-    read: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    deltas: &[RootReachabilityDelta],
-    checkpoint_roots: &[CommitId],
-    preconditions: &mut Vec<StoragePrecondition>,
-) -> Result<(), LixError> {
-    // This is the central authenticated root-publication boundary. Stage the
-    // binary-CAS publication fence in this same atomic write even when the
-    // transition only revives an existing commit and stages no blob bytes.
-    crate::binary_cas::stage_cas_publication_fence(read, writes, preconditions).await?;
-    if deltas.is_empty() && checkpoint_roots.is_empty() {
-        return Ok(());
-    }
-    let (mut queue, raw_queue) = load_reachability_queue(read).await?;
-    let sequence = queue.next_sequence;
-    queue.next_sequence = queue.next_sequence.checked_add(1).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "GC reachability queue sequence overflow",
-        )
-    })?;
-    if queue.head_sequence == 0 {
-        queue.head_sequence = sequence;
-    }
-    queue.tail_sequence = sequence;
-    let stored_deltas = deltas
-        .iter()
-        .map(|delta| StoredRootReachabilityDelta {
-            branch_id: delta.branch_id.clone(),
-            old_root: delta.old_root,
-            new_root: delta.new_root,
-            old_control: delta.old_control,
-            new_control: delta.new_control,
-            old_control_digest: delta.old_control_digest,
-            new_control_digest: delta.new_control_digest,
-        })
-        .collect::<Vec<_>>();
-    let checkpoint_roots = checkpoint_roots.to_vec();
-    let (body, digest) = encode_reachability_batch_body(sequence, stored_deltas, checkpoint_roots)?;
-    let batch = StoredRootReachabilityBatch {
-        format_version: GC_REACHABILITY_FORMAT_VERSION,
-        sequence,
-        deltas: body.deltas,
-        checkpoint_roots: body.checkpoint_roots,
-        digest,
-    };
-    writes.put(
-        GC_REACHABILITY_DELTA_SPACE,
-        reachability_sequence_key(sequence),
-        StorageValue {
-            bytes: Bytes::from(storage_codec::encode("GC reachability delta", &batch)?),
-        },
-    );
-    writes.put(
-        GC_REACHABILITY_QUEUE_SPACE,
-        StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        StorageValue {
-            bytes: Bytes::from(storage_codec::encode("GC reachability queue", &queue)?),
-        },
-    );
-    preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_REACHABILITY_QUEUE_SPACE,
-        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        expected: raw_queue,
-    });
-    Ok(())
-}
-
-async fn load_reachability_batches(
-    store: &(impl StorageAdapterRead + ?Sized),
-    queue: &StoredReachabilityQueue,
-) -> Result<Vec<(u64, StoredRootReachabilityBatch)>, LixError> {
-    fold_reachability_batches(
-        store,
-        queue,
-        Some(GC_REACHABILITY_BATCH_LIMIT),
-        Vec::new(),
-        |batches, sequence, batch| {
-            batches.push((sequence, batch));
-            Ok(())
-        },
-    )
-    .await
-}
-
-/// Authenticates and consumes a contiguous prefix of the queue in bounded
-/// pages. This is the single queue-row decoder for ordinary retirement,
-/// repository CAS marking, and tree-sweep root closure; the callback owns all
-/// domain-specific accumulation.
-///
-/// For `N` selected batches this performs `O(N)` row/decoding work and keeps
-/// `O(GC_REACHABILITY_BATCH_LIMIT + accumulator)` memory. `None` consumes the
-/// complete queue snapshot; `Some(limit)` consumes at most that many rows.
-/// The caller must bind publication to the raw queue token loaded alongside
-/// `queue` when the accumulated result can authorize deletion.
-async fn fold_reachability_batches<S, A, F>(
-    store: &S,
-    queue: &StoredReachabilityQueue,
-    limit: Option<usize>,
-    mut accumulator: A,
-    mut consume: F,
-) -> Result<A, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-    F: FnMut(&mut A, u64, StoredRootReachabilityBatch) -> Result<(), LixError>,
-{
-    if queue.head_sequence == 0 || limit == Some(0) {
-        return Ok(accumulator);
-    }
-    let queue_end = queue.tail_sequence.saturating_add(1);
-    let selected_end = limit.map_or(queue_end, |limit| {
-        queue
-            .head_sequence
-            .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
-            .min(queue_end)
-    });
-    let mut sequence = queue.head_sequence;
-    while sequence < selected_end {
-        let page_end = sequence
-            .saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64)
-            .min(selected_end);
-        let keys = (sequence..page_end)
-            .map(reachability_sequence_key)
-            .collect::<Vec<_>>();
-        let result = PointReadPlan::new(GC_REACHABILITY_DELTA_SPACE, &keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?;
-        for (expected_sequence, value) in (sequence..page_end).zip(result.value) {
-            let Some(StorageProjectedValue::FullValue(bytes)) = value else {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("GC reachability delta {expected_sequence} is missing"),
-                ));
-            };
-            consume(
-                &mut accumulator,
-                expected_sequence,
-                decode_reachability_batch(expected_sequence, &bytes)?,
-            )?;
-        }
-        sequence = page_end;
-    }
-    Ok(accumulator)
-}
-
-fn decode_reachability_batch(
-    expected_sequence: u64,
-    bytes: &[u8],
-) -> Result<StoredRootReachabilityBatch, LixError> {
-    let batch: StoredRootReachabilityBatch = storage_codec::decode("GC reachability delta", bytes)?;
-    if batch.format_version != GC_REACHABILITY_FORMAT_VERSION || batch.sequence != expected_sequence
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("GC reachability delta {expected_sequence} has invalid identity"),
-        ));
-    }
-    let (_, digest) = encode_reachability_batch_body(
-        batch.sequence,
-        batch.deltas.clone(),
-        batch.checkpoint_roots.clone(),
-    )?;
-    if digest != batch.digest {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("GC reachability delta {expected_sequence} digest mismatch"),
-        ));
-    }
-    Ok(batch)
-}
-
-async fn collect_all_reachability_checkpoint_roots<S>(
-    store: &S,
-    queue: &StoredReachabilityQueue,
-) -> Result<BTreeSet<CommitId>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    fold_reachability_batches(
-        store,
-        queue,
-        None,
-        BTreeSet::new(),
-        |checkpoint_roots, _, batch| {
-            checkpoint_roots.extend(batch.checkpoint_roots);
-            Ok(())
-        },
-    )
-    .await
-}
 
 /// Resolves a still-pending checkpoint replacement for an explicit branch
 /// source, or proves that the source remains reachable through ordinary
 /// canonical chronology.
 ///
-/// A checkpoint replacement is accepted only when one authenticated pending
-/// batch binds `source_commit_id -> checkpoint_commit_id` through matching
-/// branch controls and includes that checkpoint in the same batch's root set.
-/// Branch publication must retain this read through the ordinary reachability
-/// batch writer, whose queue CAS prevents GC consumption and branch creation
-/// from both committing from the same observation.
+/// A checkpoint replacement is accepted only when a branch's canonical
+/// recovery ref binds `source_commit_id -> checkpoint_commit_id` and that
+/// branch's live control still serves the same checkpoint. Recovery-ref
+/// rotation, checkpoint publication and the control move are one atomic write
+/// set, so this single read is the whole authority; branch publication holds
+/// the branch-control precondition that makes the observation binding.
 pub(crate) async fn resolve_pending_checkpoint_replacement<S>(
     store: &S,
     source_commit_id: CommitId,
@@ -726,34 +300,25 @@ pub(crate) async fn resolve_pending_checkpoint_replacement<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
-    let (queue, _) = load_reachability_queue(store).await?;
-    let candidates =
-        fold_reachability_batches(store, &queue, None, Vec::new(), |candidates, _, batch| {
-            let checkpoint_roots = batch
-                .checkpoint_roots
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>();
-            for delta in &batch.deltas {
-                validate_stored_root_reachability_delta(delta)?;
-                if delta.old_root != Some(source_commit_id) {
-                    continue;
-                }
-                let Some(checkpoint_commit_id) = delta.new_root else {
-                    continue;
-                };
-                let Some(new_control) = delta.new_control else {
-                    continue;
-                };
-                if new_control.working_diff_checkpoint_commit_id == Some(checkpoint_commit_id)
-                    && checkpoint_roots.contains(&checkpoint_commit_id)
-                {
-                    candidates.push((checkpoint_commit_id, delta.branch_id.clone()));
-                }
-            }
-            Ok(())
-        })
+    let controls = BranchHeadControlContext::new()
+        .reader(store.clone())
+        .scan()
         .await?;
+    let mut candidates = Vec::new();
+    for recovery in load_recovery_refs(store).await? {
+        if recovery.recovered_head_commit_id != source_commit_id {
+            continue;
+        }
+        let Some((_, control)) = controls
+            .iter()
+            .find(|(branch_id, _)| branch_id == &recovery.branch_id)
+        else {
+            continue;
+        };
+        if control.working_diff_checkpoint_commit_id == Some(recovery.checkpoint_commit_id) {
+            candidates.push((recovery.checkpoint_commit_id, recovery.branch_id));
+        }
+    }
     match candidates.len() {
         0 => {}
         1 => {
@@ -776,10 +341,6 @@ where
         }
     }
 
-    let controls = BranchHeadControlContext::new()
-        .reader(store.clone())
-        .scan()
-        .await?;
     let roots = controls
         .into_iter()
         .flat_map(|(_, control)| control.tracked_reachability().chronology_roots)
@@ -825,24 +386,10 @@ where
         .iter()
         .map(|(_, control)| control.ref_change_id)
         .collect::<BTreeSet<_>>();
-    let (queue, _) = load_reachability_queue(store).await?;
-    let batches = load_reachability_batches(store, &queue).await?;
-    let closure = load_authenticated_repository_retention(store, &controls, &queue).await?;
-    let active_root_ids = closure.chronology_roots;
-    let active_dependency_ids = closure
-        .physical_authorities
-        .union(&closure.physical_dependencies)
-        .copied()
-        .chain(closure.semantic_dependencies.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let mut retired_refs = BTreeMap::new();
-    for (_, batch) in batches {
-        for delta in batch.deltas {
-            if let Some(control) = delta.old_control {
-                retired_refs.insert(control.ref_change_id, delta.old_root);
-            }
-        }
-    }
+    // Loading the closure is the point: the audit must fail exactly where the
+    // planner would, so a fixture that cannot be planned is never reported as
+    // a clean standalone-change inventory.
+    let _closure = load_authenticated_repository_retention(store, &controls).await?;
     let mut reader = ChangelogContext::new().reader(store);
     let mut entries = Vec::new();
     let mut start_after = None::<String>;
@@ -856,28 +403,10 @@ where
         for change in batch.entries {
             let reason = if active_refs.contains(&change.change_id) {
                 "active_branch_ref"
-            } else if let Some(old_root) = retired_refs.get(&change.change_id) {
-                if let Some(root) = old_root {
-                    if active_root_ids.contains(root) {
-                        "retired_delta_old_control:active_root_pin"
-                    } else if active_dependency_ids.contains(root) {
-                        "retired_delta_old_control:history_dependency_pin"
-                    } else {
-                        "retired_delta_old_control:reclaimable"
-                    }
-                } else {
-                    "retired_delta_old_control:reclaimable"
-                }
             } else {
-                "unclassified_no_frontier_delta"
+                "unclassified_no_live_control"
             };
-            if let Some(old_root) = retired_refs.get(&change.change_id) {
-                entries.push(format!(
-                    "{}:{reason}:old_root={}",
-                    change.change_id,
-                    old_root.map_or_else(|| "none".to_owned(), |root| root.to_string())
-                ));
-            } else if reason == "unclassified_no_frontier_delta" {
+            if reason == "unclassified_no_live_control" {
                 entries.push(format!(
                     "{}:{reason}:schema={}:account={}:origin={}",
                     change.change_id,
@@ -1307,6 +836,11 @@ async fn load_authenticated_serving_dependency_closure<S>(
     chronology_roots: BTreeSet<CommitId>,
     serving_dependencies: BTreeSet<CommitId>,
     history_dependencies: BTreeSet<CommitId>,
+    // Commits reachable from the roots through canonical parent links. This
+    // retains the *semantic* plane only: the public history surfaces walk the
+    // commit graph, so their projections are load-bearing, while their physical
+    // delta segments are exactly what compaction is supposed to free.
+    graph_reachable: BTreeSet<CommitId>,
 ) -> Result<AuthenticatedServingDependencyClosure, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
@@ -1329,6 +863,7 @@ where
     physical_dependencies.extend(history_dependencies.iter().copied());
     let mut semantic_dependencies = serving_dependencies;
     semantic_dependencies.extend(history_dependencies.iter().copied());
+    semantic_dependencies.extend(graph_reachable);
     let mut cas_logical_dependencies = history_dependencies;
     let mut manifests = BTreeMap::new();
     let mut pending = chronology_roots.iter().copied().collect::<Vec<_>>();
@@ -1515,7 +1050,6 @@ where
 async fn load_authenticated_repository_retention<S>(
     store: &S,
     controls: &[(String, BranchHeadControl)],
-    queue: &StoredReachabilityQueue,
 ) -> Result<AuthenticatedServingDependencyClosure, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
@@ -1533,14 +1067,76 @@ where
                 ]
             }),
     );
-    chronology_roots.extend(collect_all_reachability_checkpoint_roots(store, queue).await?);
+    let graph_reachable = collect_ref_reachable_commit_ids(store, &chronology_roots).await?;
     load_authenticated_serving_dependency_closure(
         store,
         chronology_roots,
         control_reachability.serving_dependencies,
         control_reachability.history_dependencies,
+        graph_reachable,
     )
     .await
+}
+
+/// Every commit reachable from the authenticated roots through canonical parent
+/// links.
+///
+/// This is the reachability the public history surfaces actually read: a
+/// `_history()` query walks the commit graph, so a projection on that chain is
+/// load-bearing no matter how far below the serving checkpoint it sits. The
+/// ledger expressed the same retention by pinning every checkpoint commit it
+/// had ever seen, forever, in a row it could never consume. Walking refs states
+/// it directly, costs one commit-record read per reachable commit, and shrinks
+/// as compaction shortens the chain.
+async fn collect_ref_reachable_commit_ids<S>(
+    store: &S,
+    roots: &BTreeSet<CommitId>,
+) -> Result<BTreeSet<CommitId>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let mut graph = CommitGraphContext::new().reader(store);
+    let mut reachable = BTreeSet::new();
+    let mut pending = roots.iter().copied().collect::<Vec<_>>();
+    while let Some(commit_id) = pending.pop() {
+        if !reachable.insert(commit_id) {
+            continue;
+        }
+        let Some(node) = graph.load_node(&commit_id).await? else {
+            continue;
+        };
+        pending.extend(node.parent_commit_ids.iter().copied());
+    }
+    Ok(reachable)
+}
+
+/// Derives this sweep's retirement candidates.
+///
+/// This replaces the `gc.reachability_delta.v1` publication ledger. That ledger
+/// stored one ~439 B row per branch-head publication recording an `old_root ->
+/// new_root` transition so a later sweep would know which commit had been
+/// superseded. The manifest plane already states the same thing and states it
+/// better: a commit owns a manifest exactly while it owns physical state, and
+/// [`crate::tracked_state::stage_retire_commit_physical_state`] deletes it. So
+/// the inventory *is* the outstanding-work list, it shrinks as work completes,
+/// and it needs no publication-time write at all.
+///
+/// Deliberately not a walk from refs. A commit can stop being reachable from
+/// any ref while still owning physical state — every commit of a deleted branch
+/// is in that position — and a refs walk cannot name those at all. Liveness
+/// still comes only from refs: this list is filtered against the authenticated
+/// retention closure, and nothing here is ever treated as a root.
+///
+/// The list is unordered on purpose. The ledger consumed a queue in
+/// publication order and stopped at the first blocked row, so one permanently
+/// live root at the head — genesis always is one, because engine-bootstrap rows
+/// authored at init stay live and keep naming it — froze every younger
+/// candidate behind it forever. Here a pinned candidate holds back only itself.
+async fn derive_retirement_candidates<S>(store: &S) -> Result<Vec<CommitId>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    crate::tracked_state::scan_commit_state_manifest_commit_ids(store).await
 }
 
 /// Plans and stages logical repository GC against one pinned read.
@@ -1551,10 +1147,14 @@ where
 /// Content-addressed tree/CAS orphan repair is intentionally an offline path;
 /// out-of-band JSON is reclaimed here only from explicit ownership-loss
 /// candidates.
-/// Ordinary GC consumes only authenticated publication deltas. Branch-head
-/// controls and checkpoint recovery refs are the complete active-root set;
-/// the only semantic walk permitted here is the exact point-replay dependency
-/// closure of those roots. Full-space inventory discovery remains forbidden.
+/// Ordinary GC derives its candidates from the physical manifest inventory and
+/// proves liveness only from refs: branch-head controls and checkpoint recovery
+/// refs are the complete active-root set, and the walk from those roots through
+/// canonical parent links, plus the exact point-replay dependency closure, is
+/// the only reachability implementation. Semantic *inventory* discovery — a
+/// changelog or commit-space scan that rediscovers liveness — remains
+/// forbidden; the manifest scan is an inventory of the physical state being
+/// collected, never a source of retention.
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn stage_repository_gc<S>(
     store: S,
@@ -1601,16 +1201,6 @@ where
             observed.raw_token,
         )?);
     }
-    let (queue, raw_queue) = load_reachability_queue(&store).await?;
-    // Every repository sweep publishes against the exact queue snapshot used
-    // for root discovery, even when the bounded retirement window is empty or
-    // blocked and no queue row is consumed.
-    staged_preconditions.push(StoragePrecondition::KeyValueEquals {
-        space: GC_REACHABILITY_QUEUE_SPACE,
-        key: StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-        expected: raw_queue,
-    });
-    let batches = load_reachability_batches(&store, &queue).await?;
     let AuthenticatedServingDependencyClosure {
         chronology_roots: active_roots,
         physical_authorities: active_authority_ids,
@@ -1620,40 +1210,25 @@ where
         mutation_nodes: active_mutation_nodes,
         scoped_nodes: active_scoped_nodes,
         native_parts: active_current_parts,
-    } = load_authenticated_repository_retention(&store, &controls, &queue).await?;
+    } = load_authenticated_repository_retention(&store, &controls).await?;
+
+    // Retirement candidates are derived here, not read from a ledger.
+    let candidates = derive_retirement_candidates(&store).await?;
 
     // Derive both physical retirement and logical CAS retention from the one
     // authenticated serving closure. In particular, do not perform a second
-    // replay-graph walk for CAS: a queue-old root is retained exactly when it
+    // replay-graph walk for CAS: a candidate root is retained exactly when it
     // is already a dependency of the active closure. This makes the retained
     // owner set deterministic and prevents a separately reconstructed CAS
     // authority from racing semantic projection retirement.
-    let mut blocked_sequences = BTreeSet::new();
     let mut blocked_physical_dependency_ids = BTreeSet::new();
     let mut blocked_history_dependency_ids = BTreeSet::new();
-    for (sequence, batch) in &batches {
-        for delta in &batch.deltas {
-            validate_stored_root_reachability_delta(delta)?;
-            let Some(old_root) = delta.old_root else {
-                continue;
-            };
-            if !retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_authority_ids,
-                &active_dependency_ids,
-            ) {
-                blocked_sequences.insert(*sequence);
-                blocked_physical_dependency_ids.insert(old_root);
-            }
-            if !retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_roots,
-                &active_cas_dependency_ids,
-            ) {
-                blocked_history_dependency_ids.insert(old_root);
-            }
+    for commit_id in candidates.iter().copied() {
+        if !retirement_is_proven(commit_id, &active_authority_ids, &active_dependency_ids) {
+            blocked_physical_dependency_ids.insert(commit_id);
+        }
+        if !retirement_is_proven(commit_id, &active_roots, &active_cas_dependency_ids) {
+            blocked_history_dependency_ids.insert(commit_id);
         }
     }
 
@@ -1687,208 +1262,38 @@ where
     crate::binary_cas::stage_cas_reclamation_fence(&store, writes, &mut staged_preconditions)
         .await?;
 
-    if batches.is_empty() {
-        preconditions.extend(staged_preconditions);
-        return Ok(RepositoryGcPlan {
-            changelog: GcPlan {
-                roots: active_roots
-                    .iter()
-                    .copied()
-                    .map(GcRoot::BranchHead)
-                    .collect(),
-                live: GcLiveSet {
-                    commits: retained_root_ids.into_iter().collect(),
-                    changes: Vec::new(),
-                    payloads: Vec::new(),
-                },
-                sweep: GcSweepSet {
-                    commits: Vec::new(),
-                    commit_change_ids: Vec::new(),
-                    changes: Vec::new(),
-                    json_payloads: Vec::new(),
-                },
-                repair: GcRepairSet::default(),
-            },
-            sweep: RepositoryGcSweep {
-                tracked_commit_roots: Vec::new(),
-                standalone_changes: Vec::new(),
-                reclaimed_generation_rows: 0,
-                binary_cas,
-            },
-            profile: RepositoryGcProfile {
-                root_discovery_us: elapsed_micros(started),
-                changelog_us: 0,
-                tracked_root_stage_us: 0,
-                total_us: elapsed_micros(started),
-            },
-        });
-    }
-
-    // A delta is a candidate until every active history/checkpoint/replay
-    // dependency releases the old root.  Never consume a batch containing a
-    // blocked candidate: dropping that signal would make the root permanently
-    // unreclaimable after the pin is later released.  The whole batch remains
-    // at the queue head; this intentionally delays later deltas but preserves
-    // the authenticated publication order and retry semantics.
-    let mut next_queue = queue;
-    let queue_head = next_queue.head_sequence;
-    let mut consumed_through = queue_head;
-    let mut queue_open = true;
+    // Retire the derived candidates. Nothing here is ordered and nothing is
+    // capped: a candidate that is still pinned holds back only itself, and the
+    // two planes prove retirement independently. The ledger could do neither —
+    // it consumed a queue in publication order and stopped at the first blocked
+    // row, so one permanently live root at the head froze every younger
+    // candidate behind it forever.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
-    let mut reclaimed_standalone_changes = BTreeSet::new();
-    let mut reclaimed_checkpoint_branches = BTreeSet::new();
-    // Derived serving generations are reachable from exactly one place: the
-    // live branch controls this pass already read for root discovery. Reusing
-    // that root set is what keeps generation reclamation inside the single
-    // reachability walk instead of needing a second retention ledger.
-    let live_generations = controls
-        .iter()
-        .flat_map(|(branch_id, control)| {
-            [
-                (branch_id.as_str(), control.tracked_generation),
-                (branch_id.as_str(), control.untracked_generation),
-            ]
-        })
-        .collect::<BTreeSet<_>>();
-    let mut retired_generations = BTreeSet::new();
-    let mut reclaimed_generation_rows = 0_u64;
-    for (sequence, batch) in batches {
-        if queue_open && blocked_sequences.contains(&sequence) {
-            queue_open = false;
+    for commit_id in candidates {
+        if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
+            && reclaimed_semantic_commits.insert(commit_id)
+        {
+            crate::changelog::stage_delete_commit_projection(&store, writes, commit_id).await?;
         }
-        if queue_open {
-            consumed_through = sequence.saturating_add(1);
+        if blocked_physical_dependency_ids.contains(&commit_id) {
+            continue;
         }
-        for delta in batch.deltas {
-            validate_stored_root_reachability_delta(&delta)?;
-            // Branch checkpoint rows are derived serving state owned by the
-            // branch lifecycle, not by a tracked root.  Process the
-            // authenticated deletion signal before inspecting `old_root` so
-            // a branch deleted before its first rooted publication cannot
-            // strand its checkpoint prefix forever.  A recreated branch has
-            // a live control and therefore keeps the shared branch-id range.
-            if delta.new_control.is_none()
-                && !controls
-                    .iter()
-                    .any(|(active_branch_id, _)| active_branch_id == &delta.branch_id)
-                && reclaimed_checkpoint_branches.insert(delta.branch_id.clone())
-            {
-                crate::transaction::stage_delete_branch_plugin_checkpoints(
-                    &store,
-                    writes,
-                    &delta.branch_id,
-                )
-                .await?;
-            }
-            // A branch generation is a disposable serving cache reachable from
-            // exactly one place: a branch control. Once no live control selects
-            // it, nothing can ever read it again, so retire it.
-            //
-            // This deliberately does not wait for the batch to be consumable.
-            // A blocked batch means a *commit root* is still pinned by history,
-            // undo, or replay — all of which read tracked-state records, never
-            // these derived rows. Coupling the two would strand a whole
-            // generation behind an unrelated pin, exactly like the retired
-            // branch-checkpoint prefix immediately above.
-            if let Some(old_control) = delta.old_control.as_ref() {
-                for generation in [
-                    old_control.tracked_generation,
-                    old_control.untracked_generation,
-                ] {
-                    if delta.new_control.is_some_and(|new_control| {
-                        new_control.tracked_generation == generation
-                            || new_control.untracked_generation == generation
-                    }) || live_generations.contains(&(delta.branch_id.as_str(), generation))
-                    {
-                        continue;
-                    }
-                    if retired_generations.insert((delta.branch_id.clone(), generation)) {
-                        reclaimed_generation_rows = reclaimed_generation_rows.saturating_add(
-                            crate::live_state::stage_retire_hot_generation(
-                                &store,
-                                writes,
-                                &delta.branch_id,
-                                generation,
-                            )
-                            .await?,
-                        );
-                    }
-                }
-            }
-            let Some(old_root) = delta.old_root else {
-                continue;
-            };
-            let physical_retirement = retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_authority_ids,
-                &active_dependency_ids,
-            );
-            let semantic_retirement = retirement_is_proven(
-                old_root,
-                delta.new_root,
-                &active_roots,
-                &active_semantic_dependency_ids,
-            );
-            if semantic_retirement && reclaimed_semantic_commits.insert(old_root) {
-                crate::changelog::stage_delete_commit_projection(&store, writes, old_root).await?;
-            }
-            if !physical_retirement {
-                continue;
-            }
-            if reclaimed_commits.insert(old_root) {
-                crate::tracked_state::stage_retire_commit_physical_state(
-                    &store,
-                    writes,
-                    old_root,
-                    RetainedPhysicalState {
-                        mutation_nodes: &active_mutation_nodes,
-                        scoped_nodes: &active_scoped_nodes,
-                        native_parts: &active_current_parts,
-                    },
-                )
-                .await?;
-            }
-            if let Some(control) = delta.old_control.as_ref()
-                && !controls
-                    .iter()
-                    .any(|(_, active)| active.ref_change_id == control.ref_change_id)
-            {
-                crate::changelog::stage_delete_standalone_change(
-                    &store,
-                    writes,
-                    control.ref_change_id,
-                )
-                .await?;
-                reclaimed_standalone_changes.insert(control.ref_change_id);
-            }
+        if reclaimed_commits.insert(commit_id) {
+            crate::tracked_state::stage_retire_commit_physical_state(
+                &store,
+                writes,
+                commit_id,
+                RetainedPhysicalState {
+                    mutation_nodes: &active_mutation_nodes,
+                    scoped_nodes: &active_scoped_nodes,
+                    native_parts: &active_current_parts,
+                },
+            )
+            .await?;
         }
     }
-
-    if consumed_through > queue_head {
-        consumed_through = consumed_through
-            .min(queue_head.saturating_add(GC_REACHABILITY_BATCH_LIMIT as u64))
-            .min(next_queue.tail_sequence.saturating_add(1));
-        for sequence in next_queue.head_sequence..consumed_through {
-            writes.delete(
-                GC_REACHABILITY_DELTA_SPACE,
-                reachability_sequence_key(sequence),
-            );
-        }
-        if consumed_through > next_queue.tail_sequence {
-            next_queue.head_sequence = 0;
-            next_queue.tail_sequence = 0;
-        } else {
-            next_queue.head_sequence = consumed_through;
-        }
-        writes.put(
-            GC_REACHABILITY_QUEUE_SPACE,
-            StorageKey(Bytes::from_static(GC_REACHABILITY_QUEUE_KEY)),
-            StorageValue {
-                bytes: Bytes::from(storage_codec::encode("GC reachability queue", &next_queue)?),
-            },
-        );
+    if !reclaimed_semantic_commits.is_empty() {
         writes.seal_changelog_gc();
     }
 
@@ -1915,8 +1320,11 @@ where
         },
         sweep: RepositoryGcSweep {
             tracked_commit_roots: reclaimed_commits.into_iter().collect(),
-            standalone_changes: reclaimed_standalone_changes.into_iter().collect(),
-            reclaimed_generation_rows,
+            // Superseded branch-ref facts and stale serving generations are
+            // retired by the publication that supersedes them, in that same
+            // write set. A sweep has no such debt left to report.
+            standalone_changes: Vec::new(),
+            reclaimed_generation_rows: 0,
             binary_cas,
         },
         profile: RepositoryGcProfile {
@@ -1979,12 +1387,6 @@ where
     // maintenance work, but delta rows have no shared ownership and must be
     // reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
-    // Old serving generations are derived data. Removing them in the same
-    // atomic sweep as their untracked payload-root withdrawal prevents stale
-    // branch generations from accumulating indefinitely.
-    let stale_untracked_refs = TrackedHeadContext::new()
-        .stage_collect_stale_current_state_generations(&store, writes, &controls)
-        .await?;
     // The changelog plan contains every payload reachable from tracked
     // history plus the active untracked roots supplied above. A retired
     // untracked JSON ref is only a deletion candidate: content-addressed
@@ -2006,10 +1408,7 @@ where
         .iter()
         .map(|json_ref| *json_ref.as_hash_array())
         .collect::<BTreeSet<_>>();
-    let mut reclaimable_untracked_refs = stale_untracked_refs
-        .into_iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
+    let mut reclaimable_untracked_refs = BTreeSet::new();
     let mut consumed_candidate_keys = Vec::new();
     for candidate in JsonStoreContext::new()
         .scan_untracked_reclaim_candidates(&store)
@@ -2761,14 +2160,11 @@ fn elapsed_micros(started: Instant) -> u64 {
 }
 
 fn retirement_is_proven(
-    old_root: CommitId,
-    new_root: Option<CommitId>,
+    candidate: CommitId,
     active_authority_ids: &BTreeSet<CommitId>,
     active_dependency_ids: &BTreeSet<CommitId>,
 ) -> bool {
-    new_root != Some(old_root)
-        && !active_authority_ids.contains(&old_root)
-        && !active_dependency_ids.contains(&old_root)
+    !active_authority_ids.contains(&candidate) && !active_dependency_ids.contains(&candidate)
 }
 
 #[cfg(test)]
@@ -2797,7 +2193,7 @@ mod tests {
     use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
-        StorageKey, StoragePrecondition, StorageReadOptions, StorageSpace, StorageValue,
+        StorageKey, StorageReadOptions, StorageSpace, StorageValue,
         StorageWriteOptions, StorageWriteSet,
     };
     use crate::tracked_state::{
@@ -2818,47 +2214,12 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
 
     use super::{
-        CheckpointGcState, CheckpointRecoveryRef, GC_REACHABILITY_DELTA_SPACE,
-        GC_REACHABILITY_QUEUE_SPACE, RootReachabilityDelta,
-        authenticated_control_commit_reachability, collect_all_reachability_checkpoint_roots,
-        load_checkpoint_gc_state, load_reachability_batches, load_reachability_queue,
-        load_recovery_ref, load_recovery_refs, resolve_pending_checkpoint_replacement,
-        retirement_is_proven, root_control_digest_for_control, stage_checkpoint_gc_state,
-        stage_delete_recovery_ref, stage_reachability_delta_batch, stage_reachability_queue_seed,
-        stage_recovery_ref_rotation,
+        CHECKPOINT_GC_STATE_SPACE, CheckpointGcState, CheckpointRecoveryRef,
+        authenticated_control_commit_reachability,
+        derive_retirement_candidates, load_checkpoint_gc_state, load_recovery_ref,
+        load_recovery_refs, resolve_pending_checkpoint_replacement, retirement_is_proven,
+        stage_checkpoint_gc_state, stage_delete_recovery_ref, stage_recovery_ref_rotation,
     };
-
-    async fn append_checkpoint_batch(
-        storage: &StorageAdapter<Memory>,
-        checkpoint_roots: &[CommitId],
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("queue append read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &[],
-            checkpoint_roots,
-            &mut preconditions,
-        )
-        .await
-        .expect("checkpoint batch should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("checkpoint batch should commit");
-    }
 
     #[tokio::test]
     async fn destructive_consumers_share_the_complete_tracked_control_projection() {
@@ -2866,7 +2227,6 @@ mod tests {
             *CommitId::for_test_label("control-projection-head").as_uuid(),
         );
         let tracked_generation = CommitId::for_test_label("control-projection-tracked");
-        let untracked_generation = CommitId::for_test_label("control-projection-untracked");
         let working_diff = CommitId::with_change_address_space(
             *CommitId::for_test_label("control-projection-working-diff").as_uuid(),
         );
@@ -2877,7 +2237,6 @@ mod tests {
             BranchHeadControl {
                 head_commit_id: head,
                 tracked_generation,
-                untracked_generation,
                 current_state_revision: 7,
                 working_diff_checkpoint_commit_id: Some(working_diff),
                 created_at: timestamp,
@@ -2929,11 +2288,6 @@ mod tests {
         );
         assert!(reachability.serving_dependencies.is_empty());
         assert!(!reachability.chronology_roots.contains(&tracked_generation));
-        assert!(
-            !reachability
-                .chronology_roots
-                .contains(&untracked_generation)
-        );
     }
 
     #[tokio::test]
@@ -2960,13 +2314,12 @@ mod tests {
         active_manifest.snapshot_root = Some(Box::new(test_snapshot_root(active.commit_id)));
 
         let control_ref = ChangeId::for_test_label("rootless-serving-control");
-        let old_control = replay_branch_control(old_root.commit_id, control_ref, timestamp);
+        let _old_control = replay_branch_control(old_root.commit_id, control_ref, timestamp);
         let serving_generation = CommitId::for_test_label("rootless-serving-generation");
         let mut active_control = replay_branch_control(active.commit_id, control_ref, timestamp);
         active_control.tracked_generation = serving_generation;
 
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("rootless serving queue should seed");
         stage_branch_head_control(&mut writes, "main", active_control)
             .expect("rootless serving control should stage");
         persist_replay_closure_fixture(
@@ -2974,21 +2327,6 @@ mod tests {
             writes,
             &[old_root.clone(), active.clone()],
             &[old_manifest, active_manifest],
-        )
-        .await;
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(old_root.commit_id),
-                new_root: Some(active.commit_id),
-                old_control: Some(old_control),
-                new_control: Some(active_control),
-                old_control_digest: root_control_digest_for_control(Some(&old_control))
-                    .expect("old rootless serving control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&active_control))
-                    .expect("active rootless serving control should encode"),
-            },
         )
         .await;
 
@@ -3407,6 +2745,7 @@ mod tests {
             BTreeSet::from([active.commit_id]),
             BTreeSet::new(),
             BTreeSet::new(),
+            BTreeSet::new(),
         )
         .await
         .expect("rootless selected owner must remain valid physical authority");
@@ -3440,7 +2779,6 @@ mod tests {
         );
 
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("selected-owner queue should seed");
         let owner_deltas =
             commit_delta_refs(owner.commit_id, std::slice::from_ref(&selected_change));
         let owner_stage = stage_commit_deltas_for_commit_state(&mut writes, &owner_deltas)
@@ -3468,7 +2806,7 @@ mod tests {
         released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
 
         let control_ref = ChangeId::for_test_label("selected-owner-control");
-        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
         let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
@@ -3478,22 +2816,7 @@ mod tests {
             &storage,
             writes,
             &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest, released_manifest],
-        )
-        .await;
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(owner.commit_id),
-                new_root: Some(checkpoint.commit_id),
-                old_control: Some(owner_control),
-                new_control: Some(checkpoint_control),
-                old_control_digest: root_control_digest_for_control(Some(&owner_control))
-                    .expect("owner control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("checkpoint control should encode"),
-            },
+            &[owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3514,8 +2837,16 @@ mod tests {
         let closure = load_audited_repository_retention(&storage).await;
         assert!(closure.physical_authorities.contains(&owner.commit_id));
 
+        // The not-yet-published `released` commit is a candidate the moment its
+        // manifest exists, and reclaiming it is correct: nothing references it.
+        // What must not move is the pinned owner.
         let retained_plan = run_ordinary_repository_gc(&storage).await;
-        assert!(retained_plan.sweep.tracked_commit_roots.is_empty());
+        assert!(
+            !retained_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&owner.commit_id)
+        );
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3529,44 +2860,7 @@ mod tests {
         );
         drop(read);
 
-        let mut writes = storage.new_write_set();
-        stage_branch_head_control(&mut writes, "main", released_control)
-            .expect("released control should stage");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("selected-owner release read should open");
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &[RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(checkpoint.commit_id),
-                new_root: Some(released.commit_id),
-                old_control: Some(checkpoint_control),
-                new_control: Some(released_control),
-                old_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("checkpoint control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&released_control))
-                    .expect("released control should encode"),
-            }],
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("selected-owner release delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("selected-owner release should publish atomically");
+        publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
 
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
@@ -3619,7 +2913,6 @@ mod tests {
             });
 
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("scoped owner queue should seed");
         let owner_inventory = stage_replacement_inventory(
             &mut writes,
             owner.commit_id,
@@ -3681,7 +2974,7 @@ mod tests {
         released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
 
         let control_ref = ChangeId::for_test_label("scoped-owner-control");
-        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
         let released_control = replay_branch_control(released.commit_id, control_ref, timestamp);
@@ -3691,22 +2984,7 @@ mod tests {
             &storage,
             writes,
             &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest, released_manifest],
-        )
-        .await;
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(owner.commit_id),
-                new_root: Some(checkpoint.commit_id),
-                old_control: Some(owner_control),
-                new_control: Some(checkpoint_control),
-                old_control_digest: root_control_digest_for_control(Some(&owner_control))
-                    .expect("scoped owner control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("scoped checkpoint control should encode"),
-            },
+            &[owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3714,11 +2992,11 @@ mod tests {
         assert!(closure.physical_authorities.contains(&owner.commit_id));
 
         assert!(
-            run_ordinary_repository_gc(&storage)
+            !run_ordinary_repository_gc(&storage)
                 .await
                 .sweep
                 .tracked_commit_roots
-                .is_empty()
+                .contains(&owner.commit_id)
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3732,7 +3010,7 @@ mod tests {
         );
         drop(read);
 
-        publish_replay_root_release(&storage, "main", checkpoint_control, released_control).await;
+        publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
             released_plan
@@ -3815,7 +3093,6 @@ mod tests {
         };
 
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("native row queue should seed");
         writes.put(
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
             StorageKey(Bytes::copy_from_slice(&encoded.digest)),
@@ -3889,7 +3166,7 @@ mod tests {
         released_manifest.snapshot_root = Some(Box::new(test_snapshot_root(released.commit_id)));
 
         let control_ref = ChangeId::for_test_label("native-row-control");
-        let owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
+        let _owner_control = replay_branch_control(owner.commit_id, control_ref, timestamp);
         let mut checkpoint_control =
             replay_branch_control(checkpoint.commit_id, control_ref, timestamp);
         let serving_generation = CommitId::for_test_label("native-row-serving-generation");
@@ -3909,22 +3186,7 @@ mod tests {
             &storage,
             writes,
             &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest, released_manifest],
-        )
-        .await;
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(owner.commit_id),
-                new_root: Some(checkpoint.commit_id),
-                old_control: Some(owner_control),
-                new_control: Some(checkpoint_control),
-                old_control_digest: root_control_digest_for_control(Some(&owner_control))
-                    .expect("native owner control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("native checkpoint control should encode"),
-            },
+            &[owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -4011,11 +3273,11 @@ mod tests {
             .expect("authenticated native part restoration should commit");
 
         assert!(
-            run_ordinary_repository_gc(&storage)
+            !run_ordinary_repository_gc(&storage)
                 .await
                 .sweep
                 .tracked_commit_roots
-                .is_empty()
+                .contains(&owner.commit_id)
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4029,44 +3291,7 @@ mod tests {
         );
         drop(read);
 
-        let mut writes = storage.new_write_set();
-        stage_branch_head_control(&mut writes, "main", released_control)
-            .expect("native released control should stage");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("native release read should open");
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &[RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(checkpoint.commit_id),
-                new_root: Some(released.commit_id),
-                old_control: Some(checkpoint_control),
-                new_control: Some(released_control),
-                old_control_digest: root_control_digest_for_control(Some(&checkpoint_control))
-                    .expect("native checkpoint control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&released_control))
-                    .expect("native released control should encode"),
-            }],
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("native owner release should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("native owner release should publish");
+        publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
 
         let released_plan = run_ordinary_repository_gc(&storage).await;
         assert!(
@@ -4125,7 +3350,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(commit_id),
             created_at: timestamp,
@@ -4134,7 +3358,6 @@ mod tests {
             schema_presence_bloom: [0; 4],
         };
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("queue should stage");
         stage_commit_state_manifest(&mut writes, &manifest).expect("manifest should stage");
         stage_branch_head_control(&mut writes, "main", control).expect("control should stage");
         for (hash, bytes) in [
@@ -4177,7 +3400,6 @@ mod tests {
         let mut advanced = observed.control.expect("fixture control should exist");
         advanced.head_commit_id = CommitId::for_test_label("concurrent-head");
         advanced.tracked_generation = advanced.head_commit_id;
-        advanced.untracked_generation = advanced.head_commit_id;
         advanced.current_state_revision = advanced.current_state_revision.saturating_add(1);
         stage_branch_head_control(&mut concurrent, "main", advanced)
             .expect("concurrent control should stage");
@@ -4188,7 +3410,7 @@ mod tests {
 
         let mut stale_sweep = storage.new_write_set();
         stale_sweep.put(
-            GC_REACHABILITY_QUEUE_SPACE,
+            CHECKPOINT_GC_STATE_SPACE,
             StorageKey(Bytes::from_static(b"stale-sweep-marker")),
             StorageValue {
                 bytes: Bytes::from_static(b"stale-sweep-marker"),
@@ -4253,10 +3475,9 @@ mod tests {
             current_state_scoped_ranges: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
-        let owner_control = replay_branch_control(owner, retired_ref, timestamp);
+        let _owner_control = replay_branch_control(owner, retired_ref, timestamp);
         let active_control = replay_branch_control(active, active_ref, timestamp);
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("shared offline queue should seed");
         stage_branch_head_control(&mut writes, "main", active_control)
             .expect("shared offline control should stage");
         stage_commit_state_manifest(&mut writes, &manifest(owner, owner_root))
@@ -4293,21 +3514,6 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("shared offline fixture should commit");
-        stage_replay_root_delta(
-            &storage,
-            RootReachabilityDelta {
-                branch_id: "main".to_owned(),
-                old_root: Some(owner),
-                new_root: Some(active),
-                old_control: Some(owner_control),
-                new_control: Some(active_control),
-                old_control_digest: root_control_digest_for_control(Some(&owner_control))
-                    .expect("shared offline old control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&active_control))
-                    .expect("shared offline active control should encode"),
-            },
-        )
-        .await;
 
         let read = SharedStorageAdapterRead::new(
             storage
@@ -4320,10 +3526,7 @@ mod tests {
             .scan()
             .await
             .expect("shared offline controls should load");
-        let (queue, _) = load_reachability_queue(&read)
-            .await
-            .expect("shared offline queue should load");
-        let closure = super::load_authenticated_repository_retention(&read, &controls, &queue)
+        let closure = super::load_authenticated_repository_retention(&read, &controls)
             .await
             .expect("shared offline owner closure should authenticate");
         assert!(closure.physical_dependencies.contains(&owner));
@@ -4358,11 +3561,16 @@ mod tests {
         let audit = super::audit_repository_gc_standalone_refs(&read)
             .await
             .expect("standalone audit should consume the same closure");
+        // With the publication ledger gone the audit no longer has a stored
+        // `old_control` to attribute a superseded ref change to. A branch-ref
+        // change that no live control claims is simply unclassified: the
+        // publication that supersedes it now deletes it in the same write set,
+        // so a surviving one is a fixture artefact, not deferred GC debt.
         assert_eq!(
             audit,
             vec![format!(
-                "{}:retired_delta_old_control:history_dependency_pin:old_root={owner}",
-                retired_ref
+                "{retired_ref}:unclassified_no_live_control:schema=authority_gc:account={}:origin=none",
+                crate::ANONYMOUS_ACCOUNT_ID
             )]
         );
     }
@@ -4437,248 +3645,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachability_delta_queue_round_trips_with_authenticated_digest() {
+    async fn recovery_ref_without_live_serving_control_is_not_branchable_authority() {
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("queue seed should commit");
-
-        let old_root = CommitId::for_test_label("delta-old-root");
-        let new_root = CommitId::for_test_label("delta-new-root");
-        let timestamp =
-            LixTimestamp::expect_parse("reachability delta test timestamp", "2026-01-01T00:00:00Z");
-        let old_control = BranchHeadControl {
-            head_commit_id: old_root,
-            tracked_generation: old_root,
-            untracked_generation: old_root,
-            current_state_revision: 0,
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label("delta-old-control"),
-            schema_presence_bloom: [0; 4],
-        };
-        let new_control = BranchHeadControl {
-            head_commit_id: new_root,
-            tracked_generation: new_root,
-            untracked_generation: new_root,
-            current_state_revision: 0,
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label("delta-new-control"),
-            schema_presence_bloom: [0; 4],
-        };
-        let delta = RootReachabilityDelta {
-            branch_id: "main".to_string(),
-            old_root: Some(old_root),
-            new_root: Some(new_root),
-            old_control: Some(old_control),
-            new_control: Some(new_control),
-            old_control_digest: root_control_digest_for_control(Some(&old_control))
-                .expect("old control should encode"),
-            new_control_digest: root_control_digest_for_control(Some(&new_control))
-                .expect("new control should encode"),
-        };
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("queue read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            std::slice::from_ref(&delta),
-            &[new_root],
-            &mut preconditions,
-        )
-        .await
-        .expect("delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("delta should commit atomically");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("queue read should reopen");
-        let (queue, _) = load_reachability_queue(&read)
-            .await
-            .expect("queue should decode");
-        let batches = load_reachability_batches(&read, &queue)
-            .await
-            .expect("delta should decode");
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].1.checkpoint_roots, vec![new_root]);
-        assert_eq!(batches[0].1.deltas[0].old_root, Some(old_root));
-    }
-
-    fn checkpoint_replacement_delta(
-        label: &str,
-        old_root: CommitId,
-        new_root: CommitId,
-    ) -> RootReachabilityDelta {
-        let timestamp = LixTimestamp::expect_parse(
-            "checkpoint replacement test timestamp",
-            "2026-01-01T00:00:00Z",
-        );
-        let old_control = BranchHeadControl {
-            head_commit_id: old_root,
-            tracked_generation: old_root,
-            untracked_generation: old_root,
-            current_state_revision: 0,
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label(&format!("{label}-old-control")),
-            schema_presence_bloom: [0; 4],
-        };
-        let new_control = BranchHeadControl {
-            head_commit_id: new_root,
-            tracked_generation: new_root,
-            untracked_generation: new_root,
-            current_state_revision: 1,
-            working_diff_checkpoint_commit_id: Some(new_root),
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label(&format!("{label}-new-control")),
-            schema_presence_bloom: [0; 4],
-        };
-        RootReachabilityDelta {
-            branch_id: label.to_owned(),
-            old_root: Some(old_root),
-            new_root: Some(new_root),
-            old_control: Some(old_control),
-            new_control: Some(new_control),
-            old_control_digest: root_control_digest_for_control(Some(&old_control))
-                .expect("old replacement control should encode"),
-            new_control_digest: root_control_digest_for_control(Some(&new_control))
-                .expect("new replacement control should encode"),
-        }
-    }
-
-    async fn append_replacement_delta(
-        storage: &StorageAdapter<Memory>,
-        delta: RootReachabilityDelta,
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("replacement publication read should open");
-        let checkpoint = delta.new_root.expect("replacement has a new root");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            std::slice::from_ref(&delta),
-            &[checkpoint],
-            &mut preconditions,
-        )
-        .await
-        .expect("replacement delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("replacement delta should commit");
-    }
-
-    #[tokio::test]
-    async fn pending_checkpoint_replacement_is_unique_and_queue_cas_fenced() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut seed = storage.new_write_set();
-        stage_reachability_queue_seed(&mut seed).expect("queue seed should stage");
-        storage
-            .commit_write_set(seed, StorageWriteOptions::default())
-            .await
-            .expect("queue seed should commit");
-
-        let recovered = CommitId::for_test_label("pending-replacement-recovered");
-        let checkpoint = CommitId::for_test_label("pending-replacement-checkpoint");
-        append_replacement_delta(
-            &storage,
-            checkpoint_replacement_delta("main", recovered, checkpoint),
-        )
-        .await;
-
-        let stale_read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("branch publication read should open"),
-        );
-        let proof = resolve_pending_checkpoint_replacement(&stale_read, recovered)
-            .await
-            .expect("unique pending replacement should authenticate")
-            .expect("pending replacement should exist");
-        assert_eq!(proof.checkpoint_commit_id, checkpoint);
-        assert_eq!(proof.checkpoint_branch_id, "main");
-
-        let mut stale_writes = storage.new_write_set();
-        let mut stale_preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &stale_read,
-            &mut stale_writes,
-            &[],
-            &[checkpoint],
-            &mut stale_preconditions,
-        )
-        .await
-        .expect("branch-side queue fence should stage");
-
-        let second_checkpoint = CommitId::for_test_label("pending-replacement-checkpoint-2");
-        append_replacement_delta(
-            &storage,
-            checkpoint_replacement_delta("main", recovered, second_checkpoint),
-        )
-        .await;
-        let stale_error = storage
-            .commit_write_set(
-                stale_writes,
-                StorageWriteOptions {
-                    preconditions: stale_preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect_err("stale branch publication must lose the queue CAS");
-        assert!(stale_error.to_string().contains("precondition"));
-
-        let read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("ambiguous replacement read should open"),
-        );
-        let ambiguous = resolve_pending_checkpoint_replacement(&read, recovered)
-            .await
-            .expect_err("two pending direct replacements must fail closed");
-        assert!(ambiguous.message.contains("ambiguous"));
-    }
-
-    #[tokio::test]
-    async fn recovery_ref_without_pending_replacement_is_not_branchable_authority() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
         let recovered = CommitId::for_test_label("consumed-replacement-recovered");
         let checkpoint = CommitId::for_test_label("consumed-replacement-checkpoint");
         stage_recovery_ref_rotation(
@@ -4704,460 +3673,8 @@ mod tests {
         );
         let error = resolve_pending_checkpoint_replacement(&read, recovered)
             .await
-            .expect_err("a mutable recovery ref must not replace a consumed queue proof");
+            .expect_err("a recovery ref no live control still serves is not a branchable root");
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn malformed_pending_checkpoint_replacement_fails_closed() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut seed = storage.new_write_set();
-        stage_reachability_queue_seed(&mut seed).expect("queue seed should stage");
-        storage
-            .commit_write_set(seed, StorageWriteOptions::default())
-            .await
-            .expect("queue seed should commit");
-
-        let recovered = CommitId::for_test_label("malformed-replacement-recovered");
-        let checkpoint = CommitId::for_test_label("malformed-replacement-checkpoint");
-        let mut malformed = checkpoint_replacement_delta("main", recovered, checkpoint);
-        malformed
-            .new_control
-            .as_mut()
-            .expect("replacement has new control")
-            .working_diff_checkpoint_commit_id = None;
-        malformed.new_control_digest =
-            root_control_digest_for_control(malformed.new_control.as_ref())
-                .expect("malformed control should still encode");
-        append_replacement_delta(&storage, malformed).await;
-
-        let read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("malformed replacement read should open"),
-        );
-        let error = resolve_pending_checkpoint_replacement(&read, recovered)
-            .await
-            .expect_err("mapping without an exact checkpoint baseline must fail closed");
-        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn authenticated_queue_fold_streams_beyond_one_page_and_fails_closed_on_corruption() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("queue seed should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("queue seed should commit");
-        let roots = (0..65)
-            .map(|index| CommitId::for_test_label(&format!("queue-root-{index}")))
-            .collect::<Vec<_>>();
-        for root in &roots {
-            append_checkpoint_batch(&storage, std::slice::from_ref(root)).await;
-        }
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("full queue read should open");
-        let (queue, _) = load_reachability_queue(&read)
-            .await
-            .expect("queue should load");
-        assert_eq!(
-            load_reachability_batches(&read, &queue)
-                .await
-                .expect("bounded retirement batches should load")
-                .len(),
-            64
-        );
-        assert_eq!(
-            collect_all_reachability_checkpoint_roots(&read, &queue)
-                .await
-                .expect("full root fold should load"),
-            roots.iter().copied().collect()
-        );
-        drop(read);
-
-        let mut corrupt = storage.new_write_set();
-        corrupt.put(
-            GC_REACHABILITY_DELTA_SPACE,
-            super::reachability_sequence_key(65),
-            StorageValue {
-                bytes: Bytes::from_static(b"corrupt-authenticated-queue-batch"),
-            },
-        );
-        storage
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .expect("queue corruption fixture should commit");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("corrupt queue read should open");
-        assert!(
-            collect_all_reachability_checkpoint_roots(&read, &queue)
-                .await
-                .is_err(),
-            "the shared decoder must authenticate every page"
-        );
-    }
-
-    async fn stage_root_only_branch_publication(
-        storage: &StorageAdapter<Memory>,
-        new_control: BranchHeadControl,
-    ) -> (StorageWriteSet, Vec<StoragePrecondition>) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("new branch publication read should open");
-        let mut publication = storage.new_write_set();
-        stage_branch_head_control(&mut publication, "queue-race-branch", new_control)
-            .expect("new branch control should stage");
-        let delta = RootReachabilityDelta {
-            branch_id: "queue-race-branch".to_owned(),
-            old_root: None,
-            new_root: Some(new_control.head_commit_id),
-            old_control: None,
-            new_control: Some(new_control),
-            old_control_digest: root_control_digest_for_control(None).unwrap(),
-            new_control_digest: root_control_digest_for_control(Some(&new_control)).unwrap(),
-        };
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(&read, &mut publication, &[delta], &[], &mut preconditions)
-            .await
-            .expect("new branch queue batch should stage");
-        (publication, preconditions)
-    }
-
-    async fn queue_publication_race_rejects_stale_peer(blocked_queue: bool, gc_first: bool) {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("race repository should initialize");
-        let storage = StorageAdapter::new(backend);
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("orphan staging read should open");
-        let mut orphan_writes = storage.new_write_set();
-        let orphan = crate::binary_cas::BinaryCasContext::new()
-            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
-            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
-                b"queue-race-orphan".to_vec(),
-            ))
-            .await
-            .expect("orphan payload should stage");
-        drop(read);
-        storage
-            .commit_write_set(orphan_writes, StorageWriteOptions::default())
-            .await
-            .expect("orphan payload should commit");
-
-        let (main_branch_id, main_control) = BranchHeadControlContext::new()
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("main control read should open"),
-            )
-            .scan()
-            .await
-            .expect("branch controls should load")
-            .into_iter()
-            .find(|(branch_id, _)| branch_id != GLOBAL_BRANCH_ID)
-            .expect("workspace branch control should exist");
-        if blocked_queue {
-            let read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("blocked batch read should open");
-            let mut writes = storage.new_write_set();
-            let mut preconditions = Vec::new();
-            let delta = RootReachabilityDelta {
-                branch_id: main_branch_id,
-                old_root: Some(main_control.head_commit_id),
-                new_root: Some(main_control.head_commit_id),
-                old_control: Some(main_control),
-                new_control: Some(main_control),
-                old_control_digest: root_control_digest_for_control(Some(&main_control)).unwrap(),
-                new_control_digest: root_control_digest_for_control(Some(&main_control)).unwrap(),
-            };
-            stage_reachability_delta_batch(&read, &mut writes, &[delta], &[], &mut preconditions)
-                .await
-                .expect("blocked batch should stage");
-            drop(read);
-            storage
-                .commit_write_set(
-                    writes,
-                    StorageWriteOptions {
-                        preconditions,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await
-                .expect("blocked batch should commit");
-        }
-
-        let stale_read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("stale sweep read should open"),
-        );
-        let mut stale_writes = storage.new_write_set();
-        let mut stale_preconditions = Vec::new();
-        let plan = super::stage_repository_gc_with_preconditions(
-            stale_read,
-            &mut stale_writes,
-            &mut stale_preconditions,
-        )
-        .await
-        .expect("stale sweep should stage");
-        assert_eq!(plan.sweep.binary_cas.reclaimed_chunk_rows, 1);
-
-        let mut new_control = main_control;
-        new_control.ref_change_id = ChangeId::for_test_label("queue-race-new-branch-ref");
-        let (publication, publication_preconditions) =
-            stage_root_only_branch_publication(&storage, new_control).await;
-        if gc_first {
-            storage
-                .commit_write_set(
-                    stale_writes,
-                    StorageWriteOptions {
-                        preconditions: stale_preconditions,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await
-                .expect("GC should win the root-publication epoch");
-            let error = storage
-                .commit_write_set(
-                    publication,
-                    StorageWriteOptions {
-                        preconditions: publication_preconditions,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await
-                .expect_err("stale root-only publication must lose after GC");
-            assert!(error.to_string().contains("precondition"));
-            let (retry, retry_preconditions) =
-                stage_root_only_branch_publication(&storage, new_control).await;
-            storage
-                .commit_write_set(
-                    retry,
-                    StorageWriteOptions {
-                        preconditions: retry_preconditions,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await
-                .expect("fresh root-only publication retry should commit");
-            let control = BranchHeadControlContext::new()
-                .reader(
-                    storage
-                        .begin_read(StorageReadOptions::default())
-                        .await
-                        .expect("root-only retry verification read should open"),
-                )
-                .load("queue-race-branch")
-                .await
-                .expect("root-only retry control should load");
-            assert_eq!(control, Some(new_control));
-            let read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("GC-first orphan verification read should open");
-            let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-            assert!(
-                reader
-                    .load_bytes_many(&[orphan.hash])
-                    .await
-                    .expect("GC-first orphan verification should load")
-                    .into_vec()[0]
-                    .is_none()
-            );
-            return;
-        }
-        storage
-            .commit_write_set(
-                publication,
-                StorageWriteOptions {
-                    preconditions: publication_preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("new branch publication should commit");
-
-        let error = storage
-            .commit_write_set(
-                stale_writes,
-                StorageWriteOptions {
-                    preconditions: stale_preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect_err("stale sweep must not commit after queue publication");
-        assert!(error.to_string().contains("precondition"));
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("orphan verification read should open");
-        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-        assert!(
-            reader
-                .load_bytes_many(&[orphan.hash])
-                .await
-                .expect("orphan should remain readable")
-                .into_vec()[0]
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn repository_gc_epoch_serializes_root_only_publication_in_both_orders() {
-        queue_publication_race_rejects_stale_peer(false, false).await;
-        queue_publication_race_rejects_stale_peer(true, false).await;
-        queue_publication_race_rejects_stale_peer(false, true).await;
-        queue_publication_race_rejects_stale_peer(true, true).await;
-    }
-
-    #[tokio::test]
-    async fn repository_gc_marks_binary_roots_from_checkpoint_batches_beyond_retirement_window() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("full-queue repository should initialize");
-        let engine = Engine::new(backend.clone())
-            .await
-            .expect("full-queue repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("full-queue session should open");
-        let live_bytes = b"checkpoint-batch-65-live-blob";
-        session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/queued.bin', $1)",
-                &[Value::Blob(live_bytes.to_vec().into())],
-            )
-            .await
-            .expect("queued file should publish");
-        let retained_commit = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .expect("retained commit should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("retained commit id should exist");
-        let retained_commit = CommitId::parse_lix(&retained_commit, "retained queued commit")
-            .expect("retained commit id should parse");
-        session
-            .execute("DELETE FROM lix_file WHERE path = '/queued.bin'", &[])
-            .await
-            .expect("queued file should retire from current state");
-        let current_commit = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .expect("current commit should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("current commit id should exist");
-        let current_commit = CommitId::parse_lix(&current_commit, "current queued commit")
-            .expect("current commit id should parse");
-
-        let storage = StorageAdapter::new(backend.clone());
-        loop {
-            let read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("queue length read should open");
-            let (queue, _) = load_reachability_queue(&read)
-                .await
-                .expect("queue length should load");
-            let pending = if queue.head_sequence == 0 {
-                0
-            } else {
-                queue.tail_sequence - queue.head_sequence + 1
-            };
-            drop(read);
-            if pending >= 64 {
-                break;
-            }
-            append_checkpoint_batch(&storage, &[current_commit]).await;
-        }
-        append_checkpoint_batch(&storage, &[retained_commit]).await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("orphan staging read should open");
-        let mut orphan_writes = storage.new_write_set();
-        let orphan = crate::binary_cas::BinaryCasContext::new()
-            .writer_skipping_existing_chunks(&read, &mut orphan_writes)
-            .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(
-                b"unrelated-full-queue-orphan".to_vec(),
-            ))
-            .await
-            .expect("unrelated orphan should stage");
-        drop(read);
-        storage
-            .commit_write_set(orphan_writes, StorageWriteOptions::default())
-            .await
-            .expect("unrelated orphan should commit");
-
-        let read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("repository sweep read should open"),
-        );
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        let plan =
-            super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
-                .await
-                .expect("full-queue repository sweep should stage");
-        assert!(plan.sweep.binary_cas.reclaimed_chunk_rows >= 1);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("full-queue repository sweep should commit");
-
-        drop(session);
-        drop(engine);
-        let _reopened = Engine::new(backend.clone())
-            .await
-            .expect("repository should reopen after full-queue sweep");
-        let read = StorageAdapter::new(backend)
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("cold CAS read should open");
-        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-        let blobs = reader
-            .load_bytes_many(&[
-                crate::binary_cas::BlobId::from_content(live_bytes),
-                orphan.hash,
-            ])
-            .await
-            .expect("cold CAS read should succeed")
-            .into_vec();
-        assert_eq!(blobs[0].as_deref(), Some(live_bytes.as_slice()));
-        assert!(
-            blobs[1].is_none(),
-            "unrelated CAS garbage must be reclaimed"
-        );
     }
 
     #[tokio::test]
@@ -5596,22 +4113,103 @@ mod tests {
         assert_eq!(present, expected);
     }
 
+    /// The derivation replaces `gc.reachability_delta.v1`. It must name every
+    /// commit that still owns physical state — including one no ref can reach,
+    /// which is what a deleted branch leaves behind and what a walk from refs
+    /// structurally cannot find — and it must shrink as retirement succeeds.
+    #[tokio::test]
+    async fn derived_candidates_are_the_commits_that_still_own_physical_state() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("derived candidate timestamp", "2026-01-01T00:00:00Z");
+        let head = replay_commit_record("derived-candidate-head", 0, None, timestamp);
+        // No commit record and no parent link binds this one to anything.
+        let orphan = replay_commit_record("derived-candidate-orphan", 0, None, timestamp);
+        let mut head_manifest =
+            test_commit_state_manifest(&head, CommitStateMutationInventory::default());
+        head_manifest.replay_debt = CommitStateReplayDebt::default();
+        head_manifest.snapshot_root = Some(Box::new(test_snapshot_root(head.commit_id)));
+        let mut orphan_manifest =
+            test_commit_state_manifest(&orphan, CommitStateMutationInventory::default());
+        orphan_manifest.replay_debt = CommitStateReplayDebt::default();
+        orphan_manifest.snapshot_root = Some(Box::new(test_snapshot_root(orphan.commit_id)));
+        persist_replay_closure_fixture(
+            &storage,
+            storage.new_write_set(),
+            &[head.clone()],
+            &[head_manifest, orphan_manifest],
+        )
+        .await;
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("derived candidate read should open"),
+        );
+        let derived = derive_retirement_candidates(&read)
+            .await
+            .expect("candidates should derive from the manifest plane alone");
+        assert_eq!(
+            derived.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([head.commit_id, orphan.commit_id]),
+            "every commit owning physical state is a candidate, reachable or not"
+        );
+        drop(read);
+
+        // Retiring the physical state is what removes a candidate. Nothing is
+        // remembered about the retirement; the inventory simply gets shorter.
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("retirement read should open"),
+        );
+        let mut writes = storage.new_write_set();
+        crate::tracked_state::stage_retire_commit_physical_state(
+            &read,
+            &mut writes,
+            orphan.commit_id,
+            crate::tracked_state::RetainedPhysicalState {
+                mutation_nodes: &BTreeSet::new(),
+                scoped_nodes: &BTreeSet::new(),
+                native_parts: &BTreeSet::new(),
+            },
+        )
+        .await
+        .expect("orphan physical state should retire");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("orphan retirement should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("post-retirement read should open"),
+        );
+        let derived = derive_retirement_candidates(&read)
+            .await
+            .expect("candidates should derive after retirement");
+        assert_eq!(derived, vec![head.commit_id]);
+    }
+
     #[test]
     fn retirement_requires_history_and_pin_dependency_closure() {
         let old = CommitId::for_test_label("history-old");
         let new = CommitId::for_test_label("history-new");
         let active = BTreeSet::from([new]);
         let mut dependencies = BTreeSet::from([old]);
-        assert!(!retirement_is_proven(
-            old,
-            Some(new),
-            &active,
-            &dependencies
-        ));
+        assert!(!retirement_is_proven(old, &active, &dependencies));
         // Once history/diff/undo/redo/checkpoint pins release the old root,
-        // the delta is a valid physical-retirement proof.
+        // the derived candidate is a valid physical-retirement proof.
         dependencies.clear();
-        assert!(retirement_is_proven(old, Some(new), &active, &dependencies));
+        assert!(retirement_is_proven(old, &active, &dependencies));
+        // A live root is never a candidate: chronology roots are the authority
+        // set, so the retirement proof rejects them without a second check.
+        assert!(!retirement_is_proven(new, &active, &dependencies));
     }
 
     #[tokio::test]
@@ -7067,7 +5665,6 @@ mod tests {
         BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(commit_id),
             created_at: timestamp,
@@ -7159,179 +5756,19 @@ mod tests {
             .expect("replay fixture should commit");
     }
 
-    async fn stage_replay_root_delta(
-        storage: &StorageAdapter<Memory>,
-        delta: RootReachabilityDelta,
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("replay delta read should open");
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            std::slice::from_ref(&delta),
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("replay delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("replay delta should commit");
-    }
-
-    async fn publish_replay_root_release(
+    /// Moves a branch head. With the reachability ledger gone this is the whole
+    /// publication a sweep needs to see: the superseded root is derived from the
+    /// new head's canonical parent links.
+    async fn publish_branch_head_release(
         storage: &StorageAdapter<Memory>,
         branch_id: &str,
-        old_control: BranchHeadControl,
         new_control: BranchHeadControl,
+        manifest: CommitStateManifest,
     ) {
         let mut writes = storage.new_write_set();
         stage_branch_head_control(&mut writes, branch_id, new_control)
-            .expect("released replay control should stage");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("replay release read should open");
-        let mut preconditions = Vec::new();
-        stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &[RootReachabilityDelta {
-                branch_id: branch_id.to_owned(),
-                old_root: Some(old_control.head_commit_id),
-                new_root: Some(new_control.head_commit_id),
-                old_control: Some(old_control),
-                new_control: Some(new_control),
-                old_control_digest: root_control_digest_for_control(Some(&old_control))
-                    .expect("old replay control should encode"),
-                new_control_digest: root_control_digest_for_control(Some(&new_control))
-                    .expect("new replay control should encode"),
-            }],
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("replay release delta should stage");
-        drop(read);
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("replay release should publish");
-    }
-
-    /// Reproduction of a known, unfixed defect: the retirement ledger never
-    /// drains, so `gc.reachability_delta.v1` grows one ~439 B row per branch
-    /// publication forever.
-    ///
-    /// Measured cause (this test, plus `expv_blind_space_growth commits`): it
-    /// is *not* head-of-line blocking and not the 64-row consumption cap. Every
-    /// delta is blocked on its own merits, because every commit that still owns
-    /// a live current-state scoped-range part is inserted into
-    /// `physical_authorities` (see the `source_kind` 0 | 2 arm of
-    /// `load_authenticated_serving_dependency_closure`). In an append-only
-    /// workload that is every commit, so `retirement_is_proven` is false for
-    /// every `old_root` even after a checkpoint releases the undo interval.
-    ///
-    /// Fixing it therefore requires either compacting live current state so old
-    /// commits stop owning live parts, or deriving retirement candidates from
-    /// the manifests instead of storing a per-publication ledger. Both are
-    /// larger than this change, so the reproduction is kept and ignored rather
-    /// than deleted.
-    #[tokio::test]
-    #[ignore = "reproduces the unfixed retirement-ledger leak; see the doc comment"]
-    async fn ordinary_gc_drains_the_reachability_queue_past_a_pinned_head() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("queue drain fixture should initialize");
-        let engine = Engine::new(backend.clone())
-            .await
-            .expect("queue drain fixture should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("queue drain session should open");
-        let schema = serde_json::json!({
-            "x-lix-key": "gc_queue_drain_fixture",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "required": ["path", "value"],
-            "properties": {
-                "path": { "type": "string" },
-                "value": { "type": ["object", "array", "string", "number", "integer", "boolean", "null"] }
-            },
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .expect("queue drain schema should register");
-        for row in 0..24 {
-            session
-                .execute(
-                    "INSERT INTO gc_queue_drain_fixture (path, value) VALUES ($1, lix_json($2))",
-                    &[
-                        Value::Text(format!("/row/{row}")),
-                        Value::Text(format!(r#"{{"v":{row}}}"#)),
-                    ],
-                )
-                .await
-                .expect("queue drain row should publish");
-        }
-        // A checkpoint releases the undo interval, so every commit below it is
-        // provably retirable and its delta is consumable.
-        session
-            .create_checkpoint()
-            .await
-            .expect("queue drain checkpoint should publish");
-
-        let storage = StorageAdapter::new(backend.clone());
-        let queue_depth = async |storage: &StorageAdapter<Memory>| {
-            let read = SharedStorageAdapterRead::new(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("queue depth read should open"),
-            );
-            let (queue, _) = load_reachability_queue(&read)
-                .await
-                .expect("queue depth should load");
-            queue.tail_sequence.saturating_sub(queue.head_sequence)
-        };
-        let before = queue_depth(&storage).await;
-        assert!(before > 0, "the fixture must leave a non-empty queue");
-
-        // Repeated sweeps must converge, not plateau.
-        let mut after = before;
-        for _ in 0..8 {
-            run_ordinary_repository_gc(&storage).await;
-            after = queue_depth(&storage).await;
-        }
-        assert!(
-            after < before,
-            "repeated GC left the retirement ledger at {after} of {before} deltas"
-        );
+            .expect("released control should stage");
+        persist_replay_closure_fixture(storage, writes, &[], std::slice::from_ref(&manifest)).await;
     }
 
     async fn run_ordinary_repository_gc(
@@ -7404,7 +5841,7 @@ mod tests {
     /// select, so the ordinary pass must reclaim it — no second sweeper, no
     /// retention ledger.
     #[tokio::test]
-    async fn ordinary_gc_reclaims_the_serving_generation_of_a_deleted_branch() {
+    async fn branch_deletion_reclaims_its_serving_generation_without_a_sweep() {
         let backend = Memory::new();
         Engine::initialize(backend.clone())
             .await
@@ -7501,12 +5938,19 @@ mod tests {
             )
             .await
             .expect("generation fixture branch should delete");
+        // A serving generation is reachable from exactly one place: its branch
+        // control. Deleting that control retires the generation in the same
+        // atomic write set, so there is nothing left for a sweep to find and
+        // nothing for a publication ledger to remember on its behalf.
+        assert_eq!(
+            hot_generation_rows(&storage, &branch.id, generation).await,
+            0,
+            "branch deletion must retire its own serving generation ({seeded} rows)"
+        );
         let plan = run_ordinary_repository_gc(&storage).await;
-
-        assert!(
-            plan.sweep.reclaimed_generation_rows >= seeded as u64,
-            "ordinary GC reclaimed {} of {seeded} stranded serving rows",
-            plan.sweep.reclaimed_generation_rows
+        assert_eq!(
+            plan.sweep.reclaimed_generation_rows, 0,
+            "the sweep has no generation debt left to collect"
         );
         assert_eq!(
             hot_generation_rows(&storage, &branch.id, generation).await,
@@ -7539,10 +5983,7 @@ mod tests {
             .scan()
             .await
             .expect("audited retention controls should load");
-        let (queue, _) = load_reachability_queue(&read)
-            .await
-            .expect("audited retention queue should load");
-        let closure = super::load_authenticated_repository_retention(&read, &controls, &queue)
+        let closure = super::load_authenticated_repository_retention(&read, &controls)
             .await
             .expect("serving-dependency closure should authenticate");
         super::audit_repository_gc_standalone_refs(&read)
@@ -7632,11 +6073,8 @@ mod tests {
             .scan()
             .await
             .expect("offline authority controls should load");
-        let (queue, _) = load_reachability_queue(&read)
-            .await
-            .expect("offline authority queue should load");
         let closure_error =
-            super::load_authenticated_repository_retention(&read, &controls, &queue)
+            super::load_authenticated_repository_retention(&read, &controls)
                 .await
                 .expect_err("the retention closure must fail closed");
         let audit_error = super::audit_repository_gc_standalone_refs(&read)
@@ -7711,7 +6149,6 @@ mod tests {
             test_commit_state_manifest(&child, CommitStateMutationInventory::default());
         child_manifest.replay_debt.depth = 2;
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("replay-debt queue should seed");
         stage_branch_head_control(
             &mut writes,
             "main",
@@ -7746,7 +6183,6 @@ mod tests {
             timestamp,
         );
         let mut writes = storage.new_write_set();
-        stage_reachability_queue_seed(&mut writes).expect("replay-cycle queue should seed");
         let left_inventory = stage_replacement_inventory(
             &mut writes,
             left.commit_id,

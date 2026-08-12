@@ -2998,6 +2998,7 @@ where
                 bound,
                 &file_key.file_id,
                 &file_key.branch_id,
+                file_key.untracked,
             )? {
                 rows.push(row);
             }
@@ -3034,6 +3035,13 @@ where
                     })
                     .collect(),
                 projection: plugin_state_live_state_projection(),
+                // Lane is a property of each requested file, but the exact-batch
+                // request carries one lane for the whole batch. Every file that
+                // reaches plugin reconciliation is tracked today, so this is
+                // exact. Unskipping untracked files requires either a per-row
+                // lane here or partitioning the batch by lane; leaving it as a
+                // constant would silently miss an existing untracked
+                // reservation and re-reserve over it.
                 untracked: Some(false),
                 include_tombstones: false,
             })
@@ -3046,6 +3054,7 @@ where
                 *bound,
                 &file_key.file_id,
                 &file_key.branch_id,
+                file_key.untracked,
             )?;
             existing_rows.push(existing);
         }
@@ -3062,7 +3071,7 @@ where
                     schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
                     branch_ids: vec![file_key.branch_id.clone()],
                     file_ids: vec![NullableKeyFilter::Value(file_key.file_id.clone())],
-                    untracked: Some(false),
+                    untracked: Some(file_key.untracked),
                     ..Default::default()
                 },
                 projection: plugin_registry_live_state_projection(),
@@ -3079,6 +3088,7 @@ where
                     key,
                     &file_key.file_id,
                     &file_key.branch_id,
+                    file_key.untracked,
                 )?);
             }
         }
@@ -4441,7 +4451,7 @@ where
                 let desired_owner =
                     PluginFileOwner::from_registry_entry(write.file_id.clone(), &selected)?;
                 let owner_change_id = self.functions.call_uuid_v7().to_string();
-                let mut owner_row = desired_owner.write_row(&write.branch_id)?;
+                let mut owner_row = desired_owner.write_row(&write.branch_id, write.untracked)?;
                 owner_row.change_id = Some(owner_change_id.clone());
                 let actor_key = PluginActorKey {
                     branch_id: write.branch_id.clone(),
@@ -4699,7 +4709,7 @@ where
                 let context = FilesystemRowContext {
                     branch_id: write.branch_id.clone(),
                     global: false,
-                    untracked: false,
+                    untracked: write.untracked,
                     file_id: None,
                     metadata: None,
                 };
@@ -4754,7 +4764,7 @@ where
             let context = FilesystemRowContext {
                 branch_id: write.branch_id.clone(),
                 global: false,
-                untracked: false,
+                untracked: write.untracked,
                 file_id: None,
                 metadata: None,
             };
@@ -4795,6 +4805,7 @@ where
                     rows.push(PluginFileOwner::delete_row(
                         write.file_id.clone(),
                         &write.branch_id,
+                        write.untracked,
                     )?);
                 }
                 reconciled_file_keys.insert(file_key);
@@ -4818,7 +4829,7 @@ where
             let owner_needs_write = plugin_owner_needs_write(owner, &desired_owner);
             let owner_change_id = if owner_needs_write {
                 let owner_change_id = self.functions.call_uuid_v7().to_string();
-                let mut owner_row = desired_owner.write_row(&write.branch_id)?;
+                let mut owner_row = desired_owner.write_row(&write.branch_id, write.untracked)?;
                 owner_row.change_id = Some(owner_change_id.clone());
                 rows.push(owner_row);
                 owner_change_id
@@ -6120,8 +6131,11 @@ where
                 &file_key.branch_id,
                 &file_key.file_id,
             ));
-            let owner_tombstone =
-                PluginFileOwner::delete_row(file_key.file_id, &file_key.branch_id)?;
+            let owner_tombstone = PluginFileOwner::delete_row(
+                file_key.file_id,
+                &file_key.branch_id,
+                file_key.untracked,
+            )?;
             if let Some(rows) = &mut reconciled_rows {
                 rows.push_raw(owner_tombstone);
             } else {
@@ -9098,7 +9112,7 @@ where
         };
         let mut generation = TrackedHeadContext::new()
             .reader(read)
-            .collection_generation(branch_id, control.untracked_generation, scope)
+            .collection_generation(branch_id, control.tracked_generation, scope)
             .await?;
         let staged = self.staged_writes.staging_overlay()?;
         if StagedLiveStateRows::collection_replaced(
@@ -9131,7 +9145,7 @@ where
         };
         TrackedHeadContext::new()
             .reader(read)
-            .exact_collection_live_count(branch_id, control.untracked_generation, scope)
+            .exact_collection_live_count(branch_id, control.tracked_generation, scope)
             .await
             .map(Some)
     }

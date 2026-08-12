@@ -10,7 +10,7 @@ use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
     BranchHeadControlObservation, BranchRefReader, branch_head_control_precondition,
-    stage_branch_head_control, stage_delete_branch_head_control, untracked_lifecycle_generation,
+    stage_branch_head_control, stage_delete_branch_head_control,
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
@@ -246,9 +246,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
     let mut writes = StorageWriteSet::new();
     let mut preconditions = Vec::new();
-    #[cfg(test)]
-    let seeded_reachability_queue =
-        crate::gc::ensure_reachability_queue_for_test(&*read, &mut writes).await?;
     for publication in &prepared_writes.checkpoint_publications {
         crate::gc::stage_recovery_ref_rotation(&mut writes, &publication.recovery_ref)?;
         crate::gc::stage_checkpoint_gc_state(&mut writes, &publication.gc_state)?;
@@ -380,11 +377,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &deleted_checkpoint_files,
     )
     .await?;
-    // Branch-owned plugin checkpoints are derived serving state.  Branch
-    // deletion publishes the authenticated lifecycle/control retirement here;
-    // the GC reachability consumer reclaims the UUID range after the retired
-    // root is proven unreachable.  Avoid scanning the entire checkpoint range
-    // in the foreground write transaction.
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.first_commit_parent_override_by_branch,
@@ -766,7 +758,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     )
     .await?;
     let mut root_backed_branch_publications = BTreeSet::new();
-    let mut root_reachability_deltas = Vec::new();
     let published_branch_controls = stage_branch_head_control_publications(
         read,
         &mut writes,
@@ -780,29 +771,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut preconditions,
         &branch_control_observations,
         &mut root_backed_branch_publications,
-        &mut root_reachability_deltas,
     )
     .await?;
-    #[cfg(test)]
-    if seeded_reachability_queue {
-        // The seed and first publication share this test-only bootstrap write
-        // set; the production initializer always commits the queue before any
-        // branch publication, so no delta can be lost in live repositories.
-        root_reachability_deltas.clear();
-    }
-    let checkpoint_roots = prepared_writes
-        .checkpoint_publications
-        .iter()
-        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
-        .collect::<Vec<_>>();
-    crate::gc::stage_reachability_delta_batch(
-        read,
-        &mut writes,
-        &root_reachability_deltas,
-        &checkpoint_roots,
-        &mut preconditions,
-    )
-    .await?;
+    // The binary-CAS publication fence used to ride along with the reachability
+    // delta writer. It is an authenticated root-publication fence in its own
+    // right, so it stages here even when the transition only revives an
+    // existing commit and stages no blob bytes.
+    crate::binary_cas::stage_cas_publication_fence(read, &mut writes, &mut preconditions).await?;
     if !published_branch_controls.contains_key(crate::GLOBAL_BRANCH_ID) {
         let global = branch_control_observations
             .get(crate::GLOBAL_BRANCH_ID)
@@ -3496,7 +3471,6 @@ async fn stage_tracked_head(
         .collect::<BTreeSet<_>>();
     let tracked_head = TrackedHeadContext::new();
     let mut controls = BTreeMap::new();
-    let mut key_value_control_mutations = BTreeSet::new();
     let mut deferred_fresh_hot_plans = Vec::new();
     let mut exclusive_certified_columnar_publication = false;
 
@@ -3568,15 +3542,6 @@ async fn stage_tracked_head(
         } else {
             None
         };
-        if state_row_indices.iter().any(|&row_index| {
-            let row = state_rows.row(row_index);
-            !row.untracked && row.schema_key == "lix_key_value"
-        }) || selected_materialization
-            .as_ref()
-            .is_some_and(|(rows, _, _)| rows.iter().any(|row| row.schema_key == "lix_key_value"))
-        {
-            key_value_control_mutations.insert(root.branch_id.as_str());
-        }
         let mut untracked_deltas = if certified_columnar_parts.is_some() {
             Vec::new()
         } else {
@@ -3680,38 +3645,6 @@ async fn stage_tracked_head(
                     certified_fresh_plugin_file_id,
                 )
             };
-        if let Some(control) = parent_control
-            .filter(|control| control.tracked_generation != control.untracked_generation)
-        {
-            let split_generation_guards = state_row_indices
-                .iter()
-                .filter_map(|&row_index| {
-                    let row = state_rows.row(row_index);
-                    (row.branch_id.as_str() == root.branch_id
-                        && !row.untracked
-                        && row.snapshot.is_some())
-                    .then_some(TrackedStateKeyRef {
-                        schema_key: row.schema_key,
-                        file_id: row.file_id.map(crate::common::SharedStr::as_str),
-                        entity_pk: row.entity_pk,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let guards_to_check = if split_generation_guards.is_empty() {
-                &absence_guards
-            } else {
-                &split_generation_guards
-            };
-            if !guards_to_check.is_empty() {
-                reject_tracked_absence_guards_against_untracked(
-                    read,
-                    &root.branch_id,
-                    control,
-                    guards_to_check,
-                )
-                .await?;
-            }
-        }
         let parent_generation = match (root.parent_commit_id, parent_control) {
             (_, Some(control)) if is_checkpoint_publication => Some(control.tracked_generation),
             (Some(parent_commit_id), Some(control))
@@ -3739,6 +3672,9 @@ async fn stage_tracked_head(
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
             let mut coverage = WorkingDiffIndexCoverage::default();
             let owned_absence_guards = owned_absence_guards(&absence_guards);
+            // One generation carries both retentions, so the branch's
+            // history-free rows are preserved from — and republished into —
+            // that same complete snapshot. There is no second root to advance.
             let (final_tracked, schema_keys) = tracked_head
                 .writer(read, writes)
                 .stage_complete_current_state_with_working_diff(
@@ -3747,7 +3683,7 @@ async fn stage_tracked_head(
                     final_tracked,
                     parent_control.map(|control| control.tracked_generation),
                     &[],
-                    &[],
+                    &untracked_deltas,
                     &owned_absence_guards,
                     checkpoint_commit_id,
                     &mut coverage,
@@ -3755,30 +3691,6 @@ async fn stage_tracked_head(
                 .await?;
             let mut control =
                 normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
-            if !untracked_deltas.is_empty() {
-                let previous_untracked_generation = parent_control
-                    .map(|parent| parent.untracked_generation)
-                    .unwrap_or(generation);
-                let next_revision = parent_control.map_or(Ok(0), |parent| {
-                    next_current_state_revision(parent.current_state_revision)
-                })?;
-                let next_untracked_generation = untracked_lifecycle_generation(
-                    &root.branch_id,
-                    previous_untracked_generation,
-                    next_revision,
-                );
-                tracked_head
-                    .writer(read, writes)
-                    .stage_untracked_generation(
-                        &root.branch_id,
-                        previous_untracked_generation,
-                        next_untracked_generation,
-                        &untracked_deltas,
-                        &BTreeSet::new(),
-                    )
-                    .await?;
-                control.untracked_generation = next_untracked_generation;
-            }
             control.reset_schema_presence();
             control.note_schemas(schema_keys.iter().map(String::as_str));
             tracked_snapshots.insert(root.commit_id, final_tracked);
@@ -4178,14 +4090,13 @@ async fn stage_tracked_head(
         let packed_guards_match = packed_current_base_candidate
             && !absence_guards.is_empty()
             && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
-        let deltas = tracked_deltas.clone();
-        // Every absence guard above is derived from one of these exact
-        // transaction deltas. The fresh-file certificate likewise proves its
-        // complete file-scoped namespace absent. The branch-control CAS
-        // protects both proofs through publication.
-        let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
-            && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
-        let mut writer = tracked_head.writer(read, writes);
+        // Untracked deltas are ordinary in-place mutations of the same
+        // generation, so stage them in the same pass as the tracked deltas:
+        // one pass means one coherent view of the incremental collection
+        // controls. The packed routes below reject untracked deltas by
+        // construction, and they are only candidates when their collection
+        // scopes are provably disjoint from the untracked ones, so those
+        // routes stage the untracked deltas in a second in-place pass.
         let exact_delete_candidate = !is_checkpoint_publication
             && certified_fresh_plugin_file_id.is_none()
             && !host_certified_live_increments.contains_key(&root.branch_id)
@@ -4201,6 +4112,22 @@ async fn stage_tracked_head(
                     && delta.commit_id == Some(root.commit_id)
                     && delta.change_id.is_some()
             });
+        let stage_untracked_separately = packed_current_base_candidate || exact_delete_candidate;
+        let deltas = if stage_untracked_separately {
+            tracked_deltas.clone()
+        } else {
+            let mut deltas = Vec::with_capacity(tracked_deltas.len() + untracked_deltas.len());
+            deltas.extend(tracked_deltas.iter().copied());
+            deltas.extend(untracked_deltas.iter().copied());
+            deltas
+        };
+        // Every absence guard above is derived from one of these exact
+        // transaction deltas. The fresh-file certificate likewise proves its
+        // complete file-scoped namespace absent. The branch-control CAS
+        // protects both proofs through publication.
+        let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
+            && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
+        let mut writer = tracked_head.writer(read, writes);
         let delete_generation = if exact_delete_candidate {
             writer
                 .try_stage_exact_collection_delete_current_base(
@@ -4317,25 +4244,6 @@ async fn stage_tracked_head(
                 ))
                 .await?
         } else if let Some(generation) = packed_generation {
-            if !untracked_deltas.is_empty() {
-                writer
-                    .stage_current_state_with_working_diff(
-                        &root.branch_id,
-                        Some(parent_generation),
-                        root.commit_id,
-                        &untracked_deltas,
-                        &BTreeSet::new(),
-                        None,
-                        None,
-                        None,
-                        &mut coverage,
-                    )
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.materialization.tracked_head.stage_current_overlay"
-                    ))
-                    .await?;
-            }
             generation
         } else if let Some(certified_live_increments) =
             host_certified_live_increments.get(&root.branch_id)
@@ -4412,29 +4320,26 @@ async fn stage_tracked_head(
             generation,
             working_diff_checkpoint_commit_id,
         )?;
-        if !untracked_deltas.is_empty() {
-            let previous_untracked_generation = parent_control
-                .map(|parent| parent.untracked_generation)
-                .unwrap_or(parent_generation);
-            let next_revision = parent_control.map_or(Ok(0), |parent| {
-                next_current_state_revision(parent.current_state_revision)
-            })?;
-            let next_untracked_generation = untracked_lifecycle_generation(
-                &root.branch_id,
-                previous_untracked_generation,
-                next_revision,
-            );
+        // The packed routes could not carry the history-free rows. Mutate the
+        // same generation they just published, in place.
+        // `normal_branch_head_control` already advanced
+        // `current_state_revision`, so the control CAS still fences this write.
+        if stage_untracked_separately && !untracked_deltas.is_empty() {
+            let mut untracked_coverage = WorkingDiffIndexCoverage::default();
             tracked_head
                 .writer(read, writes)
-                .stage_untracked_generation(
+                .stage_current_state_with_working_diff(
                     &root.branch_id,
-                    previous_untracked_generation,
-                    next_untracked_generation,
+                    Some(generation),
+                    generation,
                     &untracked_deltas,
                     &BTreeSet::new(),
+                    None,
+                    None,
+                    None,
+                    &mut untracked_coverage,
                 )
                 .await?;
-            control.untracked_generation = next_untracked_generation;
         }
         control.note_schemas(
             deltas
@@ -4443,44 +4348,6 @@ async fn stage_tracked_head(
                 .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
         );
         insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
-    }
-
-    // Bootstrap may initially use one physical generation for both selector
-    // domains. A tracked-only publication mutates that generation in place,
-    // so preserve the complete untracked authority under its own selector
-    // before publishing the updated branch control. Subsequent publications
-    // already have disjoint selectors and pay no copy cost.
-    for (branch_id, control) in &mut controls {
-        if !key_value_control_mutations.contains(branch_id.as_str()) {
-            continue;
-        }
-        let Some(previous) = observations
-            .get(branch_id)
-            .and_then(|observation| observation.control)
-        else {
-            continue;
-        };
-        if control.tracked_generation != control.untracked_generation
-            || control.untracked_generation != previous.untracked_generation
-        {
-            continue;
-        }
-        let next_generation = untracked_lifecycle_generation(
-            branch_id,
-            previous.untracked_generation,
-            control.current_state_revision,
-        );
-        tracked_head
-            .writer(read, writes)
-            .stage_untracked_generation(
-                branch_id,
-                previous.untracked_generation,
-                next_generation,
-                &[],
-                &BTreeSet::new(),
-            )
-            .await?;
-        control.untracked_generation = next_generation;
     }
 
     // An untracked-only transaction touches the same hot rows without
@@ -4549,19 +4416,23 @@ async fn stage_tracked_head(
                     "branch current-state revision overflowed",
                 )
             })?;
-        let next_generation =
-            untracked_lifecycle_generation(branch_id, control.untracked_generation, next_revision);
-        tracked_head
-            .writer(read, writes)
-            .stage_untracked_generation(
-                branch_id,
-                control.untracked_generation,
-                next_generation,
-                &deltas,
-                &owned_absence_guards,
-            )
-            .await?;
-        control.untracked_generation = next_generation;
+        if !deltas.is_empty() {
+            let mut untracked_coverage = WorkingDiffIndexCoverage::default();
+            tracked_head
+                .writer(read, writes)
+                .stage_current_state_with_working_diff(
+                    branch_id,
+                    Some(control.tracked_generation),
+                    control.tracked_generation,
+                    &deltas,
+                    &owned_absence_guards,
+                    None,
+                    None,
+                    None,
+                    &mut untracked_coverage,
+                )
+                .await?;
+        }
         control.current_state_revision = next_revision;
         control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
         insert_direct_branch_control(&mut controls, branch_id, control)?;
@@ -4630,85 +4501,6 @@ fn owned_absence_guards(guards: &[TrackedStateKeyRef<'_>]) -> BTreeSet<TrackedSt
 /// The tracked writer intentionally reads only its authenticated tracked root;
 /// when the selectors diverge, validate the correlated INSERT identities
 /// against the untracked generation before publishing the tracked root.
-async fn reject_tracked_absence_guards_against_untracked(
-    read: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    control: BranchHeadControl,
-    guards: &[TrackedStateKeyRef<'_>],
-) -> Result<(), LixError> {
-    let schema_keys = guards
-        .iter()
-        .map(|guard| guard.schema_key.to_owned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let entity_pks = guards
-        .iter()
-        .map(|guard| guard.entity_pk.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let file_ids = guards
-        .iter()
-        .map(|guard| guard.file_id.map(str::to_owned))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|file_id| match file_id {
-            Some(file_id) => NullableKeyFilter::Value(file_id),
-            None => NullableKeyFilter::Null,
-        })
-        .collect();
-    let rows = TrackedHeadContext::new()
-        .reader(read)
-        .scan_live_batch_for_retention(
-            branch_id,
-            control,
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys,
-                    entity_pks,
-                    file_ids,
-                    include_tombstones: true,
-                },
-                read_columns: TrackedStateReadColumns::default(),
-                limit: None,
-            },
-            Some(true),
-        )
-        .await?
-        .into_rows();
-    let existing = rows
-        .into_iter()
-        .filter(|row| row.untracked && !row.deleted)
-        .map(|row| TrackedStateKey {
-            schema_key: row.schema_key,
-            entity_pk: row.entity_pk,
-            file_id: row.file_id,
-        })
-        .collect::<BTreeSet<_>>();
-    for guard in guards {
-        let key = TrackedStateKey {
-            schema_key: guard.schema_key.to_owned(),
-            entity_pk: guard.entity_pk.clone(),
-            file_id: guard.file_id.map(str::to_owned),
-        };
-        if existing.contains(&key) {
-            return Err(untracked_current_identity_collision_error(&key));
-        }
-    }
-    Ok(())
-}
-
-fn untracked_current_identity_collision_error(key: &TrackedStateKey) -> LixError {
-    LixError::new(
-        LixError::CODE_UNIQUE,
-        format!(
-            "cannot insert tracked row in schema '{}' entity_pk {:?}: a canonical untracked row already exists; delete it first",
-            key.schema_key, key.entity_pk,
-        ),
-    )
-}
-
 fn packed_current_base_guards_match(
     deltas: &[crate::live_state::CurrentStateDeltaRef<'_>],
     guards: &[TrackedStateKeyRef<'_>],
@@ -4943,9 +4735,6 @@ fn normal_branch_head_control(
     generation: CommitId,
     working_diff_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<BranchHeadControl, LixError> {
-    let untracked_generation = previous
-        .map(|control| control.untracked_generation)
-        .unwrap_or(generation);
     let current_state_revision = match previous {
         Some(control) => control
             .current_state_revision
@@ -4961,7 +4750,6 @@ fn normal_branch_head_control(
     Ok(BranchHeadControl {
         head_commit_id: root.commit_id,
         tracked_generation: generation,
-        untracked_generation,
         current_state_revision,
         working_diff_checkpoint_commit_id,
         created_at: previous.map_or(root.ref_updated_at, |control| control.created_at),
@@ -5047,13 +4835,32 @@ async fn stage_root_backed_branch_publication(
     engine_rows: &[EngineCurrentRow],
     insert_selection: &PreparedInsertSelection,
 ) -> Result<BranchHeadControl, LixError> {
-    let generation = lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
     let tracked_head = TrackedHeadContext::new();
-    tracked_head.writer(read, writes).stage_root_current_base(
-        branch_id,
-        generation,
-        head_commit_id,
-    );
+    // Tracked and untracked rows share one serving generation, so minting a
+    // fresh one strands the branch's history-free rows in the old one. A
+    // republication that does not move the head therefore keeps its
+    // generation; there is nothing new to serve and nothing to copy.
+    //
+    // A publication that *does* move the head (or deletes the branch) is
+    // destructive, and `reject_explicit_branch_ref_lifecycle_with_untracked_rows`
+    // already refuses it while branch-local untracked rows exist — so a fresh
+    // generation there is only ever reached with no untracked rows to lose.
+    let reused_generation = previous_control
+        .filter(|previous| previous.head_commit_id == head_commit_id)
+        .map(|previous| previous.tracked_generation);
+    let generation = match reused_generation {
+        Some(generation) => generation,
+        None => {
+            let generation =
+                lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
+            tracked_head.writer(read, writes).stage_root_current_base(
+                branch_id,
+                generation,
+                head_commit_id,
+            );
+            generation
+        }
+    };
     if stage_initial_working_diff_epoch {
         stage_tracked_working_diff_epoch(
             writes,
@@ -5068,9 +4875,6 @@ async fn stage_root_backed_branch_publication(
     let mut control = BranchHeadControl {
         head_commit_id,
         tracked_generation: generation,
-        untracked_generation: previous_control
-            .map(|control| control.untracked_generation)
-            .unwrap_or(generation),
         current_state_revision: match previous_control {
             None => 0,
             // An explicit move of an existing head is a new current-state
@@ -5135,19 +4939,21 @@ async fn stage_root_backed_branch_publication(
                 })
                 .collect()
         };
-        let next_generation =
-            untracked_lifecycle_generation(branch_id, control.untracked_generation, revision);
+        let mut untracked_coverage = WorkingDiffIndexCoverage::default();
         tracked_head
             .writer(read, writes)
-            .stage_untracked_generation(
+            .stage_current_state_with_working_diff(
                 branch_id,
-                control.untracked_generation,
-                next_generation,
+                Some(control.tracked_generation),
+                control.tracked_generation,
                 &untracked_deltas,
                 &absence_guards,
+                None,
+                None,
+                None,
+                &mut untracked_coverage,
             )
             .await?;
-        control.untracked_generation = next_generation;
         control.current_state_revision = revision;
     }
     Ok(control)
@@ -5167,7 +4973,6 @@ async fn stage_branch_head_control_publications(
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     root_backed_branch_publications: &mut BTreeSet<String>,
-    root_reachability_deltas: &mut Vec<crate::gc::RootReachabilityDelta>,
 ) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
     if let Some(branch_id) = branch_checkpoint_bridges
@@ -5293,31 +5098,40 @@ async fn stage_branch_head_control_publications(
             branch_id,
             observation.raw_token.clone(),
         )?);
-        let old_root = observation.control.map(|control| control.head_commit_id);
-        let new_root = desired.as_ref().map(|control| control.head_commit_id);
-        // An explicit deletion is a lifecycle transition even when this
-        // pinned observation has no rooted control.  Publishing the
-        // authenticated None -> None delta gives deferred consumers a durable
-        // branch-retirement signal for checkpoints staged before the branch
-        // ever acquired a tracked root.
-        if old_root != new_root || desired.is_none() {
-            root_reachability_deltas.push(crate::gc::RootReachabilityDelta {
-                branch_id: branch_id.clone(),
-                old_root,
-                new_root,
-                old_control: observation.control,
-                new_control: *desired,
-                old_control_digest: crate::gc::root_control_digest_for_control(
-                    observation.control.as_ref(),
-                )?,
-                new_control_digest: crate::gc::root_control_digest_for_control(desired.as_ref())?,
-            });
+        // Everything a superseded control still owned is retired right here,
+        // in the same atomic write set that supersedes it. These are all
+        // control-scoped facts — the branch's derived serving generations, its
+        // superseded standalone branch-ref change, and, on deletion, its
+        // plugin-checkpoint prefix — reachable from exactly one place: this
+        // control. Once it moves, nothing can ever read them again, so there is
+        // nothing to defer and nothing for a publication ledger to remember.
+        if let Some(old_control) = observation.control.as_ref() {
+            let generation = old_control.tracked_generation;
+            if !desired.is_some_and(|new_control| new_control.tracked_generation == generation) {
+                crate::live_state::stage_retire_hot_generation(read, writes, branch_id, generation)
+                    .await?;
+            }
+            if desired.is_none_or(|new_control| new_control.ref_change_id != old_control.ref_change_id)
+            {
+                crate::changelog::stage_delete_standalone_change(
+                    read,
+                    writes,
+                    old_control.ref_change_id,
+                )
+                .await?;
+            }
         }
         match desired {
             Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
             None => {
                 stage_delete_branch_head_control(writes, branch_id)?;
                 crate::gc::stage_delete_recovery_ref(writes, branch_id)?;
+                // A deleted branch must not keep its derived plugin-checkpoint
+                // prefix alive; a recreated branch republishes it.
+                crate::transaction::stage_delete_branch_plugin_checkpoints(
+                    read, writes, branch_id,
+                )
+                .await?;
             }
         }
     }
@@ -5717,16 +5531,30 @@ async fn stage_tracked_roots(
     }
     let mut tracked_writer = tracked_state.writer(read, writes);
     let mut staged_rebuild_plan_ids = BTreeSet::new();
+    #[cfg(feature = "storage-benches")]
+    let _replay_scope = (!durable_root_rebuild_parents.is_empty())
+        .then(crate::storage_bench::RootReplayScope::enter);
     for parent_commit_id in durable_root_rebuild_parents {
+        #[cfg(feature = "storage-benches")]
+        let plan_load_start = std::time::Instant::now();
         let plans = crate::tracked_state::load_rebuild_plans_to_nearest_available_root(
             read,
             &parent_commit_id.to_string(),
             true,
         )
         .await?;
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_root_replay_plan_load_nanos(
+                plan_load_start.elapsed().as_nanos() as u64,
+            );
+            crate::storage_bench::record_root_replay_boundary(plans.len());
+        }
         let all_new = plans
             .iter()
             .all(|plan| !staged_rebuild_plan_ids.contains(&plan.commit_id));
+        #[cfg(feature = "storage-benches")]
+        let stage_start = std::time::Instant::now();
         if all_new
             && crate::tracked_state::try_stage_collapsed_rebuild_plans_with_writer(
                 &mut tracked_writer,
@@ -5735,6 +5563,13 @@ async fn stage_tracked_roots(
             .await?
             .is_some()
         {
+            #[cfg(feature = "storage-benches")]
+            {
+                crate::storage_bench::record_root_replay_plan_staged();
+                crate::storage_bench::record_root_replay_stage_nanos(
+                    stage_start.elapsed().as_nanos() as u64,
+                );
+            }
             // A collapsed replay stages only its terminal root. Intermediate
             // plan IDs remain unstaged so another rebuild parent sharing this
             // suffix can independently collapse against immutable authority.
@@ -5743,10 +5578,16 @@ async fn stage_tracked_roots(
         }
         for plan in plans.iter().rev() {
             if staged_rebuild_plan_ids.insert(plan.commit_id) {
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_root_replay_plan_staged();
                 crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
                     .await?;
             }
         }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_root_replay_stage_nanos(
+            stage_start.elapsed().as_nanos() as u64
+        );
     }
     let empty_certified_replacement_markers = BTreeSet::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
@@ -6675,14 +6516,6 @@ mod tests {
     #[tokio::test]
     async fn branch_creation_owner_publishes_checkpoint_serving_context() {
         let storage = StorageAdapter::new(Memory::new());
-        let mut seed = storage.new_write_set();
-        crate::gc::stage_reachability_queue_seed(&mut seed)
-            .expect("reachability queue should seed");
-        storage
-            .commit_write_set(seed, StorageWriteOptions::default())
-            .await
-            .expect("reachability queue seed should commit");
-
         let branch_id = "01960000-0000-7000-8000-0000000000b1";
         let recovered_head = commit_id("branch-bridge-recovered-head");
         let checkpoint = commit_id("branch-bridge-checkpoint");
@@ -6705,7 +6538,6 @@ mod tests {
         let mut writes = storage.new_write_set();
         let mut preconditions = Vec::new();
         let mut root_backed = BTreeSet::new();
-        let mut reachability_deltas = Vec::new();
         let controls = stage_branch_head_control_publications(
             &read,
             &mut writes,
@@ -6725,7 +6557,6 @@ mod tests {
                 },
             )]),
             &mut root_backed,
-            &mut reachability_deltas,
         )
         .await
         .expect("branch owner should stage checkpoint serving context");
@@ -6736,19 +6567,6 @@ mod tests {
         assert_eq!(control.head_commit_id, recovered_head);
         assert_eq!(control.working_diff_checkpoint_commit_id, Some(checkpoint));
         assert!(root_backed.contains(branch_id));
-        assert_eq!(reachability_deltas.len(), 1);
-        assert_eq!(reachability_deltas[0].old_root, None);
-        assert_eq!(reachability_deltas[0].new_root, Some(recovered_head));
-        assert_eq!(reachability_deltas[0].new_control, Some(control));
-        crate::gc::stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &reachability_deltas,
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("branch publication should stage the exact queue fence");
         drop(read);
         storage
             .commit_write_set(
@@ -7890,7 +7708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rootless_branch_delete_defers_checkpoint_cleanup_through_gc_and_reopen() {
+    async fn rootless_branch_delete_reclaims_its_checkpoint_prefix_and_survives_reopen() {
         let backend = Memory::new();
         crate::engine::Engine::initialize(backend.clone())
             .await
@@ -7975,9 +7793,9 @@ mod tests {
                 blob_hash,
             )
             .await
-            .expect("retained rootless checkpoint should load")
-            .is_some(),
-            "foreground branch deletion must leave checkpoint reclamation to GC"
+            .expect("retired rootless checkpoint should load")
+            .is_none(),
+            "branch deletion reclaims its own checkpoint prefix in the same write set"
         );
         drop(retained_read);
 

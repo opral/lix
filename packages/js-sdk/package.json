@@ -20,10 +20,6 @@
 		"./remote-protocol": {
 			"types": "./dist/remote/protocol.d.ts",
 			"default": "./dist/remote/protocol.js"
-		},
-		"./local-storage-adapter": {
-			"types": "./dist/local-storage-adapter.d.ts",
-			"default": "./dist/local-storage-adapter.js"
 		}
 	},
 	"imports": {

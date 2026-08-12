@@ -4411,9 +4411,16 @@ mod tests {
             &self,
             requests: &[GetManyRequest<'_>],
         ) -> Result<GetManyResult, StorageError> {
+            // Match the branch-control space by identity, not by its exact
+            // name. The trailing version is part of the *encoding* contract and
+            // is bumped whenever the record layout changes, so pinning the full
+            // name here silently disarms this gate the next time that happens:
+            // the switch still issues its authoritative branch-control read,
+            // the wrapper just stops recognising it, and the test then fails on
+            // its timeout as though the read had disappeared.
             let reads_branch_control = requests
                 .iter()
-                .any(|request| request.space.name == "branch.head_control.v10");
+                .any(|request| request.space.name.starts_with("branch.head_control."));
             if reads_branch_control
                 && self
                     .gate

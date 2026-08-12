@@ -3,6 +3,55 @@ use lix::{LixError, Value};
 use super::assert_rows_eq;
 
 simulation_test!(
+    information_schema_never_exposes_raw_snapshot_content,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                   lix_json('{\"x-lix-key\":\"snapshot_column_absence\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
+                   false,\
+                   false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        let table_columns = session
+            .execute(
+                "SELECT table_name \
+                 FROM information_schema.columns \
+                 WHERE column_name = 'lixcol_snapshot_content'",
+                &[],
+            )
+            .await
+            .expect("table column catalog should be readable");
+        assert!(table_columns.rows().is_empty());
+
+        let function_columns = session
+            .execute(
+                "SELECT function_name \
+                 FROM information_schema.table_functions \
+                 WHERE result_column = 'lixcol_snapshot_content'",
+                &[],
+            )
+            .await
+            .expect("table-function column catalog should be readable");
+        assert!(function_columns.rows().is_empty());
+    }
+);
+
+simulation_test!(
     information_schema_columns_select_star_is_safe_for_public_results,
     |sim| async move {
         let engine = sim.boot_engine().await;
