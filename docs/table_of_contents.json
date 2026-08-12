@@ -8,7 +8,7 @@
   "Concepts": [
     { "path": "./schemas.md", "label": "Schemas" },
     { "path": "./semantic-changes.md", "label": "Semantic Changes" },
-    { "path": "./versions.md", "label": "Branches & Merging" },
+    { "path": "./branching.md", "label": "Branching" },
     { "path": "./checkpoints.md", "label": "Checkpoints" },
     { "path": "./diff-commands.md", "label": "Diff Commands" },
     { "path": "./history.md", "label": "Change History" },
