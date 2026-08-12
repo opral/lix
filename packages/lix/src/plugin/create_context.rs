@@ -249,6 +249,7 @@ pub(crate) fn require_existing_id_authorities(
     rows: &MaterializedLiveStateExactBatch,
     file_id: &str,
     branch_id: &str,
+    untracked: bool,
 ) -> Result<(), LixError> {
     if keys.len() != rows.len() {
         return Err(LixError::new(
@@ -267,7 +268,8 @@ pub(crate) fn require_existing_id_authorities(
                 && row.file_id() == Some(file_id)
                 && row.branch_id() == branch_id
                 && !row.global()
-                && !row.untracked()
+                // The authority row lives in its own file's lane.
+                && row.untracked() == untracked
         });
         if !valid {
             return Err(LixError::new(
