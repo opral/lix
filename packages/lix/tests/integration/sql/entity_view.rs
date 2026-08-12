@@ -180,6 +180,120 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    entity_point_read_order_by_pk_elides_physical_sort,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        register_pushdown_note_schema(&session).await;
+        insert_pushdown_note(&session, "n1", "todo", "First", "1", "NULL").await;
+        insert_pushdown_note(&session, "n2", "done", "Second", "2", "NULL").await;
+
+        // A fully-applied primary-key equality pins the sort column to one
+        // literal, so the ORDER BY over the at-most-one matching row must not
+        // build a physical sort operator.
+        for point_sql in [
+            "SELECT id, title FROM pushdown_note WHERE id = 'n2' ORDER BY id",
+            "SELECT id, title FROM pushdown_note WHERE id IN ('n2') ORDER BY id",
+        ] {
+            let explain = session
+                .execute(&format!("EXPLAIN {point_sql}"), &[])
+                .await
+                .expect("EXPLAIN should succeed");
+            let plan = explain_plan_text(&explain);
+            assert!(
+                !plan.contains("SortExec"),
+                "point read with ORDER BY on the pinned pk must elide the sort:\n{plan}"
+            );
+
+            let result = session
+                .execute(point_sql, &[])
+                .await
+                .expect("point read should succeed");
+            assert_rows_eq(
+                result,
+                vec![vec![
+                    Value::Text("n2".to_string()),
+                    Value::Text("Second".to_string()),
+                ]],
+            );
+        }
+    }
+);
+
+simulation_test!(
+    entity_multi_key_and_unpinned_order_by_keep_physical_sort,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        register_pushdown_note_schema(&session).await;
+        insert_pushdown_note(&session, "n1", "todo", "First", "1", "NULL").await;
+        insert_pushdown_note(&session, "n2", "done", "Second", "2", "NULL").await;
+
+        // A multi-value IN pins nothing: ordering across the matched keys is
+        // real work and the sort must stay.
+        let multi_sql = "SELECT id FROM pushdown_note WHERE id IN ('n2', 'n1') ORDER BY id";
+        let explain = session
+            .execute(&format!("EXPLAIN {multi_sql}"), &[])
+            .await
+            .expect("EXPLAIN should succeed");
+        let plan = explain_plan_text(&explain);
+        assert!(
+            plan.contains("SortExec"),
+            "multi-key IN with ORDER BY must keep its physical sort:\n{plan}"
+        );
+        let result = session
+            .execute(multi_sql, &[])
+            .await
+            .expect("multi-key read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![Value::Text("n1".to_string())],
+                vec![Value::Text("n2".to_string())],
+            ],
+        );
+
+        // An inexact residual predicate proves nothing about the scan output;
+        // ordering by an unpinned column must keep its physical sort.
+        let range_sql = "SELECT id FROM pushdown_note WHERE score > 0 ORDER BY id";
+        let explain = session
+            .execute(&format!("EXPLAIN {range_sql}"), &[])
+            .await
+            .expect("EXPLAIN should succeed");
+        let plan = explain_plan_text(&explain);
+        assert!(
+            plan.contains("SortExec"),
+            "range-filtered ORDER BY must keep its physical sort:\n{plan}"
+        );
+        let result = session
+            .execute(range_sql, &[])
+            .await
+            .expect("range read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![Value::Text("n1".to_string())],
+                vec![Value::Text("n2".to_string())],
+            ],
+        );
+    }
+);
+
 async fn register_pushdown_note_schema(
     session: &crate::support::simulation_test::engine::SimSession,
 ) {

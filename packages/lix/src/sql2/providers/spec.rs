@@ -26,10 +26,11 @@ use datafusion::common::{DFSchema, DataFusionError, Result, SchemaExt};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{
-    EquivalenceProperties, PhysicalExpr, PhysicalSortExpr, create_physical_expr,
+    AcrossPartitions, ConstExpr, EquivalenceProperties, PhysicalExpr, PhysicalSortExpr,
+    create_physical_expr,
 };
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -917,6 +918,7 @@ impl TableProvider for SpecTableProvider {
             filters: filters.iter().map(ToString::to_string).collect(),
             limit,
         };
+        let constant_columns = exact_filter_constant_columns(self.spec.as_ref(), filters);
         let planned = self
             .spec
             .plan_scan(projection, filters, limit, state.execution_props())
@@ -936,8 +938,62 @@ impl TableProvider for SpecTableProvider {
             state.config().target_partitions(),
             statement_cache_key,
             physical_cache_key,
-        )))
+            &constant_columns,
+        )?))
     }
+}
+
+/// Output columns pinned to one literal value by a fully-applied (`Exact`)
+/// pushed-down filter.
+///
+/// `Exact` pushdown means the provider applies the predicate in full, so every
+/// row leaving the scan satisfies it. For predicates shaped `col = literal` or
+/// `col IN (single literal)` the column is therefore constant across the scan's
+/// output — the same fact `FilterExec` would have advertised through its
+/// equivalence properties had the filter stayed above the scan. Restoring it
+/// here lets DataFusion's own `EnforceSorting` rule elide sort operators whose
+/// sort keys are pinned; the canonical beneficiary is the point read
+/// `WHERE pk = … ORDER BY pk`, which otherwise streams its at-most-one row
+/// through a full `SortExec`. Conjunctions recurse — an exactly-applied
+/// `a = 'x' AND b = 'y'` pins both columns — while `OR`, negated `IN`, and
+/// multi-value `IN` pin nothing. Filters the spec reports as `Inexact` or
+/// `Unsupported` are skipped: their rows are only narrowed above the scan, so
+/// the scan itself proves nothing.
+fn exact_filter_constant_columns(spec: &dyn TableSpec, filters: &[Expr]) -> Vec<String> {
+    fn collect(filter: &Expr, columns: &mut Vec<String>) {
+        match filter {
+            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+                collect(&binary.left, columns);
+                collect(&binary.right, columns);
+            }
+            Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+                match (binary.left.as_ref(), binary.right.as_ref()) {
+                    (Expr::Column(column), Expr::Literal(..))
+                    | (Expr::Literal(..), Expr::Column(column)) => {
+                        columns.push(column.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            Expr::InList(in_list) if !in_list.negated && in_list.list.len() == 1 => {
+                if let (Expr::Column(column), Expr::Literal(..)) =
+                    (in_list.expr.as_ref(), &in_list.list[0])
+                {
+                    columns.push(column.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut columns = Vec::new();
+    for filter in filters {
+        if spec.filter_pushdown(filter) != TableProviderFilterPushDown::Exact {
+            continue;
+        }
+        collect(filter, &mut columns);
+    }
+    columns
 }
 
 fn physical_filters(
@@ -1055,13 +1111,14 @@ impl SpecScanExec {
         target_partitions: usize,
         statement_cache_key: Option<StatementScanKey>,
         physical_cache_key: PhysicalScanKey,
-    ) -> Self {
+        constant_columns: &[String],
+    ) -> Result<Self> {
         // A declared ordering only proves that each source fragment is sorted,
         // not that adjacent fragments have non-overlapping value ranges.
         // Keep ordered fragments separate unless the source can eventually
         // provide that stronger cross-fragment guarantee.
         let preserve_fragment_boundaries = planned.ordering.is_some();
-        let equivalence_properties = planned
+        let mut equivalence_properties = planned
             .ordering
             .as_deref()
             .and_then(|column_name| {
@@ -1083,6 +1140,23 @@ impl SpecScanExec {
                     })
             })
             .unwrap_or_else(|| EquivalenceProperties::new(Arc::clone(&planned.schema)));
+        // Exact-pushdown equalities pin these output columns to one literal
+        // value, uniformly across every partition. Columns pruned from the
+        // projected schema carry no ordering obligations and are skipped.
+        let constants = constant_columns
+            .iter()
+            .filter_map(|column_name| {
+                planned.schema.index_of(column_name).ok().map(|index| {
+                    ConstExpr::new(
+                        Arc::new(Column::new(column_name, index)) as Arc<dyn PhysicalExpr>,
+                        AcrossPartitions::Uniform(None),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if !constants.is_empty() {
+            equivalence_properties.add_constants(constants)?;
+        }
         let grouped_target = if preserve_fragment_boundaries {
             planned.source.partition_count
         } else {
@@ -1096,7 +1170,7 @@ impl SpecScanExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Self {
+        Ok(Self {
             table,
             schema: planned.schema,
             source: planned.source,
@@ -1104,7 +1178,7 @@ impl SpecScanExec {
             properties: Arc::new(properties),
             statement_cache_key,
             physical_cache_key,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -1126,7 +1200,9 @@ impl SpecScanExec {
             target_partitions,
             statement_cache_key,
             physical_cache_key,
+            &[],
         )
+        .expect("test scan properties build")
     }
 
     pub(crate) fn statement_cache_key(&self) -> Option<&StatementScanKey> {

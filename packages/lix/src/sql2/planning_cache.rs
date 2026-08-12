@@ -1,15 +1,19 @@
+use std::any::Any;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crate::sql2::catalog::PublicCatalog;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, Value};
+use async_trait::async_trait;
 use datafusion::catalog::{
     CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList,
-    MemorySchemaProvider,
+    SchemaProvider, TableProvider,
 };
+use datafusion::common::exec_err;
 use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
@@ -102,6 +106,83 @@ pub(crate) struct CachedUpdateLiteralShape {
     middle_start: usize,
     middle_end: usize,
     suffix_start: usize,
+}
+
+/// Statement-scoped `public` schema for pooled read sessions.
+///
+/// Every snapshot-bound table provider a statement registers lands here and
+/// must be gone by the time the session returns to the pool. DataFusion's
+/// `MemorySchemaProvider` can only express that as `table_names()` — one owned
+/// `String` per table, per statement, walking every dashmap shard — followed by
+/// one `deregister_table` per name. This provider keeps the identical
+/// registration semantics (registering an existing name is an error, matching
+/// `MemorySchemaProvider`) while letting session recycling drop every provider
+/// in one map clear.
+#[derive(Debug, Default)]
+struct StatementSchemaProvider {
+    tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
+}
+
+impl StatementSchemaProvider {
+    fn tables(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<dyn TableProvider>>> {
+        self.tables
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn tables_mut(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Arc<dyn TableProvider>>> {
+        self.tables
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Drops every statement-registered provider at once.
+    fn clear(&self) {
+        self.tables_mut().clear();
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for StatementSchemaProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        self.tables().keys().cloned().collect()
+    }
+
+    async fn table(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<dyn TableProvider>>, datafusion::error::DataFusionError> {
+        Ok(self.tables().get(name).cloned())
+    }
+
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
+        let mut tables = self.tables_mut();
+        if tables.contains_key(name.as_str()) {
+            return exec_err!("The table {name} already exists");
+        }
+        Ok(tables.insert(name, table))
+    }
+
+    fn deregister_table(
+        &self,
+        name: &str,
+    ) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
+        Ok(self.tables_mut().remove(name))
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.tables().contains_key(name)
+    }
 }
 
 /// One DataFusion session borrowed from the engine's pool for the duration of
@@ -216,7 +297,7 @@ where
         let catalogs = Arc::new(MemoryCatalogProviderList::new());
         let catalog = Arc::new(MemoryCatalogProvider::new());
         catalog
-            .register_schema("public", Arc::new(MemorySchemaProvider::new()))
+            .register_schema("public", Arc::new(StatementSchemaProvider::default()))
             .expect("fresh DataFusion catalog accepts the public schema");
         catalogs.register_catalog("datafusion".to_string(), catalog);
         super::session::sql_session_from_template(self.datafusion_state.clone(), Some(catalogs))
@@ -234,14 +315,22 @@ where
         if let Some(catalog) = session.context.catalog("datafusion")
             && let Some(public) = catalog.schema("public")
         {
-            for table in public.table_names() {
-                let _ = session
-                    .context
-                    .deregister_table(datafusion::common::TableReference::full(
-                        "datafusion",
-                        "public",
-                        table,
-                    ));
+            match public.as_any().downcast_ref::<StatementSchemaProvider>() {
+                Some(statement_schema) => statement_schema.clear(),
+                None => {
+                    // Sessions built by `datafusion_session` always carry a
+                    // `StatementSchemaProvider`; this enumeration remains only
+                    // for a foreign schema provider reaching the pool.
+                    for table in public.table_names() {
+                        let _ = session.context.deregister_table(
+                            datafusion::common::TableReference::full(
+                                "datafusion",
+                                "public",
+                                table,
+                            ),
+                        );
+                    }
+                }
             }
         }
         // Only table-valued functions are registered per statement; the five
