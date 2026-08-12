@@ -2078,19 +2078,6 @@ impl TransactionFileContent {
     }
 
     pub(crate) fn set_certified_entity_batches(&mut self, batches: Vec<WasmCertifiedEntityBatch>) {
-        // A certified entity batch is a commit-rooted representation: the
-        // commit path materializes its rows by expanding them from the
-        // published commit root, and it deduplicates the result against the
-        // ordinary change rows for that same commit. An untracked file
-        // publishes no commit, so there is no root to expand from.
-        //
-        // Dropping the batch here is a de-optimization, not a loss. The
-        // ordinary component change list is the authority for entity rows on
-        // both lanes; the certified batch only lets the tracked-head writer
-        // avoid persisting a separately expanded row per entity.
-        if self.untracked {
-            return;
-        }
         self.certified_entity_batches = batches;
     }
 

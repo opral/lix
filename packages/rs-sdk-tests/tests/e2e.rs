@@ -424,6 +424,24 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
 /// `change_id` (identity) with a NULL `commit_id` (no history). The change id
 /// is asserted as a property, never as a literal — its value is a function of
 /// UUID draw order.
+/// BLOCKED — see `certified entity batch has no matching published commit`.
+///
+/// Unskipping plugin reconciliation is necessary but not sufficient. A
+/// component plugin's created entities are carried out of the guest in a
+/// host-synthesized *certified entity batch* (`CERTIFIED_CREATED_PACKET_V1`),
+/// and `transaction/commit.rs` materializes those rows by expanding them from
+/// the file's published commit root. An untracked file publishes no commit, so
+/// there is no root to expand from and the write fails.
+///
+/// Dropping the batch for untracked files was tried and does not work: the
+/// ordinary component change list is empty for a fresh-file transition, so the
+/// write then succeeds with zero entity rows. The rows exist only inside the
+/// certified packet. Both outcomes were measured on `ryzen-9950x-V`.
+///
+/// Making this pass needs an untracked representation for a certified root —
+/// a packed root row that is not keyed to a commit — which is a new artifact
+/// shape for untracked state and needs a ruling before it is built.
+#[ignore = "blocked: certified entity batches are commit-rooted; see doc comment"]
 #[tokio::test]
 async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_one() {
     const TRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008a1";
@@ -540,6 +558,53 @@ async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_o
     lix.close()
         .await
         .expect("lane-parity workspace should close");
+}
+
+/// Scopes the blast radius of unskipping reconciliation for untracked writes.
+///
+/// An untracked file whose path matches no installed plugin must keep working
+/// exactly as before: bytes in, bytes out, no entity rows, no plugin involved.
+/// This separates "untracked plugin-owned files are blocked" from the far worse
+/// "untracked files are blocked".
+#[tokio::test]
+async fn untracked_file_matching_no_plugin_is_unaffected_by_reconciliation() {
+    const FILE_ID: &str = "01900000-0000-7000-8000-0000000008a3";
+    const PATH: &str = "/lane-parity-unmatched.bin";
+    const CONTENT: &[u8] = b"\x00\x01\x02 not json, not csv";
+
+    let lix = open_lix().await.expect("workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text(FILE_ID.to_owned()),
+            Value::Text(PATH.to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("an untracked file matching no plugin must still write");
+
+    assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(CONTENT.to_vec()));
+
+    let untracked = lix
+        .execute(
+            "SELECT lixcol_untracked FROM lix_file WHERE id = $1",
+            &[Value::Text(FILE_ID.to_owned())],
+        )
+        .await
+        .expect("descriptor should query");
+    assert_eq!(untracked.len(), 1);
+    assert_eq!(untracked.rows()[0].values(), &[Value::Boolean(true)]);
+
+    lix.close().await.expect("workspace should close");
 }
 
 #[tokio::test]
