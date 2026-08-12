@@ -633,6 +633,14 @@ impl FilesystemPathIndex {
                 requests.len()
             )));
         }
+        // `cached_blob_data` participates in no sort key, so hydration can only
+        // change values. Re-inserting each entry would remove and reinsert it in
+        // five AVL maps, path-copying and reallocating O(log n) nodes ten times
+        // per file; the substitution below rewrites each map once in one linear
+        // pass with the tree shape preserved.
+        let mut hydrated_by_identity =
+            BTreeMap::<FilesystemPathEntryIdentity, Arc<FilesystemPathEntry>>::new();
+        let mut heap_bytes_delta: isize = 0;
         for ((_, (hash, size_bytes, entries)), data) in requests.into_iter().zip(values) {
             let Some(data) = data else {
                 continue;
@@ -644,9 +652,28 @@ impl FilesystemPathIndex {
             for entry in entries {
                 let mut hydrated = (*entry).clone();
                 hydrated.cached_blob_data = Some(data.clone());
-                self.insert_entry(Arc::new(hydrated));
+                let hydrated = Arc::new(hydrated);
+                heap_bytes_delta += estimated_entry_index_bytes(&hydrated) as isize
+                    - estimated_entry_index_bytes(&entry) as isize;
+                hydrated_by_identity.insert(entry_identity(&entry), hydrated);
             }
         }
+        if hydrated_by_identity.is_empty() {
+            return Ok(self);
+        }
+        let substitute = |entry: &Arc<FilesystemPathEntry>| -> Arc<FilesystemPathEntry> {
+            hydrated_by_identity
+                .get(&entry_identity(entry))
+                .map_or_else(|| Arc::clone(entry), Arc::clone)
+        };
+        self.entries_by_path = self.entries_by_path.map_values(substitute);
+        self.entries_by_identity = self.entries_by_identity.map_values(substitute);
+        self.entries_by_descriptor_id = self.entries_by_descriptor_id.map_values(substitute);
+        self.files_by_id = self.files_by_id.map_values(substitute);
+        self.children_by_parent = self.children_by_parent.map_values(substitute);
+        self.estimated_heap_bytes = self
+            .estimated_heap_bytes
+            .saturating_add_signed(heap_bytes_delta);
         Ok(self)
     }
 
