@@ -34,6 +34,8 @@ mimalloc.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 lix = { workspace = true, default-features = false }
+blake3 = "1"
+bytes = "1"
 console_error_panic_hook = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }

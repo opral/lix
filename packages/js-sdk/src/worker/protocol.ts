@@ -56,7 +56,6 @@ export type WorkerOperation =
 	| { kind: "mergeBranch"; options: MergeBranchOptions }
 	| { kind: "importFilesystemPaths"; paths: string[] }
 	| { kind: "syncDiskToLix" }
-	| { kind: "exportSnapshot" }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
 	| { kind: "close" };

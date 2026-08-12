@@ -55,19 +55,17 @@ open a local engine. Dynamic headers are resolved for every request and
 observation reconnect. An injected `fetch` can route requests through a service
 binding or another authorized server-side transport.
 
-Browser clients can opt into private, durable client state with the local
-storage adapter:
+Browser clients can opt into private, durable client state with IndexedDB:
 
 ```ts
-import { openLix } from "@lix-js/sdk";
-import { LocalStorage } from "@lix-js/sdk/local-storage-adapter";
+import { IndexedDbStorage, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
 	server: {
 		mode: "remote",
 		url: "https://lixray.com/@namespace/workspace",
 	},
-	storage: new LocalStorage(),
+	storage: new IndexedDbStorage({ name: "lixray-client" }),
 });
 
 const previousUiState = lix.clientState.get("atelier-ui");
@@ -76,17 +74,14 @@ await lix.clientState.set("atelier-ui", { sidebar: "history" });
 
 `lix.clientState` is hydrated before `openLix()` resolves, so reads are
 synchronous. Its JSON values and the client's active branch are stored in a
-private local Lix snapshot; workspace SQL continues to execute only on the
-server. Reopening the same remote URL with the same storage restores both. Each
+the local IndexedDB database; workspace SQL continues to execute only on the
+server. Reopening the same remote URL with the same storage name restores both. Each
 remote server session is branch-pinned, so switching one client does not switch
 another client.
 
-After a remote branch switch succeeds, saving that branch as the next-reopen
-preference is best effort: a client-storage failure does not turn the completed
-server switch into a rejected operation. Explicit `lix.clientState.set()` and
-`.delete()` calls report durability failures to their caller. Because the local
-Rust transaction has already committed, `get()` continues to expose that live
-session value; a later successful snapshot save can make it durable.
+Client-state mutations commit through the same transactional storage boundary
+as a complete local Lix. A failed IndexedDB transaction rejects the mutation
+without publishing it to the live client-state facade.
 
 Filesystem sync uses native Node.js dependencies:
 
@@ -173,11 +168,13 @@ try {
 ## Notes
 
 - `openLix()` opens a fresh in-memory Lix. Pass `new LocalFilesystem({ path, syncAllFiles: true })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
+- In browsers, pass `new IndexedDbStorage({ name })` to persist a complete local Lix across reloads.
+- Only one Lix handle may open an IndexedDB storage name at a time, including across browser tabs.
 - Pass `new LocalFilesystem({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
 - Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `storage.importPaths(["notes/today.md"])` on the `LocalFilesystem` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
-- In browsers, local mode and remote mode with client storage load the Rust
-  engine as WebAssembly. Supplying a snapshot storage adapter persists that
-  local Lix; in remote mode, the local engine contains only client state.
+- In browsers, local mode and remote mode with IndexedDB storage load the Rust
+  engine as WebAssembly. In remote mode, the local engine contains only client
+  state.
 - `LocalFilesystem` is Node.js-only. Constructing it is safe in
   shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.

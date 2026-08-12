@@ -1,5 +1,6 @@
 export {
 	LocalFilesystem,
+	IndexedDbStorage,
 	Lix,
 	LixTransaction,
 	ObserveEvents,
@@ -22,6 +23,7 @@ export type {
 	LixBatchOptions,
 	LixBatchStatement,
 	LocalFilesystemOptions,
+	IndexedDbStorageOptions,
 	JsonValue,
 	LixValue,
 	MergeBranchOptions,
@@ -35,7 +37,6 @@ export type {
 	OpenLixOptions,
 	LixTelemetryOptions,
 	LixTelemetrySpan,
-	LixSnapshotStorage,
 	RemoteLixFetch,
 	RemoteLixServerOptions,
 	UndoReceipt,
