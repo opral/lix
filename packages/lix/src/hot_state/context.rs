@@ -835,7 +835,7 @@ where
                     control.tracked_generation,
                     &predicate.schema_key,
                     predicate.ordinal,
-                    &predicate.value,
+                    &predicate.values,
                 )
                 .await?
             else {

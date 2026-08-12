@@ -1246,13 +1246,17 @@ pub(crate) enum ScanOperator {
     },
 }
 
-/// An equality predicate on a column the schema declares as unique or as a
+/// A membership predicate on a column the schema declares as unique or as a
 /// foreign key, addressed by its stable ordinal in the schema's index.
+///
+/// `values` holds one value for an `=` predicate and several for an `IN` list.
+/// The set is a disjunction: a row qualifies when its indexed column equals
+/// any member.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DeclaredColumnEq {
     pub(crate) schema_key: String,
     pub(crate) ordinal: u16,
-    pub(crate) value: crate::hot_state::HotIndexValue,
+    pub(crate) values: Vec<crate::hot_state::HotIndexValue>,
 }
 
 /// Identity-centered filter for visible live entities.

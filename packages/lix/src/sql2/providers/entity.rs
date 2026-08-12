@@ -625,6 +625,49 @@ impl TableSpec for EntitySpec {
         }
     }
 
+    /// Columns the hot index plane can serve that this scan is not already
+    /// constrained on.
+    ///
+    /// A scan whose filters already resolve to an identity, or that already
+    /// mentions the indexed column, is either a point lookup or about to be
+    /// one. Offering such a column as a probe key would make a join collect
+    /// its build side and replan a scan that was already as narrow as the
+    /// index can make it — measurably slower for no rows saved.
+    ///
+    /// The two tests are ordered by cost. Collecting the filters' column names
+    /// is cheap and already rejects the common case — a scan the planner has
+    /// pushed an equality on this very column into — so the identity analysis,
+    /// which parses primary-key constraints, only runs for the scans that are
+    /// still candidates. This runs once per scan per execution, including on
+    /// the warm plan-cache path that replans leaves, so it is on the point-read
+    /// critical path.
+    fn probe_key_columns(&self, filters: &[Expr]) -> Vec<String> {
+        if self.spec.indexed_columns.is_empty() {
+            return Vec::new();
+        }
+        let constrained = filters
+            .iter()
+            .flat_map(|filter| filter.column_refs())
+            .map(|column| column.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let columns = self
+            .spec
+            .indexed_columns
+            .iter()
+            .filter(|column| !constrained.contains(column.name.as_str()))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        if columns.is_empty()
+            || entity_pks_from_primary_key_filters(&self.spec, filters)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            return Vec::new();
+        }
+        columns
+    }
+
     async fn plan_scan(
         &self,
         projection: Option<&Vec<usize>>,
@@ -1800,41 +1843,72 @@ pub(super) fn entity_pks_from_primary_key_filters(
         .map(|ids| ids.into_iter().collect()))
 }
 
-/// The first equality on a column this schema declares as unique or as a
-/// foreign key, which the hot index plane can serve as an access path.
+/// The first equality or `IN` list on a column this schema declares as unique
+/// or as a foreign key, which the hot index plane can serve as an access path.
 ///
 /// The matched filter is deliberately **left in `row_filters`**. Index entries
 /// are never deleted when a value is superseded, so a lookup returns
 /// candidates and this predicate is what rejects the stale ones. It is not a
 /// redundant re-check over a handful of rows — it is the correctness half of
 /// the access path, and removing it reintroduces rows that no longer match.
+///
+/// An `IN` list resolves the same way as an equality — one index bucket per
+/// member, union of the candidates — which is what lets a join's runtime probe
+/// keys reach the index at all: a probe carries the several build-side values
+/// of one key column, never a single literal.
 fn declared_column_eq(
     spec: &EntitySurfaceSpec,
     row_filters: &[EntityRowFilter],
 ) -> Option<crate::hot_state::DeclaredColumnEq> {
     row_filters.iter().find_map(|filter| {
-        let EntityRowFilter::ColumnEq { column, value, .. } = filter else {
-            return None;
-        };
+        let (column, values) = declared_column_membership(filter)?;
         let indexed = spec
             .indexed_columns
             .iter()
-            .find(|candidate| candidate.name == *column)?;
-        let value = match value {
-            EntityFilterValue::String(value) => {
-                crate::hot_state::HotIndexValue::String(value.clone())
-            }
-            EntityFilterValue::Integer(value) => {
-                crate::hot_state::HotIndexValue::Integer(*value)
-            }
-            _ => return None,
-        };
+            .find(|candidate| candidate.name == column)?;
+        let values = values
+            .into_iter()
+            .map(|value| match value {
+                EntityFilterValue::String(value) => {
+                    Some(crate::hot_state::HotIndexValue::String(value.clone()))
+                }
+                EntityFilterValue::Integer(value) => {
+                    Some(crate::hot_state::HotIndexValue::Integer(*value))
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
         Some(crate::hot_state::DeclaredColumnEq {
             schema_key: spec.schema_key.clone(),
             ordinal: indexed.ordinal,
-            value,
+            values,
         })
     })
+}
+
+/// The column and the value set one row filter constrains it to, when the
+/// filter is a membership test on a single column.
+///
+/// A disjunction counts: DataFusion's simplifier rewrites a short `IN` list
+/// into `col = a OR col = b`, so the two spellings must reach the index the
+/// same way. A conjunction does not, because either side alone would need to
+/// be re-checked against the other, which is a wider contract than "the value
+/// is one of these".
+fn declared_column_membership(filter: &EntityRowFilter) -> Option<(&str, Vec<&EntityFilterValue>)> {
+    match filter {
+        EntityRowFilter::ColumnEq { column, value, .. } => Some((column, vec![value])),
+        EntityRowFilter::ColumnIn { column, values, .. } => Some((column, values.iter().collect())),
+        EntityRowFilter::Or(left, right) => {
+            let (column, mut values) = declared_column_membership(left)?;
+            let (right_column, right_values) = declared_column_membership(right)?;
+            if column != right_column {
+                return None;
+            }
+            values.extend(right_values);
+            Some((column, values))
+        }
+        EntityRowFilter::And(..) => None,
+    }
 }
 
 fn apply_exact_entity_pk_filters(

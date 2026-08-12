@@ -3162,7 +3162,7 @@ fn declared_column_probe(
     Some(crate::hot_state::DeclaredColumnEq {
         schema_key: scope.schema_key.clone(),
         ordinal,
-        value: value.exact_hot_index_value()?,
+        values: vec![value.exact_hot_index_value()?],
     })
 }
 
