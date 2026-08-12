@@ -160,7 +160,7 @@ pub enum BenchChangeLookup {
 
 #[derive(Clone, Copy, Debug)]
 pub struct BenchDecodedAppendIndex {
-    objects: usize,
+    pub objects: usize,
 }
 
 pub fn append_1c_1ch() -> Result<BenchAppend, LixError> {
