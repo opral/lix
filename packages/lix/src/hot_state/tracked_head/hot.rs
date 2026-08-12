@@ -615,10 +615,11 @@ pub(crate) async fn stage_certified_entity_batches(
                     StorageBeginScanOptions::default(),
                 )
                 .await?;
-            let manifests = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in manifests.entries {
+            // The prefix is only the 16-byte generation, so this range covers
+            // every file on the branch. Reading one page dropped every file
+            // past row 1024 out of the new generation permanently.
+            let manifests = cursor.collect_all().await?;
+            for entry in manifests {
                 let suffix = entry
                     .key
                     .0
@@ -685,10 +686,10 @@ pub(crate) async fn stage_certified_entity_batches(
                         StorageBeginScanOptions::default(),
                     )
                     .await?;
-                let prior_manifests = cursor
-                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                    .await?;
-                for entry in prior_manifests.entries {
+                // Every prior manifest for this file must be deleted, or a
+                // superseded batch survives its replacement.
+                let prior_manifests = cursor.collect_all().await?;
+                for entry in prior_manifests {
                     writes.delete(CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, entry.key);
                 }
             }
@@ -1066,12 +1067,7 @@ async fn scan_certified_entity_batch_rows(
                     StorageBeginScanOptions::default(),
                 )
                 .await?;
-            manifest_entries.extend(
-                cursor
-                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                    .await?
-                    .entries,
-            );
+            manifest_entries.extend(cursor.collect_all().await?);
         }
     } else {
         let range = StoragePrefix {
@@ -1085,10 +1081,10 @@ async fn scan_certified_entity_batch_rows(
                 StorageBeginScanOptions::default(),
             )
             .await?;
-        manifest_entries = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?
-            .entries;
+        // Prefixed by the generation alone, so this covers every file on the
+        // branch. One page silently hid every file past row 1024 from the
+        // merged scan result.
+        manifest_entries = cursor.collect_all().await?;
     }
     if exact_file_ids.is_none() && manifest_entries.is_empty() {
         if let Some(cache) = transaction_cache {
@@ -3509,10 +3505,11 @@ async fn scan_root_current_base_rows_for_merge(
                     StorageBeginScanOptions::default(),
                 )
                 .await?;
-            control_entries = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?
-                .entries;
+            // A replacement control anywhere in the generation decides whether
+            // the root scan may keep a pushed-down LIMIT. Missing one past row
+            // 1024 reads as "no replacement" and can select a retired row while
+            // a live row still exists further along.
+            control_entries = cursor.collect_all().await?;
         } else {
             for schema_key in &request.filter.schema_keys {
                 let mut prefix = hot_scope_prefix(branch_id, generation);
@@ -3528,12 +3525,7 @@ async fn scan_root_current_base_rows_for_merge(
                         StorageBeginScanOptions::default(),
                     )
                     .await?;
-                control_entries.extend(
-                    cursor
-                        .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                        .await?
-                        .entries,
-                );
+                control_entries.extend(cursor.collect_all().await?);
             }
         }
         control_entries

@@ -381,10 +381,51 @@ impl Default for BeginScanOptions {
     }
 }
 
+/// One page of a storage scan, together with whether the range has more rows.
+///
+/// Both fields are private on purpose. The only way to reach the rows is
+/// [`ScanChunk::into_parts`], which hands back `has_more` in the same
+/// expression, so a caller that stops after one page does so visibly at the
+/// call site. The previous public `entries` field let
+/// `cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.entries` read as a complete
+/// scan while silently dropping every row past the page boundary; nothing in
+/// the type system, the linter, or CI could see that.
+///
+/// Callers that want every row in the range must not assemble pages by hand.
+/// Use [`crate::storage::ScanCursor::collect_all`] for a materialized vector or
+/// [`crate::storage::ScanCursor::next_chunk`] to stream page by page — neither
+/// exposes a flag that can be forgotten.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "a scan page carries `has_more`; dropping it silently truncates the scan"]
 pub struct ScanChunk {
-    pub entries: Vec<ReadEntry>,
-    pub has_more: bool,
+    entries: Vec<ReadEntry>,
+    has_more: bool,
+}
+
+impl ScanChunk {
+    /// Builds one scan page. Storage adapters are the intended callers.
+    pub fn new(entries: Vec<ReadEntry>, has_more: bool) -> Self {
+        Self { entries, has_more }
+    }
+
+    /// Splits the page into its rows and whether the range continues past them.
+    ///
+    /// Binding both halves is the point: a caller that discards the flag has
+    /// written that decision down where a reviewer can see it.
+    pub fn into_parts(self) -> (Vec<ReadEntry>, bool) {
+        (self.entries, self.has_more)
+    }
+
+    /// Rows in this page, not counting anything the range may hold after it.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether this page has no rows. A page can be empty while the range
+    /// itself is not yet drained only if the backend says so.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

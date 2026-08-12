@@ -440,7 +440,7 @@ impl StorageScanSource for RocksDBScanSource<'_> {
                 .iterator
                 .key()
                 .is_some_and(|key| self.bounds.before_upper(key));
-            Ok(ScanChunk { entries, has_more })
+            Ok(ScanChunk::new(entries, has_more))
         })
     }
 }

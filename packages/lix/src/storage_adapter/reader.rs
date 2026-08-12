@@ -92,10 +92,7 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>>
         {
             Box::pin(async {
-                Ok(ScanChunk {
-                    entries: Vec::new(),
-                    has_more: false,
-                })
+                Ok(ScanChunk::new(Vec::new(), false))
             })
         }
     }

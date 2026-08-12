@@ -429,10 +429,7 @@ impl StorageScanSource for BrokenScanSource {
                 self.last = Some(entry.clone());
                 entries.push(entry);
             }
-            Ok(ScanChunk {
-                entries,
-                has_more: !self.rows.is_empty(),
-            })
+            Ok(ScanChunk::new(entries, !self.rows.is_empty()))
         })
     }
 }

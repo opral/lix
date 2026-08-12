@@ -3070,7 +3070,7 @@ impl StorageScanSource for SlateDBScanSource {
             let space_id = self.space.id;
             #[cfg(test)]
             let worker_gate = self.worker_gate.clone();
-            let (state, mut chunk) = self
+            let (state, chunk) = self
                 .worker
                 .call_read(move |_db| async move {
                     #[cfg(test)]
@@ -3089,14 +3089,15 @@ impl StorageScanSource for SlateDBScanSource {
                 gate.entered_notify.notify_waiters();
                 gate.release.notified().await;
             }
+            let (mut entries, has_more) = chunk.into_parts();
             hydrate_immutable_value_scan(
                 &self.immutable_value_store,
                 self.space,
                 self.projection,
-                &mut chunk,
+                &mut entries,
             )
             .await?;
-            Ok(chunk)
+            Ok(ScanChunk::new(entries, has_more))
         })
     }
 }
@@ -3284,7 +3285,7 @@ async fn streaming_scan_page(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((state, ScanChunk { entries, has_more }))
+    Ok((state, ScanChunk::new(entries, has_more)))
 }
 
 async fn next_streaming_visible_row(
@@ -3364,7 +3365,7 @@ async fn hydrate_immutable_value_scan(
     immutable_value_store: &ImmutableValueStore,
     space: StorageSpace,
     projection: CoreProjection,
-    chunk: &mut ScanChunk,
+    entries: &mut [ReadEntry],
 ) -> Result<(), StorageError> {
     if space.value_semantics != ValueSemantics::Immutable || projection != CoreProjection::FullValue
     {
@@ -3372,8 +3373,7 @@ async fn hydrate_immutable_value_scan(
     }
     let values = immutable_value_store
         .get_many(
-            chunk
-                .entries
+            entries
                 .iter()
                 .map(|entry| match &entry.value {
                     ProjectedValue::FullValue(marker) => Ok(marker.clone()),
@@ -3384,7 +3384,7 @@ async fn hydrate_immutable_value_scan(
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .await?;
-    for (entry, value) in chunk.entries.iter_mut().zip(values) {
+    for (entry, value) in entries.iter_mut().zip(values) {
         entry.value = ProjectedValue::FullValue(value);
     }
     Ok(())

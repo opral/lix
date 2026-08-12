@@ -360,10 +360,7 @@ impl StorageScanSource for MemoryScanSource<'_> {
                 });
             }
             self.pending = self.cursor.next();
-            Ok(ScanChunk {
-                entries,
-                has_more: self.pending.is_some(),
-            })
+            Ok(ScanChunk::new(entries, self.pending.is_some()))
         })
     }
 }

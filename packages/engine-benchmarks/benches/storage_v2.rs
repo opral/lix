@@ -2008,15 +2008,11 @@ where
         .await?;
 
     loop {
-        let chunk = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        let has_more = chunk.has_more;
-        entries.extend(chunk.entries);
+        let (page, has_more) = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
+        entries.extend(page);
 
         if !has_more {
-            return Ok(ScanChunk {
-                entries,
-                has_more: false,
-            });
+            return Ok(ScanChunk::new(entries, false));
         }
     }
 }
