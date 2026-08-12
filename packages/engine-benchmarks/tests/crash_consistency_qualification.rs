@@ -355,13 +355,13 @@ struct Recovered {
 
 /// Everything the brief asks of a store that has just survived a crash.
 async fn verify_after_crash(
-    path: &Path,
+    path: PathBuf,
     acked: Option<i64>,
     attempted: i64,
     rows: usize,
 ) -> Result<Recovered, String> {
     // 1. Does the store open at all?
-    let storage = RocksDB::open(path).map_err(|error| format!("store did not open: {error}"))?;
+    let storage = RocksDB::open(&path).map_err(|error| format!("store did not open: {error}"))?;
     let lix = open_lix()
         .with_storage(storage.clone())
         .await
@@ -383,10 +383,14 @@ async fn verify_after_crash(
             "branch ref points at commit {head}, but lix_commit holds {head_records} record(s)"
         ));
     }
+    let branch_id = lix
+        .active_branch_id()
+        .await
+        .map_err(|error| format!("active branch id unreadable: {error}"))?;
     let branch_ref = scalar_text(
         &lix,
         "SELECT commit_id FROM lix_branch WHERE id = $1",
-        &[Value::Text(lix.active_branch_id().to_string())],
+        &[Value::Text(branch_id)],
     )
     .await
     .map_err(|error| format!("branch table unreadable: {error}"))?;
@@ -443,7 +447,7 @@ async fn verify_after_crash(
     drop(storage);
 
     // And the recovered store must stay recovered across another clean reopen.
-    let storage = RocksDB::open(path).map_err(|error| format!("second open failed: {error}"))?;
+    let storage = RocksDB::open(&path).map_err(|error| format!("second open failed: {error}"))?;
     let lix = open_lix()
         .with_storage(storage.clone())
         .await
@@ -596,7 +600,7 @@ async fn scalar_text<S: Storage + Clone + Send + Sync + 'static>(
     }
     rows[0]
         .get::<String>(result_column(sql))
-        .ok_or_else(|| "column was not text".to_owned())
+        .map_err(|error| format!("column was not text: {error}"))
 }
 
 async fn scalar_i64<S: Storage + Clone + Send + Sync + 'static>(
@@ -614,7 +618,7 @@ async fn scalar_i64<S: Storage + Clone + Send + Sync + 'static>(
     }
     rows[0]
         .get::<i64>(result_column(sql))
-        .ok_or_else(|| "column was not an integer".to_owned())
+        .map_err(|error| format!("column was not an integer: {error}"))
 }
 
 fn result_column(sql: &str) -> &'static str {
@@ -681,12 +685,11 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
             .get((*kill_at as usize).saturating_sub(1))
             .cloned()
             .unwrap_or_else(|| "?".to_owned());
-        let outcome = block_on(verify_after_crash(
-            &dir.join("database"),
-            child.acked,
-            workload.commits as i64,
-            workload.rows,
-        ));
+        let database = dir.join("database");
+        let acked = child.acked;
+        let outcome = block_on(move || {
+            verify_after_crash(database, acked, workload.commits as i64, workload.rows)
+        });
         if let Err(error) = &outcome {
             failures.push(format!(
                 "kill_at={kill_at} ({label}, killed={}): {error}",
@@ -717,12 +720,11 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
         if child.killed_by_signal {
             killed_trials += 1;
         }
-        let outcome = block_on(verify_after_crash(
-            &dir.join("database"),
-            child.acked,
-            workload.commits as i64,
-            workload.rows,
-        ));
+        let database = dir.join("database");
+        let acked = child.acked;
+        let outcome = block_on(move || {
+            verify_after_crash(database, acked, workload.commits as i64, workload.rows)
+        });
         if let Err(error) = &outcome {
             failures.push(format!(
                 "timed delay={delay}ns (killed={}): {error}",
@@ -897,9 +899,10 @@ where
         .expect("crash-consistency thread should not panic");
 }
 
-fn block_on<T, Fut>(future: Fut) -> T
+fn block_on<T, F, Fut>(make_future: F) -> T
 where
-    Fut: Future<Output = T> + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T>,
     T: Send + 'static,
 {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -911,7 +914,7 @@ where
                 .enable_all()
                 .build()
                 .expect("build crash-consistency verify runtime")
-                .block_on(future);
+                .block_on(make_future());
             let _ = sender.send(value);
         })
         .expect("spawn crash-consistency verify thread")
