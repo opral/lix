@@ -396,11 +396,12 @@ impl PluginRegistry {
     }
 
     pub(crate) fn write_row(&self, branch_id: &str) -> Result<TransactionWriteRow, LixError> {
-        tracked_key_value_write_row(
+        plugin_key_value_write_row(
             PLUGIN_REGISTRY_KEY,
             None,
             Some(self.to_snapshot()?),
             branch_id,
+            false,
         )
     }
 
@@ -728,24 +729,30 @@ impl PluginFileOwner {
         Self::new(file_id, owner_value.plugin_key, owner_value.schema_keys)
     }
 
-    pub(crate) fn write_row(&self, branch_id: &str) -> Result<TransactionWriteRow, LixError> {
-        tracked_key_value_write_row(
+    pub(crate) fn write_row(
+        &self,
+        branch_id: &str,
+        untracked: bool,
+    ) -> Result<TransactionWriteRow, LixError> {
+        plugin_key_value_write_row(
             PLUGIN_OWNER_KEY,
             Some(self.file_id.clone()),
             Some(self.to_snapshot()?),
             branch_id,
+            untracked,
         )
     }
 
     pub(crate) fn delete_row(
         file_id: impl Into<String>,
         branch_id: &str,
+        untracked: bool,
     ) -> Result<TransactionWriteRow, LixError> {
         let file_id = file_id.into();
         if file_id.is_empty() {
             return Err(invalid_registry("plugin owner file_id must not be empty"));
         }
-        tracked_key_value_write_row(PLUGIN_OWNER_KEY, Some(file_id), None, branch_id)
+        plugin_key_value_write_row(PLUGIN_OWNER_KEY, Some(file_id), None, branch_id, untracked)
     }
 
     fn validate(&self) -> Result<(), LixError> {
@@ -1164,11 +1171,17 @@ fn decode_key_value_snapshot<'a>(
     })
 }
 
-fn tracked_key_value_write_row(
+/// Builds a reserved `lix_key_value` row for plugin bookkeeping.
+///
+/// File-scoped plugin rows must be written in the same durability lane as the
+/// file they describe, so the lane is a parameter rather than a constant. Rows
+/// that are not file-scoped (the branch's plugin registry) are always tracked.
+fn plugin_key_value_write_row(
     key: &str,
     file_id: Option<String>,
     snapshot: Option<JsonValue>,
     branch_id: &str,
+    untracked: bool,
 ) -> Result<TransactionWriteRow, LixError> {
     validate_branch_local_scope(branch_id)?;
     let snapshot = snapshot
@@ -1186,7 +1199,7 @@ fn tracked_key_value_write_row(
         global: false,
         change_id: None,
         commit_id: None,
-        untracked: false,
+        untracked,
         branch_id: branch_id.into(),
     })
 }
@@ -1511,7 +1524,7 @@ mod tests {
             vec!["plugin_a_note".to_string(), "plugin_a_meta".to_string()],
         )
         .unwrap();
-        let row = owner.write_row("main").unwrap();
+        let row = owner.write_row("main", false).unwrap();
         assert_eq!(
             row.entity_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_OWNER_KEY
