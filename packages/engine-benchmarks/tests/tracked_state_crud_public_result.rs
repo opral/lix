@@ -49,8 +49,28 @@ fn typed_olap_queries_are_plain_datafusion_selects() {
     }
 }
 
-#[tokio::test]
-async fn typed_olap_shapes_validate_exact_results_on_every_adapter() {
+/// Explicitly sized thread: see
+/// [`typed_olap_shapes_validate_above_columnar_publication_threshold`]. Every
+/// OLAP-shape test in this file builds the same deep DataFusion plans and none
+/// of them fit the default test-thread stack with any margin.
+#[test]
+fn typed_olap_shapes_validate_exact_results_on_every_adapter() {
+    std::thread::Builder::new()
+        .name("every-adapter-olap-validation".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build every-adapter OLAP runtime")
+                .block_on(validate_every_adapter_olap_shapes());
+        })
+        .expect("spawn every-adapter OLAP validation thread")
+        .join()
+        .expect("join every-adapter OLAP validation thread");
+}
+
+async fn validate_every_adapter_olap_shapes() {
     let _test_guard = serialized_public_result_test().await;
     let rows = workload::fixture_rows(128);
     for &profile in storage::STORAGE_PROFILES {
