@@ -5949,7 +5949,8 @@ where
                 ));
             }
             let limits = WasmTransitionLimits::default();
-            let changes = v2_host_changes_from_prepared_rows(&prepared, limits)?;
+            let changes =
+                v2_host_changes_from_prepared_rows(&prepared, limits, file_key.untracked)?;
             if changes.entity_change_count() == 0 {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
@@ -9997,14 +9998,17 @@ fn v2_host_entity_ordinals_from_live_batch(
 fn v2_host_changes_from_prepared_rows(
     rows: &PreparedStateBatch,
     limits: WasmTransitionLimits,
+    untracked: bool,
 ) -> Result<WasmHostEntityChanges, LixError> {
     let mut changes = rows
         .iter()
         .map(|row| {
-            if row.global || row.untracked || row.file_id.is_none() {
+            // Rendering is lane-agnostic; the rows only have to agree with the
+            // lane of the file being rendered.
+            if row.global || row.untracked != untracked || row.file_id.is_none() {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "component semantic rendering requires tracked, branch-local, file-scoped rows",
+                    "component semantic rendering requires branch-local, file-scoped rows in the file's own lane",
                 ));
             }
             let key = WasmEntityKey::from_owned_parts(
@@ -14091,7 +14095,7 @@ mod tests {
             "main".into(),
         );
 
-        let changes = v2_host_changes_from_prepared_rows(&semantic_rows, limits)
+        let changes = v2_host_changes_from_prepared_rows(&semantic_rows, limits, false)
             .expect("direct semantic rendering should select a lazy snapshot source");
         let WasmEntityChange::Upsert { entity, .. } = &changes.changes[0] else {
             panic!("prepared semantic snapshot should become an upsert")
