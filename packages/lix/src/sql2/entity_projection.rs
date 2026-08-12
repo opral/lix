@@ -438,7 +438,7 @@ mod tests {
     use crate::sql2::catalog::derive_entity_surface_spec_from_schema;
     use crate::sql2::exec::datafusion::query_result_from_batches;
     use crate::sql2::result_metadata::mark_json_field;
-    use crate::transaction::types::TransactionJson;
+    use crate::transaction_types::TransactionJson;
     use crate::{Json, LixError, Value};
 
     fn lix_json(canonical: &str) -> Json {

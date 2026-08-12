@@ -24,7 +24,7 @@ use crate::tracked_state::{
     MaterializedTrackedStateRowRef, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest, TrackedStateStoreReader,
 };
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
 use super::InstalledPlugin;

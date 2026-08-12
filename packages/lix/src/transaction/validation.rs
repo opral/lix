@@ -44,8 +44,8 @@ use crate::transaction::staging::{
     PreparedInsertRef, PreparedValidationRow, PreparedWriteSet, PreparedWriteValidationSet,
 };
 #[cfg(test)]
-use crate::transaction::types::TransactionWriteOrigin;
-use crate::transaction::types::{
+use crate::transaction_types::TransactionWriteOrigin;
+use crate::transaction_types::{
     PreparedStateBatch, PreparedStateRowRef, TransactionWriteOperation,
 };
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -3252,7 +3252,7 @@ mod tests {
         LiveStateScanRequest, MaterializedLiveStateBatchBuilder, MaterializedLiveStateRow,
     };
     use crate::schema::{schema_key_from_definition, seed_schema_definition};
-    use crate::transaction::types::{
+    use crate::transaction_types::{
         LogicalPrimaryKey, StageJson, TestPreparedStateRow, TransactionJson, shared_origin_surface,
     };
 
@@ -3417,7 +3417,7 @@ mod tests {
 
     fn test_stage_json(value: &str) -> StageJson {
         let parsed = test_json_text(value).expect("test staged JSON should parse");
-        crate::transaction::types::stage_json_from_value(
+        crate::transaction_types::stage_json_from_value(
             TransactionJson::from_value_for_test(parsed),
             "test staged JSON",
         )
@@ -6774,7 +6774,7 @@ mod tests {
         let key = schema_key_from_definition(&schema).expect("test schema should have a key");
         TestPreparedStateRow {
             schema_plan_id: crate::catalog::SchemaPlanId::for_test(0),
-            facts: crate::transaction::types::PreparedRowFacts::default(),
+            facts: crate::transaction_types::PreparedRowFacts::default(),
             entity_pk: registered_schema_entity_pk(&key.schema_key),
             schema_key: REGISTERED_SCHEMA_KEY.into(),
             file_id: None,
@@ -7057,7 +7057,7 @@ mod tests {
     fn staged_row(schema_key: &str, snapshot_content: Option<String>) -> TestPreparedStateRow {
         TestPreparedStateRow {
             schema_plan_id: crate::catalog::SchemaPlanId::for_test(0),
-            facts: crate::transaction::types::PreparedRowFacts::default(),
+            facts: crate::transaction_types::PreparedRowFacts::default(),
             entity_pk: EntityPk::single("entity-1"),
             schema_key: schema_key.into(),
             file_id: None,
@@ -7152,7 +7152,7 @@ mod tests {
 
         let mut writes = PreparedWriteSet {
             state_rows: prepared_rows![descriptor.clone(), blob_ref.clone(), owner, semantic],
-            file_content_writes: vec![crate::transaction::types::TransactionFileContent::new(
+            file_content_writes: vec![crate::transaction_types::TransactionFileContent::new(
                 "01920000-0000-7000-8000-0000000000a2".to_string(),
                 Some("/a.json".to_string()),
                 Some("a.json".to_string()),
@@ -7165,7 +7165,7 @@ mod tests {
         };
         writes.commit_change_refs_by_branch.insert(
             "01920000-0000-7000-8000-0000000000a1".to_string(),
-            crate::transaction::types::StagedCommitChangeRefs::default(),
+            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::default(),
         );
         writes.remember_insert_identity_for_tests(&descriptor);
         writes
