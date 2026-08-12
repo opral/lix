@@ -92,11 +92,13 @@ impl StringDictionary {
     }
 
     /// Size of the UTF-8 arena in bytes.
+    #[cfg(test)]
     pub(crate) fn byte_len(&self) -> usize {
         self.bytes.len()
     }
 
     /// Whether the arena holds any bytes at all.
+    #[cfg(test)]
     pub(crate) fn is_arena_empty(&self) -> bool {
         self.bytes.is_empty()
     }
@@ -369,7 +371,7 @@ mod tests {
         assert_eq!(dictionary.get(0), "alpha");
         assert_eq!(dictionary.get(1), "beta");
         assert_eq!(dictionary.get(2), "gamma");
-        assert_eq!(dictionary.shared(1).as_ref(), "beta");
+        assert_eq!(dictionary.shared(1).as_str(), "beta");
         assert_eq!(dictionary.byte_len(), "alphabetagamma".len());
     }
 
