@@ -8720,7 +8720,6 @@ mod tests {
             .expect("chunk inventory should scan").into_parts();
         assert!(!chunk_has_more, "test chunk inventory must fit one page");
         chunk
-            .entries
             .into_iter()
             .map(|entry| {
                 entry

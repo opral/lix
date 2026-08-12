@@ -308,7 +308,6 @@ async fn slatedb_streams_unbounded_scan_limits() {
     assert_eq!(result.len(), 10);
     assert!(
         result
-            .entries
             .iter()
             .all(|entry| entry.value == ProjectedValue::KeyOnly)
     );
@@ -531,7 +530,6 @@ async fn assert_cached_rows(
 
     assert_eq!(result.len(), 3);
     let rows = result
-        .entries
         .into_iter()
         .map(|entry| {
             let ProjectedValue::FullValue(value) = entry.value else {

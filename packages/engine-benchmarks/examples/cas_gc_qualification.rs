@@ -803,7 +803,6 @@ async fn space_stats<S: Storage>(storage: &S, space_id: lix::storage::SpaceId) -
             .expect("scan CAS stats").into_parts();
         stats.rows += page.len() as u64;
         stats.value_bytes += page
-            .entries
             .iter()
             .map(|entry| match &entry.value {
                 lix::storage::ProjectedValue::FullValue(bytes) => bytes.len() as u64,

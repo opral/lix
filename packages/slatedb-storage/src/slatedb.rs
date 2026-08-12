@@ -5921,7 +5921,6 @@ mod tests {
             .expect("drain fresh worker-cancellation cursor").into_parts();
         assert_eq!(
             restarted
-                .entries
                 .iter()
                 .map(|entry| entry.key.0.as_ref())
                 .collect::<Vec<_>>(),

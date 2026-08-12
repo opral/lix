@@ -224,7 +224,6 @@ impl StorageScanSource for CountingScanSource<'_> {
             let mut stats = self.stats.lock().expect("I/O stats mutex");
             stats.scan_rows += chunk.len() as u64;
             stats.scan_value_bytes += chunk
-                .entries
                 .iter()
                 .map(|entry| match &entry.value {
                     ProjectedValue::KeyOnly => 0,
@@ -1119,12 +1118,10 @@ where
             .expect("scan CAS accounting space").into_parts();
         accounting.rows += page.len() as u64;
         accounting.key_bytes += page
-            .entries
             .iter()
             .map(|entry| entry.key.0.len() as u64)
             .sum::<u64>();
         accounting.value_bytes += page
-            .entries
             .iter()
             .map(|entry| match &entry.value {
                 ProjectedValue::KeyOnly => 0,

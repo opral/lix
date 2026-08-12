@@ -2393,7 +2393,7 @@ mod tests {
     async fn scan_test_space(
         read: &(impl StorageAdapterRead + ?Sized),
         space: StorageSpace,
-    ) -> crate::storage_adapter::StorageScanChunk {
+    ) -> Vec<crate::storage_adapter::StorageReadEntry> {
         let range = StoragePrefix {
             bytes: Bytes::new(),
         }
@@ -2404,7 +2404,7 @@ mod tests {
             .await
             .expect("begin test scan");
         cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .collect_all()
             .await
             .expect("read test scan page")
     }
@@ -4040,8 +4040,7 @@ mod tests {
             .await
             .expect("open file schema marker verification read");
         let projection_rows = scan_test_space(&projection_read, FILE_SPACE)
-            .await
-            .entries;
+            .await;
         assert_eq!(
             projection_rows.len(),
             1,
@@ -4681,7 +4680,6 @@ mod tests {
             .expect("open corruption fixture read");
         let unrelated_key = scan_test_space(&read, ROW_SPACE)
             .await
-            .entries
             .into_iter()
             .find_map(|entry| {
                 let value = full_value_bytes(entry.value).ok()?;

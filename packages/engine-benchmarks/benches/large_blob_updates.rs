@@ -574,7 +574,6 @@ where
             .expect("scan accounting space").into_parts();
         accounting.rows += page.len() as u64;
         accounting.value_bytes += page
-            .entries
             .iter()
             .map(|entry| match &entry.value {
                 ProjectedValue::KeyOnly => 0,

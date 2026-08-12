@@ -504,7 +504,7 @@ mod tests {
     async fn scan_test_space(
         read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
         space: StorageSpace,
-    ) -> crate::storage_adapter::StorageScanChunk {
+    ) -> Vec<crate::storage_adapter::StorageReadEntry> {
         let range = StoragePrefix {
             bytes: Bytes::new(),
         }
@@ -515,7 +515,7 @@ mod tests {
             .await
             .expect("begin test scan");
         cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .collect_all()
             .await
             .expect("read test scan page")
     }
@@ -2283,8 +2283,7 @@ mod tests {
             .await
             .expect("read initialized hot rows");
         let hot_rows = scan_test_space(&read, crate::hot_state::ROW_SPACE)
-            .await
-            .entries;
+            .await;
         assert!(
             !hot_rows.is_empty(),
             "initialized repository must have hot rows"
@@ -2484,8 +2483,7 @@ mod tests {
             .await
             .expect("read the index plane");
         let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE)
-            .await
-            .entries;
+            .await;
         let witnesses = entries
             .iter()
             .filter(|entry| match &entry.value {

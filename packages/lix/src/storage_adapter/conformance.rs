@@ -188,7 +188,6 @@ async fn prefix_scan_lowers_to_storage_range() -> StorageConformanceResult {
 
     assert_eq!(
         chunk
-            .entries
             .into_iter()
             .map(|entry| entry.key)
             .collect::<Vec<_>>(),
@@ -242,7 +241,6 @@ async fn cursor_drains_chunked_pages() -> StorageConformanceResult {
             .map_err(|error| format!("scan cursor page failed: {error}"))?.into_parts();
 
         if result
-            .entries
             .iter()
             .any(|entry| !matches!(entry.value, ProjectedValue::KeyOnly))
         {
@@ -298,7 +296,6 @@ async fn read_scope_pins_snapshot() -> StorageConformanceResult {
 
     assert_eq!(
         chunk
-            .entries
             .into_iter()
             .map(|entry| entry.value)
             .collect::<Vec<_>>(),

@@ -207,7 +207,6 @@ impl StorageScanSource for CountingScanSource<'_> {
             let mut stats = self.stats.lock().expect("I/O stats mutex");
             stats.scan_entries += chunk.len() as u64;
             stats.scan_value_bytes += chunk
-                .entries
                 .iter()
                 .map(|entry| projected_value_len(&entry.value) as u64)
                 .sum::<u64>();

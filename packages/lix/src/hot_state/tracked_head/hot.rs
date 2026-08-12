@@ -10719,10 +10719,12 @@ async fn hot_scan_entries<'a>(
                 };
                 return Ok(Some(HotScanEntries::Decoded(rows)));
             }
-            let page = cursor
+            // Deliberately bounded: this reader stops at the caller's LIMIT.
+            let (page, page_has_more) = cursor
                 .next_page(remaining.unwrap_or(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
-                .await?;
-            for entry in page.entries {
+                .await?
+                .into_parts();
+            for entry in page {
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
@@ -10747,7 +10749,7 @@ async fn hot_scan_entries<'a>(
                     }
                 }
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -10911,11 +10913,14 @@ async fn hot_scan_dense_encoded_key_range<'a>(
         if remaining_budget == 0 {
             return Ok(None);
         }
-        let page = cursor
+        // Deliberately bounded: this reader gives up once it has burned its
+        // scan budget rather than reading an unbounded range.
+        let (page, page_has_more) = cursor
             .next_page(remaining_budget.min(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
-            .await?;
-        scanned += page.entries.len();
-        for entry in page.entries {
+            .await?
+            .into_parts();
+        scanned += page.len();
+        for entry in page {
             while requested_index < key_count && key_at(requested_index) < entry.key.0.as_ref() {
                 requested_index += 1;
             }
@@ -10924,7 +10929,7 @@ async fn hot_scan_dense_encoded_key_range<'a>(
                 requested_index += 1;
             }
         }
-        if requested_index == key_count || !page.has_more {
+        if requested_index == key_count || !page_has_more {
             return Ok(Some(values));
         }
     }

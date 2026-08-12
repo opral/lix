@@ -368,12 +368,10 @@ impl StorageScanSource for CountingScanSource<'_> {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.scan_entries += chunk.len();
             stats.scan_entry_key_bytes += chunk
-                .entries
                 .iter()
                 .map(|entry| entry.key.0.len())
                 .sum::<usize>();
             stats.scan_entry_value_bytes += chunk
-                .entries
                 .iter()
                 .map(|entry| projected_value_len(&entry.value))
                 .sum::<usize>();

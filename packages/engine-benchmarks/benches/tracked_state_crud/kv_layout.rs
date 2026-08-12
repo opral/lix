@@ -444,12 +444,10 @@ where
 
         rows += page.len() as u64;
         key_bytes += page
-            .entries
             .iter()
             .map(|entry| entry.key.0.len() as u64 + 4)
             .sum::<u64>();
         value_bytes += page
-            .entries
             .iter()
             .map(|entry| match &entry.value {
                 ProjectedValue::KeyOnly => 0,
