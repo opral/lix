@@ -39,12 +39,30 @@ pub struct SqlReadProfile {
     /// filtering earlier in the plan changes `scan_rows` and leaves this
     /// unchanged.
     ///
-    /// Entity surfaces record it at every route they can take:
-    /// primary-key projection and direct-snapshot reads examine exactly what
-    /// they emit, the generic row route examines the whole scanned batch
-    /// before `EntityRowFilter`s run, and the columnar route examines the rows
-    /// of the row groups that survived manifest pruning plus its overlay rows.
+    /// Entity surfaces record it on the three row routes: primary-key
+    /// projection and direct-snapshot reads examine exactly what they emit,
+    /// and the generic row route examines the whole scanned batch before
+    /// `EntityRowFilter`s run.
+    ///
+    /// The columnar row-group route is **not** counted — see
+    /// [`Self::provider_rows_examined_incomplete`]. Always read the two
+    /// together; a zero on its own is not evidence of no work.
     pub provider_rows_examined: u64,
+    /// Whether [`Self::provider_rows_examined`] missed a scan in this read.
+    ///
+    /// True once any scan took the entity columnar row-group route, whose
+    /// rows this counter does not observe. Instrumenting that route means
+    /// adding to a partition future that already sits at the edge of the
+    /// debug-profile stack: every placement tried — inside the future, inside
+    /// a helper it awaits, and in a stream adapter over it — overflowed
+    /// `typed_olap_shapes_validate_above_columnar_publication_threshold`.
+    ///
+    /// Reporting the gap is worth more than a number that silently omits a
+    /// route. The columnar route is reachable only for state published by a
+    /// single ordered bulk insert of at least `PACKED_CURRENT_BASE_MIN_ROWS`
+    /// rows, so incremental OLTP reads — what this counter exists to gate —
+    /// are fully accounted.
+    pub provider_rows_examined_incomplete: bool,
     /// Number of rows retained by the benchmark-only result ceiling probe.
     /// A nonzero value means result conversion was intentionally bypassed;
     /// it is never set by the production result path.
@@ -120,6 +138,14 @@ pub(crate) fn record_provider_rows_examined(rows: usize) {
     let _ = ACTIVE_PROFILE.try_with(|profile| {
         let mut profile = profile.borrow_mut();
         profile.provider_rows_examined = profile.provider_rows_examined.saturating_add(rows as u64);
+    });
+}
+
+/// Marks this read as having taken a scan route the examined counter cannot
+/// observe, so a low count is never mistaken for little work.
+pub(crate) fn record_provider_rows_examined_gap() {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        profile.borrow_mut().provider_rows_examined_incomplete = true;
     });
 }
 
@@ -391,6 +417,13 @@ mod tests {
             "a non-primary-key predicate has no indexed access path today and \
              examines the whole collection"
         );
+        for profile in [indexed_profile, scanned_profile] {
+            assert!(
+                !profile.provider_rows_examined_incomplete,
+                "row-route reads must be fully accounted; only the columnar \
+                 route sets the gap flag"
+            );
+        }
     }
 
     #[tokio::test]
