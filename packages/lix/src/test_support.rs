@@ -1,6 +1,8 @@
 use crate::changelog::CommitId;
+#[cfg(test)]
+use crate::changelog::ChangeId;
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, ChangelogWriter,
+    ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, ChangelogWriter,
     CommitLoadRequest, CommitRecord,
 };
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
