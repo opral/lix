@@ -7350,10 +7350,16 @@ mod tests {
         );
     }
 
-    /// D1. `commit` clears `latest_snapshot` so the next reader refetches. That
-    /// invalidation must not be undone by an install that was decided before
-    /// the commit landed: the freshness test and the install share one lock
-    /// acquisition, and the install re-validates `next_publication_id`.
+    /// D1. `commit` clears `latest_snapshot` and bumps `next_publication_id`
+    /// so the next reader refetches. That invalidation must not be undone by an
+    /// install decided before the commit landed.
+    ///
+    /// The state below is arranged so that **only** the publication-id term can
+    /// reject the install: the racing publication has already persisted and
+    /// been retired from `visible`, so `snapshot_covers_persisted_publications`
+    /// holds, the tail is complete, and `latest_snapshot` is empty, so the
+    /// monotonic guard passes vacuously. That is precisely the state the old
+    /// two-phase structure reached by the time it called `install_snapshot`.
     #[tokio::test]
     async fn commit_is_not_undone_by_an_install_decided_before_it() {
         let storage = cached_snapshot_test_storage("test-cached-snapshot-install-race");
@@ -7373,18 +7379,28 @@ mod tests {
             .next_publication_id;
         drop(fetch);
 
-        // The commit that races the in-flight install.
+        // The commit that races the in-flight install, then fully settles:
+        // its publication persists and retires, leaving only the publication
+        // id to witness that the snapshot is stale.
         cached_snapshot_commit(&storage, space, "B").await;
-        assert!(
-            storage
+        {
+            let mut state = storage
                 .write_pipeline
                 .state
                 .lock()
-                .expect("lock publication state")
-                .latest_snapshot
-                .is_none(),
-            "commit invalidates the cached snapshot"
-        );
+                .expect("lock publication state");
+            state.visible.clear();
+            state.tail = None;
+            state.latest_snapshot = None;
+            assert_ne!(
+                state.next_publication_id, publication_id,
+                "the racing commit must advance the publication id"
+            );
+            assert!(
+                snapshot_covers_persisted_publications(&state, stale_snapshot.seq()),
+                "every other cacheability term must hold, isolating the publication-id check"
+            );
+        }
 
         assert!(
             !storage
