@@ -19,7 +19,7 @@ before starting the process timer:
 ```sh
 LIX_BENCH_COMMIT_SHA="$(git rev-parse HEAD)" \
 LIX_BENCH_RUSTC_VERSION="$(rustc --version)" \
-  cargo build --release -p lix_tests --example branch_merge_benchmark
+  cargo build --release -p lix_e2e --example branch_merge_benchmark
 target/release/examples/branch_merge_benchmark qualification > branch-merge.jsonl
 ```
 

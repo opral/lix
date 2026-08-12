@@ -122,17 +122,20 @@ jobs:
       # feature its tests actually require.
       #
       # That feature list is exhaustive, not a guess: every `[[test]]` target in
-      # `packages/e2e/Cargo.toml` declares `required-features`
-      # within {storage-benches, slatedb, rocksdb}, and `storage-benches`
-      # implies `rocksdb`. `root-replay-trace` carries no test of its own but
-      # gates instrumentation sources, so it is listed to keep them compiling —
+      # `packages/e2e/Cargo.toml` declares `required-features` within
+      # {sdk-tests, storage-benches, slatedb, rocksdb}, and `storage-benches`
+      # implies `rocksdb`. `sdk-tests` covers the 11 targets folded in from the
+      # former `lix_tests` crate; it turns on `lix/default_wasm_runtime`, which
+      # those tests need and which the benches in that crate deliberately do not
+      # build with. `root-replay-trace` carries no test of its own but gates
+      # instrumentation sources, so it is listed to keep them compiling —
       # dropping it would recreate exactly the `storage_bench.rs` blind spot
       # described above.
       - name: Compile Rust workspace tests
         if: matrix.task == 'test'
         run: |
           cargo test --profile test --workspace --exclude lix_e2e --all-features --no-run
-          cargo test --profile test -p lix_e2e --features storage-benches,slatedb,root-replay-trace --no-run
+          cargo test --profile test -p lix_e2e --features sdk-tests,storage-benches,slatedb,root-replay-trace --no-run
 
       - name: Run Rust workspace tests
         # Deliberately no RUST_MIN_STACK here. Tests that need more than
@@ -149,7 +152,7 @@ jobs:
         if: matrix.task == 'test'
         run: |
           cargo test --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
-          cargo test --profile test -p lix_e2e --features storage-benches,slatedb,root-replay-trace --no-fail-fast
+          cargo test --profile test -p lix_e2e --features sdk-tests,storage-benches,slatedb,root-replay-trace --no-fail-fast
 
       - name: Verify the packaged plugin API contract
         if: matrix.task == 'test'

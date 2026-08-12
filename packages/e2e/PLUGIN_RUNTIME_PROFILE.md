@@ -446,7 +446,7 @@ was 141.625 ms. This 3.7% movement is below the ten-percent reprofile gate.
 ## Reproduction
 
 ```sh
-cargo test --release -p lix_tests --test e2e --no-run
+cargo test --release -p lix_e2e --test e2e --no-run
 
 E2E_BIN="$(find target/release/deps -maxdepth 1 -type f -executable \
   -name 'e2e-*' -print -quit)"

@@ -74,6 +74,43 @@ path = "benches/profile_sql_result_streaming.rs"
 harness = false
 required-features = ["storage-benches"]
 
+# Benches that need nothing but `lix` itself. They ran in the e2e crate purely
+# because that is where benches happened to live, which meant measuring the SQL
+# and version-control surface pulled in RocksDB, SlateDB and their transitive
+# trees for no reason. The rule now: needs a real storage adapter or a wasm
+# plugin -> packages/e2e; needs only `lix` -> here.
+[[bench]]
+name = "diff_commands"
+path = "benches/diff_commands.rs"
+harness = false
+
+[[bench]]
+name = "undo_redo"
+path = "benches/undo_redo.rs"
+harness = false
+
+[[bench]]
+name = "entity_default_values"
+path = "benches/entity_default_values.rs"
+harness = false
+
+[[bench]]
+name = "entity_pk_layout"
+path = "benches/entity_pk_layout.rs"
+harness = false
+
+[[bench]]
+name = "registered_entity_returning"
+path = "benches/registered_entity_returning.rs"
+harness = false
+
+# `lix::storage_adapter` is only `pub` behind `storage-benches`.
+[[bench]]
+name = "commit_graph_scale"
+path = "benches/commit_graph_scale.rs"
+harness = false
+required-features = ["storage-benches"]
+
 [[test]]
 name = "plugin_arena_scorecard"
 path = "tests/plugin_arena_scorecard.rs"
@@ -117,6 +154,7 @@ wasmtime = { version = "45", default-features = false, features = ["cache", "com
 wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
 
 [dev-dependencies]
+criterion = { package = "codspeed-criterion-compat", version = "4" }
 paste = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

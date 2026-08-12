@@ -44,11 +44,11 @@ cargo test -p lix --lib \
   csv_v2_cold_open_and_warm_edit_retain_64_mib_efficiency_invariant \
   --release -- --ignored --nocapture
 
-cargo test -p lix_tests --test e2e \
+cargo test -p lix_e2e --test e2e \
   v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded \
   --release -- --ignored --nocapture
 
-cargo test -p lix_tests --test e2e \
+cargo test -p lix_e2e --test e2e \
   v2_json_ten_mib_ordinary_sql_byte_edit_benchmark \
   --release -- --ignored --nocapture
 ```

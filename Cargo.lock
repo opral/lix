@@ -3320,6 +3320,7 @@ dependencies = [
  "bytes",
  "cel",
  "chrono",
+ "codspeed-criterion-compat",
  "datafusion",
  "fastcdc",
  "futures-util",
@@ -3467,6 +3468,7 @@ version = "0.11.0"
 dependencies = [
  "ahash",
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "codspeed-criterion-compat",
@@ -3476,10 +3478,17 @@ dependencies = [
  "futures-util",
  "libc",
  "lix",
+ "lix-storage-filesystem",
  "lix-storage-rocksdb",
  "lix-storage-slatedb",
+ "lix_collaboration_test_support",
  "mimalloc",
  "object_store 0.14.0",
+ "plugin_csv",
+ "plugin_excalidraw",
+ "plugin_json",
+ "plugin_markdown",
+ "plugin_text",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -3489,10 +3498,12 @@ dependencies = [
  "tempfile",
  "tokio",
  "tpchgen",
+ "tracing",
  "tracing-subscriber",
  "ulid",
  "uuid",
  "xxhash-rust",
+ "zip 8.6.0",
  "zstd",
 ]
 
@@ -3530,39 +3541,6 @@ version = "0.11.0"
 dependencies = [
  "uuid",
  "wit-bindgen 0.57.1",
-]
-
-[[package]]
-name = "lix_tests"
-version = "0.10.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "codspeed-criterion-compat",
- "libc",
- "lix",
- "lix-storage-filesystem",
- "lix-storage-rocksdb",
- "lix-storage-slatedb",
- "lix_collaboration_test_support",
- "mimalloc",
- "plugin_csv",
- "plugin_excalidraw",
- "plugin_json",
- "plugin_markdown",
- "plugin_text",
- "rand 0.9.2",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wasmtime",
- "wasmtime-wasi",
- "zip 8.6.0",
 ]
 
 [[package]]

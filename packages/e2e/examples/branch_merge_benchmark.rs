@@ -1,10 +1,10 @@
 //! Isolated-process branching and merge qualification benchmark.
 //!
 //! Run the default qualification matrix and capture JSONL:
-//! `cargo run --release -p lix_tests --example branch_merge_benchmark -- qualification > results.jsonl`
+//! `cargo run --release -p lix_e2e --example branch_merge_benchmark -- qualification > results.jsonl`
 //!
 //! Run one worker directly:
-//! `cargo run --release -p lix_tests --example branch_merge_benchmark -- worker rows clean 10000 100 10 100 8 64`
+//! `cargo run --release -p lix_e2e --example branch_merge_benchmark -- worker rows clean 10000 100 10 100 8 64`
 
 use std::alloc::GlobalAlloc;
 use std::cell::Cell;
@@ -1134,7 +1134,7 @@ struct Measurement<T> {
 async fn measure_async<F, Fut, T>(operation: F) -> Measurement<T>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = T>,
+    Fut: Future<Output = T>,
 {
     let before = process_counters();
     let sampler = RssSampler::start();
@@ -2192,7 +2192,7 @@ fn process_counters() -> ProcessCounters {
 
 #[cfg(target_os = "linux")]
 fn current_rss_bytes() -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let status = fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
     status
         .lines()
         .find_map(|line| line.strip_prefix("VmRSS:"))
@@ -2209,7 +2209,7 @@ fn current_rss_bytes() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn proc_io_bytes() -> (u64, u64) {
-    let io = std::fs::read_to_string("/proc/self/io").expect("read /proc/self/io");
+    let io = fs::read_to_string("/proc/self/io").expect("read /proc/self/io");
     let value = |prefix: &str| {
         io.lines()
             .find_map(|line| line.strip_prefix(prefix))

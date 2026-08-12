@@ -117,7 +117,7 @@ pub struct AllocationMetrics {
     pub large_allocation_count: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct AllocatorSnapshot {
     allocation_count: u64,
     allocated_bytes: u64,
@@ -151,6 +151,7 @@ pub fn current_live_bytes() -> u64 {
 /// prevents two instrumented windows in this test binary from overlapping,
 /// while the global counters still include allocations made by any unrelated
 /// test running concurrently.
+#[derive(Debug)]
 pub struct AllocationScope {
     start: AllocatorSnapshot,
     _exclusive: MutexGuard<'static, ()>,

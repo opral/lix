@@ -21,7 +21,7 @@
 //!   commit machinery and is independent of what the write touched.
 //!
 //! ```text
-//! cargo run --release -p lix_tests --example e16_write_file_scaling -- 100 1000 10000
+//! cargo run --release -p lix_e2e --example e16_write_file_scaling -- 100 1000 10000
 //! E16_PROBES=200 E16_SIZES=10000 cargo run --release ...   # long write phase for perf
 //! ```
 
