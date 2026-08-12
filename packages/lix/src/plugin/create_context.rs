@@ -301,8 +301,9 @@ pub(crate) fn reserve_create_row(
     bound: BoundCreateContext,
     file_id: &str,
     branch_id: &str,
+    untracked: bool,
 ) -> Result<Option<TransactionWriteRow>, LixError> {
-    validate_create_reservation(existing, bound, file_id, branch_id)?;
+    validate_create_reservation(existing, bound, file_id, branch_id, untracked)?;
     if existing.is_some() {
         return Ok(None);
     }
@@ -321,6 +322,7 @@ pub(crate) fn reserve_create_row(
         Some(snapshot),
         file_id,
         branch_id,
+        untracked,
     )?))
 }
 
@@ -336,12 +338,13 @@ pub(crate) fn validate_create_reservation(
     bound: BoundCreateContext,
     file_id: &str,
     branch_id: &str,
+    untracked: bool,
 ) -> Result<(), LixError> {
     let Some(row) = existing else {
         return Ok(());
     };
     let key = bound.reservation_key();
-    validate_reservation_identity(row, &key, file_id, branch_id)?;
+    validate_reservation_identity(row, &key, file_id, branch_id, untracked)?;
     let snapshot = row
         .snapshot_content
         .as_deref()
@@ -398,11 +401,12 @@ pub(crate) fn reservation_tombstone_row(
     key: &str,
     file_id: &str,
     branch_id: &str,
+    untracked: bool,
 ) -> Result<TransactionWriteRow, LixError> {
     if !is_reservation_key(key) {
         return Err(invalid_id("invalid create reservation key"));
     }
-    reservation_row(key.to_string(), None, file_id, branch_id)
+    reservation_row(key.to_string(), None, file_id, branch_id, untracked)
 }
 
 pub(crate) fn is_reservation_key(key: &str) -> bool {
@@ -415,6 +419,7 @@ fn reservation_row(
     snapshot: Option<JsonValue>,
     file_id: &str,
     branch_id: &str,
+    untracked: bool,
 ) -> Result<TransactionWriteRow, LixError> {
     if file_id.is_empty() || branch_id.is_empty() || branch_id == crate::GLOBAL_BRANCH_ID {
         return Err(invalid_id(
@@ -435,7 +440,7 @@ fn reservation_row(
         global: false,
         change_id: None,
         commit_id: None,
-        untracked: false,
+        untracked,
         branch_id: branch_id.into(),
     })
 }
@@ -445,17 +450,18 @@ fn validate_reservation_identity(
     key: &str,
     file_id: &str,
     branch_id: &str,
+    untracked: bool,
 ) -> Result<(), LixError> {
     if row.schema_key != KEY_VALUE_SCHEMA_KEY
         || row.entity_pk.as_single_string().ok() != Some(key)
         || row.file_id.as_deref() != Some(file_id)
         || row.branch_id.as_ref() != branch_id
         || row.global
-        || row.untracked
+        || row.untracked != untracked
         || row.deleted
     {
         return Err(invalid_id(format!(
-            "create reservation '{key}' has invalid tracked file scope"
+            "create reservation '{key}' has invalid file scope"
         )));
     }
     Ok(())
@@ -583,9 +589,15 @@ mod tests {
     }
 
     fn row_for(bound: BoundCreateContext) -> MaterializedLiveStateRow {
-        let write = reserve_create_row(None, bound, "01920000-0000-7000-8000-0000000000a2", "main")
-            .expect("reserve")
-            .expect("new row");
+        let write = reserve_create_row(
+            None,
+            bound,
+            "01920000-0000-7000-8000-0000000000a2",
+            "main",
+            false,
+        )
+        .expect("reserve")
+        .expect("new row");
         MaterializedLiveStateRow {
             entity_pk: write.entity_pk.expect("pk"),
             schema_key: write.schema_key.into(),
@@ -718,7 +730,8 @@ mod tests {
                 Some(&existing),
                 first,
                 "01920000-0000-7000-8000-0000000000a2",
-                "main"
+                "main",
+                false
             )
             .expect("same proof")
             .is_none()
@@ -732,6 +745,7 @@ mod tests {
             collision,
             "01920000-0000-7000-8000-0000000000a2",
             "main",
+            false,
         )
         .expect_err("different proof must fail");
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
@@ -750,6 +764,7 @@ mod tests {
             collision,
             "01920000-0000-7000-8000-0000000000a2",
             "main",
+            false,
         )
         .expect_err("preflight must reject a reused seed before entering the guest");
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
@@ -771,10 +786,16 @@ mod tests {
         assert!(validation.requires_reservation);
         assert!(validation.existing_authorities.is_empty());
         assert_eq!(
-            reserve_create_row(None, cold, "01920000-0000-7000-8000-0000000000a2", "main")
-                .expect("cold reservation")
-                .into_iter()
-                .count(),
+            reserve_create_row(
+                None,
+                cold,
+                "01920000-0000-7000-8000-0000000000a2",
+                "main",
+                false
+            )
+            .expect("cold reservation")
+            .into_iter()
+            .count(),
             1,
         );
 
@@ -796,10 +817,16 @@ mod tests {
         assert!(validation.requires_reservation);
         assert!(validation.existing_authorities.is_empty());
         assert_eq!(
-            reserve_create_row(None, edit, "01920000-0000-7000-8000-0000000000a2", "main")
-                .expect("insert reservation")
-                .into_iter()
-                .count(),
+            reserve_create_row(
+                None,
+                edit,
+                "01920000-0000-7000-8000-0000000000a2",
+                "main",
+                false
+            )
+            .expect("insert reservation")
+            .into_iter()
+            .count(),
             1,
         );
     }
