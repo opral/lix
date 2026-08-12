@@ -1274,7 +1274,15 @@ async fn recreated_identity_created_at_after_compaction() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should reopen for rebuild");
+    // An instrument that never executes reports exactly what a clean pass
+    // reports. Count the validator's entries across the rebuild so "accepted"
+    // cannot be confused with "never reached".
+    let validations_before = crate::tracked_state::DIFF_ROW_CREATED_AT_VALIDATIONS
+        .load(std::sync::atomic::Ordering::Relaxed);
     let rebuild = engine.rebuild_tracked_state_for_branch(&branch_id).await;
+    let validations = crate::tracked_state::DIFF_ROW_CREATED_AT_VALIDATIONS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - validations_before;
     match &rebuild {
         Ok(()) => println!("phase8 | arm=compacted rebuild=accepted"),
         Err(error) => println!(
@@ -1284,7 +1292,7 @@ async fn recreated_identity_created_at_after_compaction() {
     }
 
     println!(
-        "phase8 | verdict inherited={} rebuild_ok={}",
+        "phase8 | verdict inherited={} rebuild_ok={} created_at_validations={validations}",
         first == second,
         rebuild.is_ok()
     );

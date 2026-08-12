@@ -54,6 +54,15 @@ use base64::Engine as _;
 use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_64;
 
+/// Counts `validate_diff_row_created_at` entries so a probe can distinguish
+/// "the validator ran and accepted this row" from "the validator never ran".
+/// A null result from a validator that was never reached is indistinguishable
+/// from a null result from one that passed, so the count has to be observed
+/// rather than assumed.
+#[cfg(test)]
+pub(crate) static DIFF_ROW_CREATED_AT_VALIDATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 // A right-edge probe is worthwhile for a real append batch, but would add a
@@ -1951,6 +1960,8 @@ where
         commit_id: &str,
         change_created_at: crate::common::LixTimestamp,
     ) -> Result<(), LixError> {
+        #[cfg(test)]
+        DIFF_ROW_CREATED_AT_VALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut expected_created_at = change_created_at;
         if let Some(metadata) = storage::load_snapshot_commit_root(&self.store, commit_id).await? {
             if let Some(parent) = metadata.parent_roots.first() {
