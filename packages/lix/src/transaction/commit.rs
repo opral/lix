@@ -1996,7 +1996,10 @@ fn current_state_delta_from_engine_row(
         schema_key: &row.change.schema_key,
         file_id: row.change.file_id.as_deref(),
         entity_pk: &row.change.entity_pk,
-        change_id: None,
+        // Engine rows arrive with their change record already built, so the id
+        // is authoritative here. This lane runs beside — not through — the
+        // prepared-row funnel, so the id has to be carried across explicitly.
+        change_id: Some(row.change.change_id),
         commit_id: None,
         untracked: true,
         deleted: row.change.snapshot == crate::json_store::JsonSlot::None,

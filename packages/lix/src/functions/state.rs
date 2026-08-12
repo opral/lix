@@ -63,7 +63,7 @@ pub(crate) async fn stage_sequence(
     writes: &mut StorageWriteSet,
     sequence: DeterministicSequence,
     timestamp: LixTimestamp,
-    _change_id: ChangeId,
+    change_id: ChangeId,
 ) -> Result<StoragePrecondition, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
@@ -106,7 +106,10 @@ pub(crate) async fn stage_sequence(
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
                 entity_pk: &entity_pk,
-                change_id: None,
+                // The caller already minted this id for the sequence row; this
+                // lane stages the head directly, so it must carry it rather
+                // than relying on the prepared-row path to supply one.
+                change_id: Some(change_id),
                 commit_id: None,
                 untracked: true,
                 deleted: false,

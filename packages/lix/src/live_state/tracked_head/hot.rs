@@ -9021,7 +9021,10 @@ fn stage_hot_bootstrap(
             file_id: row.file_id,
         };
         let value = HeadValueRef {
-            change_id: None,
+            // Preserved rows are read back from the head, where every untracked
+            // row already carries its minted id. Re-encoding must round-trip it
+            // rather than reset the row to an anonymous one.
+            change_id: row.change_id,
             commit_id: None,
             untracked: true,
             deleted: false,
