@@ -14,7 +14,8 @@ use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
 };
 use crate::hot_state::{
-    CurrentStateDeltaRef, HotStateReadDomain, MaterializedHotStateRow, TrackedHeadContext,
+    CurrentStateDeltaRef, GlobalKeyValueRowCache, HotStateReadDomain, MaterializedHotStateRow,
+    TrackedHeadContext,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};
@@ -32,8 +33,9 @@ const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 /// is engine-owned global state and has no changelog or commit history.
 pub(crate) async fn load_mode(
     read: &(impl StorageAdapterRead + ?Sized),
+    cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicMode, LixError> {
-    let Some(row) = load_key_value_row(read, DETERMINISTIC_MODE_KEY).await? else {
+    let Some(row) = load_key_value_row(read, cache, DETERMINISTIC_MODE_KEY).await? else {
         return Ok(DeterministicMode::disabled());
     };
     let value = key_value_payload(&row, DETERMINISTIC_MODE_KEY)?;
@@ -46,8 +48,9 @@ pub(crate) async fn load_mode(
 /// execution starts at sequence zero.
 pub(crate) async fn load_sequence(
     read: &(impl StorageAdapterRead + ?Sized),
+    cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicSequence, LixError> {
-    let Some(row) = load_key_value_row(read, DETERMINISTIC_SEQUENCE_KEY).await? else {
+    let Some(row) = load_key_value_row(read, cache, DETERMINISTIC_SEQUENCE_KEY).await? else {
         return Ok(DeterministicSequence::uninitialized());
     };
     let value = key_value_payload(&row, DETERMINISTIC_SEQUENCE_KEY)?;
@@ -142,6 +145,7 @@ pub(crate) async fn stage_sequence(
 
 async fn load_key_value_row(
     read: &(impl StorageAdapterRead + ?Sized),
+    cache: Option<&GlobalKeyValueRowCache>,
     key: &str,
 ) -> Result<Option<MaterializedHotStateRow>, LixError> {
     let Some(control) = BranchHeadControlContext::new()
@@ -151,56 +155,78 @@ async fn load_key_value_row(
     else {
         return Ok(None);
     };
-    let keys = [TrackedStateKey {
-        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-        entity_pk: EntityPk::single(key),
-        file_id: None,
-    }];
-    let projection = ChangeRecordProjection {
-        snapshot_content: true,
-        metadata: false,
-    };
-    let reader = TrackedHeadContext::new().reader(read);
-    let key_refs = keys
-        .iter()
-        .map(|key| TrackedStateKeyRef {
-            schema_key: key.schema_key.as_str(),
-            entity_pk: &key.entity_pk,
-            file_id: key.file_id.as_deref(),
-        })
-        .collect::<Vec<_>>();
-    let rows = reader
-        .load_projected_live_batch_refs_for_domain(
-            GLOBAL_BRANCH_ID,
-            control,
-            &key_refs,
-            &projection,
-            HotStateReadDomain::Untracked,
-        )
-        .await?;
-    let Some(row) = rows.row(0) else {
-        reader
-            .validate_exact_collection_closure(
+    // The control is the fence, not just the read's input: it is republished
+    // under a CAS by every write to this plane, so an unchanged control means
+    // the row below — and the collection closure validated with it — cannot
+    // have moved.
+    if let Some(cache) = cache
+        && let Some(row) = cache.get(control, key)
+    {
+        return Ok(row);
+    }
+    // Deliberately one function, not two. Extracting the canonical read into
+    // its own `async fn` would add a poll frame to a path that runs inside
+    // `Transaction::open`, and this codebase's async future-size budget is
+    // tight enough that the sign of such a change cannot be assumed. The
+    // labelled block gives the same early-exit shape with no extra future.
+    let row = 'resolved: {
+        let keys = [TrackedStateKey {
+            schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+            entity_pk: EntityPk::single(key),
+            file_id: None,
+        }];
+        let projection = ChangeRecordProjection {
+            snapshot_content: true,
+            metadata: false,
+        };
+        let reader = TrackedHeadContext::new().reader(read);
+        let key_refs = keys
+            .iter()
+            .map(|key| TrackedStateKeyRef {
+                schema_key: key.schema_key.as_str(),
+                entity_pk: &key.entity_pk,
+                file_id: key.file_id.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        let rows = reader
+            .load_projected_live_batch_refs_for_domain(
                 GLOBAL_BRANCH_ID,
-                control.tracked_generation,
-                crate::collection_generation::CollectionScopeRef {
-                    schema_key: KEY_VALUE_SCHEMA_KEY,
-                    file_id: None,
-                },
-                key_refs[0],
+                control,
+                &key_refs,
+                &projection,
                 HotStateReadDomain::Untracked,
-                control.current_state_revision == 0,
             )
             .await?;
-        return Ok(None);
+        let Some(row) = rows.row(0) else {
+            reader
+                .validate_exact_collection_closure(
+                    GLOBAL_BRANCH_ID,
+                    control.tracked_generation,
+                    crate::collection_generation::CollectionScopeRef {
+                        schema_key: KEY_VALUE_SCHEMA_KEY,
+                        file_id: None,
+                    },
+                    key_refs[0],
+                    HotStateReadDomain::Untracked,
+                    control.current_state_revision == 0,
+                )
+                .await?;
+            break 'resolved None;
+        };
+        if !row.untracked() || row.deleted() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "deterministic key-value row '{key}' is not a live untracked authority member"
+                ),
+            ));
+        }
+        Some(row.to_owned())
     };
-    if !row.untracked() || row.deleted() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("deterministic key-value row '{key}' is not a live untracked authority member"),
-        ));
+    if let Some(cache) = cache {
+        cache.insert(control, key, row.clone());
     }
-    Ok(Some(row.to_owned()))
+    Ok(row)
 }
 
 fn key_value_payload(row: &MaterializedHotStateRow, key: &str) -> Result<JsonValue, LixError> {
@@ -293,7 +319,7 @@ mod tests {
             .await
             .expect("read should open");
 
-        let mode = load_mode(&read).await.expect("missing mode should decode");
+        let mode = load_mode(&read, None).await.expect("missing mode should decode");
 
         assert_eq!(mode, DeterministicMode::disabled());
     }
@@ -316,7 +342,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let mode = load_mode(&read).await.expect("valid mode should decode");
+        let mode = load_mode(&read, None).await.expect("valid mode should decode");
 
         assert_eq!(
             mode,
@@ -336,7 +362,7 @@ mod tests {
             .await
             .expect("read should open");
 
-        let sequence = load_sequence(&read)
+        let sequence = load_sequence(&read, None)
             .await
             .expect("missing sequence should decode");
 
@@ -441,7 +467,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("corrupt sequence storage should read");
-        let error = load_sequence(&read)
+        let error = load_sequence(&read, None)
             .await
             .expect_err("missing selected sequence member must fail closed");
         assert!(
@@ -467,7 +493,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let sequence = load_sequence(&read)
+        let sequence = load_sequence(&read, None)
             .await
             .expect("valid sequence should decode");
 

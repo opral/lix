@@ -2399,7 +2399,7 @@ where
         let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
             Arc::new(self.hot_state.reader(read_store.clone()));
         let runtime_functions = if has_durable_runtime_function {
-            Some(FunctionContext::prepare(&read_store).await?)
+            Some(FunctionContext::prepare(&read_store, None).await?)
         } else {
             None
         };
