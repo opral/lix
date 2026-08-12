@@ -31,6 +31,16 @@ struct Scenario {
     sql: &'static str,
     expected_rows: usize,
     params: ParamSet,
+    /// Rows the provider must examine, when the declared-column index is
+    /// expected to serve this query.
+    ///
+    /// This is an engagement gate, not a statistic. The index's entire value is
+    /// conditional on the witness being written on the route real workloads
+    /// take, and every functional test still passes when it is not — the
+    /// benchmark just quietly reverts to scan speed. Asserting the examined
+    /// count here fails loudly instead, because this number is only reachable
+    /// through the index.
+    index_must_serve: Option<u64>,
 }
 
 const SCENARIOS: &[Scenario] = &[
@@ -39,12 +49,14 @@ const SCENARIOS: &[Scenario] = &[
         sql: "SELECT 1 AS value",
         expected_rows: 1,
         params: ParamSet::None,
+        index_must_serve: None,
     },
     Scenario {
         name: "bundle_pk",
         sql: "SELECT id, declarations FROM bundle WHERE id = $1",
         expected_rows: 1,
         params: ParamSet::Bundle,
+        index_must_serve: None,
     },
     // No join. Isolates the foreign-key access path on its own: does an equality
     // predicate on a non-primary-key column have an indexed path?
@@ -53,6 +65,7 @@ const SCENARIOS: &[Scenario] = &[
         sql: r#"SELECT id, locale FROM message WHERE "bundleId" = $1"#,
         expected_rows: 2,
         params: ParamSet::Bundle,
+        index_must_serve: Some(2),
     },
     // Right side joined on its own PRIMARY KEY, driven by a point lookup on the left.
     // Separates "no predicate is propagated across the join" from "the propagated
@@ -62,30 +75,35 @@ const SCENARIOS: &[Scenario] = &[
         sql: r#"SELECT message.id AS "messageId", bundle.id AS "bundleId" FROM message LEFT JOIN bundle ON bundle.id = message."bundleId" WHERE message.id = $1"#,
         expected_rows: 1,
         params: ParamSet::Message,
+        index_must_serve: None,
     },
     Scenario {
         name: "two_table",
         sql: r#"SELECT bundle.id AS "bundleId", message.id AS "messageId", message.locale AS "messageLocale" FROM bundle LEFT JOIN message ON message."bundleId" = bundle.id WHERE bundle.id = $1"#,
         expected_rows: 2,
         params: ParamSet::Bundle,
+        index_must_serve: Some(3),
     },
     Scenario {
         name: "two_table_inner",
         sql: r#"SELECT bundle.id AS "bundleId", message.id AS "messageId", message.locale AS "messageLocale" FROM bundle INNER JOIN message ON message."bundleId" = bundle.id WHERE bundle.id = $1"#,
         expected_rows: 2,
         params: ParamSet::Bundle,
+        index_must_serve: None,
     },
     Scenario {
         name: "real",
         sql: r#"SELECT bundle.id AS "bundleId", bundle.declarations AS "bundleDeclarations", message.id AS "messageId", message.locale AS "messageLocale", message.selectors AS "messageSelectors", variant.id AS "variantId", variant.matches AS "variantMatches", variant.pattern AS "variantPattern" FROM bundle LEFT JOIN message ON message."bundleId" = bundle.id LEFT JOIN variant ON variant."messageId" = message.id WHERE bundle.id = $1"#,
         expected_rows: 2,
         params: ParamSet::Bundle,
+        index_must_serve: None,
     },
     Scenario {
         name: "real_inner",
         sql: r#"SELECT bundle.id AS "bundleId", message.id AS "messageId", variant.id AS "variantId" FROM bundle INNER JOIN message ON message."bundleId" = bundle.id INNER JOIN variant ON variant."messageId" = message.id WHERE bundle.id = $1"#,
         expected_rows: 2,
         params: ParamSet::Bundle,
+        index_must_serve: None,
     },
     // Same three tables, but every join predicate is served by an explicit literal.
     // Upper bound for what full predicate propagation could buy.
@@ -94,6 +112,7 @@ const SCENARIOS: &[Scenario] = &[
         sql: r#"SELECT bundle.id AS "bundleId", message.id AS "messageId", variant.id AS "variantId" FROM bundle LEFT JOIN message ON message."bundleId" = bundle.id AND message."bundleId" = $1 LEFT JOIN variant ON variant."messageId" = message.id AND variant."messageId" IN ($2, $3) WHERE bundle.id = $1"#,
         expected_rows: 2,
         params: ParamSet::BundleAndMessages,
+        index_must_serve: None,
     },
     // Non-primary-key, non-foreign-key equality. Shows whether the access-path
     // gap is about foreign keys specifically or about every non-PK column.
@@ -102,6 +121,7 @@ const SCENARIOS: &[Scenario] = &[
         sql: "SELECT count(*) AS matches FROM message WHERE locale = 'en'",
         expected_rows: 1,
         params: ParamSet::None,
+        index_must_serve: None,
     },
     // Unfiltered full scan of the same table: the floor a filtered scan is
     // compared against.
@@ -110,6 +130,7 @@ const SCENARIOS: &[Scenario] = &[
         sql: "SELECT count(*) AS matches FROM message",
         expected_rows: 1,
         params: ParamSet::None,
+        index_must_serve: None,
     },
     // Primary-key equality on the same table as `message_fk_only`.
     Scenario {
@@ -117,6 +138,7 @@ const SCENARIOS: &[Scenario] = &[
         sql: "SELECT id, locale FROM message WHERE id = $1",
         expected_rows: 1,
         params: ParamSet::Message,
+        index_must_serve: None,
     },
 ];
 
@@ -209,6 +231,16 @@ async fn run_fixture(bundles: usize, rounds: u32, bulk: bool) {
                 scenario.name
             );
             accumulate(&mut total, profile);
+        }
+        if let Some(expected) = scenario.index_must_serve {
+            let examined = total.provider_rows_examined / u64::from(rounds);
+            assert_eq!(
+                examined, expected,
+                "{} examined {examined} rows per query at {bundles} bundles, expected {expected}: \
+                 the declared-column index is not being consulted. Either no witness was written \
+                 on this commit route, or the predicate was not recognised as indexable.",
+                scenario.name
+            );
         }
         report(bundles, scenario.name, total, rounds);
     }
