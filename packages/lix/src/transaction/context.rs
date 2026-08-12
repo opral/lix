@@ -21,8 +21,8 @@ use tracing::Instrument as _;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{
-    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchLifecycle,
-    BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
+    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
+    BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
 };
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogRevision, CatalogSnapshot, SchemaPlanId,
@@ -1535,10 +1535,33 @@ where
         let opening_read = SharedStorageAdapterRead::new(read);
         let read = opening_read.clone();
         let setup_result = async {
-            let active_branch_id =
-                resolve_active_branch_id(mode, hot_state.as_ref(), branch_ctx.as_ref(), &read)
-                    .await?;
-            let runtime_functions = FunctionContext::prepare(&read).await?;
+            // The active branch selector is in-memory session state, so the
+            // branch id is known before any read. Every branch fact this
+            // function needs afterwards — that a workspace selector still
+            // resolves, the deterministic-mode fence, and both opening heads —
+            // is carried by the branch-head control of at most two branches.
+            // Load them once as a batch: the pre-existing code read the same
+            // control up to four times from the same pinned snapshot, where
+            // repeated point reads of one key can only return the same bytes.
+            let active_branch_id = session_selected_branch_id(mode)?;
+            if matches!(mode, SessionMode::Workspace { .. }) {
+                BranchLifecycle::require_non_empty_id(
+                    &active_branch_id,
+                    BranchOperation::LoadWorkspaceSelector,
+                    BranchReferenceRole::WorkspaceSelector,
+                )?;
+            }
+            let (active_control, global_control) =
+                load_opening_branch_controls(&read, &active_branch_id).await?;
+            if matches!(mode, SessionMode::Workspace { .. }) && active_control.is_none() {
+                return Err(LixError::branch_not_found(
+                    &active_branch_id,
+                    BranchOperation::LoadWorkspaceSelector.label(),
+                    BranchReferenceRole::WorkspaceSelector.label(),
+                ));
+            }
+            let runtime_functions =
+                FunctionContext::prepare_with_global_control(&read, global_control).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
             // Transaction open needs the catalog revision and the tracked
@@ -1573,14 +1596,10 @@ where
                     .await?;
                 (sql_schema_catalog, tracked_schema_catalog)
             };
-            let branch_reader = branch_ctx.ref_reader(&read);
             let opening_active_branch_head =
-                branch_reader.load_head_commit_id(&active_branch_id).await?;
-            let opening_global_branch_head = if active_branch_id == GLOBAL_BRANCH_ID {
-                opening_active_branch_head
-            } else {
-                branch_reader.load_head_commit_id(GLOBAL_BRANCH_ID).await?
-            };
+                active_control.map(|control| control.head_commit_id);
+            let opening_global_branch_head =
+                global_control.map(|control| control.head_commit_id);
             Ok::<_, LixError>((
                 active_branch_id,
                 runtime_functions,
@@ -11858,43 +11877,42 @@ fn require_valid_storage_scope(branch_id: &str, global: bool) -> Result<(), LixE
     Ok(())
 }
 
-async fn resolve_active_branch_id(
-    mode: &SessionMode,
-    _hot_state: &HotStateContext,
-    branch_ctx: &BranchContext,
-    read: &(impl StorageAdapterRead + ?Sized),
-) -> Result<String, LixError> {
-    match mode {
-        SessionMode::Pinned { branch_id } => branch_id
-            .read()
-            .map(|branch_id| branch_id.clone())
-            .map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "session branch selector is poisoned",
-                )
-            }),
+/// Reads the session's active branch selector. In-memory session state only.
+fn session_selected_branch_id(mode: &SessionMode) -> Result<String, LixError> {
+    let (branch_id, poisoned) = match mode {
+        SessionMode::Pinned { branch_id } => (branch_id, "session branch selector is poisoned"),
         SessionMode::Workspace { branch_id } => {
-            let branch_id = branch_id
-                .read()
-                .map(|branch_id| branch_id.clone())
-                .map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "workspace branch selector cache is poisoned",
-                    )
-                })?;
-            let branch_ref = branch_ctx.ref_reader(read);
-            BranchLifecycle::new(&branch_ref)
-                .require_existing_ref(
-                    &branch_id,
-                    BranchOperation::LoadWorkspaceSelector,
-                    BranchReferenceRole::WorkspaceSelector,
-                )
-                .await?;
-            Ok(branch_id.clone())
+            (branch_id, "workspace branch selector cache is poisoned")
         }
+    };
+    branch_id
+        .read()
+        .map(|branch_id| branch_id.clone())
+        .map_err(|_| LixError::new(LixError::CODE_INTERNAL_ERROR, poisoned))
+}
+
+/// Loads the active and global branch-head controls in one batched point read.
+///
+/// Returns `(active, global)`. When the active branch *is* the global branch
+/// the two are the same record and only one key is requested.
+async fn load_opening_branch_controls(
+    read: &(impl StorageAdapterRead + ?Sized),
+    active_branch_id: &str,
+) -> Result<(Option<BranchHeadControl>, Option<BranchHeadControl>), LixError> {
+    let controls = BranchHeadControlContext::new().reader(read);
+    if active_branch_id == GLOBAL_BRANCH_ID {
+        let global = controls.load(GLOBAL_BRANCH_ID).await?;
+        return Ok((global, global));
     }
+    let mut loaded = controls
+        .load_many(&[
+            active_branch_id.to_string(),
+            GLOBAL_BRANCH_ID.to_string(),
+        ])
+        .await?;
+    let global = loaded.pop().flatten();
+    let active = loaded.pop().flatten();
+    Ok((active, global))
 }
 
 fn validated_uuid_entity_pk(value: &str) -> Result<EntityPk, LixError> {
