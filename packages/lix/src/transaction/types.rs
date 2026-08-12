@@ -4521,7 +4521,7 @@ mod tests {
     use super::*;
     use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKey};
 
-    fn expdl_probe_certificate(plan: u16) -> CertifiedRawWriteBatchPreparation {
+    fn expdl_probe_certificate(plan: u32) -> CertifiedRawWriteBatchPreparation {
         CertifiedRawWriteBatchPreparation {
             schema_plan_id: SchemaPlanId::for_test(plan),
             facts: PreparedRowFacts {
@@ -4534,7 +4534,7 @@ mod tests {
     }
 
     fn expdl_probe_batch(keys: &[&str], untracked: bool) -> PreparedStateBatch {
-        let entity_pks = keys.iter().map(|key| EntityPk::single(key)).collect();
+        let entity_pks = keys.iter().map(|key| EntityPk::single(*key)).collect();
         let snapshots = keys
             .iter()
             .map(|key| {
