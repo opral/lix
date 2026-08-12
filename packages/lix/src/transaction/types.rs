@@ -794,6 +794,7 @@ impl CertifiedParameterBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: certificate.tracked_keys_strictly_ordered,
             complete_collection_replacement: certificate.complete_collection_replacement,
+            staged_index_values: StagedIndexValues::default(),
         };
         if predecessor_count != 0 && predecessor_count != row_count {
             for (index, predecessor) in durable_predecessors.into_iter().enumerate() {
@@ -1343,6 +1344,7 @@ impl RawWriteBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: certificate.tracked_keys_strictly_ordered,
             complete_collection_replacement: certificate.complete_collection_replacement,
+            staged_index_values: StagedIndexValues::default(),
         })
     }
 
@@ -2805,6 +2807,54 @@ impl TestPreparedStateRow {
     }
 }
 
+/// One staged row's indexed-column values, lifted out of the snapshot while
+/// transaction validation still held it parsed.
+///
+/// This exists so the commit-time index hook never decodes a snapshot again.
+/// `StageJson::value()` panics once validation releases the decoded column,
+/// and reaching around it with a second `serde_json::from_str` is exactly the
+/// cost this carrier removes.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedIndexRow {
+    pub(crate) branch_id: SharedStr,
+    pub(crate) schema_key: SharedStr,
+    pub(crate) entity_pk: EntityPk,
+    /// **Every** indexed ordinal the row's schema declares, carrying `None`
+    /// where this row has no indexable value for it.
+    ///
+    /// Commit earns a completeness witness per `(schema, ordinal)` whether or
+    /// not extraction found a value, so dropping the `None` entries would
+    /// silently narrow witness coverage and leave a column permanently
+    /// unwitnessed — a slow read, not a wrong one, but an invisible one.
+    pub(crate) columns: Vec<(u16, Option<crate::live_state::HotIndexValue>)>,
+}
+
+/// Everything the commit-time hot index hook needs, produced by validation.
+///
+/// Empty is the safe value: no rows means no entries, and no registered
+/// collections means no witnesses, so a batch that never reached extraction
+/// publishes nothing and every read of that collection keeps scanning.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StagedIndexValues {
+    pub(crate) rows: Vec<StagedIndexRow>,
+    /// `(schema_key, ordinal)` pairs whose collection provably begins at this
+    /// commit because the commit registers the schema itself.
+    pub(crate) registered_collections: std::collections::BTreeSet<(String, u16)>,
+}
+
+impl StagedIndexValues {
+    /// Folds one schema scope's extraction into the transaction-wide result.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.rows.extend(other.rows);
+        self.registered_collections
+            .extend(other.registered_collections);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.registered_collections.is_empty()
+    }
+}
+
 /// Compact, typed owner for prepared transaction state.
 ///
 /// Rows are represented by ordinals into typed owner columns. Repeated
@@ -2834,6 +2884,10 @@ pub(crate) struct PreparedStateBatch {
     /// Proof material consumed when publishing the immutable replacement
     /// manifest. Row-topology changes clear the proof as one atomic value.
     complete_collection_replacement: Option<CompleteCollectionReplacementProof>,
+    /// Indexed-column values extracted during transaction validation, which is
+    /// the last place the snapshots are already parsed. Derived data, not row
+    /// content: [`PartialEq`] deliberately ignores it.
+    staged_index_values: StagedIndexValues,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3000,7 +3054,18 @@ impl PreparedStateBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: false,
             complete_collection_replacement: None,
+            staged_index_values: StagedIndexValues::default(),
         }
+    }
+
+    /// Publishes validation's indexed-column extraction onto the batch that
+    /// commit will materialize.
+    pub(crate) fn set_staged_index_values(&mut self, values: StagedIndexValues) {
+        self.staged_index_values = values;
+    }
+
+    pub(crate) fn staged_index_values(&self) -> &StagedIndexValues {
+        &self.staged_index_values
     }
 
     pub(crate) fn len(&self) -> usize {

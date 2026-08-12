@@ -117,7 +117,8 @@ use crate::transaction::stale_commit::{
 use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
     PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
-    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, StagedIndexValues,
+    TransactionFileContent,
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
     TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
     TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
@@ -1790,7 +1791,7 @@ where
             return Err(error);
         }
         if let Err(error) = transaction
-            .validate_prepared_writes_by_branch(&read, &prepared_writes)
+            .validate_prepared_writes_by_branch(&read, &mut prepared_writes)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.transaction_validation"
@@ -6447,10 +6448,19 @@ where
         Ok(prepared_rows)
     }
 
+    /// Validates the drained write set and, on the way through, hands the
+    /// batch its indexed-column extraction.
+    ///
+    /// Takes `&mut` only for that hand-off: validation itself reads. The two
+    /// certificate early-returns below leave the extraction empty, which is
+    /// the safe value — no entries and no witnesses means every read of those
+    /// collections keeps scanning. Both are reachable only by rows that
+    /// provably declare no indexed column or provably did not change one; see
+    /// `declared_column_rows_never_bypass_extraction`.
     async fn validate_prepared_writes_by_branch(
         &mut self,
         read: &(impl StorageAdapterRead + ?Sized),
-        prepared_writes: &PreparedWriteSet,
+        prepared_writes: &mut PreparedWriteSet,
     ) -> Result<(), LixError> {
         if prepared_tracked_rows_have_row_local_certificates(&prepared_writes.state_rows) {
             // Row-local certificates avoid rebuilding the O(rows) validation
@@ -6484,7 +6494,6 @@ where
             return Ok(());
         }
         let staged = self.staged_writes.staging_overlay()?;
-        let validation_index = prepared_writes.validation_index();
         let staged_commit_ids = prepared_writes
             .commit_change_refs_by_branch
             .values()
@@ -6496,25 +6505,38 @@ where
                     .map(|commit| commit.change_refs.commit_id),
             )
             .collect::<BTreeSet<_>>();
-        for scope in validation_index.schema_scopes() {
-            #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_transaction_validation_branch();
-            let branch_prepared_writes = validation_index.validation_set_for_schema_scope(scope);
-            let live_state = self.live_state.reader(read);
-            let schema_catalog = self
-                .schema_resolver
-                .catalog_for_validation(&live_state, &staged, scope)
-                .await?;
-            let mut validation_input = TransactionValidationInput::new(
-                &branch_prepared_writes,
-                schema_catalog,
-                &live_state,
-            )
-            .with_staged_commit_ids(staged_commit_ids.clone());
-            if self.trust_filesystem_planner {
-                validation_input = validation_input.with_trusted_filesystem_planner();
+        // `validation_index()` holds an immutable borrow of the write set for
+        // the whole loop, so the extraction accumulates into a local and is
+        // published once the borrow ends.
+        let mut staged_index_values = StagedIndexValues::default();
+        {
+            let validation_index = prepared_writes.validation_index();
+            for scope in validation_index.schema_scopes() {
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_transaction_validation_branch();
+                let branch_prepared_writes =
+                    validation_index.validation_set_for_schema_scope(scope);
+                let live_state = self.live_state.reader(read);
+                let schema_catalog = self
+                    .schema_resolver
+                    .catalog_for_validation(&live_state, &staged, scope)
+                    .await?;
+                let mut validation_input = TransactionValidationInput::new(
+                    &branch_prepared_writes,
+                    schema_catalog,
+                    &live_state,
+                )
+                .with_staged_commit_ids(staged_commit_ids.clone());
+                if self.trust_filesystem_planner {
+                    validation_input = validation_input.with_trusted_filesystem_planner();
+                }
+                staged_index_values.absorb(validate_prepared_writes(validation_input).await?);
             }
-            validate_prepared_writes(validation_input).await?;
+        }
+        if !staged_index_values.is_empty() {
+            prepared_writes
+                .state_rows
+                .set_staged_index_values(staged_index_values);
         }
         Ok(())
     }

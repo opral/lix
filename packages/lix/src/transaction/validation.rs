@@ -46,7 +46,8 @@ use crate::transaction::staging::{
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteOrigin;
 use crate::transaction::types::{
-    PreparedStateBatch, PreparedStateRowRef, TransactionWriteOperation,
+    PreparedStateBatch, PreparedStateRowRef, StagedIndexRow, StagedIndexValues,
+    TransactionWriteOperation,
 };
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -342,7 +343,7 @@ async fn load_committed_constraint_rows(
 /// coalesced staged write set.
 pub(crate) async fn validate_prepared_writes(
     input: TransactionValidationInput<'_>,
-) -> Result<(), LixError> {
+) -> Result<StagedIndexValues, LixError> {
     validate_foreign_key_definitions(input.schema_catalog)?;
     let staged_rows = input.staged_writes.rows().collect::<Vec<_>>();
     let constraint_rows = input.staged_writes.constraint_rows().collect::<Vec<_>>();
@@ -361,13 +362,22 @@ pub(crate) async fn validate_prepared_writes(
                 "lix.perf.validation.insert_identities"
             ))
             .await?;
-        return Ok(());
+        // Extraction is skipped here, and that is sound rather than lucky.
+        // Every row on this path carries `!requires_transaction_validation`,
+        // which `normalization.rs` grants only when the schema declares no
+        // uniques and no foreign keys — precisely the schemas whose
+        // `indexed_columns` is empty — or when `constraints_unchanged` proves
+        // an UPDATE assigned none of the primary key, uniques, or foreign-key
+        // local properties, a strict superset of the indexed columns. See
+        // `declared_column_rows_never_bypass_extraction`.
+        return Ok(StagedIndexValues::default());
     }
     let mut pending_constraints = PendingConstraintIndexes::default();
     let mut validated_constraint_rows =
         BTreeMap::<DomainRowIdentity, ValidatedRowContent<'_>>::new();
     let mut file_owner_validator = FileOwnerReferenceValidator::default();
     let mut staged_snapshots = Vec::new();
+    let mut index_extractor = StagedIndexExtractor::new(input.schema_catalog);
     for row in &constraint_rows {
         let row = *row;
         let Some(snapshot) = row.snapshot_json() else {
@@ -405,6 +415,13 @@ pub(crate) async fn validate_prepared_writes(
                 validate_primary_key_identity(row, schema_plan, snapshot)?;
             }
             pending_constraints.remember_foreign_key_references(row, schema_plan, snapshot)?;
+            // The hot index plane's values are lifted out here, where the
+            // snapshot is already a parsed `JsonValue` that validation owns.
+            // Commit therefore receives them pre-extracted and never decodes a
+            // snapshot again — `StageJson::value()` panics after this point on
+            // purpose, and routing around it with a second
+            // `serde_json::from_str` was a whole extra parse of every row.
+            index_extractor.observe(row, snapshot);
             staged_snapshots.push((row, schema_plan, snapshot));
         } else {
             pending_constraints.remember_tombstone(row);
@@ -457,7 +474,94 @@ pub(crate) async fn validate_prepared_writes(
             "lix.perf.validation.filesystem_namespace"
         ))
         .await?;
-    Ok(())
+    Ok(index_extractor.finish())
+}
+
+/// Lifts declared-column values out of snapshots validation has already
+/// parsed, so the commit-time hot index hook needs no JSON decode of its own.
+///
+/// Entity surface specs are derived once per schema key and memoized, because
+/// a bulk insert visits one schema thousands of times.
+struct StagedIndexExtractor<'a> {
+    schema_catalog: &'a CatalogSnapshot,
+    specs: BTreeMap<String, Option<std::sync::Arc<crate::sql2::EntitySurfaceSpec>>>,
+    values: StagedIndexValues,
+}
+
+impl<'a> StagedIndexExtractor<'a> {
+    fn new(schema_catalog: &'a CatalogSnapshot) -> Self {
+        Self {
+            schema_catalog,
+            specs: BTreeMap::new(),
+            values: StagedIndexValues::default(),
+        }
+    }
+
+    fn observe(&mut self, row: PreparedValidationRow<'_>, snapshot: &JsonValue) {
+        if row.schema_key() == REGISTERED_SCHEMA_KEY {
+            // A schema registration is the moment a collection's index is
+            // complete for free: no row can exist for a schema that is not
+            // registered yet, so an empty index is a correct index and the
+            // witness costs one key per declared column. The registration
+            // row's `value` column carries the schema document itself.
+            let registered = snapshot.get("value").unwrap_or(snapshot);
+            if let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(registered) {
+                for column in &spec.indexed_columns {
+                    self.values
+                        .registered_collections
+                        .insert((spec.schema_key.clone(), column.ordinal));
+                }
+            }
+            return;
+        }
+        let schema_catalog = self.schema_catalog;
+        let spec = self
+            .specs
+            .entry(row.schema_key().to_owned())
+            .or_insert_with(|| {
+                schema_catalog
+                    .schema(row.schema_key())
+                    .and_then(|schema| {
+                        crate::sql2::derive_entity_surface_spec_from_schema(schema).ok()
+                    })
+                    .map(std::sync::Arc::new)
+            })
+            .clone();
+        let Some(spec) = spec else {
+            return;
+        };
+        if spec.indexed_columns.is_empty() {
+            return;
+        }
+        let PreparedValidationRow::State(state_row) = row;
+        self.values.rows.push(StagedIndexRow {
+            branch_id: state_row.branch_id.clone(),
+            schema_key: state_row.schema_key.clone(),
+            entity_pk: state_row.entity_pk.clone(),
+            columns: spec
+                .indexed_columns
+                .iter()
+                .map(|column| (column.ordinal, hot_index_value(snapshot, column)))
+                .collect(),
+        });
+    }
+
+    fn finish(self) -> StagedIndexValues {
+        self.values
+    }
+}
+
+/// The two JSON scalar shapes the index plane has an order-preserving key
+/// encoding for. Everything else stays on the collection scan.
+fn hot_index_value(
+    snapshot: &JsonValue,
+    column: &crate::sql2::EntityIndexedColumn,
+) -> Option<crate::live_state::HotIndexValue> {
+    match snapshot.get(&column.name)? {
+        JsonValue::String(value) => Some(crate::live_state::HotIndexValue::String(value.clone())),
+        JsonValue::Number(value) => value.as_i64().map(crate::live_state::HotIndexValue::Integer),
+        _ => None,
+    }
 }
 
 fn row_local_certificates_cover_validation(staged_rows: &[PreparedValidationRow<'_>]) -> bool {
