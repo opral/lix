@@ -748,3 +748,70 @@ async fn hot_row_tombstone_compaction_premise() {
         );
     }
 }
+
+/// H7 — does a re-inserted identity inherit the deleted predecessor's
+/// `created_at`?
+///
+/// Code reading says yes, by a two-hop chain: a tracked delete resolves the
+/// live row as its predecessor and copies its `created_at` into the tombstone;
+/// a later insert resolves the tombstone as *its* predecessor and copies that
+/// forward. This measures the chain end to end rather than inferring it, and
+/// it is the test that pins the behaviour change.
+#[tokio::test]
+async fn recreated_identity_created_at_semantics() {
+    let (_storage, session) = open_session().await;
+    register(&session, probe_schema("h7row")).await;
+
+    session
+        .execute("INSERT INTO h7row (id, locale) VALUES ('row-0', 'first')", &[])
+        .await
+        .expect("first insert should commit");
+    let first = session
+        .execute(
+            "SELECT lixcol_created_at AS created_at FROM h7row WHERE id = 'row-0'",
+            &[],
+        )
+        .await
+        .expect("first created_at reads");
+    let first_created_at = first.rows()[0]
+        .get::<String>("created_at")
+        .expect("created_at is text");
+
+    session
+        .execute("DELETE FROM h7row WHERE id = 'row-0'", &[])
+        .await
+        .expect("delete should commit");
+    session
+        .execute("INSERT INTO h7row (id, locale) VALUES ('row-0', 'second')", &[])
+        .await
+        .expect("re-insert should commit");
+    let second = session
+        .execute(
+            "SELECT lixcol_created_at AS created_at, locale FROM h7row WHERE id = 'row-0'",
+            &[],
+        )
+        .await
+        .expect("second created_at reads");
+    let second_created_at = second.rows()[0]
+        .get::<String>("created_at")
+        .expect("created_at is text");
+    let locale = second.rows()[0]
+        .get::<String>("locale")
+        .expect("locale is text");
+
+    println!(
+        "h7 | first_created_at={first_created_at} second_created_at={second_created_at} \
+         locale={locale} inherited={}",
+        first_created_at == second_created_at
+    );
+
+    assert_eq!(locale, "second", "the re-inserted row must be the new one");
+    // A re-created identity is a new entity and must carry its own creation
+    // timestamp. Inheriting the deleted predecessor's reported an entity as
+    // older than its own creation.
+    assert_ne!(
+        second_created_at, first_created_at,
+        "a re-created identity must mint a fresh created_at, not inherit the \
+         deleted predecessor's"
+    );
+}
