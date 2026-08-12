@@ -257,6 +257,45 @@ async fn scan_committed_constraint_rows(
     })
 }
 
+/// The tracked committed rows of one collection whose declared column equals a
+/// value, resolved through the hot index plane when it can serve the column.
+///
+/// The index resolves to candidate identities inside the live-state reader; if
+/// the collection has no completeness witness the reader silently keeps its
+/// ordinary scan, so this is an access-path choice and never a semantic one.
+/// The caller re-checks every returned row's actual value.
+async fn scan_committed_constraint_rows_by_declared_column(
+    live_state: &dyn LiveStateReader,
+    domain: &Domain,
+    schema_key: &str,
+    declared_column_eq: crate::live_state::DeclaredColumnEq,
+) -> Result<CommittedLiveStateRows, LixError> {
+    let request = LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: vec![schema_key.to_string()],
+            branch_ids: vec![domain.branch_id().to_string()],
+            file_ids: domain.file_filters(),
+            untracked: Some(domain.untracked()),
+            declared_column_eq: Some(declared_column_eq),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let batch = live_state
+        .scan_domain_batch(
+            &request,
+            if domain.untracked() {
+                LiveStateReadDomain::Untracked
+            } else {
+                LiveStateReadDomain::Tracked
+            },
+        )
+        .await?;
+    CommittedLiveStateRows::select(batch, |row| {
+        domain.contains_ref(row) && row.schema_key() == schema_key
+    })
+}
+
 async fn scan_committed_canonical_rows(
     live_state: &dyn LiveStateReader,
     domain: &Domain,
@@ -2954,62 +2993,147 @@ async fn validate_committed_unique_constraints(
     }
 
     for (scope, pending_values) in pending_by_scope {
-        let committed_rows = scan_committed_constraint_rows(
-            input.live_state,
-            &scope.domain,
-            vec![scope.schema_key.clone()],
-            Vec::new(),
-            false,
-        )
-        .await?;
-
-        for committed_row in committed_rows.iter() {
-            if !committed_row_is_in_exact_unique_scope(committed_row, &scope) {
-                continue;
-            }
-            if pending_constraints.tombstones_identity(committed_row) {
-                continue;
-            }
-            let Some(snapshot_content) = committed_row
-                .snapshot_content()
-                .map(|snapshot| snapshot.as_str())
-            else {
-                continue;
-            };
-            let snapshot =
-                serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_VALIDATION,
-                        format!(
-                            "committed snapshot_content for schema '{}' is invalid JSON: {error}",
-                            committed_row.schema_key()
-                        ),
+        // One scan per scope becomes one probe per distinct value when the
+        // scope's pointer group is a single column the hot index plane serves.
+        // That trades an O(collection) scan with a parse per row for O(pending
+        // values) point lookups — a win for the ordinary one-row insert and
+        // for any bulk insert whose collection is larger than its batch.
+        // Everything else, including composite groups and values with no
+        // order-preserving key encoding, keeps the single whole-scope scan.
+        let probes = declared_column_probes(input.schema_catalog, &scope, &pending_values);
+        match probes {
+            Some(probes) => {
+                for probe in probes {
+                    let committed_rows = scan_committed_constraint_rows_by_declared_column(
+                        input.live_state,
+                        &scope.domain,
+                        &scope.schema_key,
+                        probe,
                     )
-                })?;
-            let Some(committed_value) =
-                UniqueConstraintValue::from_snapshot(&snapshot, &scope.pointer_group)
-            else {
-                continue;
-            };
-            let Some(pending_entity_pks) = pending_values.get(&committed_value) else {
-                continue;
-            };
-            for pending_entity_pk in pending_entity_pks {
-                if committed_row.entity_pk() == *pending_entity_pk {
-                    continue;
+                    .await?;
+                    reject_committed_unique_conflicts(
+                        &committed_rows,
+                        &scope,
+                        &pending_values,
+                        pending_constraints,
+                    )?;
                 }
-                return Err(LixError::new(
-                    LixError::CODE_UNIQUE,
-                    format!(
-                        "unique constraint violation on {}.{} for value {}: committed row '{}' conflicts with staged row '{}'",
-                        scope.schema_key,
-                        format_pointer_group(&scope.pointer_group),
-                        committed_value.display(),
-                        committed_row.entity_pk().as_json_array_text()?,
-                        pending_entity_pk.as_json_array_text()?
-                    ),
-                ));
             }
+            None => {
+                let committed_rows = scan_committed_constraint_rows(
+                    input.live_state,
+                    &scope.domain,
+                    vec![scope.schema_key.clone()],
+                    Vec::new(),
+                    false,
+                )
+                .await?;
+                reject_committed_unique_conflicts(
+                    &committed_rows,
+                    &scope,
+                    &pending_values,
+                    pending_constraints,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One `declared_column_eq` predicate per distinct pending value, or `None`
+/// when this scope must keep its whole-collection scan.
+///
+/// Declines unless the scope is a single-column group that the schema's
+/// `indexed_columns` cover **and** every pending value round-trips exactly
+/// through the index's key encoding. A probe built from a value that does not
+/// round-trip could miss a committed conflict, which would turn a unique
+/// violation into a silently accepted duplicate — so an inexact value sends
+/// the whole scope back to the scan rather than probing approximately.
+fn declared_column_probes(
+    schema_catalog: &CatalogSnapshot,
+    scope: &PendingUniqueConstraintScope,
+    pending_values: &BTreeMap<UniqueConstraintValue, Vec<&EntityPk>>,
+) -> Option<Vec<crate::live_state::DeclaredColumnEq>> {
+    let [pointer] = scope.pointer_group.as_slice() else {
+        return None;
+    };
+    let [property] = pointer.as_slice() else {
+        return None;
+    };
+    let schema = schema_catalog.schema(&scope.schema_key)?;
+    let spec = crate::sql2::derive_entity_surface_spec_from_schema(schema).ok()?;
+    let ordinal = spec
+        .indexed_columns
+        .iter()
+        .find(|column| column.name == *property)?
+        .ordinal;
+    pending_values
+        .keys()
+        .map(|value| {
+            Some(crate::live_state::DeclaredColumnEq {
+                schema_key: scope.schema_key.clone(),
+                ordinal,
+                value: value.exact_hot_index_value()?,
+            })
+        })
+        .collect()
+}
+
+/// The committed-row half of the unique check, shared by the probe and scan
+/// routes so both reject exactly the same conflicts.
+fn reject_committed_unique_conflicts(
+    committed_rows: &CommittedLiveStateRows,
+    scope: &PendingUniqueConstraintScope,
+    pending_values: &BTreeMap<UniqueConstraintValue, Vec<&EntityPk>>,
+    pending_constraints: &PendingConstraintIndexes,
+) -> Result<(), LixError> {
+    for committed_row in committed_rows.iter() {
+        if !committed_row_is_in_exact_unique_scope(committed_row, scope) {
+            continue;
+        }
+        if pending_constraints.tombstones_identity(committed_row) {
+            continue;
+        }
+        let Some(snapshot_content) = committed_row
+            .snapshot_content()
+            .map(|snapshot| snapshot.as_str())
+        else {
+            continue;
+        };
+        let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "committed snapshot_content for schema '{}' is invalid JSON: {error}",
+                    committed_row.schema_key()
+                ),
+            )
+        })?;
+        let Some(committed_value) =
+            UniqueConstraintValue::from_snapshot(&snapshot, &scope.pointer_group)
+        else {
+            continue;
+        };
+        // Index entries are candidates, never answers: a probe can return a
+        // row whose value has since changed. This lookup is what rejects it.
+        let Some(pending_entity_pks) = pending_values.get(&committed_value) else {
+            continue;
+        };
+        for pending_entity_pk in pending_entity_pks {
+            if committed_row.entity_pk() == *pending_entity_pk {
+                continue;
+            }
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "unique constraint violation on {}.{} for value {}: committed row '{}' conflicts with staged row '{}'",
+                    scope.schema_key,
+                    format_pointer_group(&scope.pointer_group),
+                    committed_value.display(),
+                    committed_row.entity_pk().as_json_array_text()?,
+                    pending_entity_pk.as_json_array_text()?
+                ),
+            ));
         }
     }
     Ok(())
@@ -3129,6 +3253,27 @@ impl UniqueConstraintValue {
             values.push(stable_unique_value(value));
         }
         Some(Self(values))
+    }
+
+    /// The hot index plane's encoding of a single-column value, but only when
+    /// the recovered value re-encodes to exactly this stable form.
+    ///
+    /// `stable_unique_value` is lossy for anything the index cannot key
+    /// anyway, and an approximate probe would be a missed conflict rather
+    /// than a slow one. The round-trip check makes "recoverable" provable
+    /// instead of assumed.
+    fn exact_hot_index_value(&self) -> Option<crate::live_state::HotIndexValue> {
+        let [encoded] = self.0.as_slice() else {
+            return None;
+        };
+        if let Ok(text) = serde_json::from_str::<String>(encoded)
+            && stable_unique_value(&JsonValue::String(text.clone())) == *encoded
+        {
+            return Some(crate::live_state::HotIndexValue::String(text));
+        }
+        let number = encoded.parse::<i64>().ok()?;
+        (stable_unique_value(&JsonValue::Number(number.into())) == *encoded)
+            .then_some(crate::live_state::HotIndexValue::Integer(number))
     }
 
     fn display(&self) -> String {

@@ -1888,7 +1888,7 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
 fn hot_index_writes_for_commit(
     state_rows: &PreparedStateBatch,
     branch_id: &str,
-    parent_control: Option<&crate::branch::BranchHeadControl>,
+    parent_control: Option<&BranchHeadControl>,
 ) -> (Vec<crate::live_state::HotIndexEntry>, BTreeSet<(String, u16)>) {
     let staged = state_rows.staged_index_values();
     let mut entries = Vec::new();

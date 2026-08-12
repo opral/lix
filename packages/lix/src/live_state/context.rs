@@ -1196,6 +1196,20 @@ where
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedLiveStateBatch::default());
         }
+        // The tracked domain is the constraint validator's route, and
+        // `validate_committed_unique_constraints` reaches it with an equality
+        // on a declared column. Resolving it here is the same access-path
+        // choice the combined route already makes, and it is what stops an
+        // insert into an `x-lix-unique` collection from scanning that
+        // collection.
+        let resolved;
+        let request = match self.resolve_declared_column_eq(request, &scope).await? {
+            Some(rewritten) => {
+                resolved = rewritten;
+                &resolved
+            }
+            None => request,
+        };
         let derived_rows = MaterializedLiveStateBatch::from_rows(
             scan_derived_rows(
                 store,
@@ -1251,6 +1265,14 @@ where
         request: &LiveStateScanRequest,
         scope: &LiveStateScanScope,
     ) -> Result<Vec<HotBranchRows>, LixError> {
+        // `LiveStateRowFilter::None` means "no identity can match", which is
+        // exactly what an index probe with no candidates produces. The tracked
+        // request below carries only `entity_pks`, where an empty list means
+        // "no identity filter" — the opposite — so the empty case has to be
+        // answered before the request is lowered.
+        if matches!(request.filter.rows, LiveStateRowFilter::None) {
+            return Ok(Vec::new());
+        }
         let store = &self.store;
         let tracked_request = tracked_scan_request_from_live(request);
         let branches = scope
