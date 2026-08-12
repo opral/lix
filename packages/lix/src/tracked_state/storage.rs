@@ -8477,7 +8477,17 @@ pub(crate) async fn scan_commit_delta_members(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
-    let batch = scan_commit_delta_values(store, commit_id, &[]).await?;
+    let batch = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::DeltaSegments,
+        );
+        scan_commit_delta_values(store, commit_id, &[]).await?
+    };
+    #[cfg(feature = "storage-benches")]
+    let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+        crate::storage_bench::PlanLoadPhase::Collect,
+    );
     let mut members = Vec::with_capacity(batch.len());
     for row in batch.iter() {
         let key = row.key_ref();
@@ -9254,7 +9264,14 @@ pub(crate) async fn scan_commit_delta_values(
     commit_id: CommitId,
     schema_keys: &[String],
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
-    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
+    let state = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::ReplayState,
+        );
+        load_point_replay_commit_state(store, commit_id).await?
+    };
+    let Some(state) = state else {
         return Ok(DecodedCommitDeltaBatch::default());
     };
     let source = match state.mutations.selected_source_commit_id() {
