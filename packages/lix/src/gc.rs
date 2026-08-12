@@ -6885,7 +6885,7 @@ mod tests {
                     schema_key: "gc_untracked_owner",
                     file_id: None,
                     entity_pk: &entity_pk,
-                    change_id: None,
+                    change_id: Some(ChangeId::for_test_label("gc-untracked-owner")),
                     commit_id: None,
                     untracked: true,
                     deleted: snapshot.is_none(),
