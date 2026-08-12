@@ -383,9 +383,22 @@ impl HotStateContext {
         }
     }
 
-    /// Creates a reader whose derived indexes are private to one retained
-    /// storage snapshot. Process-wide caches intentionally advance with live
-    /// commits and therefore cannot serve an older explicit transaction.
+    /// Creates a reader whose entity-level derived indexes are private to one
+    /// retained storage snapshot. Those caches are not revision-tagged, so they
+    /// cannot serve an older explicit transaction and stay per-snapshot.
+    ///
+    /// The filesystem path index is deliberately **not** among them. It is
+    /// keyed by the `filesystem.path` revision, which
+    /// [`stage_path_index_revision`](crate::filesystem::stage_path_index_revision)
+    /// rewrites with a fresh UUIDv7 on every commit that changes the filesystem
+    /// view. Equal revision therefore means equal view, and a reader pinned to
+    /// an older snapshot loads the older revision from its own store and misses
+    /// rather than being served a newer view. Correctness comes from the
+    /// revision in the cache key, not from owning a private cache — and giving
+    /// each snapshot reader its own empty cache guaranteed a full
+    /// whole-repository rebuild for the first statement of every write
+    /// transaction, which is the epoch-0 path in
+    /// `TransactionSqlWriteExecutionContext::filesystem_path_index`.
     pub(crate) fn snapshot_reader<S>(&self, store: S) -> HotStateContextReader<S>
     where
         S: StorageAdapterRead,
@@ -394,7 +407,7 @@ impl HotStateContext {
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
-            filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
+            filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
             entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
             branch_head_control_cache: None,
