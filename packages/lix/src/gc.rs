@@ -1150,9 +1150,27 @@ where
 /// nothing replaced it. `stage_delete_refs` and every function that enumerates
 /// payload hashes are `#[cfg(test)]`, and this path stages an empty
 /// `json_payloads`. A repository's out-of-band payload count therefore grows
-/// linearly with edits and is never reclaimed -- measured at 0 rows reclaimed
-/// for 10, 100, and 1000 rewrites of a single row
-/// (`engine-benchmarks/examples/e1_json_leak.rs`).
+/// linearly with edits and is never reclaimed.
+///
+/// The rate is **one leaked payload per superseded edit**, and it is
+/// independent of checkpoint cadence. Measured by
+/// `engine-benchmarks/examples/e1_json_leak.rs` over a
+/// shape x cadence x edits matrix: rewriting one row 1000 times leaves 1004
+/// payload rows where 1 is live, at every cadence (never / every 10 / every
+/// 100), i.e. `leaked_per_edit` 1.300 -> 1.030 -> 1.003 at 10 -> 100 -> 1000
+/// edits, converging on 1.0 over a fixed ~3-row bootstrap. The `insert` control
+/// arm, where every payload stays live, leaks exactly those 3 rows at every
+/// size -- so the rewrite arm's growth is the superseded payloads and nothing
+/// else.
+///
+/// **That measurement is only meaningful because the probe checkpoints.** An
+/// earlier version of this comment cited the same probe before it did, and that
+/// evidence could not support the claim: without a checkpoint the sweep proves
+/// *nothing* retirable -- 0 commit-state manifests retired across 1000 edits --
+/// so "0 payloads reclaimed" was equally consistent with "the sweep had no work
+/// to do". With a checkpoint every 10 edits the same stream retires 1095
+/// manifests and *still* reclaims 0 payloads. That is what establishes the
+/// leak: the owning commits really are being retired underneath the payloads.
 /// Ordinary GC derives its candidates from the physical manifest inventory and
 /// proves liveness only from refs: branch-head controls and checkpoint recovery
 /// refs are the complete active-root set, and the walk from those roots through
