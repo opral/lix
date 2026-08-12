@@ -6972,7 +6972,11 @@ mod tests {
         TRACKED_STATE_TREE_CHUNK_SPACE_ID,
         "tracked_state.tree_chunk",
     );
-    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
+    // Immutable, matching the canonical declaration in `tracked_state`. Only
+    // the id is load-bearing here (`has_mutations_in_space` keys on it), but a
+    // space id has exactly one value semantics, so restating it wrongly would
+    // be the drift `storage_spaces` exists to prevent.
+    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID,
         "tracked_state.commit_state_manifest.v7",
     );

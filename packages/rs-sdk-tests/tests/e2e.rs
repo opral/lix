@@ -3,8 +3,7 @@ mod benchmark_metrics;
 use bytes::Bytes;
 use lix::storage::{
     BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
-    ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
-    WriteOptions,
+    ReadOptions, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
 };
 use lix::storage_adapter::{
     StorageAdapter, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
@@ -5637,13 +5636,15 @@ async fn qualify_corrupt_current_plugin_checkpoint<B: CurrentPluginCheckpointCor
         "checkpoint payload must include authenticated bytes"
     );
     value[92] ^= 1;
-    let (space_id, canonical_name) = layout_space_catalog()
+    let (space_id, _) = layout_space_catalog()
         .into_iter()
         .find(|(_, name)| *name == CHECKPOINT_SPACE)
         .expect("plugin current-checkpoint space must be catalogued");
     let mut writes = storage.new_write_set();
     writes.put(
-        StorageSpace::mutable(SpaceId(space_id), canonical_name),
+        // A space id has exactly one value semantics; read it from the engine
+        // registry rather than restating it here.
+        lix::storage_bench::storage_space_by_id(space_id),
         StorageKey(Bytes::from(expected_key)),
         StorageValue {
             bytes: Bytes::from(value),
@@ -7795,12 +7796,15 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
     reopened.close().await.unwrap();
 }
 
-const CERTIFIED_ENTITY_BATCH_TEST_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0004_001f), "live_state.certified_entity_batch.v1");
-const CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE: StorageSpace = StorageSpace::mutable(
-    SpaceId(0x0004_0022),
-    "live_state.certified_entity_batch_page.v1",
-);
+// A space id has exactly one value semantics, declared once in the engine
+// registry. These read it back instead of restating id, name and semantics.
+fn certified_entity_batch_space() -> StorageSpace {
+    lix::storage_bench::storage_space_by_name("live_state.certified_entity_batch.v1")
+}
+
+fn certified_entity_batch_page_space() -> StorageSpace {
+    lix::storage_bench::storage_space_by_name("live_state.certified_entity_batch_page.v1")
+}
 const CEB2_FIXTURE_PATH: &str = "/ceb2-hard-cut.excalidraw";
 const CEB2_FIXTURE_BYTES: &[u8] = br#"{"type":"excalidraw","version":2,"elements":[{"id":"a","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}]}"#;
 
@@ -7881,7 +7885,7 @@ where
     );
     lix.close().await.expect("close CEB2 fixture workspace");
 
-    let contents = storage_space_entries(storage, CERTIFIED_ENTITY_BATCH_TEST_SPACE).await;
+    let contents = storage_space_entries(storage, certified_entity_batch_space()).await;
     assert!(
         !contents.is_empty(),
         "writer must publish a certified batch"
@@ -7891,7 +7895,7 @@ where
         "current writers must emit only CEB2"
     );
     assert!(
-        !storage_space_entries(storage, CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE)
+        !storage_space_entries(storage, certified_entity_batch_page_space())
             .await
             .is_empty(),
         "CEB2 writer must publish external pages"
@@ -7926,7 +7930,7 @@ async fn corrupt_first_ceb2_page<StorageImpl>(storage: &StorageImpl)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut pages = storage_space_entries(storage, CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE).await;
+    let mut pages = storage_space_entries(storage, certified_entity_batch_page_space()).await;
     let (key, mut bytes) = pages
         .drain(..)
         .next()
@@ -7939,7 +7943,7 @@ where
         .expect("open CEB2 corruption write");
     write
         .put_many(
-            CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE,
+            certified_entity_batch_page_space(),
             PutBatch {
                 entries: vec![PutEntry {
                     key,

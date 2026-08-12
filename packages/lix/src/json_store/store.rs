@@ -2,7 +2,7 @@ use crate::LixError;
 use crate::json_store::compression::{JsonBatchCompressor, decode_json_zstd_payload};
 use crate::json_store::encoded::JsonCodec;
 use crate::json_store::types::{JsonReadScopeRef, JsonRef};
-use crate::storage_adapter::{PointReadPlan, StorageAdapterRead, StorageSpace};
+use crate::storage_adapter::{PointReadPlan, StorageAdapterRead, StorageSpace, ValueSemantics};
 use crate::storage_adapter::{
     StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId,
 };
@@ -11,8 +11,11 @@ use std::collections::{HashMap, hash_map::Entry};
 use std::ops::Range;
 
 pub(crate) const JSON_NAMESPACE: &str = "json_store.json";
-pub(crate) const JSON_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0002_0001), JSON_NAMESPACE);
+pub(crate) const JSON_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0002_0001),
+    JSON_NAMESPACE,
+    ValueSemantics::Mutable,
+);
 const STORED_JSON_MAGIC: &[u8] = b"lix-json:v1";
 const STORED_JSON_HEADER_LEN: usize = STORED_JSON_MAGIC.len() + 1 + 8;
 /// Compression floor. Payloads at or under the inline threshold never

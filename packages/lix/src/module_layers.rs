@@ -125,7 +125,12 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
          in-memory backend, so it is not a layer",
     ),
     ("storage_bench", "feature-gated harness"),
-    ("storage_spaces", "cfg-gated harness"),
+    (
+        "storage_spaces",
+        "the space registry, which `storage::types` reads to check the value \
+         semantics a space id is declared with, so it sits beside `storage` \
+         rather than below it",
+    ),
     ("telemetry", "instrumentation, no layer semantics"),
     ("test_support", "cfg-gated harness"),
     (
