@@ -4185,12 +4185,42 @@ async fn scan_packed_current_base_provenance_rows(
     Ok(rows.finish())
 }
 
+/// Aligns already-resolved HOT overlay rows to an exact key list so the packed
+/// current base is only consulted for keys it could still win.
+fn packed_current_base_shadow_from_rows(
+    keys: &[TrackedStateKeyRef<'_>],
+    rows: &MaterializedHotStateBatch,
+) -> Vec<Option<CommitId>> {
+    let mut resolved = BTreeMap::<(&str, Option<&str>, &EntityPk), Option<CommitId>>::new();
+    for row in rows.iter() {
+        let commit_id = row.commit_id();
+        let slot = resolved
+            .entry((row.schema_key(), row.file_id(), row.entity_pk()))
+            .or_insert(commit_id);
+        // Keep the newest resolved commit. A row without one proves nothing
+        // about the base, so it disables the skip for that key entirely.
+        *slot = match (*slot, commit_id) {
+            (Some(current), Some(candidate)) => Some(current.max(candidate)),
+            _ => None,
+        };
+    }
+    keys.iter()
+        .map(|key| {
+            resolved
+                .get(&(key.schema_key, key.file_id, key.entity_pk))
+                .copied()
+                .flatten()
+        })
+        .collect()
+}
+
 async fn load_packed_current_base_exact(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
     active_checkpoint_commit_id: Option<CommitId>,
     keys: &[TrackedStateKeyRef<'_>],
+    shadow: PackedCurrentBaseShadow<'_>,
     projection: ChangeRecordProjection,
     transaction_cache: Option<&HotStateTransactionCache>,
 ) -> Result<MaterializedHotStateExactBatch, LixError> {
@@ -4205,6 +4235,7 @@ async fn load_packed_current_base_exact(
         branch_id,
         generation,
         keys,
+        shadow,
         transaction_cache,
     )
     .await?;
@@ -4306,11 +4337,24 @@ async fn load_packed_current_base_exact(
     MaterializedHotStateExactBatch::new(rows.finish(), slots)
 }
 
+/// Per-key commit id already resolved from a plane that shadows the packed
+/// current base — in practice a branch-local HOT row. Empty means "nothing is
+/// known", which reads every key from the base as before.
+///
+/// A packed current base published at commit `C` can only serve rows whose
+/// owning commit is an ancestor of `C`, so `C` is an upper bound on every
+/// `commit_id` it can produce. The caller's merge keeps a packed candidate
+/// only when it is *strictly newer* than what is already resolved; a key whose
+/// resolved commit id is at least the newest base ref therefore cannot change
+/// its winner, and its segment never has to be fetched or decoded.
+type PackedCurrentBaseShadow<'a> = &'a [Option<CommitId>];
+
 async fn load_packed_current_base_exact_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
+    shadow: PackedCurrentBaseShadow<'_>,
     transaction_cache: Option<&HotStateTransactionCache>,
 ) -> Result<
     Vec<
@@ -4325,6 +4369,7 @@ async fn load_packed_current_base_exact_entries(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
+    debug_assert!(shadow.is_empty() || shadow.len() == keys.len());
     let transaction_cache = match transaction_cache {
         Some(cache) if cache.should_reuse_packed_points(generation)? => Some(cache),
         Some(_) | None => None,
@@ -4346,7 +4391,71 @@ async fn load_packed_current_base_exact_entries(
     if base_refs.is_empty() {
         return Ok((0..keys.len()).map(|_| None).collect());
     }
-    if let [base_ref] = base_refs.as_slice() {
+    let skipped = packed_current_base_unresolved_indices(keys, shadow, &base_refs);
+    let unresolved_keys;
+    let selected = match skipped.as_deref() {
+        Some(indices) => {
+            if indices.is_empty() {
+                return Ok((0..keys.len()).map(|_| None).collect());
+            }
+            unresolved_keys = indices.iter().map(|&index| keys[index]).collect::<Vec<_>>();
+            unresolved_keys.as_slice()
+        }
+        None => keys,
+    };
+    // The base loader is boxed rather than inlined: this wrapper sits deep in an
+    // already-tall async write stack, and holding the loader's state machine in
+    // this frame overflows libtest's 2 MiB worker stack.
+    let loaded = Box::pin(load_packed_current_base_exact_entries_from_refs(
+        store,
+        &base_refs,
+        selected,
+        transaction_cache,
+    ))
+    .await?;
+    let Some(indices) = skipped else {
+        return Ok(loaded);
+    };
+    let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+    for (index, entry) in indices.into_iter().zip(loaded) {
+        output[index] = entry;
+    }
+    Ok(output)
+}
+
+/// Indices of the keys the packed current base could still win, or `None` when
+/// nothing is known and every key must be read.
+fn packed_current_base_unresolved_indices(
+    keys: &[TrackedStateKeyRef<'_>],
+    shadow: PackedCurrentBaseShadow<'_>,
+    base_refs: &[PackedCurrentBaseRef],
+) -> Option<Vec<usize>> {
+    if shadow.len() != keys.len() {
+        return None;
+    }
+    let newest_base = base_refs.iter().map(|base_ref| base_ref.commit_id).max()?;
+    let unresolved = (0..keys.len())
+        .filter(|&index| shadow[index].is_none_or(|resolved| resolved < newest_base))
+        .collect::<Vec<_>>();
+    (unresolved.len() != keys.len()).then_some(unresolved)
+}
+
+async fn load_packed_current_base_exact_entries_from_refs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    base_refs: &[PackedCurrentBaseRef],
+    keys: &[TrackedStateKeyRef<'_>],
+    transaction_cache: Option<&HotStateTransactionCache>,
+) -> Result<
+    Vec<
+        Option<(
+            crate::tracked_state::TrackedStateIndexValue,
+            crate::changelog::ChangeRecord,
+            Option<crate::tracked_state::TrackedStateBaseCoordinate>,
+        )>,
+    >,
+    LixError,
+> {
+    if let [base_ref] = base_refs {
         return Ok(
             crate::tracked_state::load_owned_commit_delta_entries_one_ordered_ref(
                 store,
@@ -5641,12 +5750,14 @@ where
                     entity_pk: &key.entity_pk,
                 })
                 .collect::<Vec<_>>();
+            let shadow = packed_current_base_shadow_from_rows(&key_refs, &rows);
             load_packed_current_base_exact(
                 &self.store,
                 branch_id,
                 generation,
                 active_checkpoint_commit_id,
                 &key_refs,
+                &shadow,
                 projection,
                 self.transaction_cache.as_deref(),
             )
@@ -5928,12 +6039,20 @@ where
         // proving that a keyed update or foreign-key target already exists.
         // Decode the matching segment rows only when the ordinary point-read
         // index misses, then preserve the original request alignment.
+        let packed_shadow = slots
+            .iter()
+            .map(|slot| {
+                slot.and_then(|slot| rows.get(slot as usize))
+                    .and_then(|row| row.commit_id())
+            })
+            .collect::<Vec<_>>();
         let packed = load_packed_current_base_exact(
             &self.store,
             branch_id,
             generation,
             active_checkpoint_commit_id,
             keys,
+            &packed_shadow,
             *projection,
             self.transaction_cache.as_deref(),
         )
@@ -7535,11 +7654,25 @@ where
                 }
             })
             .collect::<Vec<_>>();
+        // The HOT overlay predecessor loaded just above already shadows the
+        // packed current base whenever it is at least as new as the newest
+        // base ref, so hand it over and let the base loader skip those keys.
+        let packed_previous_shadow = packed_previous_indices
+            .iter()
+            .map(|&index| {
+                Ok(previous_values[index]
+                    .as_ref()
+                    .map(CertifiedCurrentStatePredecessor::view)
+                    .transpose()?
+                    .and_then(|previous| previous.commit_id))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
         let packed_previous = Box::pin(load_packed_current_base_exact_entries(
             self.store,
             branch_id,
             generation,
             &packed_previous_keys,
+            &packed_previous_shadow,
             None,
         ))
         .await?;
@@ -13427,6 +13560,7 @@ mod tests {
             crate::GLOBAL_BRANCH_ID,
             generation,
             &request_keys,
+            &[],
             Some(transaction_cache.as_ref()),
         )
         .await
@@ -13437,6 +13571,7 @@ mod tests {
                 crate::GLOBAL_BRANCH_ID,
                 generation,
                 &request_keys,
+                &[],
                 Some(transaction_cache.as_ref()),
             )
             .await
@@ -13448,6 +13583,7 @@ mod tests {
             crate::GLOBAL_BRANCH_ID,
             generation,
             &request_keys,
+            &[],
             Some(transaction_cache.as_ref()),
         )
         .await
@@ -13462,6 +13598,7 @@ mod tests {
             crate::GLOBAL_BRANCH_ID,
             generation,
             &request_keys,
+            &[],
             Some(transaction_cache.as_ref()),
         )
         .await
