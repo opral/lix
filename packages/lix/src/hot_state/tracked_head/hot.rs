@@ -11597,39 +11597,29 @@ fn read_hot_scan_key_string(
     offset: &mut usize,
     field: &str,
 ) -> Result<(HotScanString, u8), LixError> {
-    let start = *offset;
-    let mut cursor = start;
-    loop {
-        let byte = *bytes
-            .get(cursor)
-            .ok_or_else(|| key_codec_error(&format!("is truncated in {field}")))?;
-        cursor += 1;
-        if byte != KEY_PART_FINAL {
-            continue;
-        }
-        let terminator = *bytes
-            .get(cursor)
-            .ok_or_else(|| key_codec_error(&format!("is truncated after {field}")))?;
-        cursor += 1;
-        if terminator != KEY_ESCAPE {
-            let end = cursor - 2;
-            std::str::from_utf8(&bytes[start..end])
+    let part = scan_key_part(bytes.as_ref(), *offset)
+        .map_err(|error| head_key_part_error(error, field))?;
+    *offset = part.end;
+    match part.value {
+        // No escape: the part is a span of the key, so it stays shared rather
+        // than becoming an owned buffer for generated schema and file ids.
+        ScannedKeyValue::Verbatim(range) => {
+            std::str::from_utf8(&bytes[range.clone()])
                 .map_err(|error| key_codec_error(&format!("{field} is not UTF-8: {error}")))?;
-            let start = u32::try_from(start)
+            let start = u32::try_from(range.start)
                 .map_err(|_| key_codec_error(&format!("{field} offset exceeds u32")))?;
-            let end = u32::try_from(end)
+            let end = u32::try_from(range.end)
                 .map_err(|_| key_codec_error(&format!("{field} offset exceeds u32")))?;
-            *offset = cursor;
-            return Ok((HotScanString::Borrowed(start..end), terminator));
+            Ok((HotScanString::Borrowed(start..end), part.terminator))
         }
-        break;
+        // Embedded NULs require unescaping; that uncommon case owns its buffer.
+        ScannedKeyValue::Unescaped(value) => {
+            let value = String::from_utf8(value).map_err(|error| {
+                key_codec_error(&format!("{field} is not UTF-8: {}", error.utf8_error()))
+            })?;
+            Ok((HotScanString::Owned(value), part.terminator))
+        }
     }
-
-    // Embedded NULs require unescaping. Preserve that uncommon case without
-    // imposing an owned buffer on generated schema and file identifiers.
-    *offset = start;
-    read_key_string(bytes.as_ref(), offset, field)
-        .map(|(value, terminator)| (HotScanString::Owned(value), terminator))
 }
 
 fn read_hot_scan_shared_bytes(
@@ -11637,30 +11627,16 @@ fn read_hot_scan_shared_bytes(
     offset: &mut usize,
     field: &str,
 ) -> Result<(Bytes, u8), LixError> {
-    let start = *offset;
-    let mut cursor = start;
-    loop {
-        let byte = *bytes
-            .get(cursor)
-            .ok_or_else(|| key_codec_error(&format!("is truncated in {field}")))?;
-        cursor += 1;
-        if byte != KEY_PART_FINAL {
-            continue;
-        }
-        let terminator = *bytes
-            .get(cursor)
-            .ok_or_else(|| key_codec_error(&format!("is truncated after {field}")))?;
-        cursor += 1;
-        if terminator != KEY_ESCAPE {
-            *offset = cursor;
-            return Ok((bytes.slice(start..cursor - 2), terminator));
-        }
-        break;
-    }
-
-    *offset = start;
-    read_key_bytes(bytes.as_ref(), offset, field)
-        .map(|(value, terminator)| (Bytes::from(value), terminator))
+    let part = scan_key_part(bytes.as_ref(), *offset)
+        .map_err(|error| head_key_part_error(error, field))?;
+    *offset = part.end;
+    let value = match part.value {
+        // No escape: hand back a refcounted slice of the same allocation.
+        ScannedKeyValue::Verbatim(range) => bytes.slice(range),
+        // Embedded NULs had to be unescaped, so this case owns its buffer.
+        ScannedKeyValue::Unescaped(value) => Bytes::from(value),
+    };
+    Ok((value, part.terminator))
 }
 
 fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
