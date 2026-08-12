@@ -91,7 +91,9 @@ async fn main() {
     );
 
     // ---- seed (untimed) -------------------------------------------------
-    {
+    // `E24_SKIP_SEED=1` reuses an already-populated directory so a profile can
+    // be taken over the read path alone, with no write-path samples in it.
+    if !std::env::var("E24_SKIP_SEED").is_ok_and(|v| v == "1") {
         let lix = open_at(&dir).await;
         let seed_started = Instant::now();
         let mut cursor = 0usize;
