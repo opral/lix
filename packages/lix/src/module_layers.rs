@@ -105,6 +105,7 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ),
     ("handle", "entry point; reaches everywhere by design"),
     ("hot_index_aging_probe", "cfg(test) measurement probe"),
+    ("hot_row_tombstone_probe", "cfg(test) measurement probe"),
     ("init", "entry point; reaches everywhere by design"),
     ("lib", "crate root"),
     ("module_layers", "this guard"),
