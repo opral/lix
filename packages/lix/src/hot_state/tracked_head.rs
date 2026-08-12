@@ -12,6 +12,11 @@ mod hot;
 pub(crate) use hot::hot_decode_entity_pk_probe;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use hot::{
+    BROAD_CANONICAL_CREATED_AT_HITS, BROAD_CANONICAL_CREATED_AT_KEYS,
+    BROAD_CANONICAL_CREATED_AT_LOOKUPS,
+};
 #[cfg(test)]
 pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
