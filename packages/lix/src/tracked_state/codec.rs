@@ -752,7 +752,11 @@ fn read_entity_pk_shared(
         match terminator {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
-            _ => unreachable!("shared key decoder validates terminators"),
+            // Sound because every arm of `read_entity_pk_part_shared` gets its
+            // terminator past `is_key_part_terminator`: the string and bytes
+            // arms via `scan_key_part`, the fixed-width arms by checking it
+            // directly.
+            _ => unreachable!("scan_key_part validates terminators"),
         }
     }
     crate::entity_pk::EntityPk::from_components(components).map_err(|error| {
@@ -889,7 +893,9 @@ fn read_entity_pk(
         match terminator {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
-            _ => unreachable!("read_key_string validates terminators"),
+            // Same invariant as `read_entity_pk_shared` above: `scan_key_part`
+            // is now the single place the terminator set is enforced.
+            _ => unreachable!("scan_key_part validates terminators"),
         }
     }
     crate::entity_pk::EntityPk::from_components(components).map_err(|error| {
@@ -1027,51 +1033,29 @@ fn read_key_bytes(
         .map(|(value, terminator)| (value.into_owned(), terminator))
 }
 
+/// Maps the shared scanner's structured error into this plane's vocabulary.
+fn tree_key_part_error(error: KeyPartError, field: &str) -> LixError {
+    match error {
+        KeyPartError::Truncated => key_codec_error(format!("{field} is truncated")),
+        KeyPartError::EscapeTruncated => key_codec_error(format!("{field} escape is truncated")),
+        KeyPartError::UnknownEscape(other) => {
+            key_codec_error(format!("{field} has unknown escape {other}"))
+        }
+    }
+}
+
 fn read_key_bytes_cow<'a>(
     bytes: &'a [u8],
     offset: &mut usize,
     field: &str,
 ) -> Result<(Cow<'a, [u8]>, u8), LixError> {
-    let start = *offset;
-    let mut segment_start = start;
-    let mut decoded: Option<Vec<u8>> = None;
-    loop {
-        let tail = bytes
-            .get(segment_start..)
-            .ok_or_else(|| key_codec_error(format!("{field} is truncated")))?;
-        let relative_zero = memchr::memchr(0, tail)
-            .ok_or_else(|| key_codec_error(format!("{field} is truncated")))?;
-        let zero = segment_start + relative_zero;
-        let escape = *bytes
-            .get(zero + 1)
-            .ok_or_else(|| key_codec_error(format!("{field} escape is truncated")))?;
-        *offset = zero + 2;
-        match escape {
-            KEY_ESCAPE => {
-                let out = decoded.get_or_insert_with(|| {
-                    Vec::with_capacity(zero.saturating_sub(start).saturating_add(16))
-                });
-                out.extend_from_slice(&bytes[segment_start..zero]);
-                out.push(0);
-                segment_start = *offset;
-            }
-            KEY_PART_FINAL | KEY_PART_MORE => {
-                let value = decoded.map_or_else(
-                    || Cow::Borrowed(&bytes[start..zero]),
-                    |mut out| {
-                        out.extend_from_slice(&bytes[segment_start..zero]);
-                        Cow::Owned(out)
-                    },
-                );
-                return Ok((value, escape));
-            }
-            other => {
-                return Err(key_codec_error(format!(
-                    "{field} has unknown escape {other}"
-                )));
-            }
-        }
-    }
+    let part = scan_key_part(bytes, *offset).map_err(|error| tree_key_part_error(error, field))?;
+    *offset = part.end;
+    let value = match part.value {
+        ScannedKeyValue::Verbatim(range) => Cow::Borrowed(&bytes[range]),
+        ScannedKeyValue::Unescaped(value) => Cow::Owned(value),
+    };
+    Ok((value, part.terminator))
 }
 
 fn read_key_bytes_shared(
@@ -1079,46 +1063,14 @@ fn read_key_bytes_shared(
     offset: &mut usize,
     field: &str,
 ) -> Result<(Bytes, u8), LixError> {
-    let start = *offset;
-    let mut segment_start = start;
-    let mut decoded: Option<Vec<u8>> = None;
-    loop {
-        let tail = bytes
-            .get(segment_start..)
-            .ok_or_else(|| key_codec_error(format!("{field} is truncated")))?;
-        let relative_zero = memchr::memchr(0, tail)
-            .ok_or_else(|| key_codec_error(format!("{field} is truncated")))?;
-        let zero = segment_start + relative_zero;
-        let escape = *bytes
-            .get(zero + 1)
-            .ok_or_else(|| key_codec_error(format!("{field} escape is truncated")))?;
-        *offset = zero + 2;
-        match escape {
-            KEY_ESCAPE => {
-                let out = decoded.get_or_insert_with(|| {
-                    Vec::with_capacity(zero.saturating_sub(start).saturating_add(16))
-                });
-                out.extend_from_slice(&bytes[segment_start..zero]);
-                out.push(0);
-                segment_start = *offset;
-            }
-            KEY_PART_FINAL | KEY_PART_MORE => {
-                let value = decoded.map_or_else(
-                    || bytes.slice(start..zero),
-                    |mut out| {
-                        out.extend_from_slice(&bytes[segment_start..zero]);
-                        Bytes::from(out)
-                    },
-                );
-                return Ok((value, escape));
-            }
-            other => {
-                return Err(key_codec_error(format!(
-                    "{field} has unknown escape {other}"
-                )));
-            }
-        }
-    }
+    let part = scan_key_part(bytes.as_ref(), *offset)
+        .map_err(|error| tree_key_part_error(error, field))?;
+    *offset = part.end;
+    let value = match part.value {
+        ScannedKeyValue::Verbatim(range) => bytes.slice(range),
+        ScannedKeyValue::Unescaped(value) => Bytes::from(value),
+    };
+    Ok((value, part.terminator))
 }
 
 fn key_codec_error(message: impl Into<String>) -> LixError {

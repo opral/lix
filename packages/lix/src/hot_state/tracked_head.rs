@@ -1121,60 +1121,30 @@ fn read_key_string(
     Ok((value, terminator))
 }
 
+/// Maps the shared scanner's structured error into this plane's vocabulary, so
+/// unifying the scanner did not unify the error text.
+fn head_key_part_error(error: KeyPartError, field: &str) -> LixError {
+    match error {
+        KeyPartError::Truncated => key_codec_error(&format!("is truncated in {field}")),
+        KeyPartError::EscapeTruncated => key_codec_error(&format!("is truncated after {field}")),
+        KeyPartError::UnknownEscape(_) => {
+            key_codec_error(&format!("{field} has an invalid terminator"))
+        }
+    }
+}
+
 fn read_key_bytes(
     bytes: &[u8],
     offset: &mut usize,
     field: &str,
 ) -> Result<(Vec<u8>, u8), LixError> {
-    let start = *offset;
-    let mut cursor = start;
-    // The normal generated IDs do not contain the escaped NUL byte. Decode
-    // that common case directly from the RocksDB key instead of first growing
-    // a temporary `Vec<u8>` one byte at a time.
-    loop {
-        let byte = *bytes
-            .get(cursor)
-            .ok_or_else(|| key_codec_error(&format!("is truncated in {field}")))?;
-        cursor += 1;
-        if byte != KEY_PART_FINAL {
-            continue;
-        }
-        let terminator = *bytes
-            .get(cursor)
-            .ok_or_else(|| key_codec_error(&format!("is truncated after {field}")))?;
-        cursor += 1;
-        if terminator != KEY_ESCAPE {
-            *offset = cursor;
-            return Ok((bytes[start..cursor - 2].to_vec(), terminator));
-        }
-        break;
-    }
-
-    // Escaped NUL bytes are rare but remain fully supported. Seed the owned
-    // buffer with the prefix before the first escape, then decode the rest.
-    let mut out = Vec::with_capacity(cursor.saturating_sub(start) + 16);
-    out.extend_from_slice(&bytes[start..cursor - 2]);
-    out.push(KEY_PART_FINAL);
-    loop {
-        let byte = *bytes
-            .get(cursor)
-            .ok_or_else(|| key_codec_error(&format!("is truncated in {field}")))?;
-        cursor += 1;
-        if byte != KEY_PART_FINAL {
-            out.push(byte);
-            continue;
-        }
-        let terminator = *bytes
-            .get(cursor)
-            .ok_or_else(|| key_codec_error(&format!("is truncated after {field}")))?;
-        cursor += 1;
-        if terminator == KEY_ESCAPE {
-            out.push(KEY_PART_FINAL);
-            continue;
-        }
-        *offset = cursor;
-        return Ok((out, terminator));
-    }
+    let part = scan_key_part(bytes, *offset).map_err(|error| head_key_part_error(error, field))?;
+    *offset = part.end;
+    let value = match part.value {
+        ScannedKeyValue::Verbatim(range) => bytes[range].to_vec(),
+        ScannedKeyValue::Unescaped(value) => value,
+    };
+    Ok((value, part.terminator))
 }
 
 fn key_codec_error(message: &str) -> LixError {

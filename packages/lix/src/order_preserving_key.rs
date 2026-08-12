@@ -14,29 +14,29 @@
 //! signed integers use sign-bit-flipped big endian, so lexical byte order is
 //! logical order.
 //!
-//! # The decoders are still duplicated
+//! # Decoding is unified here too
 //!
-//! Encoding is unified here. **Decoding is not** — there are three independent
-//! implementations of this same grammar, and this module owns only the
-//! primitives whose divergence would corrupt silently (the field widths, the
-//! terminator predicate, and the sign flip):
+//! Both encoding and decoding are owned by this module. Decoding used to be
+//! four hand-written scanners across three planes, differing in ownership model
+//! and in *where* the terminator was validated:
 //!
 //! | implementation | ownership | scanner | terminator validated |
 //! |---|---|---|---|
 //! | `hot_state::tracked_head` | `Vec<u8>` / `String` | byte loop | by callers |
-//! | `hot_state::tracked_head::hot` | `Bytes` / `SharedStr` | byte loop | by callers |
-//! | `tracked_state::codec` | `Vec` / `Cow` / `Bytes` | `memchr` | inside the scanner |
+//! | `hot_state::tracked_head::hot` (×2) | `Bytes` / `SharedStr` | byte loop | by callers |
+//! | `tracked_state::codec` (×2) | `Vec` / `Cow` / `Bytes` | `memchr` | inside the scanner |
 //!
-//! They agree today — [`tests::all_three_decoders_agree`] proves it over every
-//! truncation and every single-byte mutation of a seed corpus — but they agree
-//! by coincidence of maintenance, not by construction. Unifying them means
-//! standardising on one scanner (the `memchr` one) behind a borrowable span so
-//! all three ownership modes keep zero-copy, and mapping a structured error
-//! enum to each plane's own error code and prefix. That rewrites a hot inner
-//! loop, so it wants a benchmark rather than only a green gate.
+//! They agreed on accept/reject, but by coincidence of maintenance rather than
+//! by construction, and the duplication had already drifted twice. All of them
+//! now call [`scan_key_part`], which scans with `memchr` and returns either a
+//! **span of the input** or an unescaped buffer — so an owned, a borrowed and a
+//! refcounted decoder share one scanner without any of them losing zero-copy.
+//! Each plane maps the returned [`KeyPartError`] onto its own error code and
+//! prefix, so unifying the scanner did not unify the error text.
 //!
-//! Treat the differential test as the contract until then: it fails the moment
-//! a fourth divergence appears.
+//! [`tests::all_three_decoders_agree`] remains the contract, and now guards a
+//! single implementation against its callers rather than three against each
+//! other: it fails the moment a plane's decode path diverges again.
 
 pub(crate) const KEY_ESCAPE: u8 = 0xff;
 pub(crate) const KEY_PART_FINAL: u8 = 0x00;
@@ -48,6 +48,109 @@ pub(crate) const ENTITY_PK_UUID: u8 = 0x00;
 pub(crate) const ENTITY_PK_INTEGER: u8 = 0x01;
 pub(crate) const ENTITY_PK_STRING: u8 = 0x02;
 pub(crate) const ENTITY_PK_BYTES: u8 = 0x03;
+
+/// One scanned key part: where it ends, how it terminated, and how to get its
+/// bytes without copying when it contained no escape.
+pub(crate) struct ScannedKeyPart {
+    pub(crate) value: ScannedKeyValue,
+    pub(crate) terminator: u8,
+    /// Offset just past the terminator.
+    pub(crate) end: usize,
+}
+
+/// A part is either exactly a span of the input, or — when it contained an
+/// escaped NUL — a buffer that had to be unescaped. Keeping the span case
+/// separate is what lets an owned, a borrowed and a shared decoder share one
+/// scanner without any of them losing zero-copy.
+pub(crate) enum ScannedKeyValue {
+    Verbatim(core::ops::Range<usize>),
+    Unescaped(Vec<u8>),
+}
+
+/// Structured so each plane maps it to its own error code and message. The
+/// planes' wordings differ and this module deliberately does not unify them.
+pub(crate) enum KeyPartError {
+    /// Ran out of input before the part's terminating NUL.
+    Truncated,
+    /// The NUL was the last byte, so its escape-or-terminator byte is missing.
+    EscapeTruncated,
+    /// The byte after the NUL is neither `KEY_ESCAPE` nor a valid terminator.
+    UnknownEscape(u8),
+}
+
+/// Scans one escaped key part beginning at `start`.
+///
+/// This is the single implementation of the part grammar. It replaced four
+/// scanners across three planes: an owned byte loop in `hot_state::tracked_head`,
+/// two `Bytes` byte loops in `hot_state::tracked_head::hot`, and two copies of
+/// this `memchr` scan in `tracked_state::codec`. They agreed on accept/reject
+/// but validated the terminator at different layers, which is the kind of drift
+/// that eventually lands in the bytes rather than in a message.
+///
+/// Validation now happens here, in the scanner, for every plane. That is
+/// accept/reject-neutral because every call site already re-validated the
+/// terminator it was handed — what changes is only *where* a couple of
+/// malformed shapes are rejected, and hence which message they carry.
+/// `#[inline]` is load-bearing, not decoration. This replaced byte loops that
+/// were inlined into their callers; measured on `tracked_state_crud`, letting
+/// it stay a real call cost **+5.3%** on `transaction/read_all_rows/10k` (the
+/// `hot_state` scan path) while the escape-free path is otherwise one `memchr`
+/// plus one compare. The unescaping tail is deliberately out of line so only
+/// the fast path is duplicated into each of the five call sites.
+#[inline]
+pub(crate) fn scan_key_part(bytes: &[u8], start: usize) -> Result<ScannedKeyPart, KeyPartError> {
+    let tail = bytes.get(start..).ok_or(KeyPartError::Truncated)?;
+    let relative_zero = memchr::memchr(KEY_PART_FINAL, tail).ok_or(KeyPartError::Truncated)?;
+    let zero = start + relative_zero;
+    let escape = *bytes.get(zero + 1).ok_or(KeyPartError::EscapeTruncated)?;
+    if is_key_part_terminator(escape) {
+        // No escaped NUL: the part is exactly a span of the input, so no
+        // ownership mode has to copy.
+        return Ok(ScannedKeyPart {
+            value: ScannedKeyValue::Verbatim(start..zero),
+            terminator: escape,
+            end: zero + 2,
+        });
+    }
+    if escape != KEY_ESCAPE {
+        return Err(KeyPartError::UnknownEscape(escape));
+    }
+    scan_key_part_escaped(bytes, start, zero)
+}
+
+/// The rare tail: the part contains at least one escaped NUL, so it cannot be a
+/// span of the input and has to be unescaped into an owned buffer.
+#[cold]
+#[inline(never)]
+fn scan_key_part_escaped(
+    bytes: &[u8],
+    start: usize,
+    first_zero: usize,
+) -> Result<ScannedKeyPart, KeyPartError> {
+    let mut out = Vec::with_capacity(first_zero.saturating_sub(start).saturating_add(16));
+    out.extend_from_slice(&bytes[start..first_zero]);
+    out.push(KEY_PART_FINAL);
+    let mut segment_start = first_zero + 2;
+    loop {
+        let tail = bytes.get(segment_start..).ok_or(KeyPartError::Truncated)?;
+        let relative_zero = memchr::memchr(KEY_PART_FINAL, tail).ok_or(KeyPartError::Truncated)?;
+        let zero = segment_start + relative_zero;
+        let escape = *bytes.get(zero + 1).ok_or(KeyPartError::EscapeTruncated)?;
+        out.extend_from_slice(&bytes[segment_start..zero]);
+        if is_key_part_terminator(escape) {
+            return Ok(ScannedKeyPart {
+                value: ScannedKeyValue::Unescaped(out),
+                terminator: escape,
+                end: zero + 2,
+            });
+        }
+        if escape != KEY_ESCAPE {
+            return Err(KeyPartError::UnknownEscape(escape));
+        }
+        out.push(KEY_PART_FINAL);
+        segment_start = zero + 2;
+    }
+}
 
 /// Byte width of a UUID entity-primary-key component.
 pub(crate) const ENTITY_PK_UUID_BYTES: usize = 16;
