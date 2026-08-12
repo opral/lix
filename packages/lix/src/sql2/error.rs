@@ -58,7 +58,7 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
 
     if looks_like_unsupported_dialect(&lower) {
         return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, message)
-            .with_hint("Lix SQL uses DataFusion syntax. Use lix_json_get(...) or lix_json_get_text(...) for JSON access, and placeholders like ?, ? or $1, $2, ...");
+            .with_hint("Lix SQL uses a PostgreSQL-dialect subset. Use lix_json_get(...) or lix_json_get_text(...) for JSON access, and numbered placeholders like $1, $2, ...");
     }
 
     if looks_like_unsupported_runtime_plan(&lower) {
@@ -76,7 +76,7 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         || lower.contains("bind")
     {
         return LixError::new(LixError::CODE_PARSE_ERROR, message)
-            .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...");
+            .with_hint("Use PostgreSQL-style numbered placeholders like $1, $2, ...");
     }
 
     if lower.contains("table not found")

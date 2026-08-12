@@ -1019,7 +1019,7 @@ simulation_test!(
             .expect("draft checkpoint should succeed");
         assert_eq!(
             main.execute(
-                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = ?",
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1",
                 &[Value::Text(checkpoint.commit_id.clone())],
             )
             .await
@@ -1050,7 +1050,7 @@ simulation_test!(
 
         let checkpoints = main
             .execute(
-                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = ?",
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1",
                 &[Value::Text(checkpoint.commit_id.clone())],
             )
             .await

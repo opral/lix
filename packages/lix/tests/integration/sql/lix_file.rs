@@ -1360,7 +1360,7 @@ simulation_test!(
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
             assert_eq!(
                 error.hint(),
-                Some("Use CAST(? AS BYTEA) with a text parameter for file contents."),
+                Some("Use CAST($1 AS BYTEA) with a text parameter for file contents."),
                 "{id}"
             );
         }
@@ -1406,7 +1406,7 @@ simulation_test!(
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         assert_eq!(
             error.hint(),
-            Some("Use CAST(? AS BYTEA) with a text parameter for file contents.")
+            Some("Use CAST($1 AS BYTEA) with a text parameter for file contents.")
         );
 
         let result = session
@@ -1455,7 +1455,7 @@ simulation_test!(
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
             assert_eq!(
                 error.hint(),
-                Some("Use CAST(? AS BYTEA) with a text parameter for file contents."),
+                Some("Use CAST($1 AS BYTEA) with a text parameter for file contents."),
                 "{id}"
             );
         }
@@ -1552,7 +1552,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_accepts_anonymous_path_and_content_parameters,
+    lix_file_insert_accepts_numbered_path_and_content_parameters,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1565,38 +1565,38 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES (?, ?, ?)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text("616e6f6e-796d-8f75-832d-706172616d00".to_string()),
-                    Value::Text("/anonymous-param.bin".to_string()),
-                    Value::Blob(b"anonymous".to_vec().into()),
+                    Value::Text("/numbered-param.bin".to_string()),
+                    Value::Blob(b"numbered".to_vec().into()),
                 ],
             )
             .await
-            .expect("anonymous parameter insert should succeed");
+            .expect("numbered parameter insert should succeed");
         assert_eq!(insert_result.rows_affected(), 1);
 
         let result = session
             .execute(
-                "SELECT path, content FROM lix_file WHERE id = ?",
+                "SELECT path, content FROM lix_file WHERE id = $1",
                 &[Value::Text(
                     "616e6f6e-796d-8f75-832d-706172616d00".to_string(),
                 )],
             )
             .await
-            .expect("anonymous parameter read should succeed");
+            .expect("numbered parameter read should succeed");
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Text("/anonymous-param.bin".to_string()),
-                Value::Blob(b"anonymous".to_vec().into()),
+                Value::Text("/numbered-param.bin".to_string()),
+                Value::Blob(b"numbered".to_vec().into()),
             ]],
         );
     }
 );
 
 simulation_test!(
-    lix_file_anonymous_content_parameter_keeps_strict_blob_validation,
+    lix_file_numbered_content_parameter_keeps_strict_blob_validation,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1609,15 +1609,15 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES (?, ?, ?)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text("616e6f6e-796d-8f75-832d-746578742d00".to_string()),
-                    Value::Text("/anonymous-text-data.bin".to_string()),
+                    Value::Text("/numbered-text-data.bin".to_string()),
                     Value::Text("not binary".to_string()),
                 ],
             )
             .await
-            .expect_err("anonymous non-binary data parameter should be rejected");
+            .expect_err("numbered non-binary data parameter should be rejected");
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
     }
 );

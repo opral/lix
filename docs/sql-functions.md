@@ -4,7 +4,7 @@ description: Built-in scalar SQL functions provided by the Lix engine. Covers JS
 
 # SQL Functions
 
-Lix's DataFusion-backed engine registers a small set of scalar functions for use inside `lix.execute()`. They cover the gaps between standard SQL and Lix's own conventions: parsing JSON parameters, producing IDs and timestamps, and resolving the active branch and its commit id.
+Lix accepts a PostgreSQL-dialect SQL subset executed by its DataFusion-backed engine. It registers a small set of scalar functions for use inside `lix.execute()`. They cover the gaps between PostgreSQL grammar and Lix's own conventions: parsing JSON parameters, producing IDs and timestamps, and resolving the active branch and its commit id.
 
 ## At a glance
 
@@ -111,5 +111,5 @@ For the column types Lix accepts in `CAST` expressions (for example `TEXT` and `
 ## Notes
 
 - Functions are pure scalars; they do not consume rows or take aggregates.
-- Bound parameters can use `?` or `$1`, `$2`, …
+- Bound parameters use PostgreSQL-style `$1`, `$2`, … placeholders.
 - `lix_active_branch_id()`, `lix_active_branch_commit_id()`, `lix_uuid_v7()`, and `lix_timestamp()` reflect the engine's current view at planning/execution time and are stable across the rows of a single statement.

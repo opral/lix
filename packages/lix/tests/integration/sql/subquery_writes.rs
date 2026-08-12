@@ -30,7 +30,7 @@ simulation_test!(subquery_writes_do_not_leak_storage_read_handles, |sim| async m
     for (index, key) in ["sqw-a", "sqw-b", "sqw-c"].into_iter().enumerate() {
         session
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES (?, ?)",
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
                 &[
                     Value::Text(key.to_string()),
                     Value::Text(format!("value-{index}")),
@@ -90,7 +90,7 @@ simulation_test!(subquery_writes_do_not_leak_storage_read_handles, |sim| async m
         let result = session
             .execute(
                 "INSERT INTO lix_file (id, path) \
-                 SELECT ?, ? WHERE EXISTS (SELECT 1 FROM lix_key_value WHERE key = 'sqw-a')",
+                 SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM lix_key_value WHERE key = 'sqw-a')",
                 &[
                     Value::Text(id.to_string()),
                     Value::Text(format!("/subquery-{index}.txt")),

@@ -1,30 +1,12 @@
 use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement};
-use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
-use serde_json::json;
 
 use crate::LixError;
 
 pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError> {
-    let dialect = GenericDialect {};
-    let mut next_index = 1usize;
-    let mut has_anonymous = false;
-    let mut explicit_placeholders = Vec::new();
-
-    let mut tokens = Vec::new();
-    Tokenizer::new(&dialect, sql)
-        .tokenize_with_location_into_buf_with_mapper(&mut tokens, |mut token_span| {
-            if let Token::Placeholder(placeholder) = &token_span.token {
-                if placeholder == "?" {
-                    has_anonymous = true;
-                    token_span.token = Token::Placeholder(format!("${next_index}"));
-                    next_index += 1;
-                } else {
-                    explicit_placeholders.push(placeholder.clone());
-                }
-            }
-            token_span
-        })
+    let dialect = super::dialect::lix_sql_dialect();
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
         .map_err(|error| {
             LixError::new(
                 LixError::CODE_PARSE_ERROR,
@@ -33,18 +15,6 @@ pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError
         })?;
 
     reject_sql_hex_literals(&tokens)?;
-
-    if has_anonymous && !explicit_placeholders.is_empty() {
-        return Err(LixError::new(
-            LixError::CODE_PARSE_ERROR,
-            "SQL mixes anonymous and explicit parameter placeholders",
-        )
-        .with_hint("Use either anonymous placeholders like ?, ? or numbered placeholders like $1, $2, but not both.")
-        .with_details(json!({
-            "operation": "execute",
-            "explicit_placeholders": explicit_placeholders,
-        })));
-    }
 
     let mut statements = DFParserBuilder::new(tokens)
         .with_dialect(&dialect)
@@ -78,7 +48,7 @@ pub(super) fn reject_sql_hex_literals(tokens: &[TokenWithSpan]) -> Result<(), Li
             "SQL hex literals are not supported",
         )
         .with_hint(
-            "Bind binary data directly, or use CAST(? AS BYTEA) with a text parameter for UTF-8 content.",
+            "Bind binary data directly, or use CAST($1 AS BYTEA) with a text parameter for UTF-8 content.",
         ));
     }
 
@@ -89,6 +59,24 @@ pub(super) fn reject_sql_hex_literals(tokens: &[TokenWithSpan]) -> Result<(), Li
 mod tests {
     use super::parse_statement;
     use crate::LixError;
+
+    #[test]
+    fn parses_postgresql_numbered_parameters() {
+        parse_statement("SELECT $1::TEXT, $2")
+            .expect("PostgreSQL parameters and casts should parse");
+    }
+
+    #[test]
+    fn parses_postgresql_values_table_expression() {
+        parse_statement("SELECT value FROM (VALUES ($1)) AS selected(value)")
+            .expect("PostgreSQL VALUES table expression should parse");
+    }
+
+    #[test]
+    fn rejects_anonymous_parameters() {
+        let error = parse_statement("SELECT ?").expect_err("anonymous parameters are unsupported");
+        assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
+    }
 
     #[test]
     fn rejects_hex_literals_before_read_or_write_planning() {

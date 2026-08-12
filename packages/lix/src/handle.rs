@@ -211,13 +211,13 @@ where
         })
     }
 
-    /// Executes one DataFusion SQL statement against this Lix session.
+    /// Executes one PostgreSQL-dialect SQL statement against this Lix session.
     ///
-    /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
-    /// placeholders use `?` or `$1`, `$2`, and so on. SQLite-specific catalog tables
-    /// and transaction statements such as `sqlite_master`, `BEGIN`, and
-    /// `COMMIT` are not part of this contract; use `information_schema` for
-    /// catalog inspection. Lix owns transaction boundaries for each statement.
+    /// Lix supports a PostgreSQL-dialect subset executed by DataFusion.
+    /// Positional placeholders use `$1`, `$2`, and so on. Parsing PostgreSQL
+    /// syntax does not imply support for every PostgreSQL statement or runtime
+    /// feature. Use `information_schema` for catalog inspection. Lix owns
+    /// transaction boundaries for each statement.
     /// While a transaction is active, call `execute()` on the transaction
     /// handle instead.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {

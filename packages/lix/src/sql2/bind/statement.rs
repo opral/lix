@@ -1648,56 +1648,25 @@ fn active_branch_scope(active_branch_id: &str) -> BranchScope {
 
 #[derive(Default)]
 struct ParamBinder {
-    next_implicit_index: usize,
-    mode: Option<ParamMode>,
     params: BTreeMap<usize, BoundParamRef>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ParamMode {
-    Implicit,
-    Numbered,
 }
 
 impl ParamBinder {
     fn bind(&mut self, name: &str) -> Result<BoundParamRef, LixError> {
-        let index = if name == "?" {
-            self.require_mode(ParamMode::Implicit, name)?;
-            self.next_implicit_index += 1;
-            self.next_implicit_index
-        } else {
-            self.require_mode(ParamMode::Numbered, name)?;
-            name.strip_prefix('$')
-                .and_then(|raw| raw.parse::<usize>().ok())
-                .filter(|index| *index > 0)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_PARSE_ERROR,
-                        format!("unsupported SQL parameter placeholder '{name}'"),
-                    )
-                    .with_hint(
-                        "Use placeholders like ?, ? or numbered placeholders like $1, $2, ...",
-                    )
-                })?
-        };
+        let index = name
+            .strip_prefix('$')
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|index| *index > 0)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_PARSE_ERROR,
+                    format!("unsupported SQL parameter placeholder '{name}'"),
+                )
+                .with_hint("Use PostgreSQL-style numbered placeholders like $1, $2, ...")
+            })?;
         let param = BoundParamRef { index };
         self.params.entry(index).or_insert(param);
         Ok(param)
-    }
-
-    fn require_mode(&mut self, mode: ParamMode, name: &str) -> Result<(), LixError> {
-        match self.mode {
-            Some(existing) if existing != mode => Err(LixError::new(
-                LixError::CODE_PARSE_ERROR,
-                format!("cannot mix SQL parameter placeholder styles near '{name}'"),
-            )
-            .with_hint("Use either positional ? placeholders or numbered $1 placeholders.")),
-            Some(_) => Ok(()),
-            None => {
-                self.mode = Some(mode);
-                Ok(())
-            }
-        }
     }
 
     fn into_map(self) -> BoundParamMap {
@@ -2403,18 +2372,17 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_mixed_placeholder_styles() {
+    fn bind_statement_rejects_anonymous_placeholders() {
         let mut params = ParamBinder::default();
-        params.bind("?").expect("implicit placeholder should bind");
         let error = params
-            .bind("$1")
-            .expect_err("mixed placeholder styles should be rejected");
+            .bind("?")
+            .expect_err("anonymous placeholders are unsupported");
 
         assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
         assert!(
             error
                 .message
-                .contains("cannot mix SQL parameter placeholder styles")
+                .contains("unsupported SQL parameter placeholder")
         );
     }
 
