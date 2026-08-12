@@ -33,6 +33,12 @@ where
             overwrite_and_delete_final_state_survives_reopen(factory),
         )
         .await;
+    report
+        .run(
+            "persistence::await_durable_commit_is_accepted_and_survives_reopen",
+            await_durable_commit_is_accepted_and_survives_reopen(factory),
+        )
+        .await;
 }
 
 async fn committed_data_survives_reopen<F>(factory: &F) -> ConformanceResult
@@ -76,6 +82,58 @@ where
         ],
     )
     .await
+}
+
+/// An adapter must accept `WriteOptions::await_durable` and apply the write
+/// set unchanged under it.
+///
+/// # Read the name literally
+///
+/// This proves **acceptance and round-trip, not durability.** A durable
+/// acknowledgement is invisible from inside the process — on RocksDB it is an
+/// `fdatasync` on the WAL, and no in-process observation distinguishes a synced
+/// commit from an unsynced one. An adapter that ignores the flag entirely
+/// passes this case, and for four rounds one did.
+///
+/// It is here for the failure it *can* catch cheaply: an adapter that rejects
+/// the flag, or that takes a different and buggy code path under it. Verifying
+/// that the sync actually happens requires an external syscall census, and
+/// verifying that the store survives losing power requires block-level fault
+/// injection; see `WriteOptions::await_durable`. **Do not extend this case to
+/// claim more than its name says** — a test that looks like it checks
+/// durability while checking acceptance is worse than no test.
+async fn await_durable_commit_is_accepted_and_survives_reopen<F>(factory: &F) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let fixture = factory.create_fixture();
+    let test_space = space(71);
+    let durable = key("durable");
+
+    {
+        let storage = fixture.open().await;
+        let mut write = storage
+            .begin_write(WriteOptions {
+                await_durable: true,
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(|error| format!("begin_write with await_durable failed: {error}"))?;
+        write
+            .put_many(
+                TEST_SPACE,
+                put_batch([full_put(durable.clone(), "durable-value")]),
+            )
+            .await
+            .map_err(|error| format!("put_many under await_durable failed: {error}"))?;
+        write
+            .commit()
+            .await
+            .map_err(|error| format!("await_durable commit failed: {error}"))?;
+    }
+
+    let reopened = fixture.open().await;
+    assert_full_values(&reopened, test_space, &[(durable, Some("durable-value"))]).await
 }
 
 async fn rolled_back_data_does_not_survive_reopen<F>(factory: &F) -> ConformanceResult

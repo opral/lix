@@ -573,6 +573,71 @@ pub struct WriteOptions {
     pub idempotency_key: Option<Bytes>,
     /// Do not acknowledge the commit until the backend has crossed its
     /// durable persistence boundary.
+    ///
+    /// # Where the boundary sits
+    ///
+    /// **lix guarantees atomicity. The adapter guarantees durability.**
+    ///
+    /// A publication — blob chunks, commit records, derived views and the
+    /// branch ref move — is lowered into one write set and committed exactly
+    /// once, so no reader observes it in stages. That is lix's property and it
+    /// holds on every backend. What "committed" means *on the physical device*
+    /// is the adapter's decision, and this flag is the whole of the engine's
+    /// influence over it. lix deliberately implements no durability policy on
+    /// top of a backend: there is no checkpoint-boundary flush, and no flush
+    /// API. If you need a stronger acknowledgement than your adapter gives,
+    /// that is a question for the adapter, not for lix.
+    ///
+    /// # What each shipping adapter actually does
+    ///
+    /// Measured behaviour, not declared intent. Sources are named so the
+    /// claims can be re-run rather than trusted.
+    ///
+    /// | adapter | flag clear | flag set |
+    /// |---|---|---|
+    /// | **RocksDB** | the batch is applied into the OS page cache before ack: a process crash cannot lose it, a power loss can | the WAL is fsynced before ack |
+    /// | **SlateDB** | `commit()` acks once the write set is queued in-process: a SIGKILL discards it | waits for the WAL upload |
+    /// | **IndexedDB** | the browser's normal transaction durability | forwarded as `strict_durability` |
+    ///
+    /// RocksDB syncs **one WAL fsync per commit that raises the flag** —
+    /// measured by strace as exactly `2.0` per single-part resumable upload,
+    /// which is two such commits (the part commit and the finalizing
+    /// publication), against a slope of `0.0` before the adapter honoured it.
+    /// Commits that leave the flag clear produce a byte-identical syscall
+    /// census, so the cost is confined to callers that ask for it.
+    ///
+    /// SlateDB lost **846 of 1,008** acknowledged writes to SIGKILL with the
+    /// flag clear, and **0 of 1,512** with it set. Across both adapters the
+    /// atomicity result is 6,789 SIGKILL trials with zero torn write sets.
+    ///
+    /// # The asymmetry, which is the opposite of what you would guess
+    ///
+    /// Until recently RocksDB **ignored** this flag and SlateDB **honoured**
+    /// it — and RocksDB was nevertheless the safer of the two under process
+    /// death, losing nothing where SlateDB lost five acknowledged writes in
+    /// six.
+    ///
+    /// That has nothing to do with the flag. It follows from where each
+    /// adapter's acknowledgement sits: RocksDB's `WriteBatch` is already inside
+    /// the kernel when `commit()` returns, so only a power loss can take it
+    /// back, while SlateDB's is still in the dying process's own heap, so a
+    /// SIGKILL is enough. **"Honours `await_durable`" is not a ranking of
+    /// backends,** and a non-durable acknowledgement does not fail the same way
+    /// everywhere: on RocksDB it survives a crashing process, on SlateDB it
+    /// does not. Read the table, not the flag.
+    ///
+    /// # What is not proven
+    ///
+    /// On RocksDB this flag is verified by observing the `fdatasync` syscall,
+    /// because the effect is invisible from inside the process — no in-process
+    /// test can distinguish a synced commit from an unsynced one. **That is a
+    /// statement about a syscall, not about a recovered store.** Nothing here
+    /// establishes that the store survives a power cut *between* two syncs;
+    /// proving that needs block-level fault injection (`dm-log-writes`, which
+    /// replays the write log to each flush boundary and checks the store at
+    /// every one), and no such harness exists. Until it does, do not describe
+    /// any backend as "durable" without saying which of these two things is
+    /// meant.
     pub await_durable: bool,
     /// Conditions evaluated atomically against the state immediately before
     /// this write becomes visible.
