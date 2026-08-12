@@ -4408,10 +4408,38 @@ where
         single_partition_from_bounds(&first.first_key, &last.last_key)?
     };
     if segment_row_counts.len() == 1 {
-        let (_, inline_segment) = first_segment
+        let (bounds, encoded) = first_segment
             .take()
-            .expect("one ordered segment remains inline in its manifest");
-        manifest.inline_segment = inline_segment;
+            .expect("one ordered segment remains available for its manifest");
+        // Inlining a lone segment into the manifest saves a small commit one
+        // storage row and one point read, and costs nothing while no reader
+        // touches the payload — a small commit leaves its rows on the hot
+        // plane, which is where current-value reads find them.
+        //
+        // A segment that fills to `COMMIT_DELTA_SEGMENT_MAX_ROWS` is the one
+        // case where that stops being true. Filling a whole segment is also
+        // what takes the commit over the packing threshold, so its rows leave
+        // the hot plane and every current-value read has to fetch the manifest
+        // and decode the entire inlined segment to reach one row.
+        //
+        // Measured (rocksdb, 10 240 rows, 2 000 point reads, ryzen-9950x-II):
+        // a 512-row commit read at 887 us against 140 us at 511 rows and
+        // 314 us at 513 — 6.3x — because 512 is the only width that both packs
+        // and produces exactly one segment. Decode dominates that cost
+        // (`decode_commit_delta_with_payloads` 41%, zstd 23%, manifest fetch
+        // under 2.5%), so the fix is to stop inlining a full segment rather
+        // than to make the fetch cheaper.
+        if usize::from(segment_row_counts[0]) < COMMIT_DELTA_SEGMENT_MAX_ROWS {
+            manifest.inline_segment = encoded;
+        } else {
+            manifest.segments.push(bounds);
+            writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, 1, 0);
+            writes.put(
+                TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+                key(commit_delta_segment_key(commit_id, 0)?),
+                value(encoded),
+            );
+        }
     }
     let dense_addresses = segment_row_counts
         .iter()

@@ -13,13 +13,20 @@
 //! Modes:
 //!
 //! ```text
-//! write_amplification seed   <dir> <rows>
+//! write_amplification seed   <dir> <rows> [seed_width]
 //! write_amplification update <dir> <updates> <width> <distinct>
+//! write_amplification read   <dir> <reads> <distinct>
 //! write_amplification census <dir>
 //! ```
 //!
 //! `seed` inserts `rows` tracked rows through the real SQL commit path in
-//! batches of 1000 (one commit each). `update` applies `updates` single-row
+//! commits of `seed_width` rows (default 1000). Varying `seed_width` while
+//! holding `rows` fixed changes how wide the commit that *wrote* a row was,
+//! which is what `read` exists to probe: a current-value read locates a row
+//! through its owning commit's packed delta, so if read cost tracks
+//! `seed_width` the current-value path is paying for history it does not need.
+//!
+//! `update` applies `updates` single-row
 //! `UPDATE`s committed in groups of `width`, cycling over `distinct` distinct
 //! rows, so repeated edits to one row can be told apart from edits spread over
 //! many. `census` walks every registered space and prints per-space rows, key
@@ -67,6 +74,7 @@ impl BenchStorage for RocksDB {
 
 const SEED_SQL: &str = "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
 const UPDATE_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+const READ_SQL: &str = "SELECT value FROM json_pointer WHERE path = $1";
 const SEED_COMMIT_ROWS: usize = 1_000;
 const MIN_RUN: usize = 6;
 
@@ -89,10 +97,13 @@ async fn main() {
     match mode.as_str() {
         "seed" => {
             let rows = next("rows");
+            let seed_width = args
+                .next()
+                .map_or(SEED_COMMIT_ROWS, |v| v.parse().expect("seed_width"));
             if rocksdb {
-                seed(RocksDB::open(&dir).expect("open RocksDB"), rows).await;
+                seed(RocksDB::open(&dir).expect("open RocksDB"), rows, seed_width).await;
             } else {
-                seed(SlateDB::open(&dir).expect("open SlateDB"), rows).await;
+                seed(SlateDB::open(&dir).expect("open SlateDB"), rows, seed_width).await;
             }
         }
         "update" => {
@@ -117,6 +128,15 @@ async fn main() {
                 .await;
             }
         }
+        "read" => {
+            let reads = next("reads");
+            let distinct = next("distinct");
+            if rocksdb {
+                read_rows(RocksDB::open(&dir).expect("open RocksDB"), reads, distinct).await;
+            } else {
+                read_rows(SlateDB::open(&dir).expect("open SlateDB"), reads, distinct).await;
+            }
+        }
         "census" => {
             if rocksdb {
                 census(RocksDB::open(&dir).expect("open RocksDB")).await;
@@ -128,7 +148,7 @@ async fn main() {
     }
 }
 
-async fn seed<S: BenchStorage>(storage: S, rows: usize) {
+async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
     Engine::initialize(storage.clone())
         .await
         .expect("initialize repository");
@@ -164,7 +184,7 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize) {
 
     let mut inserted = 0_usize;
     while inserted < rows {
-        let chunk = SEED_COMMIT_ROWS.min(rows - inserted);
+        let chunk = seed_width.max(1).min(rows - inserted);
         let parameter_rows = (inserted..inserted + chunk).map(|index| {
             vec![
                 Value::Text(format!("/fixture/path/{index:08}")),
@@ -191,7 +211,7 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize) {
     drop(session);
     drop(engine);
     storage.settle().await;
-    println!("SEEDED\trows={rows}");
+    println!("SEEDED\trows={rows}\tseed_width={seed_width}");
 }
 
 /// Applies `updates` row updates in `updates / width` commits.
@@ -239,6 +259,52 @@ async fn update<S: BenchStorage>(storage: S, updates: usize, width: usize, disti
     println!(
         "UPDATED\tupdates={updates}\twidth={width}\tdistinct={distinct}\tcommits={}",
         updates / width
+    );
+}
+
+/// Times `reads` current-value point reads over `distinct` rows.
+///
+/// This is the read half of a single-row `UPDATE` in isolation: no transaction,
+/// no commit, just "find the current value of this row".
+async fn read_rows<S: BenchStorage>(storage: S, reads: usize, distinct: usize) {
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("open engine over initialized repository");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("open workspace session");
+
+    // Warm the plan cache so the measurement is the read, not planning.
+    for index in 0..distinct.min(16) {
+        session
+            .execute(
+                READ_SQL,
+                &[Value::Text(format!("/fixture/path/{index:08}"))],
+            )
+            .await
+            .expect("warm read");
+    }
+
+    let start = std::time::Instant::now();
+    let mut rows_seen = 0_u64;
+    for index in 0..reads {
+        let target = index % distinct;
+        let result = session
+            .execute(
+                READ_SQL,
+                &[Value::Text(format!("/fixture/path/{target:08}"))],
+            )
+            .await
+            .expect("point read");
+        rows_seen += result.len() as u64;
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(rows_seen as usize, reads, "every point read must find its row");
+    println!(
+        "READ\treads={reads}\tdistinct={distinct}\ttotal_us={}\tus_per_read={:.2}",
+        elapsed.as_micros(),
+        elapsed.as_micros() as f64 / reads as f64,
     );
 }
 
