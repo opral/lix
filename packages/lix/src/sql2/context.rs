@@ -17,9 +17,9 @@ use crate::filesystem::{
 };
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
-use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateExactBatch,
+use crate::hot_state::{
+    HotStateExactBatchRequest, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
+    MaterializedHotStateExactBatch,
 };
 use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
@@ -116,7 +116,7 @@ pub(crate) trait SqlExecutionContext: Sync {
     fn active_account_id(&self) -> &str {
         crate::ANONYMOUS_ACCOUNT_ID
     }
-    fn live_state(&self) -> Arc<dyn LiveStateReader>;
+    fn hot_state(&self) -> Arc<dyn HotStateReader>;
     /// Supplies the committed tracked-head entity snapshot capability when the
     /// read context can prove it is scoped to one immutable storage snapshot.
     /// Generic and transaction contexts intentionally retain the default
@@ -125,7 +125,7 @@ pub(crate) trait SqlExecutionContext: Sync {
         None
     }
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
-        Arc::new(UncachedFilesystemPathIndexReader::new(self.live_state()))
+        Arc::new(UncachedFilesystemPathIndexReader::new(self.hot_state()))
     }
     fn functions(&self) -> FunctionProviderHandle;
     fn history_query_source(
@@ -195,22 +195,22 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 
     async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
 
-    async fn scan_live_state_batch(
+    async fn scan_hot_state_batch(
         &mut self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError>;
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError>;
 
-    async fn load_exact_live_state_batch(
+    async fn load_exact_hot_state_batch(
         &mut self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError>;
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError>;
 
     async fn filesystem_path_index(
         &mut self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         let rows = self
-            .scan_live_state_batch(&request.live_state_request())
+            .scan_hot_state_batch(&request.hot_state_request())
             .await?;
         Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?))
     }
@@ -396,10 +396,10 @@ impl SqlWriteContext {
         unsafe { self.ptr.0.as_ref().session_file_views() }
     }
 
-    pub(crate) async fn scan_live_state_batch(
+    pub(crate) async fn scan_hot_state_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
             self.ptr
@@ -407,15 +407,15 @@ impl SqlWriteContext {
                 .as_ptr()
                 .as_mut()
                 .unwrap()
-                .scan_live_state_batch(request)
+                .scan_hot_state_batch(request)
                 .await
         }
     }
 
-    pub(crate) async fn load_exact_live_state_batch(
+    pub(crate) async fn load_exact_hot_state_batch(
         &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
             self.ptr
@@ -423,7 +423,7 @@ impl SqlWriteContext {
                 .as_ptr()
                 .as_mut()
                 .unwrap()
-                .load_exact_live_state_batch(request)
+                .load_exact_hot_state_batch(request)
                 .await
         }
     }
@@ -550,35 +550,35 @@ impl WriteAccess {
     }
 }
 
-pub(crate) struct WriteContextLiveStateReader {
+pub(crate) struct WriteContextHotStateReader {
     ctx: SqlWriteContext,
 }
 
-impl WriteContextLiveStateReader {
+impl WriteContextHotStateReader {
     pub(crate) fn new(ctx: SqlWriteContext) -> Self {
         Self { ctx }
     }
 }
 
 #[async_trait]
-impl LiveStateReader for WriteContextLiveStateReader {
+impl HotStateReader for WriteContextHotStateReader {
     async fn scan_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.ctx.scan_live_state_batch(request).await
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
+        self.ctx.scan_hot_state_batch(request).await
     }
 
     async fn load_exact_batch(
         &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        self.ctx.load_exact_live_state_batch(request).await
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
+        self.ctx.load_exact_hot_state_batch(request).await
     }
 }
 
 #[async_trait]
-impl FilesystemPathIndexReader for WriteContextLiveStateReader {
+impl FilesystemPathIndexReader for WriteContextHotStateReader {
     async fn path_index(
         &self,
         request: &FilesystemPathIndexRequest,

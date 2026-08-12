@@ -309,7 +309,7 @@ where
                 branch::register_lix_branch_read_provider(
                     session,
                     &surface.name,
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     Arc::clone(&branch_ref),
                 )
                 .await?;
@@ -397,7 +397,7 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
@@ -411,7 +411,7 @@ where
                 file::register_lix_file_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
@@ -437,7 +437,7 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -448,7 +448,7 @@ where
                 directory::register_lix_directory_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.live_state(),
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -480,7 +480,7 @@ where
     entity::register_entity_providers(
         session,
         ctx.active_branch_id(),
-        ctx.live_state(),
+        ctx.hot_state(),
         ctx.entity_snapshot_reader(),
         Arc::clone(&branch_ref),
         needs_entity_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
@@ -672,7 +672,7 @@ mod tests {
         ReachableCommitGraphNode,
     };
     use crate::json_store::JsonStoreContext;
-    use crate::live_state::{LiveStateReader, LiveStateScanRequest};
+    use crate::hot_state::{HotStateReader, HotStateScanRequest};
     use crate::sql2::HistoryQuerySource;
     use crate::sql2::catalog::{
         PublicCatalog, PublicSurfaceKind, derive_entity_surface_spec_from_schema,
@@ -1010,7 +1010,7 @@ mod tests {
         entity::register_entity_providers(
             &session,
             "01920000-0000-7000-8000-0000000000a1",
-            Arc::new(EmptyLiveStateReader),
+            Arc::new(EmptyHotStateReader),
             None,
             Arc::new(EmptyBranchRefReader),
             Some(Arc::new(tokio::sync::Mutex::new(Box::new(
@@ -1126,21 +1126,21 @@ mod tests {
         }
     }
 
-    struct EmptyLiveStateReader;
+    struct EmptyHotStateReader;
 
     #[async_trait]
-    impl LiveStateReader for EmptyLiveStateReader {
+    impl HotStateReader for EmptyHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            _request: &HotStateScanRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
             Ok(Vec::new().into())
         }
     }

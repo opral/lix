@@ -12,7 +12,7 @@ use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlC
 use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::{CommitGraphContext, CommitGraphEdge, CommitGraphNode, commit_edges};
 use crate::entity_pk::{EntityPk, EntityPkComponent};
-use crate::live_state::{LiveStateRowFilter, LiveStateScanRequest, MaterializedLiveStateRow};
+use crate::hot_state::{HotStateRowFilter, HotStateScanRequest, MaterializedHotStateRow};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
@@ -108,7 +108,7 @@ struct DerivedScanScope<'a> {
 }
 
 #[async_trait]
-trait DerivedLiveStateProvider<S>: Sync
+trait DerivedHotStateProvider<S>: Sync
 where
     S: StorageAdapterRead + ?Sized,
 {
@@ -118,11 +118,11 @@ where
         &self,
         reads: &mut DerivedReadContext<'_, S>,
         scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError>;
 }
 
 #[async_trait]
-trait DerivedEntityPointProvider<S>: DerivedLiveStateProvider<S>
+trait DerivedEntityPointProvider<S>: DerivedHotStateProvider<S>
 where
     S: StorageAdapterRead + ?Sized,
 {
@@ -131,13 +131,13 @@ where
         reads: &mut DerivedReadContext<'_, S>,
         entity_pks: &[EntityPk],
         scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError>;
 }
 
 struct CommitProvider;
 
 #[async_trait]
-impl<S> DerivedLiveStateProvider<S> for CommitProvider
+impl<S> DerivedHotStateProvider<S> for CommitProvider
 where
     S: StorageAdapterRead + ?Sized,
 {
@@ -149,7 +149,7 @@ where
         &self,
         reads: &mut DerivedReadContext<'_, S>,
         scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
         let commits = reads.all_nodes().await?;
         let mut rows = Vec::with_capacity(commits.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
@@ -176,7 +176,7 @@ where
         reads: &mut DerivedReadContext<'_, S>,
         entity_pks: &[EntityPk],
         scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
         let commit_ids = entity_pks
             .iter()
             .filter_map(commit_id_from_entity_pk)
@@ -213,7 +213,7 @@ where
 struct CommitEdgeProvider;
 
 #[async_trait]
-impl<S> DerivedLiveStateProvider<S> for CommitEdgeProvider
+impl<S> DerivedHotStateProvider<S> for CommitEdgeProvider
 where
     S: StorageAdapterRead + ?Sized,
 {
@@ -225,7 +225,7 @@ where
         &self,
         reads: &mut DerivedReadContext<'_, S>,
         scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
         let commits = reads.all_nodes().await?;
         let edges = commit_edges(commits);
         let mut rows = Vec::with_capacity(edges.len() * scope.branch_ids.len());
@@ -248,7 +248,7 @@ where
         reads: &mut DerivedReadContext<'_, S>,
         entity_pks: &[EntityPk],
         scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
         let edge_ids = entity_pks
             .iter()
             .filter_map(commit_edge_id_from_entity_pk)
@@ -294,7 +294,7 @@ where
 struct BranchRefProvider;
 
 #[async_trait]
-impl<S> DerivedLiveStateProvider<S> for BranchRefProvider
+impl<S> DerivedHotStateProvider<S> for BranchRefProvider
 where
     S: StorageAdapterRead + ?Sized,
 {
@@ -306,7 +306,7 @@ where
         &self,
         reads: &mut DerivedReadContext<'_, S>,
         scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
         if !scope
             .storage_branch_ids
             .iter()
@@ -334,7 +334,7 @@ where
         reads: &mut DerivedReadContext<'_, S>,
         entity_pks: &[EntityPk],
         scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
         if !scope
             .storage_branch_ids
             .iter()
@@ -367,15 +367,15 @@ where
 pub(super) async fn scan_derived_rows<S>(
     store: &S,
     commit_graph: &CommitGraphContext,
-    request: &LiveStateScanRequest,
+    request: &HotStateScanRequest,
     projection_branch_ids: &[String],
     storage_branch_ids: &[String],
     retention: Option<bool>,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError>
+) -> Result<Vec<MaterializedHotStateRow>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    if matches!(request.filter.rows, LiveStateRowFilter::None) {
+    if matches!(request.filter.rows, HotStateRowFilter::None) {
         return Ok(Vec::new());
     }
     if !request.filter.branch_ids.is_empty() && projection_branch_ids.is_empty() {
@@ -402,9 +402,9 @@ where
 async fn append_registered_provider_rows<S>(
     provider: RegisteredDerivedProvider,
     reads: &mut DerivedReadContext<'_, S>,
-    request: &LiveStateScanRequest,
+    request: &HotStateScanRequest,
     scope: &DerivedScanScope<'_>,
-    rows: &mut Vec<MaterializedLiveStateRow>,
+    rows: &mut Vec<MaterializedHotStateRow>,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + ?Sized,
@@ -428,9 +428,9 @@ where
 async fn append_point_provider_rows<S, P>(
     provider: &P,
     reads: &mut DerivedReadContext<'_, S>,
-    request: &LiveStateScanRequest,
+    request: &HotStateScanRequest,
     scope: &DerivedScanScope<'_>,
-    rows: &mut Vec<MaterializedLiveStateRow>,
+    rows: &mut Vec<MaterializedHotStateRow>,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + ?Sized,
@@ -468,7 +468,7 @@ where
 }
 
 fn provider_filter_allows(
-    request: &LiveStateScanRequest,
+    request: &HotStateScanRequest,
     scope: &DerivedScanScope<'_>,
     descriptor: DerivedProviderDescriptor,
 ) -> bool {
@@ -479,7 +479,7 @@ fn provider_filter_allows(
         && file_filter_allows(&request.filter.file_ids, descriptor.file_identity)
 }
 
-pub(super) fn request_may_include_derived(request: &LiveStateScanRequest) -> bool {
+pub(super) fn request_may_include_derived(request: &HotStateScanRequest) -> bool {
     request.filter.schema_keys.is_empty()
         || request
             .filter
@@ -488,7 +488,7 @@ pub(super) fn request_may_include_derived(request: &LiveStateScanRequest) -> boo
             .any(|schema_key| is_derived_schema(schema_key))
 }
 
-pub(super) fn is_derived_only_request(request: &LiveStateScanRequest) -> bool {
+pub(super) fn is_derived_only_request(request: &HotStateScanRequest) -> bool {
     !request.filter.schema_keys.is_empty()
         && request
             .filter
@@ -570,7 +570,7 @@ fn commit_row(
     change_id: ChangeId,
     created_at: crate::common::LixTimestamp,
     branch_id: &str,
-) -> Result<MaterializedLiveStateRow, LixError> {
+) -> Result<MaterializedHotStateRow, LixError> {
     let snapshot_content =
         serde_json::to_string(&serde_json::json!({ "id": commit_id })).map_err(|error| {
             LixError::new(
@@ -578,7 +578,7 @@ fn commit_row(
                 format!("failed to encode derived lix_commit snapshot: {error}"),
             )
         })?;
-    Ok(MaterializedLiveStateRow {
+    Ok(MaterializedHotStateRow {
         entity_pk: EntityPk::uuid_from_bytes(*commit_id.as_uuid().as_bytes()),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
@@ -598,7 +598,7 @@ fn commit_row(
 fn commit_edge_row(
     edge: &CommitGraphEdge,
     branch_id: &str,
-) -> Result<MaterializedLiveStateRow, LixError> {
+) -> Result<MaterializedHotStateRow, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "parent_id": edge.parent_commit_id,
         "child_id": edge.child_commit_id,
@@ -610,7 +610,7 @@ fn commit_edge_row(
             format!("failed to encode derived lix_commit_edge snapshot: {error}"),
         )
     })?;
-    Ok(MaterializedLiveStateRow {
+    Ok(MaterializedHotStateRow {
         entity_pk: EntityPk::from_components(smallvec::smallvec![
             EntityPkComponent::Uuid(*edge.child_commit_id.as_uuid().as_bytes()),
             EntityPkComponent::Integer(i64::from(edge.parent_order)),
@@ -634,7 +634,7 @@ fn commit_edge_row(
 fn branch_ref_row(
     branch_id: &str,
     control: BranchHeadControl,
-) -> Result<MaterializedLiveStateRow, LixError> {
+) -> Result<MaterializedHotStateRow, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "id": branch_id,
         "commit_id": control.head_commit_id.to_string(),
@@ -645,7 +645,7 @@ fn branch_ref_row(
             format!("failed to encode direct branch-ref snapshot: {error}"),
         )
     })?;
-    Ok(MaterializedLiveStateRow {
+    Ok(MaterializedHotStateRow {
         entity_pk: EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,

@@ -27,10 +27,10 @@ use crate::common::{json_pointer_get, validate_row_metadata};
 use crate::domain::DomainFileScope;
 use crate::domain::{Domain, DomainRowIdentity, committed_row_ref_is_exact_branch_scoped};
 use crate::entity_pk::{EntityPk, EntityPkError, canonical_json_text};
-use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
-    LiveStateReadDomain, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateRowRef,
+use crate::hot_state::{
+    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
+    HotStateReadDomain, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
+    MaterializedHotStateRowRef,
 };
 use crate::plugin::PLUGIN_OWNER_KEY;
 #[cfg(test)]
@@ -64,7 +64,7 @@ const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 pub(crate) struct TransactionValidationInput<'a> {
     staged_writes: &'a PreparedWriteValidationSet<'a>,
     schema_catalog: &'a CatalogSnapshot,
-    live_state: &'a dyn LiveStateReader,
+    hot_state: &'a dyn HotStateReader,
     staged_commit_ids: BTreeSet<CommitId>,
     trust_filesystem_planner: bool,
 }
@@ -73,12 +73,12 @@ impl<'a> TransactionValidationInput<'a> {
     pub(crate) fn new(
         staged_writes: &'a PreparedWriteValidationSet<'a>,
         schema_catalog: &'a CatalogSnapshot,
-        live_state: &'a dyn LiveStateReader,
+        hot_state: &'a dyn HotStateReader,
     ) -> Self {
         Self {
             staged_writes,
             schema_catalog,
-            live_state,
+            hot_state,
             staged_commit_ids: BTreeSet::new(),
             trust_filesystem_planner: false,
         }
@@ -101,14 +101,14 @@ impl<'a> TransactionValidationInput<'a> {
     fn from_visible_schemas_for_tests(
         staged_writes: &'a PreparedWriteSet,
         visible_schemas: &'a [JsonValue],
-        live_state: &'a dyn LiveStateReader,
+        hot_state: &'a dyn HotStateReader,
     ) -> Self {
         let catalog = Box::leak(Box::new(
             CatalogSnapshot::from_visible_schemas(visible_schemas)
                 .expect("test schema catalog should build"),
         ));
         let validation_set = Box::leak(Box::new(staged_writes.validation_set_for_tests()));
-        Self::new(validation_set, catalog, live_state)
+        Self::new(validation_set, catalog, hot_state)
     }
 }
 
@@ -117,15 +117,15 @@ impl<'a> TransactionValidationInput<'a> {
 /// The ordinary case remains dense and therefore retains only the batch
 /// owner. A defensive post-scan filter allocates one compact ordinal column
 /// after the first rejected row; it never rebuilds rows or their payloads.
-struct CommittedLiveStateRows {
-    batch: MaterializedLiveStateBatch,
+struct CommittedHotStateRows {
+    batch: MaterializedHotStateBatch,
     selected: Option<Vec<u32>>,
 }
 
-impl CommittedLiveStateRows {
+impl CommittedHotStateRows {
     fn select(
-        batch: MaterializedLiveStateBatch,
-        mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
+        batch: MaterializedHotStateBatch,
+        mut keep: impl FnMut(MaterializedHotStateRowRef<'_>) -> bool,
     ) -> Result<Self, LixError> {
         u32::try_from(batch.len()).map_err(|_| {
             LixError::new(
@@ -167,14 +167,14 @@ impl CommittedLiveStateRows {
             .map_or_else(|| self.batch.len(), Vec::len)
     }
 
-    fn iter(&self) -> CommittedLiveStateRowsIter<'_> {
-        CommittedLiveStateRowsIter {
+    fn iter(&self) -> CommittedHotStateRowsIter<'_> {
+        CommittedHotStateRowsIter {
             rows: self,
             next: 0,
         }
     }
 
-    fn row(&self, index: usize) -> MaterializedLiveStateRowRef<'_> {
+    fn row(&self, index: usize) -> MaterializedHotStateRowRef<'_> {
         let batch_index = self
             .selected
             .as_ref()
@@ -182,7 +182,7 @@ impl CommittedLiveStateRows {
         self.batch.row(batch_index)
     }
 
-    fn first(&self) -> Option<MaterializedLiveStateRowRef<'_>> {
+    fn first(&self) -> Option<MaterializedHotStateRowRef<'_>> {
         self.iter().next()
     }
 
@@ -192,13 +192,13 @@ impl CommittedLiveStateRows {
     }
 }
 
-struct CommittedLiveStateRowsIter<'a> {
-    rows: &'a CommittedLiveStateRows,
+struct CommittedHotStateRowsIter<'a> {
+    rows: &'a CommittedHotStateRows,
     next: usize,
 }
 
-impl<'a> Iterator for CommittedLiveStateRowsIter<'a> {
-    type Item = MaterializedLiveStateRowRef<'a>;
+impl<'a> Iterator for CommittedHotStateRowsIter<'a> {
+    type Item = MaterializedHotStateRowRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next == self.rows.len() {
@@ -219,17 +219,17 @@ impl<'a> Iterator for CommittedLiveStateRowsIter<'a> {
     }
 }
 
-impl ExactSizeIterator for CommittedLiveStateRowsIter<'_> {}
+impl ExactSizeIterator for CommittedHotStateRowsIter<'_> {}
 
 async fn scan_committed_constraint_rows(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     domain: &Domain,
     schema_keys: Vec<String>,
     entity_pks: Vec<EntityPk>,
     include_tombstones: bool,
-) -> Result<CommittedLiveStateRows, LixError> {
-    let request = LiveStateScanRequest {
-        filter: LiveStateFilter {
+) -> Result<CommittedHotStateRows, LixError> {
+    let request = HotStateScanRequest {
+        filter: HotStateFilter {
             schema_keys: schema_keys.clone(),
             entity_pks: entity_pks.clone(),
             branch_ids: vec![domain.branch_id().to_string()],
@@ -240,17 +240,17 @@ async fn scan_committed_constraint_rows(
         },
         ..Default::default()
     };
-    let batch = live_state
+    let batch = hot_state
         .scan_domain_batch(
             &request,
             if domain.untracked() {
-                LiveStateReadDomain::Untracked
+                HotStateReadDomain::Untracked
             } else {
-                LiveStateReadDomain::Tracked
+                HotStateReadDomain::Tracked
             },
         )
         .await?;
-    CommittedLiveStateRows::select(batch, |row| {
+    CommittedHotStateRows::select(batch, |row| {
         domain.contains_ref(row)
             && (schema_keys.is_empty() || schema_keys.iter().any(|key| key == row.schema_key()))
             && (entity_pks.is_empty() || entity_pks.contains(row.entity_pk()))
@@ -265,13 +265,13 @@ async fn scan_committed_constraint_rows(
 /// ordinary scan, so this is an access-path choice and never a semantic one.
 /// The caller re-checks every returned row's actual value.
 async fn scan_committed_constraint_rows_by_declared_column(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     domain: &Domain,
     schema_key: &str,
-    declared_column_eq: crate::live_state::DeclaredColumnEq,
-) -> Result<CommittedLiveStateRows, LixError> {
-    let request = LiveStateScanRequest {
-        filter: LiveStateFilter {
+    declared_column_eq: crate::hot_state::DeclaredColumnEq,
+) -> Result<CommittedHotStateRows, LixError> {
+    let request = HotStateScanRequest {
+        filter: HotStateFilter {
             schema_keys: vec![schema_key.to_string()],
             branch_ids: vec![domain.branch_id().to_string()],
             file_ids: domain.file_filters(),
@@ -281,27 +281,27 @@ async fn scan_committed_constraint_rows_by_declared_column(
         },
         ..Default::default()
     };
-    let batch = live_state
+    let batch = hot_state
         .scan_domain_batch(
             &request,
             if domain.untracked() {
-                LiveStateReadDomain::Untracked
+                HotStateReadDomain::Untracked
             } else {
-                LiveStateReadDomain::Tracked
+                HotStateReadDomain::Tracked
             },
         )
         .await?;
-    CommittedLiveStateRows::select(batch, |row| {
+    CommittedHotStateRows::select(batch, |row| {
         domain.contains_ref(row) && row.schema_key() == schema_key
     })
 }
 
 async fn scan_committed_canonical_rows(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     domain: &Domain,
     schema_key: &str,
     entity_pks: Vec<EntityPk>,
-) -> Result<CommittedLiveStateRows, LixError> {
+) -> Result<CommittedHotStateRows, LixError> {
     let file_id = match domain.file_filters().as_slice() {
         [] => None,
         [NullableKeyFilter::Null] => None,
@@ -316,14 +316,14 @@ async fn scan_committed_canonical_rows(
     let requested_entity_pks = entity_pks.clone();
     let rows = entity_pks
         .into_iter()
-        .map(|entity_pk| LiveStateExactRowRequest {
+        .map(|entity_pk| HotStateExactRowRequest {
             schema_key: schema_key.to_string(),
             branch_id: domain.branch_id().to_string(),
             entity_pk,
             file_id: file_id.clone(),
         })
         .collect::<Vec<_>>();
-    let projection = LiveStateProjection {
+    let projection = HotStateProjection {
         columns: vec![
             "schema_key".to_string(),
             "entity_pk".to_string(),
@@ -336,8 +336,8 @@ async fn scan_committed_canonical_rows(
     // probe already returns whichever member owns the identity. The request is
     // exactly K identities and therefore remains bounded by the directory
     // point-read path; no schema or `All` expansion is permitted here.
-    let batch = live_state
-        .load_exact_batch(&LiveStateExactBatchRequest {
+    let batch = hot_state
+        .load_exact_batch(&HotStateExactBatchRequest {
             rows,
             projection,
             untracked: None,
@@ -345,7 +345,7 @@ async fn scan_committed_canonical_rows(
         })
         .await?
         .into_present_batch();
-    CommittedLiveStateRows::select(batch, |row| {
+    CommittedHotStateRows::select(batch, |row| {
         domain.contains_canonical_ref(row)
             && row.schema_key() == schema_key
             && requested_entity_pks.contains(row.entity_pk())
@@ -353,14 +353,14 @@ async fn scan_committed_canonical_rows(
 }
 
 async fn load_committed_constraint_rows(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     domain: &Domain,
     schema_key: &str,
     entity_pk: EntityPk,
     include_tombstones: bool,
-) -> Result<CommittedLiveStateRows, LixError> {
+) -> Result<CommittedHotStateRows, LixError> {
     scan_committed_constraint_rows(
-        live_state,
+        hot_state,
         domain,
         vec![schema_key.to_string()],
         vec![entity_pk],
@@ -595,10 +595,10 @@ impl<'a> StagedIndexExtractor<'a> {
 fn hot_index_value(
     snapshot: &JsonValue,
     column: &crate::sql2::EntityIndexedColumn,
-) -> Option<crate::live_state::HotIndexValue> {
+) -> Option<crate::hot_state::HotIndexValue> {
     match snapshot.get(&column.name)? {
-        JsonValue::String(value) => Some(crate::live_state::HotIndexValue::String(value.clone())),
-        JsonValue::Number(value) => value.as_i64().map(crate::live_state::HotIndexValue::Integer),
+        JsonValue::String(value) => Some(crate::hot_state::HotIndexValue::String(value.clone())),
+        JsonValue::Number(value) => value.as_i64().map(crate::hot_state::HotIndexValue::Integer),
         _ => None,
     }
 }
@@ -835,7 +835,7 @@ async fn validate_directory_descriptor_parent_graph(
 ) -> Result<(), LixError> {
     let scopes = staged_directory_descriptor_scopes(staged_rows);
     for scope in scopes {
-        let mut parents = committed_directory_parent_map(input.live_state, &scope).await?;
+        let mut parents = committed_directory_parent_map(input.hot_state, &scope).await?;
         apply_staged_directory_parent_rows(constraint_rows, &scope, &mut parents)?;
         validate_directory_parent_map(&scope, &parents)?;
     }
@@ -862,7 +862,7 @@ async fn validate_registered_schema_identity_is_canonical(
         reject_reserved_schema_namespace(&key)?;
 
         let committed_rows = load_committed_constraint_rows(
-            input.live_state,
+            input.hot_state,
             &pending_row.domain().with_exact_file_scope(None),
             REGISTERED_SCHEMA_KEY,
             pending_row.entity_pk().clone(),
@@ -918,13 +918,13 @@ fn staged_directory_descriptor_scopes(
 }
 
 async fn committed_directory_parent_map(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     scope: &DirectoryDescriptorScope,
 ) -> Result<BTreeMap<String, Option<String>>, LixError> {
     let mut parents = BTreeMap::new();
     for domain in scope.domain.directory_parent_domains() {
         let rows = scan_committed_constraint_rows(
-            live_state,
+            hot_state,
             &domain,
             vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
             Vec::new(),
@@ -947,7 +947,7 @@ async fn committed_directory_parent_map(
 }
 
 fn committed_directory_row_is_in_domain(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     _scope: &DirectoryDescriptorScope,
     domain: &Domain,
 ) -> bool {
@@ -1110,7 +1110,7 @@ async fn validate_filesystem_namespace(
             continue;
         }
         let mut occupants =
-            committed_filesystem_namespace_occupants(input.live_state, &domain).await?;
+            committed_filesystem_namespace_occupants(input.hot_state, &domain).await?;
         apply_staged_filesystem_namespace_rows(staged_rows, &domain, &mut occupants)?;
         validate_filesystem_namespace_occupants(&domain, occupants)?;
     }
@@ -1176,7 +1176,7 @@ async fn filesystem_namespace_domain_changed(
         return Ok(true);
     };
     let committed_rows = load_committed_constraint_rows(
-        input.live_state,
+        input.hot_state,
         domain,
         row.schema_key(),
         row.entity_pk().clone(),
@@ -1245,11 +1245,11 @@ fn staged_filesystem_namespace_domains(
 }
 
 async fn committed_filesystem_namespace_occupants(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     domain: &Domain,
 ) -> Result<BTreeMap<FilesystemNamespaceIdentity, FilesystemNamespaceOccupant>, LixError> {
     let rows = scan_committed_constraint_rows(
-        live_state,
+        hot_state,
         domain,
         vec![
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -1272,7 +1272,7 @@ async fn committed_filesystem_namespace_occupants(
 }
 
 fn committed_filesystem_row_is_in_domain(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     domain: &Domain,
 ) -> bool {
     (row.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
@@ -1313,7 +1313,7 @@ fn apply_staged_filesystem_namespace_rows(
 }
 
 fn filesystem_namespace_occupant_from_live_row(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
 ) -> Result<Option<(FilesystemNamespaceIdentity, FilesystemNamespaceOccupant)>, LixError> {
     let Some(snapshot_content) = row.snapshot_content().map(|snapshot| snapshot.as_str()) else {
         return Ok(None);
@@ -1539,7 +1539,7 @@ async fn validate_committed_insert_identities(
     pending_constraints: Option<&PendingConstraintIndexes>,
 ) -> Result<(), LixError> {
     validate_committed_insert_identity_entries(
-        input.live_state,
+        input.hot_state,
         input.staged_writes.inserts().filter(|insert| {
             // `PreparedWriteValidationSet::inserts` and `constraint_rows`
             // contain the same exact schema scope. Building pending constraints
@@ -1561,7 +1561,7 @@ async fn validate_committed_insert_identities(
 /// identity absence is a committed-state property and must still be checked
 /// against the coherent transaction snapshot.
 pub(crate) async fn validate_certified_tracked_insert_identities(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     prepared_writes: &PreparedWriteSet,
 ) -> Result<(), LixError> {
     if let Some((_facts, schema_key, branch_id)) = prepared_writes
@@ -1575,7 +1575,7 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
             schema_key,
             file_id: None,
         };
-        if live_state
+        if hot_state
             .collection_generation(branch_id, scope)
             .await?
             .is_some_and(|generation| generation.live_count == 0)
@@ -1597,7 +1597,7 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
             schema_key: first.row.schema_key,
             file_id: first.row.file_id.map(crate::common::SharedStr::as_str),
         };
-        if live_state
+        if hot_state
             .collection_generation(first.row.branch_id, scope)
             .await?
             .is_some_and(|generation| generation.live_count == 0)
@@ -1610,7 +1610,7 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
         }
     }
     validate_committed_insert_identity_entries(
-        live_state,
+        hot_state,
         prepared_writes
             .insert_selection
             .iter(&prepared_writes.state_rows),
@@ -1622,11 +1622,11 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
 /// Retains public INSERT absence semantics for a structural fresh-file import
 /// without rebuilding its full transaction validation index.
 pub(crate) async fn validate_certified_fresh_plugin_file_import(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     certificate: FreshPluginFileImportCertificate<'_>,
 ) -> Result<(), LixError> {
     validate_committed_insert_identity_entries(
-        live_state,
+        hot_state,
         certificate.insert_selection.iter(certificate.state_rows),
         None,
     )
@@ -1634,7 +1634,7 @@ pub(crate) async fn validate_certified_fresh_plugin_file_import(
 }
 
 async fn validate_committed_insert_identity_entries<'a, I>(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     entries: I,
     pending_constraints: Option<&PendingConstraintIndexes>,
 ) -> Result<(), LixError>
@@ -1669,7 +1669,7 @@ where
             .map(|insert| insert.row.entity_pk.clone())
             .collect::<Vec<_>>();
         let committed_rows =
-            scan_committed_canonical_rows(live_state, &domain, first.row.schema_key, entity_pks)
+            scan_committed_canonical_rows(hot_state, &domain, first.row.schema_key, entity_pks)
                 .await?;
         let mut committed_ordinals = committed_rows
             .iter()
@@ -1806,7 +1806,7 @@ async fn validate_branch_ref_delete_restrictions(
             }
 
             let descriptor_rows = load_committed_constraint_rows(
-                input.live_state,
+                input.hot_state,
                 descriptor_identity.domain(),
                 descriptor_identity.schema_key(),
                 descriptor_identity.entity_pk_owned(),
@@ -1934,7 +1934,7 @@ impl FileOwnerReferenceValidator {
                 continue;
             }
             if self
-                .committed_file_descriptor_exists_in_domain(input.live_state, domain, file_id)
+                .committed_file_descriptor_exists_in_domain(input.hot_state, domain, file_id)
                 .await?
             {
                 return Ok(());
@@ -1954,7 +1954,7 @@ impl FileOwnerReferenceValidator {
             Some(PendingFileDescriptorState::Tombstone) => false,
             None => {
                 self.committed_file_descriptor_exists_in_domain(
-                    input.live_state,
+                    input.hot_state,
                     &other_lane,
                     file_id,
                 )
@@ -1970,7 +1970,7 @@ impl FileOwnerReferenceValidator {
 
     async fn committed_file_descriptor_exists_in_domain(
         &mut self,
-        live_state: &dyn LiveStateReader,
+        hot_state: &dyn HotStateReader,
         domain: &Domain,
         file_id: &str,
     ) -> Result<bool, LixError> {
@@ -1983,7 +1983,7 @@ impl FileOwnerReferenceValidator {
             return Ok(*exists);
         }
         let exists =
-            committed_file_descriptor_exists_in_domain(live_state, &descriptor_domain, file_id)
+            committed_file_descriptor_exists_in_domain(hot_state, &descriptor_domain, file_id)
                 .await?;
         self.committed_descriptor_exists.insert(key, exists);
         Ok(exists)
@@ -1991,7 +1991,7 @@ impl FileOwnerReferenceValidator {
 }
 
 async fn committed_file_descriptor_exists_in_domain(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     descriptor_domain: &Domain,
     file_id: &str,
 ) -> Result<bool, LixError> {
@@ -1999,7 +1999,7 @@ async fn committed_file_descriptor_exists_in_domain(
         return Ok(false);
     };
     let rows = load_committed_constraint_rows(
-        live_state,
+        hot_state,
         descriptor_domain,
         FILE_DESCRIPTOR_SCHEMA_KEY,
         entity_pk.clone(),
@@ -2379,7 +2379,7 @@ impl PendingConstraintIndexes {
         Ok(())
     }
 
-    fn tombstones_identity(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+    fn tombstones_identity(&self, row: MaterializedHotStateRowRef<'_>) -> bool {
         !self.tombstone_identities.is_empty()
             && committed_row_ref_is_exact_branch_scoped(row, row.branch_id())
             && self
@@ -2391,7 +2391,7 @@ impl PendingConstraintIndexes {
                 ))
     }
 
-    fn replaces_committed_identity(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+    fn replaces_committed_identity(&self, row: MaterializedHotStateRowRef<'_>) -> bool {
         self.identity_targets
             .contains(&DomainRowIdentity::in_domain(
                 Domain::for_live_row_ref(row),
@@ -2637,7 +2637,7 @@ async fn validate_committed_delete_restrictions(
         }
         for reference in delete_plan.foreign_key_references {
             let Some(deleted_value) = committed_deleted_row_value(
-                input.live_state,
+                input.hot_state,
                 tombstone,
                 &reference.foreign_key.referenced_properties,
             )
@@ -2663,7 +2663,7 @@ async fn validate_committed_delete_restrictions(
         }
     }
     validate_committed_normal_delete_restriction_batches(
-        input.live_state,
+        input.hot_state,
         pending_constraints,
         normal_batches,
     )
@@ -2716,7 +2716,7 @@ struct NormalDeleteRestrictionBatchKey {
 }
 
 async fn validate_committed_normal_delete_restriction_batches(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     pending_constraints: &PendingConstraintIndexes,
     batches: BTreeMap<
         NormalDeleteRestrictionBatchKey,
@@ -2725,7 +2725,7 @@ async fn validate_committed_normal_delete_restriction_batches(
 ) -> Result<(), LixError> {
     for (batch, tombstones_by_value) in batches {
         let rows = scan_committed_constraint_rows(
-            live_state,
+            hot_state,
             &batch.source_domain,
             vec![batch.source_key.schema_key.clone()],
             Vec::new(),
@@ -2766,12 +2766,12 @@ async fn validate_committed_normal_delete_restriction_batches(
 }
 
 async fn committed_deleted_row_value(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     tombstone: &PendingTombstone,
     referenced_properties: &[Vec<String>],
 ) -> Result<Option<UniqueConstraintValue>, LixError> {
     let rows = load_committed_constraint_rows(
-        live_state,
+        hot_state,
         tombstone.identity.domain(),
         tombstone.identity.schema_key(),
         tombstone.identity.entity_pk_owned(),
@@ -2793,7 +2793,7 @@ async fn committed_deleted_row_value(
 
 fn committed_delete_restriction_error(
     deleted_identity: &DomainRowIdentity,
-    referencing_row: MaterializedLiveStateRowRef<'_>,
+    referencing_row: MaterializedHotStateRowRef<'_>,
     local_properties: &[Vec<String>],
 ) -> Result<LixError, LixError> {
     Ok(LixError::new(
@@ -2810,7 +2810,7 @@ fn committed_delete_restriction_error(
 }
 
 fn parse_committed_snapshot(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     snapshot_content: &str,
 ) -> Result<JsonValue, LixError> {
     serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
@@ -2936,7 +2936,7 @@ async fn validate_committed_foreign_keys(
     let mut still_unresolved = Vec::new();
     for check in unresolved_checks {
         let resolved = committed_normal_foreign_key_target_exists(
-            input.live_state,
+            input.hot_state,
             input.schema_catalog,
             pending_constraints,
             &check.target,
@@ -2980,7 +2980,7 @@ fn unresolved_foreign_key_target_description(
 }
 
 async fn committed_normal_foreign_key_target_exists(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     schema_catalog: &CatalogSnapshot,
     pending_constraints: &PendingConstraintIndexes,
     target: &PendingForeignKeyTargetKey,
@@ -2990,7 +2990,7 @@ async fn committed_normal_foreign_key_target_exists(
         .collect();
     for domain in target.domain.fk_target_domains() {
         let rows = scan_committed_constraint_rows(
-            live_state,
+            hot_state,
             &domain,
             vec![target.schema_key.clone()],
             entity_pks.clone(),
@@ -3067,7 +3067,7 @@ async fn validate_committed_unique_constraints(
             can_skip_unchanged && pending_unique_owner_is_insert(input, key, pending_entity_pk);
         if can_skip_unchanged
             && !is_insert
-            && committed_unique_value_is_unchanged(input.live_state, key, pending_entity_pk).await?
+            && committed_unique_value_is_unchanged(input.hot_state, key, pending_entity_pk).await?
         {
             continue;
         }
@@ -3087,7 +3087,7 @@ async fn validate_committed_unique_constraints(
         match declared_column_probe(input.schema_catalog, &scope, &pending_values) {
             Some(probe) => {
                 let committed_rows = scan_committed_constraint_rows_by_declared_column(
-                    input.live_state,
+                    input.hot_state,
                     &scope.domain,
                     &scope.schema_key,
                     probe,
@@ -3102,7 +3102,7 @@ async fn validate_committed_unique_constraints(
             }
             None => {
                 let committed_rows = scan_committed_constraint_rows(
-                    input.live_state,
+                    input.hot_state,
                     &scope.domain,
                     vec![scope.schema_key.clone()],
                     Vec::new(),
@@ -3142,7 +3142,7 @@ fn declared_column_probe(
     schema_catalog: &CatalogSnapshot,
     scope: &PendingUniqueConstraintScope,
     pending_values: &BTreeMap<UniqueConstraintValue, Vec<&EntityPk>>,
-) -> Option<crate::live_state::DeclaredColumnEq> {
+) -> Option<crate::hot_state::DeclaredColumnEq> {
     let [pointer] = scope.pointer_group.as_slice() else {
         return None;
     };
@@ -3159,7 +3159,7 @@ fn declared_column_probe(
         .iter()
         .find(|column| column.name == *property)?
         .ordinal;
-    Some(crate::live_state::DeclaredColumnEq {
+    Some(crate::hot_state::DeclaredColumnEq {
         schema_key: scope.schema_key.clone(),
         ordinal,
         value: value.exact_hot_index_value()?,
@@ -3169,7 +3169,7 @@ fn declared_column_probe(
 /// The committed-row half of the unique check, shared by the probe and scan
 /// routes so both reject exactly the same conflicts.
 fn reject_committed_unique_conflicts(
-    committed_rows: &CommittedLiveStateRows,
+    committed_rows: &CommittedHotStateRows,
     scope: &PendingUniqueConstraintScope,
     pending_values: &BTreeMap<UniqueConstraintValue, Vec<&EntityPk>>,
     pending_constraints: &PendingConstraintIndexes,
@@ -3259,12 +3259,12 @@ fn pending_unique_owner_is_insert(
 }
 
 async fn committed_unique_value_is_unchanged(
-    live_state: &dyn LiveStateReader,
+    hot_state: &dyn HotStateReader,
     key: &PendingUniqueKey,
     entity_pk: &EntityPk,
 ) -> Result<bool, LixError> {
     let committed_rows = load_committed_constraint_rows(
-        live_state,
+        hot_state,
         &key.domain,
         &key.schema_key,
         entity_pk.clone(),
@@ -3288,10 +3288,10 @@ async fn committed_unique_value_is_unchanged(
 }
 
 fn committed_row_is_in_exact_unique_scope(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     scope: &PendingUniqueConstraintScope,
 ) -> bool {
-    // LiveStateReader may return serving projections such as global rows
+    // HotStateReader may return serving projections such as global rows
     // projected into a requested branch. Constraint validation is root-local:
     // only rows authored in the exact branch participate.
     scope.domain.contains_ref(row) && row.schema_key() == scope.schema_key
@@ -3349,18 +3349,18 @@ impl UniqueConstraintValue {
     /// anyway, and an approximate probe would be a missed conflict rather
     /// than a slow one. The round-trip check makes "recoverable" provable
     /// instead of assumed.
-    fn exact_hot_index_value(&self) -> Option<crate::live_state::HotIndexValue> {
+    fn exact_hot_index_value(&self) -> Option<crate::hot_state::HotIndexValue> {
         let [encoded] = self.0.as_slice() else {
             return None;
         };
         if let Ok(text) = serde_json::from_str::<String>(encoded)
             && stable_unique_value(&JsonValue::String(text.clone())) == *encoded
         {
-            return Some(crate::live_state::HotIndexValue::String(text));
+            return Some(crate::hot_state::HotIndexValue::String(text));
         }
         let number = encoded.parse::<i64>().ok()?;
         (stable_unique_value(&JsonValue::Number(number.into())) == *encoded)
-            .then_some(crate::live_state::HotIndexValue::Integer(number))
+            .then_some(crate::hot_state::HotIndexValue::Integer(number))
     }
 
     fn display(&self) -> String {
@@ -3584,8 +3584,8 @@ mod tests {
 
     use super::*;
     use crate::common::SharedStr;
-    use crate::live_state::{
-        LiveStateScanRequest, MaterializedLiveStateBatchBuilder, MaterializedLiveStateRow,
+    use crate::hot_state::{
+        HotStateScanRequest, MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
     };
     use crate::schema::{schema_key_from_definition, seed_schema_definition};
     use crate::transaction_types::{
@@ -3598,19 +3598,19 @@ mod tests {
         };
     }
 
-    struct EmptyLiveStateReader;
+    struct EmptyHotStateReader;
 
-    struct BatchOnlyConstraintLiveStateReader {
-        rows: Mutex<Option<MaterializedLiveStateBatch>>,
+    struct BatchOnlyConstraintHotStateReader {
+        rows: Mutex<Option<MaterializedHotStateBatch>>,
     }
 
     #[async_trait]
-    impl LiveStateReader for BatchOnlyConstraintLiveStateReader {
+    impl HotStateReader for BatchOnlyConstraintHotStateReader {
         async fn scan_constraint_batch(
             &self,
-            _request: &LiveStateScanRequest,
+            _request: &HotStateScanRequest,
             _tracked_only: bool,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(self
                 .rows
                 .lock()
@@ -3621,17 +3621,17 @@ mod tests {
 
         async fn scan_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            _request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             panic!("constraint validation must not project the shared batch into owned rows")
         }
 
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::MaterializedLiveStateExactBatch::new(
-                MaterializedLiveStateBatch::default(),
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::MaterializedHotStateExactBatch::new(
+                MaterializedHotStateBatch::default(),
                 vec![None; request.rows.len()],
             )
         }
@@ -3649,7 +3649,7 @@ mod tests {
         let snapshot = SharedStr::from(r#"{"value":"shared"}"#);
         let metadata = SharedStr::from(r#"{"source":"constraint-batch"}"#);
         let timestamp = ts("2026-01-01T00:00:00Z");
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(ROW_COUNT);
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(ROW_COUNT);
         for _ in 0..ROW_COUNT {
             builder.push_materialized_ref(
                 &entity_pk,
@@ -3669,7 +3669,7 @@ mod tests {
         }
         let batch = builder.finish();
         let original_entity_column = batch.entity_column_ptr();
-        let reader = BatchOnlyConstraintLiveStateReader {
+        let reader = BatchOnlyConstraintHotStateReader {
             rows: Mutex::new(Some(batch)),
         };
 
@@ -3692,7 +3692,7 @@ mod tests {
         assert_eq!(rows.batch.dictionary_entry_count(), 2);
         let first = rows
             .first()
-            .and_then(MaterializedLiveStateRowRef::snapshot_content)
+            .and_then(MaterializedHotStateRowRef::snapshot_content)
             .expect("first row should retain its snapshot");
         let last = rows
             .batch
@@ -3705,7 +3705,7 @@ mod tests {
     #[test]
     fn defensive_constraint_selection_keeps_original_batch_order() {
         let timestamp = ts("2026-01-01T00:00:00Z");
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(4);
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(4);
         for (entity_id, schema_key) in [
             ("first", "selected"),
             ("rejected", "other"),
@@ -3730,7 +3730,7 @@ mod tests {
         }
         let batch = builder.finish();
         let original_entity_column = batch.entity_column_ptr();
-        let rows = CommittedLiveStateRows::select(batch, |row| row.schema_key() == "selected")
+        let rows = CommittedHotStateRows::select(batch, |row| row.schema_key() == "selected")
             .expect("four rows fit the selection ordinal column");
 
         assert!(!rows.is_dense());
@@ -3788,21 +3788,21 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateReader for EmptyLiveStateReader {
+    impl HotStateReader for EmptyHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(test_file_descriptor_rows()
                 .into_iter()
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>()
                 .into())
         }
@@ -3817,12 +3817,12 @@ mod tests {
                 .expect("test schema catalog should build"),
         ));
         let validation_set = Box::leak(Box::new(staged_writes.validation_set_for_tests()));
-        TransactionValidationInput::new(validation_set, catalog, &EmptyLiveStateReader)
+        TransactionValidationInput::new(validation_set, catalog, &EmptyHotStateReader)
     }
 
     async fn filesystem_namespace_domain_changed_for_test(
         staged_rows: Vec<TestPreparedStateRow>,
-        committed_rows: Vec<MaterializedLiveStateRow>,
+        committed_rows: Vec<MaterializedHotStateRow>,
     ) -> Result<bool, LixError> {
         let staged_writes = PreparedWriteSet {
             state_rows: PreparedStateBatch::from_test_rows(staged_rows),
@@ -3838,16 +3838,16 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ])?;
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: committed_rows,
         };
-        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
         filesystem_namespace_domain_changed(&input, &staged_rows, &domain).await
     }
 
     async fn assert_filesystem_namespace_domain_changed(
         staged_rows: Vec<TestPreparedStateRow>,
-        committed_rows: Vec<MaterializedLiveStateRow>,
+        committed_rows: Vec<MaterializedHotStateRow>,
         expected: bool,
         scenario: &str,
     ) {
@@ -3867,16 +3867,16 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ])?;
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: Vec::new(),
             scan_count: AtomicUsize::new(0),
         };
-        let mut input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let mut input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
         if trust_filesystem_planner {
             input = input.with_trusted_filesystem_planner();
         }
         validate_filesystem_namespace(&input, &staged_rows).await?;
-        Ok(live_state.scan_count.load(Ordering::Relaxed))
+        Ok(hot_state.scan_count.load(Ordering::Relaxed))
     }
 
     fn filesystem_insert_origin(surface: &str, entity_id: &str) -> TransactionWriteOrigin {
@@ -3964,57 +3964,57 @@ mod tests {
         Ok(catalog)
     }
 
-    struct StaticLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct StaticHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for StaticLiveStateReader {
+    impl HotStateReader for StaticHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(self
                 .rows
                 .iter()
                 .cloned()
                 .chain(test_file_descriptor_rows())
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>()
                 .into())
         }
     }
 
-    struct OverlayingStaticLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct OverlayingStaticHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for OverlayingStaticLiveStateReader {
+    impl HotStateReader for OverlayingStaticHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             let rows = self
                 .rows
                 .iter()
                 .cloned()
                 .chain(test_file_descriptor_rows())
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>();
             if request.filter.untracked.is_some() {
                 return Ok(rows.into());
@@ -4033,9 +4033,9 @@ mod tests {
     }
 
     fn overlay_untracked_rows_for_test(
-        tracked_rows: Vec<MaterializedLiveStateRow>,
-        untracked_rows: Vec<MaterializedLiveStateRow>,
-    ) -> Vec<MaterializedLiveStateRow> {
+        tracked_rows: Vec<MaterializedHotStateRow>,
+        untracked_rows: Vec<MaterializedHotStateRow>,
+    ) -> Vec<MaterializedHotStateRow> {
         let mut rows_by_identity = BTreeMap::new();
         for row in tracked_rows {
             rows_by_identity.insert(DomainRowIdentity::from_live_row(&row), row);
@@ -4046,77 +4046,77 @@ mod tests {
         rows_by_identity.into_values().collect()
     }
 
-    struct StrictEmptyLiveStateReader;
+    struct StrictEmptyHotStateReader;
 
     #[async_trait]
-    impl LiveStateReader for StrictEmptyLiveStateReader {
+    impl HotStateReader for StrictEmptyHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            _request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(Vec::new().into())
         }
     }
 
-    struct StrictStaticLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct StrictStaticHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for StrictStaticLiveStateReader {
+    impl HotStateReader for StrictStaticHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(self
                 .rows
                 .iter()
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .cloned()
                 .collect::<Vec<_>>()
                 .into())
         }
     }
 
-    struct CountingStaticLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
+    struct CountingStaticHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
         scan_count: AtomicUsize,
     }
 
     #[async_trait]
-    impl LiveStateReader for CountingStaticLiveStateReader {
+    impl HotStateReader for CountingStaticHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             self.scan_count.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .rows
                 .iter()
                 .cloned()
                 .chain(test_file_descriptor_rows())
-                .filter(|row| live_state_row_matches_scan(row, request))
+                .filter(|row| hot_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>()
                 .into())
         }
@@ -4210,7 +4210,7 @@ mod tests {
             ),
             (
                 vec![directory.clone()],
-                vec![MaterializedLiveStateRow::from(directory)],
+                vec![MaterializedHotStateRow::from(directory)],
                 "directory descriptor",
             ),
         ];
@@ -4251,7 +4251,7 @@ mod tests {
             "before",
             "01920000-0000-7000-8000-0000000000a1",
         );
-        let committed_directory = MaterializedLiveStateRow::from(renamed_directory.clone());
+        let committed_directory = MaterializedHotStateRow::from(renamed_directory.clone());
         renamed_directory.snapshot = Some(test_stage_json(
             r#"{"id":"01920000-0000-7000-8000-0000000000a3","parent_id":null,"name":"after"}"#,
         ));
@@ -4547,21 +4547,21 @@ mod tests {
             directory_descriptor_schema(),
         ])
         .expect("descriptor catalog should compile");
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: vec![committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
                 "01920000-0000-7000-8000-0000000000a1",
             )],
             scan_count: AtomicUsize::new(0),
         };
-        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
 
         validate_committed_unique_constraints(&input, &pending_constraints)
             .await
             .expect("namespace validation owns descriptor parent/name uniqueness");
 
         assert_eq!(
-            live_state.scan_count.load(Ordering::Relaxed),
+            hot_state.scan_count.load(Ordering::Relaxed),
             0,
             "descriptor unique validation must not rescan committed descriptors"
         );
@@ -4587,7 +4587,7 @@ mod tests {
         );
         committed_file.snapshot_content =
             Some(r#"{"id":"01920000-0000-7000-8000-000000000162","directory_id":null,"name":"occupied"}"#.into());
-        let committed_directory = MaterializedLiveStateRow::from(directory_descriptor_row(
+        let committed_directory = MaterializedHotStateRow::from(directory_descriptor_row(
             "01920000-0000-7000-8000-000000000163",
             None,
             "occupied",
@@ -4598,14 +4598,14 @@ mod tests {
             (committed_file, "file/file"),
             (committed_directory, "file/directory"),
         ] {
-            let live_state = StrictStaticLiveStateReader {
+            let hot_state = StrictStaticHotStateReader {
                 rows: vec![committed],
             };
             let error = validate_prepared_writes(
                 TransactionValidationInput::from_visible_schemas_for_tests(
                     &staged_writes,
                     &visible_schemas,
-                    &live_state,
+                    &hot_state,
                 ),
             )
             .await
@@ -4940,12 +4940,12 @@ mod tests {
                 (
                     "unique_schema".to_string(),
                     0,
-                    Some(crate::live_state::HotIndexValue::String("slug-1".into()))
+                    Some(crate::hot_state::HotIndexValue::String("slug-1".into()))
                 ),
                 (
                     "unique_schema".to_string(),
                     0,
-                    Some(crate::live_state::HotIndexValue::String("slug-2".into()))
+                    Some(crate::hot_state::HotIndexValue::String("slug-2".into()))
                 ),
             ],
             "every row of the freshly registered schema must be extracted, or the \
@@ -4998,7 +4998,7 @@ mod tests {
         assert_eq!(
             row.columns,
             vec![
-                (0_u16, Some(crate::live_state::HotIndexValue::Integer(7))),
+                (0_u16, Some(crate::hot_state::HotIndexValue::Integer(7))),
                 (1_u16, None),
             ],
             "a null indexed value must still report its ordinal"
@@ -5100,7 +5100,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &StrictEmptyLiveStateReader,
+                &StrictEmptyHotStateReader,
             ))
             .await
             .expect_err("non-null file_id should require a file descriptor");
@@ -5129,7 +5129,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &StrictEmptyLiveStateReader,
+            &StrictEmptyHotStateReader,
         ))
         .await
         .expect("same-transaction file descriptor should satisfy file ownership");
@@ -5159,7 +5159,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &StrictEmptyLiveStateReader,
+                &StrictEmptyHotStateReader,
             ))
             .await
             .expect_err("tracked file owner must not resolve through pending untracked descriptor");
@@ -5200,7 +5200,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &StrictEmptyLiveStateReader,
+                &StrictEmptyHotStateReader,
             ))
             .await
             .expect_err("an untracked row must not be owned by a pending tracked file");
@@ -5237,7 +5237,7 @@ mod tests {
             TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &EmptyLiveStateReader,
+                &EmptyHotStateReader,
             ),
         )
         .await
@@ -5253,7 +5253,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -5263,7 +5263,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("committed file descriptor should satisfy file ownership");
@@ -5279,7 +5279,7 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: Vec::new(),
             scan_count: AtomicUsize::new(0),
         };
@@ -5287,12 +5287,12 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("shared committed file descriptor should satisfy file ownership");
 
-        assert_eq!(live_state.scan_count.load(Ordering::Relaxed), 2);
+        assert_eq!(hot_state.scan_count.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -5307,7 +5307,7 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
         );
         mark_live_row_untracked(&mut untracked_file_descriptor);
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: vec![untracked_file_descriptor],
         };
 
@@ -5315,7 +5315,7 @@ mod tests {
             TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ),
         )
         .await
@@ -5347,7 +5347,7 @@ mod tests {
             state_rows: prepared_rows![untracked_row],
             ..empty_staged_write_set()
         };
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: vec![committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -5358,7 +5358,7 @@ mod tests {
             TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ),
         )
         .await
@@ -5389,14 +5389,14 @@ mod tests {
         );
         untracked_tombstone.snapshot_content = None;
         mark_live_row_untracked(&mut untracked_tombstone);
-        let live_state = OverlayingStaticLiveStateReader {
+        let hot_state = OverlayingStaticHotStateReader {
             rows: vec![tracked_file_descriptor, untracked_tombstone],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("tracked file owner should resolve against tracked descriptor behind overlay");
@@ -5418,14 +5418,14 @@ mod tests {
             state_rows: prepared_rows![file_descriptor_delete],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("file descriptor deletion cascades committed file-owned rows");
@@ -5448,9 +5448,9 @@ mod tests {
             ..empty_staged_write_set()
         };
         let mut untracked_row =
-            MaterializedLiveStateRow::from(unique_row("post-1", "hello-world", "first"));
+            MaterializedHotStateRow::from(unique_row("post-1", "hello-world", "first"));
         mark_live_row_untracked(&mut untracked_row);
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: vec![
                 committed_file_descriptor_row(
                     "01920000-0000-7000-8000-0000000000a2",
@@ -5463,7 +5463,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("file descriptor deletion cascades untracked file-owned rows");
@@ -5502,7 +5502,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: vec![committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
                 crate::GLOBAL_BRANCH_ID,
@@ -5513,7 +5513,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("global file descriptor should not satisfy a branch-local row");
@@ -5665,7 +5665,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
@@ -5673,7 +5673,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("committed visible unique value should conflict");
@@ -5691,7 +5691,7 @@ mod tests {
         let tracked_duplicate = committed_unique_row("post-1", "hello-world", "first");
         let mut untracked_overlay = committed_unique_row("post-1", "draft-slug", "draft");
         mark_live_row_untracked(&mut untracked_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
+        let hot_state = OverlayingStaticHotStateReader {
             rows: vec![tracked_duplicate, untracked_overlay],
         };
 
@@ -5699,7 +5699,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("tracked unique duplicate must be detected behind untracked overlay");
@@ -5721,7 +5721,7 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
@@ -5729,7 +5729,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("untracked tombstone must not hide tracked unique owner");
@@ -5744,7 +5744,7 @@ mod tests {
             state_rows: prepared_rows![nullable_unique_row("row-2", None, "root-name")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_nullable_unique_row("row-1", None, "root-name")],
         };
 
@@ -5752,7 +5752,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("committed duplicate nullable unique value should conflict");
@@ -5767,7 +5767,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
@@ -5775,7 +5775,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("same unique value in the same branch should conflict");
@@ -5792,21 +5792,21 @@ mod tests {
             state_rows: prepared_rows![branch_b],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("committed unique values should be scoped to the exact branch_id");
     }
 
     #[tokio::test]
-    async fn validation_ignores_projected_live_state_rows_for_unique_constraints() {
+    async fn validation_ignores_projected_hot_state_rows_for_unique_constraints() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
@@ -5815,14 +5815,14 @@ mod tests {
         let mut projected_overlay_row = committed_unique_row("post-1", "hello-world", "first");
         projected_overlay_row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         projected_overlay_row.global = true;
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![projected_overlay_row],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("validation should ignore live-state overlay projections");
@@ -5835,14 +5835,14 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "updated")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("same identity should update committed unique owner");
@@ -5855,7 +5855,7 @@ mod tests {
             state_rows: prepared_rows![unique_row("post-1", "second-slug", "updated")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
                 committed_unique_row("post-1", "hello-world", "first"),
                 committed_unique_row("post-2", "second-slug", "second"),
@@ -5866,7 +5866,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("changing to another committed unique value should conflict");
@@ -5892,7 +5892,7 @@ mod tests {
         };
         let mut committed = committed_unique_row("post-1", "hello-world", "first");
         committed.file_id = None;
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: vec![committed],
             scan_count: AtomicUsize::new(0),
         };
@@ -5900,12 +5900,12 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("insert with a distinct unique value should succeed");
 
-        assert_eq!(live_state.scan_count.load(Ordering::Relaxed), 1);
+        assert_eq!(hot_state.scan_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -5923,7 +5923,7 @@ mod tests {
             state_rows: prepared_rows![staged_one, staged_two],
             ..empty_staged_write_set()
         };
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: vec![committed_one, committed_two],
             scan_count: AtomicUsize::new(0),
         };
@@ -5931,12 +5931,12 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("distinct pending unique values should not conflict");
 
-        assert_eq!(live_state.scan_count.load(Ordering::Relaxed), 1);
+        assert_eq!(hot_state.scan_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -5948,14 +5948,14 @@ mod tests {
             state_rows: prepared_rows![tombstone, unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("tombstoned committed owner should not conflict");
@@ -5972,14 +5972,14 @@ mod tests {
             state_rows: prepared_rows![different_file, different_branch],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("committed uniqueness is scoped by file and branch");
@@ -6132,17 +6132,17 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
                 {
-                    let mut unrelated = MaterializedLiveStateRow::from(fk_parent_row(
+                    let mut unrelated = MaterializedHotStateRow::from(fk_parent_row(
                         "unrelated",
                         "01920000-0000-7000-8000-0000000000a1",
                     ));
                     unrelated.snapshot_content = Some("{invalid".into());
                     unrelated
                 },
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
@@ -6152,7 +6152,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("foreign key should resolve against committed rows in the same branch");
@@ -6169,12 +6169,12 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let mut untracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+        let mut untracked_parent = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
         mark_live_row_untracked(&mut untracked_parent);
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![untracked_parent],
         };
 
@@ -6182,7 +6182,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("tracked FK must not resolve through a committed untracked target");
@@ -6213,13 +6213,13 @@ mod tests {
             state_rows: prepared_rows![untracked_file_descriptor, untracked_child],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
                 committed_file_descriptor_row(
                     "01920000-0000-7000-8000-0000000000a2",
                     "01920000-0000-7000-8000-0000000000a1",
                 ),
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
@@ -6229,7 +6229,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("untracked FK should be allowed to reference a committed tracked target");
@@ -6246,23 +6246,23 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+        let tracked_parent = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
-        let mut untracked_overlay = MaterializedLiveStateRow::from(fk_parent_row(
+        let mut untracked_overlay = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
         mark_live_row_untracked(&mut untracked_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
+        let hot_state = OverlayingStaticHotStateReader {
             rows: vec![tracked_parent, untracked_overlay],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect(
@@ -6279,22 +6279,22 @@ mod tests {
             state_rows: prepared_rows![parent_delete],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+        let tracked_parent = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
-        let tracked_child = MaterializedLiveStateRow::from(fk_child_row(
+        let tracked_child = MaterializedHotStateRow::from(fk_child_row(
             "child-1",
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
-        let mut untracked_child_overlay = MaterializedLiveStateRow::from(fk_child_row(
+        let mut untracked_child_overlay = MaterializedHotStateRow::from(fk_child_row(
             "child-1",
             "other-parent",
             "01920000-0000-7000-8000-0000000000a1",
         ));
         mark_live_row_untracked(&mut untracked_child_overlay);
-        let live_state = OverlayingStaticLiveStateReader {
+        let hot_state = OverlayingStaticHotStateReader {
             rows: vec![tracked_parent, tracked_child, untracked_child_overlay],
         };
 
@@ -6302,7 +6302,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("tracked referencing row behind overlay must block target delete");
@@ -6319,17 +6319,17 @@ mod tests {
             state_rows: prepared_rows![parent_delete],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+        let tracked_parent = MaterializedHotStateRow::from(fk_parent_row(
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
-        let mut untracked_child = MaterializedLiveStateRow::from(fk_child_row(
+        let mut untracked_child = MaterializedHotStateRow::from(fk_child_row(
             "child-1",
             "parent-1",
             "01920000-0000-7000-8000-0000000000a1",
         ));
         mark_live_row_untracked(&mut untracked_child);
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![tracked_parent, untracked_child],
         };
 
@@ -6337,7 +6337,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("tracked target delete must be blocked by committed untracked references");
@@ -6356,8 +6356,8 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000b1",
             ))],
@@ -6367,7 +6367,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err(
@@ -6393,8 +6393,8 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000a1",
             ))],
@@ -6404,7 +6404,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("same-transaction tombstone should hide the committed FK target");
@@ -6430,8 +6430,8 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000a1",
             ))],
@@ -6440,7 +6440,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("untracked tombstone must not hide tracked FK target");
@@ -6462,8 +6462,8 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000a1",
             ))],
@@ -6473,7 +6473,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("pending child reference should block parent delete");
@@ -6509,13 +6509,13 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
-                MaterializedLiveStateRow::from(fk_child_row(
+                MaterializedHotStateRow::from(fk_child_row(
                     "child-1",
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
@@ -6531,7 +6531,7 @@ mod tests {
             validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ))
             .await
             .expect_err("delete should be restricted by same-branch references");
@@ -6547,11 +6547,11 @@ mod tests {
         parent_one_delete.snapshot = None;
         let mut parent_two_delete = fk_parent_row("parent-2", branch_id);
         parent_two_delete.snapshot = None;
-        let live_state = CountingStaticLiveStateReader {
+        let hot_state = CountingStaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", branch_id)),
-                MaterializedLiveStateRow::from(fk_parent_row("parent-2", branch_id)),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-2", branch_id)),
+                MaterializedHotStateRow::from(fk_parent_row("parent-1", branch_id)),
+                MaterializedHotStateRow::from(fk_parent_row("parent-2", branch_id)),
+                MaterializedHotStateRow::from(fk_child_row("child-1", "parent-2", branch_id)),
             ],
             scan_count: AtomicUsize::new(0),
         };
@@ -6566,7 +6566,7 @@ mod tests {
         for row in validation_set.rows() {
             pending_constraints.remember_tombstone(row);
         }
-        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
 
         let error = validate_committed_delete_restrictions(&input, &catalog, &pending_constraints)
             .await
@@ -6574,7 +6574,7 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
         assert_eq!(
-            live_state.scan_count.load(Ordering::Relaxed),
+            hot_state.scan_count.load(Ordering::Relaxed),
             3,
             "two target point loads should share the committed source-schema scan"
         );
@@ -6983,13 +6983,13 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
-                MaterializedLiveStateRow::from(fk_child_row(
+                MaterializedHotStateRow::from(fk_child_row(
                     "child-1",
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -7004,7 +7004,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("references in another branch should not restrict this branch");
@@ -7021,13 +7021,13 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
         );
         child_delete.snapshot = None;
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row(
+                MaterializedHotStateRow::from(fk_parent_row(
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
                 )),
-                MaterializedLiveStateRow::from(fk_child_row(
+                MaterializedHotStateRow::from(fk_child_row(
                     "child-1",
                     "parent-1",
                     "01920000-0000-7000-8000-0000000000a1",
@@ -7042,7 +7042,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("committed references deleted in the same transaction should not restrict delete");
@@ -7055,11 +7055,11 @@ mod tests {
         let mut parent_delete = fk_parent_row("parent-1", branch_id);
         parent_delete.snapshot = None;
         let child_update = fk_child_row("child-1", "parent-2", branch_id);
-        let live_state = StaticLiveStateReader {
+        let hot_state = StaticHotStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", branch_id)),
-                MaterializedLiveStateRow::from(fk_parent_row("parent-2", branch_id)),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", branch_id)),
+                MaterializedHotStateRow::from(fk_parent_row("parent-1", branch_id)),
+                MaterializedHotStateRow::from(fk_parent_row("parent-2", branch_id)),
+                MaterializedHotStateRow::from(fk_child_row("child-1", "parent-1", branch_id)),
             ],
         };
         let staged_writes = PreparedWriteSet {
@@ -7070,7 +7070,7 @@ mod tests {
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
-            &live_state,
+            &hot_state,
         ))
         .await
         .expect("a replacement row's final foreign keys should supersede its committed references");
@@ -7232,12 +7232,12 @@ mod tests {
         indexes.remember_tombstone(PreparedValidationRow::State(deleted.borrowed()));
 
         let committed =
-            MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", branch_id));
+            MaterializedHotStateRow::from(fk_child_row("child-1", "parent-1", branch_id));
         let mut other_file = committed.clone();
         other_file.file_id = Some("01920000-0000-7000-8000-0000000000b1".into());
         let mut malformed_projection = committed.clone();
         malformed_projection.global = true;
-        let batch = MaterializedLiveStateBatch::from_rows(vec![
+        let batch = MaterializedHotStateBatch::from_rows(vec![
             committed,
             other_file,
             malformed_projection,
@@ -7527,8 +7527,8 @@ mod tests {
             )],
         )
         .expect("pending FK validation should collect unresolved check");
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000a1",
             ))],
@@ -7538,7 +7538,7 @@ mod tests {
             &TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ),
             &indexes,
             &unresolved,
@@ -7582,8 +7582,8 @@ mod tests {
             )],
         )
         .expect("pending FK validation should collect unresolved check");
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(fk_parent_row(
                 "parent-1",
                 "01920000-0000-7000-8000-0000000000b1",
             ))],
@@ -7593,7 +7593,7 @@ mod tests {
             &TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
-                &live_state,
+                &hot_state,
             ),
             &indexes,
             &unresolved,
@@ -7621,9 +7621,9 @@ mod tests {
         }
     }
 
-    fn live_state_row_matches_scan(
-        row: &MaterializedLiveStateRow,
-        request: &LiveStateScanRequest,
+    fn hot_state_row_matches_scan(
+        row: &MaterializedHotStateRow,
+        request: &HotStateScanRequest,
     ) -> bool {
         if request
             .filter
@@ -7648,7 +7648,7 @@ mod tests {
                     .any(|filter| filter.matches(row.file_id.as_ref())))
     }
 
-    fn test_file_descriptor_rows() -> Vec<MaterializedLiveStateRow> {
+    fn test_file_descriptor_rows() -> Vec<MaterializedHotStateRow> {
         vec![
             committed_file_descriptor_row(
                 "01920000-0000-7000-8000-0000000000a2",
@@ -7877,7 +7877,7 @@ mod tests {
         row.commit_id = None;
     }
 
-    fn mark_live_row_untracked(row: &mut MaterializedLiveStateRow) {
+    fn mark_live_row_untracked(row: &mut MaterializedHotStateRow) {
         row.untracked = true;
         row.change_id = None;
         row.commit_id = None;
@@ -7903,8 +7903,8 @@ mod tests {
         row
     }
 
-    fn committed_file_descriptor_row(file_id: &str, branch_id: &str) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow::from(staged_file_descriptor_row(file_id, branch_id))
+    fn committed_file_descriptor_row(file_id: &str, branch_id: &str) -> MaterializedHotStateRow {
+        MaterializedHotStateRow::from(staged_file_descriptor_row(file_id, branch_id))
     }
 
     fn directory_descriptor_row(
@@ -7932,9 +7932,9 @@ mod tests {
         row
     }
 
-    fn committed_unique_row(entity_pk: &str, slug: &str, title: &str) -> MaterializedLiveStateRow {
+    fn committed_unique_row(entity_pk: &str, slug: &str, title: &str) -> MaterializedHotStateRow {
         let row = unique_row(entity_pk, slug, title);
-        MaterializedLiveStateRow {
+        MaterializedHotStateRow {
             entity_pk: row.entity_pk,
             schema_key: row.schema_key.into(),
             file_id: row.file_id.map(Into::into),
@@ -7961,8 +7961,8 @@ mod tests {
         entity_pk: &str,
         scope: Option<&str>,
         name: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow::from(nullable_unique_row(entity_pk, scope, name))
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow::from(nullable_unique_row(entity_pk, scope, name))
     }
 
     fn staged_row(schema_key: &str, snapshot_content: Option<String>) -> TestPreparedStateRow {
@@ -8227,7 +8227,7 @@ mod tests {
         let writes = fresh_plugin_file_import_write_set();
         let certificate = fresh_plugin_file_import_certificate(&writes)
             .expect("fixture should satisfy the structural certificate");
-        validate_certified_fresh_plugin_file_import(&StrictEmptyLiveStateReader, certificate)
+        validate_certified_fresh_plugin_file_import(&StrictEmptyHotStateReader, certificate)
             .await
             .expect("new descriptor and blob identities should be absent");
 
@@ -8239,8 +8239,8 @@ mod tests {
         let certificate = fresh_plugin_file_import_certificate(&writes)
             .expect("certificate remains valid before committed lookup");
         let error = validate_certified_fresh_plugin_file_import(
-            &StrictStaticLiveStateReader {
-                rows: vec![MaterializedLiveStateRow::from(duplicate_descriptor)],
+            &StrictStaticHotStateReader {
+                rows: vec![MaterializedHotStateRow::from(duplicate_descriptor)],
             },
             certificate,
         )

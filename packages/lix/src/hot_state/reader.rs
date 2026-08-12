@@ -2,13 +2,13 @@ use async_trait::async_trait;
 
 use crate::LixError;
 #[cfg(test)]
-use crate::live_state::MaterializedLiveStateBatchBuilder;
-use crate::live_state::{LiveStateExactBatchRequest, LiveStateScanRequest};
-use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateExactBatch};
+use crate::hot_state::MaterializedHotStateBatchBuilder;
+use crate::hot_state::{HotStateExactBatchRequest, HotStateScanRequest};
+use crate::hot_state::{MaterializedHotStateBatch, MaterializedHotStateExactBatch};
 
 /// Selects the authenticated serving domain for an internal read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LiveStateReadDomain {
+pub(crate) enum HotStateReadDomain {
     Combined,
     Tracked,
     Untracked,
@@ -20,13 +20,13 @@ pub(crate) enum LiveStateReadDomain {
 /// should be added at this boundary later instead of leaking projection internals
 /// into sessions or SQL providers.
 #[async_trait]
-pub(crate) trait LiveStateReader: Send + Sync {
+pub(crate) trait HotStateReader: Send + Sync {
     /// Columnar scan lane used by live-state composition and SQL providers.
     ///
     async fn scan_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError>;
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError>;
 
     /// Scans committed rows for constraint validation into one shared owner.
     ///
@@ -35,9 +35,9 @@ pub(crate) trait LiveStateReader: Send + Sync {
     /// by falling back to their ordinary columnar scan implementation.
     async fn scan_constraint_batch(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
         tracked_only: bool,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         if tracked_only {
             self.scan_tracked_batch(request).await
         } else {
@@ -50,17 +50,17 @@ pub(crate) trait LiveStateReader: Send + Sync {
     /// current-only durable callers select their domain explicitly.
     async fn scan_domain_batch(
         &self,
-        request: &LiveStateScanRequest,
-        domain: LiveStateReadDomain,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+        domain: HotStateReadDomain,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         match domain {
-            LiveStateReadDomain::Combined => self.scan_constraint_batch(request, false).await,
-            LiveStateReadDomain::Tracked => {
+            HotStateReadDomain::Combined => self.scan_constraint_batch(request, false).await,
+            HotStateReadDomain::Tracked => {
                 let mut request = request.clone();
                 request.filter.untracked = Some(false);
                 self.scan_constraint_batch(&request, true).await
             }
-            LiveStateReadDomain::Untracked => {
+            HotStateReadDomain::Untracked => {
                 let mut request = request.clone();
                 request.filter.untracked = Some(true);
                 self.scan_constraint_batch(&request, false).await
@@ -79,8 +79,8 @@ pub(crate) trait LiveStateReader: Send + Sync {
     /// lane. Readers with a distinct immutable tracked source override this.
     async fn scan_tracked_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         let mut request = request.clone();
         request.filter.untracked = Some(false);
         self.scan_batch(&request).await
@@ -94,8 +94,8 @@ pub(crate) trait LiveStateReader: Send + Sync {
     /// to prevent.
     async fn load_exact_batch(
         &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError>;
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError>;
 
     /// Loads collection control from this reader's coherent storage snapshot.
     ///
@@ -113,12 +113,12 @@ pub(crate) trait LiveStateReader: Send + Sync {
 #[cfg(test)]
 pub(crate) async fn load_exact_batch_via_scan_for_test<R>(
     reader: &R,
-    request: &LiveStateExactBatchRequest,
-) -> Result<MaterializedLiveStateExactBatch, LixError>
+    request: &HotStateExactBatchRequest,
+) -> Result<MaterializedHotStateExactBatch, LixError>
 where
-    R: LiveStateReader + ?Sized,
+    R: HotStateReader + ?Sized,
 {
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+    let mut rows = MaterializedHotStateBatchBuilder::with_capacity(request.rows.len());
     let mut slots = Vec::with_capacity(request.rows.len());
     for row in &request.rows {
         let scanned = reader.scan_batch(&request.row_scan_request(row)).await?;
@@ -135,5 +135,5 @@ where
                 })?,
         );
     }
-    MaterializedLiveStateExactBatch::new(rows.finish(), slots)
+    MaterializedHotStateExactBatch::new(rows.finish(), slots)
 }

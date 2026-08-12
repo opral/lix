@@ -16,9 +16,9 @@ use crate::common::{
     ExecuteStatementMetadata, RequestBlobSpliceProvenance, SharedStr, validate_row_metadata,
 };
 use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateScanRequest,
-    MaterializedLiveStateBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+use crate::hot_state::{
+    HotStateFilter, HotStateProjection, HotStateRowFilter, HotStateScanRequest,
+    MaterializedHotStateBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
@@ -1156,7 +1156,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         });
     }
     let candidates = if certified_generation_identity {
-        MaterializedLiveStateBatch::default()
+        MaterializedHotStateBatch::default()
     } else {
         let candidates =
             scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.to_vec(), true)
@@ -1466,8 +1466,8 @@ fn direct_replacement_text_columns<'a>(
 
 #[derive(Clone, Copy)]
 enum EntityLiveRowRef<'a> {
-    Owned(&'a MaterializedLiveStateRow),
-    Batch(MaterializedLiveStateRowRef<'a>),
+    Owned(&'a MaterializedHotStateRow),
+    Batch(MaterializedHotStateRowRef<'a>),
 }
 
 impl<'a> EntityLiveRowRef<'a> {
@@ -1550,7 +1550,7 @@ impl<'a> EntityLiveRowRef<'a> {
 
     fn durable_predecessor(
         self,
-    ) -> Option<&'a crate::live_state::CertifiedCurrentStatePredecessor> {
+    ) -> Option<&'a crate::hot_state::CertifiedCurrentStatePredecessor> {
         match self {
             Self::Owned(_) => None,
             Self::Batch(row) => row.durable_predecessor(),
@@ -1565,14 +1565,14 @@ impl<'a> EntityLiveRowRef<'a> {
     }
 }
 
-impl<'a> From<&'a MaterializedLiveStateRow> for EntityLiveRowRef<'a> {
-    fn from(row: &'a MaterializedLiveStateRow) -> Self {
+impl<'a> From<&'a MaterializedHotStateRow> for EntityLiveRowRef<'a> {
+    fn from(row: &'a MaterializedHotStateRow) -> Self {
         Self::Owned(row)
     }
 }
 
-impl<'a> From<MaterializedLiveStateRowRef<'a>> for EntityLiveRowRef<'a> {
-    fn from(row: MaterializedLiveStateRowRef<'a>) -> Self {
+impl<'a> From<MaterializedHotStateRowRef<'a>> for EntityLiveRowRef<'a> {
+    fn from(row: MaterializedHotStateRowRef<'a>) -> Self {
         Self::Batch(row)
     }
 }
@@ -3239,15 +3239,15 @@ pub(crate) async fn prepare_path_value_replacement_row(
     let primary_key = program.primary_key(params)?;
     let entity_pk = EntityPk::single(primary_key.to_owned());
     let candidates = ctx
-        .scan_live_state_batch(&LiveStateScanRequest {
-            filter: LiveStateFilter {
+        .scan_hot_state_batch(&HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec![program.schema_key.clone()],
                 entity_pks: vec![entity_pk.clone()],
                 branch_ids: vec![ctx.active_branch_id().to_owned()],
                 include_tombstones: false,
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
-            ..LiveStateScanRequest::default()
+            ..HotStateScanRequest::default()
         })
         .await?;
     if candidates.is_empty() {
@@ -3533,7 +3533,7 @@ fn entity_staged_returning_identity(
     ))
 }
 
-fn entity_live_returning_identity(row: MaterializedLiveStateRowRef<'_>) -> EntityReturningIdentity {
+fn entity_live_returning_identity(row: MaterializedHotStateRowRef<'_>) -> EntityReturningIdentity {
     (
         row.entity_pk().clone(),
         row.file_id().map(ToOwned::to_owned),
@@ -4022,8 +4022,8 @@ fn insert_row_entity_pk(
 fn find_conflict_candidate<'a>(
     insert_row: RawWriteRowRef<'_>,
     inserted_entity_pk: &EntityPk,
-    candidates: &'a MaterializedLiveStateBatch,
-) -> Option<MaterializedLiveStateRowRef<'a>> {
+    candidates: &'a MaterializedHotStateBatch,
+) -> Option<MaterializedHotStateRowRef<'a>> {
     candidates.iter().find(|candidate| {
         candidate_matches_insert_identity(*candidate, insert_row, inserted_entity_pk)
     })
@@ -4045,7 +4045,7 @@ async fn scan_entity_conflict_candidates(
     ctx: &mut dyn SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
     insert_rows: &RawWriteBatch,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     let mut branch_ids = std::collections::BTreeSet::new();
     let mut entity_pks = std::collections::BTreeSet::new();
     let mut file_ids = std::collections::BTreeSet::new();
@@ -4067,16 +4067,16 @@ async fn scan_entity_conflict_candidates(
     // of SQL conflict identity. A tracked INSERT therefore conflicts with an
     // existing untracked row (and vice versa); `DO UPDATE` then preserves the
     // existing row's retention through `append_entity_replace_row_from_live`.
-    ctx.scan_live_state_batch(&LiveStateScanRequest {
-        filter: LiveStateFilter {
+    ctx.scan_hot_state_batch(&HotStateScanRequest {
+        filter: HotStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             entity_pks: entity_pks.into_iter().collect(),
             branch_ids: branch_ids.into_iter().map(Into::into).collect(),
             file_ids,
             include_tombstones: false,
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         },
-        ..LiveStateScanRequest::default()
+        ..HotStateScanRequest::default()
     })
     .await
 }
@@ -4086,26 +4086,26 @@ async fn scan_entity_candidates(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     let branch_ids = scan_branch_ids(&plan.bound.branch_scope)?;
-    let mut request = LiveStateScanRequest {
-        filter: LiveStateFilter {
+    let mut request = HotStateScanRequest {
+        filter: HotStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             branch_ids,
             include_tombstones: false,
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         },
-        ..LiveStateScanRequest::default()
+        ..HotStateScanRequest::default()
     };
     if let Some(entity_pks) =
         bound_entity_pks_from_primary_key_predicate(spec, &plan.bound.predicate, params)
     {
         if entity_pks.is_empty() {
-            request.filter.rows = LiveStateRowFilter::None;
+            request.filter.rows = HotStateRowFilter::None;
         }
         request.filter.entity_pks = entity_pks;
     }
-    ctx.scan_live_state_batch(&request).await
+    ctx.scan_hot_state_batch(&request).await
 }
 
 async fn scan_entity_candidates_for_pks(
@@ -4114,23 +4114,23 @@ async fn scan_entity_candidates_for_pks(
     spec: &EntitySurfaceSpec,
     entity_pks: Vec<EntityPk>,
     metadata_only: bool,
-) -> Result<MaterializedLiveStateBatch, LixError> {
-    ctx.scan_live_state_batch(&LiveStateScanRequest {
-        filter: LiveStateFilter {
+) -> Result<MaterializedHotStateBatch, LixError> {
+    ctx.scan_hot_state_batch(&HotStateScanRequest {
+        filter: HotStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             entity_pks,
             branch_ids: scan_branch_ids(&plan.bound.branch_scope)?,
             include_tombstones: false,
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         },
         projection: if metadata_only {
-            LiveStateProjection {
+            HotStateProjection {
                 columns: vec!["metadata".to_string()],
             }
         } else {
-            LiveStateProjection::default()
+            HotStateProjection::default()
         },
-        ..LiveStateScanRequest::default()
+        ..HotStateScanRequest::default()
     })
     .await
 }

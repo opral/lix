@@ -57,7 +57,7 @@ pub(crate) mod gc;
 mod handle;
 pub(crate) mod init;
 pub(crate) mod json_store;
-pub(crate) mod live_state;
+pub(crate) mod hot_state;
 /// The declared module layer order and the test that enforces it. Test-only:
 /// it contains no engine code, just the layering artifact and its guard.
 #[cfg(test)]

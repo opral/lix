@@ -1,7 +1,7 @@
-//! Anatomy of a `live_state.hot_row.v21` row, and what two branches share.
+//! Anatomy of a `hot_state.row.v21` row, and what two branches share.
 //!
 //! Experiment T attributed 95.4% of the two-branch storage delta to
-//! `live_state.hot_row.v21` and showed that two branches making *identical*
+//! `hot_state.row.v21` and showed that two branches making *identical*
 //! edits pay the same as two branches making *disjoint* edits. This tool
 //! answers the follow-up questions directly on the bytes:
 //!
@@ -49,7 +49,7 @@ fn pad() -> String {
     PAD_UNIT.repeat(bytes.div_ceil(PAD_UNIT.len()))[..bytes].to_owned()
 }
 
-// Mirrors `live_state::tracked_head` value codec v8. Asserted against the
+// Mirrors `hot_state::tracked_head` value codec v8. Asserted against the
 // version byte of every scanned row, so a codec change fails loudly here.
 const HEAD_VALUE_VERSION: u8 = 8;
 const HEAD_VALUE_HEADER_BYTES: usize = 59;

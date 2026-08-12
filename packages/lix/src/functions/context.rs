@@ -131,15 +131,15 @@ mod tests {
     use crate::entity_pk::EntityPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
-    use crate::live_state::LiveStateContext;
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext};
+    use crate::hot_state::HotStateContext;
+    use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
 
-    fn live_state_context() -> LiveStateContext {
-        LiveStateContext::new(
+    fn hot_state_context() -> HotStateContext {
+        HotStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
@@ -246,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn persist_if_needed_writes_sequence_when_deterministic_functions_advanced() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
             storage.clone(),
@@ -292,9 +292,9 @@ mod tests {
         // Deterministic mode must stamp the bookkeeping row from the
         // persisted sequence, never from the system clock; the persisted
         // sequence was empty, so next_sequence is 0 -> epoch.
-        let row = live_state
+        let row = hot_state
             .reader(&read)
-            .load_row(&crate::live_state::LiveStateRowRequest {
+            .load_row(&crate::hot_state::HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),

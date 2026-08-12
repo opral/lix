@@ -24,9 +24,9 @@ use crate::commit_graph::CommitGraphContext;
 use crate::json_store::JsonRef;
 #[cfg(test)]
 use crate::json_store::{JsonSlot, JsonStoreContext};
-use crate::live_state::TrackedHeadContext;
+use crate::hot_state::TrackedHeadContext;
 #[cfg(test)]
-use crate::live_state::stage_collect_stale_working_diff_indexes;
+use crate::hot_state::stage_collect_stale_working_diff_indexes;
 #[cfg(test)]
 use crate::storage_adapter::StorageCoreProjection;
 use crate::storage_adapter::{
@@ -1935,7 +1935,7 @@ where
                 crate::columnar_row_group::stage_delete_row_group_set(
                     store,
                     writes,
-                    crate::live_state::entity_row_group_set_id(*commit_id, schema_key),
+                    crate::hot_state::entity_row_group_set_id(*commit_id, schema_key),
                 )
                 .await?;
             }
@@ -2137,7 +2137,7 @@ mod tests {
         JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
         NormalizedJsonRef,
     };
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
+    use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
         StorageKey, StorageReadOptions, StorageSpace, StorageValue,
@@ -5032,7 +5032,7 @@ mod tests {
         for commit_id in [live_parent, dead_commit] {
             crate::columnar_row_group::stage_row_group_set(
                 &mut writes,
-                crate::live_state::entity_row_group_set_id(commit_id, "authority_gc"),
+                crate::hot_state::entity_row_group_set_id(commit_id, "authority_gc"),
                 &sidecar,
             )
             .expect("stage GC sidecar");
@@ -5164,7 +5164,7 @@ mod tests {
         assert!(
             crate::columnar_row_group::load_row_group_manifest(
                 &read,
-                crate::live_state::entity_row_group_set_id(live_parent, "authority_gc"),
+                crate::hot_state::entity_row_group_set_id(live_parent, "authority_gc"),
             )
             .await
             .expect("load live sidecar")
@@ -5174,7 +5174,7 @@ mod tests {
         assert!(
             crate::columnar_row_group::load_row_group_manifest(
                 &read,
-                crate::live_state::entity_row_group_set_id(dead_commit, "authority_gc"),
+                crate::hot_state::entity_row_group_set_id(dead_commit, "authority_gc"),
             )
             .await
             .expect("load retained authority sidecar")
@@ -5453,14 +5453,14 @@ mod tests {
             .await
             .expect("generation census read should open");
         let prefix = crate::storage_adapter::StoragePrefix {
-            bytes: Bytes::from(crate::live_state::hot_generation_scope_prefix(
+            bytes: Bytes::from(crate::hot_state::hot_generation_scope_prefix(
                 branch_id, generation,
             )),
         };
         let mut rows = 0;
         let mut cursor = crate::storage_adapter::StorageAdapterRead::begin_scan(
             &read,
-            crate::live_state::HOT_ROW_SPACE,
+            crate::hot_state::ROW_SPACE,
             prefix.to_range().expect("generation prefix should range"),
             crate::storage_adapter::StorageBeginScanOptions::default(),
         )

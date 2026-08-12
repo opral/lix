@@ -28,7 +28,7 @@ pub(crate) const ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
     "lix.entity_columnar.layout_fingerprint.v1";
 pub(crate) const ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.entity_columnar.base_coordinates.v1";
-pub(crate) use crate::live_state::{
+pub(crate) use crate::hot_state::{
     ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
 };
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;

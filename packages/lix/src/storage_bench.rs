@@ -2602,16 +2602,16 @@ pub async fn current_image_cas_oracle_accounting<R>(
 where
     R: StorageAdapterRead,
 {
-    use crate::live_state::LiveStateScanRequest;
+    use crate::hot_state::HotStateScanRequest;
 
-    let live_state = crate::live_state::LiveStateContext::new(
+    let hot_state = crate::hot_state::HotStateContext::new(
         crate::tracked_state::TrackedStateContext::new(),
         crate::commit_graph::CommitGraphContext::new(),
     );
-    let current_rows = live_state
+    let current_rows = hot_state
         .reader(read)
-        .scan_batch(&LiveStateScanRequest {
-            filter: crate::live_state::LiveStateFilter {
+        .scan_batch(&HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
                 schema_keys: vec!["lix_binary_blob_ref".to_owned()],
                 ..Default::default()
             },

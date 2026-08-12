@@ -16,7 +16,7 @@ use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance,
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonRef;
-use crate::live_state::{CertifiedCurrentStatePredecessor, MaterializedLiveStateRow};
+use crate::hot_state::{CertifiedCurrentStatePredecessor, MaterializedHotStateRow};
 use crate::tracked_state::OrderedAddressableCommitDeltaStage;
 use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
 use bytes::Bytes;
@@ -2860,7 +2860,7 @@ pub(crate) struct StagedIndexRow {
     /// not extraction found a value, so dropping the `None` entries would
     /// silently narrow witness coverage and leave a column permanently
     /// unwitnessed — a slow read, not a wrong one, but an invisible one.
-    pub(crate) columns: Vec<(u16, Option<crate::live_state::HotIndexValue>)>,
+    pub(crate) columns: Vec<(u16, Option<crate::hot_state::HotIndexValue>)>,
 }
 
 /// Everything the commit-time hot index hook needs, produced by validation.
@@ -4150,7 +4150,7 @@ impl PartialEq for PreparedStateRowRef<'_> {
 
 impl Eq for PreparedStateRowRef<'_> {}
 
-impl From<PreparedStateRowRef<'_>> for MaterializedLiveStateRow {
+impl From<PreparedStateRowRef<'_>> for MaterializedHotStateRow {
     fn from(row: PreparedStateRowRef<'_>) -> Self {
         Self {
             entity_pk: row.entity_pk.clone(),
@@ -4171,7 +4171,7 @@ impl From<PreparedStateRowRef<'_>> for MaterializedLiveStateRow {
 }
 
 #[cfg(test)]
-impl From<TestPreparedStateRow> for MaterializedLiveStateRow {
+impl From<TestPreparedStateRow> for MaterializedHotStateRow {
     fn from(row: TestPreparedStateRow) -> Self {
         let deleted = row.snapshot.is_none();
         Self {
@@ -4193,7 +4193,7 @@ impl From<TestPreparedStateRow> for MaterializedLiveStateRow {
 }
 
 #[cfg(test)]
-impl From<&TestPreparedStateRow> for MaterializedLiveStateRow {
+impl From<&TestPreparedStateRow> for MaterializedHotStateRow {
     fn from(row: &TestPreparedStateRow) -> Self {
         Self {
             entity_pk: row.entity_pk.clone(),

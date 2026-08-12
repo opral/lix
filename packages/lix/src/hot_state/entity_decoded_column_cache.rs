@@ -38,7 +38,7 @@ struct CacheInner {
     changes: watch::Sender<u64>,
     max_bytes: usize,
     max_entries: usize,
-    array_budget: Arc<crate::live_state::EntityColumnarArrayBudget>,
+    array_budget: Arc<crate::hot_state::EntityColumnarArrayBudget>,
     #[cfg(test)]
     waiter_observed: tokio::sync::Notify,
 }
@@ -75,12 +75,12 @@ impl EntityDecodedColumnCache {
         Self::with_limits_and_budget(
             max_bytes,
             max_entries,
-            Arc::new(crate::live_state::EntityColumnarArrayBudget::new(max_bytes)),
+            Arc::new(crate::hot_state::EntityColumnarArrayBudget::new(max_bytes)),
         )
     }
 
     pub(crate) fn with_array_budget(
-        array_budget: Arc<crate::live_state::EntityColumnarArrayBudget>,
+        array_budget: Arc<crate::hot_state::EntityColumnarArrayBudget>,
     ) -> Self {
         Self::with_limits_and_budget(
             DECODED_COLUMN_CACHE_MAX_BYTES,
@@ -92,7 +92,7 @@ impl EntityDecodedColumnCache {
     fn with_limits_and_budget(
         max_bytes: usize,
         max_entries: usize,
-        array_budget: Arc<crate::live_state::EntityColumnarArrayBudget>,
+        array_budget: Arc<crate::hot_state::EntityColumnarArrayBudget>,
     ) -> Self {
         let (changes, _) = watch::channel(0);
         Self {
@@ -783,11 +783,11 @@ mod tests {
     async fn shared_budget_bounds_exact_batch_and_decoded_layers() {
         let resident_array = array(0);
         let bytes = resident_array.get_array_memory_size();
-        let budget = Arc::new(crate::live_state::EntityColumnarArrayBudget::new(bytes));
-        let mut exact = crate::live_state::EntityColumnarShadowMaskCache::with_array_budget(
+        let budget = Arc::new(crate::hot_state::EntityColumnarArrayBudget::new(bytes));
+        let mut exact = crate::hot_state::EntityColumnarShadowMaskCache::with_array_budget(
             Arc::clone(&budget),
         );
-        let shadow = crate::live_state::EntityColumnarShadowMaskKey {
+        let shadow = crate::hot_state::EntityColumnarShadowMaskKey {
             row_groups: RowGroupSetId::new([18; 16]),
             branch_id: Arc::from("main"),
             head_commit_id: crate::changelog::CommitId::for_test_label(
@@ -837,13 +837,13 @@ mod tests {
     #[tokio::test]
     async fn dropping_one_cache_releases_capacity_to_its_sibling() {
         let bytes = array(0).get_array_memory_size();
-        let budget = Arc::new(crate::live_state::EntityColumnarArrayBudget::new(bytes));
+        let budget = Arc::new(crate::hot_state::EntityColumnarArrayBudget::new(bytes));
         {
-            let mut exact = crate::live_state::EntityColumnarShadowMaskCache::with_array_budget(
+            let mut exact = crate::hot_state::EntityColumnarShadowMaskCache::with_array_budget(
                 Arc::clone(&budget),
             );
             exact.insert_batch(
-                crate::live_state::EntityColumnarShadowMaskKey {
+                crate::hot_state::EntityColumnarShadowMaskKey {
                     row_groups: RowGroupSetId::new([21; 16]),
                     branch_id: Arc::from("main"),
                     head_commit_id: crate::changelog::CommitId::for_test_label(

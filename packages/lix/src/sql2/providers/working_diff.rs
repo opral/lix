@@ -12,7 +12,7 @@ use crate::branch::{BranchHeadControlContext, BranchRefReader};
 use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_commit_id_at_head};
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
-use crate::live_state::TrackedHeadContext;
+use crate::hot_state::TrackedHeadContext;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;

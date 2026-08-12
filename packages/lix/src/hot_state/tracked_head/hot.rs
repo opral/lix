@@ -29,14 +29,14 @@ use crate::wasm::WasmCertifiedEntityBatch;
 
 use super::*;
 
-pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v21";
-pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
-pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
-pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
-pub(crate) const HOT_INDEX_NAMESPACE: &str = "live_state.hot_index.v1";
-pub(crate) const HOT_ROW_SPACE: StorageSpace = StorageSpace::declare(
+pub(crate) const ROW_NAMESPACE: &str = "hot_state.row.v21";
+pub(crate) const FILE_NAMESPACE: &str = "hot_state.file_schema.v18";
+pub(crate) const DIFF_NAMESPACE: &str = "hot_state.diff.v17";
+pub(crate) const COLLECTION_CONTROL_NAMESPACE: &str = "hot_state.collection_control.v1";
+pub(crate) const INDEX_NAMESPACE: &str = "hot_state.index.v1";
+pub(crate) const ROW_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_001b),
-    HOT_ROW_NAMESPACE,
+    ROW_NAMESPACE,
     ValueSemantics::Mutable,
 );
 /// Conservative `(branch, generation, schema)` file-membership markers.
@@ -44,15 +44,15 @@ pub(crate) const HOT_ROW_SPACE: StorageSpace = StorageSpace::declare(
 /// The authoritative hot row owns every value and file identity. Markers are
 /// never removed within a generation, so they may produce a harmless false
 /// positive after the last file member is deleted but cannot hide live rows.
-pub(crate) const HOT_FILE_SPACE: StorageSpace = StorageSpace::declare(
+pub(crate) const FILE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_001c),
-    HOT_FILE_NAMESPACE,
+    FILE_NAMESPACE,
     ValueSemantics::Mutable,
 );
 /// Reserved for the row-level first-before working-diff index.
-pub(crate) const HOT_DIFF_SPACE: StorageSpace = StorageSpace::declare(
+pub(crate) const DIFF_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_001d),
-    HOT_DIFF_NAMESPACE,
+    DIFF_NAMESPACE,
     ValueSemantics::Mutable,
 );
 /// Declared-column access path over the hot rows: `value -> entity_pk`.
@@ -72,7 +72,7 @@ pub(crate) const HOT_DIFF_SPACE: StorageSpace = StorageSpace::declare(
 ///
 /// **Maintenance is put-only, and the invariant is "never a false negative".**
 /// An entry is written when a row's indexed value is written and is never
-/// deleted when that value is superseded, exactly as [`HOT_FILE_SPACE`]
+/// deleted when that value is superseded, exactly as [`FILE_SPACE`]
 /// markers behave. A superseded or deleted row therefore leaves a stale entry
 /// behind, so a lookup returns *candidates*, never answers. Candidates are
 /// resolved through the ordinary exact-entity-pk read and re-checked by the
@@ -80,14 +80,14 @@ pub(crate) const HOT_DIFF_SPACE: StorageSpace = StorageSpace::declare(
 /// changed row with no pre-image read, which is in turn what keeps write cost
 /// flat in collection size — the property this whole plane exists to buy on
 /// the read side.
-pub(crate) const HOT_INDEX_SPACE: StorageSpace = StorageSpace::declare(
+pub(crate) const INDEX_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0033),
-    HOT_INDEX_NAMESPACE,
+    INDEX_NAMESPACE,
     ValueSemantics::Mutable,
 );
-pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
+pub(crate) const COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0023),
-    HOT_COLLECTION_CONTROL_NAMESPACE,
+    COLLECTION_CONTROL_NAMESPACE,
     ValueSemantics::Mutable,
 );
 /// Generation-local immutable current-state bases.
@@ -97,12 +97,12 @@ pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::decl
 /// into `HOT_ROW`; later updates and deletes remain sparse HOT overlays.
 pub(crate) const PACKED_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0024),
-    "live_state.packed_current_base.v1",
+    "hot_state.packed_current_base.v1",
     ValueSemantics::Mutable,
 );
 pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0025),
-    "live_state.packed_current_base_control.v1",
+    "hot_state.packed_current_base_control.v1",
     ValueSemantics::Mutable,
 );
 /// Generation-local index of packed bases containing exactly one schema.
@@ -112,7 +112,7 @@ pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace:
 /// schemas.
 pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0027),
-    "live_state.packed_current_exclusive_schema_base.v1",
+    "hot_state.packed_current_exclusive_schema_base.v1",
     ValueSemantics::Mutable,
 );
 /// One immutable tracked-state root used as the baseline for a sparse branch
@@ -120,7 +120,7 @@ pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = Stor
 /// copying every tracked row into branch-local HOT storage.
 pub(crate) const ROOT_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0028),
-    "live_state.root_current_base.v1",
+    "hot_state.root_current_base.v1",
     ValueSemantics::Mutable,
 );
 const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
@@ -136,22 +136,22 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
 pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_001f),
-    "live_state.certified_entity_batch.v1",
+    "hot_state.certified_entity_batch.v1",
     ValueSemantics::Mutable,
 );
 pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0021),
-    "live_state.certified_entity_batch_manifest.v1",
+    "hot_state.certified_entity_batch_manifest.v1",
     ValueSemantics::Mutable,
 );
 pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0022),
-    "live_state.certified_entity_batch_page.v1",
+    "hot_state.certified_entity_batch_page.v1",
     ValueSemantics::Mutable,
 );
 const DEFERRED_FRESH_HOT_ROWS_PER_PAGE: usize = 4_096;
 const DEFERRED_FRESH_HOT_SPACES: [StorageSpace; 3] =
-    [HOT_ROW_SPACE, HOT_FILE_SPACE, HOT_DIFF_SPACE];
+    [ROW_SPACE, FILE_SPACE, DIFF_SPACE];
 
 pub(crate) struct DeferredFreshHotRowRef<'a> {
     pub(crate) branch_id: &'a str,
@@ -355,7 +355,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
             if !self.plan.file_schema_keys.is_empty() {
                 let scope = hot_scope_prefix(&self.plan.branch_id, self.plan.generation);
                 return Some(DeferredFinalPutPage {
-                    space: HOT_FILE_SPACE,
+                    space: FILE_SPACE,
                     entries: PutBatch {
                         entries: self
                             .plan
@@ -474,7 +474,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
         }
         if !diff_key_ranges.is_empty() {
             self.pending_pages.push_back(DeferredFinalPutPage {
-                space: HOT_DIFF_SPACE,
+                space: DIFF_SPACE,
                 entries: PutBatch {
                     entries: diff_key_ranges
                         .into_iter()
@@ -489,7 +489,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
             });
         }
         Some(DeferredFinalPutPage {
-            space: HOT_ROW_SPACE,
+            space: ROW_SPACE,
             entries: PutBatch {
                 entries: row_entries,
             },
@@ -1022,9 +1022,9 @@ async fn scan_certified_entity_batch_rows(
     request: &TrackedStateScanRequest,
     limit: Option<usize>,
     transaction_cache: Option<&HotStateTransactionCache>,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     if matches!(limit, Some(0)) {
-        return Ok(MaterializedLiveStateBatch::default());
+        return Ok(MaterializedHotStateBatch::default());
     }
     let exact_file_ids = (!request.filter.file_ids.is_empty()
         && !request
@@ -1047,7 +1047,7 @@ async fn scan_certified_entity_batch_rows(
         && let Some(cache) = transaction_cache
         && cache.certified_generation_absent(generation)?
     {
-        return Ok(MaterializedLiveStateBatch::default());
+        return Ok(MaterializedHotStateBatch::default());
     }
     let mut manifest_entries = Vec::new();
     if let Some(file_ids) = exact_file_ids.as_ref() {
@@ -1093,7 +1093,7 @@ async fn scan_certified_entity_batch_rows(
         if let Some(cache) = transaction_cache {
             cache.remember_certified_generation_absent(generation)?;
         }
-        return Ok(MaterializedLiveStateBatch::default());
+        return Ok(MaterializedHotStateBatch::default());
     }
     let content_keys = manifest_entries
         .into_iter()
@@ -1142,7 +1142,7 @@ async fn scan_certified_entity_batch_rows(
                 .push((page_index, full_value_bytes(value)?));
         }
     }
-    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(
+    let mut builder = MaterializedHotStateBatchBuilder::with_capacity(
         limit.unwrap_or_else(|| decode_inputs.len().saturating_mul(1024)),
     );
     for (value, external_pages) in decode_inputs {
@@ -1180,7 +1180,7 @@ async fn scan_certified_entity_batch_rows(
             std::collections::btree_map::Entry::Occupied(_) => {}
         }
     }
-    let mut rows = MaterializedLiveStateBatch::from_rows(winners.into_values().collect());
+    let mut rows = MaterializedHotStateBatch::from_rows(winners.into_values().collect());
     if let Some(limit) = limit {
         rows = rows.filter(|_| true, Some(limit));
     }
@@ -1191,7 +1191,7 @@ pub(crate) async fn scan_certified_history_rows(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_ids: &BTreeSet<CommitId>,
     request: &TrackedStateScanRequest,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+) -> Result<Vec<MaterializedHotStateRow>, LixError> {
     if commit_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1201,7 +1201,7 @@ pub(crate) async fn scan_certified_history_rows(
         .iter()
         .any(|column| column == "snapshot_content");
     let filter_index = CertifiedScanFilterIndex::new(request);
-    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(commit_ids.len() * 1024);
+    let mut builder = MaterializedHotStateBatchBuilder::with_capacity(commit_ids.len() * 1024);
     for commit_id in commit_ids {
         let range = StoragePrefix {
             bytes: Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()),
@@ -1275,7 +1275,7 @@ pub(crate) async fn load_certified_rows_at_commit(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: &str,
     keys: &[TrackedStateKey],
-) -> Result<BTreeMap<TrackedStateKey, MaterializedLiveStateRow>, LixError> {
+) -> Result<BTreeMap<TrackedStateKey, MaterializedHotStateRow>, LixError> {
     if keys.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -1344,7 +1344,7 @@ pub(crate) fn materialize_certified_root_rows(
     commit_id: CommitId,
     timestamp: LixTimestamp,
     batch: &WasmCertifiedEntityBatch,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     let schema_bytes = batch
         .schema_keys
         .iter()
@@ -1400,7 +1400,7 @@ pub(crate) fn materialize_certified_root_rows(
     let filter_index = CertifiedScanFilterIndex::new(&request);
     let row_count = usize::try_from(batch.row_count)
         .map_err(|_| head_value_error("certified root row count exceeds usize"))?;
-    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(row_count);
+    let mut builder = MaterializedHotStateBatchBuilder::with_capacity(row_count);
     decode_certified_entity_batch_rows(
         &header,
         &pages,
@@ -1500,7 +1500,7 @@ fn decode_certified_entity_batch_rows(
     filter_index: &CertifiedScanFilterIndex,
     needs_snapshot: bool,
     limit: Option<usize>,
-    builder: &mut MaterializedLiveStateBatchBuilder,
+    builder: &mut MaterializedHotStateBatchBuilder,
 ) -> Result<(), LixError> {
     let mut input = CertifiedBatchReader::new(bytes)?;
     let schema_count = input.u16()? as usize;
@@ -1713,7 +1713,7 @@ fn decode_certified_packet_rows(
     needs_snapshot: bool,
     limit: Option<usize>,
     base_ordinal: u64,
-    builder: &mut MaterializedLiveStateBatchBuilder,
+    builder: &mut MaterializedHotStateBatchBuilder,
 ) -> Result<u64, LixError> {
     let mut input = CertifiedPacketReader {
         bytes: page,
@@ -2296,7 +2296,7 @@ async fn load_stored_hot_collection_control(
         branch_generation,
         scope,
     )));
-    let value = PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &[key])
+    let value = PointReadPlan::new(COLLECTION_CONTROL_SPACE, &[key])
         .materialize(store, StorageGetOptions::default())
         .await?
         .value
@@ -2327,7 +2327,7 @@ async fn load_hot_collection_visibility_control(
         branch_generation,
         scope,
     )));
-    let value = PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &[key])
+    let value = PointReadPlan::new(COLLECTION_CONTROL_SPACE, &[key])
         .materialize(store, StorageGetOptions::default())
         .await?
         .value
@@ -2446,7 +2446,7 @@ async fn load_stored_hot_collection_controls(
             )))
         })
         .collect::<Vec<_>>();
-    let values = PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &keys)
+    let values = PointReadPlan::new(COLLECTION_CONTROL_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?
         .value;
@@ -2474,7 +2474,7 @@ fn stage_hot_collection_control(
     control: HotCollectionControl,
 ) -> Result<(), LixError> {
     writes.put(
-        HOT_COLLECTION_CONTROL_SPACE,
+        COLLECTION_CONTROL_SPACE,
         StorageKey(Bytes::from(hot_collection_control_key(
             branch_id,
             branch_generation,
@@ -3033,11 +3033,11 @@ const ENTITY_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES: usize = 128 * 1024 * 1024;
 const ENTITY_COLUMNAR_OVERLAY_OUTPUT_ADMISSION_BYTES: usize = 128 * 1024 * 1024;
 
 fn materialized_columnar_overlay_admission_bytes(
-    rows: &MaterializedLiveStateBatch,
+    rows: &MaterializedHotStateBatch,
 ) -> Result<usize, LixError> {
     rows.iter().try_fold(0_usize, |bytes, row| {
         bytes
-            .checked_add(size_of::<MaterializedLiveStateRow>())
+            .checked_add(size_of::<MaterializedHotStateRow>())
             .and_then(|bytes| bytes.checked_add(row.schema_key().len()))
             .and_then(|bytes| bytes.checked_add(row.file_id().map_or(0, str::len)))
             .and_then(|bytes| bytes.checked_add(row.branch_id().len()))
@@ -3345,7 +3345,7 @@ fn packed_current_base_working_diff_baseline(
 }
 
 fn push_root_current_base_row(
-    rows: &mut MaterializedLiveStateBatchBuilder,
+    rows: &mut MaterializedHotStateBatchBuilder,
     row: crate::tracked_state::MaterializedTrackedStateRowRef<'_>,
     branch_id: &str,
     active_checkpoint_commit_id: Option<CommitId>,
@@ -3393,10 +3393,10 @@ async fn scan_root_current_base_rows(
     generation: CommitId,
     active_checkpoint_commit_id: Option<CommitId>,
     request: &TrackedStateScanRequest,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
     else {
-        return Ok(MaterializedLiveStateBatch::default());
+        return Ok(MaterializedHotStateBatch::default());
     };
     let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
     let tracked =
@@ -3436,7 +3436,7 @@ async fn scan_root_current_base_rows(
         .zip(stored_control_values)
         .filter_map(|(scope, control)| control.map(|control| (scope, control)))
         .collect::<BTreeMap<_, _>>();
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(tracked.len());
+    let mut rows = MaterializedHotStateBatchBuilder::with_capacity(tracked.len());
     for row in tracked.iter() {
         if !root_tracked_row_is_active(row, generation, &active_generations, &stored_controls) {
             continue;
@@ -3453,10 +3453,10 @@ async fn scan_root_current_base_rows_for_merge(
     active_checkpoint_commit_id: Option<CommitId>,
     request: &TrackedStateScanRequest,
     other_candidate_count: usize,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
     else {
-        return Ok(MaterializedLiveStateBatch::default());
+        return Ok(MaterializedHotStateBatch::default());
     };
     let exact_scopes = (!request.filter.schema_keys.is_empty()
         && !request.filter.file_ids.is_empty()
@@ -3503,7 +3503,7 @@ async fn scan_root_current_base_rows_for_merge(
             .to_range()?;
             let mut cursor = store
                 .begin_scan(
-                    HOT_COLLECTION_CONTROL_SPACE,
+                    COLLECTION_CONTROL_SPACE,
                     range,
                     StorageBeginScanOptions::default(),
                 )
@@ -3522,7 +3522,7 @@ async fn scan_root_current_base_rows_for_merge(
                 .to_range()?;
                 let mut cursor = store
                     .begin_scan(
-                        HOT_COLLECTION_CONTROL_SPACE,
+                        COLLECTION_CONTROL_SPACE,
                         range,
                         StorageBeginScanOptions::default(),
                     )
@@ -3594,11 +3594,11 @@ async fn load_root_current_base_exact(
     active_checkpoint_commit_id: Option<CommitId>,
     keys: &[TrackedStateKeyRef<'_>],
     projection: ChangeRecordProjection,
-) -> Result<MaterializedLiveStateExactBatch, LixError> {
+) -> Result<MaterializedHotStateExactBatch, LixError> {
     let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
     else {
-        return MaterializedLiveStateExactBatch::new(
-            MaterializedLiveStateBatch::default(),
+        return MaterializedHotStateExactBatch::new(
+            MaterializedHotStateBatch::default(),
             vec![None; keys.len()],
         );
     };
@@ -3644,7 +3644,7 @@ async fn load_root_current_base_exact(
         .zip(stored_control_values)
         .filter_map(|(scope, control)| control.map(|control| (scope, control)))
         .collect::<BTreeMap<_, _>>();
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
+    let mut rows = MaterializedHotStateBatchBuilder::with_capacity(keys.len());
     let mut slots = Vec::with_capacity(keys.len());
     for index in 0..tracked.len() {
         slots.push(
@@ -3671,7 +3671,7 @@ async fn load_root_current_base_exact(
                 }),
         );
     }
-    MaterializedLiveStateExactBatch::new(rows.finish(), slots)
+    MaterializedHotStateExactBatch::new(rows.finish(), slots)
 }
 
 async fn load_root_active_collection_generations<'a>(
@@ -3806,13 +3806,13 @@ async fn scan_packed_current_base_rows(
     generation: CommitId,
     request: &TrackedStateScanRequest,
     limit: Option<usize>,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     if matches!(limit, Some(0)) {
-        return Ok(MaterializedLiveStateBatch::default());
+        return Ok(MaterializedHotStateBatch::default());
     }
     let base_refs = packed_current_base_refs(store, branch_id, generation).await?;
     if base_refs.is_empty() {
-        return Ok(MaterializedLiveStateBatch::default());
+        return Ok(MaterializedHotStateBatch::default());
     }
     if request.read_columns.columns.as_slice() == ["commit_id"] {
         return scan_packed_current_base_provenance_rows(
@@ -3959,7 +3959,7 @@ async fn scan_packed_current_base_rows(
     let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
     let winner_rows = ordered_winners.unwrap_or_else(|| winners.into_values().collect::<Vec<_>>());
     let row_capacity = limit.map_or(winner_rows.len(), |limit| limit.min(winner_rows.len()));
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(row_capacity);
+    let mut rows = MaterializedHotStateBatchBuilder::with_capacity(row_capacity);
     let mut json_refs = Vec::new();
     let mut deferred = Vec::new();
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
@@ -4038,7 +4038,7 @@ async fn scan_packed_current_base_provenance_rows(
     base_refs: Vec<PackedCurrentBaseRef>,
     request: &TrackedStateScanRequest,
     limit: Option<usize>,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     let mut winners = BTreeMap::new();
     for base_ref in base_refs {
         let compact = crate::tracked_state::scan_commit_delta_values(
@@ -4080,7 +4080,7 @@ async fn scan_packed_current_base_provenance_rows(
     }
 
     let row_capacity = limit.map_or(winners.len(), |limit| limit.min(winners.len()));
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(row_capacity);
+    let mut rows = MaterializedHotStateBatchBuilder::with_capacity(row_capacity);
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
     for ((schema_key, entity_pk, file_id), value) in winners.into_iter().take(row_capacity) {
         rows.push_materialized(
@@ -4110,10 +4110,10 @@ async fn load_packed_current_base_exact(
     keys: &[TrackedStateKeyRef<'_>],
     projection: ChangeRecordProjection,
     transaction_cache: Option<&HotStateTransactionCache>,
-) -> Result<MaterializedLiveStateExactBatch, LixError> {
+) -> Result<MaterializedHotStateExactBatch, LixError> {
     if keys.is_empty() {
-        return MaterializedLiveStateExactBatch::new(
-            MaterializedLiveStateBatch::default(),
+        return MaterializedHotStateExactBatch::new(
+            MaterializedHotStateBatch::default(),
             Vec::new(),
         );
     }
@@ -4126,7 +4126,7 @@ async fn load_packed_current_base_exact(
     )
     .await?;
 
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
+    let mut rows = MaterializedHotStateBatchBuilder::with_capacity(keys.len());
     let mut slots = Vec::with_capacity(keys.len());
     let mut json_refs = Vec::new();
     let mut deferred = Vec::new();
@@ -4220,7 +4220,7 @@ async fn load_packed_current_base_exact(
             }
         }
     }
-    MaterializedLiveStateExactBatch::new(rows.finish(), slots)
+    MaterializedHotStateExactBatch::new(rows.finish(), slots)
 }
 
 async fn load_packed_current_base_exact_entries(
@@ -4325,8 +4325,8 @@ async fn load_packed_current_base_exact_entries(
 }
 
 fn compare_materialized_live_identities(
-    left: &MaterializedLiveStateRow,
-    right: &MaterializedLiveStateRow,
+    left: &MaterializedHotStateRow,
+    right: &MaterializedHotStateRow,
 ) -> Ordering {
     left.schema_key
         .cmp(&right.schema_key)
@@ -4343,9 +4343,9 @@ fn compare_materialized_live_identities(
 /// sort. Repeated identities are valid only when every materialized payload
 /// byte and authority field is identical.
 fn canonicalize_single_certified_batch(
-    batch: MaterializedLiveStateBatch,
+    batch: MaterializedHotStateBatch,
     limit: Option<usize>,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     let already_strictly_ordered = (1..batch.len()).all(|index| {
         compare_materialized_live_identity_refs(batch.row(index - 1), batch.row(index)).is_lt()
     });
@@ -4379,14 +4379,14 @@ fn canonicalize_single_certified_batch(
     if let Some(limit) = limit {
         canonical.truncate(limit);
     }
-    Ok(MaterializedLiveStateBatch::from_rows(canonical))
+    Ok(MaterializedHotStateBatch::from_rows(canonical))
 }
 
 #[cfg(test)]
 fn merge_ordered_live_rows(
-    left: Vec<MaterializedLiveStateRow>,
-    right: Vec<MaterializedLiveStateRow>,
-) -> Vec<MaterializedLiveStateRow> {
+    left: Vec<MaterializedHotStateRow>,
+    right: Vec<MaterializedHotStateRow>,
+) -> Vec<MaterializedHotStateRow> {
     let mut left = VecDeque::from(left);
     let mut right = VecDeque::from(right);
     let mut merged = Vec::with_capacity(left.len().saturating_add(right.len()));
@@ -4415,8 +4415,8 @@ fn merge_ordered_live_rows(
 }
 
 fn compare_materialized_live_identity_refs(
-    left: MaterializedLiveStateRowRef<'_>,
-    right: MaterializedLiveStateRowRef<'_>,
+    left: MaterializedHotStateRowRef<'_>,
+    right: MaterializedHotStateRowRef<'_>,
 ) -> Ordering {
     left.schema_key()
         .cmp(right.schema_key())
@@ -4427,9 +4427,9 @@ fn compare_materialized_live_identity_refs(
 /// Merge two identity-ordered materialized batches without expanding their
 /// dictionary and payload columns into row-owned DTOs.
 fn merge_ordered_live_batches(
-    left: MaterializedLiveStateBatch,
-    right: MaterializedLiveStateBatch,
-) -> MaterializedLiveStateBatch {
+    left: MaterializedHotStateBatch,
+    right: MaterializedHotStateBatch,
+) -> MaterializedHotStateBatch {
     if left.is_empty() {
         return right;
     }
@@ -4437,7 +4437,7 @@ fn merge_ordered_live_batches(
         return left;
     }
     let mut merged =
-        MaterializedLiveStateBatchBuilder::with_capacity(left.len().saturating_add(right.len()));
+        MaterializedHotStateBatchBuilder::with_capacity(left.len().saturating_add(right.len()));
     let mut left_index = 0usize;
     let mut right_index = 0usize;
     while left_index < left.len() && right_index < right.len() {
@@ -4478,9 +4478,9 @@ fn merge_ordered_live_batches(
 /// authority batch. Both inputs are scan results in canonical identity order,
 /// so one forward cursor replaces a per-row tree lookup and owned identity.
 fn exclude_ordered_live_batch_identities(
-    rows: MaterializedLiveStateBatch,
-    authority: &MaterializedLiveStateBatch,
-) -> MaterializedLiveStateBatch {
+    rows: MaterializedHotStateBatch,
+    authority: &MaterializedHotStateBatch,
+) -> MaterializedHotStateBatch {
     if rows.is_empty() || authority.is_empty() {
         return rows;
     }
@@ -4682,13 +4682,13 @@ where
         branch_generation: CommitId,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
         required_identity: TrackedStateKeyRef<'_>,
-        expected_domain: LiveStateReadDomain,
+        expected_domain: HotStateReadDomain,
         allow_bootstrap_absence: bool,
     ) -> Result<(), LixError> {
         let expected_untracked = match expected_domain {
-            LiveStateReadDomain::Tracked => false,
-            LiveStateReadDomain::Untracked => true,
-            LiveStateReadDomain::Combined => {
+            HotStateReadDomain::Tracked => false,
+            HotStateReadDomain::Untracked => true,
+            HotStateReadDomain::Combined => {
                 return Err(head_value_error(
                     "exact collection closure requires one explicit state domain",
                 ));
@@ -4732,7 +4732,7 @@ where
         let mut actual = 0_u64;
         let mut cursor = self
             .store
-            .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
+            .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
             let page = cursor
@@ -4794,7 +4794,7 @@ where
         control: BranchHeadControl,
         request: &TrackedStateScanRequest,
         requested_untracked: Option<bool>,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         // The branch has one serving generation. Tracked and history-free
         // rows share it and are separated only by their per-row flag, so an
         // explicit retention filter is a row predicate over a single scan,
@@ -4818,7 +4818,7 @@ where
         controls: &[(String, BranchHeadControl)],
         request: &TrackedStateScanRequest,
         requested_untracked: Option<bool>,
-    ) -> Result<Vec<(String, MaterializedLiveStateBatch)>, LixError> {
+    ) -> Result<Vec<(String, MaterializedHotStateBatch)>, LixError> {
         let mut rows = Vec::with_capacity(controls.len());
         for (branch_id, control) in controls {
             let branch_rows = self
@@ -4896,7 +4896,7 @@ where
             schema_key,
             ordinal,
         )));
-        let present = PointReadPlan::new(HOT_INDEX_SPACE, &[witness])
+        let present = PointReadPlan::new(INDEX_SPACE, &[witness])
             .materialize(
                 &self.store,
                 StorageGetOptions {
@@ -4920,7 +4920,7 @@ where
         let mut cursor = self
             .store
             .begin_scan(
-                HOT_INDEX_SPACE,
+                INDEX_SPACE,
                 range,
                 StorageBeginScanOptions::default(),
             )
@@ -4961,7 +4961,7 @@ where
         let mut cursor = self
             .store
             .begin_scan(
-                HOT_ROW_SPACE,
+                ROW_SPACE,
                 range,
                 StorageBeginScanOptions {
                     projection: StorageCoreProjection::KeyOnly,
@@ -5009,7 +5009,7 @@ where
                 ))
                 .await?
             } else {
-                MaterializedLiveStateBatch::default()
+                MaterializedHotStateBatch::default()
             };
         if !root.is_empty() {
             return Ok(true);
@@ -5210,7 +5210,7 @@ where
         else {
             return Ok(None);
         };
-        let id = crate::live_state::entity_row_group_set_id(base_commit_id, schema_key);
+        let id = crate::hot_state::entity_row_group_set_id(base_commit_id, schema_key);
         let Some(manifest) =
             crate::columnar_row_group::load_row_group_manifest(&self.store, id).await?
         else {
@@ -5400,7 +5400,7 @@ where
         branch_id: &str,
         expected_head: &str,
         request: &TrackedStateScanRequest,
-    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+    ) -> Result<Option<Vec<MaterializedHotStateRow>>, LixError> {
         let expected_head = CommitId::parse_lix(expected_head, "hot-state expected commit")?;
         let control = BranchHeadControlContext::new()
             .reader(&self.store)
@@ -5428,7 +5428,7 @@ where
         generation: CommitId,
         active_checkpoint_commit_id: Option<CommitId>,
         request: &TrackedStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         self.scan_live_batch_for_generation_with_visibility(
             branch_id,
             generation,
@@ -5446,7 +5446,7 @@ where
         active_checkpoint_commit_id: Option<CommitId>,
         request: &TrackedStateScanRequest,
         apply_collection_visibility: bool,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         let collection_control = if apply_collection_visibility {
             match request.filter.schema_keys.as_slice() {
                 [schema_key]
@@ -5474,7 +5474,7 @@ where
         let replaced_generation =
             collection_control.filter(|control| control.active_generation != generation);
         if replaced_generation.is_some_and(|control| control.live_count == 0) {
-            return Ok(MaterializedLiveStateBatch::default());
+            return Ok(MaterializedHotStateBatch::default());
         }
         // A storage prefix is ordered by identity, but tombstones are filtered
         // only after decoding the value. Applying SQL LIMIT to the raw scan
@@ -5555,7 +5555,7 @@ where
                 .iter()
                 .all(|schema_key| schema_key.starts_with("lix_"))
         {
-            MaterializedLiveStateBatch::default()
+            MaterializedHotStateBatch::default()
         } else {
             scan_certified_entity_batch_rows(
                 &self.store,
@@ -5613,7 +5613,7 @@ where
         expected_head: &str,
         keys: &[TrackedStateKey],
         projection: &ChangeRecordProjection,
-    ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
+    ) -> Result<Option<Vec<Option<MaterializedHotStateRow>>>, LixError> {
         let expected_head = CommitId::parse_lix(expected_head, "hot-state expected commit")?;
         let control = BranchHeadControlContext::new()
             .reader(&self.store)
@@ -5636,10 +5636,10 @@ where
         control: BranchHeadControl,
         keys: &[TrackedStateKey],
         projection: &ChangeRecordProjection,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+    ) -> Result<Vec<Option<MaterializedHotStateRow>>, LixError> {
         self.load_projected_live_batch(branch_id, control, keys, projection)
             .await
-            .map(MaterializedLiveStateExactBatch::into_rows)
+            .map(MaterializedHotStateExactBatch::into_rows)
     }
 
     pub(crate) async fn load_projected_live_batch(
@@ -5648,7 +5648,7 @@ where
         control: BranchHeadControl,
         keys: &[TrackedStateKey],
         projection: &ChangeRecordProjection,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         let keys = keys
             .iter()
             .map(|key| TrackedStateKeyRef {
@@ -5667,13 +5667,13 @@ where
         control: BranchHeadControl,
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         self.load_projected_live_batch_refs_for_domain(
             branch_id,
             control,
             keys,
             projection,
-            LiveStateReadDomain::Combined,
+            HotStateReadDomain::Combined,
         )
         .await
     }
@@ -5684,8 +5684,8 @@ where
         control: BranchHeadControl,
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
-        domain: LiveStateReadDomain,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        domain: HotStateReadDomain,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         // One serving generation holds at most one row per identity, so the
         // read domain is a predicate on the row that was found rather than a
         // precedence rule between two roots.
@@ -5698,9 +5698,9 @@ where
         ))
         .await?;
         match domain {
-            LiveStateReadDomain::Combined => Ok(rows),
-            LiveStateReadDomain::Tracked => rows.filter(|row| !row.untracked()),
-            LiveStateReadDomain::Untracked => rows.filter(|row| row.untracked()),
+            HotStateReadDomain::Combined => Ok(rows),
+            HotStateReadDomain::Tracked => rows.filter(|row| !row.untracked()),
+            HotStateReadDomain::Untracked => rows.filter(|row| row.untracked()),
         }
     }
 
@@ -5711,7 +5711,7 @@ where
         active_checkpoint_commit_id: Option<CommitId>,
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         self.load_projected_live_batch_for_generation_refs_with_visibility(
             branch_id,
             generation,
@@ -5731,9 +5731,9 @@ where
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
         apply_collection_visibility: bool,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         if keys.is_empty() {
-            return Ok(MaterializedLiveStateExactBatch::default());
+            return Ok(MaterializedHotStateExactBatch::default());
         }
         let replaced_generation = apply_collection_visibility
             .then(|| {
@@ -5765,8 +5765,8 @@ where
             None => None,
         };
         if replaced_generation.is_some_and(|control| control.live_count == 0) {
-            return MaterializedLiveStateExactBatch::new(
-                MaterializedLiveStateBatch::default(),
+            return MaterializedHotStateExactBatch::new(
+                MaterializedHotStateBatch::default(),
                 vec![None; keys.len()],
             );
         }
@@ -5840,8 +5840,8 @@ where
             ))
             .await?
         } else {
-            MaterializedLiveStateExactBatch::new(
-                MaterializedLiveStateBatch::default(),
+            MaterializedHotStateExactBatch::new(
+                MaterializedHotStateBatch::default(),
                 vec![None; keys.len()],
             )?
         };
@@ -5887,7 +5887,7 @@ where
                 .or_default()
                 .push(key.entity_pk.clone());
         }
-        let mut certified = MaterializedLiveStateBatch::default();
+        let mut certified = MaterializedHotStateBatch::default();
         for ((schema_key, file_id), mut entity_pks) in certified_groups {
             entity_pks.sort_unstable();
             entity_pks.dedup();
@@ -5937,7 +5937,7 @@ where
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(keys.len());
         let mut combined_slots = Vec::with_capacity(keys.len());
         for (key, row) in keys.iter().zip(resolved) {
             let certified_row = certified_by_identity
@@ -5976,7 +5976,7 @@ where
                 .transpose()?,
             );
         }
-        MaterializedLiveStateExactBatch::new(builder.finish(), combined_slots)
+        MaterializedHotStateExactBatch::new(builder.finish(), combined_slots)
     }
 
     pub(crate) async fn working_diff_epoch(
@@ -6000,7 +6000,7 @@ where
             .to_range()?;
             let mut cursor = self
                 .store
-                .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
+                .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
                 .await?;
             loop {
                 let page = cursor
@@ -6196,7 +6196,7 @@ where
         generation: CommitId,
         new_head: CommitId,
         rows: I,
-        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
+        entity_columnar_write_sets: &crate::hot_state::EntityColumnarWriteSets,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError>
@@ -6247,7 +6247,7 @@ where
             {
                 crate::columnar_row_group::stage_row_group_set(
                     self.writes,
-                    crate::live_state::entity_row_group_set_id(new_head, schema_key),
+                    crate::hot_state::entity_row_group_set_id(new_head, schema_key),
                     encoded,
                 )?;
             }
@@ -6321,7 +6321,7 @@ where
         new_head: CommitId,
         schema_key: &str,
         row_count: usize,
-        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
+        entity_columnar_write_sets: &crate::hot_state::EntityColumnarWriteSets,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(CommitId, bool), LixError> {
@@ -6364,7 +6364,7 @@ where
         schema_key: &str,
         row_count: u64,
         control: HotCollectionControl,
-        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
+        entity_columnar_write_sets: &crate::hot_state::EntityColumnarWriteSets,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(CommitId, bool), LixError> {
@@ -6467,7 +6467,7 @@ where
         if let Some(encoded) = entity_columnar_write_sets.get(&(new_head, schema_key.to_string())) {
             crate::columnar_row_group::stage_row_group_set(
                 self.writes,
-                crate::live_state::entity_row_group_set_id(new_head, schema_key),
+                crate::hot_state::entity_row_group_set_id(new_head, schema_key),
                 encoded,
             )?;
         }
@@ -6507,7 +6507,7 @@ where
         parent_commit_id: CommitId,
         new_head: CommitId,
         deltas: &[CurrentStateDeltaRef<'_>],
-        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
+        entity_columnar_write_sets: &crate::hot_state::EntityColumnarWriteSets,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<Option<CommitId>, LixError> {
@@ -7054,7 +7054,7 @@ where
         deltas: &[CurrentStateDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
+        preserved_untracked_rows: Option<Vec<MaterializedHotStateRow>>,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
@@ -7088,7 +7088,7 @@ where
         durable_predecessors: &[CertifiedCurrentStatePredecessorRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
+        preserved_untracked_rows: Option<Vec<MaterializedHotStateRow>>,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
@@ -7198,7 +7198,7 @@ where
         deltas: &[CurrentStateDeltaRef<'_>],
         absence_guards: &[TrackedStateKeyRef<'_>],
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
+        preserved_untracked_rows: Option<Vec<MaterializedHotStateRow>>,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
         validated_absent_file_id: Option<&str>,
@@ -7263,7 +7263,7 @@ where
         durable_predecessors: &[CertifiedCurrentStatePredecessorRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
+        preserved_untracked_rows: Option<Vec<MaterializedHotStateRow>>,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
         absence_guards_validated: bool,
@@ -7486,8 +7486,8 @@ where
             ))
             .await?
         } else {
-            MaterializedLiveStateExactBatch::new(
-                MaterializedLiveStateBatch::default(),
+            MaterializedHotStateExactBatch::new(
+                MaterializedHotStateBatch::default(),
                 vec![None; packed_previous_keys.len()],
             )?
         };
@@ -8697,7 +8697,7 @@ async fn hot_load_primary_mutation_identity_refs(
                 .slice(start..start + identity.row_key.len()),
         ));
     }
-    PointReadPlan::new(HOT_ROW_SPACE, &keys)
+    PointReadPlan::new(ROW_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?
         .value
@@ -8859,10 +8859,10 @@ fn stage_hot_encoded_mutation_ranges(
         row_deletes,
     )
     .expect("hot row ranges originate in the supplied encoded buffers");
-    writes.stage_encoded_batch(HOT_ROW_SPACE, row_batch);
+    writes.stage_encoded_batch(ROW_SPACE, row_batch);
     file_schema_puts.retain(|key| {
         !writes.contains_put(
-            HOT_FILE_SPACE,
+            FILE_SPACE,
             &key_bytes[key.offset()..key.offset().saturating_add(key.len())],
         )
     });
@@ -8877,7 +8877,7 @@ fn stage_hot_encoded_mutation_ranges(
         let file_batch =
             EncodedMutationBatch::try_new(key_bytes, Bytes::new(), file_puts, Vec::new())
                 .expect("hot file schema ranges originate in the supplied encoded buffers");
-        writes.stage_encoded_batch(HOT_FILE_SPACE, file_batch);
+        writes.stage_encoded_batch(FILE_SPACE, file_batch);
     }
 }
 
@@ -8903,7 +8903,7 @@ fn stage_hot_diff_batch(
             Vec::new(),
         )
         .expect("direct hot diff ranges originate in the supplied encoded buffer");
-        writes.stage_encoded_batch(HOT_DIFF_SPACE, batch);
+        writes.stage_encoded_batch(DIFF_SPACE, batch);
         return Ok(());
     }
 
@@ -8986,7 +8986,7 @@ fn stage_hot_diff_batch(
         Vec::new(),
     )
     .expect("hot diff segment ranges originate in the supplied encoded buffers");
-    writes.stage_encoded_batch(HOT_DIFF_SPACE, batch);
+    writes.stage_encoded_batch(DIFF_SPACE, batch);
     Ok(())
 }
 
@@ -9071,10 +9071,10 @@ fn stage_complete_hot_rows(
     let row_batch =
         EncodedMutationBatch::try_new(key_bytes.clone(), value_bytes.clone(), row_puts, Vec::new())
             .expect("complete hot row ranges originate in the supplied encoded buffers");
-    writes.stage_encoded_batch(HOT_ROW_SPACE, row_batch);
+    writes.stage_encoded_batch(ROW_SPACE, row_batch);
     file_puts.retain(|put| {
         !writes.contains_put(
-            HOT_FILE_SPACE,
+            FILE_SPACE,
             &key_bytes[put.key.offset()..put.key.offset().saturating_add(put.key.len())],
         )
     });
@@ -9082,7 +9082,7 @@ fn stage_complete_hot_rows(
         let file_batch =
             EncodedMutationBatch::try_new(key_bytes, Bytes::new(), file_puts, Vec::new())
                 .expect("complete hot file ranges originate in the supplied encoded buffers");
-        writes.stage_encoded_batch(HOT_FILE_SPACE, file_batch);
+        writes.stage_encoded_batch(FILE_SPACE, file_batch);
     }
 }
 
@@ -9109,7 +9109,7 @@ fn stage_hot_bootstrap(
     branch_id: &str,
     generation: CommitId,
     parent_rows: Vec<MaterializedTrackedStateRow>,
-    preserved_untracked_rows: Vec<MaterializedLiveStateRow>,
+    preserved_untracked_rows: Vec<MaterializedHotStateRow>,
     deltas: &[&CurrentStateDeltaRef<'_>],
     absence_guards: &BTreeSet<TrackedStateKey>,
     working_diff_capture_checkpoint_commit_id: Option<CommitId>,
@@ -9584,7 +9584,7 @@ impl Ord for HotScanIdentity {
 impl LiveMaterializationIdentity for HotScanIdentity {
     fn push_materialized(
         self,
-        rows: &mut MaterializedLiveStateBatchBuilder,
+        rows: &mut MaterializedHotStateBatchBuilder,
         snapshot_content: Option<SharedStr>,
         metadata: Option<SharedStr>,
         deleted: bool,
@@ -9713,7 +9713,7 @@ async fn hot_load_finite_identity_bytes(
     let keys = (0..batch.len())
         .map(|index| batch.encoded.primary_key(index))
         .collect::<Vec<_>>();
-    PointReadPlan::new(HOT_ROW_SPACE, &keys)
+    PointReadPlan::new(ROW_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?
         .value
@@ -9765,7 +9765,7 @@ async fn materialize_hot_scan_entries(
     projection: ChangeRecordProjection,
     branch_id: &str,
     active_checkpoint_commit_id: Option<CommitId>,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     match entries {
         HotScanEntries::Decoded(entries) => {
             materialize_live_entries(
@@ -9817,7 +9817,7 @@ async fn hot_load_identity_ref_bytes(
     let keys = (0..identities.len())
         .map(|index| encoded.primary_key(index))
         .collect::<Vec<_>>();
-    PointReadPlan::new(HOT_ROW_SPACE, &keys)
+    PointReadPlan::new(ROW_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?
         .value
@@ -9850,7 +9850,7 @@ async fn hot_load_primary_identity_bytes(
     let keys = (0..identities.len())
         .map(|index| encoded.primary_key(index))
         .collect::<Vec<_>>();
-    PointReadPlan::new(HOT_ROW_SPACE, &keys)
+    PointReadPlan::new(ROW_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?
         .value
@@ -9873,7 +9873,7 @@ async fn hot_load_file_scope_identities(
     let mut identities = Vec::new();
     let mut cursor = store
         .begin_scan(
-            HOT_ROW_SPACE,
+            ROW_SPACE,
             range,
             StorageBeginScanOptions {
                 projection: StorageCoreProjection::KeyOnly,
@@ -10013,7 +10013,7 @@ async fn hot_working_diff_entries(
     let mut actual_coverage = WorkingDiffIndexCoverage::default();
     let mut selected = BTreeMap::<HeadIdentity, Option<WorkingDiffVersion>>::new();
     let mut cursor = store
-        .begin_scan(HOT_DIFF_SPACE, range, StorageBeginScanOptions::default())
+        .begin_scan(DIFF_SPACE, range, StorageBeginScanOptions::default())
         .await?;
     loop {
         let page = cursor
@@ -10568,7 +10568,7 @@ async fn hot_scan_entries<'a>(
         }
         .to_range()?;
         let mut cursor = store
-            .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
+            .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
             let remaining = physical_limit.map(|limit| limit.saturating_sub(rows.len()));
@@ -10765,7 +10765,7 @@ async fn hot_scan_dense_encoded_key_range<'a>(
     let mut requested_index = 0;
     let mut values = vec![None; key_count];
     let mut cursor = store
-        .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
+        .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
         .await?;
     loop {
         let remaining_budget = scan_budget.saturating_sub(scanned);
@@ -10854,7 +10854,7 @@ async fn scan_hot_file_entries(
         }
         .to_range()?;
         let mut cursor = store
-            .begin_scan(HOT_ROW_SPACE, range, StorageBeginScanOptions::default())
+            .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
             let page = cursor
@@ -10903,7 +10903,7 @@ async fn hot_schema_has_file_member(
 ) -> Result<bool, LixError> {
     let scope = hot_scope_prefix(branch_id, generation);
     let key = StorageKey(Bytes::from(encode_hot_file_schema_key(&scope, schema_key)));
-    let values = PointReadPlan::new(HOT_FILE_SPACE, &[key])
+    let values = PointReadPlan::new(FILE_SPACE, &[key])
         .materialize(
             store,
             StorageGetOptions {
@@ -11109,7 +11109,7 @@ fn encode_hot_diff_key_parts(
 ///
 /// The ordinary **entity** surface has no such obligation and does take that
 /// route: `lixcol_file_id` is an exact provider constraint that lands in
-/// `LiveStateFilter::file_ids`, and every authority the live-state merge reads
+/// `HotStateFilter::file_ids`, and every authority the live-state merge reads
 /// — `HOT_ROW`, the packed current base, the certified entity batches, and the
 /// root current base — filters on it, two of them with their own file-scoped
 /// seek. Rows that never had a branch-local `HOT_ROW` are therefore still
@@ -11430,7 +11430,7 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
     })
 }
 
-/// Distinguishes the two record kinds sharing [`HOT_INDEX_SPACE`]: entries and
+/// Distinguishes the two record kinds sharing [`INDEX_SPACE`]: entries and
 /// the per-collection completeness witness. Entries sort after the witness for
 /// a given schema, so a witness probe is a point read and never scans entries.
 const HOT_INDEX_WITNESS_TAG: u8 = 0x00;
@@ -11477,7 +11477,7 @@ pub(crate) fn stage_hot_index_entries(
             head_value_error(format!("hot index entity pk is not encodable: {error}"))
         })?;
         writes.put(
-            HOT_INDEX_SPACE,
+            INDEX_SPACE,
             StorageKey(Bytes::from(key)),
             StorageValue {
                 bytes: Bytes::from(identity.into_bytes()),
@@ -11490,7 +11490,7 @@ pub(crate) fn stage_hot_index_entries(
             continue;
         }
         writes.put(
-            HOT_INDEX_SPACE,
+            INDEX_SPACE,
             StorageKey(Bytes::from(key)),
             StorageValue {
                 bytes: Bytes::new(),
@@ -11761,10 +11761,10 @@ fn collect_hot_untracked_refs(value: HeadValueView<'_>, refs: &mut BTreeSet<[u8;
 /// absent: their rows are shared across generations and are reclaimed by
 /// content reachability, not by scope.
 const GENERATION_SCOPED_SPACES: &[StorageSpace] = &[
-    HOT_INDEX_SPACE,
-    HOT_ROW_SPACE,
-    HOT_FILE_SPACE,
-    HOT_COLLECTION_CONTROL_SPACE,
+    INDEX_SPACE,
+    ROW_SPACE,
+    FILE_SPACE,
+    COLLECTION_CONTROL_SPACE,
     PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_BASE_CONTROL_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
@@ -11845,7 +11845,7 @@ where
     }
     .to_range()?;
     let mut cursor = store
-        .begin_scan(HOT_DIFF_SPACE, range, StorageBeginScanOptions::default())
+        .begin_scan(DIFF_SPACE, range, StorageBeginScanOptions::default())
         .await?;
     loop {
         let page = cursor
@@ -11881,7 +11881,7 @@ where
                 _ => false,
             };
             if !keep {
-                writes.delete(HOT_DIFF_SPACE, entry.key);
+                writes.delete(DIFF_SPACE, entry.key);
             }
         }
         if !page.has_more {
@@ -11915,7 +11915,7 @@ where
     .to_range()?;
     let mut cursor = store
         .begin_scan(
-            HOT_DIFF_SPACE,
+            DIFF_SPACE,
             range,
             StorageBeginScanOptions {
                 projection: StorageCoreProjection::KeyOnly,
@@ -11928,7 +11928,7 @@ where
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?;
         writes.delete_batch(
-            HOT_DIFF_SPACE,
+            DIFF_SPACE,
             page.entries.into_iter().map(|entry| entry.key),
         );
         if !page.has_more {
@@ -12491,7 +12491,7 @@ mod tests {
                     file_id: None,
                 },
                 missing_identity,
-                LiveStateReadDomain::Tracked,
+                HotStateReadDomain::Tracked,
                 false,
             )
             .await
@@ -12509,7 +12509,7 @@ mod tests {
                     entity_pk: &missing_entity_pk,
                     file_id: Some("a.lix"),
                 },
-                LiveStateReadDomain::Tracked,
+                HotStateReadDomain::Tracked,
                 false,
             )
             .await
@@ -12556,7 +12556,7 @@ mod tests {
                 entity_pk: &missing_entity_pk,
                 file_id: None,
             },
-            LiveStateReadDomain::Tracked,
+            HotStateReadDomain::Tracked,
             false,
         )
         .await
@@ -12696,7 +12696,7 @@ mod tests {
                 generation,
                 scope,
                 required_identity,
-                LiveStateReadDomain::Untracked,
+                HotStateReadDomain::Untracked,
                 true,
             )
             .await
@@ -12707,7 +12707,7 @@ mod tests {
                 generation,
                 scope,
                 required_identity,
-                LiveStateReadDomain::Untracked,
+                HotStateReadDomain::Untracked,
                 false,
             )
             .await
@@ -12745,7 +12745,7 @@ mod tests {
             generation,
             scope,
             required_identity,
-            LiveStateReadDomain::Untracked,
+            HotStateReadDomain::Untracked,
             true,
         )
         .await
@@ -12800,9 +12800,9 @@ mod tests {
             )));
             let mut writes = StorageWriteSet::new();
             match label {
-                "missing" => writes.delete(HOT_COLLECTION_CONTROL_SPACE, control_key),
+                "missing" => writes.delete(COLLECTION_CONTROL_SPACE, control_key),
                 "malformed" => writes.put(
-                    HOT_COLLECTION_CONTROL_SPACE,
+                    COLLECTION_CONTROL_SPACE,
                     control_key,
                     StorageValue {
                         bytes: Bytes::from_static(b"\0"),
@@ -12867,7 +12867,7 @@ mod tests {
                     entity_pk: &missing_entity_pk,
                     file_id: None,
                 },
-                LiveStateReadDomain::Tracked,
+                HotStateReadDomain::Tracked,
                 false,
             )
             .await
@@ -12879,8 +12879,8 @@ mod tests {
         }
     }
 
-    fn live_row(entity_pk: &str, commit_label: &str) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    fn live_row(entity_pk: &str, commit_label: &str) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: "schema".to_owned(),
             file_id: None,
@@ -12915,13 +12915,13 @@ mod tests {
 
     #[test]
     fn ordered_authority_exclusion_removes_only_identity_collisions() {
-        let rows = MaterializedLiveStateBatch::from_rows(vec![
+        let rows = MaterializedHotStateBatch::from_rows(vec![
             live_row("a", "candidate-a"),
             live_row("b", "candidate-b"),
             live_row("c", "candidate-c"),
             live_row("d", "candidate-d"),
         ]);
-        let authority = MaterializedLiveStateBatch::from_rows(vec![
+        let authority = MaterializedHotStateBatch::from_rows(vec![
             live_row("a", "authority-a"),
             live_row("c", "authority-c"),
         ]);
@@ -12949,7 +12949,7 @@ mod tests {
         member.schema_key = "json_object_member".to_owned();
 
         let canonical = canonicalize_single_certified_batch(
-            MaterializedLiveStateBatch::from_rows(vec![
+            MaterializedHotStateBatch::from_rows(vec![
                 root.clone(),
                 member.clone(),
                 member.clone(),
@@ -12962,7 +12962,7 @@ mod tests {
         assert_eq!(canonical.row(1).schema_key(), "json_root");
 
         let limited = canonicalize_single_certified_batch(
-            MaterializedLiveStateBatch::from_rows(vec![root.clone(), member.clone()]),
+            MaterializedHotStateBatch::from_rows(vec![root.clone(), member.clone()]),
             Some(1),
         )
         .expect("LIMIT should follow certified identity canonicalization");
@@ -12972,7 +12972,7 @@ mod tests {
         let mut conflicting = member.clone();
         conflicting.metadata = Some(SharedStr::from("{\"conflict\":true}"));
         let error = canonicalize_single_certified_batch(
-            MaterializedLiveStateBatch::from_rows(vec![member, conflicting]),
+            MaterializedHotStateBatch::from_rows(vec![member, conflicting]),
             None,
         )
         .expect_err("conflicting duplicate certified authority must fail closed");
@@ -13018,7 +13018,7 @@ mod tests {
         manifest_key.extend_from_slice(generation.as_uuid().as_bytes());
         let mut writes = StorageWriteSet::new();
         writes.delete(
-            HOT_ROW_SPACE,
+            ROW_SPACE,
             StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
                 branch_id: crate::GLOBAL_BRANCH_ID.to_owned(),
                 generation,
@@ -13244,7 +13244,7 @@ mod tests {
             replacement_head,
             SCHEMA_KEY,
             1_024,
-            &crate::live_state::EntityColumnarWriteSets::new(),
+            &crate::hot_state::EntityColumnarWriteSets::new(),
             None,
             &mut coverage,
         )
@@ -13381,7 +13381,7 @@ mod tests {
             parent_commit_id,
             new_head,
             &replacement_deltas,
-            &crate::live_state::EntityColumnarWriteSets::new(),
+            &crate::hot_state::EntityColumnarWriteSets::new(),
             None,
             &mut WorkingDiffIndexCoverage::default(),
         )
@@ -13454,7 +13454,7 @@ mod tests {
             packed_exclusive_schema_base_key(BRANCH_ID, generation, SCHEMA_KEY, generation);
         let mut fixture_writes = StorageWriteSet::new();
         fixture_writes.delete(
-            HOT_ROW_SPACE,
+            ROW_SPACE,
             StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
                 branch_id: BRANCH_ID.to_owned(),
                 generation,
@@ -13565,7 +13565,7 @@ mod tests {
         .value;
         assert!(index[0].is_none());
         let hot = PointReadPlan::new(
-            HOT_ROW_SPACE,
+            ROW_SPACE,
             &[StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
                 branch_id: BRANCH_ID.to_owned(),
                 generation,
@@ -14387,7 +14387,7 @@ mod tests {
             identity.schema_key() == schema_key && identity.file_id() == Some(file_id)
         }));
 
-        let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(ROW_COUNT);
+        let mut rows = MaterializedHotStateBatchBuilder::with_capacity(ROW_COUNT);
         for identity in identities {
             identity.push_materialized(
                 &mut rows,
@@ -14712,7 +14712,7 @@ mod tests {
         .to_range()
         .expect("valid prefix range");
         let mut cursor = read
-            .begin_scan(HOT_DIFF_SPACE, range, StorageBeginScanOptions::default())
+            .begin_scan(DIFF_SPACE, range, StorageBeginScanOptions::default())
             .await
             .expect("begin segmented hot diff scan");
         let page = cursor
@@ -15220,7 +15220,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         for key in &keys {
             writes.put(
-                HOT_ROW_SPACE,
+                ROW_SPACE,
                 key.clone(),
                 StorageValue {
                     bytes: Bytes::from_static(b"row"),
@@ -15242,7 +15242,7 @@ mod tests {
             .await
             .expect("scan dense mutation range")
             .expect("dense mutation range should stay on the scan path");
-        let point = PointReadPlan::new(HOT_ROW_SPACE, &keys)
+        let point = PointReadPlan::new(ROW_SPACE, &keys)
             .materialize(&read, StorageGetOptions::default())
             .await
             .expect("point-read dense mutation identities")
@@ -15285,7 +15285,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         for identity in &all_identities {
             writes.put(
-                HOT_ROW_SPACE,
+                ROW_SPACE,
                 StorageKey(Bytes::from(encode_hot_row_key(identity))),
                 StorageValue {
                     bytes: Bytes::from_static(b"row"),
@@ -15341,7 +15341,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         for identity in &all_identities {
             writes.put(
-                HOT_ROW_SPACE,
+                ROW_SPACE,
                 StorageKey(Bytes::from(encode_hot_row_key(identity))),
                 StorageValue {
                     bytes: Bytes::from_static(b"row"),
@@ -15462,7 +15462,7 @@ mod tests {
             (&orphan_key, orphan_value),
         ] {
             writes.put(
-                HOT_DIFF_SPACE,
+                DIFF_SPACE,
                 StorageKey(Bytes::copy_from_slice(key)),
                 StorageValue {
                     bytes: Bytes::from(value),
@@ -15524,7 +15524,7 @@ mod tests {
             .next()
             .flatten();
             assert!(epoch.is_none(), "inactive epoch must be reclaimed");
-            let record = PointReadPlan::new(HOT_DIFF_SPACE, &[StorageKey(Bytes::from(key))])
+            let record = PointReadPlan::new(DIFF_SPACE, &[StorageKey(Bytes::from(key))])
                 .materialize(&read, StorageGetOptions::default())
                 .await
                 .expect("read stale hot record")
@@ -15536,7 +15536,7 @@ mod tests {
         }
 
         let active_record =
-            PointReadPlan::new(HOT_DIFF_SPACE, &[StorageKey(Bytes::from(active_key))])
+            PointReadPlan::new(DIFF_SPACE, &[StorageKey(Bytes::from(active_key))])
                 .materialize(&read, StorageGetOptions::default())
                 .await
                 .expect("read active hot record")

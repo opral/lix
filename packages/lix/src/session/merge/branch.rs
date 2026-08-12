@@ -959,7 +959,7 @@ where
         .filter(|(index, _)| base_rows.row(*index).is_none())
         .map(|(_, key)| key.clone())
         .collect::<Vec<_>>();
-    let certified_base_rows = crate::live_state::load_certified_rows_at_commit(
+    let certified_base_rows = crate::hot_state::load_certified_rows_at_commit(
         reader.store(),
         &analysis.commits.base_commit_id.to_string(),
         &missing_base_keys,
@@ -1032,7 +1032,7 @@ where
 }
 
 fn certified_live_payload(
-    row: &crate::live_state::MaterializedLiveStateRow,
+    row: &crate::hot_state::MaterializedHotStateRow,
 ) -> Option<PluginMergeConflictPayload> {
     if row.deleted {
         return None;

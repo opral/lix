@@ -9,7 +9,7 @@
 
 mod hot;
 
-pub(crate) use crate::live_state::LiveStateReadDomain;
+pub(crate) use crate::hot_state::HotStateReadDomain;
 #[cfg(test)]
 pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
@@ -18,8 +18,8 @@ pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
     DeferredFreshHotRowRef, DeferredFreshHotRows, EntityColumnarOverlayRow,
-    HOT_COLLECTION_CONTROL_SPACE, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_INDEX_SPACE,
-    HOT_ROW_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
+    COLLECTION_CONTROL_SPACE, DIFF_SPACE, FILE_SPACE, INDEX_SPACE,
+    ROW_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, load_certified_rows_at_commit,
     materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
@@ -57,9 +57,9 @@ use crate::entity_pk::EntityPk;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
 };
-use crate::live_state::{
-    MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
-    MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+use crate::hot_state::{
+    MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
+    MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
@@ -73,7 +73,7 @@ use crate::tracked_state::{
     TrackedStateKey, TrackedStateKeyRef, TrackedStateScanRequest,
 };
 
-pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "live_state.hot_diff_marker.v16";
+pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "hot_state.diff_marker.v16";
 pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_001e),
     TRACKED_WORKING_DIFF_MARKER_NAMESPACE,
@@ -2179,7 +2179,7 @@ trait LiveMaterializationIdentity {
     #[allow(clippy::too_many_arguments)]
     fn push_materialized(
         self,
-        rows: &mut MaterializedLiveStateBatchBuilder,
+        rows: &mut MaterializedHotStateBatchBuilder,
         snapshot_content: Option<SharedStr>,
         metadata: Option<SharedStr>,
         deleted: bool,
@@ -2196,7 +2196,7 @@ trait LiveMaterializationIdentity {
 impl LiveMaterializationIdentity for HeadRowIdentity {
     fn push_materialized(
         self,
-        rows: &mut MaterializedLiveStateBatchBuilder,
+        rows: &mut MaterializedHotStateBatchBuilder,
         snapshot_content: Option<SharedStr>,
         metadata: Option<SharedStr>,
         deleted: bool,
@@ -2229,7 +2229,7 @@ impl LiveMaterializationIdentity for HeadRowIdentity {
 impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
     fn push_materialized(
         self,
-        rows: &mut MaterializedLiveStateBatchBuilder,
+        rows: &mut MaterializedHotStateBatchBuilder,
         snapshot_content: Option<SharedStr>,
         metadata: Option<SharedStr>,
         deleted: bool,
@@ -2269,14 +2269,14 @@ async fn materialize_live_entries<I>(
     projection: ChangeRecordProjection,
     branch_id: &str,
     active_checkpoint_commit_id: Option<CommitId>,
-) -> Result<MaterializedLiveStateBatch, LixError>
+) -> Result<MaterializedHotStateBatch, LixError>
 where
     I: LiveMaterializationIdentity,
 {
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
     let mut json_refs = Vec::new();
     let mut deferred = Vec::new();
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(entries.len());
+    let mut rows = MaterializedHotStateBatchBuilder::with_capacity(entries.len());
     for (identity, bytes) in entries {
         let value = decode_head_value(&bytes)?;
         let row_index = rows.len();
@@ -3427,7 +3427,7 @@ mod tests {
         assert_eq!(no_op_coverage, WorkingDiffIndexCoverage::default());
         assert!(
             writes.contains_put(
-                HOT_ROW_SPACE,
+                ROW_SPACE,
                 &hot::encode_hot_row_key(&HeadIdentity {
                     branch_id: branch_id.to_owned(),
                     generation: checkpoint,
@@ -3471,7 +3471,7 @@ mod tests {
             entity_pk: entity_pk.clone(),
             file_id: None,
         });
-        let value = PointReadPlan::new(HOT_ROW_SPACE, &[StorageKey(Bytes::from(hot_key))])
+        let value = PointReadPlan::new(ROW_SPACE, &[StorageKey(Bytes::from(hot_key))])
             .materialize(&read, StorageGetOptions::default())
             .await
             .expect("read cleaned checkpoint HOT row")
@@ -4039,7 +4039,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file schema marker verification read");
-        let projection_rows = scan_test_space(&projection_read, HOT_FILE_SPACE)
+        let projection_rows = scan_test_space(&projection_read, FILE_SPACE)
             .await
             .entries;
         assert_eq!(
@@ -4624,7 +4624,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file-schema marker verification read");
-        let projections = scan_test_space(&read, HOT_FILE_SPACE).await.entries;
+        let projections = scan_test_space(&read, FILE_SPACE).await.entries;
         assert_eq!(projections.len(), 1);
         assert!(
             projections.into_iter().all(|projection| {
@@ -4679,7 +4679,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open corruption fixture read");
-        let unrelated_key = scan_test_space(&read, HOT_ROW_SPACE)
+        let unrelated_key = scan_test_space(&read, ROW_SPACE)
             .await
             .entries
             .into_iter()
@@ -4693,7 +4693,7 @@ mod tests {
         drop(read);
         let mut corrupt_writes = StorageWriteSet::new();
         corrupt_writes.put(
-            HOT_ROW_SPACE,
+            ROW_SPACE,
             unrelated_key,
             StorageValue {
                 bytes: Bytes::from_static(b"corrupt unrelated hot row"),
@@ -5191,7 +5191,7 @@ mod tests {
             },
         );
         writes.put(
-            HOT_DIFF_SPACE,
+            DIFF_SPACE,
             malformed_index_key.clone(),
             StorageValue {
                 bytes: Bytes::from_static(b"not-a-hot-diff-before-image"),
@@ -5224,7 +5224,7 @@ mod tests {
             .expect("open cleanup verification read");
         for (space, key) in [
             (TRACKED_WORKING_DIFF_MARKER_SPACE, malformed_epoch_key),
-            (HOT_DIFF_SPACE, malformed_index_key),
+            (DIFF_SPACE, malformed_index_key),
         ] {
             let value = PointReadPlan::new(space, &[key])
                 .materialize(&read, StorageGetOptions::default())

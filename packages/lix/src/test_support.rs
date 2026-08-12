@@ -23,7 +23,7 @@ use crate::GLOBAL_BRANCH_ID;
 #[cfg(test)]
 use crate::branch::{BranchHeadControl, stage_branch_head_control};
 #[cfg(test)]
-use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
+use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
 
 #[cfg(test)]
 pub(crate) const TEST_EMPTY_ROOT_COMMIT_ID: &str = "01920000-0000-7000-8000-000000000001";
