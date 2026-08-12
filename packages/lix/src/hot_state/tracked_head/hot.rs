@@ -10074,15 +10074,9 @@ async fn hot_file_backed_schema_keys(
             },
         )
         .await?;
-    loop {
-        let page = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+    while let Some(entries) = cursor.next_chunk().await? {
+        for entry in entries {
             schema_keys.push(decode_hot_file_schema_key_in_scope(entry.key.0, &scope)?);
-        }
-        if !page.has_more {
-            break;
         }
     }
     schema_keys.sort();
