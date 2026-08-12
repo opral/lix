@@ -1922,38 +1922,43 @@ impl WritePipeline {
         let snapshot = worker
             .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
             .await?;
-        let cacheable = {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.next_publication_id == publication_id
-                && state
-                    .tail
-                    .as_ref()
-                    .is_none_or(|tail| tail.done.load(Ordering::Acquire))
-                && snapshot_covers_persisted_publications(&state, snapshot.seq())
-        };
-        if cacheable {
-            self.install_snapshot(Arc::clone(&snapshot));
-        } else {
+        if !self.try_install_snapshot(publication_id, &snapshot) {
             worker.check_open_fast()?;
         }
         Ok((snapshot, fetch))
     }
 
-    fn install_snapshot(&self, snapshot: Arc<DbSnapshot>) {
+    /// Publishes `snapshot` as the cached snapshot when it is still current,
+    /// reporting whether it was installed.
+    ///
+    /// The freshness test and the install happen under **one** acquisition of
+    /// the pipeline lock. They used to be two, and a commit landing in the gap
+    /// was silently undone: `commit` clears `latest_snapshot` and bumps
+    /// `next_publication_id`, then the later install found `latest_snapshot`
+    /// empty, passed its monotonic guard vacuously, and reinstated a snapshot
+    /// that predated the write that commit had just published.
+    fn try_install_snapshot(&self, publication_id: u64, snapshot: &Arc<DbSnapshot>) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cacheable = state.next_publication_id == publication_id
+            && state
+                .tail
+                .as_ref()
+                .is_none_or(|tail| tail.done.load(Ordering::Acquire))
+            && snapshot_covers_persisted_publications(&state, snapshot.seq());
+        if !cacheable {
+            return false;
+        }
         if state
             .latest_snapshot
             .as_ref()
             .is_none_or(|current| current.seq() <= snapshot.seq())
         {
-            state.latest_snapshot = Some(snapshot);
+            state.latest_snapshot = Some(Arc::clone(snapshot));
         }
+        true
     }
 
     fn capture_with_worker(
@@ -7342,6 +7347,60 @@ mod tests {
             snapshot_fetches_of(&storage),
             0,
             "dropping the guard must balance the counter"
+        );
+    }
+
+    /// D1. `commit` clears `latest_snapshot` so the next reader refetches. That
+    /// invalidation must not be undone by an install that was decided before
+    /// the commit landed: the freshness test and the install share one lock
+    /// acquisition, and the install re-validates `next_publication_id`.
+    #[tokio::test]
+    async fn commit_is_not_undone_by_an_install_decided_before_it() {
+        let storage = cached_snapshot_test_storage("test-cached-snapshot-install-race");
+        let space = StorageSpace::mutable(SpaceId(0x92), "test.cached-snapshot-install-race");
+        cached_snapshot_commit(&storage, space, "A").await;
+
+        let (stale_snapshot, fetch) = storage
+            .write_pipeline
+            .snapshot(&storage.worker)
+            .await
+            .expect("fetch the pre-commit snapshot");
+        let publication_id = storage
+            .write_pipeline
+            .state
+            .lock()
+            .expect("lock publication state")
+            .next_publication_id;
+        drop(fetch);
+
+        // The commit that races the in-flight install.
+        cached_snapshot_commit(&storage, space, "B").await;
+        assert!(
+            storage
+                .write_pipeline
+                .state
+                .lock()
+                .expect("lock publication state")
+                .latest_snapshot
+                .is_none(),
+            "commit invalidates the cached snapshot"
+        );
+
+        assert!(
+            !storage
+                .write_pipeline
+                .try_install_snapshot(publication_id, &stale_snapshot),
+            "an install decided before the commit must be rejected"
+        );
+        assert!(
+            storage
+                .write_pipeline
+                .state
+                .lock()
+                .expect("lock publication state")
+                .latest_snapshot
+                .is_none(),
+            "the commit's cache invalidation must not be undone by a stale install"
         );
     }
 
