@@ -1169,6 +1169,22 @@ async fn entity_columnar_scan_source(
                 RecordBatch::try_new(batch_schema, batch.columns().to_vec())
                     .map_err(DataFusionError::from)
             });
+            // Rows of one row group that survived manifest pruning: group
+            // pruning is the columnar route's access path, so a pruned group
+            // never reaches here and never counts.
+            //
+            // Recorded by mapping the stream rather than inside the future
+            // above. That future is already at the edge of the debug-profile
+            // stack — anything added to its state machine, including through a
+            // helper it awaits, overflows
+            // `typed_olap_shapes_validate_above_columnar_publication_threshold`.
+            // A map closure runs on the poll stack instead.
+            let batches = futures_util::StreamExt::map(batches, |batch| {
+                if let Ok(batch) = &batch {
+                    crate::sql_profile::record_provider_rows_examined(batch.num_rows());
+                }
+                batch
+            });
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
         },
     ))
@@ -1182,22 +1198,14 @@ async fn cached_or_load_entity_columnar_batch(
     projection: Vec<usize>,
     load: impl Future<Output = Result<Arc<RecordBatch>>>,
 ) -> Result<Arc<RecordBatch>> {
-    // Rows of one row group that survived manifest pruning: group pruning is
-    // the columnar route's access path, so a pruned group never reaches here
-    // and never counts. Recorded in this small helper rather than in the
-    // partition closure that calls it — that closure's future is already at
-    // the edge of the debug-profile stack, and one more live temporary there
-    // overflows it.
     if let Some(batch) = reader
         .cached_entity_columnar_batch(layout, group_index, shadow_identity_digest, &projection)
         .await
         .map_err(lix_error_to_datafusion_error)?
     {
-        crate::sql_profile::record_provider_rows_examined(batch.num_rows());
         return Ok(batch);
     }
     let batch = load.await?;
-    crate::sql_profile::record_provider_rows_examined(batch.num_rows());
     reader
         .cache_entity_columnar_batch(
             layout,
