@@ -9,10 +9,16 @@
 //! `hot_state/tracked_head/hot.rs`. Those rows only exist for files a WASM
 //! plugin materialized, so no row-shaped fixture can see them.
 //!
-//! This example seeds `N` JSON files through the real plugin path, snapshots
-//! exact logical layout accounting, creates one branch, and snapshots again.
-//! The delta is the price of the branch. Byte and row counts are
-//! deterministic, so one repetition per size is the whole measurement.
+//! This example seeds `N` plugin-backed files, snapshots exact logical layout
+//! accounting, creates one branch, and snapshots again. The delta is the price
+//! of the branch. Byte and row counts are deterministic, so one repetition per
+//! size is the whole measurement.
+//!
+//! Files are plain-text documents handled by the `text` plugin, with a line
+//! count above `HOST_CERTIFIED_PACKET_MIN_ROWS` (64) so that every seeded file
+//! produces a real certified entity batch and therefore a certified manifest
+//! row. A fixture whose files materialize into fewer rows leaves the manifest
+//! plane empty and cannot see the inheritance path at all.
 //!
 //! ```text
 //! cargo run --release -p lix_tests --example e10_branch_file_cost -- 100 1000 10000
@@ -30,6 +36,8 @@ use lix::{CreateBranchOptions, Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 const INSERT_BATCH: usize = 100;
+/// Above `HOST_CERTIFIED_PACKET_MIN_ROWS` so each file certifies a dense batch.
+const LINES_PER_FILE: usize = 80;
 
 fn main() {
     let sizes: Vec<usize> = std::env::args()
@@ -66,7 +74,7 @@ async fn run_case(files: usize) {
         .await
         .expect("open branch-file-cost Lix");
 
-    install_json_plugin(&lix).await;
+    install_text_plugin(&lix).await;
     let seed_started = Instant::now();
     seed_files(&lix, files).await;
     let seed_ms = seed_started.elapsed().as_secs_f64() * 1_000.0;
@@ -183,19 +191,19 @@ async fn snapshot(storage: &RocksDB, directory: &Path) -> Snapshot {
     }
 }
 
-async fn install_json_plugin<StorageImpl>(lix: &Lix<StorageImpl>)
+async fn install_text_plugin<StorageImpl>(lix: &Lix<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
-            Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
-            Value::Blob(build_json_plugin_archive().into()),
+            Value::Text("/.lix/plugins/plugin_text.lixplugin".to_owned()),
+            Value::Blob(build_text_plugin_archive().into()),
         ],
     )
     .await
-    .expect("install branch-file-cost JSON plugin");
+    .expect("install branch-file-cost text plugin");
 }
 
 async fn seed_files<StorageImpl>(lix: &Lix<StorageImpl>, files: usize)
@@ -214,15 +222,14 @@ where
             let parameter = offset * 2;
             sql.push_str(&format!("(${}, ${})", parameter + 1, parameter + 2));
             let index = written + offset;
-            params.push(Value::Text(format!("/docs/file-{index:07}.json")));
-            params.push(Value::Blob(
-                format!(
-                    r#"{{"index":{index},"title":"document {index}","body":"{}"}}"#,
-                    "content padding for a realistic small document"
-                )
-                .into_bytes()
-                .into(),
-            ));
+            params.push(Value::Text(format!("/docs/file-{index:07}.txt")));
+            let mut body = String::with_capacity(LINES_PER_FILE * 48);
+            for line in 0..LINES_PER_FILE {
+                body.push_str(&format!(
+                    "document {index} line {line}: content padding text\n"
+                ));
+            }
+            params.push(Value::Blob(body.into_bytes().into()));
         }
         lix.execute(&sql, &params)
             .await
@@ -231,11 +238,11 @@ where
     }
 }
 
-fn build_json_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"));
+fn build_text_plugin_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_TEXT_plugin_text"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
-            "failed to read bindep-built JSON wasm at {}: {error}",
+            "failed to read bindep-built text wasm at {}: {error}",
             wasm_path.display()
         )
     });
@@ -245,19 +252,11 @@ fn build_json_plugin_archive() -> Vec<u8> {
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/json/manifest.json").as_bytes(),
+            include_str!("../../../plugins/text/manifest.json").as_bytes(),
         ),
         (
-            "schema/json_root.json",
-            include_str!("../../../plugins/json/schema/json_root.json").as_bytes(),
-        ),
-        (
-            "schema/json_object_member.json",
-            include_str!("../../../plugins/json/schema/json_object_member.json").as_bytes(),
-        ),
-        (
-            "schema/json_array_item.json",
-            include_str!("../../../plugins/json/schema/json_array_item.json").as_bytes(),
+            "schema/text_line.json",
+            include_str!("../../../plugins/text/schema/text_line.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
