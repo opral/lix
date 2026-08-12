@@ -3967,7 +3967,7 @@ mod tests {
             .await
             .expect("shared-payload repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("shared-payload session should open");
         register_payload_schema(&session, "gc_payload_row").await;
@@ -4068,7 +4068,7 @@ mod tests {
             .await
             .expect("co-owned payload repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("co-owned payload session should open");
         for schema_key in [
@@ -4176,7 +4176,7 @@ mod tests {
             .await
             .expect("superseded payload repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("superseded payload session should open");
         register_payload_schema(&session, "gc_payload_row").await;
