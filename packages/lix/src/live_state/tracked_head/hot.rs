@@ -7455,7 +7455,6 @@ where
             }
         }
         let mut created_ats = Vec::with_capacity(sorted.len());
-        let mut retired_untracked_json_refs = BTreeSet::new();
         for (delta, previous) in sorted.iter().zip(&previous_values) {
             let Some(previous) = previous else {
                 created_ats.push(delta.created_at);
@@ -7468,13 +7467,6 @@ where
                 reject_guarded_live_member(absence_guards, delta, existing)?;
             }
             reject_retention_change(delta, existing)?;
-            if existing.untracked {
-                collect_retired_untracked_json_refs(
-                    existing,
-                    delta,
-                    &mut retired_untracked_json_refs,
-                );
-            }
             created_ats.push(if reset_working_diff_baselines && !delta.untracked {
                 // Checkpoint selection canonicalizes newly added rows to the
                 // changelog timestamp and preserves the original timestamp
@@ -7724,7 +7716,6 @@ where
                 working_diff_capture_checkpoint_commit_id,
                 reset_working_diff_baselines,
                 &mut next_coverage,
-                &mut retired_untracked_json_refs,
             )
             .await
         }
@@ -7733,12 +7724,6 @@ where
             "lix.perf.materialization.hot.stage"
         ))
         .await?;
-        JsonStoreWriter::stage_untracked_reclaim_candidates(
-            self.writes,
-            retired_untracked_json_refs
-                .into_iter()
-                .map(JsonRef::from_hash_bytes),
-        );
         *coverage = next_coverage;
         Ok(generation)
     }
@@ -7777,23 +7762,12 @@ where
         let sorted_tracked = sorted_lifecycle_hot_deltas(tracked_deltas, false)?;
         reject_lifecycle_retention_collisions(&sorted_untracked, &sorted_tracked)?;
 
-        let mut retired_untracked_json_refs = BTreeSet::new();
         for delta in &sorted_untracked {
-            apply_complete_hot_snapshot_delta(
-                &mut untracked_rows,
-                delta,
-                absence_guards,
-                &mut retired_untracked_json_refs,
-            )?;
+            apply_complete_hot_snapshot_delta(&mut untracked_rows, delta, absence_guards)?;
         }
         merge_final_untracked_rows(&mut rows, untracked_rows)?;
         for delta in &sorted_tracked {
-            apply_complete_hot_snapshot_delta(
-                &mut rows,
-                delta,
-                absence_guards,
-                &mut retired_untracked_json_refs,
-            )?;
+            apply_complete_hot_snapshot_delta(&mut rows, delta, absence_guards)?;
         }
 
         // A replacement generation cannot inherit a checkpoint baseline from
@@ -7818,12 +7792,6 @@ where
 
         stage_complete_collection_controls(self.writes, branch_id, generation, &rows)?;
         stage_complete_hot_rows(self.writes, branch_id, generation, rows);
-        JsonStoreWriter::stage_untracked_reclaim_candidates(
-            self.writes,
-            retired_untracked_json_refs
-                .into_iter()
-                .map(JsonRef::from_hash_bytes),
-        );
         *coverage = WorkingDiffIndexCoverage::default();
         Ok((
             HotTrackedSnapshot {
@@ -7844,7 +7812,6 @@ async fn stage_incremental_file_delete_cascades(
     working_diff_capture_checkpoint_commit_id: Option<CommitId>,
     reset_working_diff_baselines: bool,
     coverage: &mut WorkingDiffIndexCoverage,
-    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
     let mut cascades = BTreeMap::<String, &CurrentStateDeltaRef<'_>>::new();
     for cascade in deltas {
@@ -7940,7 +7907,6 @@ async fn stage_incremental_file_delete_cascades(
         write_entity_pk(&mut mutations.key_bytes, &identity.entity_pk);
         let row_key = BufferRange::new(row_start, mutations.key_bytes.len() - row_start);
         if existing.untracked {
-            collect_hot_untracked_refs(existing, retired_untracked_json_refs);
             mutations.row_deletes.push(row_key);
             continue;
         }
@@ -8314,14 +8280,12 @@ fn reject_lifecycle_retention_collisions(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_complete_hot_snapshot_delta(
     rows: &mut HotRowMap,
     delta: &CurrentStateDeltaRef<'_>,
     absence_guards: &BTreeSet<TrackedStateKey>,
-    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
-    apply_complete_file_delete_cascade(rows, delta, retired_untracked_json_refs)?;
+    apply_complete_file_delete_cascade(rows, delta)?;
     let identity = HeadRowIdentity {
         schema_key: delta.schema_key.to_string(),
         entity_pk: delta.entity_pk.clone(),
@@ -8332,9 +8296,6 @@ fn apply_complete_hot_snapshot_delta(
         let existing = decode_head_value(previous)?;
         reject_guarded_live_member(absence_guards, delta, existing)?;
         reject_retention_change(delta, existing)?;
-        if existing.untracked {
-            collect_retired_untracked_json_refs(existing, delta, retired_untracked_json_refs);
-        }
     }
     if delta.physically_deletes() {
         rows.remove(&identity);
@@ -8358,7 +8319,6 @@ fn apply_complete_hot_snapshot_delta(
 fn apply_complete_file_delete_cascade(
     rows: &mut HotRowMap,
     delta: &CurrentStateDeltaRef<'_>,
-    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
     let Some(file_id) = file_delete_cascade_id(delta)? else {
         return Ok(());
@@ -8377,7 +8337,6 @@ fn apply_complete_file_delete_cascade(
             continue;
         }
         if existing.untracked {
-            collect_hot_untracked_refs(existing, retired_untracked_json_refs);
             rows.remove(&identity);
             continue;
         }
@@ -9119,9 +9078,8 @@ fn stage_hot_bootstrap(
             ));
         }
     }
-    let mut retired_untracked_json_refs = BTreeSet::new();
     for delta in deltas {
-        apply_complete_file_delete_cascade(&mut rows, delta, &mut retired_untracked_json_refs)?;
+        apply_complete_file_delete_cascade(&mut rows, delta)?;
         let identity = HeadRowIdentity {
             schema_key: delta.schema_key.to_string(),
             entity_pk: delta.entity_pk.clone(),
@@ -9132,13 +9090,6 @@ fn stage_hot_bootstrap(
             let existing = decode_head_value(previous)?;
             reject_guarded_live_member(absence_guards, delta, existing)?;
             reject_retention_change(delta, existing)?;
-            if existing.untracked {
-                collect_retired_untracked_json_refs(
-                    existing,
-                    delta,
-                    &mut retired_untracked_json_refs,
-                );
-            }
         }
         if delta.physically_deletes() {
             rows.remove(&identity);
@@ -9166,12 +9117,6 @@ fn stage_hot_bootstrap(
     }
     stage_complete_collection_controls(writes, branch_id, generation, &rows)?;
     stage_complete_hot_rows(writes, branch_id, generation, rows);
-    JsonStoreWriter::stage_untracked_reclaim_candidates(
-        writes,
-        retired_untracked_json_refs
-            .into_iter()
-            .map(JsonRef::from_hash_bytes),
-    );
     *coverage = WorkingDiffIndexCoverage::default();
     Ok(())
 }
@@ -14923,7 +14868,6 @@ mod tests {
         let generation = CommitId::for_test_label("ordinary-import-generation");
         let mut writes = StorageWriteSet::new();
         let mut coverage = WorkingDiffIndexCoverage::default();
-        let mut retired_untracked_json_refs = BTreeSet::new();
         let explicit_index_builds = incremental_cascade_explicit_index_builds();
 
         stage_incremental_file_delete_cascades(
@@ -14935,7 +14879,6 @@ mod tests {
             None,
             false,
             &mut coverage,
-            &mut retired_untracked_json_refs,
         )
         .await
         .expect("ordinary imports do not need file-delete cascade staging");

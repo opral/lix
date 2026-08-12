@@ -38,8 +38,6 @@
 use crate::storage_adapter::StorageSpace;
 
 pub const JSON_SPACE: StorageSpace = crate::json_store::JSON_SPACE;
-pub const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace =
-    crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE;
 pub const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace =
     crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE;
 pub const REPOSITORY_PROTOCOL_SPACE: StorageSpace = crate::init::REPOSITORY_PROTOCOL_SPACE;
@@ -110,7 +108,6 @@ mod tests {
     /// publishes the whole registry" a checked claim rather than a comment.
     const PUBLISHED: &[StorageSpace] = &[
         JSON_SPACE,
-        UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
         TRACKED_STATE_TREE_CHUNK_SPACE,
         REPOSITORY_PROTOCOL_SPACE,
         TRACKED_STATE_CHANGE_LOCATOR_SPACE,
