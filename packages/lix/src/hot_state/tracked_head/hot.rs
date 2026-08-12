@@ -4956,26 +4956,36 @@ where
         Ok(dependencies)
     }
 
-    /// Candidate entity primary keys whose indexed column equals `value`.
+    /// Candidate entity primary keys whose indexed column equals any of
+    /// `values`.
     ///
     /// Returns `None` when the caller must not use the index and must fall
-    /// back to its ordinary scan, which happens for two reasons: the
-    /// collection has no completeness witness for the generation, or the
-    /// witness says the plane has degraded far enough that resolving its
-    /// candidates would cost more than the scan (see
-    /// [`hot_index_candidate_budget`]). `Some` is a candidate set, not an
+    /// back to its ordinary scan, which happens for three reasons: the
+    /// collection has no completeness witness for the generation, the witness
+    /// says the plane has degraded far enough that resolving its candidates
+    /// would cost more than the scan (see [`hot_index_candidate_budget`]), or
+    /// the caller asked for more distinct values than
+    /// [`HOT_INDEX_PROBE_VALUE_LIMIT`]. `Some` is a candidate set, not an
     /// answer: entries are never deleted within a generation, so a candidate
     /// may name a row that has since changed value or been deleted. Callers
     /// resolve candidates through the exact-entity-pk read and re-apply their
     /// own predicate. The set never *omits* a live matching row.
+    ///
+    /// The witness read and the candidate budget are shared across `values`:
+    /// the budget bounds the *total* candidate count, so a multi-value probe
+    /// can never read more index entries than a single-value probe was already
+    /// allowed to.
     pub(crate) async fn scan_hot_index_candidates(
         &self,
         branch_id: &str,
         generation: CommitId,
         schema_key: &str,
         ordinal: u16,
-        value: &HotIndexValue,
+        values: &[HotIndexValue],
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        if values.is_empty() || values.len() > HOT_INDEX_PROBE_VALUE_LIMIT {
+            return Ok(None);
+        }
         let witness = StorageKey(Bytes::from(encode_hot_index_witness_key(
             branch_id,
             generation,
@@ -4998,47 +5008,51 @@ where
             return Ok(None);
         };
         let budget = hot_index_candidate_budget(entries_published);
-        let range = StoragePrefix {
-            bytes: Bytes::from(hot_index_value_prefix(
-                branch_id,
-                generation,
-                schema_key,
-                ordinal,
-                value,
-            )),
-        }
-        .to_range()?;
-        let mut cursor = self
-            .store
-            .begin_scan(
-                INDEX_SPACE,
-                range,
-                StorageBeginScanOptions::default(),
-            )
-            .await?;
         let mut candidates = Vec::new();
-        loop {
-            // Never read more than one entry past the budget: the extra entry
-            // is what proves the bucket exceeds it, and everything beyond is
-            // work this route has already decided not to do.
-            let want = (budget + 1 - candidates.len()).min(HOT_INDEX_CANDIDATE_PAGE);
-            let (page, page_has_more) = cursor.next_page(want).await?.into_parts();
-            for entry in &page {
-                let StorageProjectedValue::FullValue(value) = &entry.value else {
-                    continue;
-                };
-                let text = std::str::from_utf8(value).map_err(|error| {
-                    head_value_error(format!("hot index entry is not utf-8: {error}"))
-                })?;
-                candidates.push(EntityPk::from_json_array_text(text).map_err(|error| {
-                    head_value_error(format!("hot index entry has an invalid entity pk: {error}"))
-                })?);
+        for value in values {
+            let range = StoragePrefix {
+                bytes: Bytes::from(hot_index_value_prefix(
+                    branch_id,
+                    generation,
+                    schema_key,
+                    ordinal,
+                    value,
+                )),
             }
-            if candidates.len() > budget {
-                return Ok(None);
-            }
-            if !page_has_more {
-                break;
+            .to_range()?;
+            let mut cursor = self
+                .store
+                .begin_scan(
+                    INDEX_SPACE,
+                    range,
+                    StorageBeginScanOptions::default(),
+                )
+                .await?;
+            loop {
+                // Never read more than one entry past the budget: the extra
+                // entry is what proves the bucket exceeds it, and everything
+                // beyond is work this route has already decided not to do.
+                let want = (budget + 1 - candidates.len()).min(HOT_INDEX_CANDIDATE_PAGE);
+                let (page, page_has_more) = cursor.next_page(want).await?.into_parts();
+                for entry in &page {
+                    let StorageProjectedValue::FullValue(value) = &entry.value else {
+                        continue;
+                    };
+                    let text = std::str::from_utf8(value).map_err(|error| {
+                        head_value_error(format!("hot index entry is not utf-8: {error}"))
+                    })?;
+                    candidates.push(EntityPk::from_json_array_text(text).map_err(|error| {
+                        head_value_error(format!(
+                            "hot index entry has an invalid entity pk: {error}"
+                        ))
+                    })?);
+                }
+                if candidates.len() > budget {
+                    return Ok(None);
+                }
+                if !page_has_more {
+                    break;
+                }
             }
         }
         Ok(Some(candidates))
@@ -11670,6 +11684,13 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
 const HOT_INDEX_WITNESS_TAG: u8 = 0x00;
 const HOT_INDEX_ENTRY_TAG: u8 = 0x01;
 const HOT_INDEX_CANDIDATE_PAGE: usize = 256;
+/// Distinct values one indexed-column probe may resolve.
+///
+/// Each value costs its own range scan, so a very wide `IN` list — or a very
+/// wide join build side — is cheaper to answer with the ordinary collection
+/// scan. Declining above the limit keeps the probe route weakly better than
+/// the scan route it replaces.
+const HOT_INDEX_PROBE_VALUE_LIMIT: usize = 64;
 
 /// One index entry to publish: the row's indexed value and its identity.
 #[derive(Debug, Clone)]

@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::sync::Arc;
 #[cfg(feature = "storage-benches")]
@@ -9,18 +9,19 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::ScanArgs;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{DataFusionError, internal_err};
+use datafusion::common::{DataFusionError, NullEquality, ScalarValue, internal_err};
 use datafusion::datasource::provider_as_source;
 use datafusion::error::Result;
 use datafusion::execution::SessionState;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
-use datafusion::physical_expr::{LexOrdering, Partitioning};
+use datafusion::logical_expr::{JoinType, LogicalPlan};
+use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+use datafusion::physical_expr::{LexOrdering, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, CardinalityEffect, EmissionType};
-use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -634,6 +635,10 @@ fn adapt_runtime_plan_inner(
         return Ok(Arc::new(StatementScanCacheExec::new(state)));
     }
 
+    if let Some(probe_join) = probe_key_join(&plan)? {
+        return Ok(probe_join);
+    }
+
     let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() else {
         return Ok(plan);
     };
@@ -641,6 +646,279 @@ fn adapt_runtime_plan_inner(
         Arc::clone(coalesce.input()),
         coalesce.fetch(),
     )))
+}
+
+/// Distinct probe keys one join may carry into its scan.
+///
+/// Each key becomes its own index bucket lookup, so a wide build side is
+/// cheaper to answer with the collection scan the join already had. The
+/// storage plane applies the same cap independently and declines above it, so
+/// exceeding this number costs a scan, never a wrong answer.
+const MAX_PROBE_KEYS: usize = 64;
+
+/// Wraps a hash join whose probe side is a scan that can seek on the join key.
+///
+/// Only the shapes where discarding a non-matching probe row is already the
+/// join's own behaviour qualify:
+///
+/// - `CollectLeft`, so the build side is the left input and is fully consumed
+///   before the probe side is read;
+/// - `Inner` or `Left`, whose output contains a right row only when it matched
+///   a left row — `Right` and `Full` null-extend unmatched probe rows and are
+///   therefore excluded;
+/// - `NullEqualsNothing`, so a null probe key cannot match and dropping null
+///   rows is not observable;
+/// - a single output partition, so the build side is consumed once.
+///
+/// With more than one equijoin key, restricting on any one of them is still
+/// conservative: a row that matches must match on every key, so it survives the
+/// restriction on each of them individually.
+fn probe_key_join(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() else {
+        return Ok(None);
+    };
+    if join.mode != PartitionMode::CollectLeft
+        || !matches!(join.join_type(), JoinType::Inner | JoinType::Left)
+        || join.null_equality() != NullEquality::NullEqualsNothing
+        || plan.output_partitioning().partition_count() != 1
+        || join.left().output_partitioning().partition_count() != 1
+    {
+        return Ok(None);
+    }
+    let Some(scan) = probe_scan(join.right()) else {
+        return Ok(None);
+    };
+    let left_schema = join.left().schema();
+    let right_schema = join.right().schema();
+    for (left_key, right_key) in join.on() {
+        let Some(column) = right_key.as_any().downcast_ref::<PhysicalColumn>() else {
+            continue;
+        };
+        if !scan.serves_probe_column(column.name()) {
+            continue;
+        }
+        // The restriction is handed to the provider as literals of the probe
+        // column's own type. A join key that had to be widened or cast is not
+        // that type, so leave those to the scan.
+        if left_key.data_type(&left_schema)? != right_key.data_type(&right_schema)? {
+            continue;
+        }
+        return Ok(Some(Arc::new(ProbeKeyJoinExec::new(
+            Arc::clone(plan),
+            Arc::clone(left_key),
+            column.name().to_string(),
+        ))));
+    }
+    Ok(None)
+}
+
+/// The scan a probe side reads its rows from, if the operators above it in
+/// that side neither rename its columns nor add rows to it.
+///
+/// DataFusion puts a cooperative-yielding wrapper over every leaf and may put
+/// batch coalescing or a residual filter between the join and the scan. All
+/// three pass their input's schema through unchanged, so a join key names the
+/// same scan column through any chain of them, and all three only ever emit a
+/// subset of what the scan produced — which is what makes restricting the scan
+/// beneath them observationally identical to restricting the probe side.
+fn probe_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&SpecScanExec> {
+    if let Some(scan) = plan.as_any().downcast_ref::<SpecScanExec>() {
+        return Some(scan);
+    }
+    if !probe_passthrough(plan.as_ref()) {
+        return None;
+    }
+    let children = plan.children();
+    let [child] = children.as_slice() else {
+        return None;
+    };
+    probe_scan(child)
+}
+
+fn probe_passthrough(plan: &dyn ExecutionPlan) -> bool {
+    matches!(
+        plan.name(),
+        "CooperativeExec" | "CoalesceBatchesExec" | "FilterExec"
+    )
+}
+
+/// Rebuilds a probe side around a replacement for the scan `probe_scan` found.
+fn replace_probe_scan(
+    plan: &Arc<dyn ExecutionPlan>,
+    replacement: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if plan.as_any().downcast_ref::<SpecScanExec>().is_some() {
+        return Ok(replacement);
+    }
+    let children = plan.children();
+    let [child] = children.as_slice() else {
+        return internal_err!("probe side lost its scan");
+    };
+    let child = replace_probe_scan(child, replacement)?;
+    Arc::clone(plan).with_new_children(vec![child])
+}
+
+/// A hash join that reads its build side first and replans its probe scan
+/// restricted to the build side's key values.
+///
+/// The rewrite is an access-path choice, never a semantic one. The restricted
+/// scan is the same provider scan with one extra `IN` predicate on a key
+/// column, and the join that runs over it is the original join with its
+/// children swapped for a replay of the build side and that restricted scan.
+/// Every reason to decline — too many distinct keys, a provider that cannot
+/// seek the column, a build side whose keys are all null — falls back to the
+/// unrestricted scan and produces the same rows more slowly.
+#[derive(Debug)]
+struct ProbeKeyJoinExec {
+    join: Arc<dyn ExecutionPlan>,
+    left_key: Arc<dyn PhysicalExpr>,
+    probe_column: String,
+    properties: Arc<PlanProperties>,
+}
+
+impl ProbeKeyJoinExec {
+    fn new(
+        join: Arc<dyn ExecutionPlan>,
+        left_key: Arc<dyn PhysicalExpr>,
+        probe_column: String,
+    ) -> Self {
+        Self {
+            properties: Arc::clone(join.properties()),
+            join,
+            left_key,
+            probe_column,
+        }
+    }
+}
+
+impl DisplayAs for ProbeKeyJoinExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ProbeKeyJoinExec: probe_key={}", self.probe_column)
+    }
+}
+
+impl ExecutionPlan for ProbeKeyJoinExec {
+    fn name(&self) -> &'static str {
+        "ProbeKeyJoinExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.join.children()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let join = rebuild_hash_join(&self.join, children)?;
+        // Re-derive rather than reattach: a replacement probe child that can no
+        // longer seek this key must go back to the plain join.
+        Ok(probe_key_join(&join)?.unwrap_or(join))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let join = Arc::clone(&self.join);
+        let left_key = Arc::clone(&self.left_key);
+        let probe_column = self.probe_column.clone();
+        let schema = self.schema();
+        let restricted = stream::once(async move {
+            let children = join.children();
+            let (Some(build), Some(probe)) = (children.first(), children.get(1)) else {
+                return internal_err!("probe-key join lost a child");
+            };
+            // The build side is consumed once here to read the keys and replayed
+            // from memory by the join. `CollectLeft` already materializes it, so
+            // this is the same collection moved one operator earlier.
+            let build: Arc<dyn ExecutionPlan> = Arc::new(StatementScanCacheExec::new(Arc::new(
+                StatementScanCacheState::new(Arc::clone(build)),
+            )));
+            let batches =
+                collect_adapted_input_plan(Arc::clone(&build), Arc::clone(&context)).await?;
+            let restricted_scan = match probe_keys(&batches, &left_key)? {
+                Some(values) => match probe_scan(probe) {
+                    Some(scan) if scan.serves_probe_column(&probe_column) => {
+                        scan.rebind_probe(&probe_column, values).await?
+                    }
+                    _ => None,
+                },
+                None => None,
+            };
+            let probe = match restricted_scan {
+                Some(restricted_scan) => replace_probe_scan(probe, restricted_scan)?,
+                None => Arc::clone(probe),
+            };
+            rebuild_hash_join(&join, vec![build, probe])?.execute(partition, context)
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, restricted)))
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        self.join.partition_statistics(partition)
+    }
+}
+
+/// Rebuilds a hash join over new children with no state carried over.
+///
+/// `HashJoinExec::with_new_children` deliberately preserves the build table and
+/// dynamic-filter state of the operator it clones, which a rebuilt join must
+/// not inherit.
+fn rebuild_hash_join(
+    join: &Arc<dyn ExecutionPlan>,
+    children: Vec<Arc<dyn ExecutionPlan>>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let Some(hash_join) = join.as_any().downcast_ref::<HashJoinExec>() else {
+        return internal_err!("probe-key join wraps a non-hash join");
+    };
+    hash_join
+        .builder()
+        .with_new_children(children)?
+        .reset_state()
+        .build_exec()
+}
+
+/// The distinct non-null build-side key values, or `None` when the join must
+/// keep its unrestricted probe scan.
+///
+/// Null keys are dropped because the caller already established
+/// `NullEqualsNothing`, under which a null key matches nothing.
+fn probe_keys(
+    batches: &[RecordBatch],
+    key: &Arc<dyn PhysicalExpr>,
+) -> Result<Option<Vec<ScalarValue>>> {
+    let mut seen = HashSet::new();
+    let mut values = Vec::new();
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let array = key.evaluate(batch)?.into_array(batch.num_rows())?;
+        for index in 0..array.len() {
+            if array.is_null(index) {
+                continue;
+            }
+            let value = ScalarValue::try_from_array(&array, index)?;
+            if seen.insert(value.clone()) {
+                if values.len() == MAX_PROBE_KEYS {
+                    return Ok(None);
+                }
+                values.push(value);
+            }
+        }
+    }
+    Ok((!values.is_empty()).then_some(values))
 }
 
 #[derive(Debug)]
