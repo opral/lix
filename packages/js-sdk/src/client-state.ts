@@ -6,8 +6,8 @@ export const ACTIVE_BRANCH_CLIENT_STATE_KEY = "lix_active_branch_id";
 export const ACTIVE_ACCOUNT_CLIENT_STATE_KEY = "lix_active_account_id";
 
 export type LixClientState = {
-	/** Returns the hydrated client-local value without a network round trip. */
-	get<T extends JsonValue = JsonValue>(key: string): T | undefined;
+	/** Reads a client-local value through the configured client storage. */
+	get<T extends JsonValue = JsonValue>(key: string): Promise<T | undefined>;
 	/** Persists a client-local value in the configured client storage. */
 	set(key: string, value: JsonValue): Promise<void>;
 	/** Deletes a client-local value from the configured client storage. */
@@ -30,7 +30,7 @@ export function unavailableClientState(): LixClientState {
 		return error;
 	};
 	return {
-		get: () => undefined,
+		get: async () => undefined,
 		set: async () => {
 			throw unavailable();
 		},
@@ -55,46 +55,45 @@ export type OpenClientStateOptions = {
  * prefix is intentionally private so built-in Lix key/value rows never leak
  * through this small API.
  */
-export async function openClientState(
+export function openClientState(
 	options: OpenClientStateOptions,
-): Promise<ManagedLixClientState> {
-	const entries = options.binding.clientStateEntries;
-	if (!entries) {
+): ManagedLixClientState {
+	if (
+		!options.binding.clientStateGet ||
+		!options.binding.clientStateSet ||
+		!options.binding.clientStateDelete
+	) {
 		throw new Error(
 			"The selected Lix binding does not support typed client state",
 		);
 	}
-	const initial = new Map<string, JsonValue>();
-	for (const entry of await entries.call(options.binding)) {
-		assertClientStateKey(entry.key);
-		assertJsonValue(entry.value);
-		initial.set(entry.key, cloneJsonValue(entry.value));
-	}
-	return new ManagedLixClientState(options, initial);
+	return new ManagedLixClientState(options);
 }
 
 export class ManagedLixClientState implements LixClientState {
 	readonly #binding: ClientStateBinding;
 	readonly #closeBinding: boolean;
-	readonly #values: Map<string, JsonValue>;
 	readonly #listeners = new Set<() => void>();
 	#operationQueue: Promise<void> = Promise.resolve();
 	#closePromise: Promise<void> | undefined;
 	#acceptingOperations = true;
 
-	constructor(
-		options: OpenClientStateOptions,
-		initial: Map<string, JsonValue>,
-	) {
+	constructor(options: OpenClientStateOptions) {
 		this.#binding = options.binding;
 		this.#closeBinding = options.closeBinding ?? false;
-		this.#values = initial;
 	}
 
-	get<T extends JsonValue = JsonValue>(key: string): T | undefined {
+	get<T extends JsonValue = JsonValue>(key: string): Promise<T | undefined> {
 		assertClientStateKey(key);
-		const value = this.#values.get(key);
-		return value === undefined ? undefined : (cloneJsonValue(value) as T);
+		this.#assertOpen();
+		return this.#enqueue(async () => {
+			const get = this.#binding.clientStateGet;
+			if (!get) throw new Error("Typed Lix client state is unavailable");
+			const value = await get.call(this.#binding, key);
+			if (value === undefined) return undefined;
+			assertJsonValue(value);
+			return cloneJsonValue(value) as T;
+		});
 	}
 
 	set(key: string, value: JsonValue): Promise<void> {
@@ -106,7 +105,7 @@ export class ManagedLixClientState implements LixClientState {
 			const set = this.#binding.clientStateSet;
 			if (!set) throw new Error("Typed Lix client state is unavailable");
 			await set.call(this.#binding, key, nextValue);
-			this.#commitSet(key, nextValue);
+			this.#publish();
 		});
 	}
 
@@ -118,7 +117,7 @@ export class ManagedLixClientState implements LixClientState {
 			if (!deleteValue)
 				throw new Error("Typed Lix client state is unavailable");
 			await deleteValue.call(this.#binding, key);
-			this.#commitDelete(key);
+			this.#publish();
 		});
 	}
 
@@ -142,22 +141,13 @@ export class ManagedLixClientState implements LixClientState {
 		return this.#closePromise;
 	}
 
-	#enqueue(operation: () => Promise<void>): Promise<void> {
+	#enqueue<T>(operation: () => Promise<T>): Promise<T> {
 		const result = this.#operationQueue.then(operation, operation);
 		this.#operationQueue = result.then(
 			() => undefined,
 			() => undefined,
 		);
 		return result;
-	}
-
-	#commitSet(key: string, value: JsonValue): void {
-		this.#values.set(key, value);
-		this.#publish();
-	}
-
-	#commitDelete(key: string): void {
-		if (this.#values.delete(key)) this.#publish();
 	}
 
 	#publish(): void {

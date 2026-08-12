@@ -33,10 +33,10 @@ test("managed Lix close rejects new work and drains an in-flight branch switch",
 			order.push("client binding closed");
 		},
 	} as unknown as LixBinding;
-	const clientState = new ManagedLixClientState(
-		{ binding: clientBinding, closeBinding: true },
-		new Map(),
-	);
+	const clientState = new ManagedLixClientState({
+		binding: clientBinding,
+		closeBinding: true,
+	});
 	const lix = new Lix(binding, clientState);
 	const branchListener = vi.fn();
 	lix.subscribeActiveBranch(branchListener);
@@ -44,12 +44,16 @@ test("managed Lix close rejects new work and drains an in-flight branch switch",
 	const switching = lix.switchBranch({ branchId: "draft" });
 	const closing = lix.close();
 	const readAfterClose = lix.execute("SELECT 1");
+	const stateReadAfterClose = lix.clientState.get("late");
 	const stateWriteAfterClose = lix.clientState.set("late", true);
 
 	await expect(readAfterClose).rejects.toMatchObject({
 		code: "LIX_ERROR_CLOSED",
 	});
 	expect(execute).not.toHaveBeenCalled();
+	await expect(stateReadAfterClose).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
 	await expect(stateWriteAfterClose).rejects.toMatchObject({
 		code: "LIX_ERROR_CLOSED",
 	});
@@ -91,14 +95,18 @@ test("an active-transaction close preflight preserves client state and observati
 		})),
 		close: vi.fn(async () => undefined),
 	} as unknown as LixBinding;
+	const storedClientState = new Map<string, unknown>();
 	const clientBinding = {
-		clientStateSet: vi.fn(async () => undefined),
+		clientStateGet: vi.fn(async (key: string) => storedClientState.get(key)),
+		clientStateSet: vi.fn(async (key: string, value: unknown) => {
+			storedClientState.set(key, value);
+		}),
 		close: vi.fn(async () => undefined),
 	} as unknown as LixBinding;
-	const clientState = new ManagedLixClientState(
-		{ binding: clientBinding, closeBinding: true },
-		new Map(),
-	);
+	const clientState = new ManagedLixClientState({
+		binding: clientBinding,
+		closeBinding: true,
+	});
 	const lix = new Lix(binding, clientState);
 	const observation = lix.observe("SELECT 1");
 	await observation.next();
@@ -111,7 +119,7 @@ test("an active-transaction close preflight preserves client state and observati
 	expect(clientBinding.close).not.toHaveBeenCalled();
 	expect(observationClose).not.toHaveBeenCalled();
 	await expect(lix.clientState.set("still-open", true)).resolves.toBeUndefined();
-	expect(lix.clientState.get("still-open")).toBe(true);
+	await expect(lix.clientState.get("still-open")).resolves.toBe(true);
 
 	await transaction.rollback();
 	await expect(lix.close()).resolves.toBeUndefined();
@@ -143,6 +151,33 @@ test("a terminal commit failure releases the transaction from its parent Lix", a
 	expect(transactionBinding.rollback).not.toHaveBeenCalled();
 });
 
+test("client state get reads the binding and preserves operation order", async () => {
+	const pendingSet = deferred<void>();
+	let stored: unknown = "before";
+	const clientBinding = {
+		clientStateGet: vi.fn(async () => stored),
+		clientStateSet: vi.fn(async (_key: string, value: unknown) => {
+			await pendingSet.promise;
+			stored = value;
+		}),
+	} as unknown as LixBinding;
+	const clientState = new ManagedLixClientState({ binding: clientBinding });
+
+	await expect(clientState.get("preference")).resolves.toBe("before");
+	stored = "changed-outside-facade";
+	await expect(clientState.get("preference")).resolves.toBe(
+		"changed-outside-facade",
+	);
+
+	const setting = clientState.set("preference", "after");
+	const reading = clientState.get("preference");
+	expect(clientBinding.clientStateGet).toHaveBeenCalledTimes(2);
+	pendingSet.resolve();
+	await expect(setting).resolves.toBeUndefined();
+	await expect(reading).resolves.toBe("after");
+	expect(clientBinding.clientStateGet).toHaveBeenCalledTimes(3);
+});
+
 test("a remote close failure still closes managed local client state", async () => {
 	const binding = {
 		close: vi.fn(async () => {
@@ -152,10 +187,10 @@ test("a remote close failure still closes managed local client state", async () 
 	const clientBinding = {
 		close: vi.fn(async () => undefined),
 	} as unknown as LixBinding;
-	const clientState = new ManagedLixClientState(
-		{ binding: clientBinding, closeBinding: true },
-		new Map(),
-	);
+	const clientState = new ManagedLixClientState({
+		binding: clientBinding,
+		closeBinding: true,
+	});
 	const lix = new Lix(binding, clientState);
 
 	await expect(lix.close()).rejects.toThrow("remote close failed");

@@ -57,7 +57,6 @@ export type LixBinding = {
 	beginTransaction(): Promise<LixTransactionBinding>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
-	clientStateEntries?(): Promise<Array<{ key: string; value: JsonValue }>>;
 	clientStateGet?(key: string): Promise<JsonValue | undefined>;
 	clientStateSet?(key: string, value: JsonValue): Promise<void>;
 	clientStateDelete?(key: string): Promise<void>;

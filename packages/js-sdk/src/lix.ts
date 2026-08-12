@@ -75,7 +75,7 @@ export class Lix {
 		this.clientState = managedClientState
 			? {
 					get: <T extends JsonValue = JsonValue>(key: string) =>
-						managedClientState.get<T>(key),
+						this.#runOperation(() => managedClientState.get<T>(key)),
 					set: (key, value) =>
 						this.#runOperation(() => managedClientState.set(key, value)),
 					delete: (key) =>
