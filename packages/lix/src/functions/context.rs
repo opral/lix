@@ -87,16 +87,14 @@ impl FunctionContext {
         else {
             return Ok(Vec::new());
         };
-        Ok(vec![
-            state::stage_sequence(
-                read,
-                writes,
-                DeterministicSequence { highest_seen },
-                self.bookkeeping_timestamp,
-                deterministic_sequence_change_id(highest_seen),
-            )
-            .await?,
-        ])
+        state::stage_sequence(
+            read,
+            writes,
+            DeterministicSequence { highest_seen },
+            self.bookkeeping_timestamp,
+            deterministic_sequence_change_id(highest_seen),
+        )
+        .await
     }
 
     pub(crate) fn deterministic_sequence_checkpoint(

@@ -9,7 +9,6 @@ use crate::storage_adapter::{
 use bytes::Bytes;
 use std::collections::HashSet;
 
-#[cfg(test)]
 const JSON_REF_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
@@ -127,7 +126,6 @@ impl JsonStoreWriter {
             return Ok(order);
         }
 
-        const JSON_REF_BYTES: usize = 32;
         let key_bytes_len = unique_payloads
             .len()
             .checked_mul(JSON_REF_BYTES)
@@ -159,10 +157,13 @@ impl JsonStoreWriter {
         Ok(order)
     }
 
-    /// Deletes JSON payload rows. The only caller is the `#[cfg(test)]`
-    /// changelog sweep in `gc.rs`; no production path reclaims JSON payloads
-    /// today.
-    #[cfg(test)]
+    /// Deletes JSON payload rows.
+    ///
+    /// The caller must have proved that no owner outliving its write set names
+    /// these refs — see `gc::collect_live_json_payload_hashes` — and must stage
+    /// [`crate::json_store::stage_json_reclamation_fence`] in the same write
+    /// set, because payload rows are content addressed and a concurrent
+    /// publisher can resolve onto one of them.
     #[expect(clippy::unused_self)]
     pub(crate) fn stage_delete_refs<I>(&self, writes: &mut StorageWriteSet, refs: I)
     where

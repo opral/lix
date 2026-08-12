@@ -10613,17 +10613,110 @@ async fn stage_reclaim_retired_change_locators(
     Ok(())
 }
 
+/// Collects the out-of-band JSON payload refs one commit's own packed delta
+/// physically owns.
+///
+/// Deliberately *local*. A selected member carries no payload of its own — it
+/// is a reference to a row the selected-source commit owns, and the
+/// authenticated retention closure always retains that source as a physical
+/// authority. So enumerating the hydrated form here would name payloads whose
+/// owner GC visits separately, and would make a retired commit look like the
+/// owner of bytes it only borrowed.
+///
+/// This is the same bounded per-commit inventory walk
+/// [`load_local_selected_change_owner_commit_ids`] uses: one authenticated
+/// manifest plus that commit's own segments. It never scans a repository-global
+/// change, commit, or payload space.
+pub(crate) async fn collect_local_commit_delta_json_refs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    refs: &mut BTreeSet<[u8; 32]>,
+) -> Result<(), LixError> {
+    // Boxed, not inlined. This runs inside the repository sweep's already very
+    // large future, once per retired and once per surviving commit; leaving the
+    // segment-decode chain inline grew that future past the test harness's
+    // 2 MiB worker stack and aborted `cas_gc_history_retention` with a stack
+    // overflow rather than a failure.
+    let Some(state) = Box::pin(load_point_replay_commit_state(store, commit_id)).await? else {
+        return Ok(());
+    };
+    let Some((members, _)) = Box::pin(load_authenticated_local_commit_delta_members_for_schemas(
+        store,
+        &state,
+        &[],
+        usize::MAX,
+        false,
+    ))
+    .await?
+    else {
+        unreachable!("unbounded commit-delta payload inventory cannot exceed its segment limit")
+    };
+    for member in &members {
+        for slot in [&member.change.snapshot, &member.change.metadata] {
+            if let crate::json_store::JsonSlot::Ref(json_ref) = slot {
+                refs.insert(*json_ref.as_hash_array());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collects the out-of-band JSON payload refs named by native current-state
+/// data parts, addressed by their payload-ref summary digests.
+///
+/// A missing summary is a hard error rather than an empty set: treating
+/// corruption as "this part names no payloads" is exactly the mistake that
+/// would turn a read failure into a delete.
+pub(crate) async fn collect_current_state_part_json_refs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    refs_digests: &BTreeSet<[u8; 32]>,
+    refs: &mut BTreeSet<[u8; 32]>,
+) -> Result<(), LixError> {
+    if refs_digests.is_empty() {
+        return Ok(());
+    }
+    let keys = refs_digests
+        .iter()
+        .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
+        .collect::<Vec<_>>();
+    let loaded = PointReadPlan::new(
+        crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+        &keys,
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    for (digest, value) in refs_digests.iter().zip(loaded.value) {
+        let Some(bytes) = value.and_then(full_value_bytes) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "current-state data part references a missing payload-ref summary",
+            ));
+        };
+        refs.extend(crate::tracked_state::decode_current_state_data_part_refs(
+            digest, &bytes,
+        )?);
+    }
+    Ok(())
+}
+
 /// Retires every physical tracked-state row owned by one unreachable commit.
 ///
 /// GC proves unreachability from refs and hands the proof here; the layout of
 /// mutation directories, scoped-range trees, and native current-state parts —
 /// and therefore which keys a retirement touches — stays inside the module
 /// that writes them.
+///
+/// `released_part_refs_digests` receives the payload-ref summary digest of
+/// every native current-state part this retirement actually deletes. Those
+/// summaries are the only remaining owner record for the JSON payloads a
+/// carried-forward row named, so the caller must be able to turn them into
+/// reclamation candidates before the rows that name them are gone.
 pub(crate) async fn stage_retire_commit_physical_state(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     commit_id: CommitId,
     retained: RetainedPhysicalState<'_>,
+    released_part_refs_digests: &mut BTreeSet<[u8; 32]>,
 ) -> Result<(), LixError> {
     let manifest = load_commit_state_manifest(store, commit_id)
         .await?
@@ -10674,6 +10767,7 @@ pub(crate) async fn stage_retire_commit_physical_state(
                     crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
                     key(descriptor.payload_refs_digest.to_vec()),
                 );
+                released_part_refs_digests.insert(descriptor.payload_refs_digest);
             }
         }
     }

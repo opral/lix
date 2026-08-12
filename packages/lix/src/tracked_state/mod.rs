@@ -35,12 +35,10 @@ pub(crate) use context::{
 };
 pub(crate) use current_state_data_part::{
     CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE,
-    decode_current_state_data_part_commit_ids,
+    decode_current_state_data_part_commit_ids, decode_current_state_data_part_refs,
 };
 #[cfg(test)]
-pub(crate) use current_state_data_part::{
-    CurrentStateDataRow, decode_current_state_data_part_refs, encode_current_state_data_part,
-};
+pub(crate) use current_state_data_part::{CurrentStateDataRow, encode_current_state_data_part};
 pub(crate) use current_state_envelope::current_state_descriptor_from_scoped_range_part;
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
@@ -98,7 +96,8 @@ pub(crate) use storage::{
     stage_prefixed_ordered_addressable_replacement_parts,
 };
 pub(crate) use storage::{
-    RetainedPhysicalState, load_native_current_state_part_owners,
+    RetainedPhysicalState, collect_current_state_part_json_refs,
+    collect_local_commit_delta_json_refs, load_native_current_state_part_owners,
     stage_retire_commit_physical_state,
 };
 #[cfg(feature = "storage-benches")]
