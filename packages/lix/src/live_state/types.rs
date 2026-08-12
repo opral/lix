@@ -1513,6 +1513,15 @@ pub(crate) enum ScanOperator {
     },
 }
 
+/// An equality predicate on a column the schema declares as unique or as a
+/// foreign key, addressed by its stable ordinal in the schema's index.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DeclaredColumnEq {
+    pub(crate) schema_key: String,
+    pub(crate) ordinal: u16,
+    pub(crate) value: crate::live_state::HotIndexValue,
+}
+
 /// Identity-centered filter for visible live entities.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct LiveStateFilter {
@@ -1530,6 +1539,14 @@ pub(crate) struct LiveStateFilter {
     pub(crate) untracked: Option<bool>,
     #[serde(default)]
     pub(crate) constraints: Vec<ScanConstraint>,
+    /// Equality on a declared column, to be served by the hot index plane.
+    ///
+    /// Resolved into [`Self::entity_pks`] before any scan route is chosen, so
+    /// no route below this ever sees it. The predicate is *not* removed from
+    /// the caller's own filtering when this is set: index entries are
+    /// candidates, so the caller's predicate is what rejects stale ones.
+    #[serde(default)]
+    pub(crate) declared_column_eq: Option<DeclaredColumnEq>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
 }

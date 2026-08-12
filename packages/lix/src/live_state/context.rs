@@ -698,6 +698,18 @@ where
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedLiveStateBatch::default());
         }
+        // Resolve a declared-column equality through the index plane before any
+        // route is chosen, so every route below sees an ordinary entity-pk
+        // request. Candidates are not answers: the caller keeps its own
+        // predicate and rejects stale ones.
+        let resolved;
+        let request = match self.resolve_declared_column_eq(request, &scope).await? {
+            Some(rewritten) => {
+                resolved = rewritten;
+                &resolved
+            }
+            None => request,
+        };
         if let Some(rows) = self.scan_direct_entity_pk_batch(request, &scope).await? {
             return Ok(rows);
         }
@@ -757,6 +769,66 @@ where
                 limit: request.limit,
             },
         ))
+    }
+
+    /// Rewrites a declared-column equality into an entity-pk request.
+    ///
+    /// Returns `None` when the predicate cannot be served — no predicate, more
+    /// than one branch in scope, or no completeness witness for the collection
+    /// — in which case the caller's ordinary scan runs unchanged and still
+    /// produces correct rows, only slower.
+    ///
+    /// An empty candidate set becomes `LiveStateRowFilter::None`, never an
+    /// empty `entity_pks` list: an empty list means "no identity filter" and
+    /// would silently widen the scan to the whole collection.
+    async fn resolve_declared_column_eq(
+        &self,
+        request: &LiveStateScanRequest,
+        scope: &LiveStateScanScope,
+    ) -> Result<Option<LiveStateScanRequest>, LixError> {
+        let Some(predicate) = request.filter.declared_column_eq.as_ref() else {
+            return Ok(None);
+        };
+        if !request.filter.entity_pks.is_empty() {
+            let mut rewritten = request.clone();
+            rewritten.filter.declared_column_eq = None;
+            return Ok(Some(rewritten));
+        }
+        let [branch_id] = scope.storage_branch_ids.as_slice() else {
+            let mut rewritten = request.clone();
+            rewritten.filter.declared_column_eq = None;
+            return Ok(Some(rewritten));
+        };
+        let Some(control) = scope.branch_heads.get(branch_id).copied() else {
+            let mut rewritten = request.clone();
+            rewritten.filter.declared_column_eq = None;
+            return Ok(Some(rewritten));
+        };
+        let candidates = self
+            .tracked_head
+            .reader(&self.store)
+            .scan_hot_index_candidates(
+                branch_id,
+                control.tracked_generation,
+                &predicate.schema_key,
+                predicate.ordinal,
+                &predicate.value,
+            )
+            .await?;
+        let mut rewritten = request.clone();
+        rewritten.filter.declared_column_eq = None;
+        match candidates {
+            None => Ok(Some(rewritten)),
+            Some(candidates) if candidates.is_empty() => {
+                rewritten.filter.rows = LiveStateRowFilter::None;
+                Ok(Some(rewritten))
+            }
+            Some(candidates) => {
+                let mut unique = candidates.into_iter().collect::<BTreeSet<_>>();
+                rewritten.filter.entity_pks = std::mem::take(&mut unique).into_iter().collect();
+                Ok(Some(rewritten))
+            }
+        }
     }
 
     /// Serves finite entity-PK scans from the hot current-state index. Every

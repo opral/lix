@@ -11454,7 +11454,7 @@ pub(crate) fn stage_hot_index_entries(
 ///
 /// Integers use the same order-preserving flip as entity-pk components so a
 /// future range predicate can reuse this encoding unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum HotIndexValue {
     String(String),
     Integer(i64),

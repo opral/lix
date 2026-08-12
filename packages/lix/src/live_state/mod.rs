@@ -48,6 +48,7 @@ pub(crate) use tracked_head::{
 };
 #[allow(unused_imports)]
 pub(crate) use types::{
+    DeclaredColumnEq,
     Bound, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,
     LiveStateProjection, LiveStateRowFilter, LiveStateRowIdentityRef, LiveStateRowRequest,
     LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
