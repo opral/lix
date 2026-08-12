@@ -95,22 +95,6 @@ where
         }
     }
 
-    /// Rebuilds the map with every value replaced by `project`, preserving the
-    /// existing tree shape exactly.
-    ///
-    /// Keys are untouched, so no comparison, rebalancing, or path copying is
-    /// needed: this is one linear pass that allocates one node per entry.
-    /// Callers must only use it when the substitution cannot change any key.
-    pub(crate) fn map_values<F>(&self, project: F) -> Self
-    where
-        F: Fn(&V) -> V,
-    {
-        Self {
-            root: map_values_node(self.root.as_deref(), &project),
-            len: self.len,
-        }
-    }
-
     pub(crate) fn values(&self) -> Vec<V> {
         let mut values = Vec::with_capacity(self.len);
         collect_values(self.root.as_deref(), &mut values);
@@ -399,21 +383,6 @@ fn leftmost<K, V>(mut node: &Arc<Node<K, V>>) -> &Arc<Node<K, V>> {
         node = left;
     }
     node
-}
-
-fn map_values_node<K, V, F>(node: Option<&Node<K, V>>, project: &F) -> Option<Arc<Node<K, V>>>
-where
-    K: Clone,
-    F: Fn(&V) -> V,
-{
-    let node = node?;
-    Some(Arc::new(Node {
-        key: node.key.clone(),
-        value: project(&node.value),
-        height: node.height,
-        left: map_values_node(node.left.as_deref(), project),
-        right: map_values_node(node.right.as_deref(), project),
-    }))
 }
 
 fn collect_values<K, V: Clone>(node: Option<&Node<K, V>>, values: &mut Vec<V>) {

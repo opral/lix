@@ -17,6 +17,9 @@ pub(crate) use codec::{
     decode_binary_cas_manifest, decode_binary_cas_manifest_chunk,
 };
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
+// The only remaining caller is the storage-bench harness, which is compiled
+// under test or  only.
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use kv::load_bytes_many;
 pub(crate) use kv::{
     BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,

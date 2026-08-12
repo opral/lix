@@ -665,8 +665,7 @@ pub(crate) async fn execute_exact_lix_file_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(column == ExactLixFileReadColumn::Content),
+                .with_blob_refs(true),
         )
         .await?;
     let matches = match selector {
@@ -817,8 +816,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(data_range.is_none()),
+                .with_blob_refs(true),
         )
         .await?;
     let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
@@ -907,8 +905,7 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(true),
+                .with_blob_refs(true),
         )
         .await?;
     let matches = indexed_file_id_matches(index, file_ids, &FilePathPredicate::All);
@@ -1042,8 +1039,7 @@ impl TableSpec for LixFileSpec {
                 .filesystem_path_index
                 .path_index(
                     &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                        .with_blob_refs(needs_blob_rows)
-                        .with_cached_blob_data(needs_data),
+                        .with_blob_refs(needs_blob_rows),
                 )
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
@@ -2395,7 +2391,6 @@ impl PluginRenderContext {
 #[derive(Debug, Clone)]
 struct BlobRefRecord {
     blob_hash: String,
-    inline_data: Option<Vec<u8>>,
     live: HotStateRowHandle,
 }
 
@@ -2465,7 +2460,6 @@ fn blob_ref_record_from_live_row(
         key,
         BlobRefRecord {
             blob_hash: snapshot.blob_hash,
-            inline_data: None,
             live: handle,
         },
     )))
@@ -4606,7 +4600,6 @@ fn prepare_indexed_lix_file_rows(
     let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
     let mut file_paths = BTreeMap::<FilesystemDescriptorKey, String>::new();
     let mut path_ordered_file_keys = Vec::with_capacity(matches.len());
-    let mut inline_data_by_row = BTreeMap::<u32, Vec<u8>>::new();
     for entry in matches.entries() {
         if entry.kind != FilesystemPathKind::File {
             continue;
@@ -4628,7 +4621,7 @@ fn prepare_indexed_lix_file_rows(
             },
         );
         if let Some(blob_ref) = entry.blob_ref_live_row() {
-            let row_index = indexed_builder.push_materialized_ref(
+            indexed_builder.push_materialized_ref(
                 &blob_ref.entity_pk,
                 &blob_ref.schema_key,
                 blob_ref.file_id.as_deref(),
@@ -4643,12 +4636,6 @@ fn prepare_indexed_lix_file_rows(
                 blob_ref.untracked,
                 &blob_ref.branch_id,
             );
-            if let Some(data) = entry.cached_blob_data() {
-                inline_data_by_row.insert(
-                    u32::try_from(row_index).expect("indexed lix_file row count exceeds u32"),
-                    data.as_ref().to_vec(),
-                );
-            }
         }
     }
     let pushed_indexed_batch = live_rows.push(indexed_builder.finish());
@@ -4660,10 +4647,7 @@ fn prepare_indexed_lix_file_rows(
             let row = live_rows.row(handle);
             match row.schema_key() {
                 BLOB_REF_SCHEMA_KEY => {
-                    if let Some((key, mut record)) = blob_ref_record_from_live_row(row, handle)? {
-                        if batch == indexed_batch {
-                            record.inline_data = inline_data_by_row.remove(&handle.row);
-                        }
+                    if let Some((key, record)) = blob_ref_record_from_live_row(row, handle)? {
                         blob_rows.entry(key).or_insert(record);
                     }
                 }
@@ -5261,15 +5245,8 @@ async fn load_blob_ranges_for_files(
         if let Some(row) = blob_rows.get(&key) {
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
-                if let Some(data) = &row.inline_data {
-                    bytes_by_key.insert(
-                        key.clone(),
-                        Some(materialize_vec_range(data.clone(), range.clone())?),
-                    );
-                } else {
-                    keys.push(key);
-                    requests.push((BlobId::from_hex(&row.blob_hash)?, range.clone()));
-                }
+                keys.push(key);
+                requests.push((BlobId::from_hex(&row.blob_hash)?, range.clone()));
             }
             *remaining += 1;
         }
@@ -5312,12 +5289,8 @@ async fn load_blob_bytes_for_files(
         if let Some(row) = blob_rows.get(&key) {
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
-                if let Some(data) = &row.inline_data {
-                    bytes_by_key.insert(key.clone(), Some(data.clone()));
-                } else {
-                    keys.push(key);
-                    hashes.push(BlobId::from_hex(&row.blob_hash)?);
-                }
+                keys.push(key);
+                hashes.push(BlobId::from_hex(&row.blob_hash)?);
             }
             *remaining += 1;
         }

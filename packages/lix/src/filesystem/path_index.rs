@@ -11,7 +11,6 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::LixError;
-use crate::binary_cas::BlobId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
@@ -32,15 +31,6 @@ use super::persistent_map::PersistentMap;
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey};
 
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_EAGER_BLOB_BYTES: usize = 32 * 1024;
-const MAX_EAGER_BLOB_CACHE_BYTES: usize = 16 * 1024 * 1024;
-
-fn reserve_eager_blob_cache_bytes(reserved: usize, size: usize) -> Option<usize> {
-    reserved
-        .checked_add(size)
-        .filter(|total| *total <= MAX_EAGER_BLOB_CACHE_BYTES)
-}
-
 // Rebuild counters are per-thread, not process-global. `cargo test` runs many
 // tests concurrently in one process, and a global counter reports every other
 // test's rebuilds too — which makes any assertion on it fail in a full run
@@ -87,7 +77,6 @@ pub(crate) struct FilesystemPathEntry {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
     blob_ref: Option<MaterializedHotStateRow>,
-    cached_blob_data: Option<crate::Blob>,
 }
 
 impl FilesystemPathEntry {
@@ -166,10 +155,6 @@ impl FilesystemPathEntry {
         self.blob_ref.as_ref()
     }
 
-    pub(crate) fn cached_blob_data(&self) -> Option<&crate::Blob> {
-        self.cached_blob_data.as_ref()
-    }
-
     fn estimated_heap_bytes(&self) -> usize {
         self.path.capacity()
             + self.parent_id.as_ref().map_or(0, String::capacity)
@@ -192,7 +177,6 @@ impl FilesystemPathEntry {
                         .map_or(0, crate::common::SharedStr::retained_buffer_len)
                     + row.branch_id.len()
             })
-            + self.cached_blob_data.as_ref().map_or(0, |data| data.len())
     }
 }
 
@@ -435,8 +419,7 @@ impl FilesystemPathIndex {
                 change_id: record.change_id,
                 commit_id: record.commit_id,
                 blob_ref: None,
-                cached_blob_data: None,
-            });
+                });
         }
 
         for (key, record) in file_rows {
@@ -483,8 +466,7 @@ impl FilesystemPathIndex {
                 change_id: record.change_id,
                 commit_id: record.commit_id,
                 blob_ref,
-                cached_blob_data: None,
-            });
+                });
         }
 
         let entries = entries.into_iter().map(Arc::new).collect::<Vec<_>>();
@@ -573,110 +555,6 @@ impl FilesystemPathIndex {
     /// Warms small CAS payloads while the filesystem index is already being
     /// built. The manifest lookup is one batch for the whole view, so exact
     /// file reads do not pay another storage round trip after path selection.
-    pub(crate) async fn hydrate_small_blob_data(
-        mut self,
-        store: &impl StorageAdapterRead,
-    ) -> Result<Self, LixError> {
-        let mut requests =
-            BTreeMap::<String, (BlobId, usize, Vec<Arc<FilesystemPathEntry>>)>::new();
-        let mut reserved_cache_bytes = 0usize;
-        for entry in self.entries() {
-            let Some(row) = entry.blob_ref.as_ref() else {
-                continue;
-            };
-            let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-                continue;
-            };
-            let snapshot: BlobRefSnapshot =
-                serde_json::from_str(snapshot_content).map_err(|error| {
-                    LixError::unknown(format!(
-                        "invalid lix_binary_blob_ref snapshot JSON: {error}"
-                    ))
-                })?;
-            let size_bytes = usize::try_from(snapshot.size_bytes)
-                .map_err(|_| LixError::unknown("lix_binary_blob_ref size_bytes exceeds usize"))?;
-            if size_bytes > MAX_EAGER_BLOB_BYTES {
-                continue;
-            }
-            let Some(next_reserved_cache_bytes) =
-                reserve_eager_blob_cache_bytes(reserved_cache_bytes, size_bytes)
-            else {
-                continue;
-            };
-            let hash = BlobId::from_hex(&snapshot.blob_hash)?;
-            requests
-                .entry(snapshot.blob_hash)
-                .or_insert_with(|| (hash, size_bytes, Vec::new()))
-                .2
-                .push(entry);
-            // Count each projected entry even when several entries share a
-            // blob. This matches estimated_heap_bytes and bounds the complete
-            // cached view rather than only the unique CAS payloads.
-            reserved_cache_bytes = next_reserved_cache_bytes;
-        }
-        if requests.is_empty() {
-            return Ok(self);
-        }
-
-        let hashes = requests
-            .values()
-            .map(|(hash, _, _)| *hash)
-            .collect::<Vec<_>>();
-        let Ok(values) = crate::binary_cas::load_bytes_many(store, &hashes).await else {
-            return Ok(self);
-        };
-        let values = values.into_vec();
-        if values.len() != requests.len() {
-            return Err(LixError::unknown(format!(
-                "binary CAS returned {} values for {} path-index blobs",
-                values.len(),
-                requests.len()
-            )));
-        }
-        // `cached_blob_data` participates in no sort key, so hydration can only
-        // change values. Re-inserting each entry would remove and reinsert it in
-        // five AVL maps, path-copying and reallocating O(log n) nodes ten times
-        // per file; the substitution below rewrites each map once in one linear
-        // pass with the tree shape preserved.
-        let mut hydrated_by_identity =
-            BTreeMap::<FilesystemPathEntryIdentity, Arc<FilesystemPathEntry>>::new();
-        let mut heap_bytes_delta: isize = 0;
-        for ((_, (hash, size_bytes, entries)), data) in requests.into_iter().zip(values) {
-            let Some(data) = data else {
-                continue;
-            };
-            if data.len() != size_bytes || BlobId::from_content(&data) != hash {
-                continue;
-            }
-            let data = crate::Blob::from(data);
-            for entry in entries {
-                let mut hydrated = (*entry).clone();
-                hydrated.cached_blob_data = Some(data.clone());
-                let hydrated = Arc::new(hydrated);
-                heap_bytes_delta += estimated_entry_index_bytes(&hydrated) as isize
-                    - estimated_entry_index_bytes(&entry) as isize;
-                hydrated_by_identity.insert(entry_identity(&entry), hydrated);
-            }
-        }
-        if hydrated_by_identity.is_empty() {
-            return Ok(self);
-        }
-        let substitute = |entry: &Arc<FilesystemPathEntry>| -> Arc<FilesystemPathEntry> {
-            hydrated_by_identity
-                .get(&entry_identity(entry))
-                .map_or_else(|| Arc::clone(entry), Arc::clone)
-        };
-        self.entries_by_path = self.entries_by_path.map_values(substitute);
-        self.entries_by_identity = self.entries_by_identity.map_values(substitute);
-        self.entries_by_descriptor_id = self.entries_by_descriptor_id.map_values(substitute);
-        self.files_by_id = self.files_by_id.map_values(substitute);
-        self.children_by_parent = self.children_by_parent.map_values(substitute);
-        self.estimated_heap_bytes = self
-            .estimated_heap_bytes
-            .saturating_add_signed(heap_bytes_delta);
-        Ok(self)
-    }
-
     /// Applies committed descriptor rows by path-copying only the affected AVL
     /// search paths. Directory moves additionally rewrite their descendants.
     pub(crate) fn apply_committed_rows(
@@ -740,7 +618,6 @@ impl FilesystemPathIndex {
         } else {
             next.blob_ref = Some(row.clone());
         }
-        next.cached_blob_data = None;
         self.insert_entry(Arc::new(next));
         Ok(())
     }
@@ -801,9 +678,6 @@ impl FilesystemPathIndex {
             .as_ref()
             .and_then(|entry| entry.blob_ref.as_ref())
             .cloned();
-        let prior_cached_blob_data = prior
-            .as_ref()
-            .and_then(|entry| entry.cached_blob_data.clone());
         let mut descendants = if kind == FilesystemPathKind::Directory {
             prior
                 .as_ref()
@@ -832,7 +706,6 @@ impl FilesystemPathIndex {
             entry.created_at.clone_from(&prior.created_at);
         }
         entry.blob_ref = prior_blob_ref;
-        entry.cached_blob_data = prior_cached_blob_data;
         self.insert_entry(Arc::new(entry));
         for descendant in &mut descendants {
             let path = self.path_for_entry(descendant)?;
@@ -887,7 +760,6 @@ impl FilesystemPathIndex {
             change_id: row.change_id,
             commit_id: row.commit_id,
             blob_ref: None,
-            cached_blob_data: None,
         };
         entry.parent_identity = self.resolve_parent_identity(&entry);
         entry.path = self.path_for_entry(&entry)?;
@@ -1098,7 +970,6 @@ fn estimated_entry_index_bytes(entry: &FilesystemPathEntry) -> usize {
 pub(crate) struct FilesystemPathIndexRequest {
     pub(crate) branch_ids: Vec<String>,
     pub(crate) include_blob_refs: bool,
-    pub(crate) cache_small_blob_data: bool,
 }
 
 impl FilesystemPathIndexRequest {
@@ -1108,18 +979,11 @@ impl FilesystemPathIndexRequest {
         Self {
             branch_ids,
             include_blob_refs: false,
-            cache_small_blob_data: false,
         }
     }
 
     pub(crate) fn with_blob_refs(mut self, enabled: bool) -> Self {
         self.include_blob_refs = enabled;
-        self
-    }
-
-    pub(crate) fn with_cached_blob_data(mut self, enabled: bool) -> Self {
-        self.include_blob_refs |= enabled;
-        self.cache_small_blob_data = enabled;
         self
     }
 
@@ -1193,7 +1057,6 @@ struct CacheKey {
     branch_ids: Vec<String>,
     revision: Option<Vec<u8>>,
     include_blob_refs: bool,
-    cache_small_blob_data: bool,
 }
 
 impl CacheKey {
@@ -1236,7 +1099,6 @@ impl FilesystemPathIndexCache {
             branch_ids: request.branch_ids.clone(),
             revision: revision.map(<[u8]>::to_vec),
             include_blob_refs: request.include_blob_refs,
-            cache_small_blob_data: request.cache_small_blob_data,
         };
         let mut entries = self
             .entries
@@ -1259,7 +1121,6 @@ impl FilesystemPathIndexCache {
             branch_ids: request.branch_ids.clone(),
             revision: revision.map(<[u8]>::to_vec),
             include_blob_refs: request.include_blob_refs,
-            cache_small_blob_data: request.cache_small_blob_data,
         };
         let mut entries = self
             .entries
@@ -1276,7 +1137,6 @@ impl FilesystemPathIndexCache {
         entries.retain(|candidate| {
             candidate.key.branch_ids != key.branch_ids
                 || candidate.key.include_blob_refs != key.include_blob_refs
-                || candidate.key.cache_small_blob_data != key.cache_small_blob_data
         });
         let bytes =
             size_of::<CachedIndex>() + key.estimated_heap_bytes() + index.estimated_heap_bytes();
@@ -1329,8 +1189,7 @@ impl FilesystemPathIndexCache {
                 return false;
             }
             let request = FilesystemPathIndexRequest::new(candidate.key.branch_ids.clone())
-                .with_blob_refs(candidate.key.include_blob_refs)
-                .with_cached_blob_data(candidate.key.cache_small_blob_data);
+                .with_blob_refs(candidate.key.include_blob_refs);
             if let Ok(index) = candidate
                 .index
                 .apply_committed_rows(&request, rows, next_revision)
@@ -1344,7 +1203,6 @@ impl FilesystemPathIndexCache {
                 branch_ids: request.branch_ids,
                 revision: next_revision.map(<[u8]>::to_vec),
                 include_blob_refs: request.include_blob_refs,
-                cache_small_blob_data: request.cache_small_blob_data,
             };
             let bytes = size_of::<CachedIndex>()
                 + key.estimated_heap_bytes()
@@ -1390,8 +1248,7 @@ impl FilesystemPathIndexCache {
                 return false;
             }
             let request = FilesystemPathIndexRequest::new(candidate.key.branch_ids.clone())
-                .with_blob_refs(candidate.key.include_blob_refs)
-                .with_cached_blob_data(candidate.key.cache_small_blob_data);
+                .with_blob_refs(candidate.key.include_blob_refs);
             if let Ok(index) =
                 candidate
                     .index
@@ -1406,7 +1263,6 @@ impl FilesystemPathIndexCache {
                 branch_ids: request.branch_ids,
                 revision: Some(revision),
                 include_blob_refs: request.include_blob_refs,
-                cache_small_blob_data: request.cache_small_blob_data,
             };
             let bytes = size_of::<CachedIndex>()
                 + key.estimated_heap_bytes()
@@ -1466,12 +1322,6 @@ struct FileSnapshot {
     id: String,
     directory_id: Option<String>,
     name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BlobRefSnapshot {
-    blob_hash: String,
-    size_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -1559,19 +1409,6 @@ mod tests {
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
             unreachable!("path-index construction only scans live state")
         }
-    }
-
-    #[test]
-    fn eager_blob_hydration_has_an_aggregate_cache_budget() {
-        assert_eq!(
-            reserve_eager_blob_cache_bytes(MAX_EAGER_BLOB_CACHE_BYTES - 1, 1),
-            Some(MAX_EAGER_BLOB_CACHE_BYTES)
-        );
-        assert_eq!(
-            reserve_eager_blob_cache_bytes(MAX_EAGER_BLOB_CACHE_BYTES, 1),
-            None
-        );
-        assert_eq!(reserve_eager_blob_cache_bytes(usize::MAX, 1), None);
     }
 
     #[tokio::test]
@@ -1770,10 +1607,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_keeps_descriptor_only_and_blob_warmed_views_separate() {
+    fn cache_keeps_descriptor_only_and_blob_ref_views_separate() {
         let cache = FilesystemPathIndexCache::default();
         let descriptors = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
-        let blobs = descriptors.clone().with_cached_blob_data(true);
+        let blobs = descriptors.clone().with_blob_refs(true);
         let descriptor_index = cache.insert(
             &descriptors,
             Some(&[1]),
@@ -1788,7 +1625,7 @@ mod tests {
             &descriptor_index
         ));
         assert!(Arc::ptr_eq(
-            &cache.get(&blobs, Some(&[1])).expect("blob-warmed view"),
+            &cache.get(&blobs, Some(&[1])).expect("blob-ref view"),
             &blob_index
         ));
     }

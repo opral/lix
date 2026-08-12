@@ -1407,15 +1407,7 @@ where
         {
             return Ok(index);
         }
-        let mut index = build_path_index(self, request).await?;
-        if request.cache_small_blob_data {
-            index = std::sync::Arc::new(
-                (*index)
-                    .clone()
-                    .hydrate_small_blob_data(&self.store)
-                    .await?,
-            );
-        }
+        let index = build_path_index(self, request).await?;
         Ok(self
             .filesystem_path_index_cache
             .insert(request, revision.as_deref(), index))
