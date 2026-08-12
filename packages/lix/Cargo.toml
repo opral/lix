@@ -189,3 +189,7 @@ tokio = { version = "1", features = ["rt", "sync"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }
+
+[[test]]
+name = "expsnd_alias_probe"
+path = "tests/expsnd_alias_probe.rs"

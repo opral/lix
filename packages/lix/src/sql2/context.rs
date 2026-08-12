@@ -314,6 +314,8 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 pub(crate) struct SqlWriteContext {
     ptr: Arc<SqlWriteContextPtr>,
     gate: Arc<Mutex<()>>,
+    alias_depth: Arc<std::sync::atomic::AtomicUsize>,
+    alias_label: Arc<std::sync::Mutex<Option<&'static str>>>,
     explicit_insert_columns: Option<Arc<BTreeSet<String>>>,
     write_targets: Option<Arc<super::providers::WriteTargetRegistry>>,
 }
@@ -323,8 +325,84 @@ struct SqlWriteContextPtr(NonNull<dyn SqlWriteExecutionContext>);
 // DataFusion stores providers as owned Send + Sync trait objects. This context
 // is only constructed for one write execution and never outlives the borrowed
 // transaction context that owns it.
+impl Drop for SqlWriteContextPtr {
+    fn drop(&mut self) {
+        expsnd_log(&format!(
+            "DROP addr={:x}",
+            self.0.as_ptr() as *const () as usize
+        ));
+    }
+}
+
 unsafe impl Send for SqlWriteContextPtr {}
 unsafe impl Sync for SqlWriteContextPtr {}
+
+pub(crate) fn expsnd_log(line: &str) {
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/root/claude5/expSND-liveness.log")
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+static EXPSND_MUT_ONCE: std::sync::Once = std::sync::Once::new();
+static EXPSND_SHARED_ONCE: std::sync::Once = std::sync::Once::new();
+
+pub(crate) struct MutBorrowProbe {
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+    label: Arc<std::sync::Mutex<Option<&'static str>>>,
+}
+
+impl Drop for MutBorrowProbe {
+    fn drop(&mut self) {
+        self.depth
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        *self.label.lock().unwrap() = None;
+    }
+}
+
+impl SqlWriteContext {
+    /// Marks the region in which a reconstituted `&mut` to the transaction
+    /// context is live. The returned guard spans the `.await`.
+    fn enter_mut_borrow(&self, label: &'static str) -> MutBorrowProbe {
+        EXPSND_MUT_ONCE.call_once(|| expsnd_log("MUT_BORROW_REACHED"));
+        expsnd_log(&format!(
+            "MUT_ENTER addr={:x} label={label}",
+            self.ptr.0.as_ptr() as *const () as usize
+        ));
+        self.alias_depth
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.alias_label.lock().unwrap() = Some(label);
+        MutBorrowProbe {
+            depth: Arc::clone(&self.alias_depth),
+            label: Arc::clone(&self.alias_label),
+        }
+    }
+
+    /// Every ungated shared accessor calls this before producing a `&dyn` into
+    /// the same object.
+    fn probe_shared_access(&self, accessor: &'static str) {
+        EXPSND_SHARED_ONCE.call_once(|| expsnd_log("SHARED_ACCESS_REACHED"));
+        expsnd_log(&format!(
+            "SHARED addr={:x} accessor={accessor}",
+            self.ptr.0.as_ptr() as *const () as usize
+        ));
+        let depth = self
+            .alias_depth
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if depth > 0 {
+            let live = self.alias_label.lock().unwrap().unwrap_or("<unknown>");
+            panic!(
+                "SQLWRITECTX_ALIAS: shared accessor `{accessor}` produced &dyn while \
+                 `&mut` from `{live}` was live (depth={depth})\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }
+}
 
 impl SqlWriteContext {
     pub(crate) fn new(ctx: &mut dyn SqlWriteExecutionContext) -> Self {
@@ -335,9 +413,15 @@ impl SqlWriteContext {
                 NonNull<dyn SqlWriteExecutionContext + 'static>,
             >(ptr)
         };
+        expsnd_log(&format!(
+            "NEW addr={:x}",
+            ptr.as_ptr() as *const () as usize
+        ));
         Self {
             ptr: Arc::new(SqlWriteContextPtr(ptr)),
             gate: Arc::new(Mutex::new(())),
+            alias_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            alias_label: Arc::new(std::sync::Mutex::new(None)),
             explicit_insert_columns: None,
             write_targets: Some(Arc::new(super::providers::WriteTargetRegistry::default())),
         }
@@ -369,6 +453,7 @@ impl SqlWriteContext {
     }
 
     pub(crate) fn functions(&self) -> FunctionProviderHandle {
+        self.probe_shared_access("functions");
         unsafe { self.ptr.0.as_ref().functions() }
     }
 
@@ -377,22 +462,27 @@ impl SqlWriteContext {
     }
 
     pub(crate) fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
+        self.probe_shared_access("public_catalog");
         unsafe { self.ptr.0.as_ref().public_catalog() }
     }
 
     pub(crate) fn active_branch_id(&self) -> String {
+        self.probe_shared_access("active_branch_id");
         unsafe { self.ptr.0.as_ref().active_branch_id().to_string() }
     }
 
     pub(crate) fn active_account_id(&self) -> String {
+        self.probe_shared_access("active_account_id");
         unsafe { self.ptr.0.as_ref().active_account_id().to_string() }
     }
 
     pub(crate) fn plugin_host(&self) -> PluginRuntimeHost {
+        self.probe_shared_access("plugin_host");
         unsafe { self.ptr.0.as_ref().plugin_host() }
     }
 
     pub(crate) fn session_file_views(&self) -> Option<SessionFileViews> {
+        self.probe_shared_access("session_file_views");
         unsafe { self.ptr.0.as_ref().session_file_views() }
     }
 
@@ -401,6 +491,7 @@ impl SqlWriteContext {
         request: &HotStateScanRequest,
     ) -> Result<MaterializedHotStateBatch, LixError> {
         let _guard = self.gate.lock().await;
+        let _alias_probe = self.enter_mut_borrow("scan_hot_state_batch");
         unsafe {
             self.ptr
                 .0
@@ -417,6 +508,7 @@ impl SqlWriteContext {
         request: &HotStateExactBatchRequest,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
         let _guard = self.gate.lock().await;
+        let _alias_probe = self.enter_mut_borrow("load_exact_hot_state_batch");
         unsafe {
             self.ptr
                 .0
@@ -433,6 +525,7 @@ impl SqlWriteContext {
         hashes: &[BlobId],
     ) -> Result<BlobBytesBatch, LixError> {
         let _guard = self.gate.lock().await;
+        let _alias_probe = self.enter_mut_borrow("load_bytes_many");
         unsafe {
             self.ptr
                 .0
@@ -449,6 +542,7 @@ impl SqlWriteContext {
         branch_id: &str,
     ) -> Result<Option<CommitId>, LixError> {
         let _guard = self.gate.lock().await;
+        let _alias_probe = self.enter_mut_borrow("load_branch_head");
         unsafe {
             self.ptr
                 .0
@@ -465,6 +559,7 @@ impl SqlWriteContext {
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         let _guard = self.gate.lock().await;
+        let _alias_probe = self.enter_mut_borrow("filesystem_path_index");
         unsafe {
             self.ptr
                 .0
@@ -481,6 +576,7 @@ impl SqlWriteContext {
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
         let _guard = self.gate.lock().await;
+        let _alias_probe = self.enter_mut_borrow("stage_write");
         unsafe {
             self.ptr
                 .0
@@ -498,6 +594,7 @@ impl SqlWriteContext {
         diff_ids: Vec<String>,
     ) -> Result<DiffCommandOutcome, LixError> {
         let _guard = self.gate.lock().await;
+        let _alias_probe = self.enter_mut_borrow("execute_diff_command");
         unsafe {
             self.ptr
                 .0
