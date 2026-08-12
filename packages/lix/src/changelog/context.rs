@@ -1060,8 +1060,7 @@ where
             },
         )
         .await?;
-    let (chunk, chunk_has_more) = cursor.next_page(limit).await?.into_parts();
-    let has_more = chunk_has_more;
+    let (chunk, has_more) = cursor.next_page(limit).await?.into_parts();
     let mut keys = Vec::with_capacity(chunk.len());
     let mut values = Vec::with_capacity(chunk.len());
     for entry in chunk {

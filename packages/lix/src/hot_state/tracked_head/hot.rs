@@ -1212,10 +1212,9 @@ pub(crate) async fn scan_certified_history_rows(
             )
             .await?;
         loop {
-            let (page, page_has_more) = cursor
+            let (page, has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?.into_parts();
-            let has_more = page_has_more;
             for entry in page {
                 let value = full_value_bytes(entry.value)?;
                 if certified_batch_commit_id(&value)? != *commit_id {
@@ -3089,7 +3088,7 @@ async fn packed_exclusive_schema_base_refs(
         )
         .await?;
     loop {
-        let (page, page_has_more) = cursor
+        let (page, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await?.into_parts();
         for entry in page {
@@ -3107,7 +3106,7 @@ async fn packed_exclusive_schema_base_refs(
                 index_key: entry.key.0,
             });
         }
-        if !page_has_more {
+        if !has_more {
             break;
         }
     }
@@ -14362,11 +14361,11 @@ mod tests {
             .expect("manifest scan should open");
         let mut total = 0;
         loop {
-            let (page, page_has_more) = cursor
+            let (page, has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await
-                .expect("manifest page should read").into_parts();
-            let has_more = page_has_more;
+                .expect("manifest page should read")
+                .into_parts();
             total += page.len();
             if !has_more {
                 return total;
