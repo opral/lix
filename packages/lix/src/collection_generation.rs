@@ -4,7 +4,7 @@ use crate::LixError;
 use crate::changelog::CommitId;
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 
 pub(crate) const COLLECTION_GENERATION_SCHEMA_KEY: &str = "lix_collection_generation";
 /// Reserved internal count for a root-backed collection whose exact

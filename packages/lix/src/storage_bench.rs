@@ -3029,6 +3029,25 @@ pub fn storage_space_by_name(space_name: &str) -> crate::storage_adapter::Storag
         .expect("space name should exist")
 }
 
+/// The registered space for one physical space id, value semantics included.
+///
+/// Benchmarks and qualification harnesses that already hold an id must read
+/// their space here rather than re-declaring it with
+/// `StorageSpace::mutable`/`::immutable`. A space id has exactly one value
+/// semantics, and both adapters place data by that declaration — RocksDB by
+/// column family, SlateDB by LSM value versus object segment — so a harness
+/// that guesses the semantics scans a different physical location than the
+/// engine wrote. That is not hypothetical: `large_blob_updates` guessed
+/// `immutable` for `binary_cas.chunk` and handed a raw payload to the
+/// immutable-locator decoder, which reported it as data corruption.
+#[must_use]
+pub fn storage_space_by_id(space_id: u32) -> crate::storage_adapter::StorageSpace {
+    *native_storage_spaces()
+        .iter()
+        .find(|space| space.id.0 == space_id)
+        .unwrap_or_else(|| panic!("storage space id 0x{space_id:08x} is not registered"))
+}
+
 /// Per-row (key, value bytes) inventory of one space.
 ///
 /// Equivalence tests compare these inventories byte-for-byte, so the scan
@@ -3124,8 +3143,6 @@ pub fn content_address_rule(space_id: u32) -> ContentAddressRule {
         0x0005_0003 => ContentAddressRule::BinaryCasChunkPayload,
         // json_store.json
         0x0002_0001 => ContentAddressRule::JsonStorePayload,
-        // json_store.untracked_reclaim_candidate.v1
-        0x0002_0002 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
         // binary_cas.chunk_presence
         0x0005_0004 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
         _ => ContentAddressRule::NotContentAddressed,

@@ -38,6 +38,10 @@ const MODULE_LAYERS: &[&[&str]] = &[
     &["entity_pk"],
     // The canonical facts: changes, commits, commit-change ids.
     &["changelog"],
+    // The collection-replacement marker. Both state planes read it to decide
+    // whether a generation can be replaced wholesale, so it must stay below
+    // them and must never read either one back.
+    &["collection_generation"],
     // The entity-specific contract over generic columnar row groups. Addresses
     // row groups by owning commit, so it sits above `changelog`, and is shared
     // by both state planes, so it sits below them.
@@ -50,36 +54,38 @@ const MODULE_LAYERS: &[&[&str]] = &[
     // plane, so this is honestly placed above `tracked_state` rather than
     // recorded as an exception. It performs no production writes.
     &["commit_graph"],
+    // Branch-head control authority. It resolves heads over commit topology and
+    // the hot plane reads branch heads back, which pins it to exactly this
+    // position: above `commit_graph`, below `live_state`.
+    &["branch"],
     // The derived serving plane — a rebuildable cache over the canonical state.
     // Sole writer of every hot-plane storage space. Its position above
     // `tracked_state` is the structural half of the "derived views are caches"
     // invariant: the compiler now rejects a canonical-side read of the cache.
     &["live_state"],
+    // Entity-level overlays over the state planes. None of them is read by any
+    // module below, and none reads another: `checkpoint` and `plugin` both use
+    // `branch`, `undo_redo` only needs `changelog`.
+    &["checkpoint", "plugin", "undo_redo"],
 ];
 
 /// Top-level modules deliberately left out of [`MODULE_LAYERS`], with the
 /// reason. This list is the to-do, not an amnesty: a guard that starts red gets
 /// ignored, so an order is only declared once it holds.
 ///
-/// The dominant blocker is that `transaction::types` — the crate's shared
-/// write-row vocabulary — lives inside the write-path module that consumes it,
-/// which makes six modules cyclic with `transaction` for no structural reason.
+/// The former dominant blocker — `transaction::types` living inside the
+/// write-path module that consumes it — is gone: it is now
+/// [`crate::transaction_types`], and `branch`, `checkpoint`,
+/// `collection_generation`, `plugin` and `undo_redo` moved into
+/// [`MODULE_LAYERS`] as a result — ten mutual cycles became six. What remains
+/// is `session` ↔ `transaction` (the `EXECUTE_IDEMPOTENCY_RECEIPT_SPACE`
+/// ownership inversion), `gc` ↔ `session` (correct by design), `filesystem` ↔
+/// `live_state`, and the two upward references `transaction_types` still makes
+/// of its own — into `sql2` and `collection_generation`.
 const UNLAYERED_MODULES: &[(&str, &str)] = &[
-    (
-        "branch",
-        "cyclic with `transaction` via `transaction::types`",
-    ),
     ("catalog", "not yet analysed"),
     ("cel", "leaf utility, no layer semantics"),
-    (
-        "checkpoint",
-        "cyclic with `transaction` via `transaction::types`",
-    ),
     ("client_state", "entry-point plumbing, no layer semantics"),
-    (
-        "collection_generation",
-        "cyclic with `transaction` via `transaction::types`",
-    ),
     ("default_wasm_runtime", "feature-gated harness"),
     ("domain", "pure predicates, no owned invariant"),
     ("engine", "entry point; reaches everywhere by design"),
@@ -98,10 +104,6 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("module_layers", "this guard"),
     ("observe_coordinator", "not yet analysed"),
     ("observe_invalidation", "not yet analysed"),
-    (
-        "plugin",
-        "cyclic with `transaction` via `transaction::types`",
-    ),
     ("plugin_arena", "leaf utility, no layer semantics"),
     ("plugin_layout", "leaf utility, no layer semantics"),
     ("plugin_wire", "leaf utility, no layer semantics"),
@@ -109,7 +111,12 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("registered_spaces", "cfg-gated harness"),
     ("schema", "not yet analysed"),
     ("session", "cyclic with `transaction` and with `gc`"),
-    ("sql2", "cyclic with `transaction` via `transaction::types`"),
+    (
+        "sql2",
+        "still cyclic with `transaction` (one reference, \
+         `duplicate_insert_identity_message`) and with `transaction_types`, \
+         which names `sql2::EncodedEntityRowGroups`",
+    ),
     ("sql_profile", "feature-gated instrumentation"),
     ("sql_telemetry", "instrumentation, no layer semantics"),
     (
@@ -118,16 +125,26 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
          in-memory backend, so it is not a layer",
     ),
     ("storage_bench", "feature-gated harness"),
-    ("storage_spaces", "cfg-gated harness"),
+    (
+        "storage_spaces",
+        "the space registry, which `storage::types` reads to check the value \
+         semantics a space id is declared with, so it sits beside `storage` \
+         rather than below it",
+    ),
     ("telemetry", "instrumentation, no layer semantics"),
     ("test_support", "cfg-gated harness"),
     (
         "transaction",
-        "six cycles; blocked on extracting `transaction::types` downward",
+        "down from six cycles to two: still cyclic with `session` and with \
+         `sql2`",
     ),
     (
-        "undo_redo",
-        "cyclic with `transaction` via `transaction::types`",
+        "transaction_types",
+        "the shared write-row vocabulary, now its own module. It cannot be \
+         layered yet because it names `live_state`'s materialized row types \
+         while `live_state` reads `branch`, which reads this module — so \
+         layering it would have to place it both above and below `live_state`. \
+         Deduplicating the `Materialized*Row` DTOs downward unblocks it",
     ),
     ("wasm", "plugin ABI vocabulary, not yet analysed"),
 ];

@@ -35,16 +35,17 @@ use crate::live_state::{
     LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
     MaterializedLiveStateExactBatch,
 };
-use crate::transaction::types::StagedCommitChangeRefs;
-use crate::transaction::types::{
+use crate::transaction::staged_commit_changes::StagedCommitChangeBatch;
+use crate::transaction::staged_commit_changes::StagedCommitChangeRefs;
+use crate::transaction_types::{
     CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation,
     CompleteCollectionReplacementProof, LogicalPrimaryKey, PreparedRowFacts, PreparedStateBatch,
-    PreparedStateRowRef, PreparedTransactionWrite, StageJson, StagedCommitChangeBatch,
-    TransactionFileContent, TransactionJson, TransactionWriteMode, TransactionWriteOperation,
-    TransactionWriteOrigin, TransactionWriteOutcome,
+    PreparedStateRowRef, PreparedTransactionWrite, StageJson, TransactionFileContent,
+    TransactionJson, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
+    TransactionWriteOutcome,
 };
 #[cfg(test)]
-use crate::transaction::types::{TestPreparedStateRow, stage_json_from_value};
+use crate::transaction_types::{TestPreparedStateRow, stage_json_from_value};
 use crate::{LixError, NullableKeyFilter};
 
 /// Transaction-local write buffer after transaction-boundary preparation.
