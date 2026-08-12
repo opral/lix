@@ -9655,8 +9655,11 @@ mod tests {
         let spans = spans.lock().expect("capture spans");
         let sql_span = spans
             .iter()
-            .find(|span| span.name == "lix.sql.query")
-            .expect("SQL span");
+            .find(|span| {
+                span.name == "lix.sql.query"
+                    && span.parent.as_ref() == Some(&protocol_span_id)
+            })
+            .expect("SQL span under protocol request");
         assert_eq!(sql_span.parent.as_ref(), Some(&protocol_span_id));
     }
 
