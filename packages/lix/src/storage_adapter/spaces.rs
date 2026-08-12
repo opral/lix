@@ -101,9 +101,6 @@ impl StorageSpace {
         encode_physical_key(self.id, key)
     }
 
-    pub fn encode_range(&self, range: KeyRange) -> KeyRange {
-        encode_physical_range(self.id, range)
-    }
 }
 
 pub(crate) fn encode_physical_key(space: SpaceId, key: &Key) -> Key {

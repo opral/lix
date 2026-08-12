@@ -288,12 +288,6 @@ pub fn certified_entity_insert_parameter_batch_counters()
     }
 }
 
-/// Returns and resets the number of certified parameter-batch INSERT routes
-/// selected by the planner, before any physical staging occurs.
-pub fn take_certified_entity_insert_parameter_batch_certifications() -> u64 {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.swap(0, Ordering::Relaxed)
-}
-
 pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
 }

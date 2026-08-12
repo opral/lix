@@ -737,7 +737,7 @@ impl StorageWriteSet {
     /// storage space.  This is benchmark/test observability only: production
     /// planning continues to use the aggregate write-set counters and never
     /// depends on this classification.
-    #[cfg(any(test, feature = "storage-benches"))]
+    #[cfg(feature = "storage-benches")]
     pub fn delete_counts_by_space(&self) -> Vec<(StorageSpace, usize)> {
         self.groups
             .iter()
