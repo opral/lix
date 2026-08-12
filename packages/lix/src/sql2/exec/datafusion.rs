@@ -5944,6 +5944,7 @@ mod tests {
             .await
             .expect("by-path history should execute");
         let census = crate::commit_graph::scope_digest_census().since(&before);
+        eprintln!("scope_digest_census {census:?}");
 
         assert!(
             !result.rows().is_empty(),
