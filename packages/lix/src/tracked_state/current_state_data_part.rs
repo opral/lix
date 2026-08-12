@@ -148,7 +148,6 @@ pub(crate) fn encode_current_state_data_part(
     })
 }
 
-#[cfg(test)]
 pub(crate) fn decode_current_state_data_part_refs(
     expected_digest: &[u8; 32],
     encoded: &[u8],

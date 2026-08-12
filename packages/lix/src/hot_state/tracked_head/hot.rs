@@ -12249,7 +12249,6 @@ fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixErro
     ))
 }
 
-#[cfg(test)]
 fn collect_hot_row_refs(
     value: HeadValueView<'_>,
     untracked_only: bool,
