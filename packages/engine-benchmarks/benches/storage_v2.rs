@@ -1531,8 +1531,9 @@ where
                         rows as usize + 1,
                     ))
                     .expect("direct full-value scan");
-                    assert_eq!(chunk.entries.len(), rows as usize);
-                    assert!(!chunk.has_more);
+                    let (chunk_entries, chunk_has_more) = chunk.into_parts();
+                    assert_eq!(chunk_entries.len(), rows as usize);
+                    assert!(!chunk_has_more);
                     drop(read);
                     black_box(chunk_entries);
                 });
@@ -1555,8 +1556,9 @@ where
                     let chunk =
                         block_on(materialize_complete_storage_scan(&read, scan_range.clone()))
                             .expect("direct small-value full scan");
-                    assert_eq!(chunk.entries.len(), rows as usize);
-                    assert!(!chunk.has_more);
+                    let (chunk_entries, chunk_has_more) = chunk.into_parts();
+                    assert_eq!(chunk_entries.len(), rows as usize);
+                    assert!(!chunk_has_more);
                     drop(read);
                     black_box(chunk_entries);
                 });

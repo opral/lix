@@ -6598,8 +6598,10 @@ mod tests {
             .expect("scan restarted first page")
             .into_parts();
         assert_eq!(restarted[0].key, keys[0]);
-        let restarted_second =
-            block_on(restarted_cursor.next_page(1)).expect("scan restarted second page");
+        let (restarted_second, _restarted_second_has_more) =
+            block_on(restarted_cursor.next_page(1))
+                .expect("scan restarted second page")
+                .into_parts();
         assert_eq!(restarted_second[0].key, keys[1]);
     }
 
@@ -6768,7 +6770,8 @@ mod tests {
         assert_eq!(
             block_on(cursor.next_page(usize::MAX))
                 .expect("scan pending point")
-                .entries,
+                .into_parts()
+                .0,
             vec![ReadEntry {
                 key: key.clone(),
                 value: ProjectedValue::FullValue(value.clone()),
@@ -7203,7 +7206,8 @@ mod tests {
         assert_eq!(
             block_on(cursor.next_page(usize::MAX))
                 .expect("read publication through older scan view")
-                .entries,
+                .into_parts()
+                .0,
             vec![ReadEntry {
                 key,
                 value: ProjectedValue::FullValue(value),
