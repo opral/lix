@@ -6067,6 +6067,190 @@ mod tests {
         );
     }
 
+    fn file_descriptor_row_in_directory(
+        file_id: &str,
+        directory_id: Option<&str>,
+        name: &str,
+        branch_id: &str,
+    ) -> TestPreparedStateRow {
+        let mut row = staged_row(
+            FILE_DESCRIPTOR_SCHEMA_KEY,
+            Some(
+                json!({
+                    "id": file_id,
+                    "directory_id": directory_id,
+                    "name": name,
+                })
+                .to_string(),
+            ),
+        );
+        row.entity_pk =
+            EntityPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
+        row.file_id = Some(file_id.into());
+        row.branch_id = branch_id.into();
+        row.global = branch_id == crate::GLOBAL_BRANCH_ID;
+        row
+    }
+
+    const FK_SCOPE_BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000a1";
+    const FK_SCOPE_DIRECTORY_ID: &str = "01920000-0000-7000-8000-0000000000d1";
+    const FK_SCOPE_CHILD_DIRECTORY_ID: &str = "01920000-0000-7000-8000-0000000000d2";
+    const FK_SCOPE_FILE_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    async fn committed_delete_restriction_outcome(
+        staged_rows: Vec<TestPreparedStateRow>,
+        committed_rows: Vec<MaterializedLiveStateRow>,
+    ) -> Result<(), LixError> {
+        let staged_writes = PreparedWriteSet {
+            state_rows: PreparedStateBatch::from_test_rows(staged_rows),
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            file_descriptor_schema(),
+            directory_descriptor_schema(),
+        ])
+        .expect("descriptor schemas should compile");
+        let live_state = StrictStaticLiveStateReader {
+            rows: committed_rows,
+        };
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            if row.snapshot_json().is_none() {
+                pending_constraints.remember_tombstone(row);
+            }
+        }
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        validate_committed_delete_restrictions(&input, &catalog, &pending_constraints).await
+    }
+
+    async fn directory_delete_with_committed_file_child_outcome(
+        untracked: bool,
+    ) -> Result<(), LixError> {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let mut committed_directory =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        let mut committed_file = file_descriptor_row_in_directory(
+            FK_SCOPE_FILE_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "readme.md",
+            FK_SCOPE_BRANCH_ID,
+        );
+        if untracked {
+            mark_prepared_row_untracked(&mut directory_delete);
+            mark_prepared_row_untracked(&mut committed_directory);
+            mark_prepared_row_untracked(&mut committed_file);
+        }
+        committed_delete_restriction_outcome(
+            vec![directory_delete],
+            vec![
+                MaterializedLiveStateRow::from(committed_directory),
+                MaterializedLiveStateRow::from(committed_file),
+            ],
+        )
+        .await
+    }
+
+    /// Control: the same declared restriction on a same-file-scope pair does
+    /// fire, so the batch machinery itself is alive.
+    #[tokio::test]
+    async fn committed_delete_restriction_rejects_child_directory_of_deleted_directory() {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let committed_directory =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        let committed_child = directory_descriptor_row(
+            FK_SCOPE_CHILD_DIRECTORY_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "guides",
+            FK_SCOPE_BRANCH_ID,
+        );
+
+        let error = committed_delete_restriction_outcome(
+            vec![directory_delete],
+            vec![
+                MaterializedLiveStateRow::from(committed_directory),
+                MaterializedLiveStateRow::from(committed_child),
+            ],
+        )
+        .await
+        .expect_err("committed child directory must block its parent's delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    /// Reachability probe: `lix_file_descriptor./directory_id` is a declared
+    /// foreign key, but a file descriptor row lives in file scope
+    /// `Exact(Some(own id))` while the directory row lives in `Exact(None)`,
+    /// and the committed delete side never widens the source file scope.
+    #[tokio::test]
+    async fn committed_delete_restriction_scope_probe_tracked_file_child() {
+        let outcome = directory_delete_with_committed_file_child_outcome(false).await;
+
+        assert!(
+            outcome.is_ok(),
+            "tracked lane: expected the declared restriction to be unreachable, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_delete_restriction_scope_probe_untracked_file_child() {
+        let outcome = directory_delete_with_committed_file_child_outcome(true).await;
+
+        assert!(
+            outcome.is_ok(),
+            "untracked lane: expected the declared restriction to be unreachable, got {outcome:?}"
+        );
+    }
+
+    /// Contrast: the same-transaction (pending) lane does fire, because
+    /// `remember_foreign_key_references` routes the reference through
+    /// `foreign_key_target_domain`, which applies the descriptor correction.
+    #[test]
+    fn pending_delete_restriction_rejects_staged_file_child_of_deleted_directory() {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let staged_file = file_descriptor_row_in_directory(
+            FK_SCOPE_FILE_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "readme.md",
+            FK_SCOPE_BRANCH_ID,
+        );
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![directory_delete, staged_file],
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            file_descriptor_schema(),
+            directory_descriptor_schema(),
+        ])
+        .expect("descriptor schemas should compile");
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            match row.snapshot_json() {
+                Some(snapshot) => {
+                    let (_, schema_plan) = catalog
+                        .plan_for_key(row.schema_key())
+                        .expect("descriptor schema plan should resolve");
+                    pending_constraints
+                        .remember_foreign_key_references(row, schema_plan, snapshot)
+                        .expect("descriptor foreign-key references should index");
+                }
+                None => pending_constraints.remember_tombstone(row),
+            }
+        }
+
+        let error = validate_pending_delete_restrictions(&catalog, &pending_constraints)
+            .expect_err("staged file child must block the staged directory delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
     #[tokio::test]
     async fn validation_allows_delete_when_only_different_branch_reference_exists() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
