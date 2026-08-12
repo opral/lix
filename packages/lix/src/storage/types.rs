@@ -21,12 +21,48 @@ pub enum ValueSemantics {
     Immutable,
 }
 
+/// Who is responsible for detecting corruption of a space's *value* bytes.
+///
+/// This exists because one space in the engine authenticates its own values
+/// more strongly than any backend checksum can, and paying for both is pure
+/// duplicated work over the same bytes.
+///
+/// The default is [`ValueIntegrity::BackendVerified`] and every constructor
+/// produces it. Opting out requires naming
+/// [`StorageSpace::declare_content_addressed`] deliberately, so a space added
+/// tomorrow is protected without anyone having to remember that it should be.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ValueIntegrity {
+    /// The backend's own checksum is the only thing standing between a bit
+    /// flip on disk and the engine. Backends must verify it on every read.
+    #[default]
+    BackendVerified,
+    /// Every value in this space is a content-addressed blob whose **key is a
+    /// BLAKE3-256 digest of its own bytes**, and the engine recomputes that
+    /// digest and compares it before the bytes escape the read — in every
+    /// build, release included.
+    ///
+    /// A backend may therefore skip its own value checksum here: a corruption
+    /// it would have caught is caught by a strictly stronger check that has
+    /// already been paid for. Skipping is an optimisation, never an
+    /// obligation; a backend that cannot express it stays correct by doing
+    /// nothing.
+    ///
+    /// **This is a claim about the engine, not a hint.** Declaring a space
+    /// content-addressed without an unconditional digest check on every
+    /// full-value read of it removes real protection and replaces it with
+    /// nothing.
+    ContentAddressed,
+}
+
 /// A logical ordered-key space and the value semantics Lix guarantees for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorageSpace {
     pub id: SpaceId,
     pub name: &'static str,
     pub value_semantics: ValueSemantics,
+    /// Who detects value corruption in this space. See [`ValueIntegrity`].
+    pub value_integrity: ValueIntegrity,
 }
 
 impl StorageSpace {
@@ -47,6 +83,38 @@ impl StorageSpace {
             id,
             name,
             value_semantics,
+            value_integrity: ValueIntegrity::BackendVerified,
+        }
+    }
+
+    /// Declares a space whose values are BLAKE3-256 content-addressed by their
+    /// own key and verified by the engine on every full-value read.
+    ///
+    /// Deliberately a **separate constructor** rather than a parameter on
+    /// [`StorageSpace::declare`] or a builder method: the safe answer is what
+    /// you get by default and by omission, and opting out is something you
+    /// have to type. `storage_spaces::tests::exactly_one_space_declares_
+    /// content_addressed_values` pins the opt-in set to the single space that
+    /// has earned it, reading it back out of `ALL_STORAGE_SPACES` rather than
+    /// from a second hand-written list.
+    ///
+    /// Do not reach for this because a space "holds hashes" or "is immutable".
+    /// The requirement is exact: the key must be the digest of the value, and
+    /// the engine must recompute and compare it on every read in release
+    /// builds. `binary_cas.manifest` fails that test — its rows *contain*
+    /// chunk hashes but are not themselves addressed by their content, and the
+    /// whole-blob guard that would catch a corrupted manifest
+    /// (`assemble_blob_bytes`) is `cfg!(debug_assertions)` only.
+    pub(crate) const fn declare_content_addressed(
+        id: SpaceId,
+        name: &'static str,
+        value_semantics: ValueSemantics,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            value_semantics,
+            value_integrity: ValueIntegrity::ContentAddressed,
         }
     }
 
@@ -118,6 +186,10 @@ impl StorageSpace {
             id: self.id,
             name: self.name,
             value_semantics: ValueSemantics::Mutable,
+            // A corruption test writes bytes that deliberately do not match
+            // the key's digest, so this view must not claim the engine will
+            // authenticate them.
+            value_integrity: ValueIntegrity::BackendVerified,
         }
     }
 }

@@ -2847,6 +2847,20 @@ fn point_precondition_matches(precondition: &Precondition, value: Option<&Bytes>
     }
 }
 
+/// `ValueIntegrity::ContentAddressed` is a no-op on this adapter, deliberately.
+///
+/// The declaration tells a backend it *may* skip its own value checksum,
+/// because the engine recomputes the value's BLAKE3-256 digest from its key on
+/// every full-value read. Acting on it is an optimisation, never an
+/// obligation, and SlateDB has nothing to act with: `slatedb::config::ReadOptions`
+/// exposes `durability_filter`, `dirty`, `cache_blocks` and `filter_context`
+/// and no checksum control at any level. Immutable values also leave the LSM
+/// entirely for `db/lix-immutable-value-segment-v1`, where integrity is the
+/// object store's rather than a per-read setting.
+///
+/// So SlateDB keeps verifying exactly as before and stays correct by doing
+/// nothing. This comment exists so the asymmetry with `packages/rocksdb-storage`
+/// reads as a decision rather than as a missed call site.
 impl StorageRead for SlateDBRead {
     fn snapshot_cache_key(&self) -> Option<u128> {
         let publication_id = self

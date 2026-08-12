@@ -195,6 +195,58 @@ mod tests {
         }
     }
 
+    /// Opting a space out of the backend's value checksum is only sound when
+    /// the engine authenticates that space's values itself, and exactly one
+    /// space does: `binary_cas.chunk`, whose key *is* the BLAKE3-256 digest of
+    /// its value and which `decode_and_verify_payload` re-checks on every
+    /// full-value read in every build.
+    ///
+    /// This reads the opt-in set **back out of the registry** rather than
+    /// comparing two hand-written lists, so a space that opts in tomorrow
+    /// fails here rather than silently losing its corruption detection. That
+    /// is the whole point: the guard has to be able to observe the thing it
+    /// guards.
+    #[test]
+    fn exactly_one_space_declares_content_addressed_values() {
+        let opted_out: Vec<&str> = ALL_STORAGE_SPACES
+            .iter()
+            .filter(|space| space.value_integrity == ValueIntegrity::ContentAddressed)
+            .map(|space| space.name)
+            .collect();
+
+        assert_eq!(
+            opted_out,
+            vec![crate::binary_cas::BINARY_CAS_CHUNK_SPACE.name],
+            "a space declared ValueIntegrity::ContentAddressed. That tells every backend it may \
+             skip its own value checksum, which is only true if the engine recomputes the value's \
+             BLAKE3-256 digest from its key on EVERY full-value read, in release builds too. If \
+             the new space really does that, add it here deliberately; otherwise use \
+             StorageSpace::declare and keep the backend's checksum."
+        );
+    }
+
+    /// The manifest planes name chunk hashes but are not addressed by their
+    /// own content, and the whole-blob digest check that would catch a
+    /// corrupted manifest (`assemble_blob_bytes`) is `cfg!(debug_assertions)`
+    /// only. They are the most tempting spaces to opt out by analogy and the
+    /// ones where it would be silently wrong, so they are pinned explicitly.
+    #[test]
+    fn binary_cas_manifest_planes_keep_the_backend_checksum() {
+        for space in [
+            crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
+            crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
+            crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
+        ] {
+            assert_eq!(
+                space.value_integrity,
+                ValueIntegrity::BackendVerified,
+                "{} is not content-addressed: a corrupted row yields wrong chunk hashes and the \
+                 whole-blob guard in assemble_blob_bytes is debug-only",
+                space.name
+            );
+        }
+    }
+
     /// Two spaces sharing an id interleave their keys in one physical range,
     /// so each would scan and range-delete the other's rows.
     #[test]
@@ -540,17 +592,87 @@ mod tests {
 
     /// Every `StorageSpace` constructor call in one source file.
     ///
-    /// `declare` states a pairing and carries its semantics as a third
-    /// argument; `mutable` and `immutable` carry it in the name. All three are
-    /// collected, so the scan can both find the registry's own declarations
-    /// and check every use against them.
+    /// `declare` and `declare_content_addressed` state a pairing and carry
+    /// their semantics as a third argument; `mutable` and `immutable` carry it
+    /// in the name. All four are collected, so the scan can both find the
+    /// registry's own declarations and check every use against them.
+    ///
+    /// **Every constructor must be listed here.** These names are matched as
+    /// literal substrings ending in `(`, so a constructor that is added to
+    /// `StorageSpace` and not added to this list does not fail anything — its
+    /// call sites simply stop being scanned, and both
+    /// [`tests::every_declared_space_is_registered`] and
+    /// [`tests::no_registered_space_id_is_declared_with_two_value_semantics`]
+    /// go quiet about the space it declares. That is the failure mode this
+    /// module exists to prevent, reintroduced one level up. Note also that
+    /// `StorageSpace::declare(` does **not** match
+    /// `StorageSpace::declare_content_addressed(`, which is why the latter is
+    /// its own row rather than covered by a prefix.
+    const SPACE_CONSTRUCTORS: &[(&str, Option<ValueSemantics>)] = &[
+        ("StorageSpace::mutable(", Some(ValueSemantics::Mutable)),
+        ("StorageSpace::immutable(", Some(ValueSemantics::Immutable)),
+        ("StorageSpace::declare(", None),
+        ("StorageSpace::declare_content_addressed(", None),
+    ];
+
+    /// [`SPACE_CONSTRUCTORS`] must name every constructor that takes a space id.
+    ///
+    /// Read back out of `storage/types.rs` rather than compared to a second
+    /// hand-written list, because a list checked against another list is what
+    /// `UNCHECKED_SPACE_IDS` above already learned the hard way. A constructor
+    /// added to `StorageSpace` and not added to the scanner does not fail
+    /// anything by itself — it silently removes its own call sites from both
+    /// registry guards — so the scanner's completeness has to be an assertion
+    /// against the type, and this is it.
+    #[test]
+    fn the_scanner_knows_every_space_constructor() {
+        let (_, types_source) = engine_sources()
+            .into_iter()
+            .find(|(path, _)| path.replace('\\', "/").ends_with("storage/types.rs"))
+            .expect("storage/types.rs should be readable");
+        let implementation = types_source
+            .split_once("impl StorageSpace {")
+            .expect("StorageSpace should have an inherent impl block")
+            .1;
+        let mut declared = Vec::new();
+        for line in implementation.lines() {
+            if line.starts_with('}') {
+                break;
+            }
+            let Some((_, tail)) = line.trim_start().split_once("const fn ") else {
+                continue;
+            };
+            let Some((name, _)) = tail.split_once('(') else {
+                continue;
+            };
+            // `mutable_view_for_corruption_test` takes `self`, not an id, so
+            // it can neither introduce a space nor pick a value integrity.
+            if implementation
+                .split_once(&format!("const fn {name}("))
+                .is_some_and(|(_, arguments)| !arguments.trim_start().starts_with("id: SpaceId"))
+            {
+                continue;
+            }
+            declared.push(format!("StorageSpace::{name}("));
+        }
+        declared.sort();
+        let mut scanned = SPACE_CONSTRUCTORS
+            .iter()
+            .map(|(constructor, _)| (*constructor).to_string())
+            .collect::<Vec<_>>();
+        scanned.sort();
+        assert_eq!(
+            scanned, declared,
+            "storage/types.rs declares a StorageSpace constructor the registry scanner does not \
+             look for. Add it to SPACE_CONSTRUCTORS, or every space declared through it becomes \
+             invisible to every_declared_space_is_registered and to \
+             no_registered_space_id_is_declared_with_two_value_semantics."
+        );
+    }
+
     fn construction_sites(source: &str) -> Vec<ConstructionSite> {
         let mut sites = Vec::new();
-        for (constructor, declared) in [
-            ("StorageSpace::mutable(", Some(ValueSemantics::Mutable)),
-            ("StorageSpace::immutable(", Some(ValueSemantics::Immutable)),
-            ("StorageSpace::declare(", None),
-        ] {
+        for (constructor, declared) in SPACE_CONSTRUCTORS.iter().copied() {
             let mut cursor = 0;
             while let Some(offset) = source[cursor..].find(constructor) {
                 let start = cursor + offset;

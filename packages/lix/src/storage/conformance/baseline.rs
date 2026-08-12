@@ -5,6 +5,13 @@ use std::ops::Bound;
 /// the bottom of this file pin space isolation.
 const TEST_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(7), "storage.conformance.test");
 const OTHER_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(8), "storage.conformance.other");
+/// Same id and bytes as [`TEST_SPACE`] would hold, declared with the value
+/// integrity that permits a backend to skip its own value checksum.
+const CONTENT_ADDRESSED_SPACE: StorageSpace = StorageSpace::declare_content_addressed(
+    SpaceId(9),
+    "storage.conformance.content_addressed",
+    ValueSemantics::Mutable,
+);
 
 use bytes::Bytes;
 
@@ -16,7 +23,7 @@ use crate::storage::conformance::{
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Precondition,
     ProjectedValue, ReadEntry, ReadOptions, ScanChunk, ScanOrder, SpaceId, Storage, StorageError,
-    StorageRead, StorageSpace, StorageWrite, WriteOptions,
+    StorageRead, StorageSpace, StorageWrite, ValueSemantics, WriteOptions,
 };
 
 pub(crate) async fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -44,6 +51,10 @@ where
         get_many_returns_requested_slots
     );
     run!("baseline::get_many_empty_key_list", get_many_empty_key_list);
+    run!(
+        "baseline::content_addressed_space_returns_identical_bytes",
+        content_addressed_space_returns_identical_bytes
+    );
     run!(
         "baseline::delete_many_missing_keys_is_idempotent",
         delete_many_missing_keys_is_idempotent
@@ -347,6 +358,128 @@ where
             result.values
         ))
     }
+}
+
+/// `ValueIntegrity::ContentAddressed` must not change what a read returns.
+///
+/// It is a licence to skip a *redundant* corruption check on bytes the engine
+/// authenticates itself, and nothing more. An adapter is free to ignore it
+/// entirely — SlateDB does, because `slatedb::config::ReadOptions` has no
+/// checksum control — but an adapter that acts on it must return byte-identical
+/// values, through both `get_many` and a full-value scan, and must still report
+/// a missing key as missing.
+///
+/// The same rows are written to a `BackendVerified` space and a
+/// `ContentAddressed` one and the two reads are compared to each other, so this
+/// fails if a backend's opted-out path diverges in any way — not merely if it
+/// returns something a hand-written expectation did not anticipate.
+async fn content_addressed_space_returns_identical_bytes<F>(factory: &F) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let storage = open_storage(factory).await;
+    let rows: [(&str, &[u8]); 3] = [
+        ("a", b"A"),
+        ("b", b"a much longer value than the block would like"),
+        ("c", &[0u8; 512]),
+    ];
+
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .map_err(|error| format!("begin_write failed: {error}"))?;
+    for target in [TEST_SPACE, CONTENT_ADDRESSED_SPACE] {
+        write
+            .put_many(
+                target,
+                put_batch(
+                    rows.iter()
+                        .map(|(key_bytes, value_bytes)| full_put(key(key_bytes), *value_bytes)),
+                ),
+            )
+            .await
+            .map_err(|error| format!("put_many into {target} failed: {error}"))?;
+    }
+    write
+        .commit()
+        .await
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    let requested = [key("a"), key("b"), key("c"), key("missing")];
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+
+    let verified = read
+        .get_many_in_space(TEST_SPACE, &requested, GetOptions::default())
+        .await
+        .map_err(|error| format!("get_many on the verified space failed: {error}"))?;
+    let addressed = read
+        .get_many_in_space(CONTENT_ADDRESSED_SPACE, &requested, GetOptions::default())
+        .await
+        .map_err(|error| format!("get_many on the content-addressed space failed: {error}"))?;
+
+    if verified.values != addressed.values {
+        return Err(format!(
+            "content-addressed space returned different values than the verified space: \
+             {:?} vs {:?}",
+            verified.values, addressed.values
+        ));
+    }
+    if addressed.values.last() != Some(&None) {
+        return Err(format!(
+            "a missing key must stay missing on a content-addressed space, got {:?}",
+            addressed.values.last()
+        ));
+    }
+
+    let scanned = collect_full_values(&read, CONTENT_ADDRESSED_SPACE).await?;
+    let expected = rows
+        .iter()
+        .map(|(key_bytes, value_bytes)| (key(key_bytes), Bytes::copy_from_slice(value_bytes)))
+        .collect::<Vec<_>>();
+    if scanned != expected {
+        return Err(format!(
+            "full-value scan of a content-addressed space returned {scanned:?}, expected {expected:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Drains a full-value scan of `space` into `(key, value)` pairs in key order.
+async fn collect_full_values<R>(read: &R, space: StorageSpace) -> Result<Vec<(Key, Bytes)>, String>
+where
+    R: StorageRead,
+{
+    let mut cursor = read
+        .begin_scan(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions::default(),
+        )
+        .await
+        .map_err(|error| format!("begin_scan failed: {error}"))?;
+    let entries = cursor
+        .collect_all()
+        .await
+        .map_err(|error| format!("scan collect_all failed: {error}"))?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let ReadEntry {
+            key: entry_key,
+            value: ProjectedValue::FullValue(bytes),
+        } = entry
+        else {
+            return Err("full-value scan yielded a key-only entry".to_string());
+        };
+        out.push((entry_key, bytes));
+    }
+    Ok(out)
 }
 
 async fn delete_many_missing_keys_is_idempotent<F>(factory: &F) -> ConformanceResult

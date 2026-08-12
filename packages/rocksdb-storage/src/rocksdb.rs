@@ -19,8 +19,8 @@ use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
     ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId, Storage, StorageError,
-    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueSemantics,
-    WriteOptions, WriteStats,
+    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueIntegrity,
+    ValueSemantics, WriteOptions, WriteStats,
 };
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
@@ -255,6 +255,34 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
     }
 }
 
+/// Read options for a full-value read of `space`.
+///
+/// RocksDB verifies a CRC32C over every block and every blob-file record it
+/// reads. For a [`ValueIntegrity::ContentAddressed`] space that is a strictly
+/// weaker duplicate of a check the engine has already made unconditional: the
+/// key *is* the BLAKE3-256 digest of the value, and the engine recomputes and
+/// compares it before the bytes escape the read. Corruption that RocksDB's
+/// CRC32C would have caught is caught by the digest instead — including the
+/// cases CRC32C cannot distinguish — so the second pass buys nothing and costs
+/// a full sweep over every payload byte.
+///
+/// It is worth stating what is *not* claimed. Skipping verification means a
+/// corrupt block reaches the engine before it is rejected, so the failure mode
+/// moves from RocksDB's error to the engine's content-address error. The bytes
+/// never escape either way. `verify_checksums` also covers this column
+/// family's index and filter blocks; a corrupt index can only send the read to
+/// the wrong key, and the wrong payload fails the digest check for the key that
+/// was actually asked for.
+///
+/// Every other space gets RocksDB's default, which verifies.
+fn value_read_options(space: StorageSpace) -> rocksdb::ReadOptions {
+    let mut options = rocksdb::ReadOptions::default();
+    if space.value_integrity == ValueIntegrity::ContentAddressed {
+        options.set_verify_checksums(false);
+    }
+    options
+}
+
 fn column_family(db: &DB, space: StorageSpace) -> &ColumnFamily {
     match space.value_semantics {
         ValueSemantics::Mutable => mutable_column_family(db),
@@ -352,9 +380,10 @@ impl StorageRead for RocksDBRead<'_> {
                         }
                     }
                     CoreProjection::FullValue => {
-                        let values = self
-                            .snapshot
-                            .multi_get_cf(physical_keys.iter().map(|key| (cf, key.0.as_ref())));
+                        let values = self.snapshot.multi_get_cf_opt(
+                            physical_keys.iter().map(|key| (cf, key.0.as_ref())),
+                            value_read_options(request.space),
+                        );
                         results.extend(
                             values
                                 .into_iter()
@@ -384,7 +413,16 @@ impl StorageRead for RocksDBRead<'_> {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
             let bounds = EncodedBounds::new(physical_range(space.id, range.clone()));
-            let mut iterator = self.snapshot.raw_iterator_cf(column_family(self.db, space));
+            let mut iterator = match opts.projection {
+                // A key-only scan never materializes a value, so there is no
+                // value checksum to skip and the default options are right.
+                CoreProjection::KeyOnly => {
+                    self.snapshot.raw_iterator_cf(column_family(self.db, space))
+                }
+                CoreProjection::FullValue => self
+                    .snapshot
+                    .raw_iterator_cf_opt(column_family(self.db, space), value_read_options(space)),
+            };
             iterator.seek(&bounds.lower_seek);
             iterator.status().map_err(rocksdb_error)?;
             ScanCursor::from_source(

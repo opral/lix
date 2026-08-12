@@ -35,8 +35,8 @@ pub use crate::storage::{
     ReadDurability as StorageReadDurability, ReadEntry as StorageReadEntry,
     ReadOptions as StorageReadOptions, ScanChunk as StorageScanChunk,
     ScanCursor as StorageScanCursor, ScanOrder as StorageScanOrder, SpaceId as StorageSpaceId,
-    Storage, StorageError, StorageRead, StorageSpace, StoredValue as StorageValue, ValueSemantics,
-    WriteOptions as StorageWriteOptions,
+    Storage, StorageError, StorageRead, StorageSpace, StoredValue as StorageValue, ValueIntegrity,
+    ValueSemantics, WriteOptions as StorageWriteOptions,
 };
 pub(crate) use crate::storage::{PutBatch, PutEntry};
 
