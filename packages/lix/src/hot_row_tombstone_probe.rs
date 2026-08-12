@@ -748,3 +748,72 @@ async fn hot_row_tombstone_compaction_premise() {
         );
     }
 }
+
+/// PHASE 5 — is the rotated-generation read cost proportional to the base, or
+/// is it a fixed setup cost?
+///
+/// Phase 3 measured a 3.9x penalty on a *churned* collection, which confounds
+/// two things: the accumulated tombstones and the root-backed serving path. This
+/// phase removes the churn entirely — every arm inserts `n` rows and deletes
+/// none, so there are zero tombstones — and varies only `n`, holding the answer
+/// at exactly one row.
+///
+/// - `live_main` serves the answer from the branch's own hot generation.
+/// - `live_rot` creates a branch over that head and switches to it, so the same
+///   answer is served by a sparse generation over a root current base.
+///
+/// If the penalty is a fixed setup cost it is the same number of microseconds at
+/// n = 1 and at n = 10 000. If it is proportional to the base it grows with `n`
+/// while the answer stays at one row.
+///
+/// The point lane (`WHERE id = 'row-0'`, equality on the declared primary key)
+/// is measured in the same arms because it is the lane that has an exact
+/// root-base route (`load_root_current_base_exact`) available to it; the
+/// collection lane does not.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn rotated_generation_read_scaling() {
+    let sizes = sizes_from_env("LIX_TOMBSTONE_SIZES", &[1, 100, 1_000, 10_000]);
+    let reps = reps_from_env(5);
+    println!(
+        "phase5 | arm,n,row_entries,tombstones,live_entries,packed_bases,root_bases,scan_us,point_us"
+    );
+    let point_sql = "SELECT id FROM liverow WHERE id = 'row-0'";
+    for n in sizes {
+        for rotate in [false, true] {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("liverow")).await;
+            insert_rows(&session, "liverow", n).await;
+            if rotate {
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e51-rotation".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id.clone(),
+                    })
+                    .await
+                    .expect("branch should switch");
+            }
+            let census = row_census(&storage).await;
+            let scan = timed_scan(&session, &scan_sql("liverow"), 1, reps).await;
+            let point = timed_scan(&session, point_sql, 1, reps).await;
+            println!(
+                "{},{n},{},{},{},{},{},{},{}",
+                if rotate { "live_rot" } else { "live_main" },
+                census.entries,
+                census.tombstones,
+                census.live(),
+                census.packed_bases,
+                census.root_bases,
+                scan.as_micros(),
+                point.as_micros()
+            );
+        }
+    }
+}
