@@ -417,6 +417,27 @@ impl FileHistoryPublicPredicate {
             _ => None,
         }
     }
+
+    /// The finite set of `path` literals every matching row must render, when
+    /// one exists.
+    ///
+    /// A conjunction narrows (either side alone is already a sound bound); a
+    /// disjunction only bounds the whole expression when both sides do.
+    fn exact_paths(&self) -> Option<BTreeSet<String>> {
+        match self {
+            Self::All | Self::Ids(_) => None,
+            Self::Paths(paths) => Some(paths.clone()),
+            Self::And(left, right) => match (left.exact_paths(), right.exact_paths()) {
+                (Some(left), Some(right)) => Some(left.intersection(&right).cloned().collect()),
+                (bound, None) | (None, bound) => bound,
+            },
+            Self::Or(left, right) => {
+                let mut left = left.exact_paths()?;
+                left.extend(right.exact_paths()?);
+                Some(left)
+            }
+        }
+    }
 }
 
 /// A conservative exact public `id` constraint that can be translated to the
@@ -614,6 +635,28 @@ where
 
     let event_route = route.traversal_only();
     let context_route = route.anchors_only();
+    // A `path` predicate prunes exactly like an `id` predicate once it is
+    // resolved to the file IDs that could render that path.
+    let resolved_lookup_ids = match lookup_ids {
+        Some(lookup_ids) => Some(lookup_ids.clone()),
+        None => {
+            resolve_file_history_path_lookup_ids(
+                Arc::clone(&commit_graph),
+                query_source.clone(),
+                &context_route,
+                public_predicate,
+            )
+            .await?
+        }
+    };
+    if resolved_lookup_ids
+        .as_ref()
+        .is_some_and(|lookup_ids| lookup_ids.0.is_empty())
+    {
+        return Ok(Vec::new());
+    }
+    let lookup_ids = resolved_lookup_ids.as_ref();
+
     let filesystem_context = load_file_history_filesystem_context(
         Arc::clone(&commit_graph),
         query_source.clone(),
@@ -950,6 +993,85 @@ fn validate_file_history_materialization(
             descriptor.id,
         )))
     }
+}
+
+/// Resolves an exact `path` predicate to the file IDs that can render it, so a
+/// path lookup prunes the traversal the same way an ID lookup already does.
+///
+/// A row's path is `<directory path>/<descriptor name>` and a path segment can
+/// never contain `/`, so a row renders `path` only when its descriptor name
+/// equals the final segment of `path` at that commit. Every name a file has
+/// ever carried was written by a descriptor change, and every commit a row can
+/// be observed at is reachable from the anchors — so descriptor changes read
+/// from the anchors are a superset of the matching file IDs. The residual
+/// [`FileHistoryPublicPredicate::matches`] still decides every row, so this
+/// only narrows the traversal; it never decides the answer.
+///
+/// Returns `None` when the predicate cannot be bounded to a finite set of
+/// paths, which keeps the complete traversal.
+async fn resolve_file_history_path_lookup_ids<S>(
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlHistoryQuerySource<S>,
+    anchor_route: &HistoryRoute,
+    public_predicate: &FileHistoryPublicPredicate,
+) -> Result<Option<FileHistoryLookupIds>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let Some(paths) = public_predicate.exact_paths() else {
+        return Ok(None);
+    };
+    let mut names = BTreeSet::new();
+    for path in &paths {
+        match path.rsplit_once('/') {
+            Some((_, name)) if !name.is_empty() => {
+                names.insert(name.to_string());
+            }
+            // Not a composable Lix path. Rather than reason about a literal no
+            // composed path can equal, leave the traversal unpruned.
+            _ => return Ok(None),
+        }
+    }
+
+    let entries = load_history_entries(
+        HistoryViewDescriptor {
+            view_name: "lix_file_history",
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
+        },
+        commit_graph,
+        query_source,
+        anchor_route,
+        vec![FILE_DESCRIPTOR_SCHEMA_KEY.to_string()],
+        HistoryMetadataProjection::default(),
+        None,
+    )
+    .await?;
+
+    let mut file_ids = BTreeSet::new();
+    for entry in &entries {
+        // A tombstone carries no name, and the name it retired was written by
+        // the live descriptor change this scan already saw.
+        let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot: FileDescriptorSnapshot =
+            serde_json::from_str(snapshot_content).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("invalid lix_file_descriptor history snapshot JSON: {error}"),
+                )
+            })?;
+        if !names.contains(&snapshot.name) {
+            continue;
+        }
+        if EntityPk::uuid_from_canonical(&snapshot.id).is_err() {
+            // The pruned readers key on a canonical UUID. A file ID that is not
+            // one cannot be routed, so keep the complete traversal.
+            return Ok(None);
+        }
+        file_ids.insert(snapshot.id);
+    }
+    Ok(Some(FileHistoryLookupIds(file_ids)))
 }
 
 async fn load_file_history_filesystem_context<S>(
@@ -2934,6 +3056,54 @@ mod tests {
             .is_none(),
             "mixed public predicates retain the existing complete traversal"
         );
+    }
+
+    #[test]
+    fn exact_public_paths_bound_conjunctions_and_complete_disjunctions() {
+        let single = FileHistoryPublicPredicate::from_filters(&[eq_filter("path", "/docs/a.md")]);
+        assert_eq!(
+            single.exact_paths(),
+            Some(BTreeSet::from(["/docs/a.md".to_string()]))
+        );
+
+        // Either side of a conjunction is already a sound bound.
+        let mixed_conjunction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a2")),
+            Operator::And,
+            Box::new(eq_filter("path", "/docs/a.md")),
+        ));
+        assert_eq!(
+            FileHistoryPublicPredicate::from_filters(&[mixed_conjunction]).exact_paths(),
+            Some(BTreeSet::from(["/docs/a.md".to_string()]))
+        );
+
+        let path_disjunction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("path", "/docs/a.md")),
+            Operator::Or,
+            Box::new(eq_filter("path", "/docs/b.md")),
+        ));
+        assert_eq!(
+            FileHistoryPublicPredicate::from_filters(&[path_disjunction]).exact_paths(),
+            Some(BTreeSet::from([
+                "/docs/a.md".to_string(),
+                "/docs/b.md".to_string()
+            ]))
+        );
+
+        // One unbounded side leaves the whole disjunction unbounded.
+        let mixed_disjunction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("path", "/docs/a.md")),
+            Operator::Or,
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a2")),
+        ));
+        assert!(
+            FileHistoryPublicPredicate::from_filters(&[mixed_disjunction])
+                .exact_paths()
+                .is_none(),
+            "an unbounded disjunct must retain the complete traversal"
+        );
+
+        assert!(FileHistoryPublicPredicate::All.exact_paths().is_none());
     }
 
     #[tokio::test]
