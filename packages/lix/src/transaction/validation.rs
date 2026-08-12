@@ -4781,6 +4781,132 @@ mod tests {
             .expect("pending registered schema should be visible to later staged rows");
     }
 
+    /// A commit that both registers a schema and writes rows of it must
+    /// publish the collection's witness **and** those rows' entries.
+    ///
+    /// This is the one failure the hot index plane cannot have. The
+    /// registration alone earns the collection a completeness witness, so if
+    /// the same commit's rows are missing from the index the read path trusts
+    /// a complete-looking index that holds nothing and returns no rows —
+    /// silently, for every reader, until the next generation.
+    ///
+    /// The commit-time hook that this rework replaced resolved schemas through
+    /// the catalog snapshot taken when the transaction opened, which by
+    /// construction cannot contain a registration the transaction is still
+    /// staging. Extraction now runs here instead, against the same
+    /// transaction-visible catalog that
+    /// `validation_allows_pending_registered_schema_to_validate_later_rows`
+    /// pins — so the fix is structural, not a special case.
+    ///
+    /// (The SQL surface cannot currently reach this shape: an entity table
+    /// registered inside an explicit transaction is not bindable until that
+    /// transaction commits. The prepared-write path can, which is why the
+    /// invariant is pinned at this level rather than through SQL.)
+    #[tokio::test]
+    async fn a_schema_registered_in_this_commit_indexes_its_own_rows() {
+        let visible_schemas = vec![registered_schema()];
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![
+                pending_registered_schema_from_definition(unique_schema()),
+                unique_row("entity-1", "slug-1", "first"),
+                unique_row("entity-2", "slug-2", "second"),
+            ],
+            ..empty_staged_write_set()
+        };
+
+        let extracted = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
+            .await
+            .expect("registration plus rows of that schema should validate");
+
+        assert_eq!(
+            extracted
+                .registered_collections
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![("unique_schema".to_string(), 0_u16)],
+            "the registration must witness its one declared column"
+        );
+        let indexed = extracted
+            .rows
+            .iter()
+            .flat_map(|row| {
+                row.columns.iter().map(move |(ordinal, value)| {
+                    (row.schema_key.as_str().to_owned(), *ordinal, value.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexed,
+            vec![
+                (
+                    "unique_schema".to_string(),
+                    0,
+                    Some(crate::live_state::HotIndexValue::String("slug-1".into()))
+                ),
+                (
+                    "unique_schema".to_string(),
+                    0,
+                    Some(crate::live_state::HotIndexValue::String("slug-2".into()))
+                ),
+            ],
+            "every row of the freshly registered schema must be extracted, or the \
+             witness above publishes an index that is missing them"
+        );
+    }
+
+    /// Every declared ordinal is carried, `None` included.
+    ///
+    /// Commit earns a witness per `(schema, ordinal)` from the row's presence,
+    /// not from a value being found, so a row that omits an indexable value
+    /// must still report that ordinal. Dropping it would leave the column
+    /// unwitnessed and silently un-indexable for the whole collection.
+    #[tokio::test]
+    async fn extraction_reports_declared_ordinals_without_a_value() {
+        let schema = json!({
+            "x-lix-key": "sparse_index_schema",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/slug"], ["/rank"]],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "slug": { "type": ["string", "null"] },
+                "rank": { "type": ["integer", "null"] }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let mut row = staged_row(
+            "sparse_index_schema",
+            Some(json!({ "id": "entity-1", "slug": null, "rank": 7 }).to_string()),
+        );
+        row.entity_pk = EntityPk::single("entity-1");
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![
+                pending_registered_schema_from_definition(schema),
+                row,
+            ],
+            ..empty_staged_write_set()
+        };
+
+        let extracted =
+            validate_prepared_writes(validation_input(&staged_writes, &vec![registered_schema()]))
+                .await
+                .expect("sparse indexed row should validate");
+
+        let [row] = extracted.rows.as_slice() else {
+            panic!("expected exactly one extracted row, got {:?}", extracted.rows);
+        };
+        assert_eq!(
+            row.columns,
+            vec![
+                (0_u16, Some(crate::live_state::HotIndexValue::Integer(7))),
+                (1_u16, None),
+            ],
+            "a null indexed value must still report its ordinal"
+        );
+    }
+
     #[test]
     fn pending_schema_domain_covers_file_scoped_rows_in_the_same_catalog() {
         let mut pending_schema = pending_registered_schema_row("pending_file_schema");
