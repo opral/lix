@@ -176,6 +176,10 @@ where
             ));
         }
         if !force_current {
+            #[cfg(feature = "storage-benches")]
+            let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+                crate::storage_bench::PlanLoadPhase::AvailProbe,
+            );
             let available = load_available_root(store, &current_commit_id).await?;
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_root_replay_available_root_probe(available.is_some());
@@ -265,34 +269,54 @@ async fn load_commit_root_rebuild_plan<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let mut reader = ChangelogContext::new().reader(store);
-    let commit_ids = [CommitId::parse_lix(
-        commit_id,
-        "commit-root rebuild commit_id",
-    )?];
-    let batch = reader
-        .load_commits(CommitLoadRequest {
-            commit_ids: &commit_ids,
-        })
-        .await?;
-    let entry = batch
-        .into_iter()
-        .next()
-        .and_then(|(_, value)| value)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"
-                ),
-            )
-        })?;
-    let commit = entry;
+    let commit = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::CommitRecord,
+        );
+        let mut reader = ChangelogContext::new().reader(store);
+        let commit_ids = [CommitId::parse_lix(
+            commit_id,
+            "commit-root rebuild commit_id",
+        )?];
+        let batch = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &commit_ids,
+            })
+            .await?;
+        batch
+            .into_iter()
+            .next()
+            .and_then(|(_, value)| value)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"
+                    ),
+                )
+            })?
+    };
     // Commit roots contain only identity/index facts. Avoid hydrating JSON
     // sidecars while rebuilding them; the packed delta index already carries
     // deletion, owner ids, and original timestamps.
-    let deltas = storage::scan_commit_delta_members(store, commit.commit_id)
-        .await?
+    let members = storage::scan_commit_delta_members(store, commit.commit_id).await?;
+    #[cfg(feature = "root-replay-trace")]
+    let member_bytes = members
+        .iter()
+        .map(|(key, _)| {
+            (key.schema_key.len()
+                + key.file_id.as_ref().map(String::len).unwrap_or(0)
+                + key.entity_pk.estimated_heap_bytes()) as u64
+        })
+        .sum::<u64>();
+    #[cfg(feature = "root-replay-trace")]
+    crate::storage_bench::record_plan_load_plan(
+        members.len() as u64,
+        members.len() as u64,
+        member_bytes,
+    );
+    let deltas = members
         .into_iter()
         .map(|(key, value)| CommitRootRebuildDelta {
             schema_key: key.schema_key,
