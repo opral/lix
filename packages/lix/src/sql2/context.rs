@@ -314,20 +314,60 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 pub(crate) struct SqlWriteContext {
     ptr: Arc<SqlWriteContextPtr>,
     gate: Arc<Mutex<()>>,
+    shared: Arc<SqlWriteContextShared>,
     explicit_insert_columns: Option<Arc<BTreeSet<String>>>,
     write_targets: Option<Arc<super::providers::WriteTargetRegistry>>,
 }
 
 struct SqlWriteContextPtr(NonNull<dyn SqlWriteExecutionContext>);
 
+/// Values captured from the write execution context at construction time.
+///
+/// These were previously read back through `SqlWriteContextPtr` on every call,
+/// producing a `&dyn` into the transaction context with no synchronization
+/// while the gated methods could concurrently hold a reconstituted `&mut` to
+/// the same object. Every one of them is a cheap getter returning owned,
+/// `Arc`'d, or cloned data that is stable for this context's lifetime, so
+/// capturing them here removes that shared borrow outright rather than
+/// serializing it. Nothing below reads through the raw pointer.
+struct SqlWriteContextShared {
+    functions: FunctionProviderHandle,
+    /// Stored as the `Result` it was: the underlying catalog is memoized on a
+    /// fingerprint that is fixed for the context's lifetime
+    /// (`sql_schema_snapshot` is assigned once at construction and never
+    /// reassigned), so a captured value cannot go stale.
+    public_catalog: Result<Arc<PublicCatalog>, LixError>,
+    active_branch_id: String,
+    active_account_id: String,
+    plugin_host: PluginRuntimeHost,
+    /// A shared `Arc<Mutex<..>>` handle, not a snapshot: mutations made through
+    /// a captured clone are observed by every other holder.
+    session_file_views: Option<SessionFileViews>,
+}
+
 // DataFusion stores providers as owned Send + Sync trait objects. This context
 // is only constructed for one write execution and never outlives the borrowed
 // transaction context that owns it.
+//
+// SAFETY SCOPE: the pointer is now reached only by the gate-serialized methods
+// that reconstitute `&mut`. The shared accessors read `SqlWriteContextShared`
+// and never touch it, so no `&dyn` into the transaction context can be alive
+// while one of those `&mut` borrows is held.
 unsafe impl Send for SqlWriteContextPtr {}
 unsafe impl Sync for SqlWriteContextPtr {}
 
 impl SqlWriteContext {
     pub(crate) fn new(ctx: &mut dyn SqlWriteExecutionContext) -> Self {
+        // Capture the shared surface while the `&mut` borrow is still held
+        // legitimately, so no later call has to forge one.
+        let shared = Arc::new(SqlWriteContextShared {
+            functions: ctx.functions(),
+            public_catalog: ctx.public_catalog(),
+            active_branch_id: ctx.active_branch_id().to_string(),
+            active_account_id: ctx.active_account_id().to_string(),
+            plugin_host: ctx.plugin_host(),
+            session_file_views: ctx.session_file_views(),
+        });
         let ptr = NonNull::from(ctx);
         let ptr = unsafe {
             std::mem::transmute::<
@@ -338,6 +378,7 @@ impl SqlWriteContext {
         Self {
             ptr: Arc::new(SqlWriteContextPtr(ptr)),
             gate: Arc::new(Mutex::new(())),
+            shared,
             explicit_insert_columns: None,
             write_targets: Some(Arc::new(super::providers::WriteTargetRegistry::default())),
         }
@@ -369,7 +410,7 @@ impl SqlWriteContext {
     }
 
     pub(crate) fn functions(&self) -> FunctionProviderHandle {
-        unsafe { self.ptr.0.as_ref().functions() }
+        self.shared.functions.clone()
     }
 
     pub(crate) fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
@@ -377,23 +418,23 @@ impl SqlWriteContext {
     }
 
     pub(crate) fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
-        unsafe { self.ptr.0.as_ref().public_catalog() }
+        self.shared.public_catalog.clone()
     }
 
     pub(crate) fn active_branch_id(&self) -> String {
-        unsafe { self.ptr.0.as_ref().active_branch_id().to_string() }
+        self.shared.active_branch_id.clone()
     }
 
     pub(crate) fn active_account_id(&self) -> String {
-        unsafe { self.ptr.0.as_ref().active_account_id().to_string() }
+        self.shared.active_account_id.clone()
     }
 
     pub(crate) fn plugin_host(&self) -> PluginRuntimeHost {
-        unsafe { self.ptr.0.as_ref().plugin_host() }
+        self.shared.plugin_host.clone()
     }
 
     pub(crate) fn session_file_views(&self) -> Option<SessionFileViews> {
-        unsafe { self.ptr.0.as_ref().session_file_views() }
+        self.shared.session_file_views.clone()
     }
 
     pub(crate) async fn scan_hot_state_batch(
