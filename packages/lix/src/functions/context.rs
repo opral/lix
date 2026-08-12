@@ -1,4 +1,5 @@
 use crate::LixError;
+use crate::branch::BranchHeadControl;
 use crate::changelog::ChangeId;
 use crate::common::LixTimestamp;
 use crate::functions::{
@@ -36,16 +37,34 @@ impl FunctionContext {
     ///
     /// If deterministic mode is absent or disabled, the context uses system
     /// functions. If enabled, it starts from the persisted sequence + 1.
-    #[expect(trivial_casts)]
     pub(crate) async fn prepare(
         read: &(impl StorageAdapterRead + ?Sized),
     ) -> Result<Self, LixError> {
-        let mode = state::load_mode(read).await?;
+        let global_control = state::load_global_control(read).await?;
+        Self::prepare_with_global_control(read, global_control).await
+    }
+
+    /// Same as [`Self::prepare`] for a caller that already holds the global
+    /// branch-head control from the same pinned read.
+    ///
+    /// Deterministic mode and its sequence are untracked `lix_key_value` rows
+    /// on the global branch, so both are read *through* that control. A caller
+    /// that loaded it already must not read it again: a second point read of
+    /// the same key in the same snapshot can only return the same bytes.
+    #[expect(trivial_casts)]
+    pub(crate) async fn prepare_with_global_control(
+        read: &(impl StorageAdapterRead + ?Sized),
+        global_control: Option<BranchHeadControl>,
+    ) -> Result<Self, LixError> {
+        let Some(global_control) = global_control else {
+            return Ok(Self::system_for_function_free_read());
+        };
+        let mode = state::load_mode_with_control(read, global_control).await?;
         if !mode.enabled {
             return Ok(Self::system_for_function_free_read());
         }
 
-        let sequence = state::load_sequence(read).await?;
+        let sequence = state::load_sequence_with_control(read, global_control).await?;
         // Deterministic mode must produce byte-identical state across runs;
         // bookkeeping rows (sequence persistence) take a timestamp derived
         // from the persisted sequence instead of the system clock, without
