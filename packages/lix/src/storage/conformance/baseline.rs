@@ -536,7 +536,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let (chunk, chunk_has_more) = scan_range(
+    let (chunk, _chunk_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -690,7 +690,7 @@ where
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
 
-    let (included, included_has_more) = scan_range(
+    let (included, _included_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -703,7 +703,7 @@ where
     .map_err(|error| format!("included range scan failed: {error}"))?.into_parts();
     assert_read_entries(&included, &[("b", "B"), ("c", "C")])?;
 
-    let (excluded, excluded_has_more) = scan_range(
+    let (excluded, _excluded_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -733,7 +733,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let (chunk, chunk_has_more) = scan_range(
+    let (chunk, _chunk_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -784,7 +784,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let (chunk, chunk_has_more) = scan_range(
+    let (chunk, _chunk_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -966,7 +966,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let (chunk, chunk_has_more) = scan_range(
+    let (chunk, _chunk_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -1107,7 +1107,7 @@ where
         &[("a", "A")],
     )?;
 
-    let (old_scan, old_scan_has_more) = scan_range(
+    let (old_scan, _old_scan_has_more) = scan_range(
         &old_read,
         test_space,
         KeyRange {
@@ -1207,7 +1207,7 @@ where
         )
         .await
         .map_err(|error| format!("begin exclusive restart failed: {error}"))?;
-    let (restarted_page, restarted_page_has_more) = restarted
+    let (restarted_page, _restarted_page_has_more) = restarted
         .next_page(usize::MAX)
         .await
         .map_err(|error| format!("exclusive restart failed: {error}"))?.into_parts();
@@ -1266,7 +1266,7 @@ where
         .map_err(|error| format!("begin cursor failed: {error}"))?;
     let unpolled = cursor.next_page(1);
     drop(unpolled);
-    let (page, page_has_more) = cursor
+    let (page, _page_has_more) = cursor
         .next_page(1)
         .await
         .map_err(|error| format!("cursor failed after unpolled cancellation: {error}"))?.into_parts();
@@ -1340,7 +1340,7 @@ where
         &[key("a")],
     )?;
 
-    let (key_only_scan, key_only_scan_has_more) = scan_range(
+    let (key_only_scan, _key_only_scan_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {

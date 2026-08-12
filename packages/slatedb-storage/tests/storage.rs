@@ -523,7 +523,7 @@ async fn assert_cached_rows(
         )
         .await
         .expect("begin cached scan");
-    let (result, result_has_more) = cursor
+    let (result, _result_has_more) = cursor
         .next_page(usize::MAX)
         .await
         .expect("scan cached rows").into_parts();

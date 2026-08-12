@@ -1070,7 +1070,7 @@ mod tests {
             )
             .await
             .expect("chunk verification scan should succeed");
-        let (page, page_has_more) = cursor
+        let (page, _page_has_more) = cursor
             .next_page(1)
             .await
             .expect("chunk verification page should succeed").into_parts();
@@ -1470,7 +1470,7 @@ mod tests {
             )
             .await
             .expect("begin temporary upload receipt scan");
-        let (temporary_receipts, temporary_receipts_has_more) = cursor
+        let (temporary_receipts, _temporary_receipts_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan temporary upload receipts").into_parts();
@@ -1629,7 +1629,7 @@ mod tests {
             )
             .await
             .expect("begin upload leaf scan");
-        let (leaves, leaves_has_more) = cursor
+        let (leaves, _leaves_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
             .expect("scan upload leaves").into_parts();

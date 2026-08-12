@@ -999,7 +999,7 @@ where
         )
         .await
         .expect("begin row scan");
-    let (page, page_has_more) = cursor
+    let (page, _page_has_more) = cursor
         .next_page(expected_rows + 1)
         .await
         .expect("scan rows").into_parts();

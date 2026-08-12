@@ -181,7 +181,7 @@ async fn prefix_scan_lowers_to_storage_range() -> StorageConformanceResult {
         .begin_scan(space_one(), range, BeginScanOptions::default())
         .await
         .map_err(|error| format!("begin prefix scan failed: {error}"))?;
-    let (chunk, chunk_has_more) = cursor
+    let (chunk, _chunk_has_more) = cursor
         .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
         .await
         .map_err(|error| format!("scan_prefix failed: {error}"))?.into_parts();
@@ -289,7 +289,7 @@ async fn read_scope_pins_snapshot() -> StorageConformanceResult {
         )
         .await
         .map_err(|error| format!("begin scan_range failed: {error}"))?;
-    let (chunk, chunk_has_more) = cursor
+    let (chunk, _chunk_has_more) = cursor
         .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
         .await
         .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();

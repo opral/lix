@@ -302,7 +302,7 @@ mod tests {
                 .begin_scan(space(), range, BeginScanOptions::default())
                 .await
                 .expect("begin prefix scan");
-            cursor.next_page(1).await.expect("prefix scan");
+            let _ = cursor.next_page(1).await.expect("prefix scan");
         }
 
         assert_eq!(
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(page[0].key, key("a"));
         assert!(page_has_more);
 
-        let (next, next_has_more) = cursor
+        let (next, _next_has_more) = cursor
             .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
             .await
             .expect("second page").into_parts();

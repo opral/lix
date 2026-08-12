@@ -4962,7 +4962,7 @@ where
                 },
             )
             .await?;
-        let (page, page_has_more) = cursor.next_page(1).await?.into_parts();
+        let (page, _page_has_more) = cursor.next_page(1).await?.into_parts();
         if !page.is_empty() {
             return Ok(true);
         }

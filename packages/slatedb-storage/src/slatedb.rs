@@ -5788,7 +5788,7 @@ mod tests {
             },
         ))
         .expect("begin immutable chunk scan");
-        let (scan, scan_has_more) = block_on(cursor.next_page(16))
+        let (scan, _scan_has_more) = block_on(cursor.next_page(16))
             .expect("scan immutable chunk")
             .into_parts();
         assert_eq!(scan.len(), 1);
@@ -5917,7 +5917,7 @@ mod tests {
             )
             .await
             .expect("begin fresh worker-cancellation cursor");
-        let (restarted, restarted_has_more) = restart
+        let (restarted, _restarted_has_more) = restart
             .next_page(2)
             .await
             .expect("drain fresh worker-cancellation cursor").into_parts();
@@ -6009,7 +6009,7 @@ mod tests {
             )
             .await
             .expect("begin explicit exclusive restart");
-        let (restarted, restarted_has_more) = restart
+        let (restarted, _restarted_has_more) = restart
             .next_page(1)
             .await
             .expect("read explicit exclusive restart page").into_parts();
@@ -6594,11 +6594,11 @@ mod tests {
             },
         ))
         .expect("begin restarted cursor-test scan");
-        let (restarted, restarted_has_more) = block_on(restarted_cursor.next_page(1))
+        let (restarted, _restarted_has_more) = block_on(restarted_cursor.next_page(1))
             .expect("scan restarted first page")
             .into_parts();
         assert_eq!(restarted[0].key, keys[0]);
-        let (restarted_second, _restarted_second_has_more) =
+        let (restarted_second, __restarted_second_has_more) =
             block_on(restarted_cursor.next_page(1))
                 .expect("scan restarted second page")
                 .into_parts();
