@@ -2191,6 +2191,7 @@ mod tests {
     ) -> crate::commit_graph::CommitGraphNode {
         let commit_id = CommitId::for_test_label(commit_label);
         crate::commit_graph::CommitGraphNode {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             commit_id,
             change_id: ChangeId::for_test_label(&format!("{commit_label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
