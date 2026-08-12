@@ -1433,7 +1433,6 @@ async fn stage_changelog_commits(
                 parent_commit_ids: commit.parent_commit_ids.clone(),
                 first_parent_jump_commit_id: first_parent_jump.0,
                 first_parent_jump_span: first_parent_jump.1,
-                change_id: commit.change_id,
                 account_id: active_account_id.to_string(),
                 created_at: commit.created_at,
             },
@@ -1502,7 +1501,6 @@ async fn stage_changelog_commits(
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
             first_parent_jump_commit_id: first_parent_jumps[&commit_row.commit_id].0,
             first_parent_jump_span: first_parent_jumps[&commit_row.commit_id].1,
-            change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
         };
@@ -3466,7 +3464,12 @@ fn lifecycle_generation(
     hasher.update(ref_change_id.as_uuid().as_bytes());
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    CommitId::new(uuid::Uuid::from_bytes(bytes))
+    // Every commit id must reserve its change address space, including the
+    // synthetic ones: the commit's own change id is that address at ordinal
+    // zero. `with_change_address_space` folds the low bits back into the
+    // random field rather than discarding them, so the hash keeps its
+    // distinguishing power.
+    CommitId::with_change_address_space(uuid::Uuid::from_bytes(bytes))
 }
 
 fn next_current_state_revision(current: u64) -> Result<u64, LixError> {
@@ -6187,7 +6190,6 @@ struct FinalizedCommitRow {
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
     created_at: LixTimestamp,
-    change_id: ChangeId,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
 }
 
@@ -6215,14 +6217,12 @@ async fn finalize_commit_rows(
         let change_refs = intermediate.change_refs;
         let commit_id = change_refs.commit_id;
         let created_at = change_refs.created_at;
-        let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let selected_change_batches = change_refs.into_selected_change_batches();
         commit_rows.push(FinalizedCommitRow {
             commit_id,
             parent_commit_ids: vec![intermediate.parent_commit_id],
             created_at,
-            change_id: commit_change_id,
             selected_change_batches,
         });
         tracked_roots.push(PendingTrackedRoot {
@@ -6241,7 +6241,6 @@ async fn finalize_commit_rows(
         }
 
         let commit_id = change_refs.commit_id;
-        let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let timestamp = change_refs.created_at;
         let selected_change_batches = change_refs.into_selected_change_batches();
@@ -6274,7 +6273,6 @@ async fn finalize_commit_rows(
             commit_id,
             parent_commit_ids: parent_commit_ids.clone(),
             created_at: timestamp,
-            change_id: commit_change_id,
             selected_change_batches,
         });
         tracked_roots.push(PendingTrackedRoot {
@@ -7295,7 +7293,6 @@ mod tests {
             commit_id,
             parent_commit_ids: Vec::new(),
             created_at: timestamp,
-            change_id: change_id("mixed-certified-commit"),
             selected_change_batches: Vec::new(),
         }];
         let read = storage
@@ -7472,7 +7469,7 @@ mod tests {
         let Some(record) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(record.change_id, change_id("test-uuid-2"));
+        assert_eq!(record.change_id(), commit_id("test-uuid-1").commit_change_id());
         let membership_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -7503,7 +7500,7 @@ mod tests {
             .map(|member| &member.change)
             .expect("tracked change should have an authoritative packed payload");
         assert_eq!(change.schema_key, "test_schema");
-        let change_ids = [change_id("change-1"), record.change_id];
+        let change_ids = [change_id("change-1"), record.change_id()];
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &change_ids,
@@ -7561,7 +7558,7 @@ mod tests {
         assert!(
             derived_commit_rows
                 .iter()
-                .any(|row| row.change_id == Some(record.change_id)),
+                .any(|row| row.change_id == Some(record.change_id())),
             "live state should derive the commit row from changelog.commit"
         );
 
@@ -7960,7 +7957,6 @@ mod tests {
                 change_refs_with(
                     [row_change],
                     target_commit,
-                    "same-write-branch-commit-change",
                     "same-write-global-ref-change",
                 ),
             )]),
@@ -8185,7 +8181,6 @@ mod tests {
             prepared_normal_global_commit(
                 "stale-normal-change",
                 "stale-normal-commit",
-                "stale-normal-commit-change",
                 "stale-normal-branch-ref-change",
             ),
         )
@@ -8211,7 +8206,6 @@ mod tests {
             prepared_normal_global_commit(
                 "winner-normal-change",
                 "winner-normal-commit",
-                "winner-normal-commit-change",
                 "winner-normal-branch-ref-change",
             ),
         )
@@ -8287,7 +8281,6 @@ mod tests {
                 payload,
                 "ordinary-publish-row",
                 "ordinary-publish-commit",
-                "ordinary-publish-commit-change",
                 "ordinary-publish-branch-change",
             ),
         )
@@ -8350,7 +8343,6 @@ mod tests {
                 payload,
                 "ordinary-stale-row",
                 "ordinary-stale-commit",
-                "ordinary-stale-commit-change",
                 "ordinary-stale-branch-change",
             ),
         )
@@ -8400,7 +8392,6 @@ mod tests {
                 payload,
                 "ordinary-retry-row",
                 "ordinary-retry-commit",
-                "ordinary-retry-commit-change",
                 "ordinary-retry-branch-change",
             ),
         )
@@ -8447,7 +8438,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-first-change"],
                         "rootless-first-commit",
-                        "rootless-first-commit-change",
                         "rootless-first-branch-ref-change",
                     ),
                 )]),
@@ -8500,7 +8490,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-second-change"],
                         "rootless-second-commit",
-                        "rootless-second-commit-change",
                         "rootless-second-branch-ref-change",
                     ),
                 )]),
@@ -8553,7 +8542,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-third-change"],
                         "rootless-third-commit",
-                        "rootless-third-commit-change",
                         "rootless-third-branch-ref-change",
                     ),
                 )]),
@@ -8598,7 +8586,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-delete-change"],
                         "rootless-delete-commit",
-                        "rootless-delete-commit-change",
                         "rootless-delete-branch-ref-change",
                     ),
                 )]),
@@ -8760,7 +8747,6 @@ mod tests {
                     change_refs_with(
                         ["fence-normal-change"],
                         "fence-normal-commit",
-                        "fence-normal-commit-change",
                         "fence-normal-branch-ref-change",
                     ),
                 )]),
@@ -8785,7 +8771,6 @@ mod tests {
         let mut fence_refs = change_refs_with(
             [],
             "fence-commit",
-            "fence-commit-change",
             "fence-branch-ref-change",
         );
         fence_refs.add_selected_change_batch(selected_change_batch_from(
@@ -9041,7 +9026,6 @@ mod tests {
                     change_refs_with(
                         ["first-local-change"],
                         "first-local-commit",
-                        "first-local-commit-change",
                         "first-local-branch-ref-change",
                     ),
                 )]),
@@ -9085,7 +9069,6 @@ mod tests {
                     change_refs_with(
                         ["second-local-change"],
                         "second-local-commit",
-                        "second-local-commit-change",
                         "second-local-branch-ref-change",
                     ),
                 )]),
@@ -9138,7 +9121,6 @@ mod tests {
                     change_refs_with(
                         ["epoch-first-change"],
                         "epoch-first-commit",
-                        "epoch-first-commit-change",
                         "epoch-first-branch-ref-change",
                     ),
                 )]),
@@ -9199,7 +9181,6 @@ mod tests {
                     change_refs_with(
                         ["epoch-second-change"],
                         "epoch-second-commit",
-                        "epoch-second-commit-change",
                         "epoch-second-branch-ref-change",
                     ),
                 )]),
@@ -9272,7 +9253,6 @@ mod tests {
                     change_refs_with(
                         ["global-override-change", "global-fallback-change"],
                         "global-head",
-                        "global-head-commit-change",
                         "global-head-ref-change",
                     ),
                 )]),
@@ -9312,7 +9292,6 @@ mod tests {
                     change_refs_with(
                         ["branch-override-change"],
                         "branch-head",
-                        "branch-head-commit-change",
                         "branch-head-ref-change",
                     ),
                 )]),
@@ -9426,7 +9405,6 @@ mod tests {
                     change_refs_with(
                         ["branch-tombstone-change"],
                         "branch-tombstone-head",
-                        "branch-tombstone-head-commit-change",
                         "branch-tombstone-head-ref-change",
                     ),
                 )]),
@@ -9527,14 +9505,12 @@ mod tests {
                 commit_id: CommitId::for_test_label("child-commit"),
                 parent_commit_ids: vec![CommitId::for_test_label("parent-commit")],
                 created_at: ts("2026-01-01T00:00:01Z"),
-                change_id: ChangeId::for_test_label("child-commit-change"),
                 selected_change_batches: Vec::new(),
             },
             FinalizedCommitRow {
                 commit_id: CommitId::for_test_label("parent-commit"),
                 parent_commit_ids: Vec::new(),
                 created_at: ts("2026-01-01T00:00:00Z"),
-                change_id: ChangeId::for_test_label("parent-commit-change"),
                 selected_change_batches: Vec::new(),
             },
         ];
@@ -9671,7 +9647,6 @@ mod tests {
                     .map(|parent| vec![commit_ids[parent]])
                     .unwrap_or_default(),
                 created_at: ts("2026-01-01T00:00:00Z"),
-                change_id: ChangeId::for_test_label(&format!("staged-fence-record-{index}")),
                 selected_change_batches: Vec::new(),
             })
             .collect::<Vec<_>>();
@@ -9888,7 +9863,6 @@ mod tests {
                         change_refs_with(
                             ["setup-tracked-change"],
                             "setup-commit",
-                            "setup-commit-change",
                             "setup-branch-ref-change",
                         ),
                     )]),
@@ -10007,7 +9981,7 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id, change_id("test-uuid-2"));
+        assert_eq!(commit.change_id(), commit_id("test-uuid-1").commit_change_id());
         let packed_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -10147,7 +10121,7 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id, change_id("test-uuid-2"));
+        assert_eq!(commit.change_id(), commit_id("test-uuid-1").commit_change_id());
         assert_eq!(
             commit.parent_commit_ids,
             vec![CommitId::for_test_label(
@@ -10203,7 +10177,6 @@ mod tests {
         assert_eq!(rows.tracked_roots.len(), 1);
         let row = &rows.commit_rows[0];
         assert_eq!(row.commit_id, commit_id("test-uuid-1"));
-        assert_eq!(row.change_id, change_id("test-uuid-2"));
         assert_eq!(row.created_at.to_string(), "2026-01-01T00:00:00.001Z");
         assert_eq!(
             row.parent_commit_ids,
@@ -10400,7 +10373,6 @@ mod tests {
     fn prepared_normal_global_commit(
         row_change_label: &str,
         commit_label: &str,
-        commit_change_label: &str,
         branch_ref_change_label: &str,
     ) -> PreparedWriteSet {
         PreparedWriteSet {
@@ -10411,7 +10383,6 @@ mod tests {
                 change_refs_with(
                     [row_change_label],
                     commit_label,
-                    commit_change_label,
                     branch_ref_change_label,
                 ),
             )]),
@@ -10427,7 +10398,6 @@ mod tests {
         payload: &[u8],
         row_change_label: &str,
         commit_label: &str,
-        commit_change_label: &str,
         branch_ref_change_label: &str,
     ) -> PreparedWriteSet {
         let file_id = "01960000-0000-7000-8000-00000000ca55";
@@ -10455,7 +10425,6 @@ mod tests {
                 change_refs_with(
                     [row_change_label],
                     commit_label,
-                    commit_change_label,
                     branch_ref_change_label,
                 ),
             )]),
@@ -10530,18 +10499,16 @@ mod tests {
     }
 
     fn change_refs<const N: usize>(change_ids: [&str; N]) -> StagedCommitChangeRefs {
-        change_refs_with(change_ids, "test-uuid-1", "test-uuid-2", "test-uuid-3")
+        change_refs_with(change_ids, "test-uuid-1", "test-uuid-3")
     }
 
     fn change_refs_with<const N: usize>(
         change_ids: [&str; N],
         commit_id_label: &str,
-        commit_change_id_label: &str,
         branch_ref_change_id_label: &str,
     ) -> StagedCommitChangeRefs {
         let mut change_refs = StagedCommitChangeRefs::new(
             commit_id(commit_id_label),
-            change_id(commit_change_id_label),
             change_id(branch_ref_change_id_label),
             ts("2026-01-01T00:00:00.001Z"),
         );

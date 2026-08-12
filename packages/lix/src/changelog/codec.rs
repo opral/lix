@@ -136,13 +136,12 @@ mod tests {
         let commit_id = CommitId::for_test_label("codec-segment-commit");
         let base_commit_id = CommitId::for_test_label("codec-segment-base");
         let record = CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation: 70,
             parent_commit_ids: vec![CommitId::for_test_label("codec-segment-parent")],
             first_parent_jump_commit_id: base_commit_id,
             first_parent_jump_span: 6,
-            change_id: ChangeId::for_test_label("codec-segment-change"),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse(
                 "commit codec timestamp",

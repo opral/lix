@@ -369,13 +369,12 @@ mod tests {
             crate::changelog::COMMIT_SPACE,
             StorageKey(Bytes::copy_from_slice(requested.as_uuid().as_bytes())),
             crate::changelog::encode_commit_record(&CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: embedded,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 first_parent_jump_commit_id: embedded,
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label("mismatched-key-change"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
             })
@@ -411,13 +410,12 @@ mod tests {
             let current_commit_id = commit_id(label);
             let parent_commit_id = commit_id(parent);
             let record = CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: current_commit_id,
                 generation: 1,
                 parent_commit_ids: vec![parent_commit_id],
                 first_parent_jump_commit_id: parent_commit_id,
                 first_parent_jump_span: 1,
-                change_id: ChangeId::for_test_label(&format!("{label}-change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
             };
@@ -731,20 +729,19 @@ mod tests {
         let root = commit_id("commit-root");
         let left = commit_id("commit-cycle-left");
         let right = commit_id("commit-cycle-right");
-        let record = |commit_id, change_label: &str, parents| CommitRecord {
-            format_version: 3,
+        let record = |commit_id, parents| CommitRecord {
+            format_version: 4,
             commit_id,
             generation: 2,
             parent_commit_ids: parents,
             first_parent_jump_commit_id: commit_id,
             first_parent_jump_span: 0,
-            change_id: ChangeId::for_test_label(change_label),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
         };
         let records = [
-            record(left, "commit-cycle-left-change", vec![right, root]),
-            record(right, "commit-cycle-right-change", vec![left, root]),
+            record(left, vec![right, root]),
+            record(right, vec![left, root]),
         ];
         let mut writes = storage.new_write_set();
         for record in records {
@@ -903,13 +900,12 @@ mod tests {
         let child = commit_id("commit-child");
         let mut writes = storage.new_write_set();
         let record = CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id: child,
             generation: 0,
             parent_commit_ids: commit_ids(["commit-root"]),
             first_parent_jump_commit_id: child,
             first_parent_jump_span: 0,
-            change_id: ChangeId::for_test_label("commit-child-change"),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
         };
@@ -1463,13 +1459,12 @@ mod tests {
                 },
             };
             let record = CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: typed_commit_id,
                 generation,
                 parent_commit_ids,
                 first_parent_jump_commit_id,
                 first_parent_jump_span,
-                change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
             };

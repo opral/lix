@@ -62,7 +62,6 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
     crate::changelog::COMMIT_SPACE,
     crate::changelog::CHANGE_SPACE,
-    crate::changelog::COMMIT_CHANGE_ID_SPACE,
     crate::storage_adapter::REVISION_SPACE,
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
     crate::session::UPLOAD_STATE_SPACE,
@@ -639,9 +638,9 @@ mod tests {
                 };
                 let name = name.trim();
                 if name.is_empty()
-                    || !name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
                 {
                     continue;
                 }
@@ -649,9 +648,9 @@ mod tests {
                     continue;
                 };
                 let id = match declared_type.trim() {
-                    "SpaceId" | "StorageSpaceId" => literal_space_id(
-                        &expression.split_whitespace().collect::<String>(),
-                    ),
+                    "SpaceId" | "StorageSpaceId" => {
+                        literal_space_id(&expression.split_whitespace().collect::<String>())
+                    }
                     "StorageSpace" => construction_sites(expression)
                         .first()
                         .and_then(|site| literal_space_id(&site.id_expression)),
