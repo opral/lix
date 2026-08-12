@@ -1712,3 +1712,60 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_directory_recursive_delete_removes_untracked_child_file,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
+                &[],
+            )
+            .await
+            .expect("tracked directory insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content, lixcol_untracked) \
+                 VALUES ('66696c65-2d64-8261-8674-000000000000', '/docs/draft.md', CAST('draft' AS BYTEA), true)",
+                &[],
+            )
+            .await
+            .expect("untracked file insert should reuse the tracked parent directory");
+
+        let delete_result = session
+            .execute("DELETE FROM lix_directory WHERE path = '/docs'", &[])
+            .await
+            .expect("recursive directory delete should succeed");
+        assert_eq!(
+            delete_result,
+            ExecuteResult::from_rows_affected(2),
+            "recursive delete of a tracked directory must also delete its untracked child file"
+        );
+
+        let files = session
+            .execute("SELECT id, path FROM lix_file", &[])
+            .await
+            .expect("file read after recursive delete must not be poisoned by an orphan");
+        assert_eq!(
+            files.len(),
+            0,
+            "the untracked child file must not survive its parent directory"
+        );
+
+        let directories = session
+            .execute("SELECT id, path FROM lix_directory", &[])
+            .await
+            .expect("directory read after recursive delete must not be poisoned by an orphan");
+        assert_eq!(directories.len(), 0, "the directory must be deleted");
+    }
+);
