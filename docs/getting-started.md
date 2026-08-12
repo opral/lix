@@ -122,7 +122,7 @@ if (preview.conflicts.length === 0) {
 }
 ```
 
-`mergeBranchPreview()` reports the same decision as `mergeBranch()` without changing state. See [Branches & Merging](./versions.md).
+`mergeBranchPreview()` reports the same decision as `mergeBranch()` without changing state. See [Branching](./branching.md).
 
 ## The loop
 

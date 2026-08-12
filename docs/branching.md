@@ -1,10 +1,10 @@
 ---
-description: Branches are isolated lines of state. Create them, switch between them, read across them with _by_branch tables, and preview merges.
+description: Branches are independent lines of work. Create a branch, switch branches, compare their data, and preview a merge.
 ---
 
-# Branches & Merging
+# Branching
 
-A branch is an isolated line of state. It can change without affecting the main branch, then be merged back.
+A branch is an independent line of work. Changes on one branch do not affect other branches. You can merge the changes into another branch later.
 
 ## Create and switch
 
@@ -22,7 +22,7 @@ await lix.execute("UPDATE acme_section SET title = $1 WHERE id = $2", [
 await lix.switchBranch({ branchId: main });
 ```
 
-`createBranch()` returns `{ id, name, hidden, commitId }`. `switchBranch()` changes which branch later SQL statements read and write.
+`createBranch()` returns `{ id, name, hidden, commitId }`. `switchBranch()` sets the branch that later SQL statements read and write.
 
 Use names that fit your product, such as `"Marketing edit"`, `"Q3 pricing draft"`, or `"Agent task 123"`.
 
@@ -53,7 +53,7 @@ Use `_by_branch` tables for review UIs and side-by-side views. See [SQL Surfaces
 
 ## Preview a merge
 
-`mergeBranchPreview()` reports what `mergeBranch()` would do without changing state.
+`mergeBranchPreview()` shows what `mergeBranch()` would do. It does not change any data.
 
 ```ts
 const preview = await lix.mergeBranchPreview({

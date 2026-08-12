@@ -90,10 +90,10 @@ Use `lix_registered_schema` to discover available schemas. Use `lix_change` for 
 
 Merge is per entity today. Two branches that edit different rows can merge cleanly. Two branches that edit the same row produce a `sameEntityChanged` conflict.
 
-See [Branches & Merging](./versions.md) for preview results and conflict handling.
+See [Branching](./branching.md) for preview results and conflict handling.
 
 ## Next
 
 - [Getting Started](./getting-started.md): the basic setup.
-- [Branches & Merging](./versions.md): previews, conflicts, and side-by-side reads.
+- [Branching](./branching.md): previews, conflicts, and side-by-side reads.
 - [Change History](./history.md): SQL for review and undo.

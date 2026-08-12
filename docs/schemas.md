@@ -33,7 +33,7 @@ INSERT INTO lix_registered_schema (value) VALUES (lix_json('{
 }'));
 ```
 
-After registration, `acme_section` is a SQL table you can `INSERT`, `SELECT`, `UPDATE`, and `DELETE` against. A sibling table `acme_section_by_branch` exposes the same rows across all branches (see [Branches & Merging](./versions.md)).
+After registration, `acme_section` is a SQL table you can `INSERT`, `SELECT`, `UPDATE`, and `DELETE` against. A sibling table `acme_section_by_branch` exposes the same rows across all branches (see [Branching](./branching.md)).
 
 ```sql
 INSERT INTO acme_section (id, title, body) VALUES ($1, $2, $3);
