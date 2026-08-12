@@ -8,6 +8,8 @@
 //! untracked overlay.
 
 mod hot;
+#[cfg(test)]
+pub(crate) use hot::hot_decode_entity_pk_probe;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
 #[cfg(test)]
@@ -968,6 +970,17 @@ fn read_generation(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixErro
     Ok(CommitId::new(uuid::Uuid::from_bytes(uuid)))
 }
 
+
+/// Test-only shim so the shared codec's three-way differential can drive this
+/// plane's decoder. See `crate::order_preserving_key::tests`.
+#[cfg(test)]
+pub(crate) fn head_decode_entity_pk_probe(bytes: &[u8]) -> Option<(EntityPk, usize)> {
+    let mut offset = 0usize;
+    read_entity_pk(bytes, &mut offset)
+        .ok()
+        .map(|entity_pk| (entity_pk, offset))
+}
+
 fn read_entity_pk(bytes: &[u8], offset: &mut usize) -> Result<EntityPk, LixError> {
     let version = bytes
         .get(*offset)
@@ -1024,7 +1037,7 @@ fn read_entity_pk_part(
         }
         ENTITY_PK_UUID => {
             let uuid_end = offset
-                .checked_add(16)
+                .checked_add(ENTITY_PK_UUID_BYTES)
                 .ok_or_else(|| key_codec_error("UUIDv7 entity primary key offset overflow"))?;
             let uuid_bytes: [u8; 16] = bytes
                 .get(*offset..uuid_end)
@@ -1035,7 +1048,7 @@ fn read_entity_pk_part(
                 .get(uuid_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("is truncated after UUIDv7 entity primary key"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(
                     "UUIDv7 entity primary key has an invalid terminator",
                 ));
@@ -1048,7 +1061,7 @@ fn read_entity_pk_part(
         }
         ENTITY_PK_INTEGER => {
             let integer_end = offset
-                .checked_add(8)
+                .checked_add(ENTITY_PK_INTEGER_BYTES)
                 .ok_or_else(|| key_codec_error("integer entity primary key offset overflow"))?;
             let ordered = u64::from_be_bytes(
                 bytes
@@ -1061,16 +1074,14 @@ fn read_entity_pk_part(
                 .get(integer_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("is truncated after integer entity primary key"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(
                     "integer entity primary key has an invalid terminator",
                 ));
             }
             *offset = integer_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Integer(i64::from_be_bytes(
-                    (ordered ^ (1_u64 << 63)).to_be_bytes(),
-                )),
+                crate::entity_pk::EntityPkComponent::Integer(i64_from_ordered_integer(ordered)),
                 terminator,
             ))
         }

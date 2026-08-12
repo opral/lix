@@ -790,7 +790,7 @@ fn read_entity_pk_part_shared(
         }
         ENTITY_PK_UUID => {
             let uuid_end = offset
-                .checked_add(16)
+                .checked_add(ENTITY_PK_UUID_BYTES)
                 .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key part is truncated"))?;
             let uuid_bytes: [u8; 16] = bytes
                 .get(*offset..uuid_end)
@@ -801,7 +801,7 @@ fn read_entity_pk_part_shared(
                 .get(uuid_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key ending is truncated"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(format!(
                     "UUIDv7 entity primary-key part has invalid terminator {terminator}"
                 )));
@@ -814,7 +814,7 @@ fn read_entity_pk_part_shared(
         }
         ENTITY_PK_INTEGER => {
             let integer_end = offset
-                .checked_add(8)
+                .checked_add(ENTITY_PK_INTEGER_BYTES)
                 .ok_or_else(|| key_codec_error("integer entity primary-key part is truncated"))?;
             let ordered = u64::from_be_bytes(
                 bytes
@@ -827,16 +827,14 @@ fn read_entity_pk_part_shared(
                 .get(integer_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("integer entity primary-key ending is truncated"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(format!(
                     "integer entity primary-key part has invalid terminator {terminator}"
                 )));
             }
             *offset = integer_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Integer(i64::from_be_bytes(
-                    (ordered ^ (1_u64 << 63)).to_be_bytes(),
-                )),
+                crate::entity_pk::EntityPkComponent::Integer(i64_from_ordered_integer(ordered)),
                 terminator,
             ))
         }
@@ -844,6 +842,18 @@ fn read_entity_pk_part_shared(
             "entity primary-key part has unknown tag {other}"
         ))),
     }
+}
+
+
+/// Test-only shim; see `crate::order_preserving_key::tests`.
+#[cfg(test)]
+pub(crate) fn tree_decode_entity_pk_probe(
+    bytes: &[u8],
+) -> Option<(crate::entity_pk::EntityPk, usize)> {
+    let mut offset = 0usize;
+    read_entity_pk(bytes, &mut offset)
+        .ok()
+        .map(|entity_pk| (entity_pk, offset))
 }
 
 fn read_entity_pk(
@@ -915,7 +925,7 @@ fn read_entity_pk_part(
         }
         ENTITY_PK_UUID => {
             let uuid_end = offset
-                .checked_add(16)
+                .checked_add(ENTITY_PK_UUID_BYTES)
                 .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key part is truncated"))?;
             let uuid_bytes: [u8; 16] = bytes
                 .get(*offset..uuid_end)
@@ -926,7 +936,7 @@ fn read_entity_pk_part(
                 .get(uuid_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key ending is truncated"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(format!(
                     "UUIDv7 entity primary-key part has invalid terminator {terminator}"
                 )));
@@ -939,7 +949,7 @@ fn read_entity_pk_part(
         }
         ENTITY_PK_INTEGER => {
             let integer_end = offset
-                .checked_add(8)
+                .checked_add(ENTITY_PK_INTEGER_BYTES)
                 .ok_or_else(|| key_codec_error("integer entity primary-key part is truncated"))?;
             let ordered = u64::from_be_bytes(
                 bytes
@@ -952,16 +962,14 @@ fn read_entity_pk_part(
                 .get(integer_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("integer entity primary-key ending is truncated"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(format!(
                     "integer entity primary-key part has invalid terminator {terminator}"
                 )));
             }
             *offset = integer_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Integer(i64::from_be_bytes(
-                    (ordered ^ (1_u64 << 63)).to_be_bytes(),
-                )),
+                crate::entity_pk::EntityPkComponent::Integer(i64_from_ordered_integer(ordered)),
                 terminator,
             ))
         }

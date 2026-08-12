@@ -7,6 +7,8 @@ use crate::LixError;
 #[cfg(feature = "storage-benches")]
 mod bench_support;
 mod codec;
+#[cfg(test)]
+pub(crate) use codec::tree_decode_entity_pk_probe;
 mod commit_root_rebuild;
 mod context;
 mod current_state_data_part;
