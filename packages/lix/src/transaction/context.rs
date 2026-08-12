@@ -13031,6 +13031,87 @@ mod tests {
         }
     }
 
+    /// Creating a file must advance the cached path index, not discard it.
+    ///
+    /// This is the create analogue of the `(0, 0)` assertion in
+    /// `committed_filesystem_path_index_benchmark_probe`, and it is a
+    /// *deterministic* statement of the property: a rebuild count does not
+    /// depend on machine, store shape, or fixture size, so it holds where a
+    /// timing comparison would be contaminated by the fixture — seeding this
+    /// workload runs through the very path the fix changes.
+    ///
+    /// Each insert also has to chain: the index advanced to revision N is what
+    /// insert N+1 must find, otherwise only the first create would be cheap.
+    #[tokio::test]
+    async fn committed_file_creates_advance_the_path_index_without_rebuilding() {
+        if !incremental_filesystem_index_enabled() {
+            return;
+        }
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("engine should open initialized storage");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) \
+                 VALUES ('/seed.md', CAST('byte-01' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("seed file should commit");
+        session
+            .execute("SELECT id FROM lix_file WHERE path = '/seed.md'", &[])
+            .await
+            .expect("path index should warm");
+        crate::filesystem::reset_full_rebuild_stats();
+
+        // Reading after each create is what makes this discriminating. A create
+        // that fails to advance the index leaves the cache keyed on the
+        // superseded revision; nothing observes that until the next read
+        // arrives at the new revision, misses, and rebuilds.
+        for index in 0..8 {
+            session
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_file (path, content) \
+                         VALUES ('/created-{index:02}.md', CAST('byte-01' AS BYTEA))"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("created file should commit");
+            // The advanced index must be *correct*, not merely present: an
+            // under-projected delta that lost a row surfaces here as a missing
+            // path rather than as a slow read.
+            let result = session
+                .execute(
+                    &format!("SELECT id FROM lix_file WHERE path = '/created-{index:02}.md'"),
+                    &[],
+                )
+                .await
+                .expect("created path should resolve through the advanced index");
+            assert_eq!(
+                result.len(),
+                1,
+                "created path /created-{index:02}.md must resolve after the index advanced"
+            );
+        }
+
+        assert_eq!(
+            crate::filesystem::full_rebuild_stats(),
+            (0, 0),
+            "committed file creates must advance the cached path index, not rebuild it"
+        );
+    }
+
     #[tokio::test]
     async fn stage_rows_routes_tracked_and_untracked_rows_without_sql() {
         let storage = Memory::new();
