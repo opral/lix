@@ -67,6 +67,8 @@ struct RowCensus {
     packed_bases: usize,
     /// Records in the sparse-generation root base plane.
     root_bases: usize,
+    /// Records in the sparse per-row working-diff index.
+    diff_records: usize,
 }
 
 impl RowCensus {
@@ -122,11 +124,13 @@ async fn row_census(storage: &Memory) -> RowCensus {
     let root_bases = space_values(&read, crate::hot_state::ROOT_CURRENT_BASE_SPACE)
         .await
         .len();
+    let diff_records = space_values(&read, crate::hot_state::DIFF_SPACE).await.len();
     RowCensus {
         entries: rows.len(),
         tombstones,
         packed_bases,
         root_bases,
+        diff_records,
     }
 }
 
@@ -573,7 +577,7 @@ async fn hot_row_tombstone_generation_rotation() {
 async fn hot_row_tombstone_compaction_premise() {
     let n = sizes_from_env("LIX_TOMBSTONE_SIZES", &[1_000])[0];
     let reps = reps_from_env(5);
-    println!("phase4 | arm,event,row_entries,tombstones,packed_bases,root_bases,working_diff_rows,answer_rows,collection_rows,scan_us");
+    println!("phase4 | arm,event,row_entries,tombstones,packed_bases,root_bases,diff_records,working_diff_rows,answer_rows,collection_rows,scan_us");
 
     // ---- safe arm: the delete is already checkpointed ----
     {
@@ -603,11 +607,12 @@ async fn hot_row_tombstone_compaction_premise() {
             .expect("collection scan should run")
             .len();
         println!(
-            "safe,before_drop,{},{},{},{},{},1,{},{}",
+            "safe,before_drop,{},{},{},{},{},{},1,{},{}",
             census.entries,
             census.tombstones,
             census.packed_bases,
             census.root_bases,
+            census.diff_records,
             diff_before,
             collection_before,
             scan_before.as_micros()
@@ -630,11 +635,12 @@ async fn hot_row_tombstone_compaction_premise() {
             .len();
         let scan_after = timed_scan(&session, &scan_sql("safrow"), 1, reps).await;
         println!(
-            "safe,after_drop,{},{},{},{},{},{},{},{}",
+            "safe,after_drop,{},{},{},{},{},{},{},{},{}",
             census.entries,
             census.tombstones,
             census.packed_bases,
             census.root_bases,
+            census.diff_records,
             diff_after,
             answer.len(),
             collection_after,
@@ -670,11 +676,12 @@ async fn hot_row_tombstone_compaction_premise() {
         let diff_before = working_diff_rows(&session, "nmrow").await;
         let scan_before = timed_scan(&session, &scan_sql("nmrow"), 1, reps).await;
         println!(
-            "near_miss,before_drop,{},{},{},{},{},1,1,{}",
+            "near_miss,before_drop,{},{},{},{},{},{},1,1,{}",
             census.entries,
             census.tombstones,
             census.packed_bases,
             census.root_bases,
+            census.diff_records,
             diff_before,
             scan_before.as_micros()
         );
@@ -698,11 +705,12 @@ async fn hot_row_tombstone_compaction_premise() {
             .expect("collection scan should still run")
             .len();
         println!(
-            "near_miss,after_drop,{},{},{},{},{},{},{},-",
+            "near_miss,after_drop,{},{},{},{},{},{},{},{},-",
             census.entries,
             census.tombstones,
             census.packed_bases,
             census.root_bases,
+            census.diff_records,
             diff_after,
             answer.len(),
             collection_after
@@ -712,14 +720,31 @@ async fn hot_row_tombstone_compaction_premise() {
             diff_before.saturating_sub(diff_after)
         );
 
-        // This is the harm the compaction gate exists to prevent. It is
-        // asserted so that an engine change which starts dropping live-baseline
-        // tombstones fails here loudly instead of silently losing deletes.
-        assert!(
-            diff_after < diff_before,
-            "dropping a live-baseline tombstone must lose working-diff deletes; \
-             if it does not, the working diff is not the obligation we think it is \
-             and the compaction gate needs rethinking"
+        // MEASURED, and it refuted the hypothesis this arm was written to
+        // confirm. The prediction was that removing a live-baseline tombstone
+        // would lose working-diff deletes. It does not: the diff still reports
+        // every delete after all of them are physically gone and the engine has
+        // been reopened cold. The ROW_SPACE tombstone is therefore **not** the
+        // working diff's authority — `DIFF_SPACE` is, and the census column
+        // above is what says so. Condition (b) of the compaction rule does not
+        // hold against this plane at all.
+        //
+        // The assertion is kept, inverted, so that a future change which makes
+        // the working diff depend on the tombstone fails here loudly.
+        assert_eq!(
+            diff_after, diff_before,
+            "the working diff must survive tombstone removal; if it stops \
+             surviving, ROW_SPACE has become the working diff's authority and \
+             the compaction rule needs condition (b) back"
+        );
+        assert_eq!(
+            answer.len(),
+            1,
+            "the surviving row must still answer before any checkpoint"
+        );
+        assert_eq!(
+            collection_after, 1,
+            "removing an uncheckpointed tombstone must still not resurrect a row"
         );
     }
 }
