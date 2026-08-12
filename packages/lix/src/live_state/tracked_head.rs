@@ -21,8 +21,9 @@ pub(crate) use hot::{
     HOT_COLLECTION_CONTROL_SPACE, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_INDEX_SPACE,
     HOT_ROW_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, materialize_certified_root_rows,
-    scan_certified_history_rows, stage_certified_entity_batches, stage_hot_index_entries,
+    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, load_certified_rows_at_commit,
+    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
+    stage_hot_index_entries,
     stage_retire_hot_generation,
 };
 
@@ -438,14 +439,40 @@ impl<'a> CurrentStateDeltaRef<'a> {
         }
     }
 
+    /// Enforces the untracked-row identity invariant at head staging.
+    ///
+    /// Untracked rows carry identity but no history: a real, non-nil
+    /// `change_id` so every row is addressable, and an absent `commit_id`
+    /// because they are not members of the commit graph.
+    ///
+    /// This check lives here, at head staging, rather than upstream at the
+    /// prepared-row funnel, and that placement is load-bearing. An experiment
+    /// on this branch hard-errored inside
+    /// `transaction::commit::current_state_delta_from_state_row` — the
+    /// prepared-row funnel — to test whether every untracked row reaches the
+    /// head through it. It does not. The probe never fired, while 169 staging
+    /// failures showed **four production lanes that build untracked deltas
+    /// outside that funnel entirely**: repository init (`init::plan`'s seed
+    /// rows), `current_state_delta_from_engine_row`,
+    /// `functions::state::stage_sequence`, and `hot::stage_hot_bootstrap`.
+    /// Each already had a real id in hand and was discarding it.
+    ///
+    /// So the id cannot be guaranteed by any single upstream site. Head
+    /// staging is the one place every lane converges, which makes this the
+    /// only sound place to enforce it. Do not "simplify" this by moving the
+    /// check upstream to the funnel — that model was tested and is false.
     fn validate(self) -> Result<(), LixError> {
-        match (self.untracked, self.change_id, self.commit_id, self.deleted) {
-            (false, Some(_), Some(_), _) | (true, None, None, false | true) => Ok(()),
-            (false, _, _, _) => Err(head_value_error(
+        let untracked_id_is_usable = self
+            .change_id
+            .is_some_and(|change_id| !change_id.as_uuid().is_nil());
+        match (self.untracked, self.change_id, self.commit_id) {
+            (false, Some(_), Some(_)) => Ok(()),
+            (true, _, None) if untracked_id_is_usable => Ok(()),
+            (false, _, _) => Err(head_value_error(
                 "tracked current-state mutation must carry change_id and commit_id",
             )),
-            (true, _, _, _) => Err(head_value_error(
-                "untracked current-state mutation must not carry change_id or commit_id",
+            (true, _, _) => Err(head_value_error(
+                "untracked current-state mutation must carry a non-nil change_id and no commit_id",
             )),
         }
     }
@@ -1373,7 +1400,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// every row before it was copied into a live-state row.
 ///
 /// ```text
-///  0      format version (8)
+///  0      format version (9)
 ///  1      deleted + untracked + snapshot/metadata kinds + diff baseline kind
 ///  2..18  change UUID
 /// 18..34  commit UUID
@@ -1391,7 +1418,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// Persisting fingerprints only while a row is dirty keeps repeated diff
 /// classification independent of payload size without taxing checkpointed
 /// current state.
-const HEAD_VALUE_VERSION: u8 = 8;
+const HEAD_VALUE_VERSION: u8 = 9;
 const HEAD_VALUE_HEADER_BYTES: usize = 59;
 const COLUMNAR_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
@@ -1742,13 +1769,23 @@ fn append_head_value_parts(
             "deleted current-state rows must not carry JSON payloads",
         ));
     }
+    // Encode-side half of the untracked identity invariant documented on
+    // `CurrentStateDeltaRef::validate`. Rejecting a *nil* id and not merely an
+    // absent one is the point: the certified lanes default the per-row slot to
+    // `ChangeId::default()`, which is `Some` but all zeroes, so an `is_some()`
+    // check would let a row of 16 zero bytes reach the head and only fail
+    // later, on read, in `decode_head_value`.
+    let untracked_id_is_usable = value
+        .change_id
+        .is_some_and(|change_id| !change_id.as_uuid().is_nil());
     match (
         value.untracked,
         value.change_id,
         value.commit_id,
         value.deleted,
     ) {
-        (false, Some(_), Some(_), _) | (true, None, None, false) => {}
+        (false, Some(_), Some(_), _) => {}
+        (true, _, None, false) if untracked_id_is_usable => {}
         (true, _, _, true) => {
             return Err(head_value_error(
                 "untracked current-state rows must be deleted physically",
@@ -1761,7 +1798,7 @@ fn append_head_value_parts(
         }
         (true, _, _, false) => {
             return Err(head_value_error(
-                "untracked current-state rows must not carry change_id or commit_id",
+                "untracked current-state rows must carry a non-nil change_id and no commit_id",
             ));
         }
     }
@@ -2014,9 +2051,9 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
                 "untracked current-state rows must be deleted physically",
             ));
         }
-        if change_uuid != uuid::Uuid::nil() || commit_uuid != uuid::Uuid::nil() {
+        if change_uuid == uuid::Uuid::nil() || commit_uuid != uuid::Uuid::nil() {
             return Err(head_value_error(
-                "untracked current-state rows must use nil change and commit ids",
+                "untracked current-state rows must use a non-nil change id and a nil commit id",
             ));
         }
         if working_diff_baseline != WorkingDiffBaseline::Disabled {
@@ -2029,7 +2066,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
                 "untracked current-state rows must not carry an columnar base coordinate",
             ));
         }
-        (None, None)
+        (Some(ChangeId::new(change_uuid)), None)
     } else {
         if change_uuid == uuid::Uuid::nil() || commit_uuid == uuid::Uuid::nil() {
             return Err(head_value_error(

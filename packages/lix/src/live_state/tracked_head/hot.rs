@@ -1246,6 +1246,74 @@ pub(crate) async fn scan_certified_history_rows(
     Ok(builder.finish().into_rows())
 }
 
+/// Loads certified packet rows for exact identities that are intentionally
+/// absent from the ordinary tracked root. This is a narrow historical
+/// fallback for consumers, such as semantic merge, that need the complete
+/// base snapshot of a host-certified fresh import.
+pub(crate) async fn load_certified_rows_at_commit(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: &str,
+    keys: &[TrackedStateKey],
+) -> Result<BTreeMap<TrackedStateKey, MaterializedLiveStateRow>, LixError> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let exact = keys.iter().cloned().collect::<BTreeSet<_>>();
+    let schema_keys = keys
+        .iter()
+        .map(|key| key.schema_key.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let entity_pks = keys
+        .iter()
+        .map(|key| key.entity_pk.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut file_ids = Vec::new();
+    for key in keys {
+        let filter = match &key.file_id {
+            Some(file_id) => NullableKeyFilter::Value(file_id.clone()),
+            None => NullableKeyFilter::Null,
+        };
+        if !file_ids.contains(&filter) {
+            file_ids.push(filter);
+        }
+    }
+    let rows = scan_certified_history_rows(
+        store,
+        &BTreeSet::from([CommitId::parse_lix(
+            commit_id,
+            "certified historical fallback commit_id",
+        )?]),
+        &TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys,
+                entity_pks,
+                file_ids,
+                include_tombstones: true,
+            },
+            read_columns: TrackedStateReadColumns {
+                columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
+            },
+            limit: None,
+        },
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let key = TrackedStateKey {
+                schema_key: row.schema_key.clone(),
+                file_id: row.file_id.clone(),
+                entity_pk: row.entity_pk.clone(),
+            };
+            exact.contains(&key).then_some((key, row))
+        })
+        .collect())
+}
+
 /// Expands the authoritative rows needed to publish a host-produced packet.
 /// Commit deltas are self-contained, so the packet is decoded once here and
 /// never becomes a second durable payload authority.
@@ -9122,7 +9190,10 @@ fn stage_hot_bootstrap(
             file_id: row.file_id,
         };
         let value = HeadValueRef {
-            change_id: None,
+            // Preserved rows are read back from the head, where every untracked
+            // row already carries its minted id. Re-encoding must round-trip it
+            // rather than reset the row to an anonymous one.
+            change_id: row.change_id,
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -12245,7 +12316,9 @@ mod tests {
     fn encoded_test_hot_value(generation: CommitId, untracked: bool, deleted: bool) -> Bytes {
         Bytes::from(
             encode_head_value(&HeadValueRef {
-                change_id: (!untracked).then(|| ChangeId::for_test_label("closure-change")),
+                // Both lanes carry a change id; only the tracked lane carries a
+                // commit id. That asymmetry is the whole untracked model.
+                change_id: Some(ChangeId::for_test_label("closure-change")),
                 commit_id: (!untracked).then_some(generation),
                 untracked,
                 deleted,
@@ -14692,7 +14765,7 @@ mod tests {
             schema_key: "schema\0escaped",
             file_id: Some("file\0id"),
             entity_pk: &first_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-mutation-first")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14706,7 +14779,7 @@ mod tests {
             schema_key: "schema_without_file",
             file_id: None,
             entity_pk: &second_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-mutation-second")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14825,7 +14898,7 @@ mod tests {
             schema_key: "untracked_schema",
             file_id: Some("untracked.json"),
             entity_pk: &untracked_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-untracked-member")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14839,7 +14912,7 @@ mod tests {
             schema_key: "untracked_schema",
             file_id: Some("removed.json"),
             entity_pk: &removed_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-untracked-removed")),
             commit_id: None,
             untracked: true,
             deleted: true,
@@ -15088,7 +15161,7 @@ mod tests {
             schema_key: "ordinary_schema",
             file_id: Some("ordinary.json"),
             entity_pk: &entity_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-ordinary-incremental")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -15141,7 +15214,7 @@ mod tests {
                 schema_key: "schema",
                 file_id: None,
                 entity_pk,
-                change_id: None,
+                change_id: Some(ChangeId::for_test_label("hot-planned-arena")),
                 commit_id: None,
                 untracked: true,
                 deleted: false,

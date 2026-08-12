@@ -4522,11 +4522,25 @@ fn certified_entity_insert_parameter_batch(
     {
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_certified_entity_insert_parameter_batch_certification();
-        return Ok(Some(if use_typed_certified_insert(rows.len()) {
-            CertifiedEntityInsertParameterBatch::Typed(rows)
-        } else {
-            CertifiedEntityInsertParameterBatch::Raw(rows.into_raw()?)
-        }));
+        // The dense lane has no per-row change column: it derives every UUID
+        // from the commit-delta address space, which untracked rows are not
+        // members of. Rather than reintroduce the million-row column that the
+        // dense layout exists to avoid, untracked batches fall back to the
+        // *raw* certified lane, whose per-row slot already carries a change id.
+        //
+        // Raw, not generic: the ordinary untracked insert (1k/10k rows) is far
+        // below this threshold and already takes the raw lane, so nothing that
+        // #1329 optimized changes route. Only untracked batches at or above
+        // 32,768 rows move, and they move to raw rather than to the generic
+        // path they would otherwise fall to.
+        let dense_lane_supports_batch = !rows.untracked();
+        return Ok(Some(
+            if dense_lane_supports_batch && use_typed_certified_insert(rows.len()) {
+                CertifiedEntityInsertParameterBatch::Typed(rows)
+            } else {
+                CertifiedEntityInsertParameterBatch::Raw(rows.into_raw()?)
+            },
+        ));
     }
     if !allow_generic_fallback {
         return Ok(None);

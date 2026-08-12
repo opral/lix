@@ -1655,6 +1655,33 @@ fn append_tombstone_row(
     append_state_row(rows, entity_pk, schema_key, None, context);
 }
 
+/// Durability lanes whose children a directory delete in `context` may reach.
+///
+/// A directory delete crosses the durability lane *downward*: deleting a
+/// tracked directory also removes the untracked children beneath it, while an
+/// untracked delete never reaches tracked children. This is the same asymmetry
+/// the file -> rows cascade already applies one level down (see
+/// `apply_incremental_file_delete_cascade` and
+/// `apply_complete_file_delete_cascade` in `live_state::tracked_head::hot`,
+/// both spelled `if (cascade.untracked && !existing.untracked) { continue }`).
+///
+/// Without the downward crossing a tracked directory delete leaves untracked
+/// descendants pointing at a parent that no longer exists, which makes
+/// `FilesystemPathIndex::from_live_batch` fail for the whole branch.
+fn cascading_child_contexts(context: &FilesystemRowContext) -> Vec<FilesystemRowContext> {
+    if context.untracked {
+        vec![context.clone()]
+    } else {
+        vec![
+            context.clone(),
+            FilesystemRowContext {
+                untracked: true,
+                ..context.clone()
+            },
+        ]
+    }
+}
+
 fn collect_recursive_directory_delete(
     directory_id: &str,
     visible_filesystem: &VisibleFilesystem,
@@ -1662,34 +1689,43 @@ fn collect_recursive_directory_delete(
     rows: &mut RawWriteBatch,
     count: &mut u64,
 ) {
-    if let Some(child_ids) = visible_filesystem
-        .directory_children_by_parent_id
-        .get(&Some(FilesystemDescriptorKey::from_context(
-            context,
-            directory_id,
-        )))
-    {
-        for child_id in child_ids {
-            collect_recursive_directory_delete(child_id, visible_filesystem, context, rows, count);
-        }
-    }
+    // Children are addressed by *their own* lane, and every row planned for a
+    // child must carry that lane too — never the deleting directory's.
+    // `has_blob_ref` and `plan_file_delete` both key off `context.untracked`,
+    // so reusing the parent's context here would look up an untracked child's
+    // blob ref in the tracked lane, find nothing, skip the blob-ref tombstone,
+    // and leak the very blob this cascade exists to release.
+    for child_context in cascading_child_contexts(context) {
+        let child_key = FilesystemDescriptorKey::from_context(&child_context, directory_id);
 
-    if let Some(files) =
-        visible_filesystem
+        if let Some(child_ids) = visible_filesystem
+            .directory_children_by_parent_id
+            .get(&Some(child_key.clone()))
+        {
+            for child_id in child_ids {
+                collect_recursive_directory_delete(
+                    child_id,
+                    visible_filesystem,
+                    &child_context,
+                    rows,
+                    count,
+                );
+            }
+        }
+
+        if let Some(files) = visible_filesystem
             .files_by_directory_id
-            .get(&Some(FilesystemDescriptorKey::from_context(
-                context,
-                directory_id,
-            )))
-    {
-        for file_id in files {
-            let plan = plan_file_delete(FileDeleteInput {
-                file_id: file_id.clone(),
-                has_blob_ref: visible_filesystem.has_blob_ref(context, file_id),
-                context: context.clone(),
-            });
-            rows.append(plan.rows);
-            *count += plan.count;
+            .get(&Some(child_key))
+        {
+            for file_id in files {
+                let plan = plan_file_delete(FileDeleteInput {
+                    file_id: file_id.clone(),
+                    has_blob_ref: visible_filesystem.has_blob_ref(&child_context, file_id),
+                    context: child_context.clone(),
+                });
+                rows.append(plan.rows);
+                *count += plan.count;
+            }
         }
     }
 
@@ -2923,6 +2959,179 @@ mod tests {
             ]
         );
         assert!(plan.rows.iter().all(|row| row.snapshot.is_none()));
+    }
+
+    fn untracked_branch_context(branch_id: &str) -> FilesystemRowContext {
+        FilesystemRowContext {
+            untracked: true,
+            ..FilesystemRowContext::active_branch(branch_id)
+        }
+    }
+
+    fn planned_delete_rows(plan: &super::FilesystemDeletePlan) -> Vec<(String, String, bool)> {
+        plan.rows
+            .iter()
+            .map(|row| {
+                (
+                    row.schema_key.as_str().to_string(),
+                    row.entity_pk
+                        .as_ref()
+                        .expect("planned recursive delete row should carry entity_pk")
+                        .as_single_string_owned()
+                        .expect("planned recursive delete row should project entity_pk"),
+                    row.untracked,
+                )
+            })
+            .collect()
+    }
+
+    /// A tracked directory delete crosses the lane downward: untracked
+    /// descendants are tombstoned too, each in its own lane, blob refs
+    /// included. Leaving them behind orphans rows whose parent is gone and
+    /// makes the branch's whole filesystem path index fail to build.
+    #[test]
+    fn recursive_tracked_directory_delete_reaches_untracked_children() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let tracked = FilesystemRowContext::active_branch(branch_id);
+        let untracked = untracked_branch_context(branch_id);
+        let root = "01920000-0000-7000-8000-0000000000d3";
+        let untracked_directory = "01920000-0000-7000-8000-000000000103";
+        let tracked_file = "01920000-0000-7000-8000-000000000152";
+        let untracked_file = "01920000-0000-7000-8000-0000000000d2";
+        let nested_untracked_file = "01920000-0000-7000-8000-000000000160";
+
+        let mut directory_children_by_parent_id = BTreeMap::new();
+        directory_children_by_parent_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&untracked, root)),
+            BTreeSet::from([untracked_directory.to_string()]),
+        );
+
+        let mut files_by_directory_id = BTreeMap::new();
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&tracked, root)),
+            BTreeSet::from([tracked_file.to_string()]),
+        );
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&untracked, root)),
+            BTreeSet::from([untracked_file.to_string()]),
+        );
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(
+                &untracked,
+                untracked_directory,
+            )),
+            BTreeSet::from([nested_untracked_file.to_string()]),
+        );
+
+        let visible_filesystem = VisibleFilesystem {
+            directory_children_by_parent_id,
+            files_by_directory_id,
+            blob_refs_by_key: BTreeSet::from([FilesystemBlobRefKey::from_context(
+                &untracked,
+                untracked_file,
+            )]),
+        };
+
+        let plan =
+            super::plan_recursive_directory_delete(root, &visible_filesystem, tracked.clone());
+
+        assert_eq!(plan.count, 5);
+        assert_eq!(
+            planned_delete_rows(&plan),
+            vec![
+                (
+                    "lix_file_descriptor".to_string(),
+                    tracked_file.to_string(),
+                    false
+                ),
+                (
+                    "lix_file_descriptor".to_string(),
+                    nested_untracked_file.to_string(),
+                    true
+                ),
+                (
+                    "lix_directory_descriptor".to_string(),
+                    untracked_directory.to_string(),
+                    true
+                ),
+                (
+                    "lix_file_descriptor".to_string(),
+                    untracked_file.to_string(),
+                    true
+                ),
+                // The blob ref must be planned in the child's own lane; keying
+                // it off the deleting directory's tracked context would miss it
+                // and leak the blob.
+                (
+                    "lix_binary_blob_ref".to_string(),
+                    untracked_file.to_string(),
+                    true
+                ),
+                (
+                    "lix_directory_descriptor".to_string(),
+                    root.to_string(),
+                    false
+                ),
+            ]
+        );
+        assert!(plan.rows.iter().all(|row| row.snapshot.is_none()));
+    }
+
+    /// The lane crossing is one-directional. An untracked directory delete is
+    /// history-free branch state and must never tombstone tracked rows, which
+    /// mirrors `(cascade.untracked && !existing.untracked) => skip` in the
+    /// file-backed cascade.
+    #[test]
+    fn recursive_untracked_directory_delete_leaves_tracked_children() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let tracked = FilesystemRowContext::active_branch(branch_id);
+        let untracked = untracked_branch_context(branch_id);
+        let root = "01920000-0000-7000-8000-0000000000d3";
+        let tracked_child_directory = "01920000-0000-7000-8000-000000000103";
+        let tracked_file = "01920000-0000-7000-8000-000000000152";
+        let untracked_file = "01920000-0000-7000-8000-0000000000d2";
+
+        let mut directory_children_by_parent_id = BTreeMap::new();
+        directory_children_by_parent_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&tracked, root)),
+            BTreeSet::from([tracked_child_directory.to_string()]),
+        );
+
+        let mut files_by_directory_id = BTreeMap::new();
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&tracked, root)),
+            BTreeSet::from([tracked_file.to_string()]),
+        );
+        files_by_directory_id.insert(
+            Some(FilesystemDescriptorKey::from_context(&untracked, root)),
+            BTreeSet::from([untracked_file.to_string()]),
+        );
+
+        let visible_filesystem = VisibleFilesystem {
+            directory_children_by_parent_id,
+            files_by_directory_id,
+            blob_refs_by_key: BTreeSet::new(),
+        };
+
+        let plan =
+            super::plan_recursive_directory_delete(root, &visible_filesystem, untracked.clone());
+
+        assert_eq!(plan.count, 2);
+        assert_eq!(
+            planned_delete_rows(&plan),
+            vec![
+                (
+                    "lix_file_descriptor".to_string(),
+                    untracked_file.to_string(),
+                    true
+                ),
+                (
+                    "lix_directory_descriptor".to_string(),
+                    root.to_string(),
+                    true
+                ),
+            ]
+        );
     }
 
     fn live_directory_row(

@@ -6287,7 +6287,12 @@ where
             && let Some(certificate) = certified_preparation
         {
             let timestamp = self.functions.call_timestamp();
-            return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
+            return rows.into_certified_prepared(
+                certificate,
+                self.origin_key.as_ref(),
+                timestamp,
+                &self.functions,
+            );
         }
         let staged = self.staged_writes.staging_overlay()?;
         let read = SharedStorageAdapterRead::new(
@@ -13040,9 +13045,19 @@ mod tests {
             live_untracked_row.snapshot_content.as_deref(),
             Some(r#"{"key":"untracked-programmatic","value":"untracked"}"#)
         );
-        assert_eq!(
-            live_untracked_row.change_id, None,
-            "ordinary untracked rows must not enter the changelog"
+        // A change id is identity, not changelog membership. This assertion
+        // used to read `change_id == None` and stand in for "not in the
+        // changelog", which only worked while untracked rows had no id at all.
+        // Exclusion is asserted directly against tracked state below; here we
+        // assert the identity the row is now required to carry. The id is a
+        // freshly drawn v7 and therefore differs per run, so assert the
+        // property rather than recording a literal.
+        let untracked_change_id = live_untracked_row
+            .change_id
+            .expect("ordinary untracked rows must carry a change id");
+        assert!(
+            !untracked_change_id.as_uuid().is_nil(),
+            "an untracked row's change id must be a real minted id, not a nil placeholder"
         );
         assert_eq!(
             live_untracked_row.commit_id, None,

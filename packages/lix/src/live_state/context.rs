@@ -2750,7 +2750,7 @@ mod tests {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
                     entity_pk: &row.entity_pk,
-                    change_id: None,
+                    change_id: Some(ChangeId::for_test_label("live-state-untracked-store")),
                     commit_id: None,
                     untracked: true,
                     deleted: row.deleted,
@@ -2833,7 +2833,7 @@ mod tests {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
                     entity_pk: &row.entity_pk,
-                    change_id: None,
+                    change_id: Some(ChangeId::for_test_label("live-state-untracked-store-alt")),
                     commit_id: None,
                     untracked: true,
                     deleted: row.deleted,
@@ -3475,7 +3475,10 @@ mod tests {
             Some("{\"value\":\"untracked-value\"}")
         );
         assert!(rows[0].untracked);
-        assert_eq!(rows[0].change_id, None);
+        assert!(
+            rows[0].change_id.is_some_and(|id| !id.as_uuid().is_nil()),
+            "untracked rows carry a real change id"
+        );
 
         let loaded = live_state
             .reader(
@@ -3494,7 +3497,10 @@ mod tests {
             .expect("load should succeed")
             .expect("current row should be visible");
         assert!(loaded.untracked);
-        assert_eq!(loaded.change_id, None);
+        assert!(
+            loaded.change_id.is_some_and(|id| !id.as_uuid().is_nil()),
+            "untracked rows carry a real change id"
+        );
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked-value\"}")
