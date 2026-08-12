@@ -6968,7 +6968,6 @@ mod tests {
                     parent_commit_ids: vec![commit_b],
                     first_parent_jump_commit_id: commit_a,
                     first_parent_jump_span: 0,
-                    change_id: ChangeId::for_test_label("commit-a:commit"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at: crate::common::LixTimestamp::expect_parse(
                         "created_at",

@@ -203,7 +203,6 @@ pub fn append_ordered_commits(
             parent_commit_ids: Vec::new(),
             first_parent_jump_commit_id: commit_id,
             first_parent_jump_span: 0,
-            change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
@@ -236,7 +235,6 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
             parent_commit_ids,
             first_parent_jump_commit_id,
             first_parent_jump_span,
-            change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
@@ -525,7 +523,6 @@ fn direct_append_with_shape(
             parent_commit_ids: Vec::new(),
             first_parent_jump_commit_id: typed_commit_id,
             first_parent_jump_span: 0,
-            change_id: ChangeId::for_test_label(&commit_change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",

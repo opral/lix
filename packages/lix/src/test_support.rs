@@ -752,7 +752,6 @@ async fn stage_test_changelog_commit(
         parent_commit_ids: typed_parent_ids,
         first_parent_jump_commit_id,
         first_parent_jump_span,
-        change_id: typed_commit_change_id,
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at,
     };

@@ -2893,7 +2893,6 @@ mod tests {
                 parent_commit_ids: Vec::new(),
                 first_parent_jump_commit_id: CommitId::for_test_label(&commit_id_text),
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             };
@@ -3132,7 +3131,6 @@ mod tests {
                 parent_commit_ids: parents,
                 first_parent_jump_commit_id,
                 first_parent_jump_span,
-                change_id: ChangeId::for_test_label(&format!("{commit_id}:change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             });
@@ -3312,7 +3310,6 @@ mod tests {
                 parent_commit_ids: typed_parent_ids,
                 first_parent_jump_commit_id: CommitId::for_test_label(&commit_id),
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: commit_created_at,
             };

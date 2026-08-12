@@ -1129,7 +1129,6 @@ where
             parent_commit_ids: parents,
             first_parent_jump_commit_id,
             first_parent_jump_span,
-            change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "merge-base benchmark timestamp",

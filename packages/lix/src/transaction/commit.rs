@@ -1433,7 +1433,6 @@ async fn stage_changelog_commits(
                 parent_commit_ids: commit.parent_commit_ids.clone(),
                 first_parent_jump_commit_id: first_parent_jump.0,
                 first_parent_jump_span: first_parent_jump.1,
-                change_id: commit.change_id,
                 account_id: active_account_id.to_string(),
                 created_at: commit.created_at,
             },
@@ -1502,7 +1501,6 @@ async fn stage_changelog_commits(
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
             first_parent_jump_commit_id: first_parent_jumps[&commit_row.commit_id].0,
             first_parent_jump_span: first_parent_jumps[&commit_row.commit_id].1,
-            change_id: commit_row.change_id,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
         };

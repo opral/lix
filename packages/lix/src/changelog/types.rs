@@ -611,7 +611,6 @@ mod topology_tests {
             parent_commit_ids: parent.into_iter().collect(),
             first_parent_jump_commit_id: jump.map_or(commit_id, |jump| jump.0),
             first_parent_jump_span: jump.map_or(0, |jump| jump.1),
-            change_id: ChangeId::for_test_label(&format!("myers-change-{depth}")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse("Myers test timestamp", "2026-08-11T00:00:00Z"),
         }

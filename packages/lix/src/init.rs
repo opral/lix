@@ -618,7 +618,6 @@ async fn stage_init_changelog_commit(
         parent_commit_ids: plan.commit.parent_ids.clone(),
         first_parent_jump_commit_id: plan.commit.id,
         first_parent_jump_span: 0,
-        change_id: plan.commit.change_id,
         account_id: plan.commit.account_id.clone(),
         created_at: plan.commit.created_at,
     };

@@ -375,7 +375,6 @@ mod tests {
                 parent_commit_ids: Vec::new(),
                 first_parent_jump_commit_id: embedded,
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label("mismatched-key-change"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
             })
@@ -417,7 +416,6 @@ mod tests {
                 parent_commit_ids: vec![parent_commit_id],
                 first_parent_jump_commit_id: parent_commit_id,
                 first_parent_jump_span: 1,
-                change_id: ChangeId::for_test_label(&format!("{label}-change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
             };
@@ -738,7 +736,6 @@ mod tests {
             parent_commit_ids: parents,
             first_parent_jump_commit_id: commit_id,
             first_parent_jump_span: 0,
-            change_id: ChangeId::for_test_label(change_label),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
         };
@@ -909,7 +906,6 @@ mod tests {
             parent_commit_ids: commit_ids(["commit-root"]),
             first_parent_jump_commit_id: child,
             first_parent_jump_span: 0,
-            change_id: ChangeId::for_test_label("commit-child-change"),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
         };
@@ -1469,7 +1465,6 @@ mod tests {
                 parent_commit_ids,
                 first_parent_jump_commit_id,
                 first_parent_jump_span,
-                change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
             };
