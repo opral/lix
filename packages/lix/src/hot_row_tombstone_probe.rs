@@ -1128,3 +1128,164 @@ async fn retention_fence_durability_across_supported_operations() {
         drop(session);
     }
 }
+
+/// Reads back the `created_at` the engine currently reports for one identity.
+async fn created_at_of(session: &SessionContext<Memory>, table: &str, id: &str) -> String {
+    let result = session
+        .execute(
+            &format!("SELECT lixcol_created_at AS created_at FROM {table} WHERE id = '{id}'"),
+            &[],
+        )
+        .await
+        .expect("created_at reads");
+    result.rows()[0]
+        .get::<String>("created_at")
+        .expect("created_at is text")
+}
+
+/// PHASE 8 — the `created_at` consequence of compaction, and who rejects it.
+///
+/// Phase 4 established that removing an already-checkpointed delete's tombstone
+/// is safe for *serving*. This phase asks the separate write-path question the
+/// compaction design turns on: once the tombstone is gone, what `created_at`
+/// does a later re-insert of that identity receive, and does anything reject
+/// the result?
+///
+/// Today `created_at` reaches a re-inserted row by a two-hop chain — a delete
+/// copies the live row's `created_at` into the tombstone, and a re-insert
+/// copies the tombstone's forward. Compaction removes the middle hop.
+/// Canonical tracked state still retains the original `created_at` for the
+/// deleted identity, on a plane compaction never touches, so the value is
+/// recoverable. The question is whether the engine recovers it unaided.
+///
+/// The control arm runs the same sequence with the tombstone left in place, so
+/// any difference is attributable to its removal and nothing else.
+#[tokio::test]
+async fn recreated_identity_created_at_without_compaction() {
+    let (_storage, session) = open_session().await;
+    register(&session, probe_schema("c8row")).await;
+
+    session
+        .execute("INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')", &[])
+        .await
+        .expect("first insert should commit");
+    let first = created_at_of(&session, "c8row", "row-0").await;
+
+    session
+        .execute("DELETE FROM c8row WHERE id = 'row-0'", &[])
+        .await
+        .expect("delete should commit");
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should publish");
+    session
+        .execute(
+            "INSERT INTO c8row (id, locale) VALUES ('row-0', 'second')",
+            &[],
+        )
+        .await
+        .expect("re-insert should commit");
+    let second = created_at_of(&session, "c8row", "row-0").await;
+
+    println!(
+        "phase8 | arm=control first_created_at={first} second_created_at={second} \
+         inherited={}",
+        first == second
+    );
+
+    // This is the behaviour compaction must preserve. It is asserted rather
+    // than merely printed because it is the regression guard for the
+    // canonical-sourced `created_at` that compaction requires: if that
+    // sourcing silently stops firing, this is the assertion that catches it.
+    assert_eq!(
+        second, first,
+        "a re-inserted identity inherits its deleted predecessor's created_at"
+    );
+}
+
+/// The compaction arm of phase 8. Simulates compaction with the same physical
+/// tombstone removal phases 4 and 7 use, then re-inserts and asks the engine
+/// what it thinks the identity's `created_at` is — and whether a commit-root
+/// rebuild, which is where `validate_diff_row_created_at` runs in production,
+/// still accepts the result.
+#[tokio::test]
+async fn recreated_identity_created_at_after_compaction() {
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("c8row")).await;
+    let branch_id = session
+        .active_branch_id()
+        .await
+        .expect("active branch id reads");
+
+    session
+        .execute("INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')", &[])
+        .await
+        .expect("first insert should commit");
+    let first = created_at_of(&session, "c8row", "row-0").await;
+
+    session
+        .execute("DELETE FROM c8row WHERE id = 'row-0'", &[])
+        .await
+        .expect("delete should commit");
+    // Compaction is a checkpoint-time operation, and the checkpoint is what
+    // discharges the delete's working-diff obligation and commits it to
+    // canonical state. Removing the tombstone before that point would be
+    // testing an operation the design never performs.
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should publish");
+    drop(session);
+
+    let before = row_census(&storage).await;
+    let removed = drop_all_tombstones(&storage).await;
+    let after = row_census(&storage).await;
+    println!(
+        "phase8 | arm=compacted tombstones_removed={removed} \
+         entries {}->{} tombstones {}->{}",
+        before.entries, after.entries, before.tombstones, after.tombstones
+    );
+    assert!(removed > 0, "the delete must have left a tombstone to remove");
+
+    let session = reopen_session(&storage).await;
+    session
+        .execute(
+            "INSERT INTO c8row (id, locale) VALUES ('row-0', 'second')",
+            &[],
+        )
+        .await
+        .expect("re-insert should commit");
+    let second = created_at_of(&session, "c8row", "row-0").await;
+    println!(
+        "phase8 | arm=compacted first_created_at={first} second_created_at={second} \
+         inherited={}",
+        first == second
+    );
+    drop(session);
+
+    // `validate_diff_row_created_at` derives its expectation from the parent
+    // commit's canonical tracked-state index value and never inspects
+    // `deleted`, so a tombstoned ancestor still supplies a `created_at` it
+    // will insist on. In production that validator runs behind
+    // `Engine::rebuild_tracked_state_for_branch`, which means a mismatch is
+    // latent: it is written silently and only surfaces when a rebuild or
+    // repair is performed.
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should reopen for rebuild");
+    let rebuild = engine.rebuild_tracked_state_for_branch(&branch_id).await;
+    match &rebuild {
+        Ok(()) => println!("phase8 | arm=compacted rebuild=accepted"),
+        Err(error) => println!(
+            "phase8 | arm=compacted rebuild=REJECTED {}",
+            error.to_string().replace('\n', " ")
+        ),
+    }
+
+    println!(
+        "phase8 | verdict inherited={} rebuild_ok={}",
+        first == second,
+        rebuild.is_ok()
+    );
+}
