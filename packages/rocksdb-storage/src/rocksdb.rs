@@ -24,7 +24,7 @@ use lix::storage::{
 };
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
-    WriteBatch,
+    WriteBatch, WriteOptions as RocksDBWriteOptions,
 };
 use rocksdb::{DBRawIteratorWithThreadMode, Snapshot};
 use tempfile::TempDir;
@@ -78,6 +78,10 @@ pub struct RocksDBWrite {
     batch: WriteBatch,
     immutable_values: HashMap<Vec<u8>, Bytes>,
     stats: WriteStats,
+    /// Mirrors [`WriteOptions::await_durable`]. `commit()` does not otherwise
+    /// see the options it was opened with, which is how this adapter came to
+    /// accept the flag and silently drop it.
+    await_durable: bool,
 }
 
 static OPEN_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<RocksDBInner>>>> = OnceLock::new();
@@ -204,6 +208,7 @@ impl Storage for RocksDB {
                 },
                 immutable_values: HashMap::new(),
                 stats: WriteStats::default(),
+                await_durable: opts.await_durable,
             })
         }
     }
@@ -617,7 +622,23 @@ impl StorageWrite for RocksDBWrite {
 
     fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         async move {
-            self.inner.db.write(self.batch).map_err(rocksdb_error)?;
+            // `await_durable` means "do not acknowledge until the backend has
+            // crossed its durable persistence boundary". For RocksDB that is
+            // `sync = true`: the WAL append is fsynced before `write` returns,
+            // so an acknowledged publication survives power loss, not merely
+            // process death.
+            //
+            // Deliberately conditional. Ordinary row commits do not request
+            // durability and must not pay an fsync for it; the engine sets the
+            // flag only for atomic content-addressed publications and media
+            // uploads, which is precisely where losing an acknowledged write
+            // would be visible as a missing file.
+            let mut write_options = RocksDBWriteOptions::default();
+            write_options.set_sync(self.await_durable);
+            self.inner
+                .db
+                .write_opt(self.batch, &write_options)
+                .map_err(rocksdb_error)?;
             Ok(CommitResult {
                 commit_id: None,
                 stats: self.stats,
