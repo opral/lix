@@ -377,6 +377,6 @@ path = "examples/exppq_point_query.rs"
 required-features = ["storage-benches"]
 
 [[example]]
-name = "e6_key_census"
-path = "examples/e6_key_census.rs"
+name = "write_amplification"
+path = "examples/write_amplification.rs"
 required-features = ["storage-benches", "slatedb"]
