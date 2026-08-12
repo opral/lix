@@ -1,16 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[cfg(test)]
 use std::mem::size_of;
 use std::num::NonZeroU32;
+#[cfg(test)]
 use std::ops::Range;
 use std::sync::Arc;
 
-use ahash::RandomState;
 use bytes::Bytes;
 
 use super::tracked_head::{CertifiedCurrentStatePredecessor, ColumnarBaseCoordinate};
 use crate::changelog::{ChangeId, CommitId};
-use crate::common::{LixTimestamp, SharedStr};
+use crate::common::{
+    FastHashBuilder, LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder,
+    fast_hash_builder,
+};
 use crate::entity_pk::EntityPk;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
@@ -62,34 +65,6 @@ impl FileIdId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BranchIdId(u32);
 
-/// Dictionary storage shared by every identity column in one live-state batch.
-///
-/// Schema keys, file ids, and branch ids occupy one contiguous UTF-8 arena.
-/// Their typed ordinal columns make repeated batch-wide metadata a four-byte
-/// reference instead of another owned allocation on every row.
-#[derive(Debug, Clone, Default)]
-struct LiveStateStringDictionary {
-    bytes: Bytes,
-    ranges: Vec<Range<u32>>,
-    #[cfg(test)]
-    arena_allocation_count: usize,
-    #[cfg(test)]
-    arena_large_allocation_count: usize,
-}
-
-impl LiveStateStringDictionary {
-    fn get(&self, ordinal: u32) -> &str {
-        let range = self
-            .ranges
-            .get(ordinal as usize)
-            .expect("live-state string ordinal belongs to this batch");
-        let range = range.start as usize..range.end as usize;
-        // SAFETY: the builder appends complete `str` values and records their
-        // exact boundaries. `Bytes` preserves that immutable allocation.
-        unsafe { std::str::from_utf8_unchecked(&self.bytes[range]) }
-    }
-}
-
 /// Columnar owner for materialized live-state rows.
 ///
 /// This is the read-side handoff between HOT materialization, visibility, and
@@ -100,7 +75,10 @@ impl LiveStateStringDictionary {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MaterializedLiveStateBatch {
     singleton: Option<Box<MaterializedLiveStateSingleton>>,
-    strings: LiveStateStringDictionary,
+    /// Schema keys, file ids, and branch ids share one contiguous UTF-8 arena,
+    /// so repeated batch-wide metadata costs a four-byte ordinal per row rather
+    /// than another owned allocation.
+    strings: StringDictionary,
     schema_keys: Vec<SchemaKeyId>,
     file_ids: Vec<Option<FileIdId>>,
     branch_ids: Vec<BranchIdId>,
@@ -264,7 +242,7 @@ impl MaterializedLiveStateBatch {
         if let Some(singleton) = &self.singleton {
             return vec![Some(Arc::clone(&singleton.row.branch_id))];
         }
-        let mut owners = vec![None; self.strings.ranges.len()];
+        let mut owners = vec![None; self.strings.len()];
         for branch_id in &self.branch_ids {
             let ordinal = branch_id.0 as usize;
             if owners[ordinal].is_none() {
@@ -311,7 +289,7 @@ impl MaterializedLiveStateBatch {
                     file_id == row.schema_key || file_id == row.branch_id.as_ref()
                 }));
         }
-        self.strings.ranges.len()
+        self.strings.len()
     }
 
     #[cfg(test)]
@@ -330,7 +308,7 @@ impl MaterializedLiveStateBatch {
             }
             return bytes;
         }
-        self.strings.bytes.len()
+        self.strings.byte_len()
     }
 
     #[cfg(test)]
@@ -338,7 +316,7 @@ impl MaterializedLiveStateBatch {
         if self.singleton.is_some() {
             return 0;
         }
-        usize::from(!self.strings.bytes.is_empty())
+        usize::from(!self.strings.is_arena_empty())
     }
 
     #[cfg(test)]
@@ -346,7 +324,7 @@ impl MaterializedLiveStateBatch {
         if self.singleton.is_some() {
             return 0;
         }
-        self.strings.arena_allocation_count
+        self.strings.arena_allocation_count()
     }
 
     #[cfg(test)]
@@ -354,7 +332,7 @@ impl MaterializedLiveStateBatch {
         if self.singleton.is_some() {
             return 0;
         }
-        self.strings.arena_large_allocation_count
+        self.strings.arena_large_allocation_count()
     }
 
     #[cfg(test)]
@@ -389,8 +367,8 @@ impl MaterializedLiveStateBatch {
                 .map_or(0, |coordinates| {
                     coordinates.capacity() * size_of::<ColumnarBaseCoordinate>()
                 }),
-            self.strings.bytes.len(),
-            self.strings.ranges.capacity() * size_of::<Range<u32>>(),
+            self.strings.byte_len(),
+            self.strings.ranges_capacity() * size_of::<Range<u32>>(),
         ]
         .into_iter()
         .filter(|bytes| *bytes >= threshold)
@@ -720,7 +698,7 @@ impl MaterializedLiveStateExactBatch {
 fn owned_row_dictionary_capacity(rows: &[MaterializedLiveStateRow]) -> (usize, usize) {
     let mut seen = HashSet::<&str, FastHashBuilder>::with_capacity_and_hasher(
         rows.len().saturating_mul(3),
-        live_state_hash_builder(),
+        fast_hash_builder(),
     );
     let mut bytes = 0_usize;
     for row in rows {
@@ -745,253 +723,6 @@ fn account_dictionary_value<'a>(
     }
 }
 
-const SMALL_DICTIONARY_LOOKUP_LIMIT: usize = 32;
-const SMALL_DICTIONARY_ARENA_BYTES: usize = 1024;
-const NO_DICTIONARY_ORDINAL: u32 = u32::MAX;
-#[cfg(test)]
-const LARGE_DICTIONARY_ALLOCATION_BYTES: usize = 32 * 1024;
-
-type FastHashBuilder = RandomState;
-
-enum LiveStateStringLookup {
-    Small,
-    Hashed(HashMap<u64, u32, FastHashBuilder>),
-}
-
-/// Arena-first interner for the live-state identity dictionaries.
-///
-/// Hash buckets point to an ordinal in `ranges`; `collision_next` links the
-/// remaining entries with the same 64-bit hash. Keys therefore remain stable
-/// across arena growth without retaining one heap allocation per distinct
-/// string.
-struct LiveStateStringDictionaryBuilder {
-    bytes: Vec<u8>,
-    ranges: Vec<Range<u32>>,
-    collision_next: Vec<u32>,
-    lookup: LiveStateStringLookup,
-    hash_builder: FastHashBuilder,
-    expected_entry_capacity: usize,
-    maximum_entry_capacity: usize,
-    max_string_len: usize,
-    exact_byte_capacity: bool,
-    #[cfg(test)]
-    arena_allocation_count: usize,
-    #[cfg(test)]
-    arena_large_allocation_count: usize,
-}
-
-impl LiveStateStringDictionaryBuilder {
-    fn with_capacity(
-        row_capacity: usize,
-        dictionary_entry_capacity: usize,
-        dictionary_byte_capacity: usize,
-        exact_byte_capacity: bool,
-    ) -> Self {
-        let expected_entry_capacity = dictionary_entry_capacity.max(1);
-        Self {
-            bytes: Vec::with_capacity(dictionary_byte_capacity),
-            ranges: Vec::with_capacity(dictionary_entry_capacity),
-            collision_next: Vec::with_capacity(dictionary_entry_capacity),
-            lookup: LiveStateStringLookup::Small,
-            hash_builder: live_state_hash_builder(),
-            expected_entry_capacity,
-            maximum_entry_capacity: row_capacity
-                .saturating_mul(3)
-                .max(dictionary_entry_capacity)
-                .max(1),
-            max_string_len: 0,
-            exact_byte_capacity,
-            #[cfg(test)]
-            arena_allocation_count: usize::from(dictionary_byte_capacity != 0),
-            #[cfg(test)]
-            arena_large_allocation_count: usize::from(
-                dictionary_byte_capacity >= LARGE_DICTIONARY_ALLOCATION_BYTES,
-            ),
-        }
-    }
-
-    fn intern_owned(&mut self, value: String) -> u32 {
-        self.intern(value.as_str())
-    }
-
-    fn intern_ref(&mut self, value: &str) -> u32 {
-        self.intern(value)
-    }
-
-    fn intern(&mut self, value: &str) -> u32 {
-        if !matches!(&self.lookup, LiveStateStringLookup::Small) {
-            return self.intern_hashed(value);
-        }
-        if let Some(ordinal) = self.find_linear(value) {
-            return ordinal;
-        }
-        if self.ranges.len() == SMALL_DICTIONARY_LOOKUP_LIMIT {
-            self.promote_to_hashed(value.len());
-            self.intern_hashed(value)
-        } else {
-            self.append_small(value)
-        }
-    }
-
-    fn find_linear(&self, value: &str) -> Option<u32> {
-        self.ranges
-            .iter()
-            .position(|range| {
-                &self.bytes[range.start as usize..range.end as usize] == value.as_bytes()
-            })
-            .map(|ordinal| {
-                u32::try_from(ordinal).expect("live-state dictionary ordinal exceeds u32")
-            })
-    }
-
-    fn intern_hashed(&mut self, value: &str) -> u32 {
-        let hash = live_state_dictionary_hash(&self.hash_builder, value.as_bytes());
-        let mut candidate = match &self.lookup {
-            LiveStateStringLookup::Small => {
-                unreachable!("hashed dictionary lookup must be promoted first")
-            }
-            LiveStateStringLookup::Hashed(lookup) => lookup.get(&hash).copied(),
-        };
-        while let Some(ordinal) = candidate {
-            if self.value(ordinal) == value {
-                return ordinal;
-            }
-            let next = self.collision_next[ordinal as usize];
-            candidate = (next != NO_DICTIONARY_ORDINAL).then_some(next);
-        }
-        self.append_hashed(value, hash)
-    }
-
-    fn value(&self, ordinal: u32) -> &str {
-        let range = &self.ranges[ordinal as usize];
-        // SAFETY: `append_bytes` receives a `str` and records that complete
-        // value's exact boundaries.
-        unsafe {
-            std::str::from_utf8_unchecked(&self.bytes[range.start as usize..range.end as usize])
-        }
-    }
-
-    fn append_small(&mut self, value: &str) -> u32 {
-        let ordinal = self.append_bytes(value);
-        self.collision_next.push(NO_DICTIONARY_ORDINAL);
-        ordinal
-    }
-
-    fn append_hashed(&mut self, value: &str, hash: u64) -> u32 {
-        let previous_head = match &self.lookup {
-            LiveStateStringLookup::Small => {
-                unreachable!("hashed dictionary insertion must be promoted first")
-            }
-            LiveStateStringLookup::Hashed(lookup) => {
-                lookup.get(&hash).copied().unwrap_or(NO_DICTIONARY_ORDINAL)
-            }
-        };
-        let ordinal = self.append_bytes(value);
-        self.collision_next.push(previous_head);
-        let LiveStateStringLookup::Hashed(lookup) = &mut self.lookup else {
-            unreachable!("hashed dictionary insertion must retain its lookup")
-        };
-        lookup.insert(hash, ordinal);
-        ordinal
-    }
-
-    fn append_bytes(&mut self, value: &str) -> u32 {
-        self.max_string_len = self.max_string_len.max(value.len());
-        let end = self
-            .bytes
-            .len()
-            .checked_add(value.len())
-            .expect("live-state string dictionary byte count overflow");
-        let end_u32 = u32::try_from(end).expect("live-state string dictionary exceeds u32 bytes");
-        self.ensure_arena_capacity(end);
-        let start = u32::try_from(self.bytes.len())
-            .expect("live-state string dictionary start exceeds u32 bytes");
-        self.bytes.extend_from_slice(value.as_bytes());
-        let ordinal =
-            u32::try_from(self.ranges.len()).expect("live-state dictionary exceeds u32 rows");
-        assert_ne!(
-            ordinal, NO_DICTIONARY_ORDINAL,
-            "live-state dictionary reserves the terminal u32 ordinal"
-        );
-        self.ranges.push(start..end_u32);
-        ordinal
-    }
-
-    fn ensure_arena_capacity(&mut self, required: usize) {
-        if required <= self.bytes.capacity() {
-            return;
-        }
-        let projected = match &self.lookup {
-            LiveStateStringLookup::Small => SMALL_DICTIONARY_ARENA_BYTES,
-            LiveStateStringLookup::Hashed(_) => self
-                .maximum_entry_capacity
-                .saturating_mul(self.max_string_len),
-        };
-        let target = required.max(projected);
-        self.bytes.reserve_exact(target - self.bytes.len());
-        #[cfg(test)]
-        {
-            self.arena_allocation_count += 1;
-            self.arena_large_allocation_count +=
-                usize::from(target >= LARGE_DICTIONARY_ALLOCATION_BYTES);
-        }
-    }
-
-    fn promote_to_hashed(&mut self, incoming_len: usize) {
-        self.max_string_len = self.max_string_len.max(incoming_len);
-        let projected_entries = self
-            .expected_entry_capacity
-            .max(self.ranges.len().saturating_add(1));
-        let projected_bytes = projected_entries.saturating_mul(self.max_string_len);
-        if !self.exact_byte_capacity && projected_bytes > self.bytes.capacity() {
-            self.bytes.reserve_exact(projected_bytes - self.bytes.len());
-            #[cfg(test)]
-            {
-                self.arena_allocation_count += 1;
-                self.arena_large_allocation_count +=
-                    usize::from(projected_bytes >= LARGE_DICTIONARY_ALLOCATION_BYTES);
-            }
-        }
-
-        let mut lookup =
-            HashMap::with_capacity_and_hasher(projected_entries, live_state_hash_builder());
-        for ordinal in 0..self.ranges.len() {
-            let ordinal =
-                u32::try_from(ordinal).expect("live-state dictionary ordinal exceeds u32");
-            let hash =
-                live_state_dictionary_hash(&self.hash_builder, self.value(ordinal).as_bytes());
-            self.collision_next[ordinal as usize] = lookup
-                .insert(hash, ordinal)
-                .unwrap_or(NO_DICTIONARY_ORDINAL);
-        }
-        self.lookup = LiveStateStringLookup::Hashed(lookup);
-    }
-
-    fn finish(self) -> LiveStateStringDictionary {
-        debug_assert!(
-            self.ranges
-                .iter()
-                .all(|range| range.start <= range.end && range.end as usize <= self.bytes.len())
-        );
-        LiveStateStringDictionary {
-            bytes: Bytes::from(self.bytes),
-            ranges: self.ranges,
-            #[cfg(test)]
-            arena_allocation_count: self.arena_allocation_count,
-            #[cfg(test)]
-            arena_large_allocation_count: self.arena_large_allocation_count,
-        }
-    }
-}
-
-fn live_state_hash_builder() -> FastHashBuilder {
-    FastHashBuilder::with_seeds(0, 0, 0, 0)
-}
-
-fn live_state_dictionary_hash(hash_builder: &FastHashBuilder, value: &[u8]) -> u64 {
-    hash_builder.hash_one(value)
-}
-
 /// Temporary builder for a columnar materialized batch.
 ///
 /// Distinct identity values are appended directly to one UTF-8 arena. Small
@@ -1001,7 +732,7 @@ fn live_state_dictionary_hash(hash_builder: &FastHashBuilder, value: &[u8]) -> u
 pub(crate) struct MaterializedLiveStateBatchBuilder {
     singleton_capacity: bool,
     singleton: Option<Box<MaterializedLiveStateSingleton>>,
-    strings: LiveStateStringDictionaryBuilder,
+    strings: StringDictionaryBuilder,
     schema_keys: Vec<SchemaKeyId>,
     file_ids: Vec<Option<FileIdId>>,
     branch_ids: Vec<BranchIdId>,
@@ -1053,8 +784,10 @@ impl MaterializedLiveStateBatchBuilder {
         Self {
             singleton_capacity,
             singleton: None,
-            strings: LiveStateStringDictionaryBuilder::with_capacity(
-                column_capacity,
+            strings: StringDictionaryBuilder::with_capacity(
+                // Every row contributes at most a schema key, a file id and a
+                // branch id.
+                column_capacity.saturating_mul(3),
                 if singleton_capacity {
                     0
                 } else {
@@ -1096,7 +829,7 @@ impl MaterializedLiveStateBatchBuilder {
     }
 
     fn intern_ref(&mut self, value: &str) -> u32 {
-        self.strings.intern_ref(value)
+        self.strings.intern(value)
     }
 
     pub(crate) fn push_owned(&mut self, row: MaterializedLiveStateRow) {
