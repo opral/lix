@@ -34,7 +34,7 @@ const MODULE_LAYERS: &[&[&str]] = &[
     // its bytes through.
     &["storage_adapter"],
     // Value types and generic containers layered directly on the key space.
-    &["binary_cas", "columnar_row_group", "common", "json_store"],
+    &["account", "binary_cas", "columnar_row_group", "common", "json_store"],
     &["entity_pk"],
     // The order-preserving key byte format. A pure encoding over `entity_pk`
     // with no repository semantics, and the single authority for how a key
