@@ -2,9 +2,22 @@ use std::collections::BTreeMap;
 
 use lix::{LixError, Value};
 
-/// `0x7dc` is a regression seed: at step 36 it drove the tracked-state rebuild
-/// path to stage one content-addressed tree chunk twice in one write set, which
-/// failed every later read with `LIX_STORAGE_ERROR`.
+/// `0x7dc` is the seed on which tracked-state rebuild was caught staging one
+/// content-addressed tree chunk twice in a single write set, which failed every
+/// later read with `LIX_STORAGE_ERROR`.
+///
+/// It is kept here as coverage, not as the guard for that bug: the trigger needs
+/// a replay interval deep enough to contain a rooted boundary, so the seed only
+/// reproduces behind the accumulated history of the window it was found in
+/// (2006..2013 passes, 2000..2013 fails). The cheap guard is the unit test
+/// `tracked_state::storage::tests::promoting_a_chunk_the_write_set_already_staged_is_not_a_duplicate_mutation`;
+/// the end-to-end reproduction, which needs no source edit now that the seed
+/// budget is env-overridable, is:
+///
+/// ```text
+/// LIX_FUZZ_SEEDS=48 LIX_FUZZ_SEED_START=2000 cargo test -p lix --all-features \
+///   --test integration -- --test-threads=1 filesystem_fuzz
+/// ```
 const DEFAULT_SEEDS: [u64; 6] = [0, 1, 0x7dc, 0x51ce_deed, u64::MAX - 1, u64::MAX];
 const STEPS_PER_SEED: usize = 40;
 
