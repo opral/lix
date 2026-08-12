@@ -64,6 +64,7 @@ pub(crate) mod reachable_census {
     }
 
     /// Returns the counters in slot order, for delta comparison around a query.
+    #[cfg(test)]
     pub(crate) fn snapshot() -> [u64; 4] {
         [
             COUNTERS[EXACT_HIT].load(Ordering::Relaxed),
