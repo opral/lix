@@ -74,8 +74,33 @@ async fn typed_olap_shapes_validate_exact_results_on_every_adapter() {
     }
 }
 
-#[tokio::test]
-async fn typed_olap_shapes_validate_above_columnar_publication_threshold() {
+/// Runs on an explicitly sized thread for the same reason
+/// `typed_olap_shapes_validate_exact_results_after_sparse_and_moderate_mutations`
+/// below does: the OLAP shapes over a 2,048-row fixture build deep DataFusion
+/// plans whose unoptimized frames do not fit the default test-thread stack.
+///
+/// This test had been running on the default stack with no measurable margin —
+/// adding one `u64` field to `SqlReadProfile`, with no other change, was enough
+/// to abort it. Nothing about the assertions changes here; it just gets the
+/// stack its sibling already has.
+#[test]
+fn typed_olap_shapes_validate_above_columnar_publication_threshold() {
+    std::thread::Builder::new()
+        .name("columnar-threshold-olap-validation".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build columnar-threshold OLAP runtime")
+                .block_on(validate_columnar_threshold_olap_shapes());
+        })
+        .expect("spawn columnar-threshold OLAP validation thread")
+        .join()
+        .expect("join columnar-threshold OLAP validation thread");
+}
+
+async fn validate_columnar_threshold_olap_shapes() {
     let _test_guard = serialized_public_result_test().await;
     let rows = workload::fixture_rows(2_048);
     for &profile in storage::STORAGE_PROFILES {
