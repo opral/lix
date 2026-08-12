@@ -2386,7 +2386,7 @@ mod tests {
                 .expect("child should insert");
         }
 
-        let count = |session: &SessionContext<Memory>, parent: &'static str| async move {
+        async fn count(session: &SessionContext<Memory>, parent: &str) -> usize {
             session
                 .execute(
                     r#"SELECT id FROM stale_child WHERE "parentId" = $1"#,
@@ -2395,7 +2395,7 @@ mod tests {
                 .await
                 .expect("declared-column read should succeed")
                 .len()
-        };
+        }
 
         assert_eq!(count(&session, "parent-0").await, 3);
         assert_eq!(count(&session, "parent-1").await, 0);

@@ -7929,7 +7929,7 @@ mod splice_provenance_tests {
 
 #[cfg(test)]
 mod constraints_unchanged_tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::HashSet;
 
     use serde_json::{Value as JsonValue, json};
 
@@ -7980,13 +7980,11 @@ mod constraints_unchanged_tests {
             vec!["parentId", "slug"],
             "the probe schema must actually declare indexed columns"
         );
-        let plan = SchemaPlan::compile(
+        let plan = SchemaPlan::compile_standalone_for_test(
             SchemaCatalogKey {
                 schema_key: "constraint_probe".to_owned(),
             },
             schema,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
         )
         .expect("schema should compile");
 
