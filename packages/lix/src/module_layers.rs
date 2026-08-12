@@ -65,10 +65,16 @@ const MODULE_LAYERS: &[&[&str]] = &[
 /// write-row vocabulary — lives inside the write-path module that consumes it,
 /// which makes six modules cyclic with `transaction` for no structural reason.
 const UNLAYERED_MODULES: &[(&str, &str)] = &[
-    ("branch", "cyclic with `transaction` via `transaction::types`"),
+    (
+        "branch",
+        "cyclic with `transaction` via `transaction::types`",
+    ),
     ("catalog", "not yet analysed"),
     ("cel", "leaf utility, no layer semantics"),
-    ("checkpoint", "cyclic with `transaction` via `transaction::types`"),
+    (
+        "checkpoint",
+        "cyclic with `transaction` via `transaction::types`",
+    ),
     ("client_state", "entry-point plumbing, no layer semantics"),
     (
         "collection_generation",
@@ -77,16 +83,25 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("default_wasm_runtime", "feature-gated harness"),
     ("domain", "pure predicates, no owned invariant"),
     ("engine", "entry point; reaches everywhere by design"),
-    ("filesystem", "genuinely spans the overlay and write-path layers"),
+    (
+        "filesystem",
+        "genuinely spans the overlay and write-path layers",
+    ),
     ("functions", "not yet analysed"),
-    ("gc", "peer of `session` in the reclamation cycle, by design"),
+    (
+        "gc",
+        "peer of `session` in the reclamation cycle, by design",
+    ),
     ("handle", "entry point; reaches everywhere by design"),
     ("init", "entry point; reaches everywhere by design"),
     ("lib", "crate root"),
     ("module_layers", "this guard"),
     ("observe_coordinator", "not yet analysed"),
     ("observe_invalidation", "not yet analysed"),
-    ("plugin", "cyclic with `transaction` via `transaction::types`"),
+    (
+        "plugin",
+        "cyclic with `transaction` via `transaction::types`",
+    ),
     ("plugin_arena", "leaf utility, no layer semantics"),
     ("plugin_layout", "leaf utility, no layer semantics"),
     ("plugin_wire", "leaf utility, no layer semantics"),
@@ -110,7 +125,10 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
         "transaction",
         "six cycles; blocked on extracting `transaction::types` downward",
     ),
-    ("undo_redo", "cyclic with `transaction` via `transaction::types`"),
+    (
+        "undo_redo",
+        "cyclic with `transaction` via `transaction::types`",
+    ),
     ("wasm", "plugin ABI vocabulary, not yet analysed"),
 ];
 
@@ -201,7 +219,9 @@ fn blank_comments_and_literals(buffer: &mut [u8]) {
                 };
                 let close = cursor + offset + 1;
                 if close + hashes <= length
-                    && buffer[close..close + hashes].iter().all(|byte| *byte == b'#')
+                    && buffer[close..close + hashes]
+                        .iter()
+                        .all(|byte| *byte == b'#')
                 {
                     break close + hashes;
                 }
@@ -354,8 +374,8 @@ fn production_references(known: &std::collections::BTreeSet<String>) -> Vec<Refe
                 index += 1;
                 continue;
             }
-            let preceded_by_identifier = index > 0
-                && (bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
+            let preceded_by_identifier =
+                index > 0 && (bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
             if preceded_by_identifier {
                 index += PREFIX.len();
                 continue;
