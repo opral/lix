@@ -1495,7 +1495,9 @@ where
                 Ok(query) => query,
                 Err(error) => return error.into_response(),
             };
-            return result_response(handshake(state, query, parts.headers, context).await);
+            return result_response(
+                Box::pin(handshake(state, query, parts.headers, context)).await,
+            );
         }
 
         if path == "/lix/v1/session" {
