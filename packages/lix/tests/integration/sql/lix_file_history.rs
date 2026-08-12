@@ -216,6 +216,8 @@ async fn probe_file_history_entities_decoded_per_schema() {
         };
 
         storage.reset_counters();
+        lix::PROBE_DECODED_DELTA_ENTRIES.store(0, Ordering::Relaxed);
+        lix::PROBE_DECODED_DELTA_SEGMENTS.store(0, Ordering::Relaxed);
         let result = session
             .execute(
                 &format!(
@@ -228,12 +230,15 @@ async fn probe_file_history_entities_decoded_per_schema() {
             .expect("point-routed history should load");
         let answer_rows = result.rows().len();
         let (requested_keys, scan_calls, scanned_rows) = storage.counters();
+        let decoded_entries = lix::PROBE_DECODED_DELTA_ENTRIES.load(Ordering::Relaxed);
+        let decoded_segments = lix::PROBE_DECODED_DELTA_SEGMENTS.load(Ordering::Relaxed);
         eprintln!(
-            "e15probe bulk_entities={bulk_entities} commits={} answer_rows={answer_rows} \
-             requested_keys={requested_keys} scan_calls={scan_calls} scanned_rows={scanned_rows}"
+            "e19probe bulk_entities={bulk_entities} commits={} answer_rows={answer_rows} \
+             requested_keys={requested_keys} scan_calls={scan_calls} scanned_rows={scanned_rows} \
+             decoded_entries={decoded_entries} decoded_segments={decoded_segments}"
         , bulk_entities.min(1) + EDIT_COMMITS + 1);
         for (space, keys) in storage.keys_by_space() {
-            eprintln!("e15space bulk_entities={bulk_entities} space={space} keys={keys}");
+            eprintln!("e19space bulk_entities={bulk_entities} space={space} keys={keys}");
         }
 
         session.close().await.expect("session should close");

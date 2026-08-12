@@ -156,6 +156,9 @@ pub use session::{
 pub use sql_profile::SqlReadProfile;
 pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 pub use storage::Memory;
+/// E19 probe instrumentation — measurement scaffolding only, must not ship.
+#[doc(hidden)]
+pub use tracked_state::storage::{PROBE_DECODED_DELTA_ENTRIES, PROBE_DECODED_DELTA_SEGMENTS};
 
 /// Reserved high UUID sentinel for repository-global state.
 pub const GLOBAL_BRANCH_ID: &str = "ffffffff-ffff-7fff-bfff-ffffffffffff";

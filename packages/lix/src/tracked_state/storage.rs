@@ -10754,6 +10754,16 @@ fn commit_id_from_delta_key(key: &StorageKey) -> Result<CommitId, LixError> {
     ))
 }
 
+/// E19 probe instrumentation. Counts commit-delta entries decoded by
+/// `collect_strict_commit_delta_members`, and the segments those entries came
+/// from. Measurement scaffolding only — must not ship.
+#[doc(hidden)]
+pub static PROBE_DECODED_DELTA_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[doc(hidden)]
+pub static PROBE_DECODED_DELTA_SEGMENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn collect_strict_commit_delta_members(
     bytes: &[u8],
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
@@ -10764,6 +10774,8 @@ fn collect_strict_commit_delta_members(
 ) -> Result<(), LixError> {
     let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
     visit_commit_delta_leaf(&leaf, expected_commit_id, |_, _, _| Ok(()))?;
+    PROBE_DECODED_DELTA_SEGMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PROBE_DECODED_DELTA_ENTRIES.fetch_add(leaf.len() as u64, std::sync::atomic::Ordering::Relaxed);
     for entry_index in 0..leaf.len() {
         let entry = leaf.entry(entry_index)?.ok_or_else(|| {
             LixError::new(
