@@ -249,9 +249,18 @@ where
     }
 }
 
-const SHAPES: [&str; 5] = [
+const SHAPES: [&str; 8] = [
     "insert_file_80line",
     "insert_file_1line",
+    // Root-level path (one segment). `indexed_file_path_writes` only builds a
+    // whole-repository `DirectoryPathResolver` when a *nested* path is missing,
+    // so a root-level create isolates the path-index build from the resolver
+    // build.
+    "insert_root_file",
+    "upsert_root_file",
+    // Upsert over an already-resident file: nothing is missing, so no resolver
+    // is built at all. What remains is the path-index acquisition alone.
+    "upsert_existing_file",
     // Byte-identical work to `insert_file_1line`, but the ON CONFLICT clause
     // makes the planner classify the write as `UpdateContent` instead of
     // `None`, which is the discriminator for taking the indexed staging route
@@ -293,6 +302,42 @@ where
             )
             .await
             .expect("insert 1-line probe file");
+        }
+        "insert_root_file" => {
+            lix.execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text(format!("/root-ins-{probe:05}.txt")),
+                    Value::Blob(document(1, probe).into()),
+                ],
+            )
+            .await
+            .expect("insert root probe file");
+        }
+        "upsert_root_file" => {
+            lix.execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                &[
+                    Value::Text(format!("/root-ups-{probe:05}.txt")),
+                    Value::Blob(document(1, probe).into()),
+                ],
+            )
+            .await
+            .expect("upsert root probe file");
+        }
+        "upsert_existing_file" => {
+            let target = probe % files.max(1);
+            lix.execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                &[
+                    Value::Text(format!("/docs/file-{target:07}.txt")),
+                    Value::Blob(document(1, probe).into()),
+                ],
+            )
+            .await
+            .expect("upsert resident probe file");
         }
         "upsert_file_1line" => {
             lix.execute(
