@@ -12790,6 +12790,79 @@ mod tests {
         StorageWriteOptions,
     };
 
+    /// `HotCollectionControl` is `#[musli(packed)]`: its fields are positional
+    /// and the encoding carries no field tags or length prefix. Appending a
+    /// fourth field therefore appends bytes that a three-field reader cannot
+    /// account for, and `storage_codec::decode` rejects trailing bytes rather
+    /// than ignoring them.
+    ///
+    /// This pins the cost of carrying a per-collection flag (for example a
+    /// "this collection has been compacted" bit) on the control record: it is
+    /// an on-disk format break that requires a repository protocol bump, the
+    /// same way the `ordered_identity_digest` field did. It is not an additive
+    /// change.
+    #[test]
+    fn adding_a_field_to_the_packed_collection_control_breaks_older_readers() {
+        #[derive(musli::Encode)]
+        #[musli(packed)]
+        struct WidenedHotCollectionControl {
+            active_generation: CommitId,
+            live_count: u64,
+            ordered_identity_digest: Option<[u8; 32]>,
+            compacted: bool,
+        }
+
+        let generation = CommitId::for_test_label("compaction-arity");
+
+        // Both digest states matter. A `None` option and a `Some` option lay
+        // out differently in packed mode, so each has to be checked
+        // separately: the danger to rule out is not only a loud failure but a
+        // decode that silently succeeds with wrong field values.
+        for digest in [None, Some([0xA5u8; 32])] {
+            let current = HotCollectionControl {
+                active_generation: generation,
+                live_count: 7,
+                ordered_identity_digest: digest,
+            };
+            let current_bytes = storage_codec::encode("hot collection control", &current)
+                .expect("current control should encode");
+
+            // Sanity: the three-field control round-trips today, so any
+            // failure below is caused by the added field and nothing else.
+            let round_tripped: HotCollectionControl =
+                storage_codec::decode("hot collection control", &current_bytes)
+                    .expect("current control should round-trip");
+            assert_eq!(round_tripped, current);
+
+            let widened = WidenedHotCollectionControl {
+                active_generation: generation,
+                live_count: 7,
+                ordered_identity_digest: digest,
+                compacted: true,
+            };
+            let widened_bytes = storage_codec::encode("widened hot collection control", &widened)
+                .expect("widened control should encode");
+            assert!(
+                widened_bytes.len() > current_bytes.len(),
+                "the fourth positional field must actually widen the encoding"
+            );
+
+            let error = storage_codec::decode::<HotCollectionControl>(
+                "hot collection control",
+                &widened_bytes,
+            )
+            .expect_err(
+                "a three-field reader must reject a four-field control rather than \
+                 silently decoding it",
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("failed to decode hot collection control"),
+                "expected a decode rejection, got: {message}"
+            );
+        }
+    }
+
     /// The root-base cache has no invalidation rule — it relies entirely on the
     /// key being exact. So the key must actually discriminate: a different base
     /// commit, a different filter, or a different projection must all miss.
