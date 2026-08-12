@@ -69,9 +69,11 @@ mod plugin_arena;
 mod plugin_layout;
 mod plugin_wire;
 mod prepared_dml;
-// Gated exactly like `storage_spaces`, whose rows it re-exports: a build with
-// neither `cfg(test)` nor `storage-benches` has no consumer for the handles and
-// does not compile them.
+// A `pub` view of `storage_spaces`, which is itself unconditional. This module
+// stays gated on its own merits rather than mirroring the registry's: a build
+// with neither `cfg(test)` nor `storage-benches` has no consumer for the
+// handles, and publishing them there would widen the public surface for
+// nothing.
 #[cfg(any(test, feature = "storage-benches"))]
 pub mod registered_spaces;
 mod schema;
@@ -88,7 +90,10 @@ pub(crate) mod storage_adapter;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 pub(crate) mod storage_codec;
-#[cfg(any(test, feature = "storage-benches"))]
+// Unconditional: `StorageSpace::mutable`/`::immutable` check the id they are
+// given against this registry, and those constructors exist in every build.
+// A guard that is only compiled when a test feature is on is not a guard on
+// the shipped crate.
 pub(crate) mod storage_spaces;
 pub mod telemetry;
 #[cfg(any(test, feature = "storage-benches"))]
@@ -101,6 +106,7 @@ pub(crate) mod tracked_state;
 pub mod transaction;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod transaction;
+pub(crate) mod transaction_types;
 pub(crate) mod undo_redo;
 pub mod wasm;
 

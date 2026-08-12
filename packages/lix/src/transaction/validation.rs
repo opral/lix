@@ -44,8 +44,8 @@ use crate::transaction::staging::{
     PreparedInsertRef, PreparedValidationRow, PreparedWriteSet, PreparedWriteValidationSet,
 };
 #[cfg(test)]
-use crate::transaction::types::TransactionWriteOrigin;
-use crate::transaction::types::{
+use crate::transaction_types::TransactionWriteOrigin;
+use crate::transaction_types::{
     PreparedStateBatch, PreparedStateRowRef, TransactionWriteOperation,
 };
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -1798,6 +1798,30 @@ impl FileOwnerReferenceValidator {
             }
         }
 
+        // The file exists, just in the other lane. Saying "missing file_id" for
+        // a file that `SELECT * FROM lix_file` plainly returns sends people
+        // looking for the wrong bug, so name the actual mismatch and both
+        // lanes. This covers each direction: an untracked row pointing at a
+        // tracked file, and a tracked row pointing at an untracked file.
+        let other_lane = row_domain.with_untracked(!row.untracked());
+        let exists_in_other_lane = match pending_file_descriptors
+            .state_in_domain(&other_lane, file_id)
+        {
+            Some(PendingFileDescriptorState::Present) => true,
+            Some(PendingFileDescriptorState::Tombstone) => false,
+            None => {
+                self.committed_file_descriptor_exists_in_domain(
+                    input.live_state,
+                    &other_lane,
+                    file_id,
+                )
+                .await?
+            }
+        };
+        if exists_in_other_lane {
+            return Err(lane_mismatched_file_owner_error(row, file_id)?);
+        }
+
         Err(missing_file_owner_reference_error(row, file_id)?)
     }
 
@@ -1846,6 +1870,29 @@ async fn committed_file_descriptor_exists_in_domain(
         && row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
         && row.entity_pk() == &entity_pk
         && row.file_id() == Some(file_id))
+}
+
+fn lane_mismatched_file_owner_error(
+    row: PreparedValidationRow<'_>,
+    file_id: &str,
+) -> Result<LixError, LixError> {
+    let lane = |untracked: bool| if untracked { "untracked" } else { "tracked" };
+    let row_lane = lane(row.untracked());
+    let file_lane = lane(!row.untracked());
+    Ok(LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "file ownership validation failed for schema '{}': {row_lane} entity '{}' references file_id '{}', which exists but is {file_lane}, on branch '{}'",
+            row.schema_key(),
+            row.entity_pk().as_json_array_text()?,
+            file_id,
+            row.branch_id()
+        ),
+    )
+    .with_hint(
+        "A row and the file that owns it must share one lane. Write the row as \
+         lixcol_untracked = <the file's own value>, or move the file to the row's lane.",
+    ))
 }
 
 fn missing_file_owner_reference_error(
@@ -3292,7 +3339,7 @@ mod tests {
         LiveStateScanRequest, MaterializedLiveStateBatchBuilder, MaterializedLiveStateRow,
     };
     use crate::schema::{schema_key_from_definition, seed_schema_definition};
-    use crate::transaction::types::{
+    use crate::transaction_types::{
         LogicalPrimaryKey, StageJson, TestPreparedStateRow, TransactionJson, shared_origin_surface,
     };
 
@@ -3457,7 +3504,7 @@ mod tests {
 
     fn test_stage_json(value: &str) -> StageJson {
         let parsed = test_json_text(value).expect("test staged JSON should parse");
-        crate::transaction::types::stage_json_from_value(
+        crate::transaction_types::stage_json_from_value(
             TransactionJson::from_value_for_test(parsed),
             "test staged JSON",
         )
@@ -4731,11 +4778,20 @@ mod tests {
             .await
             .expect_err("tracked file owner must not resolve through pending untracked descriptor");
 
-        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
+        // Same lane mismatch as the committed case: the file is being created
+        // in this very transaction, just in the other lane.
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is untracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
+    /// Pending-descriptor sibling of
+    /// `validation_rejects_untracked_file_owner_reference_committed_as_tracked`.
     #[tokio::test]
-    async fn validation_allows_untracked_file_owner_reference_pending_as_tracked() {
+    async fn validation_rejects_untracked_file_owner_reference_pending_as_tracked() {
         let visible_schemas = vec![
             unique_schema(),
             file_descriptor_schema(),
@@ -4754,13 +4810,21 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &StrictEmptyLiveStateReader,
-        ))
-        .await
-        .expect("untracked file owner should resolve through pending tracked descriptor");
+        let error =
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &StrictEmptyLiveStateReader,
+            ))
+            .await
+            .expect_err("an untracked row must not be owned by a pending tracked file");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is tracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
     #[tokio::test]
@@ -4871,11 +4935,25 @@ mod tests {
         .await
         .expect_err("tracked file owner must not resolve through committed untracked descriptor");
 
-        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
+        // The file exists, in the other lane, so this is a lane mismatch rather
+        // than a missing file. It used to report CODE_FILE_NOT_FOUND for a file
+        // `SELECT * FROM lix_file` plainly returns.
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is untracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
+    /// The inverse of the behaviour PR D removes.
+    ///
+    /// This test previously asserted that an untracked row *may* be owned by a
+    /// tracked file — the cross-lane pairing that let a tracked file deletion
+    /// silently cascade untracked rows away. Its inversion is the evidence that
+    /// the enforcement seam is live.
     #[tokio::test]
-    async fn validation_allows_untracked_file_owner_reference_committed_as_tracked() {
+    async fn validation_rejects_untracked_file_owner_reference_committed_as_tracked() {
         let visible_schemas = vec![unique_schema()];
         let mut untracked_row = unique_row("post-1", "hello-world", "first");
         mark_prepared_row_untracked(&mut untracked_row);
@@ -4890,13 +4968,22 @@ mod tests {
             )],
         };
 
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
+        let error = validate_prepared_writes(
+            TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ),
+        )
         .await
-        .expect("untracked file owner should resolve through committed tracked descriptor");
+        .expect_err("an untracked row must not be owned by a tracked file");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is tracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
     #[tokio::test]
@@ -7212,7 +7299,7 @@ mod tests {
         let key = schema_key_from_definition(&schema).expect("test schema should have a key");
         TestPreparedStateRow {
             schema_plan_id: crate::catalog::SchemaPlanId::for_test(0),
-            facts: crate::transaction::types::PreparedRowFacts::default(),
+            facts: crate::transaction_types::PreparedRowFacts::default(),
             entity_pk: registered_schema_entity_pk(&key.schema_key),
             schema_key: REGISTERED_SCHEMA_KEY.into(),
             file_id: None,
@@ -7495,7 +7582,7 @@ mod tests {
     fn staged_row(schema_key: &str, snapshot_content: Option<String>) -> TestPreparedStateRow {
         TestPreparedStateRow {
             schema_plan_id: crate::catalog::SchemaPlanId::for_test(0),
-            facts: crate::transaction::types::PreparedRowFacts::default(),
+            facts: crate::transaction_types::PreparedRowFacts::default(),
             entity_pk: EntityPk::single("entity-1"),
             schema_key: schema_key.into(),
             file_id: None,
@@ -7590,7 +7677,7 @@ mod tests {
 
         let mut writes = PreparedWriteSet {
             state_rows: prepared_rows![descriptor.clone(), blob_ref.clone(), owner, semantic],
-            file_content_writes: vec![crate::transaction::types::TransactionFileContent::new(
+            file_content_writes: vec![crate::transaction_types::TransactionFileContent::new(
                 "01920000-0000-7000-8000-0000000000a2".to_string(),
                 Some("/a.json".to_string()),
                 Some("a.json".to_string()),
@@ -7603,7 +7690,7 @@ mod tests {
         };
         writes.commit_change_refs_by_branch.insert(
             "01920000-0000-7000-8000-0000000000a1".to_string(),
-            crate::transaction::types::StagedCommitChangeRefs::default(),
+            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::default(),
         );
         writes.remember_insert_identity_for_tests(&descriptor);
         writes

@@ -3349,7 +3349,7 @@ mod tests {
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope,
         StorageReadOptions,
     };
-    use crate::transaction::types::{
+    use crate::transaction_types::{
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
     };
     use crate::{
@@ -3898,7 +3898,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            _rows: crate::transaction::types::TypedMutationJournalBatch,
+            _rows: crate::transaction_types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
@@ -3987,7 +3987,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            rows: crate::transaction::types::TypedMutationJournalBatch,
+            rows: crate::transaction_types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             self.inner.stage_typed_mutation_journal_replace(rows).await
         }

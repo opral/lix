@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use crate::wasm::WasmCreateContext;
+use crate::storage_adapter::ValueSemantics;
 use bytes::Bytes;
 use smallvec::SmallVec;
 use tracing::Instrument as _;
@@ -32,50 +33,64 @@ pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v21";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
 pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
-pub(crate) const HOT_ROW_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
+pub(crate) const HOT_ROW_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0004_001b),
+    HOT_ROW_NAMESPACE,
+    ValueSemantics::Mutable,
+);
 /// Conservative `(branch, generation, schema)` file-membership markers.
 ///
 /// The authoritative hot row owns every value and file identity. Markers are
 /// never removed within a generation, so they may produce a harmless false
 /// positive after the last file member is deleted but cannot hide live rows.
-pub(crate) const HOT_FILE_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_001c), HOT_FILE_NAMESPACE);
+pub(crate) const HOT_FILE_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0004_001c),
+    HOT_FILE_NAMESPACE,
+    ValueSemantics::Mutable,
+);
 /// Reserved for the row-level first-before working-diff index.
-pub(crate) const HOT_DIFF_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_001d), HOT_DIFF_NAMESPACE);
-pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const HOT_DIFF_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0004_001d),
+    HOT_DIFF_NAMESPACE,
+    ValueSemantics::Mutable,
+);
+pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0023),
     HOT_COLLECTION_CONTROL_NAMESPACE,
+    ValueSemantics::Mutable,
 );
 /// Generation-local immutable current-state bases.
 ///
 /// Each tiny record points at one already-authored packed commit delta. Fresh
 /// validated inserts publish the reference instead of duplicating every row
 /// into `HOT_ROW`; later updates and deletes remain sparse HOT overlays.
-pub(crate) const PACKED_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const PACKED_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0024),
     "live_state.packed_current_base.v1",
+    ValueSemantics::Mutable,
 );
-pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0025),
     "live_state.packed_current_base_control.v1",
+    ValueSemantics::Mutable,
 );
 /// Generation-local index of packed bases containing exactly one schema.
 ///
 /// Complete collection replacements retire every indexed predecessor for the
 /// schema without inspecting or risking packed bases shared by unrelated
 /// schemas.
-pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0027),
     "live_state.packed_current_exclusive_schema_base.v1",
+    ValueSemantics::Mutable,
 );
 /// One immutable tracked-state root used as the baseline for a sparse branch
 /// generation. Branch creation publishes this 16-byte reference instead of
 /// copying every tracked row into branch-local HOT storage.
-pub(crate) const ROOT_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const ROOT_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0028),
     "live_state.root_current_base.v1",
+    ValueSemantics::Mutable,
 );
 const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
 const HOT_DENSE_SCAN_MAX_OVERREAD: usize = 2;
@@ -88,17 +103,20 @@ const HOT_DIFF_SEGMENT_MAX_IDENTITIES: u32 = 4_096;
 const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
-pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_001f),
     "live_state.certified_entity_batch.v1",
+    ValueSemantics::Mutable,
 );
-pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0021),
     "live_state.certified_entity_batch_manifest.v1",
+    ValueSemantics::Mutable,
 );
-pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0022),
     "live_state.certified_entity_batch_page.v1",
+    ValueSemantics::Mutable,
 );
 const DEFERRED_FRESH_HOT_ROWS_PER_PAGE: usize = 4_096;
 const DEFERRED_FRESH_HOT_SPACES: [StorageSpace; 3] =
@@ -7455,7 +7473,6 @@ where
             }
         }
         let mut created_ats = Vec::with_capacity(sorted.len());
-        let mut retired_untracked_json_refs = BTreeSet::new();
         for (delta, previous) in sorted.iter().zip(&previous_values) {
             let Some(previous) = previous else {
                 created_ats.push(delta.created_at);
@@ -7468,13 +7485,6 @@ where
                 reject_guarded_live_member(absence_guards, delta, existing)?;
             }
             reject_retention_change(delta, existing)?;
-            if existing.untracked {
-                collect_retired_untracked_json_refs(
-                    existing,
-                    delta,
-                    &mut retired_untracked_json_refs,
-                );
-            }
             created_ats.push(if reset_working_diff_baselines && !delta.untracked {
                 // Checkpoint selection canonicalizes newly added rows to the
                 // changelog timestamp and preserves the original timestamp
@@ -7724,7 +7734,6 @@ where
                 working_diff_capture_checkpoint_commit_id,
                 reset_working_diff_baselines,
                 &mut next_coverage,
-                &mut retired_untracked_json_refs,
             )
             .await
         }
@@ -7733,12 +7742,6 @@ where
             "lix.perf.materialization.hot.stage"
         ))
         .await?;
-        JsonStoreWriter::stage_untracked_reclaim_candidates(
-            self.writes,
-            retired_untracked_json_refs
-                .into_iter()
-                .map(JsonRef::from_hash_bytes),
-        );
         *coverage = next_coverage;
         Ok(generation)
     }
@@ -7777,23 +7780,12 @@ where
         let sorted_tracked = sorted_lifecycle_hot_deltas(tracked_deltas, false)?;
         reject_lifecycle_retention_collisions(&sorted_untracked, &sorted_tracked)?;
 
-        let mut retired_untracked_json_refs = BTreeSet::new();
         for delta in &sorted_untracked {
-            apply_complete_hot_snapshot_delta(
-                &mut untracked_rows,
-                delta,
-                absence_guards,
-                &mut retired_untracked_json_refs,
-            )?;
+            apply_complete_hot_snapshot_delta(&mut untracked_rows, delta, absence_guards)?;
         }
         merge_final_untracked_rows(&mut rows, untracked_rows)?;
         for delta in &sorted_tracked {
-            apply_complete_hot_snapshot_delta(
-                &mut rows,
-                delta,
-                absence_guards,
-                &mut retired_untracked_json_refs,
-            )?;
+            apply_complete_hot_snapshot_delta(&mut rows, delta, absence_guards)?;
         }
 
         // A replacement generation cannot inherit a checkpoint baseline from
@@ -7818,12 +7810,6 @@ where
 
         stage_complete_collection_controls(self.writes, branch_id, generation, &rows)?;
         stage_complete_hot_rows(self.writes, branch_id, generation, rows);
-        JsonStoreWriter::stage_untracked_reclaim_candidates(
-            self.writes,
-            retired_untracked_json_refs
-                .into_iter()
-                .map(JsonRef::from_hash_bytes),
-        );
         *coverage = WorkingDiffIndexCoverage::default();
         Ok((
             HotTrackedSnapshot {
@@ -7844,7 +7830,6 @@ async fn stage_incremental_file_delete_cascades(
     working_diff_capture_checkpoint_commit_id: Option<CommitId>,
     reset_working_diff_baselines: bool,
     coverage: &mut WorkingDiffIndexCoverage,
-    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
     let mut cascades = BTreeMap::<String, &CurrentStateDeltaRef<'_>>::new();
     for cascade in deltas {
@@ -7926,7 +7911,17 @@ async fn stage_incremental_file_delete_cascades(
             ));
         };
         let existing = decode_head_value(&previous)?;
-        if (cascade.untracked && !existing.untracked) || existing.deleted {
+        // A file delete cascades only within its own lane. Since PR D a row and
+        // its owning file are validated into the same lane, so the cross-lane
+        // combination should never arrive here; skipping it is defence in
+        // depth, not live behaviour.
+        //
+        // The `existing.untracked` branch below must NOT be deleted as dead
+        // code. Both lanes share this one path, keyed on the row's own flag,
+        // and it is the only mechanism that removes an untracked file's own
+        // rows when that file is deleted. What the invariant removes is the
+        // cross-lane pairing, which is this condition, not that branch.
+        if cascade.untracked != existing.untracked || existing.deleted {
             continue;
         }
         let row_start = mutations.key_bytes.len();
@@ -7940,7 +7935,6 @@ async fn stage_incremental_file_delete_cascades(
         write_entity_pk(&mut mutations.key_bytes, &identity.entity_pk);
         let row_key = BufferRange::new(row_start, mutations.key_bytes.len() - row_start);
         if existing.untracked {
-            collect_hot_untracked_refs(existing, retired_untracked_json_refs);
             mutations.row_deletes.push(row_key);
             continue;
         }
@@ -8314,14 +8308,12 @@ fn reject_lifecycle_retention_collisions(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_complete_hot_snapshot_delta(
     rows: &mut HotRowMap,
     delta: &CurrentStateDeltaRef<'_>,
     absence_guards: &BTreeSet<TrackedStateKey>,
-    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
-    apply_complete_file_delete_cascade(rows, delta, retired_untracked_json_refs)?;
+    apply_complete_file_delete_cascade(rows, delta)?;
     let identity = HeadRowIdentity {
         schema_key: delta.schema_key.to_string(),
         entity_pk: delta.entity_pk.clone(),
@@ -8332,9 +8324,6 @@ fn apply_complete_hot_snapshot_delta(
         let existing = decode_head_value(previous)?;
         reject_guarded_live_member(absence_guards, delta, existing)?;
         reject_retention_change(delta, existing)?;
-        if existing.untracked {
-            collect_retired_untracked_json_refs(existing, delta, retired_untracked_json_refs);
-        }
     }
     if delta.physically_deletes() {
         rows.remove(&identity);
@@ -8358,7 +8347,6 @@ fn apply_complete_hot_snapshot_delta(
 fn apply_complete_file_delete_cascade(
     rows: &mut HotRowMap,
     delta: &CurrentStateDeltaRef<'_>,
-    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
     let Some(file_id) = file_delete_cascade_id(delta)? else {
         return Ok(());
@@ -8373,11 +8361,13 @@ fn apply_complete_file_delete_cascade(
             continue;
         };
         let existing = decode_head_value(previous.as_ref())?;
-        if (delta.untracked && !existing.untracked) || existing.deleted {
+        // Same-lane cascade only; see the note on the incremental cascade. The
+        // `existing.untracked` branch below is the untracked lane's own removal
+        // mechanism and must not be deleted as dead code.
+        if delta.untracked != existing.untracked || existing.deleted {
             continue;
         }
         if existing.untracked {
-            collect_hot_untracked_refs(existing, retired_untracked_json_refs);
             rows.remove(&identity);
             continue;
         }
@@ -9119,9 +9109,8 @@ fn stage_hot_bootstrap(
             ));
         }
     }
-    let mut retired_untracked_json_refs = BTreeSet::new();
     for delta in deltas {
-        apply_complete_file_delete_cascade(&mut rows, delta, &mut retired_untracked_json_refs)?;
+        apply_complete_file_delete_cascade(&mut rows, delta)?;
         let identity = HeadRowIdentity {
             schema_key: delta.schema_key.to_string(),
             entity_pk: delta.entity_pk.clone(),
@@ -9132,13 +9121,6 @@ fn stage_hot_bootstrap(
             let existing = decode_head_value(previous)?;
             reject_guarded_live_member(absence_guards, delta, existing)?;
             reject_retention_change(delta, existing)?;
-            if existing.untracked {
-                collect_retired_untracked_json_refs(
-                    existing,
-                    delta,
-                    &mut retired_untracked_json_refs,
-                );
-            }
         }
         if delta.physically_deletes() {
             rows.remove(&identity);
@@ -9166,12 +9148,6 @@ fn stage_hot_bootstrap(
     }
     stage_complete_collection_controls(writes, branch_id, generation, &rows)?;
     stage_complete_hot_rows(writes, branch_id, generation, rows);
-    JsonStoreWriter::stage_untracked_reclaim_candidates(
-        writes,
-        retired_untracked_json_refs
-            .into_iter()
-            .map(JsonRef::from_hash_bytes),
-    );
     *coverage = WorkingDiffIndexCoverage::default();
     Ok(())
 }
@@ -11511,6 +11487,7 @@ fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixErro
     ))
 }
 
+#[cfg(test)]
 fn collect_hot_untracked_refs(value: HeadValueView<'_>, refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>) {
     if !value.untracked {
         return;
@@ -14923,7 +14900,6 @@ mod tests {
         let generation = CommitId::for_test_label("ordinary-import-generation");
         let mut writes = StorageWriteSet::new();
         let mut coverage = WorkingDiffIndexCoverage::default();
-        let mut retired_untracked_json_refs = BTreeSet::new();
         let explicit_index_builds = incremental_cascade_explicit_index_builds();
 
         stage_incremental_file_delete_cascades(
@@ -14935,7 +14911,6 @@ mod tests {
             None,
             false,
             &mut coverage,
-            &mut retired_untracked_json_refs,
         )
         .await
         .expect("ordinary imports do not need file-delete cascade staging");

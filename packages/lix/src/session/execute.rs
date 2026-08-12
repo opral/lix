@@ -4543,7 +4543,7 @@ mod tests {
     use crate::telemetry::{
         CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TelemetryValue,
     };
-    use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
+    use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
     use crate::{
         Memory,
         engine::{Engine, EngineOptions},

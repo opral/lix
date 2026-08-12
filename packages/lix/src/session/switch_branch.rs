@@ -4,7 +4,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::storage_adapter::{SharedStorageAdapterRead, Storage, StorageReadOptions};
-use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 
 use super::context::{SessionContext, SessionMode, WORKSPACE_BRANCH_KEY};
 

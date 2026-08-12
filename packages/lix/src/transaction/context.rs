@@ -107,6 +107,9 @@ use crate::transaction::normalization::{
     remember_pending_registered_schema,
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
+use crate::transaction::staged_commit_changes::{
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder,
+};
 use crate::transaction::staging::{
     ImmutableMutationChunkStage, ImmutableMutationJournalChunk, PreparedStateRowOverlay,
     PreparedWriteSet, TransactionWriteBuffer, TransactionWriteBufferCheckpoint,
@@ -114,13 +117,13 @@ use crate::transaction::staging::{
 use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
-use crate::transaction::types::{
+use crate::transaction_types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
     PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
-    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
-    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
-    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
-    TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
+    TransactionFileContent, TransactionJson, TransactionWrite, TransactionWriteMode,
+    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
+    TransactionWriteRow, TypedMutationJournalBatch, canonicalize_transaction_json_batch,
+    stage_json_from_value,
 };
 
 pub(crate) struct CertifiedHistoryStoreReader<S> {
@@ -2615,6 +2618,7 @@ where
     async fn cold_open_semantic_actor(
         &mut self,
         actor_key: &PluginActorKey,
+        file_key: &PluginFileWriteKey,
         plugin: &PluginRegistryEntry,
         descriptor: WasmFileDescriptor,
         factory: Arc<dyn WasmComponentFactory>,
@@ -2629,12 +2633,6 @@ where
                 .await?,
         );
         let base = self.live_state.reader(read.clone());
-        let file_key = PluginFileWriteKey {
-            branch_id: actor_key.branch_id.clone(),
-            global: false,
-            untracked: false,
-            file_id: actor_key.file_id.clone(),
-        };
         let blob_rows = overlay_scan_batch(
             &base,
             &staged,
@@ -2644,7 +2642,7 @@ where
                     entity_pks: vec![validated_uuid_entity_pk(&actor_key.file_id)?],
                     branch_ids: vec![actor_key.branch_id.clone()],
                     file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
-                    untracked: Some(false),
+                    untracked: Some(file_key.untracked),
                     ..Default::default()
                 },
                 projection: plugin_registry_live_state_projection(),
@@ -2712,7 +2710,7 @@ where
                         schema_keys: plugin.schema_keys().to_vec(),
                         branch_ids: vec![actor_key.branch_id.clone()],
                         file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
-                        untracked: Some(false),
+                        untracked: Some(file_key.untracked),
                         ..Default::default()
                     },
                     projection: plugin_state_live_state_projection(),
@@ -2724,7 +2722,7 @@ where
             MaterializedLiveStateBatch::default()
         };
         let entity_ordinals =
-            v2_host_entity_ordinals_from_live_batch(&rows, &file_key, plugin.schema_keys())?;
+            v2_host_entity_ordinals_from_live_batch(&rows, file_key, plugin.schema_keys())?;
         let entity_authorities =
             plugin_entity_authorities_from_live_batch(plugin, &rows, &entity_ordinals);
         let entity_count = entity_ordinals.len();
@@ -2817,6 +2815,7 @@ where
         &mut self,
         observation: &PluginObservation,
         actor_key: &PluginActorKey,
+        file_key: &PluginFileWriteKey,
         plugin: &PluginRegistryEntry,
         descriptor: WasmFileDescriptor,
         factory: Arc<dyn WasmComponentFactory>,
@@ -2826,13 +2825,7 @@ where
         match cache.lease_for_transition(observation).await {
             Ok(lease) => return Ok(lease),
             Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => {
-                let file_key = PluginFileWriteKey {
-                    branch_id: actor_key.branch_id.clone(),
-                    global: false,
-                    untracked: false,
-                    file_id: actor_key.file_id.clone(),
-                };
-                let Some(visible_materialization) = self.visible_materialization(&file_key).await?
+                let Some(visible_materialization) = self.visible_materialization(file_key).await?
                 else {
                     return Err(error);
                 };
@@ -2844,7 +2837,14 @@ where
         }
 
         let reopened = self
-            .cold_open_semantic_actor(actor_key, plugin, descriptor, factory, current_publications)
+            .cold_open_semantic_actor(
+                actor_key,
+                file_key,
+                plugin,
+                descriptor,
+                factory,
+                current_publications,
+            )
             .await?;
         cache.lease_for_transition(&reopened).await
     }
@@ -2907,7 +2907,7 @@ where
             .load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
                 rows: requests,
                 projection: plugin_state_live_state_projection(),
-                untracked: Some(false),
+                untracked: Some(file_key.untracked),
                 include_tombstones: false,
             })
             .await?;
@@ -2978,7 +2978,7 @@ where
             self.load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
                 rows: exact_rows,
                 projection: plugin_state_live_state_projection(),
-                untracked: Some(false),
+                untracked: Some(file_key.untracked),
                 include_tombstones: false,
             })
             .await?
@@ -2989,6 +2989,7 @@ where
             &loaded,
             &file_key.file_id,
             &file_key.branch_id,
+            file_key.untracked,
         )?;
 
         let mut rows = RawWriteBatch::with_capacity(usize::from(validation.requires_reservation));
@@ -3023,40 +3024,55 @@ where
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let loaded = self
-            .load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
-                rows: requests
-                    .iter()
-                    .map(|(bound, file_key)| LiveStateExactRowRequest {
-                        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-                        branch_id: file_key.branch_id.clone(),
-                        entity_pk: EntityPk::single(bound.reservation_key()),
-                        file_id: Some(file_key.file_id.clone()),
-                    })
-                    .collect(),
-                projection: plugin_state_live_state_projection(),
-                // Lane is a property of each requested file, but the exact-batch
-                // request carries one lane for the whole batch. Every file that
-                // reaches plugin reconciliation is tracked today, so this is
-                // exact. Unskipping untracked files requires either a per-row
-                // lane here or partitioning the batch by lane; leaving it as a
-                // constant would silently miss an existing untracked
-                // reservation and re-reserve over it.
-                untracked: Some(false),
-                include_tombstones: false,
-            })
-            .await?;
-        let mut existing_rows = Vec::with_capacity(requests.len());
+        // Lane is a property of each requested file, but `LiveStateExactBatchRequest`
+        // carries one lane for the whole batch. Both lanes now reach plugin
+        // reconciliation, so the batch is partitioned by lane and the results are
+        // scattered back into caller order. Reading every reservation under a
+        // single constant lane would miss an existing reservation in the other
+        // lane and silently re-reserve over it.
+        let mut existing_rows: Vec<Option<MaterializedLiveStateRow>> =
+            (0..requests.len()).map(|_| None).collect();
+        for lane in [false, true] {
+            let slots = requests
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, file_key))| file_key.untracked == lane)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if slots.is_empty() {
+                continue;
+            }
+            let loaded = self
+                .load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
+                    rows: slots
+                        .iter()
+                        .map(|&index| {
+                            let (bound, file_key) = &requests[index];
+                            LiveStateExactRowRequest {
+                                schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+                                branch_id: file_key.branch_id.clone(),
+                                entity_pk: EntityPk::single(bound.reservation_key()),
+                                file_id: Some(file_key.file_id.clone()),
+                            }
+                        })
+                        .collect(),
+                    projection: plugin_state_live_state_projection(),
+                    untracked: Some(lane),
+                    include_tombstones: false,
+                })
+                .await?;
+            for (slot, &index) in slots.iter().enumerate() {
+                existing_rows[index] = loaded.row(slot).map(MaterializedLiveStateRowRef::to_owned);
+            }
+        }
         for (index, (bound, file_key)) in requests.iter().enumerate() {
-            let existing = loaded.row(index).map(MaterializedLiveStateRowRef::to_owned);
             validate_create_reservation(
-                existing.as_ref(),
+                existing_rows[index].as_ref(),
                 *bound,
                 &file_key.file_id,
                 &file_key.branch_id,
                 file_key.untracked,
             )?;
-            existing_rows.push(existing);
         }
         Ok(existing_rows)
     }
@@ -3372,13 +3388,13 @@ where
                         "prepared CAS content cannot install a plugin archive",
                     ));
                 }
-                if !write.global && !write.untracked {
+                if !write.global {
                     branch_ids.insert(write.branch_id.clone());
                 }
                 continue;
             };
             if !is_plugin_storage_path(path) {
-                if !write.global && !write.untracked {
+                if !write.global {
                     branch_ids.insert(write.branch_id.clone());
                 }
                 continue;
@@ -3513,13 +3529,15 @@ where
                 branch_ids.insert(row.branch_id.to_string());
                 continue;
             }
-            if row.global || row.untracked {
+            if row.global {
                 continue;
             }
+            // Deleting an untracked plugin-owned file must clean up its owner
+            // and entity rows the same way a tracked deletion does.
             let key = PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: false,
+                untracked: row.untracked,
                 file_id,
             };
             deleted_file_keys
@@ -3538,12 +3556,13 @@ where
             }
         }
 
-        // Ordinary semantic DML carries no filesystem payload. A tracked,
-        // file-scoped row may nevertheless belong to an active plugin and
-        // therefore needs the small branch registry lookup before the host can
-        // decide whether an entity-to-file transition is required.
+        // Ordinary semantic DML carries no filesystem payload. A file-scoped
+        // row may nevertheless belong to an active plugin and therefore needs
+        // the small branch registry lookup before the host can decide whether
+        // an entity-to-file transition is required. Lane is irrelevant to that
+        // decision: the registry is branch-global either way.
         for row in rows.iter().take(input_row_count) {
-            if !row.global && !row.untracked && row.file_id.is_some() {
+            if !row.global && row.file_id.is_some() {
                 branch_ids.insert(row.branch_id.to_string());
             }
         }
@@ -3810,7 +3829,6 @@ where
         if active_branch_ids.is_empty() && deleted_file_keys.is_empty() {
             for write in file_content.iter().filter(|write| {
                 !write.global
-                    && !write.untracked
                     && write
                         .path
                         .as_deref()
@@ -3828,7 +3846,6 @@ where
         let mut candidate_file_keys = BTreeSet::<PluginFileWriteKey>::new();
         for write in file_content.iter() {
             if write.global
-                || write.untracked
                 || !active_branch_ids.contains(&write.branch_id)
                 || write.path.as_deref().is_none_or(is_plugin_storage_path)
             {
@@ -3844,7 +3861,6 @@ where
         }
         for row in rows.iter().take(input_row_count) {
             if row.global
-                || row.untracked
                 || !active_branch_ids.contains(row.branch_id.as_str())
                 || row.file_id.is_none()
             {
@@ -3853,7 +3869,7 @@ where
             candidate_file_keys.insert(PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: false,
+                untracked: row.untracked,
                 file_id: row
                     .file_id
                     .as_ref()
@@ -3866,55 +3882,71 @@ where
             return Ok(reconciliation);
         }
 
-        let owner_rows = overlay_load_exact_batch(
-            &base,
-            &staged,
-            &LiveStateExactBatchRequest {
-                rows: candidate_file_keys
-                    .iter()
-                    .map(|key| LiveStateExactRowRequest {
-                        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-                        branch_id: key.branch_id.clone(),
-                        entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
-                        file_id: Some(key.file_id.clone()),
-                    })
-                    .collect(),
-                projection: plugin_registry_live_state_projection(),
-                untracked: Some(false),
-                include_tombstones: false,
-            },
-        )
-        .await?;
+        // Owner rows are file-scoped, so each one lives in its own file's lane.
+        // `LiveStateExactBatchRequest` carries one lane per batch, so the
+        // candidates are partitioned by lane and each partition is read under
+        // its own lane. A single constant lane here would report an untracked
+        // file as unowned and re-own it from scratch on every write.
         let mut owners = BTreeMap::<PluginFileWriteKey, PluginFileOwner>::new();
         let mut owner_change_ids = BTreeMap::<PluginFileWriteKey, String>::new();
-        for row in (0..owner_rows.len()).filter_map(|slot| owner_rows.row(slot)) {
-            let branch_id = row.branch_id().to_string();
-            let owner_row = row.to_owned();
-            let Some(owner) = PluginFileOwner::from_live_state_row(&owner_row, &branch_id)? else {
+        for lane in [false, true] {
+            let lane_keys = candidate_file_keys
+                .iter()
+                .filter(|key| key.untracked == lane)
+                .collect::<Vec<_>>();
+            if lane_keys.is_empty() {
                 continue;
-            };
-            let owner_change_id = row.change_id().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "durable plugin owner for file '{}' on branch '{branch_id}' is missing change_id",
-                        owner.file_id()
-                    ),
-                )
-            })?;
-            let key = PluginFileWriteKey {
-                branch_id,
-                global: false,
-                untracked: false,
-                file_id: owner.file_id().to_string(),
-            };
-            if owners.insert(key.clone(), owner).is_some() {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    "durable plugin owner lookup returned duplicate file rows",
-                ));
             }
-            owner_change_ids.insert(key, owner_change_id.to_string());
+            let owner_rows = overlay_load_exact_batch(
+                &base,
+                &staged,
+                &LiveStateExactBatchRequest {
+                    rows: lane_keys
+                        .iter()
+                        .map(|key| LiveStateExactRowRequest {
+                            schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+                            branch_id: key.branch_id.clone(),
+                            entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+                            file_id: Some(key.file_id.clone()),
+                        })
+                        .collect(),
+                    projection: plugin_registry_live_state_projection(),
+                    untracked: Some(lane),
+                    include_tombstones: false,
+                },
+            )
+            .await?;
+            for row in (0..owner_rows.len()).filter_map(|slot| owner_rows.row(slot)) {
+                let branch_id = row.branch_id().to_string();
+                let owner_row = row.to_owned();
+                let Some(owner) =
+                    PluginFileOwner::from_live_state_row(&owner_row, &branch_id, lane)?
+                else {
+                    continue;
+                };
+                let owner_change_id = row.change_id().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "durable plugin owner for file '{}' on branch '{branch_id}' is missing change_id",
+                            owner.file_id()
+                        ),
+                    )
+                })?;
+                let key = PluginFileWriteKey {
+                    branch_id,
+                    global: false,
+                    untracked: lane,
+                    file_id: owner.file_id().to_string(),
+                };
+                if owners.insert(key.clone(), owner).is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        "durable plugin owner lookup returned duplicate file rows",
+                    ));
+                }
+                owner_change_ids.insert(key, owner_change_id.to_string());
+            }
         }
 
         let mut catalogs = BTreeMap::<String, Arc<CompiledPluginCatalog>>::new();
@@ -3938,7 +3970,7 @@ where
             let Some(file_id) = row.file_id.as_deref() else {
                 continue;
             };
-            if row.global || row.untracked || !active_branch_ids.contains(row.branch_id.as_str()) {
+            if row.global || !active_branch_ids.contains(row.branch_id.as_str()) {
                 continue;
             }
             let registry = registries
@@ -3956,7 +3988,7 @@ where
             let file_key = PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: false,
+                untracked: row.untracked,
                 file_id: file_id.to_string(),
             };
             let owner = owners.get(&file_key).ok_or_else(|| {
@@ -4055,14 +4087,16 @@ where
                             && entry.id() == file_key.file_id
                             && live.branch_id.as_ref() == file_key.branch_id
                             && !live.global
-                            && !live.untracked
+                            // Path uniqueness is per lane, so the descriptor is
+                            // matched in the same lane as its semantic rows.
+                            && live.untracked == file_key.untracked
                     })
                     .collect::<Vec<_>>();
                 let [entry] = entries.as_slice() else {
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
-                            "owned component plugin file '{}' must resolve to exactly one tracked path; found {}",
+                            "owned component plugin file '{}' must resolve to exactly one path in its own lane; found {}",
                             file_key.file_id,
                             entries.len()
                         ),
@@ -4106,7 +4140,6 @@ where
                 continue;
             };
             if write.global
-                || write.untracked
                 || is_plugin_storage_path(path)
                 || !active_branch_ids.contains(&write.branch_id)
             {
@@ -4203,6 +4236,10 @@ where
             }
             let group_key = PluginStateGroupKey {
                 branch_id: key.branch_id.clone(),
+                // Each scan below reads one lane, so groups are keyed by lane
+                // too. Merging lanes into one group would read a file's rows
+                // from the wrong lane and tombstone the wrong entities.
+                untracked: key.untracked,
                 plugin_key: owner.plugin_key().to_string(),
             };
             let group = state_groups.entry(group_key).or_default();
@@ -4235,7 +4272,7 @@ where
                             .cloned()
                             .map(NullableKeyFilter::Value)
                             .collect(),
-                        untracked: Some(false),
+                        untracked: Some(group_key.untracked),
                         ..Default::default()
                     },
                     projection: plugin_state_live_state_projection(),
@@ -4412,7 +4449,6 @@ where
             .filter_map(|(index, write)| {
                 let path = write.path.as_deref()?;
                 if write.global
-                    || write.untracked
                     || is_plugin_storage_path(path)
                     || !active_branch_ids.contains(&write.branch_id)
                 {
@@ -4581,6 +4617,7 @@ where
                     } = prepared;
                     let source_bytes = submitted_bytes.clone();
                     let creates = create_context.creates();
+                    let file_untracked = file_key.untracked;
                     let task = tokio::spawn(async move {
                         let mut actor = factory
                             .instantiate_actor()
@@ -4596,6 +4633,7 @@ where
                                     descriptor,
                                     file: Arc::new(ArcByteSource::new(source_bytes)),
                                     creates,
+                                    certified_packets_available: !file_untracked,
                                 },
                             )
                             .instrument(tracing::debug_span!(
@@ -4749,7 +4787,6 @@ where
                 continue;
             };
             if write.global
-                || write.untracked
                 || is_plugin_storage_path(path)
                 || !active_branch_ids.contains(&write.branch_id)
             {
@@ -4776,6 +4813,7 @@ where
                                 .branch_id
                                 .as_str()
                                 .cmp(write.branch_id.as_str())
+                                .then_with(|| group.untracked.cmp(&write.untracked))
                                 .then_with(|| group.plugin_key.as_str().cmp(owner.plugin_key()))
                         })
                         .ok()?;
@@ -5196,7 +5234,7 @@ where
                                             file_ids: vec![NullableKeyFilter::Value(
                                                 actor_key.file_id.clone(),
                                             )],
-                                            untracked: Some(false),
+                                            untracked: Some(file_key.untracked),
                                             ..Default::default()
                                         },
                                         projection: plugin_state_live_state_projection(),
@@ -5346,6 +5384,7 @@ where
                             None => {
                                 self.cold_open_semantic_actor(
                                     &actor_key,
+                                    &file_key,
                                     selected,
                                     descriptor.clone(),
                                     Arc::clone(&factory),
@@ -5370,6 +5409,7 @@ where
                         None => {
                             self.cold_open_semantic_actor(
                                 &actor_key,
+                                &file_key,
                                 selected,
                                 descriptor.clone(),
                                 Arc::clone(&factory),
@@ -5395,6 +5435,7 @@ where
                         .lease_or_reopen_observed_actor(
                             &observation,
                             &actor_key,
+                            &file_key,
                             selected,
                             descriptor.clone(),
                             Arc::clone(&factory),
@@ -5698,6 +5739,7 @@ where
                             descriptor,
                             file: Arc::new(source),
                             creates,
+                            certified_packets_available: !file_key.untracked,
                         },
                     )
                     .instrument(tracing::debug_span!(
@@ -5892,7 +5934,9 @@ where
                 row.branch_id.as_str() != file_key.branch_id
                     || row.file_id.map(SharedStr::as_str) != Some(file_key.file_id.as_str())
                     || row.global
-                    || row.untracked
+                    // Semantic rows stay in their file's lane, not the tracked
+                    // lane: an untracked file's entities are untracked.
+                    || row.untracked != file_key.untracked
                     || group
                         .plugin
                         .schema_keys()
@@ -5908,7 +5952,8 @@ where
                 ));
             }
             let limits = WasmTransitionLimits::default();
-            let changes = v2_host_changes_from_prepared_rows(&prepared, limits)?;
+            let changes =
+                v2_host_changes_from_prepared_rows(&prepared, limits, file_key.untracked)?;
             if changes.entity_change_count() == 0 {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
@@ -5982,6 +6027,7 @@ where
                             drop(cold_install);
                             self.cold_open_semantic_actor(
                                 &actor_key,
+                                &file_key,
                                 &group.plugin,
                                 descriptor.clone(),
                                 factory,
@@ -6091,6 +6137,7 @@ where
                 group.path,
                 group.filename,
                 file_key.branch_id.clone(),
+                file_key.untracked,
                 hash,
                 rendered_bytes,
                 same_length_output_splice,
@@ -6591,50 +6638,6 @@ where
         Ok(())
     }
 
-    /// Reports whether visible untracked state is owned by any requested file.
-    pub(crate) async fn has_untracked_file_scoped_rows(
-        &mut self,
-        file_ids: &[String],
-    ) -> Result<bool, LixError> {
-        if file_ids.is_empty() {
-            return Ok(false);
-        }
-        let branch_id = self.active_branch_id.clone();
-        let rows = self
-            .scan_visible_live_state_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    branch_ids: vec![branch_id],
-                    file_ids: file_ids
-                        .iter()
-                        .cloned()
-                        .map(NullableKeyFilter::Value)
-                        .collect(),
-                    untracked: Some(true),
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection::default(),
-                limit: Some(1),
-            })
-            .await?;
-        Ok(!rows.is_empty())
-    }
-
-    /// Reports whether the active branch has any visible untracked state.
-    pub(crate) async fn has_untracked_rows(&mut self) -> Result<bool, LixError> {
-        let branch_id = self.active_branch_id.clone();
-        let rows = self
-            .scan_visible_live_state_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    branch_ids: vec![branch_id],
-                    untracked: Some(true),
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection::default(),
-                limit: Some(1),
-            })
-            .await?;
-        Ok(!rows.is_empty())
-    }
 
     /// Stages the protocol replay receipt into this transaction's final
     /// storage write set. The receipt is guarded by `KeyAbsent` during commit,
@@ -8882,7 +8885,9 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
     }) || prepared_writes
         .commit_change_refs_by_branch
         .values()
-        .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
+        .flat_map(
+            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
+        )
         .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
 }
 
@@ -8897,7 +8902,9 @@ fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWr
     }) || prepared_writes
         .commit_change_refs_by_branch
         .values()
-        .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
+        .flat_map(
+            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
+        )
         .any(|change_ref| {
             matches!(
                 change_ref.schema_key(),
@@ -9915,7 +9922,9 @@ fn v2_host_entity_ordinals_from_live_batch(
             row.branch_id() == file_key.branch_id
                 && row.file_id() == Some(file_key.file_id.as_str())
                 && !row.global()
-                && !row.untracked()
+                // A file's entity rows live in the file's own lane. Pinning this
+                // to tracked would hydrate an untracked file as if it were empty.
+                && row.untracked() == file_key.untracked
                 && row.snapshot_content().is_some()
                 && schema_keys
                     .binary_search_by(|schema_key| schema_key.as_str().cmp(row.schema_key()))
@@ -9953,14 +9962,17 @@ fn v2_host_entity_ordinals_from_live_batch(
 fn v2_host_changes_from_prepared_rows(
     rows: &PreparedStateBatch,
     limits: WasmTransitionLimits,
+    untracked: bool,
 ) -> Result<WasmHostEntityChanges, LixError> {
     let mut changes = rows
         .iter()
         .map(|row| {
-            if row.global || row.untracked || row.file_id.is_none() {
+            // Rendering is lane-agnostic; the rows only have to agree with the
+            // lane of the file being rendered.
+            if row.global || row.untracked != untracked || row.file_id.is_none() {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "component semantic rendering requires tracked, branch-local, file-scoped rows",
+                    "component semantic rendering requires branch-local, file-scoped rows in the file's own lane",
                 ));
             }
             let key = WasmEntityKey::from_owned_parts(
@@ -10435,6 +10447,16 @@ impl PluginWriteReconciliation {
                         ),
                     )
                 })?;
+            // An untracked file gets no durable actor checkpoint. A checkpoint
+            // is a persisted artifact keyed to the file, so writing one for an
+            // untracked file would hand untracked state a durability guarantee
+            // it is defined not to have. Reconciliation still runs and still
+            // produces entity rows; only the checkpoint is withheld, so the
+            // actor rebuilds cold on the next open through the existing
+            // checkpoint-miss path.
+            if write.untracked {
+                continue;
+            }
             write.set_plugin_checkpoint(generation, semantic_root, checkpoint.bytes(), authority);
         }
         Ok(())
@@ -10758,17 +10780,20 @@ fn semantic_rendered_file_content(
     path: String,
     filename: String,
     branch_id: String,
+    untracked: bool,
     base_blob_hash: BlobId,
     rendered_bytes: crate::Blob,
     same_length_output_splice: Option<ValidatedSameLengthOutputSplice>,
 ) -> TransactionFileContent {
+    // The re-rendered payload replaces the file in its own lane. Keying it as
+    // tracked would leave an untracked file's materialization unmatched.
     let mut rendered_file = TransactionFileContent::new(
         file_id,
         Some(path),
         Some(filename),
         branch_id,
         false,
-        false,
+        untracked,
         rendered_bytes,
     )
     .with_had_blob_ref(true)
@@ -10960,6 +10985,21 @@ async fn preflight_owned_generation_upgrades(
     install_wasm: &BTreeMap<BlobId, Vec<u8>>,
     install_schema_definitions: &BTreeMap<PluginLifecycleKey, BTreeMap<String, JsonValue>>,
 ) -> Result<(), LixError> {
+    // KNOWN LANE GAP, deliberate and scoped out of the unskip.
+    //
+    // Every scan below is pinned to the tracked lane, so a plugin generation
+    // upgrade re-renders and validates only the tracked files that plugin owns.
+    // An untracked owned file is not validated against the replacement plugin.
+    //
+    // This is a validation gap, not a loss: the preflight writes no rows. An
+    // untracked owned file keeps its old-generation owner row, and the next
+    // write to it takes the ordinary `plugin_owner_needs_write` path, which
+    // rewrites the owner and re-reconciles under the new generation. The only
+    // consequence is that a replacement plugin which cannot render that file
+    // fails at the next write rather than at upgrade time.
+    //
+    // Closing it means lane-partitioning four scans and two path filters here
+    // with their own coverage, which belongs with the enforcement work.
     let branch_ids = upgrades
         .iter()
         .map(|upgrade| upgrade.branch_id.clone())
@@ -11000,7 +11040,9 @@ async fn preflight_owned_generation_upgrades(
     for row in owner_rows.iter() {
         let branch_id = row.branch_id().to_string();
         let owner_row = row.to_owned();
-        let Some(owner) = PluginFileOwner::from_live_state_row(&owner_row, &branch_id)? else {
+        // This preflight is tracked-pinned; see the lane-gap note above.
+        let Some(owner) = PluginFileOwner::from_live_state_row(&owner_row, &branch_id, false)?
+        else {
             continue;
         };
         let Some(index) = upgrade_indexes
@@ -11487,6 +11529,7 @@ fn plugin_upgrade_error(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PluginStateGroupKey {
     branch_id: String,
+    untracked: bool,
     plugin_key: String,
 }
 
@@ -11815,9 +11858,10 @@ mod tests {
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateKey, TrackedStateScanRequest,
     };
-    use crate::transaction::types::{
-        StagedCommitChangeBatchBuilder, StagedCommitChangeRefs, TransactionJson,
+    use crate::transaction::staged_commit_changes::{
+        StagedCommitChangeBatchBuilder, StagedCommitChangeRefs,
     };
+    use crate::transaction_types::TransactionJson;
     use crate::wasm::WasmEntity;
 
     fn raw_write_rows(rows: Vec<TransactionWriteRow>) -> RawWriteBatch {
@@ -12040,6 +12084,7 @@ mod tests {
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
+            false,
             base_blob_hash,
             b"abXYef".as_slice().into(),
             Some(ValidatedSameLengthOutputSplice {
@@ -12063,6 +12108,7 @@ mod tests {
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
+            false,
             base_blob_hash,
             b"abXYef".as_slice().into(),
             Some(ValidatedSameLengthOutputSplice {
@@ -14019,7 +14065,7 @@ mod tests {
             "main".into(),
         );
 
-        let changes = v2_host_changes_from_prepared_rows(&semantic_rows, limits)
+        let changes = v2_host_changes_from_prepared_rows(&semantic_rows, limits, false)
             .expect("direct semantic rendering should select a lazy snapshot source");
         let WasmEntityChange::Upsert { entity, .. } = &changes.changes[0] else {
             panic!("prepared semantic snapshot should become an upsert")

@@ -24,7 +24,7 @@ use crate::storage_adapter::{
     StorageWriteSetStats,
 };
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-00000000b001";

@@ -770,11 +770,10 @@ async fn cas_stats<S: Storage>(storage: &S) -> [SpaceStats; 4] {
 }
 
 async fn space_stats<S: Storage>(storage: &S, space_id: lix::storage::SpaceId) -> SpaceStats {
-    let space = if space_id == PAYLOAD_SPACE {
-        lix::storage::StorageSpace::immutable(space_id, "qualification.cas.payload")
-    } else {
-        lix::storage::StorageSpace::mutable(space_id, "qualification.cas.metadata")
-    };
+    // A space id has exactly one value semantics and the engine registry is
+    // where it is declared; guessing it here scans a different physical
+    // location than the engine wrote.
+    let space = lix::storage_bench::storage_space_by_id(space_id.0);
     let read = storage
         .begin_read(ReadOptions::default())
         .await
