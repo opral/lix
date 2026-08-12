@@ -17,7 +17,12 @@ use std::path::Path;
 
 const BRANCH_ID: &str = "01920000-0000-7000-8000-000000000001";
 const CHECKPOINT_FILE_ID: &str = "01920000-0000-7000-8000-000010000000";
-const BRANCH_CONTROL_SPACE: &str = "branch.head_control.v10";
+// Must track `BRANCH_HEAD_CONTROL_NAMESPACE` in `lix::branch::control`, which
+// is bumped whenever the branch-control record layout changes. Unlike the
+// predicate in the server-protocol gate this cannot match on a prefix: it names
+// the space it reconstructs. A stale value here does not fail loudly at the
+// mismatch, it makes the inventory come back empty.
+const BRANCH_CONTROL_SPACE: &str = "branch.head_control.v11";
 const PLUGIN_CHECKPOINT_SPACE: &str = "plugin.current_checkpoint.v2";
 const COMMIT_MANIFEST_SPACE: &str = "tracked_state.commit_state_manifest.v7";
 const TREE_CHUNK_SPACE: &str = "tracked_state.tree_chunk";

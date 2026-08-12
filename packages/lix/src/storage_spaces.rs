@@ -11,6 +11,14 @@
 //! layout invariant now iterates [`ALL_STORAGE_SPACES`], so a new space is
 //! covered by all of them the moment it is registered, and an unregistered
 //! space is caught by [`tests::every_declared_space_is_registered`].
+//!
+//! This module is compiled in **every** configuration, not just test and
+//! bench ones. `StorageSpace::mutable`/`::immutable` check the id they are
+//! handed against [`may_declare`], and those constructors exist in every
+//! build, so a registry that came and went with a feature flag would be a
+//! guard on the test harness rather than on the shipped crate. Nothing here
+//! costs anything at run time: it is two `const` tables and two `const fn`
+//! predicates over crate constants that already exist unconditionally.
 
 use crate::storage_adapter::{StorageSpace, StorageSpaceId, ValueSemantics};
 
@@ -59,7 +67,7 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
     crate::session::UPLOAD_STATE_SPACE,
     crate::session::UPLOAD_MANIFEST_LEAF_SPACE,
-    // `gc.rs` declares these four through the checked constructors rather than
+    // `gc.rs` declares these through the checked constructors rather than
     // `StorageSpace::declare`, so referencing its constants here would make
     // `may_declare` read a registry it is in the middle of evaluating. The
     // rows are stated here instead and `tests::gc_spaces_match_the_registry`
@@ -72,16 +80,6 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     StorageSpace::declare(
         StorageSpaceId(0x0008_0002),
         "checkpoint.gc_state.v1",
-        ValueSemantics::Mutable,
-    ),
-    StorageSpace::declare(
-        StorageSpaceId(0x0008_0003),
-        "gc.reachability_delta.v1",
-        ValueSemantics::Mutable,
-    ),
-    StorageSpace::declare(
-        StorageSpaceId(0x0008_0004),
-        "gc.reachability_queue.v1",
         ValueSemantics::Mutable,
     ),
 ];
@@ -144,6 +142,10 @@ pub(crate) const RETIRED_STORAGE_SPACE_IDS: &[StorageSpaceId] = &[
     StorageSpaceId(0x0001_0002),
     // live_state.index.branch_root.v1
     StorageSpaceId(0x0004_0005),
+    // gc.reachability_delta.v1
+    StorageSpaceId(0x0008_0003),
+    // gc.reachability_queue.v1
+    StorageSpaceId(0x0008_0004),
     // gc.tree_sweep_epoch.v1
     StorageSpaceId(0x0008_0005),
     // gc.tree_sweep_mark.v1
@@ -449,8 +451,6 @@ mod tests {
         for space in [
             crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
             crate::gc::CHECKPOINT_GC_STATE_SPACE,
-            crate::gc::GC_REACHABILITY_DELTA_SPACE,
-            crate::gc::GC_REACHABILITY_QUEUE_SPACE,
         ] {
             let row = ALL_STORAGE_SPACES
                 .iter()

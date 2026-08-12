@@ -502,7 +502,6 @@ where
         }
     }
     crate::catalog::stage_catalog_revision(&mut writes);
-    crate::gc::stage_reachability_queue_seed(&mut writes)?;
     stage_repository_protocol(&mut writes);
 
     storage

@@ -113,11 +113,11 @@ jobs:
         run: cargo test --profile test --workspace --all-features --no-run
 
       - name: Run Rust workspace tests
+        # Deliberately no RUST_MIN_STACK here. Tests that need more than
+        # libtest's 2 MiB worker-stack default must size their own thread
+        # (see `run_on_sized_stack` in the CRUD public-result parity test), so
+        # that the command a developer runs by hand behaves like CI's.
         if: matrix.task == 'test'
-        env:
-          # The CRUD public-result parity test exercises every adapter in one
-          # libtest worker and can exceed Rust's 2 MiB worker-stack default.
-          RUST_MIN_STACK: 8388608
         run: cargo test --profile test --workspace --all-features
 
       - name: Verify the packaged plugin API contract

@@ -78,7 +78,10 @@ pub(crate) mod storage_adapter;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 pub(crate) mod storage_codec;
-#[cfg(any(test, feature = "storage-benches"))]
+// Unconditional: `StorageSpace::mutable`/`::immutable` check the id they are
+// given against this registry, and those constructors exist in every build.
+// A guard that is only compiled when a test feature is on is not a guard on
+// the shipped crate.
 pub(crate) mod storage_spaces;
 pub mod telemetry;
 #[cfg(any(test, feature = "storage-benches"))]

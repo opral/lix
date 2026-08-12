@@ -70,7 +70,7 @@ export type LixBinding = {
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
 	syncDiskToLix(): Promise<void>;
-	/** Internal snapshot capability implemented by browser memory bindings. */
+	/** Explicit snapshot utility available on direct in-memory WASM bindings. */
 	exportSnapshot?(): Promise<Uint8Array>;
 	close(): Promise<void>;
 };
@@ -93,7 +93,8 @@ export type ObserveEventsBinding = {
 export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
 
 export type LixStorageConfig =
-	| { kind: "memory"; snapshot?: Uint8Array }
+	| { kind: "memory" }
+	| { kind: "indexedDb"; name: string }
 	| {
 			kind: "localFilesystem";
 			path: string;
