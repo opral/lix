@@ -32,9 +32,10 @@
 //! SIGKILL models *process* death: the kernel keeps the page cache, so anything
 //! the process had already handed to `write(2)` survives. It therefore proves
 //! that the engine does not publish in observable stages. It does **not** model
-//! power loss, which additionally requires the backend to have fsynced. See
-//! `rocksdb_ignores_await_durable_and_therefore_proves_only_process_crash_consistency`
-//! in this file for the separate, statically-decidable half of that question.
+//! power loss, which additionally requires the backend to have fsynced before
+//! acknowledging. See
+//! `rocksdb_honours_await_durable_by_syncing_the_wal_before_acknowledging` in
+//! this file for the separate, statically-decidable half of that question.
 //!
 //! There is a second, sharper distinction that only shows up once a second
 //! backend is swept: the two adapters do not acknowledge the same thing.
@@ -56,6 +57,10 @@
 //! and reruns the identical schedule — and reports consistency violations and
 //! lost acknowledgements in separate columns, so a durability contract
 //! difference is never collapsed into a corruption-shaped number.
+//!
+//! What that flag *does* on RocksDB is not observable from inside the process —
+//! it is an fsync, and only power loss can reveal whether it happened. It is
+//! therefore verified by an strace census (PR #1392) rather than by this sweep.
 //!
 //! ## Cost
 //!
@@ -352,8 +357,11 @@ struct Workload {
     /// row write set — a materially different publication shape from a plain row
     /// commit, and one that widens the swept window.
     ///
-    /// Note it does **not** set `await_durable`; measured, not assumed. See
-    /// [`Workload::force_await_durable`].
+    /// Note it does **not** set `await_durable`; measured, not assumed. The
+    /// blob is written with `INSERT INTO lix_file`, and the engine raises that
+    /// flag only in the resumable media-upload session, which is exercised by
+    /// `await_durable_publication_round_trips_through_the_resumable_upload_path`
+    /// below. See also [`Workload::force_await_durable`].
     blob_bytes: usize,
     /// Force `WriteOptions::await_durable` on at the storage boundary.
     ///
@@ -1242,24 +1250,130 @@ fn slatedb_durable_acknowledgement_survives_sigkill() {
     sweep::<SlateDB>(workload);
 }
 
-/// The RocksDB adapter accepts [`WriteOptions::await_durable`] and never acts on
-/// it. The option is documented as "do not acknowledge the commit until the
-/// backend has crossed its durable persistence boundary", the engine sets it for
-/// atomic CAS publications, and the SlateDB adapter honours it.
+/// `WriteOptions::await_durable` is documented as "do not acknowledge the commit
+/// until the backend has crossed its durable persistence boundary". The engine
+/// raises it on the resumable media-upload path — the per-part commit and the
+/// finalizing CAS publication. SlateDB waits for its WAL upload; RocksDB must
+/// fsync the WAL before acknowledging.
 ///
-/// This test pins the gap rather than hiding it: it is the reason the sweep
-/// above proves process-crash consistency and *not* power-loss durability.
+/// The adapter used to accept the flag and silently drop it — `commit()` never
+/// saw the options it was opened with, and `rocksdb::WriteOptions` was never
+/// constructed at all, so every write took the C++ default `sync = false`. That
+/// was found by strace, not by reading the code, which is why this test exists:
+/// the guarantee is invisible from inside the process, so nothing else in the
+/// suite would notice it disappearing again.
+///
+/// This is deliberately a source assertion. There is no in-process observation
+/// that distinguishes a synced commit from an unsynced one — the difference
+/// only appears if the machine loses power — so pinning the code that produces
+/// the syscall is the strongest check available without `dm-log-writes`. It is
+/// paired with an strace census (in the PR body) that measured the syscall
+/// itself: two WAL fsyncs per single-part upload on the candidate, zero on the
+/// base, and an unchanged sync count on ordinary commits.
+///
+/// If this fails, re-run that census before changing it — a green suite with a
+/// silently non-syncing adapter is exactly the state this is here to prevent.
 #[test]
-fn rocksdb_ignores_await_durable_and_therefore_proves_only_process_crash_consistency() {
+fn rocksdb_honours_await_durable_by_syncing_the_wal_before_acknowledging() {
     let source = include_str!("../../rocksdb-storage/src/rocksdb.rs");
     assert!(
-        !source.contains("await_durable"),
-        "the RocksDB adapter now reads await_durable — update this qualification's scope note"
+        source.contains("await_durable: opts.await_durable"),
+        "the RocksDB adapter no longer carries await_durable from WriteOptions onto the write \
+         handle: an acknowledged content-addressed publication would again be lost on power loss"
     );
     assert!(
-        !source.contains("set_sync(true)") && !source.contains("flush_wal(true)\n"),
-        "the RocksDB adapter now syncs on commit — update this qualification's scope note"
+        source.contains("write_options.set_sync(self.await_durable)")
+            && source.contains("write_opt(self.batch, &write_options)"),
+        "the RocksDB adapter no longer syncs on an await_durable commit: `commit()` must apply the \
+         batch with `write_opt` and `set_sync(self.await_durable)`, or the durable-acknowledgement \
+         contract is silently unimplemented again"
     );
+    assert!(
+        !source.contains("write_options.set_sync(true)"),
+        "the sync must stay conditional on await_durable — an unconditional fsync makes every \
+         ordinary row commit pay for durability the caller never asked for"
+    );
+}
+
+/// Exercises the one path that actually requests durable acknowledgement, and
+/// proves that requesting it did not change what gets written.
+///
+/// This matters because the *set* of durable writers is narrower than the
+/// module docs above might suggest. `await_durable` is raised in exactly two
+/// places, both in the resumable media-upload session
+/// (`session/media_upload.rs`): the per-part commit, and the finalization,
+/// which reaches `Transaction::stage_atomic_cas_publication` — the only caller
+/// of that function. An ordinary `INSERT INTO lix_file` carrying blob content
+/// still chunks through the content-addressed path but does **not** raise the
+/// flag, so it neither syncs before nor after this fix. A test that wrote its
+/// blob with SQL would therefore assert nothing about durability while looking
+/// like it did.
+///
+/// The fsync itself is not observable from inside the process — it is verified
+/// by the strace census in the PR body, whose slope is exactly two WAL fsyncs
+/// per upload of this shape: one for the part, one for the finalization.
+#[test]
+fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
+    const UPLOAD_PATH: &str = "/durable-round-trip.bin";
+    let temp = tempfile::tempdir().expect("create durable round-trip fixture");
+    let path = temp.path().join("database");
+    // One part: well under `lix::FILE_UPLOAD_PART_BYTES`, so this is a single
+    // part commit followed by the atomic CAS publication.
+    let content = blob_for(7, 256 * 1024);
+    let expected = content.clone();
+
+    block_on(move || async move {
+        {
+            let storage = RocksDB::open(&path).expect("open durable round-trip store");
+            let lix = open_lix()
+                .with_storage(storage.clone())
+                .await
+                .expect("open durable round-trip Lix");
+            let total_size = content.len() as u64;
+            let progress = lix
+                .upsert_file_content_part(
+                    "e35-durable-round-trip".to_owned(),
+                    UPLOAD_PATH.to_owned(),
+                    0,
+                    total_size,
+                    content,
+                )
+                .await
+                .expect("publish durable round-trip upload");
+            assert_eq!(
+                progress.next_offset, total_size,
+                "the durable upload did not consume the whole part"
+            );
+            lix.close().await.expect("close durable round-trip Lix");
+        }
+
+        let storage = RocksDB::open(&path).expect("reopen durable round-trip store");
+        let lix = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("reopen durable round-trip Lix");
+        let result = lix
+            .execute(
+                "SELECT content FROM lix_file WHERE path = $1",
+                &[Value::Text(UPLOAD_PATH.to_owned())],
+            )
+            .await
+            .expect("read durable round-trip file");
+        let rows = result.rows();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the durable upload did not publish exactly one file row"
+        );
+        let observed: Vec<u8> = rows[0]
+            .get("content")
+            .expect("durable round-trip content was not a blob");
+        assert_eq!(
+            observed, expected,
+            "durable publication wrote the wrong content-addressed bytes"
+        );
+        lix.close().await.expect("close reopened durable Lix");
+    });
 }
 
 /// The SlateDB adapter's acknowledgement is the mirror image of RocksDB's, and
