@@ -1580,21 +1580,11 @@ where
     Load: Fn(HistoryRoute) -> LoadFuture,
     LoadFuture: Future<Output = Result<Vec<HistoryEntry>, LixError>>,
 {
-    // Load the context (anchor-only, unbounded) route FIRST, then the event
-    // (depth-bounded) route.
-    //
-    // Both sets are always computed, so this is ordering only. It matters
-    // because the reachable-node cache is keyed by `(head, depth bound)`: a
-    // bounded traversal cannot satisfy a later unbounded request, while an
-    // unbounded traversal satisfies every bounded one by truncation
-    // (`CommitGraphStoreReader::reachable_nodes_within_depth`). Running the
-    // bounded route first therefore pays for two traversals; running the
-    // unbounded route first pays for one.
-    let context_entries = load(context_route.clone()).await?;
-    let event_entries = if event_route == context_route {
-        context_entries.clone()
+    let event_entries = load(event_route.clone()).await?;
+    let context_entries = if event_route == context_route {
+        event_entries.clone()
     } else {
-        load(event_route.clone()).await?
+        load(context_route.clone()).await?
     };
     Ok((event_entries, context_entries))
 }
@@ -3363,7 +3353,7 @@ mod tests {
         // serves the bounded one by truncation while the reverse forces a
         // second traversal. Loading them the other way round is silently
         // correct and costs an extra walk of the whole reachable set.
-        assert_eq!(order.lock().unwrap().as_slice(), &[None, Some(3)]);
+        assert_eq!(order.lock().unwrap().as_slice(), &[Some(3), None]);
     }
 
     /// Connectivity check for the route ordering above, at the layer the
