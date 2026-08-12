@@ -52,6 +52,23 @@ static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
 static ROOT_BASE_BATCH_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static ROOT_BASE_BATCH_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_DURABLE_ROOT: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_EXACT_KEYS: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_ROOTLESS_REPLAY: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_CALLS: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_STRING_BYTES: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_ESCAPED_STRINGS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_ROWS_LOADED: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_ROW_KEY_DECODES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_ACCOUNT_ID_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_POINT_KEY_ENCODES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_POINT_KEY_ENCODE_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_REQUEST_KEY_CLONES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZE_OWNED_KEY_BUILDS: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZE_OWNED_KEY_BYTES: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZE_REVERIFY_ROWS: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
@@ -355,6 +372,127 @@ pub fn take_root_base_batch_cache_accounting() -> (u64, u64) {
         ROOT_BASE_BATCH_CACHE_HITS.swap(0, Ordering::Relaxed),
         ROOT_BASE_BATCH_CACHE_MISSES.swap(0, Ordering::Relaxed),
     )
+}
+
+pub(crate) fn record_tracked_scan_durable_root() {
+    TRACKED_SCAN_DURABLE_ROOT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_tracked_scan_exact_keys() {
+    TRACKED_SCAN_EXACT_KEYS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_tracked_scan_rootless_replay() {
+    TRACKED_SCAN_ROOTLESS_REPLAY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Which arm of `scan_batch_at_commit` ran, since the last call:
+/// `(durable_root, exact_keys, rootless_replay)`.
+///
+/// Symbol presence in a profile is not attribution — a claim about which arm
+/// executed has to come from the branch itself. This exists because inferring
+/// it from which symbols appeared got it exactly backwards once.
+pub fn take_tracked_scan_branch_accounting() -> (u64, u64, u64) {
+    (
+        TRACKED_SCAN_DURABLE_ROOT.swap(0, Ordering::Relaxed),
+        TRACKED_SCAN_EXACT_KEYS.swap(0, Ordering::Relaxed),
+        TRACKED_SCAN_ROOTLESS_REPLAY.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Per-row identity allocation on the commit-delta payload fetch.
+///
+/// Each field names the exact site it counts, because the question this
+/// answers is whether one identity is decoded, cloned and re-encoded once per
+/// row or once per batch — and a count taken at any layer above the payload
+/// fetch cannot tell those apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackedKeyAllocationCensus {
+    /// `codec::decode_key` calls, all callers.
+    pub key_decode_calls: u64,
+    /// Encoded key bytes handed to `codec::decode_key`.
+    pub key_decode_input_bytes: u64,
+    /// Heap bytes copied by `decode_key`'s `into_owned()` over what
+    /// `decode_key_borrowed` already produced — the ceiling on what a
+    /// borrow-based fix at that site can remove.
+    pub key_decode_owned_string_bytes: u64,
+    /// Of those, strings whose encoding contained an escape and so were
+    /// already `Cow::Owned` before `into_owned()` — unavoidable by borrowing.
+    pub key_decode_escaped_strings: u64,
+    /// `load_commit_delta_entry_at_index` calls: rows fetched from a packed
+    /// commit delta.
+    pub commit_delta_rows_loaded: u64,
+    /// `decode_key` calls made by `load_commit_delta_entry_at_index` itself.
+    pub commit_delta_row_key_decodes: u64,
+    /// Bytes allocated by the per-row `account_id.to_string()`.
+    pub commit_delta_account_id_bytes: u64,
+    /// Per-request `encode_key_ref` calls on the point-read commit-delta route.
+    pub commit_delta_point_key_encodes: u64,
+    pub commit_delta_point_key_encode_bytes: u64,
+    /// `TrackedStateKey` deep clones made by `load_commit_delta_change_records`
+    /// to build its request vector.
+    pub commit_delta_request_key_clones: u64,
+    pub commit_delta_request_key_clone_bytes: u64,
+    /// Owned `TrackedStateKey` values built by `materialize_index_payloads`
+    /// from keys it already holds borrowed.
+    pub materialize_owned_key_builds: u64,
+    pub materialize_owned_key_bytes: u64,
+    /// Rows that reached the post-fetch re-verification in
+    /// `materialize_index_payloads`.
+    pub materialize_reverify_rows: u64,
+}
+
+pub(crate) fn record_key_decode_owned(input_bytes: usize, owned_string_bytes: usize, escaped: u32) {
+    KEY_DECODE_OWNED_CALLS.fetch_add(1, Ordering::Relaxed);
+    KEY_DECODE_OWNED_INPUT_BYTES.fetch_add(input_bytes as u64, Ordering::Relaxed);
+    KEY_DECODE_OWNED_STRING_BYTES.fetch_add(owned_string_bytes as u64, Ordering::Relaxed);
+    KEY_DECODE_OWNED_ESCAPED_STRINGS.fetch_add(u64::from(escaped), Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_row_loaded(account_id_bytes: usize) {
+    COMMIT_DELTA_ROWS_LOADED.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_ROW_KEY_DECODES.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_ACCOUNT_ID_BYTES.fetch_add(account_id_bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_point_key_encode(bytes: usize) {
+    COMMIT_DELTA_POINT_KEY_ENCODES.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_POINT_KEY_ENCODE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_request_key_clone(bytes: usize) {
+    COMMIT_DELTA_REQUEST_KEY_CLONES.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_materialize_owned_key(bytes: usize) {
+    MATERIALIZE_OWNED_KEY_BUILDS.fetch_add(1, Ordering::Relaxed);
+    MATERIALIZE_OWNED_KEY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_materialize_reverify_row() {
+    MATERIALIZE_REVERIFY_ROWS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn take_tracked_key_allocation_census() -> TrackedKeyAllocationCensus {
+    TrackedKeyAllocationCensus {
+        key_decode_calls: KEY_DECODE_OWNED_CALLS.swap(0, Ordering::Relaxed),
+        key_decode_input_bytes: KEY_DECODE_OWNED_INPUT_BYTES.swap(0, Ordering::Relaxed),
+        key_decode_owned_string_bytes: KEY_DECODE_OWNED_STRING_BYTES.swap(0, Ordering::Relaxed),
+        key_decode_escaped_strings: KEY_DECODE_OWNED_ESCAPED_STRINGS.swap(0, Ordering::Relaxed),
+        commit_delta_rows_loaded: COMMIT_DELTA_ROWS_LOADED.swap(0, Ordering::Relaxed),
+        commit_delta_row_key_decodes: COMMIT_DELTA_ROW_KEY_DECODES.swap(0, Ordering::Relaxed),
+        commit_delta_account_id_bytes: COMMIT_DELTA_ACCOUNT_ID_BYTES.swap(0, Ordering::Relaxed),
+        commit_delta_point_key_encodes: COMMIT_DELTA_POINT_KEY_ENCODES.swap(0, Ordering::Relaxed),
+        commit_delta_point_key_encode_bytes: COMMIT_DELTA_POINT_KEY_ENCODE_BYTES
+            .swap(0, Ordering::Relaxed),
+        commit_delta_request_key_clones: COMMIT_DELTA_REQUEST_KEY_CLONES.swap(0, Ordering::Relaxed),
+        commit_delta_request_key_clone_bytes: COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES
+            .swap(0, Ordering::Relaxed),
+        materialize_owned_key_builds: MATERIALIZE_OWNED_KEY_BUILDS.swap(0, Ordering::Relaxed),
+        materialize_owned_key_bytes: MATERIALIZE_OWNED_KEY_BYTES.swap(0, Ordering::Relaxed),
+        materialize_reverify_rows: MATERIALIZE_REVERIFY_ROWS.swap(0, Ordering::Relaxed),
+    }
 }
 
 pub(crate) fn record_entity_point_snapshot_cache_hit() {

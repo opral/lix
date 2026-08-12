@@ -386,6 +386,10 @@ where
 {
     let mut by_commit = BTreeMap::<CommitId, Vec<(TrackedStateKey, ChangeId, LixTimestamp)>>::new();
     for (key, value) in entries.filter(|(_, value)| !value.deleted) {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_materialize_owned_key(
+            key.schema_key.len() + key.file_id.map_or(0, str::len),
+        );
         by_commit.entry(value.commit_id).or_default().push((
             TrackedStateKey {
                 schema_key: key.schema_key.to_owned(),
@@ -414,6 +418,8 @@ where
                     ),
                 )
             })?;
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_materialize_reverify_row();
             if record.change_id != change_id
                 || record.schema_key != key.schema_key
                 || record.file_id != key.file_id

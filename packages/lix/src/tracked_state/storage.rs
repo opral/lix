@@ -7697,6 +7697,13 @@ pub(crate) async fn load_commit_delta_change_records(
     let requests = keys
         .iter()
         .cloned()
+        .inspect(|key| {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_commit_delta_request_key_clone(
+                key.schema_key.len() + key.file_id.as_ref().map_or(0, String::len),
+            );
+            let _ = key;
+        })
         .map(|key| (commit_id, key))
         .collect::<Vec<_>>();
     Ok(load_owned_commit_delta_entries(store, &requests)
@@ -12320,6 +12327,11 @@ fn find_loaded_commit_delta_entry<S>(
 where
     S: AsRef<[u8]>,
 {
+    // One encoded key reaches the search per point request, so counting it
+    // here counts the caller's per-row `encode_key_ref` without instrumenting
+    // eleven separate call sites.
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_point_key_encode(target_key.len());
     let Some(index) = find_commit_delta_entry_index(leaf, target_key)? else {
         return Ok(None);
     };
@@ -12356,6 +12368,11 @@ where
         ));
     }
     let payload = payloads.decode(index)?;
+    // Inside the payload fetch, not above it: this is the row-granular site the
+    // profile attributed the cost to, and it is the one that re-proves an
+    // identity `find_commit_delta_entry_index` already asserted byte-equal.
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_row_loaded(account_id.len());
     let key = decode_key(entry.key)?;
     let (snapshot, metadata, origin_key, base_coordinate, selected_ref) = match payload {
         CommitDeltaPayload::Authored(payload) => (

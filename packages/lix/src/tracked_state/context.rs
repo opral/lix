@@ -1071,6 +1071,12 @@ where
         let materialization = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let durable_root = self.tree.load_root(&self.store, commit_id).await?;
         if request_has_exact_keys(&tree_request) || durable_root.is_some() {
+            #[cfg(feature = "storage-benches")]
+            if durable_root.is_some() {
+                crate::storage_bench::record_tracked_scan_durable_root();
+            } else {
+                crate::storage_bench::record_tracked_scan_exact_keys();
+            }
             let mut entries = self
                 .index_entries_from_exact_or_durable_root(
                     commit_id,
@@ -1088,6 +1094,8 @@ where
                 .await;
         }
 
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_tracked_scan_rootless_replay();
         let replay = self
             .replay_index_batch_for_request_at_commit(commit_id, &tree_request)
             .await?;
