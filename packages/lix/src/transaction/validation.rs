@@ -6245,8 +6245,61 @@ mod tests {
             }
         }
 
+        for key in pending_constraints.fk_references.keys() {
+            eprintln!("PROBE reference target key = {key:?}");
+        }
+        for tombstone in &pending_constraints.tombstones {
+            eprintln!(
+                "PROBE tombstone identity = {tombstone:?} value = {:?}",
+                UniqueConstraintValue::from_entity_pk(tombstone.identity.entity_pk())
+            );
+        }
+
         let error = validate_pending_delete_restrictions(&catalog, &pending_constraints)
             .expect_err("staged file child must block the staged directory delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    #[test]
+    fn pending_delete_restriction_control_generic_schema_pair() {
+        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let mut parent_delete = fk_parent_row("parent-1", branch_id);
+        parent_delete.snapshot = None;
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![parent_delete, fk_child_row("child-1", "parent-1", branch_id)],
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let catalog = CatalogSnapshot::from_visible_schemas(&visible_schemas)
+            .expect("fk schemas should compile");
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            match row.snapshot_json() {
+                Some(snapshot) => {
+                    let (_, schema_plan) = catalog
+                        .plan_for_key(row.schema_key())
+                        .expect("schema plan should resolve");
+                    pending_constraints
+                        .remember_foreign_key_references(row, schema_plan, snapshot)
+                        .expect("foreign-key references should index");
+                }
+                None => pending_constraints.remember_tombstone(row),
+            }
+        }
+        for key in pending_constraints.fk_references.keys() {
+            eprintln!("CONTROL reference target key = {key:?}");
+        }
+        for tombstone in &pending_constraints.tombstones {
+            eprintln!(
+                "CONTROL tombstone identity = {tombstone:?} value = {:?}",
+                UniqueConstraintValue::from_entity_pk(tombstone.identity.entity_pk())
+            );
+        }
+
+        let error = validate_pending_delete_restrictions(&catalog, &pending_constraints)
+            .expect_err("generic staged child must block the staged parent delete");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
