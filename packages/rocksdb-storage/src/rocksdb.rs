@@ -23,8 +23,8 @@ use lix::storage::{
     WriteOptions, WriteStats,
 };
 use rocksdb::{
-    BlockBasedOptions, ChecksumType, ColumnFamily, ColumnFamilyDescriptor, DB, Direction,
-    IteratorMode, Options, WriteBatch,
+    BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
+    WriteBatch,
 };
 use rocksdb::{DBRawIteratorWithThreadMode, Snapshot};
 use tempfile::TempDir;
@@ -757,18 +757,6 @@ fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
         .map_err(|error| rocksdb_open_error(error, path))
 }
 
-/// MEASUREMENT SCAFFOLD (E24) — remove before shipping.
-///
-/// Lets one binary produce both A/B arms so the arms cannot differ in codegen.
-/// `LIX_ROCKSDB_CHECKSUM=crc32c` reproduces today's behaviour exactly.
-fn measurement_checksum_type() -> ChecksumType {
-    match std::env::var("LIX_ROCKSDB_CHECKSUM").as_deref() {
-        Ok("crc32c") => ChecksumType::CRC32c,
-        Ok("none") => ChecksumType::NoChecksum,
-        _ => ChecksumType::XXH3,
-    }
-}
-
 fn column_family_options() -> Options {
     let mut options = Options::default();
     options.set_write_buffer_size(WRITE_BUFFER_BYTES);
@@ -786,20 +774,6 @@ fn column_family_options() -> Options {
     // Full whole-key filters let missing point reads skip unrelated SST data.
     table_options.set_bloom_filter(8.0, false);
     table_options.set_optimize_filters_for_memory(true);
-    // RocksDB's default block checksum is CRC32c, and its hardware
-    // (SSE4.2 + PCLMULQDQ) implementation is selected at C++ *compile* time.
-    // `librocksdb-sys` only passes `-msse4.2 -mpclmul` when the Rust target
-    // already enables those features, and the default `x86-64` baseline does
-    // not — so every shipped build gets `ExtendImpl<DefaultCRC32>`, the
-    // table-driven software fallback. A flat profile of a 640 MiB binary-CAS
-    // read spends 34.6% of its cycles in exactly that symbol.
-    //
-    // XXH3 is a checksum of the same strength class whose speed does not
-    // depend on a compile-time ISA gate, so it is fast on every target lix
-    // ships to instead of only on hosts built with a raised baseline.
-    // Checksum type is recorded per table file: existing CRC32c files stay
-    // readable, and nothing about the key or value encoding changes.
-    table_options.set_checksum_type(measurement_checksum_type());
     options.set_block_based_table_factory(&table_options);
     options
 }
