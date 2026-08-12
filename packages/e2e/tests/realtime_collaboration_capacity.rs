@@ -191,7 +191,7 @@ impl LocalCapacityBackend {
         let mut observations = Vec::with_capacity(clients);
         for _ in 0..clients {
             let peer = root
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("collaborator session should open");
             let mut events = peer
@@ -418,7 +418,7 @@ async fn abandoned_transactions_and_sessions_release_resources() {
         let mut transactions = Vec::with_capacity(clients);
         for client in 0..clients {
             let peer = lix
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("soak session should open");
             let mut transaction = peer

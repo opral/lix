@@ -93,7 +93,7 @@ impl EngineOptions {
     /// 1.875 GiB before host-side document state. Cached actors, active
     /// existing-document transaction leases, pending publications, cold-open
     /// candidates, and upgrade preflight Stores consume the same
-    /// workspace-wide budget. Completed publications may retire their Stores
+    /// repository-wide budget. Completed publications may retire their Stores
     /// under pressure and cold-open again after commit.
     pub fn with_plugin_resource_limits(
         mut self,
@@ -223,22 +223,22 @@ where
         Ok(result)
     }
 
-    pub async fn open_session(
+    pub async fn open_session_at(
         &self,
         active_branch_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
-        self.open_session_with_account(active_branch_id, crate::ANONYMOUS_ACCOUNT_ID)
+        self.open_session_at_with_account(active_branch_id, crate::ANONYMOUS_ACCOUNT_ID)
             .await
     }
 
-    pub async fn open_session_with_account(
+    pub async fn open_session_at_with_account(
         &self,
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
         let active_account_id = active_account_id.into();
         self.validate_active_account(&active_account_id).await?;
-        SessionContext::open(
+        SessionContext::open_at(
             active_branch_id.into(),
             active_account_id,
             self.storage(),
@@ -259,18 +259,18 @@ where
         .await
     }
 
-    pub async fn open_workspace_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
-        self.open_workspace_session_with_account(crate::ANONYMOUS_ACCOUNT_ID)
+    pub async fn open_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
+        self.open_session_with_account(crate::ANONYMOUS_ACCOUNT_ID)
             .await
     }
 
-    pub async fn open_workspace_session_with_account(
+    pub async fn open_session_with_account(
         &self,
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
         let active_account_id = active_account_id.into();
         self.validate_active_account(&active_account_id).await?;
-        SessionContext::open_workspace(
+        SessionContext::open_default(
             active_account_id,
             self.storage(),
             Arc::clone(&self.hot_state),
@@ -298,7 +298,7 @@ where
     }
 
     /// Resets the process-local v2 transition aggregate used by profiling and
-    /// invariant tests. This does not mutate durable workspace state.
+    /// invariant tests. This does not mutate durable repository state.
     #[doc(hidden)]
     pub fn reset_plugin_transition_counters(&self) {
         self.plugin_host.reset_transition_counters();
@@ -994,9 +994,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
         assert_eq!(
             session
@@ -1043,9 +1043,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
 
         // These values exercise the order-preserving tracked-head codec's
@@ -1116,9 +1116,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
@@ -1167,9 +1167,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
@@ -1305,9 +1305,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
 
         let head_before = engine
@@ -1409,9 +1409,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
 
         for path in ["/clean", "/modified", "/removed", "/recycled-source"] {
@@ -1626,9 +1626,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
 
         let files = [
@@ -1867,9 +1867,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
 
         let files = ["66696c65-0000-8000-8000-000000000000", "66696c65-0001-8000-8000-000000000001"];
@@ -2040,9 +2040,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
@@ -2130,9 +2130,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
@@ -2209,7 +2209,7 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let global_session = engine
-            .open_session(GLOBAL_BRANCH_ID)
+            .open_session_at(GLOBAL_BRANCH_ID)
             .await
             .expect("global session should open");
         register_global_json_pointer_schema(&global_session).await;
@@ -2223,9 +2223,9 @@ mod tests {
             .expect("write global tracked entity row");
 
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         register_json_pointer_schema(&session).await;
         let rows = session
             .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
@@ -2251,9 +2251,9 @@ mod tests {
             .await
             .expect("initialized engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
 
         let rows = session
             .execute("SELECT id, commit_id FROM lix_branch_ref ORDER BY id", &[])
@@ -2368,7 +2368,7 @@ mod tests {
             .await
             .expect("engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session should open");
         for schema in [
@@ -2470,7 +2470,7 @@ mod tests {
             .await
             .expect("engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session should open");
         (storage, session)

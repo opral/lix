@@ -25,7 +25,18 @@ async fn rs_sdk_telemetry_is_explicit_and_redacts_sql_literals() {
     let spans = spans.lock().unwrap();
     let span = spans
         .iter()
-        .find(|span| span.start.name == "lix.sql.query")
+        .find(|span| {
+            span.start.name == "lix.sql.query"
+                && span.start.attributes.iter().any(|attribute| {
+                    matches!(
+                        (&attribute.key, &attribute.value),
+                        (
+                            &"db.query.text",
+                            TelemetryValue::String(value)
+                        ) if value == "SELECT ? AS value, ? AS number"
+                    )
+                })
+        })
         .expect("query telemetry should be emitted when configured");
     let query_text = span
         .start

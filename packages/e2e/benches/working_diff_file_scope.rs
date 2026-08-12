@@ -144,7 +144,7 @@ async fn run<StorageImpl>(
         .await
         .expect("open working-diff file-scope engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open working-diff file-scope session");
 

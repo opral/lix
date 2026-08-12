@@ -42,9 +42,9 @@ fn text(rows: &lix::ExecuteResult, column: &str) -> Option<String> {
 async fn execution_functions_follow_a_branch_switch_on_a_reused_session() {
     let engine = open_engine().await;
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     session
         .create_branch(CreateBranchOptions {
@@ -107,9 +107,9 @@ async fn execution_functions_follow_a_branch_switch_on_a_reused_session() {
 async fn active_commit_id_advances_between_executions_of_one_shape() {
     let engine = open_engine().await;
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     let sql = "SELECT lix_active_branch_commit_id() AS commit_id";
     let first = text(
@@ -143,9 +143,9 @@ async fn active_commit_id_advances_between_executions_of_one_shape() {
 async fn volatile_execution_functions_stay_fresh_on_a_reused_session() {
     let engine = open_engine().await;
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     let sql = "SELECT lix_uuid_v7() AS first, lix_uuid_v7() AS second, \
         lix_timestamp() AS stamp";
@@ -176,9 +176,9 @@ async fn volatile_execution_functions_stay_fresh_on_a_reused_session() {
 async fn a_reused_session_reads_rows_committed_after_its_plan_was_cached() {
     let engine = open_engine().await;
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     let sql = "SELECT key FROM lix_key_value WHERE key LIKE 'pooled-visibility-%' ORDER BY key";
     for round in 0..4 {
@@ -216,9 +216,9 @@ async fn a_reused_session_reads_rows_committed_after_its_plan_was_cached() {
 async fn information_schema_stays_available_across_pooled_statements() {
     let engine = open_engine().await;
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     let information_schema_sql =
         "SELECT table_name FROM information_schema.tables WHERE table_name = 'lix_key_value'";

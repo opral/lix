@@ -12,7 +12,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -35,7 +35,7 @@ simulation_test!(
                 .unwrap_or_else(|error| panic!("seed {seed:#018x}: create failed: {error:?}"));
             let source = sim.wrap_session(
                 engine
-                    .open_session(receipt.id)
+                    .open_session_at(receipt.id)
                     .await
                     .unwrap_or_else(|error| {
                         panic!("seed {seed:#018x}: source open failed: {error:?}")
@@ -126,7 +126,7 @@ simulation_test!(
                         .unwrap_or_else(|error| panic!("{label}: reopen failed: {error:?}"));
                     let reopened_main = sim.wrap_session(
                         reopened_engine
-                            .open_workspace_session()
+                            .open_session()
                             .await
                             .unwrap_or_else(|error| {
                                 panic!("{label}: reopened main failed: {error:?}")
@@ -135,7 +135,7 @@ simulation_test!(
                     );
                     let reopened_source = sim.wrap_session(
                         reopened_engine
-                            .open_session(branch_id.clone())
+                            .open_session_at(branch_id.clone())
                             .await
                             .unwrap_or_else(|error| {
                                 panic!("{label}: reopened source failed: {error:?}")

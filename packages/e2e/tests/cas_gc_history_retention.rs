@@ -81,7 +81,7 @@ where
         .await
         .expect("untracked repository should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("untracked session should open");
     session
@@ -120,7 +120,7 @@ where
         .await
         .expect("untracked repository should cold reopen");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("cold untracked session should open");
     let content = session
@@ -147,7 +147,7 @@ where
         .await
         .expect("history repository should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("history preparation session should open");
     let branch = session
@@ -160,7 +160,7 @@ where
         .expect("history disposable branch should create");
     let branch_id = branch.id;
     let branch_session = engine
-        .open_session(branch_id.clone())
+        .open_session_at(branch_id.clone())
         .await
         .expect("history disposable branch should open");
     branch_session
@@ -214,7 +214,7 @@ where
         .await
         .expect("history repository should cold reopen");
     let session = engine
-        .open_session(fixture.branch_id.clone())
+        .open_session_at(fixture.branch_id.clone())
         .await
         .expect("history disposable branch should cold reopen");
     let diff = session
@@ -242,7 +242,7 @@ where
     drop(session);
 
     let main = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("history main session should reopen");
     main.execute(
@@ -288,7 +288,7 @@ where
         .await
         .expect("final history repository should reopen");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("final history session should open");
     let branches = session

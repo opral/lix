@@ -12,9 +12,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -101,9 +101,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -136,7 +136,7 @@ simulation_test!(
         .expect("branch should be created from the recoverable auto-commit");
         let protected = sim.wrap_session(
             engine
-                .open_session("01920000-0000-7000-8000-000000000510")
+                .open_session_at("01920000-0000-7000-8000-000000000510")
                 .await
                 .expect("protected branch session should open"),
             &engine,
@@ -202,9 +202,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
         main.create_branch(CreateBranchOptions {
@@ -216,7 +216,7 @@ simulation_test!(
         .expect("other branch should be created");
         let other = sim.wrap_session(
             engine
-                .open_session("01920000-0000-7000-8000-000000000511")
+                .open_session_at("01920000-0000-7000-8000-000000000511")
                 .await
                 .expect("other branch session should open"),
             &engine,
@@ -305,9 +305,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -426,9 +426,9 @@ simulation_test!(
             .expect("engine should reopen after replay GC");
         let reopened = sim.wrap_session(
             reopened_engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("reopened workspace session should open"),
+                .expect("reopened session should open"),
             &reopened_engine,
         );
         assert_replay_gc_state(&reopened).await;

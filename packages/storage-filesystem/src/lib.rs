@@ -1,7 +1,7 @@
 //! Filesystem-backed Lix storage and synchronization.
 //!
 //! This adapter uses the RocksDB storage adapter for Lix metadata while keeping
-//! a working directory synchronized with the workspace session.
+//! a working directory synchronized with a Lix repository session.
 
 mod filesystem;
 

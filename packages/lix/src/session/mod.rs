@@ -39,7 +39,7 @@ pub use crate::common::{
 };
 pub use checkpoint::CreateCheckpointReceipt;
 pub use context::SessionContext;
-pub(crate) use context::SessionMode;
+pub(crate) use context::SessionBranch;
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecutionDisposition,
@@ -64,10 +64,10 @@ pub use undo_redo::{RedoReceipt, UndoReceipt};
 /// opaque async call contains higher-ranked references. Construction is unsafe:
 /// callers must verify that every value retained across suspension is `Send`.
 #[repr(transparent)]
-pub(super) struct AssumeSendFuture<F>(F);
+pub(crate) struct AssumeSendFuture<F>(F);
 
 impl<F> AssumeSendFuture<F> {
-    pub(super) unsafe fn new(future: F) -> Self {
+    pub(crate) unsafe fn new(future: F) -> Self {
         Self(future)
     }
 }

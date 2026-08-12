@@ -1399,7 +1399,7 @@ mod tests {
             .expect("initialize storage");
         let engine = Engine::new(storage.clone()).await.expect("open engine");
         let first_session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("open first session");
         let first = vec![0x31; FILE_UPLOAD_PART_BYTES];
@@ -1427,7 +1427,7 @@ mod tests {
         );
 
         let resumed_session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("open resumed session");
         let progress = resumed_session
@@ -1582,7 +1582,7 @@ mod tests {
             .await
             .expect("initialize storage");
         let engine = Engine::new(storage.clone()).await.expect("open engine");
-        let session = engine.open_workspace_session().await.expect("open session");
+        let session = engine.open_session().await.expect("open session");
         let total_size = 4 * FILE_UPLOAD_PART_BYTES as u64;
 
         let second = session.upsert_file_content_part(

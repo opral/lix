@@ -1745,7 +1745,7 @@ where
         let child = match self
             .inner
             .root
-            .open_session_with_account(active_branch_id, active_account_id)
+            .open_session_at_with_account(active_branch_id, active_account_id)
             .await
         {
             Ok(child) => child,
@@ -9655,8 +9655,11 @@ mod tests {
         let spans = spans.lock().expect("capture spans");
         let sql_span = spans
             .iter()
-            .find(|span| span.name == "lix.sql.query")
-            .expect("SQL span");
+            .find(|span| {
+                span.name == "lix.sql.query"
+                    && span.parent.as_ref() == Some(&protocol_span_id)
+            })
+            .expect("SQL span under protocol request");
         assert_eq!(sql_span.parent.as_ref(), Some(&protocol_span_id));
     }
 

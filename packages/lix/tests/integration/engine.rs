@@ -18,14 +18,14 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("initialized storage should open global session"),
             &engine,
         );
         let main_session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("initialized storage should open main session"),
             &engine,
@@ -103,7 +103,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open a session"),
             &engine,
@@ -156,7 +156,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("storage should open a session");
 
@@ -196,7 +196,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("storage should open a session");
 
@@ -275,7 +275,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("storage should open a session");
         let cloned_session = session.clone();
@@ -305,7 +305,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open first session"),
             &engine,
@@ -339,7 +339,7 @@ simulation_test!(
 
         let second_session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open second session"),
             &engine,
@@ -384,7 +384,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open a session"),
             &engine,
@@ -445,7 +445,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open first session"),
             &engine,
@@ -462,7 +462,7 @@ simulation_test!(
 
         let second_session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open second session"),
             &engine,
@@ -503,7 +503,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open first session"),
             &engine,
@@ -519,7 +519,7 @@ simulation_test!(
             .expect("deterministic mode insert should succeed");
         let second_session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("storage should open second session"),
             &engine,

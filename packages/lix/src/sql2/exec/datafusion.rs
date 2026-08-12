@@ -5031,7 +5031,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
         session
@@ -5141,7 +5141,7 @@ mod tests {
         let storage = Memory::new();
         let init_receipt = Engine::initialize(storage.clone()).await?;
         let engine = Engine::new(storage).await?;
-        let session = engine.open_session(init_receipt.main_branch_id).await?;
+        let session = engine.open_session_at(init_receipt.main_branch_id).await?;
 
         session
             .execute(
@@ -5199,7 +5199,7 @@ mod tests {
         let engine = Engine::new(storage).await.expect("engine should open");
         let branch_id = init_receipt.main_branch_id.clone();
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
         session
@@ -5331,7 +5331,7 @@ mod tests {
             .await
             .expect("branching from the deleted collection should succeed");
         let checkout_session = engine
-            .open_session(checkout.id)
+            .open_session_at(checkout.id)
             .await
             .expect("checkout branch session should open");
         let selected = checkout_session
@@ -5384,7 +5384,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
         session
@@ -5516,7 +5516,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
         session
@@ -5565,7 +5565,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let main = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("main session should open");
         main.execute(
@@ -5594,7 +5594,7 @@ mod tests {
             .await
             .expect("source branch should create");
         let source_session = engine
-            .open_session(source.id.clone())
+            .open_session_at(source.id.clone())
             .await
             .expect("source session should open");
         let deleted = source_session
@@ -5641,7 +5641,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
 
@@ -5703,7 +5703,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_branch_id)
+            .open_session_at(init_receipt.main_branch_id)
             .await
             .expect("session should open");
 

@@ -156,9 +156,9 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
         .await
         .expect("open engine over initialized repository");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("open workspace session");
+        .expect("open session");
 
     let schema = serde_json::json!({
         "x-lix-key": "json_pointer",
@@ -229,9 +229,9 @@ async fn update<S: BenchStorage>(storage: S, updates: usize, width: usize, disti
         .await
         .expect("open engine over initialized repository");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("open workspace session");
+        .expect("open session");
 
     let mut applied = 0_usize;
     while applied < updates {
@@ -271,9 +271,9 @@ async fn read_rows<S: BenchStorage>(storage: S, reads: usize, distinct: usize) {
         .await
         .expect("open engine over initialized repository");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("open workspace session");
+        .expect("open session");
 
     // Warm the plan cache so the measurement is the read, not planning.
     for index in 0..distinct.min(16) {

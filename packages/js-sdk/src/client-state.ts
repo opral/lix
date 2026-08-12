@@ -2,7 +2,6 @@ import type { LixBinding } from "./binding-types.js";
 import type { JsonValue } from "./types.js";
 import { Value } from "./value.js";
 
-export const ACTIVE_BRANCH_CLIENT_STATE_KEY = "lix_active_branch_id";
 export const ACTIVE_ACCOUNT_CLIENT_STATE_KEY = "lix_active_account_id";
 
 export type LixClientState = {

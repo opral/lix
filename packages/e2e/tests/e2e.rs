@@ -887,8 +887,8 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         .get::<String>("id")
         .unwrap();
 
-    let first = lix.open_workspace_session().await.unwrap();
-    let second = lix.open_workspace_session().await.unwrap();
+    let first = lix.open_session().await.unwrap();
+    let second = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&first, path).await.unwrap(),
         Some(initial.clone())
@@ -918,8 +918,8 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
 
     // Both sessions observed the same row version. Transaction commit order is
     // the deterministic LWW tiebreaker for their edits to that row.
-    let lww_first = lix.open_workspace_session().await.unwrap();
-    let lww_second = lix.open_workspace_session().await.unwrap();
+    let lww_first = lix.open_session().await.unwrap();
+    let lww_second = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&lww_first, path).await.unwrap(),
         Some(composed.clone())
@@ -945,8 +945,8 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     // A deletion detected from a historical private view is applied to the
     // current renderer document, so an earlier same-row edit does not revive
     // the deleted identity.
-    let edit_session = lix.open_workspace_session().await.unwrap();
-    let delete_session = lix.open_workspace_session().await.unwrap();
+    let edit_session = lix.open_session().await.unwrap();
+    let delete_session = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&edit_session, path).await.unwrap(),
         Some(lww.clone())
@@ -971,7 +971,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
 
     // Conflict objects are not modeled yet. A session that never received the
     // file therefore applies its complete submitted document as last-write-wins.
-    let blind = lix.open_workspace_session().await.unwrap();
+    let blind = lix.open_session().await.unwrap();
     write_file(&blind, path, b"first,ONE\n".to_vec())
         .await
         .unwrap();
@@ -980,7 +980,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
 
     // A rolled-back successor is discarded; the accepted actor and its exact
     // observation remain usable for a later committed transition.
-    let rollback_session = lix.open_workspace_session().await.unwrap();
+    let rollback_session = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&rollback_session, path).await.unwrap(),
         Some(one_row.clone())
@@ -1006,7 +1006,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         Some(b"first,COMMITTED\n".to_vec())
     );
 
-    let insert_session = lix.open_workspace_session().await.unwrap();
+    let insert_session = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&insert_session, path).await.unwrap(),
         Some(b"first,COMMITTED\n".to_vec())
@@ -1061,8 +1061,8 @@ async fn v2_csv_stale_observation_composes_a_keyless_create_with_a_concurrent_ed
         .get::<String>("id")
         .unwrap();
 
-    let edit_session = lix.open_workspace_session().await.unwrap();
-    let create_session = lix.open_workspace_session().await.unwrap();
+    let edit_session = lix.open_session().await.unwrap();
+    let create_session = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&edit_session, path).await.unwrap(),
         Some(initial.clone())
@@ -3501,8 +3501,8 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
     let file_id = file_id_at_path(&lix, path).await;
 
     // Different scalar changes from the same observed document compose.
-    let left_writer = lix.open_workspace_session().await.unwrap();
-    let right_writer = lix.open_workspace_session().await.unwrap();
+    let left_writer = lix.open_session().await.unwrap();
+    let right_writer = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&left_writer, path).await.unwrap(),
         Some(initial.clone())
@@ -3534,8 +3534,8 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(composed.clone()));
 
     // Commit order is the deterministic LWW tiebreaker for the same scalar.
-    let first_lww = lix.open_workspace_session().await.unwrap();
-    let second_lww = lix.open_workspace_session().await.unwrap();
+    let first_lww = lix.open_session().await.unwrap();
+    let second_lww = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&first_lww, path).await.unwrap(),
         Some(composed.clone())
@@ -3619,8 +3619,8 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
 
     // Structure is byte-owned. A stale scalar delta is not allowed to
     // recreate an entity after another writer removes its containing slot.
-    let stale_writer = lix.open_workspace_session().await.unwrap();
-    let structure_writer = lix.open_workspace_session().await.unwrap();
+    let stale_writer = lix.open_session().await.unwrap();
+    let structure_writer = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&stale_writer, path).await.unwrap(),
         Some(scalar_after_direct_reject.clone())
@@ -7118,7 +7118,7 @@ async fn same_base_json_transactions_resolve_overlap_and_converge() {
         .await
         .unwrap();
     let file_id = file_id_at_path(&first, path).await;
-    let second = first.open_workspace_session().await.unwrap();
+    let second = first.open_session().await.unwrap();
     let mut first_transaction = first.begin_transaction().await.unwrap();
     let mut second_transaction = second.begin_transaction().await.unwrap();
     for (transaction, value) in [
@@ -7167,7 +7167,7 @@ async fn same_base_json_file_edits_compose_disjoint_semantics_without_resolution
     write_file(&first, path, b"{\"a\":\"base\",\"b\":\"base\"}\n".to_vec())
         .await
         .unwrap();
-    let second = first.open_workspace_session().await.unwrap();
+    let second = first.open_session().await.unwrap();
     let mut first_transaction = first.begin_transaction().await.unwrap();
     let mut second_transaction = second.begin_transaction().await.unwrap();
     first_transaction
@@ -7225,7 +7225,7 @@ async fn stale_json_transaction_renders_retained_same_file_edits_with_resolution
     )
     .await
     .unwrap();
-    let winner_client = stale_client.open_workspace_session().await.unwrap();
+    let winner_client = stale_client.open_session().await.unwrap();
     let mut stale = stale_client.begin_transaction().await.unwrap();
     let mut winner = winner_client.begin_transaction().await.unwrap();
     stale
@@ -7299,7 +7299,7 @@ async fn stale_json_transaction_batches_conflicts_into_one_render_transition() {
     )
     .await
     .unwrap();
-    let winner_client = stale_client.open_workspace_session().await.unwrap();
+    let winner_client = stale_client.open_session().await.unwrap();
     let mut stale = stale_client.begin_transaction().await.unwrap();
     let mut winner = winner_client.begin_transaction().await.unwrap();
     for (transaction, value) in [(&mut stale, "stale"), (&mut winner, "winner")] {
@@ -7378,7 +7378,7 @@ async fn stale_plugin_replay_batch_benchmark_probe() {
         )
         .await
         .unwrap();
-        let winner_client = stale_client.open_workspace_session().await.unwrap();
+        let winner_client = stale_client.open_session().await.unwrap();
         let mut stale = stale_client.begin_transaction().await.unwrap();
         let mut winner = winner_client.begin_transaction().await.unwrap();
         for (transaction, value) in [(&mut stale, "stale"), (&mut winner, "winner")] {
@@ -7475,7 +7475,7 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
         install_reference_plugin_in_blank_registry(&first, plugin_key, &archive, &schemas).await;
         let path = format!("/transaction-conflict.{extension}");
         write_file(&first, &path, base.clone()).await.unwrap();
-        let second = first.open_workspace_session().await.unwrap();
+        let second = first.open_session().await.unwrap();
         let mut first_transaction = first.begin_transaction().await.unwrap();
         let mut second_transaction = second.begin_transaction().await.unwrap();
         for (transaction, bytes) in [
@@ -8784,7 +8784,7 @@ async fn v2_csv_file_incarnation_fences_old_observations_after_delete_and_recrea
     let old_bytes = b"old,incarnation\n".to_vec();
     write_file(&lix, path, old_bytes.clone()).await.unwrap();
     let old_file_id = file_id_at_path(&lix, path).await;
-    let stale = lix.open_workspace_session().await.unwrap();
+    let stale = lix.open_session().await.unwrap();
     assert_eq!(read_file(&stale, path).await.unwrap(), Some(old_bytes));
 
     lix.execute(
@@ -8873,7 +8873,7 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
     let bytes = b"first,one\nsecond,two\n".to_vec();
     write_file(&lix, path, bytes.clone()).await.unwrap();
 
-    let stale = lix.open_workspace_session().await.unwrap();
+    let stale = lix.open_session().await.unwrap();
     assert_eq!(read_file(&stale, path).await.unwrap(), Some(bytes.clone()));
 
     // A packaging-only archive generation change exercises the complete
@@ -8935,7 +8935,7 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
         "failed upgrades must leave the compatible generation authoritative"
     );
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(bytes.clone()));
-    let fresh = lix.open_workspace_session().await.unwrap();
+    let fresh = lix.open_session().await.unwrap();
     assert_eq!(read_file(&fresh, path).await.unwrap(), Some(bytes));
     fresh.reset_plugin_transition_counters();
     write_file(&fresh, path, b"first,ONE\nsecond,two\n".to_vec())
@@ -9117,7 +9117,7 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
 
     // This reader must become stale solely because the accepted actor moves
     // to the descriptor-successor key, not because file bytes changed.
-    let stale = lix.open_workspace_session().await.unwrap();
+    let stale = lix.open_session().await.unwrap();
     assert_eq!(
         read_file(&stale, before_path).await.unwrap(),
         Some(initial.clone())
@@ -9126,7 +9126,7 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
     // A path-only UPDATE is ordinary SQL. Its DML source reads the exact
     // materialized bytes and establishes the observation needed for the warm
     // empty-splice descriptor transition.
-    let renamer = lix.open_workspace_session().await.unwrap();
+    let renamer = lix.open_session().await.unwrap();
     let renamed = renamer
         .execute(
             "UPDATE lix_file SET path = $1 WHERE path = $2",
@@ -9649,7 +9649,7 @@ async fn lix_owned_sql_write_semantics_rocksdb_reopen() {
     let lix = open_rocksdb_lix(root.path()).await;
     qualify_lix_owned_sql_write_semantics(&lix, "rocks").await;
     let winner = lix
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open winner RocksDB session");
     qualify_stale_sql_write_owner(&lix, &winner, "rocks").await;
@@ -9680,7 +9680,7 @@ async fn lix_owned_sql_write_semantics_slatedb_reopen() {
         .expect("open SQL write-owner workspace");
     qualify_lix_owned_sql_write_semantics(&lix, "slate").await;
     let winner = lix
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open winner SlateDB session");
     qualify_stale_sql_write_owner(&lix, &winner, "slate").await;

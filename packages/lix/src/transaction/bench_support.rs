@@ -17,7 +17,7 @@ use crate::hot_state::{
     CurrentStateDeltaRef, HotStateContext, HotStateFilter, HotStateProjection,
     HotStateRowRequest, HotStateScanRequest, TrackedHeadContext, WorkingDiffIndexCoverage,
 };
-use crate::session::SessionMode;
+use crate::session::SessionBranch;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteSet,
@@ -297,9 +297,7 @@ where
     async fn commit_rows(&mut self, rows: RawWriteBatch) -> BenchWriteAccounting {
         let logical_rows = rows.len();
         let opened = super::open_transaction(
-            &SessionMode::Pinned {
-                branch_id: Arc::new(std::sync::RwLock::new(BENCH_BRANCH_ID.to_string())),
-            },
+            &SessionBranch::new(BENCH_BRANCH_ID.to_string()),
             crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             self.storage.clone(),
             Arc::clone(&self.hot_state),

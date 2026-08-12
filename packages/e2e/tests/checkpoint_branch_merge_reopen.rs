@@ -101,7 +101,7 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
         assert_eq!(branch.commit_id, fork_commit_id);
 
         let source = main
-            .open_session(SOURCE_BRANCH_ID)
+            .open_session_at(SOURCE_BRANCH_ID)
             .await
             .expect("open source branch");
         source

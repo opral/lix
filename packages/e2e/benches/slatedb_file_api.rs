@@ -684,7 +684,7 @@ impl SeededStore {
             .await
             .expect("open SlateDB file benchmark engine");
         let session = engine
-            .open_session(init_receipt.main_branch_id.clone())
+            .open_session_at(init_receipt.main_branch_id.clone())
             .await
             .expect("open SlateDB file benchmark session");
 
@@ -718,7 +718,7 @@ impl SeededStore {
             .await
             .expect("reopen SlateDB file benchmark engine");
         let session = engine
-            .open_session(self.main_branch_id.clone())
+            .open_session_at(self.main_branch_id.clone())
             .await
             .expect("reopen SlateDB file benchmark session");
         (session, cache_dir)
@@ -752,7 +752,7 @@ impl UploadBenchFixture {
             .await
             .expect("open SlateDB upload benchmark engine");
         let session = engine
-            .open_session(seeded.main_branch_id)
+            .open_session_at(seeded.main_branch_id)
             .await
             .expect("open SlateDB upload benchmark session");
         seeded.object_store.set_delay(delay);
@@ -1184,7 +1184,7 @@ impl FreshEngineSelectBenchFixture {
             .await
             .expect("open fresh-engine SlateDB benchmark engine");
         engine
-            .open_session(self.main_branch_id.clone())
+            .open_session_at(self.main_branch_id.clone())
             .await
             .expect("open fresh-engine SlateDB benchmark session")
     }
@@ -1219,7 +1219,7 @@ async fn lixray_download_file(engine: &Engine<SlateDB>, branch_id: &str, file_id
         "seeded lifecycle branch should exist"
     );
     let session = engine
-        .open_session(branch_id.to_string())
+        .open_session_at(branch_id.to_string())
         .await
         .expect("open lifecycle session");
     download_file(&session, file_id).await

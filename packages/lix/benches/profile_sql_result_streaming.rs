@@ -249,7 +249,7 @@ async fn seed_fixture(rows: usize) -> SessionContext<Memory> {
         .await
         .expect("open result streaming profile engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open result streaming profile session");
     let rows_per_table = rows.div_ceil(PARTITIONS);

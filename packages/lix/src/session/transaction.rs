@@ -60,7 +60,7 @@ where
             .await;
         let (mut opened, deterministic_runtime_guard) =
             match open_transaction_with_runtime_boundary(
-                &self.mode,
+                &self.branch,
                 self.active_account_id.to_string(),
                 self.storage.clone(),
                 Arc::clone(&self.hot_state),

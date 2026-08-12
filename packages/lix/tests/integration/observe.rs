@@ -17,11 +17,11 @@ const NEXT_TIMEOUT: Duration = Duration::from_secs(1);
 const NO_EVENT_TIMEOUT: Duration = Duration::from_millis(250);
 const KEY_VALUE_SQL: &str = "SELECT key, value FROM lix_key_value WHERE key = $1 ORDER BY key";
 
-async fn open_workspace_session(sim: &Simulation, engine: &Engine) -> (SessionContext, SimSession) {
+async fn open_default_session(sim: &Simulation, engine: &Engine) -> (SessionContext, SimSession) {
     let raw_session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
     let session = sim.wrap_session(raw_session.clone(), engine);
     (raw_session, session)
 }
@@ -70,7 +70,7 @@ fn assert_key_value_row(event: &ObserveEvent, key: &str, value: &str) {
 
 simulation_test!(observe_next_returns_initial_snapshot, |sim| async move {
     let engine = sim.boot_engine().await;
-    let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+    let (raw_session, session) = open_default_session(&sim, &engine).await;
     session
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('observe-initial', 'v0')",
@@ -90,7 +90,7 @@ simulation_test!(observe_next_returns_initial_snapshot, |sim| async move {
 
 simulation_test!(observe_follows_in_place_branch_switch, |sim| async move {
     let engine = sim.boot_engine().await;
-    let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+    let (raw_session, session) = open_default_session(&sim, &engine).await;
     session
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('observe-switch', 'main')",
@@ -154,9 +154,9 @@ async fn observe_initial_next_waits_without_rejecting_same_session_write() {
     let engine = Engine::new(storage).await.expect("engine should open");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
     let mut warmup = session
         .observe("SELECT 1", &[])
@@ -215,9 +215,9 @@ async fn observe_close_during_initial_evaluation_does_not_publish_a_final_snapsh
     let engine = Engine::new(storage).await.expect("engine should open");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
     let mut events = session
         .observe("SELECT 1", &[])
@@ -268,9 +268,9 @@ async fn observe_registration_allows_automatic_write_instead_of_rejecting() {
     let engine = Engine::new(storage).await.expect("engine should open");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
 
     gate.block_next();
@@ -317,9 +317,9 @@ async fn observe_initial_next_waits_for_automatic_write_instead_of_rejecting() {
     let engine = Engine::new(storage).await.expect("engine should open");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
     let params = [Value::Text("observe-after-automatic-write".to_string())];
     let mut events = session
@@ -368,7 +368,7 @@ simulation_test!(
     observe_emits_after_committed_mutation_changes_result,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
         let mut events = observe_key(&raw_session, "observe-update");
 
         let initial = next_event(&mut events, "initial empty snapshot").await;
@@ -397,8 +397,8 @@ simulation_test!(
     observe_sees_mutation_from_another_session,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (observer_raw_session, _) = open_workspace_session(&sim, &engine).await;
-        let (_, writer_session) = open_workspace_session(&sim, &engine).await;
+        let (observer_raw_session, _) = open_default_session(&sim, &engine).await;
+        let (_, writer_session) = open_default_session(&sim, &engine).await;
         let mut events = observe_key(&observer_raw_session, "observe-cross-session");
 
         let initial = next_event(&mut events, "initial empty snapshot").await;
@@ -426,7 +426,7 @@ simulation_test!(
     observe_does_not_emit_for_read_only_execute,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
         let mut events = observe_key(&raw_session, "observe-read-only");
         let _initial = next_event(&mut events, "initial snapshot").await;
 
@@ -443,7 +443,7 @@ simulation_test!(
     observe_does_not_emit_when_unrelated_mutation_leaves_rows_unchanged,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
         let mut events = observe_key(&raw_session, "observe-target");
         let _initial = next_event(&mut events, "initial snapshot").await;
 
@@ -461,7 +461,7 @@ simulation_test!(
 
 simulation_test!(observe_does_not_emit_after_failed_write, |sim| async move {
     let engine = sim.boot_engine().await;
-    let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+    let (raw_session, session) = open_default_session(&sim, &engine).await;
     let mut events = observe_key(&raw_session, "observe-failed-write");
     let initial = next_event(&mut events, "initial empty snapshot").await;
     assert!(initial.rows.is_empty());
@@ -491,7 +491,7 @@ simulation_test!(
     observe_emits_only_after_explicit_transaction_commit,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
         let mut events = observe_key(&raw_session, "observe-transaction");
         let _initial = next_event(&mut events, "initial snapshot").await;
 
@@ -523,7 +523,7 @@ simulation_test!(
     observe_does_not_emit_after_explicit_transaction_rollback,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
         let mut events = observe_key(&raw_session, "observe-rollback");
         let _initial = next_event(&mut events, "initial snapshot").await;
 
@@ -563,7 +563,7 @@ simulation_test!(
     observe_coalesces_multiple_writes_before_next_into_latest_snapshot,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
         let mut events = observe_key(&raw_session, "observe-coalesce");
         let initial = next_event(&mut events, "initial snapshot").await;
         assert!(initial.rows.is_empty());
@@ -598,7 +598,7 @@ simulation_test!(
     observe_multiple_observers_receive_updates_independently,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
         let mut events_a = observe_key(&raw_session, "observe-multi");
         let mut events_b = observe_key(&raw_session, "observe-multi");
         let initial_a = next_event(&mut events_a, "first initial snapshot").await;
@@ -635,9 +635,9 @@ async fn observe_identical_queries_share_one_evaluation_per_generation() {
         .await
         .expect("engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
     let params = [Value::Text("observe-singleflight".to_string())];
     let mut first = session
         .observe(KEY_VALUE_SQL, &params)
@@ -681,9 +681,9 @@ async fn closing_retained_observer_releases_external_watcher_demand() {
         .await
         .expect("engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
     let mut events = session
         .observe("SELECT 1", &[])
         .expect("observe should open");
@@ -711,7 +711,7 @@ simulation_test!(
     observe_new_subscriber_receives_current_rows_after_unchanged_generation,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('observe-current', 'v0')",
@@ -760,7 +760,7 @@ simulation_test!(
     observe_rejects_durable_runtime_functions,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, _) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, _) = open_default_session(&sim, &engine).await;
 
         match raw_session.observe("SELECT lix_uuid_v7()", &[]) {
             Ok(_) => panic!("observe should reject durable runtime functions"),
@@ -779,9 +779,9 @@ simulation_test!(
     observe_next_rejects_active_transaction_even_when_shared_cache_is_warm,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (blocked_raw_session, _) = open_workspace_session(&sim, &engine).await;
-        let (cache_raw_session, _) = open_workspace_session(&sim, &engine).await;
-        let (_, writer_session) = open_workspace_session(&sim, &engine).await;
+        let (blocked_raw_session, _) = open_default_session(&sim, &engine).await;
+        let (cache_raw_session, _) = open_default_session(&sim, &engine).await;
+        let (_, writer_session) = open_default_session(&sim, &engine).await;
         let params = [Value::Text("observe-active-transaction-cache".to_string())];
         let mut blocked_events = blocked_raw_session
             .observe(KEY_VALUE_SQL, &params)
@@ -830,7 +830,7 @@ simulation_test!(
 
 simulation_test!(observe_close_makes_next_return_none, |sim| async move {
     let engine = sim.boot_engine().await;
-    let (raw_session, _) = open_workspace_session(&sim, &engine).await;
+    let (raw_session, _) = open_default_session(&sim, &engine).await;
     let mut events = observe_key(&raw_session, "observe-close");
     let _initial = next_event(&mut events, "initial snapshot").await;
 
@@ -845,7 +845,7 @@ simulation_test!(observe_close_makes_next_return_none, |sim| async move {
 
 simulation_test!(observe_rejects_closed_session, |sim| async move {
     let engine = sim.boot_engine().await;
-    let (raw_session, _) = open_workspace_session(&sim, &engine).await;
+    let (raw_session, _) = open_default_session(&sim, &engine).await;
 
     raw_session
         .close()
@@ -861,7 +861,7 @@ simulation_test!(observe_rejects_closed_session, |sim| async move {
 
 simulation_test!(observe_rejects_active_transaction, |sim| async move {
     let engine = sim.boot_engine().await;
-    let (raw_session, _) = open_workspace_session(&sim, &engine).await;
+    let (raw_session, _) = open_default_session(&sim, &engine).await;
     let transaction = raw_session
         .begin_transaction()
         .await
@@ -883,7 +883,7 @@ simulation_test!(
     observe_pending_next_returns_none_when_session_closes,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, _) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, _) = open_default_session(&sim, &engine).await;
         let mut events = observe_key(&raw_session, "observe-session-close");
         let _initial = next_event(&mut events, "initial snapshot").await;
 
@@ -1184,7 +1184,7 @@ simulation_test!(
     },
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \

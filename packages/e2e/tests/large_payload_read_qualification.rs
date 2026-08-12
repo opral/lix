@@ -437,7 +437,7 @@ where
         .await
         .expect("open media qualification engine");
     let main = engine
-        .open_session(&main_branch_id)
+        .open_session_at(&main_branch_id)
         .await
         .expect("open qualification main session");
 
@@ -574,7 +574,7 @@ where
     );
 
     let source = engine
-        .open_session(&branch.id)
+        .open_session_at(&branch.id)
         .await
         .expect("open large media source branch");
     let branch_range = measured(
@@ -829,7 +829,7 @@ async fn qualify_reopen<S>(
     .await
     .expect("reopen media qualification engine");
     let main = engine
-        .open_session(&expected.main_branch_id)
+        .open_session_at(&expected.main_branch_id)
         .await
         .expect("open reopened main session");
     let read = measured(

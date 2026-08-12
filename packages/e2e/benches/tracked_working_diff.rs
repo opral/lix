@@ -404,7 +404,7 @@ async fn setup<StorageImpl>(
         .await
         .expect("open tracked-working-diff engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open tracked-working-diff session");
     register_schema(&session).await;
@@ -468,7 +468,7 @@ async fn measure<StorageImpl>(
         .await
         .expect("open tracked-working-diff engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open tracked-working-diff session");
 
@@ -520,7 +520,7 @@ async fn measure_history<StorageImpl>(
         .await
         .expect("open tracked-working-diff engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open tracked-working-diff session");
     let expected_changes = working_diff_count(&session).await;
@@ -573,7 +573,7 @@ where
         .await
         .expect("open tracked-working-diff engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open tracked-working-diff session");
     let before = working_diff_count(&session).await;
@@ -617,7 +617,7 @@ async fn measure_merge_preview<StorageImpl>(
         .await
         .expect("open merge-preview engine");
     let target = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open merge-preview target session");
     register_schema(&target).await;
@@ -635,7 +635,7 @@ async fn measure_merge_preview<StorageImpl>(
         .await
         .expect("create merge-preview source branch");
     let source = engine
-        .open_session(MERGE_PREVIEW_SOURCE_BRANCH_ID)
+        .open_session_at(MERGE_PREVIEW_SOURCE_BRANCH_ID)
         .await
         .expect("open merge-preview source session");
 
@@ -709,7 +709,7 @@ async fn measure_merge_commit<StorageImpl>(
         .await
         .expect("open merge-commit engine");
     let target = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open merge-commit target session");
     register_schema(&target).await;
@@ -731,7 +731,7 @@ async fn measure_merge_commit<StorageImpl>(
             .await
             .expect("create merge-commit source branch");
         let source = engine
-            .open_session(&source_branch_id)
+            .open_session_at(&source_branch_id)
             .await
             .expect("open merge-commit source session");
         update_commit_range(

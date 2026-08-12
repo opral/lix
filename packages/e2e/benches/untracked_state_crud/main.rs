@@ -1075,12 +1075,12 @@ where
         .expect("initialize benchmark engine");
     let engine = Engine::new(storage).await.expect("open in-memory engine");
     let setup = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open benchmark setup session");
     register_json_pointer_schema(&setup).await;
     engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open benchmark session")
 }

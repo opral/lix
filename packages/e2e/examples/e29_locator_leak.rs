@@ -128,7 +128,7 @@ async fn main() {
             .await
             .expect("open locator engine");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("open locator workspace");
         register_schema(&session).await;

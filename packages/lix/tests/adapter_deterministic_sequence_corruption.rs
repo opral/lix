@@ -22,9 +22,9 @@ where
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
     session
         .execute(
             "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
@@ -41,9 +41,9 @@ where
 {
     let engine = Engine::new(storage).await.expect("engine should reopen");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should reopen");
+        .expect("session should reopen");
     let result = session
         .execute("SELECT lix_uuid_v7() AS value", &[])
         .await
@@ -143,7 +143,7 @@ where
         .await
         .expect("member-corrupt repository should open structurally");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("member-corrupt session should open");
     let error = session

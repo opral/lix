@@ -257,7 +257,7 @@ mod tests {
             .await
             .expect("profile test engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("profile test session should open");
         let schema = serde_json::json!({
@@ -324,7 +324,7 @@ mod tests {
             .await
             .expect("rows-examined engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("rows-examined session should open");
         let schema = serde_json::json!({
@@ -404,7 +404,7 @@ mod tests {
             .await
             .expect("profile cancellation engine should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("profile cancellation session should open");
 

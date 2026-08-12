@@ -1,14 +1,7 @@
-use serde_json::json;
-
-use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::storage_adapter::{SharedStorageAdapterRead, Storage, StorageReadOptions};
-use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
-
-use super::context::{SessionContext, SessionMode, WORKSPACE_BRANCH_KEY};
-
-const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
+use super::context::SessionContext;
 
 /// Options for switching a session to another branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,116 +19,40 @@ impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    /// Switches the session's active branch selector.
+    /// Switches this session's active branch.
     ///
-    /// Pinned sessions update their in-memory selector. Workspace sessions
-    /// additionally persist the workspace selector. Clones of this session
-    /// observe the switch in place; independently opened sessions retain the
-    /// branch snapshot they opened with.
+    /// Clones of this session observe the switch in place. Independently
+    /// opened sessions and the repository's default branch are unchanged.
     pub async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
     ) -> Result<SwitchBranchReceipt, LixError> {
         let branch_id = options.branch_id;
-        let receipt_branch_id = branch_id.clone();
-        let current_mode = self.mode.clone();
-        let selector = match &self.mode {
-            SessionMode::Pinned { branch_id } | SessionMode::Workspace { branch_id } => {
-                branch_id.clone()
-            }
-        };
-        let observe_invalidation = self.observe_invalidation.clone();
-        match current_mode {
-            SessionMode::Pinned { .. } => {
-                // A pinned switch changes only this session's in-memory
-                // selector. Keep the existing session/collaboration lease so
-                // branch deletion cannot race target validation, but do not
-                // open and commit an empty repository transaction: the target
-                // branch-head control is the sole authority this path needs.
-                let _write_access = self.begin_session_write_access().await?;
-                let read = SharedStorageAdapterRead::new(
-                    self.storage
-                        .begin_read(StorageReadOptions::default())
-                        .await?,
-                );
-                let reader = self.branch_ctx.ref_reader(&read);
-                BranchLifecycle::new(&reader)
-                    .require_existing_commit_id(
-                        &branch_id,
-                        BranchOperation::SwitchBranch,
-                        BranchReferenceRole::Target,
-                    )
-                    .await?;
-                self.ensure_open()?;
-                *selector.write().map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "session branch selector is poisoned",
-                    )
-                })? = receipt_branch_id.clone();
-                observe_invalidation.bump();
-            }
-            SessionMode::Workspace { .. } => {
-                let write_access = self.begin_session_write_access().await?;
-                self.with_write_transaction_reserved_lending(
-                    write_access,
-                    async move |transaction| {
-                        {
-                            let reader = transaction.branch_ref_reader().await;
-                            BranchLifecycle::new(&reader)
-                                .require_existing_commit_id(
-                                    &branch_id,
-                                    BranchOperation::SwitchBranch,
-                                    BranchReferenceRole::Target,
-                                )
-                                .await?
-                        };
-                        let mut rows = RawWriteBatch::with_capacity(1);
-                        rows.push(workspace_branch_stage_row(&branch_id)?);
-                        transaction.stage_rows(rows).await?;
-                        Ok(())
-                    },
-                    |()| {
-                        *selector.write().map_err(|_| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                "session branch selector is poisoned",
-                            )
-                        })? = receipt_branch_id.clone();
-                        observe_invalidation.bump();
-                        Ok(())
-                    },
-                )
-                .await?;
-            }
-        }
+        // Keep the existing session/collaboration lease so branch deletion
+        // cannot race target validation. Switching is session-local and does
+        // not create a repository commit.
+        let _write_access = self.begin_session_write_access().await?;
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let reader = self.branch_ctx.ref_reader(&read);
+        BranchLifecycle::new(&reader)
+            .require_existing_commit_id(
+                &branch_id,
+                BranchOperation::SwitchBranch,
+                BranchReferenceRole::Target,
+            )
+            .await?;
+        self.ensure_open()?;
+        self.branch.set(branch_id.clone())?;
+        self.observe_invalidation.bump();
 
         Ok(SwitchBranchReceipt {
-            branch_id: receipt_branch_id,
+            branch_id,
         })
     }
-}
-
-#[expect(clippy::unnecessary_wraps)]
-fn workspace_branch_stage_row(branch_id: &str) -> Result<TransactionWriteRow, LixError> {
-    Ok(TransactionWriteRow {
-        entity_pk: Some(crate::entity_pk::EntityPk::single(WORKSPACE_BRANCH_KEY)),
-        schema_key: KEY_VALUE_SCHEMA_KEY.into(),
-        file_id: None,
-        snapshot: Some(TransactionJson::from_value_unchecked(json!({
-            "key": WORKSPACE_BRANCH_KEY,
-            "value": branch_id,
-        }))),
-        metadata: None,
-        origin: None,
-        created_at: None,
-        updated_at: None,
-        global: true,
-        change_id: None,
-        commit_id: None,
-        untracked: true,
-        branch_id: GLOBAL_BRANCH_ID.into(),
-    })
 }
 
 #[cfg(test)]
@@ -276,7 +193,7 @@ mod tests {
             .await
             .expect("open switch benchmark engine");
         let session = engine
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("open pinned main session");
         let branch = session

@@ -105,7 +105,7 @@ async fn run_workload(workload: &str, rows: usize, window: usize) {
         .await
         .expect("open duplication-audit engine");
     let main = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open duplication-audit workspace");
     register_schema(&main).await;
@@ -337,7 +337,7 @@ async fn edit_on_branch<S>(
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session = engine
-        .open_session(branch.to_owned())
+        .open_session_at(branch.to_owned())
         .await
         .expect("open duplication-audit branch session");
     edit_rows(&session, start, count, generation).await;

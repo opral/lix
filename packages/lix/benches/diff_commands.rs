@@ -185,7 +185,7 @@ async fn new_session() -> SessionContext<Memory> {
         .expect("initialize benchmark storage");
     let engine = Engine::new(storage).await.expect("open benchmark engine");
     engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open benchmark session")
 }

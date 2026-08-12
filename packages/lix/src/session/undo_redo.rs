@@ -531,7 +531,7 @@ mod tests {
     async fn setup() -> crate::session::SessionContext<Memory> {
         setup_engine()
             .await
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session opens")
     }
@@ -723,7 +723,7 @@ mod tests {
     async fn branch_forked_at_checkpoint_starts_at_an_undo_floor() {
         let engine = setup_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session opens");
         session
@@ -745,7 +745,7 @@ mod tests {
             })
             .await
             .expect("branch creates");
-        let fork = engine.open_session(branch.id).await.expect("fork opens");
+        let fork = engine.open_session_at(branch.id).await.expect("fork opens");
 
         let error = fork
             .undo()
@@ -759,7 +759,7 @@ mod tests {
     async fn branch_forked_at_undo_commit_resets_undo_history() {
         let engine = setup_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session opens");
         session
@@ -778,7 +778,7 @@ mod tests {
             })
             .await
             .expect("branch creates");
-        let fork = engine.open_session(branch.id).await.expect("fork opens");
+        let fork = engine.open_session_at(branch.id).await.expect("fork opens");
 
         let error = fork
             .undo()
@@ -1060,7 +1060,7 @@ mod tests {
             .expect("storage initializes");
         let engine = Engine::new(storage).await.expect("engine opens");
         let first = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("first session opens");
         first
@@ -1075,7 +1075,7 @@ mod tests {
         drop(first);
 
         let reopened = engine
-            .open_session(branch_id)
+            .open_session_at(branch_id)
             .await
             .expect("fresh pinned session opens");
         reopened.redo().await.expect("redo survives session loss");
@@ -1090,7 +1090,7 @@ mod tests {
             .expect("storage initializes");
         let engine = Engine::new(storage).await.expect("engine opens");
         let main = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session opens");
         let draft = main
@@ -1102,7 +1102,7 @@ mod tests {
             .await
             .expect("draft creates");
         let draft_session = engine
-            .open_session(draft.id.clone())
+            .open_session_at(draft.id.clone())
             .await
             .expect("draft session opens");
         draft_session

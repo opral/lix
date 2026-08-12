@@ -19,7 +19,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let setup = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("setup session should open");
     setup
@@ -58,11 +58,11 @@ async fn stale_transaction_composes_disjoint_semantic_writes() {
         .await
         .expect("initialized storage should create an engine");
     let stale_session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("stale session should open");
     let winner_session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("winner session should open");
 
@@ -126,11 +126,11 @@ async fn committed_media_ingest_part_does_not_invalidate_a_concurrent_project_sa
         .await
         .expect("initialized storage should create an engine");
     let ingest = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("media ingest session should open");
     let saver = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("project-save session should open");
     saver
@@ -197,11 +197,11 @@ async fn stale_transaction_reports_overlapping_ordinary_insert_atomically() {
         .await
         .expect("initialized storage should create an engine");
     let stale_session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("stale session should open");
     let winner_session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("winner session should open");
 
@@ -250,8 +250,8 @@ async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
         .await
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
-    let transaction_session = engine.open_workspace_session().await.unwrap();
-    let concurrent_session = engine.open_workspace_session().await.unwrap();
+    let transaction_session = engine.open_session().await.unwrap();
+    let concurrent_session = engine.open_session().await.unwrap();
     concurrent_session
         .execute(
             "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
@@ -318,9 +318,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
         session
@@ -382,9 +382,9 @@ async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
         .await
         .expect("initialized storage should create setup engine");
     let setup_session = setup_engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("setup workspace session should open");
+        .expect("setup session should open");
     setup_session
         .create_branch(CreateBranchOptions {
             id: Some("01930000-0000-7000-8000-000000000017".to_string()),
@@ -403,13 +403,13 @@ async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
         .await
         .expect("delete engine should open");
     let branch_session = branch_engine
-        .open_session("01930000-0000-7000-8000-000000000017")
+        .open_session_at("01930000-0000-7000-8000-000000000017")
         .await
         .expect("local branch session should open");
     let delete_session = delete_engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("delete workspace session should open");
+        .expect("delete session should open");
 
     let mut transaction = branch_session
         .begin_transaction()
@@ -468,11 +468,11 @@ async fn untracked_commit_retries_when_tracked_fk_target_changes_after_validatio
         .await
         .expect("untracked engine should open");
     let tracked_session = tracked_engine
-        .open_session(UNTRACKED_RACE_BRANCH_ID)
+        .open_session_at(UNTRACKED_RACE_BRANCH_ID)
         .await
         .expect("tracked session should open");
     let untracked_session = untracked_engine
-        .open_session(UNTRACKED_RACE_BRANCH_ID)
+        .open_session_at(UNTRACKED_RACE_BRANCH_ID)
         .await
         .expect("untracked session should open");
 
@@ -547,7 +547,7 @@ fn join_thread<T>(handle: thread::JoinHandle<T>, description: &str) -> T {
 }
 
 #[tokio::test]
-async fn existing_workspace_session_ignores_later_selector_corruption() {
+async fn existing_session_ignores_later_default_branch_corruption() {
     let storage = RecordingStorage::new();
     let _receipt = Engine::initialize(storage.clone())
         .await
@@ -556,18 +556,20 @@ async fn existing_workspace_session_ignores_later_selector_corruption() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     session
         .execute(
-            "UPDATE lix_key_value SET value = '6d697373-696e-872d-8272-616e63680000' \
-             WHERE key = 'lix_workspace_branch_id'",
+            "UPDATE lix_key_value_by_branch \
+             SET value = '6d697373-696e-872d-8272-616e63680000' \
+             WHERE key = 'lix_default_branch_id' \
+               AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
             &[],
         )
         .await
-        .expect("test should corrupt workspace selector");
+        .expect("test should corrupt the repository default branch");
 
     let before = storage.stats();
     session
@@ -579,14 +581,14 @@ async fn existing_workspace_session_ignores_later_selector_corruption() {
     assert_eq!(delta.read_opened, 1, "read SQL should open one read tx");
     assert_eq!(delta.write_opened, 0, "read SQL must not open writes");
     engine
-        .open_workspace_session()
+        .open_session()
         .await
         .err()
-        .expect("a new workspace session should reject the corrupt selector");
+        .expect("a new session should reject the corrupt repository default");
 }
 
 #[tokio::test]
-async fn explicit_transaction_open_uses_one_authoritative_snapshot_in_every_session_mode() {
+async fn explicit_transaction_open_uses_one_authoritative_snapshot() {
     let storage = RecordingStorage::new();
     let receipt = Engine::initialize(storage.clone())
         .await
@@ -594,26 +596,26 @@ async fn explicit_transaction_open_uses_one_authoritative_snapshot_in_every_sess
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let workspace = engine
-        .open_workspace_session()
+    let session = engine
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     let before = storage.stats();
-    let workspace_transaction = workspace
+    let transaction = session
         .begin_transaction()
         .await
-        .expect("workspace transaction should open");
+        .expect("transaction should open");
     let delta = storage.stats().delta_since(&before);
-    assert_eq!(delta.read_opened, 1, "workspace open must own one snapshot");
+    assert_eq!(delta.read_opened, 1, "session open must own one snapshot");
     assert_eq!(delta.write_opened, 0, "transaction open must not write");
-    workspace_transaction
+    transaction
         .rollback()
         .await
-        .expect("workspace transaction should roll back");
+        .expect("transaction should roll back");
 
     let pinned = engine
-        .open_session(receipt.main_branch_id)
+        .open_session_at(receipt.main_branch_id)
         .await
         .expect("pinned session should open");
     let before = storage.stats();
@@ -631,7 +633,7 @@ async fn explicit_transaction_open_uses_one_authoritative_snapshot_in_every_sess
 }
 
 #[tokio::test]
-async fn existing_workspace_session_writes_to_its_pinned_branch() {
+async fn existing_session_writes_to_its_selected_branch() {
     let storage = RecordingStorage::new();
     let _receipt = Engine::initialize(storage.clone())
         .await
@@ -640,18 +642,20 @@ async fn existing_workspace_session_writes_to_its_pinned_branch() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     session
         .execute(
-            "UPDATE lix_key_value SET value = '6d697373-696e-872d-8272-616e63680000' \
-             WHERE key = 'lix_workspace_branch_id'",
+            "UPDATE lix_key_value_by_branch \
+             SET value = '6d697373-696e-872d-8272-616e63680000' \
+             WHERE key = 'lix_default_branch_id' \
+               AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
             &[],
         )
         .await
-        .expect("test should corrupt workspace selector");
+        .expect("test should corrupt the repository default branch");
 
     let before = storage.stats();
     session
@@ -672,10 +676,10 @@ async fn existing_workspace_session_writes_to_its_pinned_branch() {
         "the pinned-session write should commit"
     );
     engine
-        .open_workspace_session()
+        .open_session()
         .await
         .err()
-        .expect("a new workspace session should reject the corrupt selector");
+        .expect("a new session should reject the corrupt repository default");
 }
 
 #[tokio::test]
@@ -717,9 +721,9 @@ async fn write_changelog_commit_failure_does_not_commit_storage_write() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     storage.fail_write_space(CHANGELOG_COMMIT_SPACE_ID);
     let before = storage.stats();
@@ -753,9 +757,9 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     session
         .execute(
@@ -811,9 +815,9 @@ async fn transaction_read_can_query_history_surfaces() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     session
         .execute(
@@ -853,9 +857,9 @@ async fn close_rejects_idle_explicit_transaction_without_dropping_it() {
         .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
 
     let mut tx = session
@@ -889,7 +893,7 @@ async fn close_rejects_idle_explicit_transaction_without_dropping_it() {
         .expect("transaction rollback should succeed after rejected close");
 
     let reopened = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("new session should open after closing previous session");
     let result = reopened
@@ -917,9 +921,9 @@ async fn closed_session_still_allows_active_transaction_rollback() {
         .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
 
     let tx = session
@@ -951,9 +955,9 @@ async fn closed_session_active_branch_id_does_not_open_storage_read() {
         .await
         .expect("initialized storage should create an engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     session.close().await.expect("session close should succeed");
     let before = storage.stats();
@@ -982,9 +986,9 @@ async fn close_during_transaction_open_rejects_opened_transaction() {
         .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
 
     gate.block_next_write();
@@ -1031,9 +1035,9 @@ async fn close_during_transaction_commit_waits_after_commit_boundary() {
         .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
 
     let mut tx = session
@@ -1101,9 +1105,9 @@ async fn close_waits_for_transaction_blocked_in_storage_commit() {
         .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
 
     let mut tx = session
@@ -1176,9 +1180,9 @@ async fn begin_transaction_cannot_race_with_opening_session_write() {
         .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
 
     gate.block_next_write();
@@ -1233,9 +1237,9 @@ async fn session_read_waits_for_automatic_write_instead_of_rejecting() {
         .expect("initialized storage should create an engine");
     let session = Arc::new(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
     );
 
     gate.block_next_write();

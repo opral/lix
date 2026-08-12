@@ -454,7 +454,7 @@ where
     .await
     .expect("switch workspace to plugin target");
     let mut source = lix
-        .open_session(&source_receipt.id)
+        .open_session_at(&source_receipt.id)
         .await
         .expect("open plugin source session");
     if cold_reopen {
@@ -469,7 +469,7 @@ where
         drop(lix);
         lix = open_benchmark::<StorageImpl>(&db_path).await;
         source = lix
-            .open_session(SOURCE_BRANCH_ID)
+            .open_session_at(SOURCE_BRANCH_ID)
             .await
             .expect("cold-open plugin source");
     }
@@ -729,7 +729,7 @@ where
     let branch_max_ms = sorted_branch_ms[sorted_branch_ms.len() - 1];
     let create_branches_ms = branch_measure.wall_ms;
     let source = lix
-        .open_session(&source_receipt.id)
+        .open_session_at(&source_receipt.id)
         .await
         .expect("open source session");
 

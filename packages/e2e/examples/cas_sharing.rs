@@ -378,7 +378,7 @@ where
             .await
             .expect("open cas sharing engine");
         let session = engine
-            .open_session(receipt.main_branch_id)
+            .open_session_at(receipt.main_branch_id)
             .await
             .expect("open cas sharing session");
         Self {
@@ -420,7 +420,7 @@ where
             .expect("create cas sharing branch");
         let session = self
             .engine
-            .open_session(branch.id)
+            .open_session_at(branch.id)
             .await
             .expect("open cas sharing branch session");
         let result = session

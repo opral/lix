@@ -34,7 +34,13 @@ test("forwards opt-in SQL telemetry from browser WASM", async () => {
 	const lix = await openLix({
 		telemetry: {
 			onSpan(span) {
-				if (span.name === "lix.sql.query") resolveSpan(span);
+				if (
+					span.name === "lix.sql.query" &&
+					span.attributes["db.query.text"] ===
+						"SELECT ? AS value, ? AS number"
+				) {
+					resolveSpan(span);
+				}
 			},
 		},
 	});
@@ -140,14 +146,14 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 	}
 });
 
-test("remote client state and active branch survive reopen without reaching the server", async () => {
+test("remote client state survives reopen while the server selects the session branch", async () => {
 	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
 	const storage = new IndexedDbStorage({
 		name: `lix-client-state-test:${crypto.randomUUID()}`,
 	});
 	const sessions = new Map<string, string>();
-	const availableBranches = new Set(["main", "draft"]);
 	const initialBranchRequests: Array<string | null> = [];
+	const initialAccountRequests: Array<string | null> = [];
 	const requestBodies: string[] = [];
 	let nextSession = 0;
 	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -158,19 +164,7 @@ test("remote client state and active branch survive reopen without reaching the 
 			const requestedBranch = url.searchParams.get("activeBranchId");
 			if (!suppliedSession) {
 				initialBranchRequests.push(requestedBranch);
-				expect(url.searchParams.has("activeAccountId")).toBe(false);
-				if (requestedBranch && !availableBranches.has(requestedBranch)) {
-					return Response.json(
-						{
-							error: {
-								code: "LIX_BRANCH_NOT_FOUND",
-								message: "Branch not found",
-								details: { branchId: requestedBranch },
-							},
-						},
-						{ status: 404 },
-					);
-				}
+				initialAccountRequests.push(url.searchParams.get("activeAccountId"));
 			}
 			const sessionId = suppliedSession ?? `session-${++nextSession}`;
 			if (!sessions.has(sessionId)) {
@@ -213,7 +207,7 @@ test("remote client state and active branch survive reopen without reaching the 
 
 	const second = await openLix(options);
 	try {
-		expect(await second.activeBranchId()).toBe("draft");
+		expect(await second.activeBranchId()).toBe("main");
 		await expect(second.clientState.get("atelier")).resolves.toEqual({
 			focusedPanel: "right",
 		});
@@ -222,25 +216,11 @@ test("remote client state and active branch survive reopen without reaching the 
 	} finally {
 		await second.close();
 	}
-
-	availableBranches.delete("draft");
-	const fallback = await openLix(options);
-	expect(await fallback.activeBranchId()).toBe("main");
-	await fallback.close();
-
-	const reopenedFallback = await openLix(options);
-	try {
-		expect(await reopenedFallback.activeBranchId()).toBe("main");
-		expect(initialBranchRequests).toEqual([
-			null,
-			"draft",
-			"draft",
-			null,
-			"main",
-		]);
-	} finally {
-		await reopenedFallback.close();
-	}
+	expect(initialBranchRequests).toEqual([null, null]);
+	expect(initialAccountRequests).toEqual([
+		null,
+		"00000000-0000-7000-8000-000000000002",
+	]);
 });
 
 test("IndexedDbStorage persists a complete local Lix", async () => {

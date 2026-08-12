@@ -227,7 +227,7 @@ where
         .await
         .expect("open repository-GC engine");
     let main = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open repository-GC main session");
     let schema = serde_json::json!({
@@ -256,7 +256,7 @@ where
         .await
         .expect("create repository-GC disposable branch");
     let branch_session = engine
-        .open_session(branch.id.clone())
+        .open_session_at(branch.id.clone())
         .await
         .expect("open repository-GC disposable branch");
     for commit_index in 0..commit_count {

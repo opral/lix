@@ -559,7 +559,7 @@ where
         validate_filesystem_root_directory(&layout.root)?;
         validate_filesystem_lix_directory(&layout.lix_dir)?;
         let path_filter = FilesystemPathFilter::from_sync_all_files(sync_all_files);
-        let session = engine.open_workspace_session().await?;
+        let session = engine.open_session().await?;
         let state = Arc::new(FilesystemState {
             session,
             layout,
@@ -2514,7 +2514,7 @@ mod tests {
             .await
             .unwrap();
         FilesystemState {
-            session: engine.open_workspace_session().await.unwrap(),
+            session: engine.open_session().await.unwrap(),
             layout,
             path_filter: Mutex::new(path_filter),
             sync_lock: tokio::sync::Mutex::new(()),

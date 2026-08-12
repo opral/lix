@@ -4255,7 +4255,7 @@ mod tests {
             .await
             .expect("untracked-file repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("untracked-file session should open");
         let live_bytes = b"current-only-untracked-file-blob";
@@ -4317,7 +4317,7 @@ mod tests {
             .await
             .expect("repository should cold reopen after untracked-file GC");
         let reopened_session = reopened
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("cold untracked-file session should open");
         let content = reopened_session
@@ -4362,7 +4362,7 @@ mod tests {
         .await
         .expect("plugin-GC repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("plugin-GC session should open");
         let (archive, wasm) = gc_csv_plugin_archive();
@@ -4418,7 +4418,7 @@ mod tests {
         .await
         .expect("plugin-GC repository should cold reopen");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("cold plugin-GC session should open");
         session
@@ -4456,7 +4456,7 @@ mod tests {
         .await
         .expect("shared-plugin repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("shared-plugin session should open");
         let (archive, wasm) = gc_csv_plugin_archive();
@@ -4946,9 +4946,9 @@ mod tests {
             .await
             .expect("repository should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         let schema = serde_json::json!({
             "x-lix-key": "gc_history_fixture",
             "x-lix-primary-key": ["/path"],
@@ -5070,9 +5070,9 @@ mod tests {
             .await
             .expect("repository should reopen after GC");
         let session = reopened_engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("reopened workspace session should open");
+            .expect("reopened session should open");
         let head = session
             .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
             .await
@@ -5103,7 +5103,7 @@ mod tests {
             .await
             .expect("historical blob repository should open");
         let main = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("historical blob main session should open");
         let branch = main
@@ -5116,7 +5116,7 @@ mod tests {
             .expect("historical disposable branch should create");
         let branch_id = branch.id;
         let session = engine
-            .open_session(branch_id.clone())
+            .open_session_at(branch_id.clone())
             .await
             .expect("historical disposable session should open");
         let v1 = b"historical-file-v1";
@@ -5169,7 +5169,7 @@ mod tests {
             .await
             .expect("historical blob repository should cold reopen");
         let session = reopened
-            .open_session(branch_id.clone())
+            .open_session_at(branch_id.clone())
             .await
             .expect("historical disposable branch should cold reopen");
         let diff = session
@@ -5208,7 +5208,7 @@ mod tests {
         drop(session);
 
         let main = reopened
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("historical main session should reopen");
         main.execute(
@@ -5231,7 +5231,7 @@ mod tests {
             .await
             .expect("historical repository should reopen after branch retirement");
         let final_main = final_engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("historical main should open after branch retirement");
         let branches = final_main
@@ -6105,7 +6105,7 @@ mod tests {
             .await
             .expect("generation fixture should open");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("generation fixture session should open");
         let schema = serde_json::json!({
@@ -6147,7 +6147,7 @@ mod tests {
             .await
             .expect("generation fixture branch should create");
         let branch_session = engine
-            .open_session(branch.id.clone())
+            .open_session_at(branch.id.clone())
             .await
             .expect("generation fixture branch session should open");
         for row in 0..16 {

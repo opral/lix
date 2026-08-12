@@ -50,7 +50,7 @@ async fn open_session() -> (Memory, SessionContext<Memory>) {
         .await
         .expect("engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("session should open");
     (storage, session)

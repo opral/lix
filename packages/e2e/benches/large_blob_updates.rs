@@ -360,7 +360,7 @@ where
             .await
             .expect("open large blob benchmark engine");
         let session = engine
-            .open_session(receipt.main_branch_id)
+            .open_session_at(receipt.main_branch_id)
             .await
             .expect("open large blob benchmark session");
         let workload = WorkloadState::new(size, operation);

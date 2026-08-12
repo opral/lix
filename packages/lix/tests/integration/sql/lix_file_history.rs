@@ -143,9 +143,9 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
         .await
         .expect("engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     let unrelated_values = (0..UNRELATED_FILE_COUNT)
         .map(|index| {
@@ -277,9 +277,9 @@ async fn lix_file_history_path_lookup_does_not_rescan_unrelated_observed_state()
         .await
         .expect("engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     let unrelated_values = (0..UNRELATED_FILE_COUNT)
         .map(|index| {
@@ -401,9 +401,9 @@ async fn lix_file_history_path_filter_equals_unfiltered_scan_over_many_files() {
         .await
         .expect("engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     let bulk_values = (0..BULK_FILE_COUNT)
         .map(|index| format!("('/bulk/f{index:03}.txt', CAST('bulk' AS BYTEA))"))
@@ -549,9 +549,9 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
         .await
         .expect("engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
         .map(|index| {
@@ -657,7 +657,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -785,7 +785,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -913,7 +913,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -942,7 +942,7 @@ simulation_test!(
         .expect("sibling branch should create");
         let draft = sim.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-00000000000b")
+                .open_session_at("01930000-0000-7000-8000-00000000000b")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -1022,7 +1022,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1175,7 +1175,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1321,7 +1321,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1369,7 +1369,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1390,7 +1390,7 @@ simulation_test!(
         .expect("draft branch should be created");
         let draft = sim.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-00000000000c")
+                .open_session_at("01930000-0000-7000-8000-00000000000c")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -1492,7 +1492,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1555,7 +1555,7 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -1614,7 +1614,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1672,7 +1672,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1722,7 +1722,7 @@ simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -1761,7 +1761,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1819,7 +1819,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,

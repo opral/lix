@@ -396,7 +396,7 @@ where
         .await
         .expect("open retained repository");
     let session = engine
-        .open_session(initialized.main_branch_id)
+        .open_session_at(initialized.main_branch_id)
         .await
         .expect("open retained preparation session");
     let total_size = size_mib
@@ -524,7 +524,7 @@ where
         .await
         .expect("cold reopen retained repository");
     let session = engine
-        .open_session(fixture.branch_id.clone())
+        .open_session_at(fixture.branch_id.clone())
         .await
         .expect("cold reopen retained owner branch");
     let diff = session
@@ -575,7 +575,7 @@ where
 
     let release_started = PhaseStart::begin(slate_io);
     let workspace = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open workspace for final owner release");
     workspace
@@ -620,9 +620,9 @@ where
         .await
         .expect("final repository should reopen");
     let workspace = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("final workspace session should open");
+        .expect("final session should open");
     let branches = workspace
         .execute(
             "SELECT COUNT(*) AS entries FROM lix_branch WHERE id = $1",

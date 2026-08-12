@@ -176,9 +176,9 @@ async fn run_fixture(bundles: usize, rounds: u32, bulk: bool) {
         .expect("initialize fixture");
     let engine = Engine::new(storage).await.expect("open engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("open workspace session");
+        .expect("open session");
 
     for schema in schemas() {
         session

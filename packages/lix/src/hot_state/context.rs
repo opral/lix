@@ -1018,7 +1018,7 @@ where
         // Even an untracked-only exact batch therefore needs the branch
         // controls that select the active generation; treating that request
         // as "not tracked" used to skip the controls entirely and made the
-        // workspace selector (an untracked row) invisible after hot-index init.
+        // global untracked rows invisible after hot-index initialization.
         let scope = scan_scope(
             &self.store,
             &scope_request,

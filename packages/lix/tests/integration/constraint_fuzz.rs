@@ -12,7 +12,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -185,7 +185,7 @@ simulation_test!(
                         .unwrap_or_else(|error| panic!("{label}: reopen failed: {error:?}"));
                     let reopened = sim.wrap_session(
                         reopened_engine
-                            .open_workspace_session()
+                            .open_session()
                             .await
                             .unwrap_or_else(|error| {
                                 panic!("{label}: reopened session failed: {error:?}")

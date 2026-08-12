@@ -22,8 +22,8 @@ use crate::branch::{
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
 use crate::hot_state::{
-    HotStateFilter, HotStateProjection, HotStateReader, HotStateScanRequest,
-    MaterializedHotStateRowRef,
+    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
+    HotStateReader, HotStateScanRequest, MaterializedHotStateRowRef,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::write_normalization::{
@@ -290,7 +290,12 @@ impl TableSpec for BranchSpec {
                 let active_branch_id = active_branch_id.clone();
                 async move {
                     let branch_rows = branch_rows_from_batch(&matched_batch)?;
-                    reject_protected_branch_deletes(&branch_rows, &active_branch_id)?;
+                    let default_branch_id = load_default_branch_id(&write_ctx).await?;
+                    reject_protected_branch_deletes(
+                        &branch_rows,
+                        &active_branch_id,
+                        &default_branch_id,
+                    )?;
                     let count = u64::try_from(branch_rows.len()).map_err(|_| {
                         DataFusionError::Execution("DELETE row count overflow".to_string())
                     })?;
@@ -1022,7 +1027,43 @@ fn branch_rows_from_batch(batch: &RecordBatch) -> Result<Vec<BranchRow>> {
         .collect()
 }
 
-fn reject_protected_branch_deletes(rows: &[BranchRow], active_branch_id: &str) -> Result<()> {
+async fn load_default_branch_id(write_ctx: &SqlWriteContext) -> Result<String> {
+    let rows = write_ctx
+        .load_exact_hot_state_batch(&HotStateExactBatchRequest {
+            rows: vec![HotStateExactRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                entity_pk: EntityPk::single(crate::init::DEFAULT_BRANCH_KEY),
+                file_id: None,
+            }],
+            projection: HotStateProjection {
+                columns: vec!["snapshot_content".to_string()],
+            },
+            untracked: Some(false),
+            include_tombstones: false,
+        })
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+    let snapshot = rows
+        .row(0)
+        .and_then(MaterializedHotStateRowRef::snapshot_content)
+        .ok_or_else(|| {
+            DataFusionError::Execution("repository default branch is missing".to_string())
+        })?;
+    serde_json::from_str::<JsonValue>(snapshot)
+        .ok()
+        .and_then(|value| value.get("value").and_then(JsonValue::as_str).map(str::to_owned))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DataFusionError::Execution("repository default branch is invalid".to_string())
+        })
+}
+
+fn reject_protected_branch_deletes(
+    rows: &[BranchRow],
+    active_branch_id: &str,
+    default_branch_id: &str,
+) -> Result<()> {
     for row in rows {
         if row.id == GLOBAL_BRANCH_ID {
             return Err(DataFusionError::Execution(
@@ -1032,6 +1073,12 @@ fn reject_protected_branch_deletes(rows: &[BranchRow], active_branch_id: &str) -
         if row.id == active_branch_id {
             return Err(DataFusionError::Execution(format!(
                 "DELETE FROM lix_branch cannot delete active branch '{}'",
+                row.id
+            )));
+        }
+        if row.id == default_branch_id {
+            return Err(DataFusionError::Execution(format!(
+                "DELETE FROM lix_branch cannot delete repository default branch '{}'",
                 row.id
             )));
         }
@@ -1240,7 +1287,7 @@ mod tests {
     impl HotStateReader for RowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::hot_state::HotStateExactBatchRequest,
+            request: &HotStateExactBatchRequest,
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
             crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
@@ -1270,7 +1317,7 @@ mod tests {
     impl HotStateReader for RoutingHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::hot_state::HotStateExactBatchRequest,
+            request: &HotStateExactBatchRequest,
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
             crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }

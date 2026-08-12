@@ -99,7 +99,7 @@ fn main() {
             .await
             .expect("open reclaim scan repository");
         let session = engine
-            .open_session(initialized.main_branch_id)
+            .open_session_at(initialized.main_branch_id)
             .await
             .expect("open reclaim scan session");
         let setup_started = Instant::now();

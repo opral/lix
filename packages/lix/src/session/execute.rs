@@ -4489,9 +4489,9 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open")
+            .expect("session should open")
     }
 
     async fn assert_columnar_lifecycle_current(
@@ -4595,9 +4595,9 @@ mod tests {
                 .await
                 .expect("initialized storage should create engine");
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open")
+            .expect("session should open")
     }
 
     fn batch_statement(sql: &str) -> ExecuteBatchStatement {
@@ -5989,9 +5989,9 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         let main = engine
-            .open_workspace_session_with_account(crate::SYSTEM_ACCOUNT_ID)
+            .open_session_with_account(crate::SYSTEM_ACCOUNT_ID)
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         let main_branch_id = main
             .active_branch_id()
             .await
@@ -6314,7 +6314,7 @@ mod tests {
             .await
             .expect("checkpoint branch should create");
         let draft_session = engine
-            .open_session(draft.id.clone())
+            .open_session_at(draft.id.clone())
             .await
             .expect("draft session should open");
         draft_session
@@ -6425,7 +6425,7 @@ mod tests {
             .await
             .expect("corrupt storage should still open structurally");
         let reopened_session = reopened
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("corrupt storage session should open");
         assert!(
@@ -7013,7 +7013,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized storage should create engine");
-        let setup = engine.open_workspace_session().await.unwrap();
+        let setup = engine.open_session().await.unwrap();
         let schema = serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "x-lix-key": "concurrent_parameter_insert_probe",
@@ -7034,8 +7034,8 @@ mod tests {
             .await
             .unwrap();
 
-        let first = engine.open_workspace_session().await.unwrap();
-        let second = engine.open_workspace_session().await.unwrap();
+        let first = engine.open_session().await.unwrap();
+        let second = engine.open_session().await.unwrap();
         let sql = "INSERT INTO concurrent_parameter_insert_probe (id, value) VALUES ($1, $2)";
         let first_statements = [
             ExecuteBatchStatement {
@@ -10288,11 +10288,11 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("replacement session should open");
         let concurrent_session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("concurrent session should open");
         let schema = serde_json::json!({
@@ -10950,13 +10950,13 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("first workspace session should open");
+            .expect("first session should open");
         let concurrent = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("second workspace session should open");
+            .expect("second session should open");
         let schema = serde_json::json!({
             "x-lix-key": "read_plan_probe",
             "x-lix-primary-key": ["/id"],

@@ -8,7 +8,7 @@ pub fn run(context: &AppContext, command: RedoCommand) -> Result<CommandOutput, 
     let path = resolve_db_path(context)?;
     let lix = open_lix_at(&path)?;
     let receipt = if let Some(branch_id) = command.branch {
-        let branch = crate::db::block_on(lix.open_session(branch_id))
+        let branch = crate::db::block_on(lix.open_session_at(branch_id))
             .map_err(|error| CliError::msg(error.to_string()))?;
         crate::db::block_on(branch.redo())
     } else {

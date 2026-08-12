@@ -14,7 +14,7 @@ fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Ve
             .await
             .expect("benchmark engine opens");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("benchmark session opens");
         session
@@ -49,7 +49,7 @@ fn seeded_sparse_gap_storage(runtime: &tokio::runtime::Runtime, history_depth: u
             .await
             .expect("benchmark engine opens");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("benchmark session opens");
         session
@@ -93,7 +93,7 @@ fn seeded_wide_parent_storage(runtime: &tokio::runtime::Runtime, parent_width: u
             .await
             .expect("benchmark engine opens");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("benchmark session opens");
         session
@@ -140,7 +140,7 @@ fn seeded_wide_transition_storage(
             .await
             .expect("benchmark engine opens");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("benchmark session opens");
         let before = "b".repeat(256);
@@ -188,7 +188,7 @@ fn seeded_descriptor_unrelated_width_storage(
             .await
             .expect("benchmark engine opens");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("benchmark session opens");
         session
@@ -227,7 +227,7 @@ fn open_session(runtime: &tokio::runtime::Runtime, storage: Memory) -> SessionCo
         Engine::new(storage)
             .await
             .expect("benchmark engine opens")
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("benchmark session opens")
     })

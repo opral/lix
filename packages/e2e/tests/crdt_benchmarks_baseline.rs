@@ -31,7 +31,7 @@ async fn crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts() {
         let target = format!("{}{}", "a".repeat(N), base);
         let source_text = format!("{}{}", "b".repeat(N), base);
         let peer = lix
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("peer session should open");
         let mut target_transaction = lix.begin_transaction().await.expect("target transaction");
@@ -118,7 +118,7 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
         let mut transactions = Vec::with_capacity(clients);
         for client in 0..clients {
             let peer = lix
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("peer session should open");
             let mut transaction = peer
@@ -223,8 +223,8 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
 #[tokio::test]
 async fn ordinary_concurrent_execute_serializes_without_plugin_resolution() {
     let lix = open_lix().await.unwrap();
-    let first = lix.open_workspace_session().await.unwrap();
-    let second = lix.open_workspace_session().await.unwrap();
+    let first = lix.open_session().await.unwrap();
+    let second = lix.open_session().await.unwrap();
     lix.reset_plugin_transition_counters();
     let first_write = async {
         first
@@ -281,7 +281,7 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                     let mut peers = Vec::new();
                     let mut transactions = Vec::new();
                     for value in 0..3 {
-                        let peer = lix.open_workspace_session().await.unwrap();
+                        let peer = lix.open_session().await.unwrap();
                         let mut transaction = peer.begin_transaction().await.unwrap();
                         transaction
                             .execute(
@@ -382,7 +382,7 @@ fn serialized_leader_forces_stale_followers_to_reconcile_without_losing_writes()
                     let mut peers = Vec::new();
                     let mut transactions = Vec::new();
                     for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
-                        let peer = lix.open_workspace_session().await.unwrap();
+                        let peer = lix.open_session().await.unwrap();
                         let mut transaction = peer.begin_transaction().await.unwrap();
                         transaction
                             .execute(
@@ -451,8 +451,8 @@ fn serialized_leader_forces_stale_followers_to_reconcile_without_losing_writes()
 async fn invalid_aggregate_member_does_not_poison_valid_transaction() {
     let lix = open_lix().await.unwrap();
     install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
-    let first = lix.open_workspace_session().await.unwrap();
-    let second = lix.open_workspace_session().await.unwrap();
+    let first = lix.open_session().await.unwrap();
+    let second = lix.open_session().await.unwrap();
     let mut first_transaction = first.begin_transaction().await.unwrap();
     let mut second_transaction = second.begin_transaction().await.unwrap();
     for (transaction, bytes) in [

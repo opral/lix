@@ -123,9 +123,9 @@ mod tests {
     async fn run_case(case: &DifferentialSqlCase, mode: WriteExecutorMode) -> DifferentialOutcome {
         let engine = open_initialized_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         create_probe_branches(&session).await;
         let active_branch_id = session
             .active_branch_id()
@@ -208,9 +208,9 @@ mod tests {
     async fn run_baseline(case: &DifferentialSqlCase) -> DifferentialOutcome {
         let engine = open_initialized_engine().await;
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
         create_probe_branches(&session).await;
         let active_branch_id = session
             .active_branch_id()

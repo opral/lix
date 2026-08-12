@@ -730,7 +730,7 @@ where
         .await
         .expect("open native component source engine");
     let session = engine
-        .open_session(init.main_branch_id.clone())
+        .open_session_at(init.main_branch_id.clone())
         .await
         .expect("open native component source session");
 
@@ -809,7 +809,7 @@ where
         .await
         .expect("open native component clone engine");
     let session = engine
-        .open_session(main_branch_id)
+        .open_session_at(main_branch_id)
         .await
         .expect("open native component clone session");
     ComponentFixture {

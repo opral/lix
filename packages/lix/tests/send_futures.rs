@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use lix::{ExecuteBatchStatement, Lix, open_lix};
+use lix::{ExecuteBatchStatement, Lix, SwitchBranchOptions, open_lix};
 
 fn assert_send<T: Send>(_: T) {}
 fn assert_send_sync<T: Send + Sync>() {}
@@ -17,6 +17,9 @@ async fn public_execution_and_observation_futures_are_send() {
         params: Vec::new(),
     }]));
     assert_send(lix.begin_transaction());
+    assert_send(lix.switch_branch(SwitchBranchOptions {
+        branch_id: lix.active_branch_id().await.expect("active branch"),
+    }));
 
     let mut events = lix.observe("SELECT 1", &[]).expect("observe query");
     assert_send(events.next());

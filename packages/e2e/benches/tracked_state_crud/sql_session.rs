@@ -1803,7 +1803,7 @@ where
         .await
         .expect("open tracked-state crud engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open tracked-state crud session");
     register_json_pointer_schema(&session).await;
