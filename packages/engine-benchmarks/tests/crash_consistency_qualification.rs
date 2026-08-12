@@ -67,10 +67,14 @@
 //! * `LIX_CRASH_CONSISTENCY_COMMITS` — commits attempted per trial (default 3)
 //! * `LIX_CRASH_CONSISTENCY_TIMED_TRIALS` — seeded wall-clock kills (default 12)
 //! * `LIX_CRASH_CONSISTENCY_MAX_POINTS` — cap on swept kill points (default 512)
+//! * `LIX_CRASH_CONSISTENCY_SEED` — seed for the wall-clock kill delays
+//! * `LIX_CRASH_AWAIT_DURABLE=1` — force `WriteOptions::await_durable` on every
+//!   write transaction, in every arm (the durability A/B)
 //! * `LIX_CRASH_CONSISTENCY_BLOB_BYTES` — binary file bytes republished in the
 //!   same transaction, `0` to publish rows only (default 64 KiB, 128 KiB deep).
-//!   A non-zero value is what routes the publication through the atomic CAS path
-//!   and therefore what sets `await_durable`.
+//!   A non-zero value routes the publication through the content-addressed blob
+//!   path, which widens the swept window. It does **not** set `await_durable`;
+//!   measured, not assumed — the sweep prints the durable/total write census.
 
 use std::fs;
 use std::io::Write as _;
@@ -171,7 +175,8 @@ impl Killer {
             // kill lix mid-publication, not to lose the trial's own bookkeeping.
             let _ = std::io::stdout().flush();
             // SIGKILL cannot be caught, blocked or ignored: no unwinding, no
-            // Drop, no RocksDB shutdown hook, no WAL flush.
+            // Drop, no backend shutdown hook, no WAL flush, and for SlateDB no
+            // chance for the background write pipeline to drain.
             unsafe {
                 libc::kill(libc::getpid(), libc::SIGKILL);
             }
@@ -509,8 +514,10 @@ fn append_ack(path: &Path, generation: u64) {
 
 #[derive(Debug)]
 struct Recovered {
-    /// Highest generation visible after the crash, or `None` when the crash
-    /// landed before the seed commit published.
+    /// Highest generation visible after the crash, or `None` when the store has
+    /// no rows — either because the crash landed before the seed commit
+    /// published, or because the backend had not yet persisted it (see
+    /// `lost_acknowledgement`).
     generation: Option<i64>,
     /// Set when every state the store presented was internally consistent, but
     /// a commit whose `commit()` had already returned `Ok` is not in it.
@@ -968,8 +975,7 @@ fn result_column(sql: &str) -> &'static str {
 /// backend: the only thing that varies is which adapter the engine was handed.
 /// That is what makes the two arms comparable — a second harness would only
 /// prove that two harnesses agree.
-fn sweep<B: CrashBackend>() {
-    let workload = Workload::from_env();
+fn sweep<B: CrashBackend>(workload: Workload) {
     let root = tempfile::tempdir().expect("create crash-consistency sweep root");
     let mut failures: Vec<String> = Vec::new();
     let mut lost_acks: Vec<String> = Vec::new();
@@ -1195,7 +1201,7 @@ fn sweep<B: CrashBackend>() {
 
 #[test]
 fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
-    sweep::<RocksDB>();
+    sweep::<RocksDB>(Workload::from_env());
 }
 
 /// The same sweep, the same invariants and the same null control against the
@@ -1214,7 +1220,26 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
 #[cfg(feature = "slatedb")]
 #[test]
 fn slatedb_publication_window_survives_sigkill_at_every_storage_event() {
-    sweep::<SlateDB>();
+    sweep::<SlateDB>(Workload::from_env());
+}
+
+/// The durable half of the SlateDB arm, and the reason the sweep above reports
+/// lost acknowledgements instead of failing on them.
+///
+/// Identical backend, identical workload, identical kill schedule; the only
+/// difference is that every write transaction sets
+/// `WriteOptions::await_durable`. The sweep above measures what a SQL commit
+/// gets today (acknowledged off an in-process queue, so SIGKILL takes it back);
+/// this one measures what the flag buys (acknowledged only after the WAL SST is
+/// in the object store, so SIGKILL cannot). Keeping both in the default run
+/// means the durable contract is a standing assertion rather than a one-off
+/// measurement in a PR body.
+#[cfg(feature = "slatedb")]
+#[test]
+fn slatedb_durable_acknowledgement_survives_sigkill() {
+    let mut workload = Workload::from_env();
+    workload.force_await_durable = true;
+    sweep::<SlateDB>(workload);
 }
 
 /// The RocksDB adapter accepts [`WriteOptions::await_durable`] and never acts on
@@ -1259,8 +1284,9 @@ fn slatedb_honours_await_durable_and_acknowledges_non_durable_writes_early() {
          re-measure this qualification's durability arm"
     );
     assert!(
-        source.contains("if await_durable {\n                    db.flush().await?;"),
-        "the SlateDB adapter no longer flushes the WAL for a durable write — \
+        source.contains("let await_durable = writes.iter().any(|write| write.await_durable);")
+            && source.contains("db.flush().await?"),
+        "the SlateDB adapter's write drainer no longer flushes the WAL for a durable write — \
          re-measure this qualification's durability arm"
     );
     assert!(
