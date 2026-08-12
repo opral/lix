@@ -2182,24 +2182,8 @@ mod tests {
                 .expect("child should insert");
         }
 
-        let storage_adapter = StorageAdapter::new(storage);
-        let read = storage_adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read the index plane");
-        let entries = scan_test_space(&read, crate::live_state::HOT_INDEX_SPACE)
-            .await
-            .entries;
-        let witnesses = entries
-            .iter()
-            .filter(|entry| match &entry.value {
-                crate::storage::ProjectedValue::FullValue(bytes) => bytes.is_empty(),
-                crate::storage::ProjectedValue::KeyOnly => true,
-            })
-            .count();
-        let rows = entries.len() - witnesses;
         assert_eq!(
-            (witnesses, rows),
+            hot_index_record_counts(&storage).await,
             (1, 3),
             "expected one witness for the one declared column and one entry per child row"
         );

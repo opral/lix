@@ -14,14 +14,21 @@
 //! the reported number is the marginal cost of one insert into a collection of
 //! that size — not an amortized average over the seed.
 //!
-//! Usage: `exppq_write_scaling [sizes_csv] [measured_inserts]`
-//! (defaults: `10,100,500,2000` and 40).
+//! `pk_only` is the **null control**: its schema declares no unique group and
+//! no foreign key, so it has no indexed column and executes no changed code in
+//! either arm. Whatever spread it shows between arms is this harness's noise
+//! floor, and a delta on another lane that is smaller than that spread is not
+//! a result.
+//!
+//! Usage: `exppq_write_scaling [sizes_csv] [measured_inserts] [backend]`
+//! (defaults: `10,100,500,2000`, 40, and `rocksdb`).
 
 use std::time::Instant;
 
 use lix::Value;
 use lix::integration::{Engine, SessionContext};
-use lix::Memory;
+use lix::storage::Storage;
+use lix_storage_rocksdb::RocksDB;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Lane {
@@ -45,7 +52,7 @@ impl Lane {
 
 const LANES: [Lane; 3] = [Lane::PkOnly, Lane::Unique, Lane::ForeignKey];
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
     let sizes = args
@@ -58,19 +65,32 @@ async fn main() {
         .next()
         .and_then(|value| value.parse().ok())
         .unwrap_or(40);
+    let backend = args.next().unwrap_or_else(|| "rocksdb".to_owned());
 
     println!(
-        "# exppq write scaling | measured_inserts={measured} | sizes={sizes:?} | storage=Memory"
+        "# exppq write scaling | measured_inserts={measured} | sizes={sizes:?} | storage={backend}"
     );
     for lane in LANES {
         for &size in &sizes {
-            run_lane(lane, size, measured).await;
+            match backend.as_str() {
+                "rocksdb" => {
+                    let directory = tempfile::tempdir().expect("create RocksDB directory");
+                    let storage = RocksDB::open(directory.path()).expect("open RocksDB");
+                    run_lane(storage, lane, size, measured).await;
+                }
+                "memory" => {
+                    run_lane(lix::Memory::default(), lane, size, measured).await;
+                }
+                other => panic!("unknown backend '{other}', expected rocksdb or memory"),
+            }
         }
     }
 }
 
-async fn run_lane(lane: Lane, seeded: usize, measured: usize) {
-    let storage = Memory::default();
+async fn run_lane<S>(storage: S, lane: Lane, seeded: usize, measured: usize)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     Engine::initialize(storage.clone())
         .await
         .expect("initialize fixture");
@@ -124,7 +144,10 @@ async fn run_lane(lane: Lane, seeded: usize, measured: usize) {
     );
 }
 
-async fn insert_row(session: &SessionContext<Memory>, lane: Lane, index: usize) {
+async fn insert_row<S>(session: &SessionContext<S>, lane: Lane, index: usize)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     match lane {
         Lane::PkOnly => {
             session
