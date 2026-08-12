@@ -45,11 +45,31 @@ async fn main() {
         .unwrap_or(500);
     assert!(samples >= 3, "need at least three samples");
 
-    let directory = tempfile::tempdir().expect("create RocksDB directory");
-    let storage = RocksDB::open(directory.path()).expect("open RocksDB");
-    Engine::initialize(storage.clone())
-        .await
-        .expect("initialize repository");
+    // Seeding is O(files^2 / batch) because every seeding transaction
+    // re-validates the filesystem namespace over the whole domain, so at large
+    // collection sizes it dwarfs the thing being measured. `LIX_FK_SEED_DIR`
+    // seeds one reusable fixture; `LIX_FK_FIXTURE` measures against a copy of
+    // it. Both arms then run over byte-identical state, which is also better
+    // science than reseeding per arm.
+    let seed_dir = std::env::var("LIX_FK_SEED_DIR").ok();
+    let fixture_dir = std::env::var("LIX_FK_FIXTURE").ok();
+
+    let scratch = tempfile::tempdir().expect("create RocksDB directory");
+    let (path, seeding) = match (&seed_dir, &fixture_dir) {
+        (Some(dir), _) => (std::path::PathBuf::from(dir), true),
+        (None, Some(dir)) => (std::path::PathBuf::from(dir), false),
+        (None, None) => (scratch.path().to_path_buf(), true),
+    };
+
+    if seeding {
+        std::fs::create_dir_all(&path).expect("create fixture directory");
+    }
+    let storage = RocksDB::open(&path).expect("open RocksDB");
+    if seeding {
+        Engine::initialize(storage.clone())
+            .await
+            .expect("initialize repository");
+    }
     let engine = Engine::new(storage.clone()).await.expect("open engine");
     let session = engine
         .open_workspace_session()
@@ -57,8 +77,10 @@ async fn main() {
         .expect("open workspace");
 
     let seed_started = Instant::now();
-    seed_files(&session, files, seed_batch).await;
-    seed_victims(&session, samples, seed_batch).await;
+    if seeding {
+        seed_files(&session, files, seed_batch).await;
+        seed_victims(&session, samples, seed_batch).await;
+    }
     let seed_elapsed = seed_started.elapsed();
 
     let observed = count_files(&session).await;
@@ -66,6 +88,15 @@ async fn main() {
         observed, files as i64,
         "seeded file count must match the requested collection size"
     );
+
+    if seed_dir.is_some() {
+        println!(
+            "expfk_directory_delete_scan SEEDED files={files} seed_s={:.1} path={}",
+            seed_elapsed.as_secs_f64(),
+            path.display()
+        );
+        return;
+    }
 
     // One untimed delete so plan caches and page caches are warm.
     delete_directory(&session, "/empty/warmup").await;
