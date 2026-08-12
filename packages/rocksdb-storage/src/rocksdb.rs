@@ -19,8 +19,8 @@ use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
     ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId, Storage, StorageError,
-    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueSemantics,
-    WriteOptions, WriteStats,
+    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueIntegrity,
+    ValueSemantics, WriteOptions, WriteStats,
 };
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
@@ -30,6 +30,11 @@ use rocksdb::{DBRawIteratorWithThreadMode, Snapshot};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+const WRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+/// Spare memtables per column family. Four buffers cap resident memtable memory
+/// at `WRITE_BUFFER_BYTES * WRITE_BUFFER_COUNT` per family (512 MiB across the
+/// two families) and are what keeps a flush off the next writer's latency.
+const WRITE_BUFFER_COUNT: i32 = 4;
 const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
 const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const BLOB_GC_FORCE_THRESHOLD: f64 = 0.5;
@@ -250,6 +255,34 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
     }
 }
 
+/// Read options for a full-value read of `space`.
+///
+/// RocksDB verifies a CRC32C over every block and every blob-file record it
+/// reads. For a [`ValueIntegrity::ContentAddressed`] space that is a strictly
+/// weaker duplicate of a check the engine has already made unconditional: the
+/// key *is* the BLAKE3-256 digest of the value, and the engine recomputes and
+/// compares it before the bytes escape the read. Corruption that RocksDB's
+/// CRC32C would have caught is caught by the digest instead — including the
+/// cases CRC32C cannot distinguish — so the second pass buys nothing and costs
+/// a full sweep over every payload byte.
+///
+/// It is worth stating what is *not* claimed. Skipping verification means a
+/// corrupt block reaches the engine before it is rejected, so the failure mode
+/// moves from RocksDB's error to the engine's content-address error. The bytes
+/// never escape either way. `verify_checksums` also covers this column
+/// family's index and filter blocks; a corrupt index can only send the read to
+/// the wrong key, and the wrong payload fails the digest check for the key that
+/// was actually asked for.
+///
+/// Every other space gets RocksDB's default, which verifies.
+fn value_read_options(space: StorageSpace) -> rocksdb::ReadOptions {
+    let mut options = rocksdb::ReadOptions::default();
+    if space.value_integrity == ValueIntegrity::ContentAddressed {
+        options.set_verify_checksums(false);
+    }
+    options
+}
+
 fn column_family(db: &DB, space: StorageSpace) -> &ColumnFamily {
     match space.value_semantics {
         ValueSemantics::Mutable => mutable_column_family(db),
@@ -347,9 +380,10 @@ impl StorageRead for RocksDBRead<'_> {
                         }
                     }
                     CoreProjection::FullValue => {
-                        let values = self
-                            .snapshot
-                            .multi_get_cf(physical_keys.iter().map(|key| (cf, key.0.as_ref())));
+                        let values = self.snapshot.multi_get_cf_opt(
+                            physical_keys.iter().map(|key| (cf, key.0.as_ref())),
+                            value_read_options(request.space),
+                        );
                         results.extend(
                             values
                                 .into_iter()
@@ -379,7 +413,16 @@ impl StorageRead for RocksDBRead<'_> {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
             let bounds = EncodedBounds::new(physical_range(space.id, range.clone()));
-            let mut iterator = self.snapshot.raw_iterator_cf(column_family(self.db, space));
+            let mut iterator = match opts.projection {
+                // A key-only scan never materializes a value, so there is no
+                // value checksum to skip and the default options are right.
+                CoreProjection::KeyOnly => {
+                    self.snapshot.raw_iterator_cf(column_family(self.db, space))
+                }
+                CoreProjection::FullValue => self
+                    .snapshot
+                    .raw_iterator_cf_opt(column_family(self.db, space), value_read_options(space)),
+            };
             iterator.seek(&bounds.lower_seek);
             iterator.status().map_err(rocksdb_error)?;
             ScanCursor::from_source(
@@ -440,7 +483,7 @@ impl StorageScanSource for RocksDBScanSource<'_> {
                 .iterator
                 .key()
                 .is_some_and(|key| self.bounds.before_upper(key));
-            Ok(ScanChunk { entries, has_more })
+            Ok(ScanChunk::new(entries, has_more))
         })
     }
 }
@@ -754,7 +797,17 @@ fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
 
 fn column_family_options() -> Options {
     let mut options = Options::default();
-    options.set_write_buffer_size(64 * 1024 * 1024);
+    options.set_write_buffer_size(WRITE_BUFFER_BYTES);
+    // RocksDB's default of two write buffers gives a writer exactly one spare
+    // memtable: the moment the active one fills, the next `db.write` blocks
+    // until the previous flush has finished. A media commit stages megabytes at
+    // a time, so a bulk import fills both buffers and the *next* ordinary agent
+    // commit pays the whole flush inside its own latency. Measured on a 64 file
+    // / 10 MiB corpus, that one commit cost 337-369 ms against a 21 ms median;
+    // with four buffers it costs 22 ms and the median does not move. Raising
+    // `max_background_jobs` instead changes nothing (measured 339/369 ms), so
+    // the spare-memtable count is the whole effect.
+    options.set_max_write_buffer_number(WRITE_BUFFER_COUNT);
     let mut table_options = BlockBasedOptions::default();
     // Full whole-key filters let missing point reads skip unrelated SST data.
     table_options.set_bloom_filter(8.0, false);

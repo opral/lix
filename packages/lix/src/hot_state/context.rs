@@ -383,9 +383,22 @@ impl HotStateContext {
         }
     }
 
-    /// Creates a reader whose derived indexes are private to one retained
-    /// storage snapshot. Process-wide caches intentionally advance with live
-    /// commits and therefore cannot serve an older explicit transaction.
+    /// Creates a reader whose entity-level derived indexes are private to one
+    /// retained storage snapshot. Those caches are not revision-tagged, so they
+    /// cannot serve an older explicit transaction and stay per-snapshot.
+    ///
+    /// The filesystem path index is deliberately **not** among them. It is
+    /// keyed by the `filesystem.path` revision, which
+    /// [`stage_path_index_revision`](crate::filesystem::stage_path_index_revision)
+    /// rewrites with a fresh UUIDv7 on every commit that changes the filesystem
+    /// view. Equal revision therefore means equal view, and a reader pinned to
+    /// an older snapshot loads the older revision from its own store and misses
+    /// rather than being served a newer view. Correctness comes from the
+    /// revision in the cache key, not from owning a private cache — and giving
+    /// each snapshot reader its own empty cache guaranteed a full
+    /// whole-repository rebuild for the first statement of every write
+    /// transaction, which is the epoch-0 path in
+    /// `TransactionSqlWriteExecutionContext::filesystem_path_index`.
     pub(crate) fn snapshot_reader<S>(&self, store: S) -> HotStateContextReader<S>
     where
         S: StorageAdapterRead,
@@ -394,7 +407,7 @@ impl HotStateContext {
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
-            filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
+            filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
             entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
             branch_head_control_cache: None,
@@ -2885,15 +2898,13 @@ mod tests {
         let mut records = std::collections::BTreeMap::new();
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
-            let commit_change_id = format!("{commit_id_text}:commit");
             let record = crate::changelog::CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: CommitId::for_test_label(&commit_id_text),
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 first_parent_jump_commit_id: CommitId::for_test_label(&commit_id_text),
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             };
@@ -3126,13 +3137,12 @@ mod tests {
                 .copied()
                 .map_or((commit_id, 0), |parent| (parent, 1));
             append.commits.push(crate::changelog::CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id,
                 generation,
                 parent_commit_ids: parents,
                 first_parent_jump_commit_id,
                 first_parent_jump_span,
-                change_id: ChangeId::for_test_label(&format!("{commit_id}:change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             });
@@ -3274,7 +3284,6 @@ mod tests {
                 .first()
                 .map(|(change, _, _)| change.created_at)
                 .unwrap_or_else(|| ts("1970-01-01T00:00:00.000Z"));
-            let commit_change_id = format!("{commit_id}:commit");
             let generation = if let Some(parent) = parent_ids.first() {
                 let parent_generation = if let Some(generation) = generations.get(parent) {
                     *generation
@@ -3306,13 +3315,12 @@ mod tests {
                 .map(|id| CommitId::for_test_label(id))
                 .collect::<Vec<_>>();
             let record = crate::changelog::CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: CommitId::for_test_label(&commit_id),
                 generation,
                 parent_commit_ids: typed_parent_ids,
                 first_parent_jump_commit_id: CommitId::for_test_label(&commit_id),
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label(&commit_change_id),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: commit_created_at,
             };

@@ -1123,13 +1123,12 @@ where
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation,
             parent_commit_ids: parents,
             first_parent_jump_commit_id,
             first_parent_jump_span,
-            change_id: crate::changelog::ChangeId::for_test_label(&format!("{label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "merge-base benchmark timestamp",
@@ -1464,7 +1463,6 @@ pub struct RepositoryGcBenchResult {
     pub deleted_mutation_inventories: usize,
     pub deleted_semantic_commit_projections: usize,
     pub deleted_semantic_change_rows: usize,
-    pub deleted_semantic_reverse_index_rows: usize,
     pub staged_written_bytes: u64,
     pub delete_descriptors: usize,
     pub delete_descriptor_capacity: usize,
@@ -1686,8 +1684,6 @@ where
     );
     let deleted_semantic_commit_projections = delete_count(crate::changelog::COMMIT_SPACE.id.0);
     let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id.0);
-    let deleted_semantic_reverse_index_rows =
-        delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0);
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
         swept_commits: plan
@@ -1716,7 +1712,6 @@ where
         deleted_mutation_inventories,
         deleted_semantic_commit_projections,
         deleted_semantic_change_rows,
-        deleted_semantic_reverse_index_rows,
         staged_written_bytes: stats.written_bytes,
         delete_descriptors: arena.delete_descriptors,
         delete_descriptor_capacity: arena.delete_descriptor_capacity,
@@ -1741,7 +1736,6 @@ pub struct RepositoryGcCommitBenchResult {
     pub reclaimed_manifest_rows: usize,
     pub reclaimed_manifest_chunk_rows: usize,
     pub reclaimed_chunk_rows: usize,
-    pub reclaimed_chunk_bytes: u64,
     pub plan_us: u64,
     pub commit_us: u64,
 }
@@ -1800,7 +1794,6 @@ where
                     reclaimed_manifest_rows: binary_cas.reclaimed_manifest_rows,
                     reclaimed_manifest_chunk_rows: binary_cas.reclaimed_manifest_chunk_rows,
                     reclaimed_chunk_rows: binary_cas.reclaimed_chunk_rows,
-                    reclaimed_chunk_bytes: binary_cas.reclaimed_chunk_bytes,
                     plan_us,
                     commit_us: commit_started.elapsed().as_micros() as u64,
                 });
@@ -3181,9 +3174,7 @@ pub fn recompute_content_address(
 
 /// Decodes one `binary_cas.manifest_chunk` row into the chunk it references
 /// and that chunk's logical size.
-pub fn decode_binary_cas_chunk_reference(
-    value: &[u8],
-) -> Result<([u8; 32], u64), crate::LixError> {
+pub fn decode_binary_cas_chunk_reference(value: &[u8]) -> Result<([u8; 32], u64), crate::LixError> {
     crate::binary_cas::decode_binary_cas_manifest_chunk(value)
 }
 
@@ -3218,12 +3209,12 @@ where
         .await
         .expect("begin storage bench layout scan");
     loop {
-        let result = cursor
+        let (result, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan complete storage bench layout space");
-        let has_more = result.has_more;
-        for entry in result.entries {
+            .expect("scan complete storage bench layout space")
+            .into_parts();
+        for entry in result {
             accounting.rows = accounting
                 .rows
                 .checked_add(1)
@@ -3271,12 +3262,12 @@ where
         .await
         .expect("begin storage bench layout scan");
     loop {
-        let result = cursor
+        let (result, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan complete storage bench layout space");
-        let has_more = result.has_more;
-        entries.extend(result.entries);
+            .expect("scan complete storage bench layout space")
+            .into_parts();
+        entries.extend(result);
         if !has_more {
             return entries;
         }
@@ -3522,7 +3513,6 @@ mod tests {
         assert_eq!(first.deleted_semantic_commit_projections, 10);
         // Each reclaimed projection owns one change fact and reverse-index row.
         assert_eq!(first.deleted_semantic_change_rows, 10);
-        assert_eq!(first.deleted_semantic_reverse_index_rows, 10);
         // The stranded serving generation is gone too, but the branch deletion
         // retired it rather than this sweep: a generation is reachable from
         // exactly one branch control, so the write set that removes the control
@@ -3545,7 +3535,6 @@ mod tests {
                 ), // mutation inventory authority
                 (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
                 (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
-                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 10), // commit -> change reverse index
             ]
         );
         assert_eq!(

@@ -3824,10 +3824,10 @@ pub(crate) async fn scan_commit_state_manifest_commit_ids(
         .await?;
     let mut commit_ids = Vec::new();
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in &page.entries {
+            .await?.into_parts();
+        for entry in &page {
             let bytes: [u8; 16] = entry.key.0.as_ref().try_into().map_err(|_| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -3836,7 +3836,7 @@ pub(crate) async fn scan_commit_state_manifest_commit_ids(
             })?;
             commit_ids.push(CommitId::new(uuid::Uuid::from_bytes(bytes)));
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -4408,10 +4408,38 @@ where
         single_partition_from_bounds(&first.first_key, &last.last_key)?
     };
     if segment_row_counts.len() == 1 {
-        let (_, inline_segment) = first_segment
+        let (bounds, encoded) = first_segment
             .take()
-            .expect("one ordered segment remains inline in its manifest");
-        manifest.inline_segment = inline_segment;
+            .expect("one ordered segment remains available for its manifest");
+        // Inlining a lone segment into the manifest saves a small commit one
+        // storage row and one point read, and costs nothing while no reader
+        // touches the payload — a small commit leaves its rows on the hot
+        // plane, which is where current-value reads find them.
+        //
+        // A segment that fills to `COMMIT_DELTA_SEGMENT_MAX_ROWS` is the one
+        // case where that stops being true. Filling a whole segment is also
+        // what takes the commit over the packing threshold, so its rows leave
+        // the hot plane and every current-value read has to fetch the manifest
+        // and decode the entire inlined segment to reach one row.
+        //
+        // Measured (rocksdb, 10 240 rows, 2 000 point reads, ryzen-9950x-II):
+        // a 512-row commit read at 887 us against 140 us at 511 rows and
+        // 314 us at 513 — 6.3x — because 512 is the only width that both packs
+        // and produces exactly one segment. Decode dominates that cost
+        // (`decode_commit_delta_with_payloads` 41%, zstd 23%, manifest fetch
+        // under 2.5%), so the fix is to stop inlining a full segment rather
+        // than to make the fetch cheaper.
+        if usize::from(segment_row_counts[0]) < COMMIT_DELTA_SEGMENT_MAX_ROWS {
+            manifest.inline_segment = encoded;
+        } else {
+            manifest.segments.push(bounds);
+            writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, 1, 0);
+            writes.put(
+                TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+                key(commit_delta_segment_key(commit_id, 0)?),
+                value(encoded),
+            );
+        }
     }
     let dense_addresses = segment_row_counts
         .iter()
@@ -9835,10 +9863,10 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry_batch in page.entries.chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS) {
+            .await?.into_parts();
+        for entry_batch in page.chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS) {
             let commit_ids = entry_batch
                 .iter()
                 .map(|entry| commit_id_from_delta_key(&entry.key))
@@ -9925,7 +9953,7 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                 }
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -10003,14 +10031,14 @@ async fn validate_no_orphan_commit_delta_segments(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        if page.entries.is_empty() {
+            .await?.into_parts();
+        if page.is_empty() {
             break;
         }
         let mut commit_ids = Vec::new();
-        for entry in &page.entries {
+        for entry in &page {
             if entry.key.0.len() != 20 && entry.key.0.len() != 52 {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -10027,7 +10055,7 @@ async fn validate_no_orphan_commit_delta_segments(
             .into_iter()
             .zip(manifests)
             .collect::<BTreeMap<_, _>>();
-        for entry in &page.entries {
+        for entry in &page {
             let commit_id = commit_id_from_delta_key(&entry.key)?;
             let segment_index = usize::try_from(u32::from_be_bytes(
                 entry.key.0[16..20]
@@ -10065,7 +10093,7 @@ async fn validate_no_orphan_commit_delta_segments(
                 ));
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -10675,10 +10703,10 @@ pub(crate) async fn stage_sweep_unreachable_content_nodes(
             )
             .await?;
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 let node_id = <[u8; 32]>::try_from(entry.key.0.as_ref()).map_err(|_| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -10692,7 +10720,7 @@ pub(crate) async fn stage_sweep_unreachable_content_nodes(
                     writes.delete(space, entry.key);
                 }
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -10720,16 +10748,16 @@ async fn scan_full_space(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in &page.entries {
+            .await?.into_parts();
+        for entry in &page {
             let StorageProjectedValue::FullValue(bytes) = &entry.value else {
                 unreachable!("full commit-delta scan returned a key-only row");
             };
             rows.push((entry.key.clone(), bytes.clone()));
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -12368,6 +12396,17 @@ impl TrackedStateChunkOverlay {
         self.chunks.keys().copied()
     }
 
+    /// Promotes overlay chunks a previous rootless interval staged only
+    /// transiently into the durable write set.
+    ///
+    /// This stages through the same content-addressed entry point as
+    /// [`Self::stage_chunks`]. Both producers write the one chunk space in one
+    /// rebuild write set, and a rooted plan routinely re-derives a node an
+    /// earlier rootless plan already produced — content-addressed, so the same
+    /// digest. Staging that digest through a plain put made the second producer
+    /// a duplicate mutation and failed the whole rebuild; the shared
+    /// content-addressed path coalesces the identical entry while still
+    /// rejecting a same-digest/different-bytes conflict.
     pub(crate) async fn stage_selected_chunks(
         &mut self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -12382,6 +12421,7 @@ impl TrackedStateChunkOverlay {
         // run against the digests themselves rather than the staged-chunk map.
         self.probe_durable_digests(store, hashes.iter().copied())
             .await?;
+        let mut entries = Vec::with_capacity(hashes.len());
         for hash in hashes {
             if self.known_durable.contains(&hash) {
                 continue;
@@ -12392,14 +12432,14 @@ impl TrackedStateChunkOverlay {
                     "tracked-state transient chunk promotion lost its overlay bytes",
                 )
             })?;
-            writes.put(
-                TRACKED_STATE_TREE_CHUNK_SPACE,
+            entries.push((
                 StorageKey(Bytes::copy_from_slice(&hash)),
                 StorageValue {
                     bytes: bytes.clone(),
                 },
-            );
+            ));
         }
+        writes.put_content_addressed_batch(TRACKED_STATE_TREE_CHUNK_SPACE, entries);
         Ok(())
     }
 
@@ -13778,7 +13818,6 @@ mod tests {
             parent_commit_ids: Vec::new(),
             first_parent_jump_commit_id: commit_id,
             first_parent_jump_span: 0,
-            change_id: ChangeId::for_test_label(&format!("{commit_id}:fixture-commit")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
         };
@@ -15794,6 +15833,53 @@ mod tests {
             );
             assert_eq!(staged, chunks.chunk_bytes(*chunk));
         }
+    }
+
+    /// Regression: a rebuild write set carries both chunk producers.
+    ///
+    /// `rebuild_commit_root_at` stages a rooted plan's chunks with
+    /// `stage_chunks` and then promotes the transient chunks an earlier
+    /// rootless plan produced with `stage_selected_chunks`. The tree is
+    /// content-addressed, so a re-derived node is the same digest in both
+    /// producers; promotion used to stage it as a plain put, which the
+    /// write-set validator rejected as a duplicate mutation and which made the
+    /// whole rebuild fail with `LIX_STORAGE_ERROR`.
+    #[tokio::test]
+    async fn promoting_a_chunk_the_write_set_already_staged_is_not_a_duplicate_mutation() {
+        let store = StorageAdapter::new(Memory::new())
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open empty snapshot");
+        let data = vec![7u8; 96];
+        let chunks = PendingChunkBatch::from_parts(
+            Bytes::from(data.clone()),
+            vec![PendingChunk {
+                hash: hash_bytes(&data),
+                data_start: 0,
+                data_len: data.len(),
+            }],
+        );
+        let hash = chunks.chunks()[0].hash;
+
+        let mut writes = StorageWriteSet::new();
+        let mut overlay = TrackedStateChunkOverlay::repairing();
+        overlay
+            .stage_chunks(&store, &mut writes, &chunks)
+            .await
+            .expect("rooted plan stages its derived chunks");
+        overlay
+            .stage_selected_chunks(&store, &mut writes, [hash])
+            .await
+            .expect("promotion of an already staged digest stages");
+
+        writes
+            .validate()
+            .expect("a re-derived content-addressed chunk is not a duplicate mutation");
+        assert_eq!(
+            writes.arena_stats().put_descriptors,
+            1,
+            "the identical content-addressed entry must be coalesced, not restated"
+        );
     }
 
     #[tokio::test]

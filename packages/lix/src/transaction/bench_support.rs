@@ -672,14 +672,16 @@ mod tests {
         assert_eq!(point_update.logical_rows, 1);
         // The point write keeps the compact current-state certificate,
         // publishes its authenticated branch control, and rotates the mandatory
-        // binary-CAS publication/reclamation epoch. It touches nine spaces, not
+        // binary-CAS publication/reclamation epoch. It touches eight spaces, not
         // eleven: the binary-CAS epoch and the tracked mutation fence are two
-        // keys in the one revision space, and the retirement candidates a
-        // sweep needs are now derived from the commit graph instead of being
-        // published into a reachability delta row plus its queue control.
-        assert_eq!(point_update.staged_puts, 10, "{point_update:?}");
-        assert_eq!(point_update.touched_spaces, 9, "{point_update:?}");
-        assert_eq!(point_update.put_batches, 9, "{point_update:?}");
+        // keys in the one revision space, the retirement candidates a sweep
+        // needs are derived from the commit graph instead of being published
+        // into a reachability delta row plus its queue control, and the
+        // commit-derived change id is computed from the commit id instead of
+        // being mirrored into a reverse-index space.
+        assert_eq!(point_update.staged_puts, 9, "{point_update:?}");
+        assert_eq!(point_update.touched_spaces, 8, "{point_update:?}");
+        assert_eq!(point_update.put_batches, 8, "{point_update:?}");
 
         // A sparse overlay deliberately invalidates the complete-generation
         // digest, so use a fresh fixture to exercise exact bulk replacement

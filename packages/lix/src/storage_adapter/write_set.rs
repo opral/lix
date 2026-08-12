@@ -358,7 +358,6 @@ impl StorageWriteSet {
     /// Identical entries already staged by an earlier batch are coalesced;
     /// same-key, different-value entries remain duplicate mutations and are
     /// deliberately left for the canonical validator to reject.
-    #[cfg(test)]
     pub(crate) fn put_content_addressed_batch<I>(&mut self, space: StorageSpace, entries: I)
     where
         I: IntoIterator<Item = (Key, StoredValue)>,

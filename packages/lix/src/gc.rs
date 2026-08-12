@@ -20,13 +20,13 @@ use crate::changelog::{ChangeRecord, CommitScanRequest};
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::changelog::{ChangeScanRequest, ChangelogContext, ChangelogReader};
 use crate::commit_graph::CommitGraphContext;
+use crate::hot_state::TrackedHeadContext;
+#[cfg(test)]
+use crate::hot_state::stage_collect_stale_working_diff_indexes;
 #[cfg(test)]
 use crate::json_store::JsonRef;
 #[cfg(test)]
 use crate::json_store::{JsonSlot, JsonStoreContext};
-use crate::hot_state::TrackedHeadContext;
-#[cfg(test)]
-use crate::hot_state::stage_collect_stale_working_diff_indexes;
 #[cfg(test)]
 use crate::storage_adapter::StorageCoreProjection;
 use crate::storage_adapter::{
@@ -280,7 +280,6 @@ pub(crate) fn stage_checkpoint_gc_state(
     Ok(())
 }
 
-
 /// Resolves a still-pending checkpoint replacement for an explicit branch
 /// source, or proves that the source remains reachable through ordinary
 /// canonical chronology.
@@ -440,10 +439,11 @@ pub(crate) async fn load_recovery_refs(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?
+            .into_parts();
+        for entry in page {
             let StorageProjectedValue::FullValue(bytes) = entry.value else {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -481,7 +481,7 @@ pub(crate) async fn load_recovery_refs(
                 },
             );
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -1142,9 +1142,17 @@ where
 /// The caller must serialize this operation with repository writes and commit
 /// `writes` atomically. Planning and mutation are deliberately separated from
 /// storage commit so checkpoint/session code can retain lifecycle control.
-/// Content-addressed tree/CAS orphan repair is intentionally an offline path;
-/// out-of-band JSON is reclaimed here only from explicit ownership-loss
-/// candidates.
+/// Content-addressed tree/CAS orphan repair is intentionally an offline path.
+///
+/// **Out-of-band JSON is not reclaimed here at all.** This comment used to
+/// claim reclamation "from explicit ownership-loss candidates"; that mechanism
+/// was deleted in 31cb639ae because the candidate hints were write-only, and
+/// nothing replaced it. `stage_delete_refs` and every function that enumerates
+/// payload hashes are `#[cfg(test)]`, and this path stages an empty
+/// `json_payloads`. A repository's out-of-band payload count therefore grows
+/// linearly with edits and is never reclaimed -- measured at 0 rows reclaimed
+/// for 10, 100, and 1000 rewrites of a single row
+/// (`engine-benchmarks/examples/e1_json_leak.rs`).
 /// Ordinary GC derives its candidates from the physical manifest inventory and
 /// proves liveness only from refs: branch-head controls and checkpoint recovery
 /// refs are the complete active-root set, and the walk from those roots through
@@ -1944,10 +1952,6 @@ where
             )?;
         }
     }
-    crate::changelog::stage_delete_commit_change_ids(
-        writes,
-        sweep_commit_change_ids.iter().copied(),
-    );
     crate::changelog::stage_delete_changes(writes, sweep_changes.iter().copied());
     JsonStoreContext::new()
         .writer()
@@ -2039,12 +2043,13 @@ where
             }
             let parent_start = commits.parent_commit_ids.len();
             let parent_len = commit.parent_commit_ids.len();
+            let change_id = commit.change_id();
             commits
                 .parent_commit_ids
                 .extend(commit.parent_commit_ids.into_iter());
             commits.entries.push(GcCommitInventoryEntry {
                 commit_id: commit.commit_id,
-                change_id: commit.change_id,
+                change_id,
                 parent_start,
                 parent_len,
             });
@@ -2133,15 +2138,15 @@ mod tests {
     };
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
+    use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::json_store::{
         JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
         NormalizedJsonRef,
     };
-    use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
-        StorageKey, StorageReadOptions, StorageSpace, StorageValue,
-        StorageWriteOptions, StorageWriteSet,
+        StorageKey, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
+        StorageWriteSet,
     };
     use crate::tracked_state::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
@@ -2162,10 +2167,10 @@ mod tests {
 
     use super::{
         CHECKPOINT_GC_STATE_SPACE, CheckpointGcState, CheckpointRecoveryRef,
-        authenticated_control_commit_reachability,
-        derive_retirement_candidates, load_checkpoint_gc_state, load_recovery_ref,
-        load_recovery_refs, resolve_pending_checkpoint_replacement, retirement_is_proven,
-        stage_checkpoint_gc_state, stage_delete_recovery_ref, stage_recovery_ref_rotation,
+        authenticated_control_commit_reachability, derive_retirement_candidates,
+        load_checkpoint_gc_state, load_recovery_ref, load_recovery_refs,
+        resolve_pending_checkpoint_replacement, retirement_is_proven, stage_checkpoint_gc_state,
+        stage_delete_recovery_ref, stage_recovery_ref_rotation,
     };
 
     #[tokio::test]
@@ -4622,7 +4627,6 @@ mod tests {
         assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
     }
 
-
     #[tokio::test]
     async fn authority_gc_rejects_missing_live_commit_state_before_staging_deletes() {
         let storage = StorageAdapter::new(Memory::new());
@@ -4688,46 +4692,42 @@ mod tests {
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
         let commits = [
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: source_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 first_parent_jump_commit_id: source_commit,
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-source-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: alias_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 first_parent_jump_commit_id: alias_commit,
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-live-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: authority_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 first_parent_jump_commit_id: authority_commit,
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-authority-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![alias_commit, authority_commit],
                 first_parent_jump_commit_id: live_head,
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label("gc-tombstone-alias-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
@@ -4939,35 +4939,32 @@ mod tests {
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
         let commits = vec![
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: live_parent,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 first_parent_jump_commit_id: live_parent,
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label("authority-gc-live-parent-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![live_parent],
                 first_parent_jump_commit_id: live_head,
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label("authority-gc-live-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: dead_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 first_parent_jump_commit_id: dead_commit,
                 first_parent_jump_span: 0,
-                change_id: ChangeId::for_test_label("authority-gc-dead-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
@@ -5201,7 +5198,6 @@ mod tests {
         );
     }
 
-
     async fn run_repository_gc(storage: &Memory) {
         let storage_adapter = StorageAdapter::new(storage.clone());
         let read = SharedStorageAdapterRead::new(
@@ -5262,13 +5258,12 @@ mod tests {
     fn gc_authority_record(label: &str) -> CommitRecord {
         let commit_id = CommitId::for_test_label(label);
         CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
             first_parent_jump_commit_id: commit_id,
             first_parent_jump_span: 0,
-            change_id: ChangeId::for_test_label(&format!("{label}-header")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse(
                 "authority GC record timestamp",
@@ -5288,13 +5283,12 @@ mod tests {
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             parent.map_or((commit_id, 0), |parent| (parent, 1));
         CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation,
             parent_commit_ids: parent.into_iter().collect(),
             first_parent_jump_commit_id,
             first_parent_jump_span,
-            change_id: ChangeId::for_test_label(&format!("{label}-header")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at,
         }
@@ -5467,12 +5461,13 @@ mod tests {
         .await
         .expect("generation census scan should open");
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await
-                .expect("generation census page should load");
-            rows += page.entries.len();
-            if !page.has_more {
+                .expect("generation census page should load")
+                .into_parts();
+            rows += page.len();
+            if !page_has_more {
                 break;
             }
         }
@@ -5716,10 +5711,9 @@ mod tests {
             .scan()
             .await
             .expect("offline authority controls should load");
-        let closure_error =
-            super::load_authenticated_repository_retention(&read, &controls)
-                .await
-                .expect_err("the retention closure must fail closed");
+        let closure_error = super::load_authenticated_repository_retention(&read, &controls)
+            .await
+            .expect_err("the retention closure must fail closed");
         let audit_error = super::audit_repository_gc_standalone_refs(&read)
             .await
             .expect_err("standalone audit must fail closed");
@@ -5733,10 +5727,13 @@ mod tests {
 
     #[tokio::test]
     async fn retention_closure_and_audit_reject_missing_and_malformed_required_authority() {
-        const MUTABLE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
-            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id,
-            "tracked_state.commit_state_manifest.v7",
-        );
+        // States the corruption-test need at the call site instead of smuggling
+        // it in as a second `StorageSpace::mutable` declaration that reads like
+        // a canonical one. This was the last raw re-declaration in the engine,
+        // and closing it lets `UNCHECKED_SPACE_IDS` go empty.
+        const MUTABLE_MANIFEST_SPACE: StorageSpace =
+            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+                .mutable_view_for_corruption_test();
 
         let (storage, commit_id, _, _, _) = gc_sweep_fixture().await;
         let mut writes = storage.new_write_set();

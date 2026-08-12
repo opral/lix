@@ -374,12 +374,12 @@ where
         .expect("begin row scan");
     let mut rows = 0usize;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan rows");
-        rows += page.entries.len();
-        if !page.has_more {
+            .expect("scan rows").into_parts();
+        rows += page.len();
+        if !page_has_more {
             break;
         }
     }
@@ -437,19 +437,17 @@ where
     let mut key_bytes = 0u64;
     let mut value_bytes = 0u64;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan kv layout accounting");
+            .expect("scan kv layout accounting").into_parts();
 
-        rows += page.entries.len() as u64;
+        rows += page.len() as u64;
         key_bytes += page
-            .entries
             .iter()
             .map(|entry| entry.key.0.len() as u64 + 4)
             .sum::<u64>();
         value_bytes += page
-            .entries
             .iter()
             .map(|entry| match &entry.value {
                 ProjectedValue::KeyOnly => 0,
@@ -457,7 +455,7 @@ where
             })
             .sum::<u64>();
 
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }

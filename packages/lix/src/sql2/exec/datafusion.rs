@@ -4838,11 +4838,44 @@ mod tests {
                 ],
             ]
         );
-        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        // A `WHERE` clause that resolves to a complete entity identity set is
+        // applied in full by the `entity_pks` access path, so this read must
+        // take the direct point-snapshot route rather than the generic
+        // visibility scan.
+        //
+        // This assertion pair previously read `scans == 1` and
+        // `requests.is_empty()` — the exact opposite — and its message called
+        // the snapshot reader "the deleted native snapshot route". That wording
+        // predates the current `EntitySnapshotReader`, which is a live route
+        // registered from `SqlExecutionContext::entity_snapshot_reader` and
+        // backed by the entity point-snapshot cache. The old expectation froze
+        // a mis-gate in `plan_scan_parts`: it re-derived a residual row filter
+        // for a predicate the access path already applied, and a non-empty
+        // `row_filters` disqualifies every direct route.
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            0,
+            "an exact identity point read must not fall back to the generic visibility scan"
+        );
         let requests = requests.lock().expect("captured snapshot requests lock");
-        assert!(
-            requests.is_empty(),
-            "DataFusion reads must not invoke the deleted native snapshot route"
+        assert_eq!(
+            requests.len(),
+            1,
+            "an exact identity point read must consult the entity point-snapshot route exactly once"
+        );
+        assert_eq!(
+            requests[0].filter.schema_keys,
+            vec!["test_state_schema".to_string()],
+            "the point-snapshot request must be scoped to the queried schema"
+        );
+        assert_eq!(
+            requests[0].filter.entity_pks,
+            vec![
+                crate::entity_pk::EntityPk::single("entity-a"),
+                crate::entity_pk::EntityPk::single("entity-b"),
+            ],
+            "the repeated 'entity-b' in the IN list must collapse into a deduplicated, \
+             ordered identity set rather than being pushed down three times"
         );
     }
 

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use lix::{LixError, Value};
 
-const SEEDS: [u64; 4] = [0, 1, 0x51ce_deed, u64::MAX];
+const DEFAULT_SEEDS: [u64; 4] = [0, 1, 0x51ce_deed, u64::MAX];
 const TRANSACTIONS_PER_SEED: usize = 32;
 const KEYS_PER_SEED: usize = 8;
 
@@ -18,7 +18,7 @@ simulation_test!(
             &engine,
         );
 
-        for seed in SEEDS {
+        for seed in crate::support::fuzz_seeds(&DEFAULT_SEEDS) {
             let prefix = format!("corruption-fuzz-{seed:016x}-");
             let keys = (0..KEYS_PER_SEED)
                 .map(|index| format!("{prefix}{index}"))

@@ -63,15 +63,46 @@ impl CommitId {
         Self::new(Uuid::from_bytes(bytes))
     }
 
+    /// The change id of the commit itself, at ordinal zero of its own change
+    /// address space.
+    ///
+    /// [`Self::with_change_address_space`] reserves the low 32 bits for packed
+    /// change ordinals, and the packed encoder biases every ordinal by one
+    /// (`tracked_state::storage::addressable_change_id`), so the all-zero
+    /// address is permanently unreachable as a member change —
+    /// `direct_change_locator` rejects it. That makes it the natural, and only
+    /// safe, slot for the synthetic `lix_commit` change that stands for the
+    /// commit itself.
+    ///
+    /// Deriving it is what lets the commit record be the single authority for
+    /// this identity. It was previously a freshly generated UUIDv7 stored on
+    /// the commit record and mirrored into a dedicated reverse-index space so
+    /// `lix_change` point reads could invert it; both are now unnecessary.
+    pub(crate) fn commit_change_id(&self) -> ChangeId {
+        ChangeId::new(self.uuid)
+    }
+
+    /// Test-only commit ids must satisfy the same invariant as real ones: the
+    /// low 32 bits are reserved, because the commit's own change id is that
+    /// address at ordinal zero.
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) fn for_test_label(value: &str) -> Self {
-        Uuid::parse_str(value)
-            .map(Self::new)
-            .unwrap_or_else(|_| Self::new(test_uuid_from_label(0x43, value)))
+        let uuid = Uuid::parse_str(value).unwrap_or_else(|_| test_uuid_from_label(0x43, value));
+        Self::with_change_address_space(uuid)
     }
 }
 
 impl ChangeId {
+    /// Recovers the commit whose synthetic `lix_commit` change this id is, if
+    /// it is one.
+    ///
+    /// The inverse of [`CommitId::commit_change_id`]. Returns `None` unless the
+    /// low 32 bits are zero, which is exactly the condition that excludes every
+    /// packed member change.
+    pub(crate) fn as_commit_change(&self) -> Option<CommitId> {
+        (self.uuid.as_bytes()[12..] == [0; 4]).then(|| CommitId::new(self.uuid))
+    }
+
     pub(crate) fn new(value: Uuid) -> Self {
         Self { uuid: value }
     }
@@ -314,6 +345,8 @@ pub(crate) struct ChangelogAppend {
 #[musli(packed)]
 pub(crate) struct CommitRecord {
     /// Version 3 adds the authenticated first-parent jump certified below.
+    /// Version 4 drops the stored `change_id`: it is now derived from
+    /// `commit_id` by [`CommitRecord::change_id`].
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     /// Longest-path distance from a graph root. Every parent has a strictly
@@ -326,9 +359,17 @@ pub(crate) struct CommitRecord {
     /// Number of first-parent edges covered by the jump. Roots and merge
     /// commits reset the linear lane with a self jump of span zero.
     pub(crate) first_parent_jump_span: u64,
-    pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
+}
+
+impl CommitRecord {
+    /// The public `lix_change.id` of this commit's synthetic `lix_commit` row.
+    ///
+    /// Derived, never stored: see [`CommitId::commit_change_id`].
+    pub(crate) fn change_id(&self) -> ChangeId {
+        self.commit_id.commit_change_id()
+    }
 }
 
 /// Derives the one-pointer Myers jump owned by a new immutable commit.
@@ -394,7 +435,7 @@ pub(crate) fn next_first_parent_jump(
 
 #[cfg(test)]
 mod topology_tests {
-    use super::{ChangeId, CommitId, CommitRecord, next_first_parent_jump};
+    use super::{CommitId, CommitRecord, next_first_parent_jump};
     use crate::common::LixTimestamp;
 
     #[test]
@@ -568,13 +609,12 @@ mod topology_tests {
     fn record(depth: u64, parent: Option<CommitId>, jump: Option<(CommitId, u64)>) -> CommitRecord {
         let commit_id = id(depth);
         CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation: depth,
             parent_commit_ids: parent.into_iter().collect(),
             first_parent_jump_commit_id: jump.map_or(commit_id, |jump| jump.0),
             first_parent_jump_span: jump.map_or(0, |jump| jump.1),
-            change_id: ChangeId::for_test_label(&format!("myers-change-{depth}")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse("Myers test timestamp", "2026-08-11T00:00:00Z"),
         }

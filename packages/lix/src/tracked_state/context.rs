@@ -6968,7 +6968,6 @@ mod tests {
                     parent_commit_ids: vec![commit_b],
                     first_parent_jump_commit_id: commit_a,
                     first_parent_jump_span: 0,
-                    change_id: ChangeId::for_test_label("commit-a:commit"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at: crate::common::LixTimestamp::expect_parse(
                         "created_at",
@@ -8594,12 +8593,23 @@ mod tests {
     /// repair still proves the whole closure. Pins both halves, because the
     /// difference between them is the entire cost argument: the commit path
     /// walks one root-to-leaf path, repair walks every row.
+    ///
+    /// This sweeps every non-root chunk rather than damaging one of them.
+    /// A single representative cannot express the property: `Addressable`
+    /// walks root -> leftmost child -> leaf, so damage *on* that path
+    /// legitimately defeats the bounded probe too, and only damage *off* it
+    /// separates the two proofs. Measured on this fixture, 2 of the 40
+    /// candidates sit on the bounded path. Selecting one of them by content
+    /// hash therefore leaves a ~1-in-20 chance that any future change to the
+    /// tree's contents flips this test to a permanent failure that reads like
+    /// a commit-root-rebuild regression rather than fixture drift. (An earlier
+    /// version selected by `HashSet` iteration order, which made the same
+    /// mistake nondeterministically and flaked in roughly 5% of runs.)
+    /// Sweeping pins the whole partition instead of guessing a member of it.
     #[tokio::test]
     async fn availability_proof_is_bounded_on_commit_and_total_on_repair() {
         use crate::tracked_state::commit_root_rebuild::RootAvailabilityProof;
 
-        let tracked_state = TrackedStateContext::new();
-        let storage = StorageAdapter::new(Memory::new());
         // Wide enough that the tree is more than one chunk, so "the root chunk"
         // and "the closure" are actually different sets.
         let rows = (0..4000)
@@ -8612,17 +8622,26 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        write_root_for_test(&storage, &tracked_state, "gen", None, &rows)
-            .await
-            .expect("wide genesis root should write");
-        write_rootless_commit_for_test(
-            &storage,
-            "a1",
-            "gen",
-            &[row_with_value("entity-a1", "a1-change", "a1", "a1")],
-        )
-        .await;
 
+        // The damage is a delete, so every candidate needs an undamaged fixture
+        // of its own.
+        async fn seeded_fixture(rows: &[MaterializedTrackedStateRow]) -> StorageAdapter {
+            let tracked_state = TrackedStateContext::new();
+            let storage = StorageAdapter::new(Memory::new());
+            write_root_for_test(&storage, &tracked_state, "gen", None, rows)
+                .await
+                .expect("wide genesis root should write");
+            write_rootless_commit_for_test(
+                &storage,
+                "a1",
+                "gen",
+                &[row_with_value("entity-a1", "a1-change", "a1", "a1")],
+            )
+            .await;
+            storage
+        }
+
+        let storage = seeded_fixture(&rows).await;
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -8632,64 +8651,96 @@ mod tests {
             .expect("genesis root should load")
             .expect("genesis root should exist");
         drop(read);
-        let chunks = stored_tree_chunk_hashes_for_test(&storage).await;
+        let root_bytes = *root_id.as_bytes();
+        let mut candidates = stored_tree_chunk_hashes_for_test(&storage)
+            .await
+            .into_iter()
+            .filter(|chunk| chunk != &root_bytes)
+            .collect::<Vec<_>>();
+        // Sorted so the sweep order, and any failure message, is reproducible.
+        candidates.sort_unstable();
         assert!(
-            chunks.len() > 2,
-            "fixture must build a multi-chunk tree, got {} chunks",
-            chunks.len()
+            candidates.len() > 1,
+            "fixture must build a multi-chunk tree, got {} non-root chunks",
+            candidates.len()
         );
+        drop(storage);
 
-        // Damage a chunk that is not the root and not on the leftmost path, so
-        // only a total traversal can notice it.
-        let mut damaged_chunk = None;
-        for chunk in chunks.iter() {
-            if chunk != root_id.as_bytes() {
-                damaged_chunk = Some(*chunk);
+        let mut resumed_from_damaged_root = 0usize;
+        let mut rejected_damaged_root = 0usize;
+        for candidate in &candidates {
+            let storage = seeded_fixture(&rows).await;
+            let mut writes = storage.new_write_set();
+            writes.delete(
+                storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(candidate)),
+            );
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("chunk delete should commit");
+
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("probe read should open");
+            let bounded = crate::tracked_state::commit_root_rebuild::
+                load_rebuild_plans_to_nearest_available_root_with_proof(
+                    &read,
+                    "a1",
+                    true,
+                    RootAvailabilityProof::Addressable,
+                )
+                .await
+                .expect("bounded probe should load plans");
+            let total = crate::tracked_state::commit_root_rebuild::
+                load_rebuild_plans_to_nearest_available_root_with_proof(
+                    &read,
+                    "a1",
+                    true,
+                    RootAvailabilityProof::Complete,
+                )
+                .await
+                .expect("total probe should load plans");
+
+            // Repair distrusts the chunk plane, so every damaged closure makes
+            // it walk back past the resume point — on the bounded path or not.
+            assert_eq!(
+                total.len(),
+                2,
+                "explicit repair must reject a resume point with a damaged closure \
+                 and replay past it (chunk {candidate:02x?})"
+            );
+            match bounded.len() {
+                1 => resumed_from_damaged_root += 1,
+                2 => rejected_damaged_root += 1,
+                other => panic!(
+                    "bounded probe returned {other} plans for chunk {candidate:02x?}; \
+                     expected 1 (resumed) or 2 (walked back)"
+                ),
             }
         }
-        let damaged_chunk = damaged_chunk.expect("a non-root chunk exists");
-        let mut writes = storage.new_write_set();
-        writes.delete(
-            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
-            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&damaged_chunk)),
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("chunk delete should commit");
 
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("probe read should open");
-        let bounded = crate::tracked_state::commit_root_rebuild::
-            load_rebuild_plans_to_nearest_available_root_with_proof(
-                &read,
-                "a1",
-                true,
-                RootAvailabilityProof::Addressable,
-            )
-            .await
-            .expect("bounded probe should load plans");
-        assert_eq!(
-            bounded.len(),
-            1,
-            "the commit path resumes from an addressable root and does not re-derive closure completeness"
+        // The commit path does not re-derive closure completeness: damage its
+        // one root-to-leaf walk never touches leaves the root resumable.
+        assert!(
+            resumed_from_damaged_root > 0,
+            "the commit path must resume from a root whose closure is damaged off \
+             the bounded path"
         );
-
-        let total = crate::tracked_state::commit_root_rebuild::
-            load_rebuild_plans_to_nearest_available_root_with_proof(
-                &read,
-                "a1",
-                true,
-                RootAvailabilityProof::Complete,
-            )
-            .await
-            .expect("total probe should load plans");
-        assert_eq!(
-            total.len(),
-            2,
-            "explicit repair must reject a resume point with a damaged closure and replay past it"
+        // ...and the bounded probe is not vacuous: damage *on* that walk still
+        // rejects the root.
+        assert!(
+            rejected_damaged_root > 0,
+            "the bounded probe must still reject a root whose bounded path is damaged"
+        );
+        // The whole cost argument: the bounded probe reads one root-to-leaf
+        // path, not the closure. If it read the closure, every chunk would
+        // reject.
+        assert!(
+            rejected_damaged_root < candidates.len(),
+            "the bounded probe walks one root-to-leaf path, so it cannot notice \
+             every chunk in the closure"
         );
     }
 
@@ -8714,13 +8765,12 @@ mod tests {
             )
             .await
             .expect("chunk inventory scan should begin");
-        let chunk = cursor
+        let (chunk, chunk_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("chunk inventory should scan");
-        assert!(!chunk.has_more, "test chunk inventory must fit one page");
+            .expect("chunk inventory should scan").into_parts();
+        assert!(!chunk_has_more, "test chunk inventory must fit one page");
         chunk
-            .entries
             .into_iter()
             .map(|entry| {
                 entry

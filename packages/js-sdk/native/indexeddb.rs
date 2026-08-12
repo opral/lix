@@ -394,10 +394,7 @@ impl StorageScanSource for IndexedDbScanSource {
                 })
                 .collect::<Result<Vec<_>, StorageError>>()?;
             self.offset = end;
-            Ok(ScanChunk {
-                entries,
-                has_more: self.offset < self.entries.len(),
-            })
+            Ok(ScanChunk::new(entries, self.offset < self.entries.len()))
         })
     }
 }

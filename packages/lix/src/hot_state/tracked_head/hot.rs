@@ -7,6 +7,7 @@
 //! the physical mutation unit, and stores each value only in the authoritative
 //! file-first row index.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::mem::size_of;
@@ -139,9 +140,18 @@ pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::decl
     "hot_state.certified_entity_batch.v1",
     ValueSemantics::Mutable,
 );
+/// Maps one branch generation to the certified batches published under it.
+///
+/// The value carries the batch's schema-key set ahead of the content key, so a
+/// schema-filtered scan can decide from the manifest alone whether a batch can
+/// contribute rows. Without it the only way to learn a batch's schemas was to
+/// fetch and parse its content header, which made every schema-filtered scan
+/// read every batch on the branch.
+///
+/// `.v2` because the value layout changed; `.v1` bytes must not parse.
 pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0021),
-    "hot_state.certified_entity_batch_manifest.v1",
+    "hot_state.certified_entity_batch_manifest.v2",
     ValueSemantics::Mutable,
 );
 pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::declare(
@@ -614,10 +624,11 @@ pub(crate) async fn stage_certified_entity_batches(
                     StorageBeginScanOptions::default(),
                 )
                 .await?;
-            let manifests = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in manifests.entries {
+            // The prefix is only the 16-byte generation, so this range covers
+            // every file on the branch. Reading one page dropped every file
+            // past row 1024 out of the new generation permanently.
+            let manifests = cursor.collect_all().await?;
+            for entry in manifests {
                 let suffix = entry
                     .key
                     .0
@@ -684,10 +695,10 @@ pub(crate) async fn stage_certified_entity_batches(
                         StorageBeginScanOptions::default(),
                     )
                     .await?;
-                let prior_manifests = cursor
-                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                    .await?;
-                for entry in prior_manifests.entries {
+                // Every prior manifest for this file must be deleted, or a
+                // superseded batch survives its replacement.
+                let prior_manifests = cursor.collect_all().await?;
+                for entry in prior_manifests {
                     writes.delete(CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, entry.key);
                 }
             }
@@ -781,12 +792,81 @@ pub(crate) async fn stage_certified_entity_batches(
                 CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
                 StorageKey(Bytes::from(manifest_key)),
                 StorageValue {
-                    bytes: Bytes::from(content_key),
+                    bytes: Bytes::from(encode_certified_manifest_value(
+                        &batch.schema_keys,
+                        &content_key,
+                    )?),
                 },
             );
         }
     }
     Ok(())
+}
+
+/// Encodes one certified manifest value: the batch's schema-key set, then the
+/// content key it points at.
+///
+/// The schema set is a covering column over the batch header's own list, not a
+/// second authority: both are written from `batch.schema_keys` in the same
+/// write set, and inheritance copies the whole value, so the two cannot drift.
+fn encode_certified_manifest_value(
+    schema_keys: &[String],
+    content_key: &[u8],
+) -> Result<Vec<u8>, LixError> {
+    let schema_bytes = schema_keys
+        .iter()
+        .try_fold(2usize, |total, schema| total.checked_add(2 + schema.len()))
+        .ok_or_else(|| head_value_error("certified manifest schema list size overflowed"))?;
+    let mut value = Vec::with_capacity(schema_bytes + content_key.len());
+    value.extend_from_slice(
+        &u16::try_from(schema_keys.len())
+            .map_err(|_| head_value_error("certified manifest has too many schemas"))?
+            .to_le_bytes(),
+    );
+    for schema_key in schema_keys {
+        append_batch_text(&mut value, schema_key)?;
+    }
+    value.extend_from_slice(content_key);
+    Ok(value)
+}
+
+/// Returns where the content key starts, or `None` when this manifest's schema
+/// set cannot satisfy `wanted` and the batch therefore need not be fetched.
+///
+/// A manifest with no declared schemas is never pruned: an empty set means the
+/// batch declared nothing, not that it matches nothing.
+fn certified_manifest_content_offset(
+    value: &[u8],
+    wanted: Option<&HashSet<String>>,
+) -> Result<Option<usize>, LixError> {
+    let count_bytes = value
+        .get(..2)
+        .ok_or_else(|| head_value_error("certified manifest value is truncated"))?;
+    let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
+    let mut offset = 2usize;
+    let mut matched = wanted.is_none() || count == 0;
+    for _ in 0..count {
+        let length_bytes = value
+            .get(offset..offset + 2)
+            .ok_or_else(|| head_value_error("certified manifest schema length is truncated"))?;
+        let length = u16::from_le_bytes([length_bytes[0], length_bytes[1]]) as usize;
+        offset += 2;
+        let schema_bytes = value
+            .get(offset..offset + length)
+            .ok_or_else(|| head_value_error("certified manifest schema key is truncated"))?;
+        offset += length;
+        if let Some(wanted) = wanted
+            && !matched
+        {
+            let schema_key = std::str::from_utf8(schema_bytes)
+                .map_err(|_| head_value_error("certified manifest schema key is not utf-8"))?;
+            matched = wanted.contains(schema_key);
+        }
+    }
+    if offset > value.len() {
+        return Err(head_value_error("certified manifest content key is truncated"));
+    }
+    Ok(matched.then_some(offset))
 }
 
 fn append_batch_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
@@ -1065,12 +1145,7 @@ async fn scan_certified_entity_batch_rows(
                     StorageBeginScanOptions::default(),
                 )
                 .await?;
-            manifest_entries.extend(
-                cursor
-                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                    .await?
-                    .entries,
-            );
+            manifest_entries.extend(cursor.collect_all().await?);
         }
     } else {
         let range = StoragePrefix {
@@ -1084,10 +1159,10 @@ async fn scan_certified_entity_batch_rows(
                 StorageBeginScanOptions::default(),
             )
             .await?;
-        manifest_entries = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?
-            .entries;
+        // Prefixed by the generation alone, so this covers every file on the
+        // branch. One page silently hid every file past row 1024 from the
+        // merged scan result.
+        manifest_entries = cursor.collect_all().await?;
     }
     if exact_file_ids.is_none() && manifest_entries.is_empty() {
         if let Some(cache) = transaction_cache {
@@ -1095,10 +1170,24 @@ async fn scan_certified_entity_batch_rows(
         }
         return Ok(MaterializedHotStateBatch::default());
     }
-    let content_keys = manifest_entries
-        .into_iter()
-        .map(|entry| full_value_bytes(entry.value).map(StorageKey))
-        .collect::<Result<Vec<_>, _>>()?;
+    let filter_index = CertifiedScanFilterIndex::new(request);
+    // Prune from the manifest alone. The manifest value carries the batch's
+    // schema-key set, so a batch that cannot match the requested schemas is
+    // never fetched; previously the only way to learn its schemas was to read
+    // and parse the content header, so every batch on the branch was fetched.
+    let mut content_keys = Vec::with_capacity(manifest_entries.len());
+    for entry in manifest_entries {
+        let value = full_value_bytes(entry.value)?;
+        let Some(offset) =
+            certified_manifest_content_offset(&value, filter_index.schema_keys.as_ref())?
+        else {
+            continue;
+        };
+        content_keys.push(StorageKey(value.slice(offset..)));
+    }
+    if content_keys.is_empty() {
+        return Ok(MaterializedHotStateBatch::default());
+    }
     let contents = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_SPACE, &content_keys)
         .materialize(store, StorageGetOptions::default())
         .await?
@@ -1110,7 +1199,6 @@ async fn scan_certified_entity_batch_rows(
             .columns
             .iter()
             .any(|column| column == "snapshot_content");
-    let filter_index = CertifiedScanFilterIndex::new(request);
     let mut decode_inputs = Vec::with_capacity(content_keys.len());
     let mut page_routes = Vec::new();
     let mut page_keys = Vec::new();
@@ -1215,11 +1303,10 @@ pub(crate) async fn scan_certified_history_rows(
             )
             .await?;
         loop {
-            let page = cursor
+            let (page, has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            let has_more = page.has_more;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 let value = full_value_bytes(entry.value)?;
                 if certified_batch_commit_id(&value)? != *commit_id {
                     continue;
@@ -3092,10 +3179,10 @@ async fn packed_exclusive_schema_base_refs(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
                 return Err(head_value_error(
@@ -3110,7 +3197,7 @@ async fn packed_exclusive_schema_base_refs(
                 index_key: entry.key.0,
             });
         }
-        if !page.has_more {
+        if !has_more {
             break;
         }
     }
@@ -3167,10 +3254,10 @@ async fn packed_current_base_refs(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
                 return Err(head_value_error(
@@ -3196,7 +3283,7 @@ async fn packed_current_base_refs(
                 coverage_key: entry.key.0,
             });
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -3238,13 +3325,13 @@ async fn stage_retire_packed_current_bases(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             writes.delete(PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, entry.key);
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -3508,10 +3595,11 @@ async fn scan_root_current_base_rows_for_merge(
                     StorageBeginScanOptions::default(),
                 )
                 .await?;
-            control_entries = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?
-                .entries;
+            // A replacement control anywhere in the generation decides whether
+            // the root scan may keep a pushed-down LIMIT. Missing one past row
+            // 1024 reads as "no replacement" and can select a retired row while
+            // a live row still exists further along.
+            control_entries = cursor.collect_all().await?;
         } else {
             for schema_key in &request.filter.schema_keys {
                 let mut prefix = hot_scope_prefix(branch_id, generation);
@@ -3527,12 +3615,7 @@ async fn scan_root_current_base_rows_for_merge(
                         StorageBeginScanOptions::default(),
                     )
                     .await?;
-                control_entries.extend(
-                    cursor
-                        .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                        .await?
-                        .entries,
-                );
+                control_entries.extend(cursor.collect_all().await?);
             }
         }
         control_entries
@@ -4735,10 +4818,10 @@ where
             .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 let raw_key = entry.key.0;
                 let raw_value = full_value_bytes(entry.value)?;
                 let identity = validate_exact_collection_member(
@@ -4758,7 +4841,7 @@ where
                         .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
                 }
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -4875,13 +4958,16 @@ where
 
     /// Candidate entity primary keys whose indexed column equals `value`.
     ///
-    /// Returns `None` when this collection has no completeness witness for the
-    /// generation, which means the caller must not use the index and must fall
-    /// back to its ordinary scan. `Some` is a candidate set, not an answer:
-    /// entries are never deleted within a generation, so a candidate may name a
-    /// row that has since changed value or been deleted. Callers resolve
-    /// candidates through the exact-entity-pk read and re-apply their own
-    /// predicate. The set never *omits* a live matching row.
+    /// Returns `None` when the caller must not use the index and must fall
+    /// back to its ordinary scan, which happens for two reasons: the
+    /// collection has no completeness witness for the generation, or the
+    /// witness says the plane has degraded far enough that resolving its
+    /// candidates would cost more than the scan (see
+    /// [`hot_index_candidate_budget`]). `Some` is a candidate set, not an
+    /// answer: entries are never deleted within a generation, so a candidate
+    /// may name a row that has since changed value or been deleted. Callers
+    /// resolve candidates through the exact-entity-pk read and re-apply their
+    /// own predicate. The set never *omits* a live matching row.
     pub(crate) async fn scan_hot_index_candidates(
         &self,
         branch_id: &str,
@@ -4897,16 +4983,21 @@ where
             ordinal,
         )));
         let present = PointReadPlan::new(INDEX_SPACE, &[witness])
-            .materialize(
-                &self.store,
-                StorageGetOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                },
-            )
+            .materialize(&self.store, StorageGetOptions::default())
             .await?;
-        if present.value.into_iter().next().flatten().is_none() {
+        let Some(StorageProjectedValue::FullValue(witness_value)) =
+            present.value.into_iter().next().flatten()
+        else {
             return Ok(None);
-        }
+        };
+        // A witness that carries no readable count cannot size the plane, and
+        // an unsized plane is exactly the case this guard exists to refuse.
+        // The next commit that touches the collection republishes the witness
+        // with a count, so this is self-healing rather than permanent.
+        let Some(entries_published) = decode_hot_index_witness(&witness_value) else {
+            return Ok(None);
+        };
+        let budget = hot_index_candidate_budget(entries_published);
         let range = StoragePrefix {
             bytes: Bytes::from(hot_index_value_prefix(
                 branch_id,
@@ -4927,8 +5018,12 @@ where
             .await?;
         let mut candidates = Vec::new();
         loop {
-            let page = cursor.next_page(HOT_INDEX_CANDIDATE_PAGE).await?;
-            for entry in &page.entries {
+            // Never read more than one entry past the budget: the extra entry
+            // is what proves the bucket exceeds it, and everything beyond is
+            // work this route has already decided not to do.
+            let want = (budget + 1 - candidates.len()).min(HOT_INDEX_CANDIDATE_PAGE);
+            let (page, page_has_more) = cursor.next_page(want).await?.into_parts();
+            for entry in &page {
                 let StorageProjectedValue::FullValue(value) = &entry.value else {
                     continue;
                 };
@@ -4939,7 +5034,10 @@ where
                     head_value_error(format!("hot index entry has an invalid entity pk: {error}"))
                 })?);
             }
-            if !page.has_more {
+            if candidates.len() > budget {
+                return Ok(None);
+            }
+            if !page_has_more {
                 break;
             }
         }
@@ -4969,8 +5067,8 @@ where
                 },
             )
             .await?;
-        let page = cursor.next_page(1).await?;
-        if !page.entries.is_empty() {
+        let (page, _page_has_more) = cursor.next_page(1).await?.into_parts();
+        if !page.is_empty() {
             return Ok(true);
         }
         if packed_current_base_has_schema(
@@ -6003,15 +6101,15 @@ where
                 .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
                 .await?;
             loop {
-                let page = cursor
+                let (page, page_has_more) = cursor
                     .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                    .await?;
-                for entry in page.entries {
+                    .await?.into_parts();
+                for entry in page {
                     let bytes = full_value_bytes(entry.value)?;
                     let value = decode_head_value(&bytes)?;
                     collect_hot_untracked_refs(value, &mut refs);
                 }
-                if !page.has_more {
+                if !page_has_more {
                     break;
                 }
             }
@@ -9882,10 +9980,10 @@ async fn hot_load_file_scope_identities(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let row = decode_hot_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
             if !row
                 .file_id
@@ -9902,7 +10000,7 @@ async fn hot_load_file_scope_identities(
                 file_id: row.file_id,
             });
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -9974,6 +10072,142 @@ pub(crate) struct WorkingDiffPathHits {
     pub(crate) finite_bypass: std::sync::atomic::AtomicUsize,
 }
 
+/// Decides whether a working-diff read may skip the `HOT_DIFF` scope scan and
+/// enumerate primary `HOT_ROW` rows instead, and under which filter.
+///
+/// `None` means "no bounded primary route exists — take the index scan".
+///
+/// # Why this is sound without the coverage proof
+///
+/// The `HOT_DIFF` coverage proof is scope-global and cannot be partitioned (see
+/// [`append_hot_diff_key_parts`]), so a *filtered* index scan still has to
+/// enumerate the whole `(branch, checkpoint, generation)` scope to reconstruct
+/// it. The proof exists to certify that the sparse index names **every** dirty
+/// identity. A reader that never consults the index does not need it certified:
+/// it needs the primary rows it enumerates to be the complete authority for the
+/// identities it claims to cover.
+///
+/// That is exactly the invariant the finite bypass already rests on, and it is
+/// a property of `HOT_ROW`, not of the filter shape:
+///
+/// * `HOT_DIFF` keys are only written for `!delta.untracked` deltas.
+/// * A primary row is physically removed only by
+///   `CurrentStateDelta::physically_deletes` (`untracked && deleted`); a tracked
+///   delete leaves a tombstone that keeps its baseline.
+/// * `reject_retention_change` forbids flipping retention while a physical
+///   member exists.
+///
+/// So every dirty tracked identity has a branch-local `HOT_ROW` row carrying its
+/// own `working_diff_baseline` — **except** identities whose current authority
+/// is a packed current base published inside this checkpoint window, which own
+/// no `HOT_ROW` row at all. Those are precisely what the caller's
+/// `packed_refs.is_empty()` guard excludes before calling this, and that guard
+/// is unchanged.
+///
+/// The only thing this function adds is *which* bounded routes count. The
+/// caller previously admitted one (a finite `schema_key + entity_pk` identity
+/// batch); a file-scoped read is equally bounded, because `HOT_ROW` is keyed
+/// `scope ++ schema_key ++ file_id ++ entity_pk` and `hot_scan_entries` already
+/// owns the file-first prefix route over it. Admitting it trades
+/// O(dirty rows in the branch) for O(live rows in the file).
+async fn hot_working_diff_bypass_filter<'a>(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    filter: &'a TrackedStateFilter,
+) -> Result<Option<Cow<'a, TrackedStateFilter>>, LixError> {
+    // A finite identity batch resolves as point reads and needs no file bound.
+    if !filter.entity_pks.is_empty() {
+        return Ok((!filter.schema_keys.is_empty()).then_some(Cow::Borrowed(filter)));
+    }
+    // Every remaining bounded route is a file-first `HOT_ROW` prefix seek, so
+    // every requested file id must be an exact value. `Any` and `Null` name no
+    // prefix.
+    if filter.file_ids.is_empty()
+        || filter
+            .file_ids
+            .iter()
+            .any(|file_id| !matches!(file_id, NullableKeyFilter::Value(_)))
+    {
+        return Ok(None);
+    }
+    if !filter.schema_keys.is_empty() {
+        return Ok(Some(Cow::Borrowed(filter)));
+    }
+    // No schema predicate. `HOT_ROW` is schema-major, so a file bound alone
+    // names no prefix. `FILE_SPACE` holds one marker per
+    // `(branch, generation, schema)` that has ever written a file-backed row,
+    // which is the schema domain a file-scoped read must cover: a row with a
+    // non-null `file_id` cannot exist without its schema's marker. Markers are
+    // conservative in the safe direction — never removed within a generation,
+    // so a stale one costs one empty seek and cannot hide a live row.
+    let schema_keys = hot_file_backed_schema_keys(store, branch_id, generation).await?;
+    if schema_keys.is_empty() {
+        // Nothing in this generation is file-backed. Fall back rather than
+        // inventing an empty-prefix scan; the index path answers this
+        // (necessarily empty) case correctly and it is not hot.
+        return Ok(None);
+    }
+    let mut bypass = filter.clone();
+    bypass.schema_keys = schema_keys;
+    Ok(Some(Cow::Owned(bypass)))
+}
+
+/// Names every schema with a file-backed row in this `(branch, generation)`,
+/// read from the conservative `FILE_SPACE` markers.
+///
+/// The markers carry no value, so this is a key-only scan bounded by the number
+/// of schemas, not by the number of rows.
+async fn hot_file_backed_schema_keys(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+) -> Result<Vec<String>, LixError> {
+    let scope = hot_scope_prefix(branch_id, generation);
+    let range = StoragePrefix {
+        bytes: Bytes::from(scope.clone()),
+    }
+    .to_range()?;
+    let mut schema_keys = Vec::new();
+    let mut cursor = store
+        .begin_scan(
+            FILE_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    while let Some(entries) = cursor.next_chunk().await? {
+        for entry in entries {
+            schema_keys.push(decode_hot_file_schema_key_in_scope(entry.key.0, &scope)?);
+        }
+    }
+    schema_keys.sort();
+    schema_keys.dedup();
+    Ok(schema_keys)
+}
+
+fn decode_hot_file_schema_key_in_scope(key: Bytes, scope: &[u8]) -> Result<String, LixError> {
+    if !key.starts_with(scope) {
+        return Err(key_codec_error(
+            "hot file marker does not begin with its scanned scope",
+        ));
+    }
+    let mut offset = scope.len();
+    let (schema_key, terminator) = read_hot_scan_key_string(&key, &mut offset, "schema key")?;
+    if terminator != KEY_PART_FINAL {
+        return Err(key_codec_error(
+            "hot file marker schema key has an invalid terminator",
+        ));
+    }
+    if offset != key.len() {
+        return Err(key_codec_error("hot file marker key has trailing bytes"));
+    }
+    Ok(schema_key.as_str(&key).to_string())
+}
+
 /// Resolves a checkpoint diff from row-local first-before images. Broad diffs
 /// enumerate the sparse dirty-key index; finite PK queries read only the
 /// primary rows that can answer the request.
@@ -9990,15 +10224,19 @@ async fn hot_working_diff_entries(
         .into_iter()
         .filter(|base| base.checkpoint_commit_id == Some(checkpoint_commit_id))
         .collect::<Vec<_>>();
-    if packed_refs.is_empty() && !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
-        return hot_working_diff_entries_for_finite_filter(
-            store,
-            branch_id,
-            checkpoint_commit_id,
-            generation,
-            filter,
-        )
-        .await;
+    if packed_refs.is_empty() {
+        if let Some(bypass) =
+            hot_working_diff_bypass_filter(store, branch_id, generation, filter).await?
+        {
+            return hot_working_diff_entries_for_finite_filter(
+                store,
+                branch_id,
+                checkpoint_commit_id,
+                generation,
+                bypass.as_ref(),
+            )
+            .await;
+        }
     }
 
     #[cfg(test)]
@@ -10016,10 +10254,10 @@ async fn hot_working_diff_entries(
         .begin_scan(DIFF_SPACE, range, StorageBeginScanOptions::default())
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let Ok(bytes) = full_value_bytes(entry.value) else {
                 return Ok(None);
             };
@@ -10073,7 +10311,7 @@ async fn hot_working_diff_entries(
                 return Ok(None);
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -10580,10 +10818,12 @@ async fn hot_scan_entries<'a>(
                 };
                 return Ok(Some(HotScanEntries::Decoded(rows)));
             }
-            let page = cursor
+            // Deliberately bounded: this reader stops at the caller's LIMIT.
+            let (page, page_has_more) = cursor
                 .next_page(remaining.unwrap_or(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
-                .await?;
-            for entry in page.entries {
+                .await?
+                .into_parts();
+            for entry in page {
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
@@ -10608,7 +10848,7 @@ async fn hot_scan_entries<'a>(
                     }
                 }
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -10772,11 +11012,14 @@ async fn hot_scan_dense_encoded_key_range<'a>(
         if remaining_budget == 0 {
             return Ok(None);
         }
-        let page = cursor
+        // Deliberately bounded: this reader gives up once it has burned its
+        // scan budget rather than reading an unbounded range.
+        let (page, page_has_more) = cursor
             .next_page(remaining_budget.min(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
-            .await?;
-        scanned += page.entries.len();
-        for entry in page.entries {
+            .await?
+            .into_parts();
+        scanned += page.len();
+        for entry in page {
             while requested_index < key_count && key_at(requested_index) < entry.key.0.as_ref() {
                 requested_index += 1;
             }
@@ -10785,7 +11028,7 @@ async fn hot_scan_dense_encoded_key_range<'a>(
                 requested_index += 1;
             }
         }
-        if requested_index == key_count || !page.has_more {
+        if requested_index == key_count || !page_has_more {
             return Ok(Some(values));
         }
     }
@@ -10857,16 +11100,16 @@ async fn scan_hot_file_entries(
             .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
                     rows.push((identity, full_value_bytes(entry.value)?));
                 }
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -11046,13 +11289,15 @@ fn encode_hot_diff_key_parts(
 /// prefix-seeks `HOT_DIFF` below its `(branch, checkpoint, generation)`
 /// scope.
 ///
-/// - `hot_working_diff_entries` must enumerate the entire scope to
+/// - Any reader that *consults* this index must enumerate the entire scope to
 ///   reconstruct the [`WorkingDiffIndexCoverage`] count/XOR proof before the
-///   sparse index may be trusted, so even file- or schema-filtered diff
-///   queries visit every entry and filter in memory. A sub-scope seek can
-///   never satisfy the proof.
-/// - Finite (schema + entity) diff queries bypass this space entirely and
-///   read the `working_diff_baseline` inline on primary `HOT_ROW` rows.
+///   sparse index may be trusted, so a schema-filtered diff query that takes
+///   the index path visits every entry and filters in memory. A sub-scope seek
+///   can never satisfy the proof.
+/// - Finite (schema + entity) and file-scoped diff queries bypass this space
+///   entirely and read the `working_diff_baseline` inline on primary `HOT_ROW`
+///   rows, so they never pay the proof at all. See
+///   [`hot_working_diff_bypass_filter`].
 /// - Batches of `HOT_DIFF_PACK_MIN_IDENTITIES` or more identities are packed
 ///   into segments keyed by `scope ++ digest`; the identity components leave
 ///   the key for the segment value altogether.
@@ -11090,22 +11335,27 @@ fn encode_hot_diff_key_parts(
 ///   re-paying the scope and a 32-byte digest — and most publications stop
 ///   reaching `HOT_DIFF_PACK_MIN_IDENTITIES` per partition at all.
 ///
-/// Measured consequence of leaving the proof scope-global (rocksdb,
-/// hetzner-cpx62-II, `working_diff_file_scope`, 9 reps, four dirty rows in the
-/// probed file): `WHERE file_id = $1` costs 0.61 ms at 1k total dirty rows and
-/// 51.6 ms at 100k — linear in the dirty set, flat in the answer — while the
-/// finite `schema_key + entity_pk + file_id` shape that bypasses this space
-/// stays at ~0.5 ms across the same range.
+/// Measured consequence of routing a file-scoped read *through* this proof
+/// (rocksdb, hetzner-cpx62-II, `working_diff_file_scope`, 9 reps, four dirty
+/// rows in the probed file): `WHERE file_id = $1` cost 0.61 ms at 1k total
+/// dirty rows and 51.6 ms at 100k — linear in the dirty set, flat in the
+/// answer — while the finite `schema_key + entity_pk + file_id` shape that
+/// bypasses this space stayed at ~0.5 ms across the same range.
 ///
-/// The route that would remove that scan does not need this space at all:
-/// `HOT_ROW` is already keyed `schema_key ++ file_id ++ entity_pk` and
-/// `hot_scan_entries` already owns a file-first prefix route, so a
-/// `schema_key + file_id` working-diff read could enumerate primary rows the
-/// way the finite bypass does. That trades O(dirty rows in the branch) for
-/// O(live rows in the file). It is still not implemented *for the working
-/// diff*, because a diff must also see identities whose current authority is a
-/// packed current base published inside this checkpoint window, and those
-/// contribute exactly the whole-commit coverage groups described above.
+/// That is why file-scoped reads no longer take this path. The route that
+/// removes the scan does not need this space at all: `HOT_ROW` is keyed
+/// `schema_key ++ file_id ++ entity_pk` and `hot_scan_entries` owns a
+/// file-first prefix route, so a file-scoped working-diff read enumerates
+/// primary rows the way the finite bypass does, trading O(dirty rows in the
+/// branch) for O(live rows in the file). [`hot_working_diff_bypass_filter`]
+/// implements it and carries the soundness argument.
+///
+/// The one obligation that route cannot discharge is a packed current base
+/// published inside this checkpoint window, whose members own no `HOT_ROW` row
+/// and contribute exactly the whole-commit coverage groups described above.
+/// That case is excluded by the caller's pre-existing `packed_refs.is_empty()`
+/// guard and still reads the index, proof and all — which is why the proof
+/// stays scope-global and this key order stays as it is.
 ///
 /// The ordinary **entity** surface has no such obligation and does take that
 /// route: `lixcol_file_id` is an exact provider constraint that lands in
@@ -11199,6 +11449,16 @@ fn decode_hot_scan_row_key_in_scope(key: Bytes, scope: &[u8]) -> Result<HotScanI
     })
 }
 
+
+/// Test-only shim; see `crate::order_preserving_key::tests`.
+#[cfg(test)]
+pub(crate) fn hot_decode_entity_pk_probe(bytes: &[u8]) -> Option<(EntityPk, usize)> {
+    let mut offset = 0usize;
+    read_hot_scan_entity_pk(&Bytes::copy_from_slice(bytes), &mut offset)
+        .ok()
+        .map(|entity_pk| (entity_pk, offset))
+}
+
 fn read_hot_scan_entity_pk(bytes: &Bytes, offset: &mut usize) -> Result<EntityPk, LixError> {
     let version = bytes
         .get(*offset)
@@ -11257,7 +11517,7 @@ fn read_hot_scan_entity_pk_part(
         }
         ENTITY_PK_UUID => {
             let uuid_end = offset
-                .checked_add(16)
+                .checked_add(ENTITY_PK_UUID_BYTES)
                 .ok_or_else(|| key_codec_error("UUIDv7 entity primary key offset overflow"))?;
             let uuid_bytes: [u8; 16] = bytes
                 .get(*offset..uuid_end)
@@ -11268,7 +11528,7 @@ fn read_hot_scan_entity_pk_part(
                 .get(uuid_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("is truncated after UUIDv7 entity primary key"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(
                     "UUIDv7 entity primary key has an invalid terminator",
                 ));
@@ -11281,7 +11541,7 @@ fn read_hot_scan_entity_pk_part(
         }
         ENTITY_PK_INTEGER => {
             let integer_end = offset
-                .checked_add(8)
+                .checked_add(ENTITY_PK_INTEGER_BYTES)
                 .ok_or_else(|| key_codec_error("integer entity primary key offset overflow"))?;
             let ordered = u64::from_be_bytes(
                 bytes
@@ -11294,16 +11554,14 @@ fn read_hot_scan_entity_pk_part(
                 .get(integer_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("is truncated after integer entity primary key"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(
                     "integer entity primary key has an invalid terminator",
                 ));
             }
             *offset = integer_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Integer(i64::from_be_bytes(
-                    (ordered ^ (1_u64 << 63)).to_be_bytes(),
-                )),
+                crate::entity_pk::EntityPkComponent::Integer(i64_from_ordered_integer(ordered)),
                 terminator,
             ))
         }
@@ -11453,7 +11711,8 @@ pub(crate) struct HotIndexEntry {
 /// O(changed rows) with no reads. Duplicate `(space, key)` mutations are
 /// rejected by the write set, so identical entries staged twice in one commit
 /// are collapsed here rather than at lowering time.
-pub(crate) fn stage_hot_index_entries(
+pub(crate) async fn stage_hot_index_entries(
+    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     branch_id: &str,
     generation: CommitId,
@@ -11461,6 +11720,7 @@ pub(crate) fn stage_hot_index_entries(
     witnessed_collections: &BTreeSet<(String, u16)>,
 ) -> Result<(), LixError> {
     let mut staged = BTreeSet::new();
+    let mut published_by_collection: BTreeMap<(String, u16), u64> = BTreeMap::new();
     for entry in entries {
         let key = encode_hot_index_entry_key(
             branch_id,
@@ -11483,21 +11743,118 @@ pub(crate) fn stage_hot_index_entries(
                 bytes: Bytes::from(identity.into_bytes()),
             },
         );
+        *published_by_collection
+            .entry((entry.schema_key.clone(), entry.ordinal))
+            .or_default() += 1;
     }
-    for (schema_key, ordinal) in witnessed_collections {
-        let key = encode_hot_index_witness_key(branch_id, generation, schema_key, *ordinal);
-        if !staged.insert(key.clone()) {
+    for collection in witnessed_collections {
+        published_by_collection.entry(collection.clone()).or_default();
+    }
+    if published_by_collection.is_empty() {
+        return Ok(());
+    }
+    // One multi-get and one put per *collection* touched by this commit, not
+    // per row, so maintaining the count is O(collections) and independent of
+    // how many rows the commit carries.
+    let witness_keys = published_by_collection
+        .keys()
+        .map(|(schema_key, ordinal)| {
+            StorageKey(Bytes::from(encode_hot_index_witness_key(
+                branch_id,
+                generation,
+                schema_key,
+                *ordinal,
+            )))
+        })
+        .collect::<Vec<_>>();
+    let previous = PointReadPlan::new(INDEX_SPACE, &witness_keys)
+        .materialize(read, StorageGetOptions::default())
+        .await?
+        .value;
+    for ((collection, published), (key, previous)) in published_by_collection
+        .into_iter()
+        .zip(witness_keys.into_iter().zip(previous.into_iter()))
+    {
+        let existing = match previous {
+            Some(StorageProjectedValue::FullValue(bytes)) => Some(decode_hot_index_witness(&bytes)),
+            Some(StorageProjectedValue::KeyOnly) | None => None,
+        };
+        // Never *create* a witness for a collection that has not asserted
+        // completeness. A witness is the claim that this plane holds every row
+        // of the collection, and inventing one here would turn a partial index
+        // into an authoritative-looking one.
+        if existing.is_none() && !witnessed_collections.contains(&collection) {
+            continue;
+        }
+        // A witness whose previous value could not be decoded restarts the
+        // count from this commit. That undercounts history, which shrinks the
+        // budget and makes the guard fire *earlier* — the safe direction.
+        let total = existing.flatten().unwrap_or(0).saturating_add(published);
+        if !staged.insert(key.0.to_vec()) {
             continue;
         }
         writes.put(
             INDEX_SPACE,
-            StorageKey(Bytes::from(key)),
+            key,
             StorageValue {
-                bytes: Bytes::new(),
+                bytes: Bytes::from(encode_hot_index_witness(total).to_vec()),
             },
         );
     }
     Ok(())
+}
+
+/// Entries published into one `(collection, column)` plane since the
+/// generation began, as carried by the witness record.
+///
+/// This is a monotone upper bound on the plane's size, not an exact count: it
+/// counts staged puts, and a commit that rewrites an unchanged value restages
+/// an identical key. Over-counting only widens the budget, so the bound is
+/// safe in the direction that matters.
+fn encode_hot_index_witness(entries_published: u64) -> [u8; 8] {
+    entries_published.to_be_bytes()
+}
+
+fn decode_hot_index_witness(value: &[u8]) -> Option<u64> {
+    value.try_into().ok().map(u64::from_be_bytes)
+}
+
+/// How many candidates one value lookup may collect before the collection scan
+/// becomes the cheaper route.
+///
+/// **This is a graceful-degradation bound, not a repair.** Entries still
+/// accumulate; past the budget the plane simply stops being consulted, so the
+/// index can never cost more than not having it. Nothing is pruned and no
+/// bytes are reclaimed.
+///
+/// The constant is measured, not chosen. On `ryzen-9950x-I` at base
+/// `a0ccd0dd6`, resolving one candidate costs ≈0.73 µs (point read plus
+/// snapshot parse) while the collection scan costs ≈0.30–0.49 µs per row, so
+/// the index route loses once a bucket exceeds roughly two thirds of the rows
+/// the scan would walk. `entries_published` is an upper bound on the plane's
+/// size and grows with the same entity churn that grows the scan's row count
+/// (deleted rows leave tombstones the scan still walks), which makes it the
+/// available proxy for that row count. Halving it keeps the budget below the
+/// measured crossover.
+///
+/// Checked against every point of the measurement that motivated it: the aged
+/// 100/1000/10000 buckets, the moved 100/1000/10000 buckets and the 100/1000/5000
+/// write-path buckets all exceed their budget, and all were slower than the
+/// scan; the fresh one-candidate arm and the 10-candidate write-path arm stay
+/// under it, and both were faster.
+///
+/// At the boundary the route flips: a bucket of exactly `budget` is served by
+/// the index; one entry more abandons the route after reading that one extra
+/// entry and pays the scan, so the worst case is the scan plus a bounded
+/// key-only prefix read.
+///
+/// The floor exists because below it the absolute cost is smaller than the
+/// measurement's own noise floor — a 64-candidate bucket resolves in ≈47 µs —
+/// so flipping tiny collections to a scan would trade a real access path for
+/// no measurable gain.
+fn hot_index_candidate_budget(entries_published: u64) -> usize {
+    const MIN_CANDIDATE_BUDGET: u64 = 64;
+    usize::try_from((entries_published / 2).max(MIN_CANDIDATE_BUDGET)).unwrap_or(usize::MAX)
 }
 
 /// One indexed value, encoded so that equality is a key prefix.
@@ -11519,8 +11876,7 @@ impl HotIndexValue {
             }
             Self::Integer(value) => {
                 out.push(ENTITY_PK_INTEGER);
-                let ordered = u64::from_be_bytes(value.to_be_bytes()) ^ (1_u64 << 63);
-                out.extend_from_slice(&ordered.to_be_bytes());
+                out.extend_from_slice(&ordered_integer_from_i64(*value).to_be_bytes());
                 out.push(KEY_PART_FINAL);
             }
         }
@@ -11813,17 +12169,17 @@ where
             )
             .await?;
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 if declared.contains(entry.key.0.as_ref()) {
                     continue;
                 }
                 writes.delete(*space, entry.key);
                 deleted = deleted.saturating_add(1);
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -11848,10 +12204,10 @@ where
         .begin_scan(DIFF_SPACE, range, StorageBeginScanOptions::default())
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let keep = match full_value_bytes(entry.value) {
                 Ok(bytes) if bytes.is_empty() => decode_hot_diff_key(entry.key.0.as_ref())
                     .is_ok_and(|(checkpoint_commit_id, identity)| {
@@ -11884,7 +12240,7 @@ where
                 writes.delete(DIFF_SPACE, entry.key);
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -11924,14 +12280,14 @@ where
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
+            .await?.into_parts();
         writes.delete_batch(
             DIFF_SPACE,
-            page.entries.into_iter().map(|entry| entry.key),
+            page.into_iter().map(|entry| entry.key),
         );
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -13750,7 +14106,10 @@ mod tests {
             CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
             StorageKey(Bytes::from(manifest_key)),
             StorageValue {
-                bytes: malformed_content_key.0.clone(),
+                bytes: Bytes::from(
+                    encode_certified_manifest_value(&[], &malformed_content_key.0)
+                        .expect("manifest value should encode"),
+                ),
             },
         );
         writes.put(
@@ -13831,7 +14190,10 @@ mod tests {
             CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
             StorageKey(Bytes::from(manifest_key)),
             StorageValue {
-                bytes: malformed_content_key.0.clone(),
+                bytes: Bytes::from(
+                    encode_certified_manifest_value(&[], &malformed_content_key.0)
+                        .expect("manifest value should encode"),
+                ),
             },
         );
         writes.put(
@@ -14091,6 +14453,478 @@ mod tests {
             get_many_calls.load(Ordering::Relaxed),
             2,
             "one content read and one page read must serve every certified batch"
+        );
+    }
+
+    const PAGING_SCHEMA_KEY: &str = "paged_certified_row";
+    const PAGING_FILE_COUNT: usize = crate::storage_adapter::MAX_SCAN_PAGE_ROWS + 3;
+
+    fn paging_certified_batch(index: usize) -> WasmCertifiedEntityBatch {
+        certified_batch_for_schema(PAGING_SCHEMA_KEY, index)
+    }
+
+    fn certified_batch_for_schema(schema_key: &str, index: usize) -> WasmCertifiedEntityBatch {
+        let mut page = Vec::new();
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u64.to_le_bytes());
+        page.push(0);
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u16.to_le_bytes());
+        page.extend_from_slice(&5_u32.to_le_bytes());
+        page.extend_from_slice(b"value");
+        let page = crate::plugin_wire::encode_single_section(
+            crate::plugin_wire::Representation::SchemaRows,
+            crate::plugin_wire::Operation::Create,
+            schema_key,
+            br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
+            1,
+            page,
+        )
+        .expect("paged certified schema-row page");
+        WasmCertifiedEntityBatch {
+            format: 1,
+            schema_keys: vec![schema_key.to_owned()],
+            row_count: 1,
+            creates: WasmCreateContext {
+                high: 0x0192_0000_0000_7000,
+                low: 0x8000_0000 + index as u32,
+            },
+            create_ranges: Vec::new(),
+            complete_file_state: true,
+            pages: vec![Bytes::from(page)],
+        }
+    }
+
+    /// Publishes `PAGING_FILE_COUNT` single-row certified files on one branch
+    /// generation, so every certified manifest scan for that generation has to
+    /// cross the storage scan page boundary.
+    async fn seed_paged_certified_generation(
+        branch_id: &str,
+        generation_label: &str,
+    ) -> (StorageAdapter, BranchHeadControl) {
+        let storage = StorageAdapter::new(Memory::new());
+        let head_commit_id = CommitId::for_test_label("paged-certified-head");
+        let created_at = timestamp();
+        let control = BranchHeadControl {
+            head_commit_id,
+            tracked_generation: CommitId::for_test_label(generation_label),
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at,
+            updated_at: created_at,
+            ref_change_id: ChangeId::for_test_label("paged-certified-ref"),
+        };
+
+        let file_ids = (0..PAGING_FILE_COUNT)
+            .map(|index| format!("paged-{index:05}.csv"))
+            .collect::<Vec<_>>();
+        let batches = (0..PAGING_FILE_COUNT)
+            .map(|index| [paging_certified_batch(index)])
+            .collect::<Vec<_>>();
+        let files = file_ids
+            .iter()
+            .zip(batches.iter())
+            .map(|(file_id, batches)| CertifiedEntityBatchFileRef {
+                branch_id,
+                file_id,
+                batches,
+            })
+            .collect::<Vec<_>>();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged certified seed read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, branch_id, control)
+            .expect("paged certified control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &files,
+            &BTreeMap::from([(branch_id.to_owned(), control)]),
+            &BTreeMap::from([(
+                branch_id.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: Some(control),
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::from([(head_commit_id, created_at)]),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("paged certified batches should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("paged certified batches should commit");
+        (storage, control)
+    }
+
+    async fn count_certified_manifests(
+        read: &impl StorageAdapterRead,
+        generation: CommitId,
+    ) -> usize {
+        let range = StoragePrefix {
+            bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
+        }
+        .to_range()
+        .expect("manifest prefix range");
+        let mut cursor = read
+            .begin_scan(
+                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                range,
+                StorageBeginScanOptions::default(),
+            )
+            .await
+            .expect("manifest scan should open");
+        let mut total = 0;
+        loop {
+            let (page, has_more) = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await
+                .expect("manifest page should read")
+                .into_parts();
+            total += page.len();
+            if !has_more {
+                return total;
+            }
+        }
+    }
+
+    /// A schema-filtered scan must not fetch a batch whose manifest already
+    /// says it cannot match.
+    ///
+    /// The non-matching file's content batch is deliberately malformed. Before
+    /// the manifest carried the schema set, the scan had to fetch and parse
+    /// every content header to learn its schemas, so it would reach these bytes
+    /// and fail. Passing proves the batch was never fetched.
+    #[tokio::test]
+    async fn schema_filtered_certified_scan_skips_non_matching_batches() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000001a4";
+        const WANTED_FILE: &str = "wanted.csv";
+        const WANTED_SCHEMA: &str = "wanted_schema";
+        const OTHER_FILE: &str = "other.csv";
+        const OTHER_SCHEMA: &str = "other_schema";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let head_commit_id = CommitId::for_test_label("schema-prune-head");
+        let generation = CommitId::for_test_label("schema-prune-generation");
+        let created_at = timestamp();
+        let control = BranchHeadControl {
+            head_commit_id,
+            tracked_generation: generation,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at,
+            updated_at: created_at,
+            ref_change_id: ChangeId::for_test_label("schema-prune-ref"),
+        };
+
+        let wanted = [certified_batch_for_schema(WANTED_SCHEMA, 0)];
+        let files = [CertifiedEntityBatchFileRef {
+            branch_id: BRANCH_ID,
+            file_id: WANTED_FILE,
+            batches: &wanted,
+        }];
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("schema prune seed read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, BRANCH_ID, control)
+            .expect("schema prune control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &files,
+            &BTreeMap::from([(BRANCH_ID.to_owned(), control)]),
+            &BTreeMap::from([(
+                BRANCH_ID.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: Some(control),
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::from([(head_commit_id, created_at)]),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("schema prune batch should stage");
+
+        // A second file whose manifest declares only OTHER_SCHEMA, pointing at
+        // content that cannot be parsed.
+        let poison_content_key = StorageKey(Bytes::from_static(b"schema-prune-poison"));
+        let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
+        append_batch_text(&mut manifest_key, OTHER_FILE).unwrap();
+        manifest_key.extend_from_slice(&1_u32.to_le_bytes());
+        manifest_key.extend_from_slice(head_commit_id.as_uuid().as_bytes());
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+            StorageKey(Bytes::from(manifest_key)),
+            StorageValue {
+                bytes: Bytes::from(
+                    encode_certified_manifest_value(
+                        &[OTHER_SCHEMA.to_owned()],
+                        &poison_content_key.0,
+                    )
+                    .expect("poison manifest should encode"),
+                ),
+            },
+        );
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_SPACE,
+            poison_content_key,
+            StorageValue {
+                bytes: Bytes::from_static(b"malformed"),
+            },
+        );
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("schema prune fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("schema prune verification read should open");
+        let rows = scan_certified_entity_batch_rows(
+            &read,
+            BRANCH_ID,
+            generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![WANTED_SCHEMA.to_owned()],
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("a manifest that cannot match must never be fetched or decoded");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0).file_id(), Some(WANTED_FILE));
+        assert_eq!(rows.row(0).schema_key(), WANTED_SCHEMA);
+    }
+
+    /// Pins why a `LIMIT` cannot be pushed into the certified manifest scan.
+    ///
+    /// Manifest keys are `generation || file_id || format || commit_id`, so the
+    /// scan visits files in `file_id` order. Rows are returned in canonical
+    /// identity order, which is `(schema_key, entity_pk, file_id)` — `file_id`
+    /// is the *last* tiebreaker (`compare_materialized_live_identity_refs`).
+    /// The two orders are orthogonal, so the canonically first row can live in
+    /// the last file the scan reaches, and no prefix of the manifest scan is
+    /// enough to answer `LIMIT 1`.
+    ///
+    /// This fixture makes that concrete: the winning row sits in the
+    /// lexicographically *last* file. A limit pushed into the manifest scan
+    /// would stop at `early.csv` and return the wrong row, so this test fails
+    /// for any such pushdown that is not preceded by a physical layout change.
+    #[tokio::test]
+    async fn certified_limit_cannot_stop_at_the_first_manifest() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000001a3";
+        const EARLY_FILE: &str = "early.csv";
+        const LATE_FILE: &str = "late.csv";
+        // Canonical order is schema-major, so the row in the later file wins.
+        const LATE_FILE_SCHEMA: &str = "aaa_winning_schema";
+        const EARLY_FILE_SCHEMA: &str = "zzz_losing_schema";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let head_commit_id = CommitId::for_test_label("limit-pushdown-head");
+        let generation = CommitId::for_test_label("limit-pushdown-generation");
+        let created_at = timestamp();
+        let control = BranchHeadControl {
+            head_commit_id,
+            tracked_generation: generation,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at,
+            updated_at: created_at,
+            ref_change_id: ChangeId::for_test_label("limit-pushdown-ref"),
+        };
+
+        let early = [certified_batch_for_schema(EARLY_FILE_SCHEMA, 0)];
+        let late = [certified_batch_for_schema(LATE_FILE_SCHEMA, 1)];
+        let files = [
+            CertifiedEntityBatchFileRef {
+                branch_id: BRANCH_ID,
+                file_id: EARLY_FILE,
+                batches: &early,
+            },
+            CertifiedEntityBatchFileRef {
+                branch_id: BRANCH_ID,
+                file_id: LATE_FILE,
+                batches: &late,
+            },
+        ];
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("limit pushdown seed read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, BRANCH_ID, control)
+            .expect("limit pushdown control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &files,
+            &BTreeMap::from([(BRANCH_ID.to_owned(), control)]),
+            &BTreeMap::from([(
+                BRANCH_ID.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: Some(control),
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::from([(head_commit_id, created_at)]),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("limit pushdown batches should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("limit pushdown batches should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("limit pushdown verification read should open");
+        let rows = scan_certified_entity_batch_rows(
+            &read,
+            BRANCH_ID,
+            generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter::default(),
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: Some(1),
+            },
+            Some(1),
+            None,
+        )
+        .await
+        .expect("limited certified scan should succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.row(0).file_id(),
+            Some(LATE_FILE),
+            "LIMIT 1 must return the canonically first row, which lives in the \
+             last file the manifest scan reaches; a limit pushed into that scan \
+             would return {EARLY_FILE} instead"
+        );
+        assert_eq!(rows.row(0).schema_key(), LATE_FILE_SCHEMA);
+    }
+
+    #[tokio::test]
+    async fn certified_scan_returns_every_file_past_one_scan_page() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000001a0";
+        let (storage, control) =
+            seed_paged_certified_generation(BRANCH_ID, "paged-certified-generation").await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged certified verification read should open");
+        assert_eq!(
+            count_certified_manifests(&read, control.tracked_generation).await,
+            PAGING_FILE_COUNT,
+            "every published file must have a durable certified manifest"
+        );
+
+        let rows = scan_certified_entity_batch_rows(
+            &read,
+            BRANCH_ID,
+            control.tracked_generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![PAGING_SCHEMA_KEY.to_owned()],
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("paged certified rows should scan");
+
+        assert_eq!(
+            rows.len(),
+            PAGING_FILE_COUNT,
+            "an unfiltered certified scan must not stop at the first storage scan page"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_creation_inherits_every_certified_manifest_past_one_scan_page() {
+        const DONOR_BRANCH: &str = "01920000-0000-7000-8000-0000000001a1";
+        const CREATED_BRANCH: &str = "01920000-0000-7000-8000-0000000001a2";
+        let (storage, donor_control) =
+            seed_paged_certified_generation(DONOR_BRANCH, "paged-inherit-donor").await;
+        let created_control = BranchHeadControl {
+            tracked_generation: CommitId::for_test_label("paged-inherit-created"),
+            ref_change_id: ChangeId::for_test_label("paged-inherit-created-ref"),
+            ..donor_control
+        };
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged inherit read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &[],
+            &BTreeMap::from([(CREATED_BRANCH.to_owned(), created_control)]),
+            &BTreeMap::from([(
+                CREATED_BRANCH.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: None,
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("created branch should inherit certified manifests");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("inherited certified manifests should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged inherit verification read should open");
+        assert_eq!(
+            count_certified_manifests(&read, created_control.tracked_generation).await,
+            PAGING_FILE_COUNT,
+            "branch creation must inherit every certified manifest, not one scan page of them"
         );
     }
 
@@ -14715,15 +15549,15 @@ mod tests {
             .begin_scan(DIFF_SPACE, range, StorageBeginScanOptions::default())
             .await
             .expect("begin segmented hot diff scan");
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan segmented hot diff");
-        assert!(!page.has_more);
+            .expect("scan segmented hot diff").into_parts();
+        assert!(!page_has_more);
 
         let mut actual_coverage = WorkingDiffIndexCoverage::default();
         let mut decoded = 0_usize;
-        for entry in page.entries {
+        for entry in page {
             let bytes = full_value_bytes(entry.value).expect("full segment value");
             let segment_scope =
                 decode_hot_diff_segment_key(entry.key.0.as_ref()).expect("segment key");
@@ -15122,6 +15956,68 @@ mod tests {
         assert_eq!(buffers.row_deletes.as_ptr(), row_delete_allocation);
         assert!(buffers.row_puts.capacity() >= ROW_COUNT);
         assert!(buffers.row_deletes.capacity() >= ROW_COUNT);
+    }
+
+    /// The budget is the whole guard, so its shape is pinned here rather than
+    /// inferred from a timing test. Every constant is justified in
+    /// [`hot_index_candidate_budget`]'s own documentation against the
+    /// measurement that produced it.
+    #[test]
+    fn the_candidate_budget_floors_small_planes_and_halves_large_ones() {
+        // Below the floor the absolute cost of resolving a bucket is smaller
+        // than the measurement's noise floor, so tiny planes keep the index.
+        assert_eq!(hot_index_candidate_budget(0), 64);
+        assert_eq!(hot_index_candidate_budget(1), 64);
+        assert_eq!(hot_index_candidate_budget(128), 64);
+        // Above it the budget is half the plane, which sits below the measured
+        // crossover of roughly two thirds.
+        assert_eq!(hot_index_candidate_budget(129), 64);
+        assert_eq!(hot_index_candidate_budget(200), 100);
+        assert_eq!(hot_index_candidate_budget(20_000), 10_000);
+        // The guard must not overflow into a permissive budget on a plane
+        // whose count is nonsense.
+        assert_eq!(hot_index_candidate_budget(u64::MAX), (u64::MAX / 2) as usize);
+    }
+
+    /// Every arm of the measurement that motivated the guard, classified by the
+    /// budget. The aged, moved and large write-path buckets were all slower
+    /// than the collection scan and must be refused; the fresh and small
+    /// write-path buckets were faster and must be kept.
+    #[test]
+    fn the_budget_refuses_exactly_the_buckets_that_lost_to_the_scan() {
+        for (entries_published, bucket, expected_served) in [
+            // arm            plane    bucket  index route beat the scan?
+            /* fresh      */ (1_u64, 1_usize, true),
+            /* write 10   */ (11, 10, true),
+            /* write 100  */ (101, 100, false),
+            /* write 1000 */ (1_001, 1_000, false),
+            /* write 5000 */ (5_001, 5_000, false),
+            /* aged 100   */ (100, 100, false),
+            /* aged 1000  */ (1_000, 1_000, false),
+            /* aged 10000 */ (10_000, 10_000, false),
+            /* moved 100  */ (199, 100, false),
+            /* moved 1000 */ (1_999, 1_000, false),
+            /* moved 10k  */ (19_999, 10_000, false),
+        ] {
+            let served = bucket <= hot_index_candidate_budget(entries_published);
+            assert_eq!(
+                served, expected_served,
+                "plane of {entries_published} entries, bucket of {bucket}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_witness_round_trips_its_published_count() {
+        assert_eq!(decode_hot_index_witness(&encode_hot_index_witness(0)), Some(0));
+        assert_eq!(
+            decode_hot_index_witness(&encode_hot_index_witness(7_919)),
+            Some(7_919)
+        );
+        // An unreadable witness cannot size the plane, and the lookup refuses
+        // the index rather than guessing a budget.
+        assert_eq!(decode_hot_index_witness(&[]), None);
+        assert_eq!(decode_hot_index_witness(&[0, 1, 2]), None);
     }
 
     #[tokio::test]

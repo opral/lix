@@ -220,11 +220,10 @@ impl StorageScanSource for CountingScanSource<'_> {
         limit_rows: usize,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
         Box::pin(async move {
-            let chunk = self.inner.next_page(limit_rows).await?;
+            let (chunk, chunk_has_more) = self.inner.next_page(limit_rows).await?.into_parts();
             let mut stats = self.stats.lock().expect("I/O stats mutex");
-            stats.scan_rows += chunk.entries.len() as u64;
+            stats.scan_rows += chunk.len() as u64;
             stats.scan_value_bytes += chunk
-                .entries
                 .iter()
                 .map(|entry| match &entry.value {
                     ProjectedValue::KeyOnly => 0,
@@ -232,7 +231,7 @@ impl StorageScanSource for CountingScanSource<'_> {
                 })
                 .sum::<u64>();
             drop(stats);
-            Ok(chunk)
+            Ok(ScanChunk::new(chunk, chunk_has_more))
         })
     }
 }
@@ -1113,25 +1112,23 @@ where
         .await
         .expect("begin CAS accounting scan");
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan CAS accounting space");
-        accounting.rows += page.entries.len() as u64;
+            .expect("scan CAS accounting space").into_parts();
+        accounting.rows += page.len() as u64;
         accounting.key_bytes += page
-            .entries
             .iter()
             .map(|entry| entry.key.0.len() as u64)
             .sum::<u64>();
         accounting.value_bytes += page
-            .entries
             .iter()
             .map(|entry| match &entry.value {
                 ProjectedValue::KeyOnly => 0,
                 ProjectedValue::FullValue(value) => value.len() as u64,
             })
             .sum::<u64>();
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }

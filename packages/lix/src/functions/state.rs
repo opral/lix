@@ -388,10 +388,9 @@ mod tests {
             .await
             .expect("selected HOT member scan should begin");
         let mut rows = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .collect_all()
             .await
-            .expect("selected HOT members should scan")
-            .entries;
+            .expect("selected HOT members should scan");
         assert_eq!(
             rows.len(),
             1,

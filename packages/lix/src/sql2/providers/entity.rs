@@ -288,7 +288,18 @@ impl EntitySpec {
         limit: Option<usize>,
     ) -> Result<(SchemaRef, HotStateScanRequest, Vec<EntityRowFilter>)> {
         let projected_schema = projected_schema(&self.schema, projection);
-        let row_filters = EntityRowFilterAnalyzer::new(&self.spec).analyze_filters(filters)?;
+        // A predicate that resolves to a complete identity set is applied in
+        // full by the `entity_pks` access path below, and `filter_pushdown`
+        // already reports it as `Exact` for exactly that reason. Re-deriving a
+        // residual row filter for it makes the provider evaluate the same
+        // predicate twice and — because a non-empty `row_filters` disqualifies
+        // every direct route — forces the point read onto the generic
+        // visibility scan.
+        let row_filters =
+            EntityRowFilterAnalyzer::new(&self.spec).analyze_filters(&exact_identity_residual(
+                &EntityPrimaryKeyFilterAnalyzer::new(&self.spec),
+                filters,
+            ))?;
         let mut request = entity_hot_state_scan_request(
             &self.spec.schema_key,
             self.branch_binding.active_branch_id(),
@@ -2238,7 +2249,7 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
     }
 
     #[expect(clippy::unnecessary_wraps)]
-    fn analyze_filters(&self, filters: &[Expr]) -> Result<Vec<EntityRowFilter>> {
+    fn analyze_filters(&self, filters: &[&Expr]) -> Result<Vec<EntityRowFilter>> {
         Ok(filters
             .iter()
             .filter_map(|filter| self.analyze(filter))
@@ -2902,6 +2913,18 @@ fn projection_column_names(schema: &Schema) -> Vec<String> {
         .iter()
         .filter_map(|field| field.name().strip_prefix("lixcol_"))
         .map(str::to_string)
+        .collect()
+}
+
+/// The filters that still need a row-shaped predicate after the exact
+/// identity access path has consumed the ones it applies in full.
+fn exact_identity_residual<'a>(
+    analyzer: &EntityPrimaryKeyFilterAnalyzer<'_>,
+    filters: &'a [Expr],
+) -> Vec<&'a Expr> {
+    filters
+        .iter()
+        .filter(|filter| !analyzer.supports(filter))
         .collect()
 }
 

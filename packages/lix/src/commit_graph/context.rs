@@ -649,7 +649,7 @@ fn commit_graph_node_from_record(
     };
     let node = CommitGraphNode {
         commit_id: record.commit_id,
-        change_id: record.change_id,
+        change_id: record.change_id(),
         account_id: record.account_id,
         generation: record.generation,
         parent_commit_ids: record.parent_commit_ids,
@@ -951,7 +951,7 @@ mod tests {
 
         assert_eq!(commit.commit_id, commit_id("commit-1"));
         assert_eq!(commit.parent_commit_ids, commit_ids(["parent-1"]));
-        assert_eq!(commit.change_id, change_id("commit-1-change"));
+        assert_eq!(commit.change_id, commit_id("commit-1").commit_change_id());
     }
 
     #[tokio::test]
@@ -1429,7 +1429,6 @@ mod tests {
                     parent_commit_ids: Vec::new(),
                     first_parent_jump_commit_id: commit_id,
                     first_parent_jump_span: 0,
-                    change_id: change_id("selected-tombstone-commit-change"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at,
                 }],
@@ -1966,7 +1965,6 @@ mod tests {
                 parent_commit_ids: change.parent_commit_ids.clone(),
                 first_parent_jump_commit_id,
                 first_parent_jump_span,
-                change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
             };
@@ -2047,15 +2045,13 @@ mod tests {
     }
 
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
-        let change_id = format!("{commit_id}-change");
         append.commits.push(CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
             first_parent_jump_commit_id: commit_id,
             first_parent_jump_span: 0,
-            change_id: ChangeId::for_test_label(&change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
         });

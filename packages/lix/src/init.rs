@@ -14,11 +14,11 @@ use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_snapshot};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::hot_state::{
     CurrentStateDeltaRef, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_tracked_working_diff_epoch,
 };
+use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
@@ -171,7 +171,7 @@ pub struct InitReceipt {
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
     let main_branch_id = functions.call_uuid_v7().to_string();
     let lix_id = functions.call_uuid_v7().to_string();
-    let initial_commit_id = CommitId::from(functions.call_uuid_v7());
+    let initial_commit_id = CommitId::with_change_address_space(functions.call_uuid_v7());
     let timestamp = functions.call_timestamp();
 
     let mut registered_schema_changes = Vec::new();
@@ -612,13 +612,12 @@ async fn stage_init_changelog_commit(
     changes: Vec<ChangeRecord>,
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
-        format_version: 3,
+        format_version: 4,
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
         first_parent_jump_commit_id: plan.commit.id,
         first_parent_jump_span: 0,
-        change_id: plan.commit.change_id,
         account_id: plan.commit.account_id.clone(),
         created_at: plan.commit.created_at,
     };
@@ -754,7 +753,12 @@ mod tests {
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
         assert_eq!(plan.receipt.lix_id, test_uuid(2));
-        assert_eq!(plan.receipt.initial_commit_id, test_uuid(3));
+        // The initial commit id reserves its low 32 bits for packed change
+        // ordinals like every other commit id, so it is not the raw v7 value.
+        assert_eq!(
+            plan.receipt.initial_commit_id,
+            "01920000-0000-7000-8000-000300000000"
+        );
     }
 
     #[test]
@@ -902,7 +906,7 @@ mod tests {
         };
 
         assert_eq!(record.commit_id, receipt.initial_commit_id);
-        let commit_change_id = record.change_id.clone();
+        let commit_change_id = record.change_id();
         let membership_read = storage
             .begin_read(crate::storage_adapter::StorageReadOptions::default())
             .await
@@ -913,7 +917,7 @@ mod tests {
                 .expect("initial commit membership should load");
         assert_eq!(change_refs.len(), seed_schema_definitions().len() + 6);
         assert!(
-            !change_refs.contains(&record.change_id),
+            !change_refs.contains(&record.change_id()),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"
         );
 

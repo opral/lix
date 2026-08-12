@@ -41,22 +41,29 @@ fn reserve_eager_blob_cache_bytes(reserved: usize, size: usize) -> Option<usize>
         .filter(|total| *total <= MAX_EAGER_BLOB_CACHE_BYTES)
 }
 
+// Rebuild counters are per-thread, not process-global. `cargo test` runs many
+// tests concurrently in one process, and a global counter reports every other
+// test's rebuilds too — which makes any assertion on it fail in a full run
+// while passing when the test is filtered to itself. `#[tokio::test]` drives
+// its future on the calling thread, so a test observes exactly its own
+// rebuilds.
 #[cfg(test)]
-static FULL_REBUILD_BUILDS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static FULL_REBUILD_DESCRIPTOR_ROWS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static FULL_REBUILD_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FULL_REBUILD_DESCRIPTOR_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn reset_full_rebuild_stats() {
-    FULL_REBUILD_BUILDS.store(0, Ordering::SeqCst);
-    FULL_REBUILD_DESCRIPTOR_ROWS.store(0, Ordering::SeqCst);
+    FULL_REBUILD_BUILDS.with(|builds| builds.set(0));
+    FULL_REBUILD_DESCRIPTOR_ROWS.with(|rows| rows.set(0));
 }
 
 #[cfg(test)]
 pub(crate) fn full_rebuild_stats() -> (usize, usize) {
     (
-        FULL_REBUILD_BUILDS.load(Ordering::SeqCst),
-        FULL_REBUILD_DESCRIPTOR_ROWS.load(Ordering::SeqCst),
+        FULL_REBUILD_BUILDS.with(std::cell::Cell::get),
+        FULL_REBUILD_DESCRIPTOR_ROWS.with(std::cell::Cell::get),
     )
 }
 
@@ -1147,8 +1154,9 @@ pub(crate) async fn build_path_index(
     let rows = hot_state.scan_batch(&request.hot_state_request()).await?;
     #[cfg(test)]
     {
-        FULL_REBUILD_BUILDS.fetch_add(1, Ordering::SeqCst);
-        FULL_REBUILD_DESCRIPTOR_ROWS.fetch_add(rows.len(), Ordering::SeqCst);
+        FULL_REBUILD_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
+        FULL_REBUILD_DESCRIPTOR_ROWS
+            .with(|descriptor_rows| descriptor_rows.set(descriptor_rows.get() + rows.len()));
     }
     Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?))
 }

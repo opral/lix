@@ -55,6 +55,8 @@ pub(crate) mod filesystem;
 pub(crate) mod functions;
 pub(crate) mod gc;
 mod handle;
+#[cfg(test)]
+mod hot_index_aging_probe;
 pub(crate) mod init;
 pub(crate) mod json_store;
 pub(crate) mod hot_state;
@@ -64,6 +66,7 @@ pub(crate) mod hot_state;
 mod module_layers;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
+pub(crate) mod order_preserving_key;
 pub(crate) mod plugin;
 mod plugin_arena;
 mod plugin_layout;

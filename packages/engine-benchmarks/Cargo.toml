@@ -107,12 +107,22 @@ path = "examples/revision_pack_oracle.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
+name = "e5_media_probe"
+path = "examples/e5_media_probe.rs"
+required-features = ["storage-benches"]
+
+[[example]]
 name = "chunking_oracle"
 path = "examples/chunking_oracle.rs"
 
 [[example]]
 name = "cas_sharing"
 path = "examples/cas_sharing.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "e3_cas_reclaim_scan"
+path = "examples/e3_cas_reclaim_scan.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
@@ -154,6 +164,11 @@ required-features = ["storage-benches", "slatedb"]
 name = "large_payload_read_qualification"
 path = "tests/large_payload_read_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
+
+[[test]]
+name = "crash_consistency_qualification"
+path = "tests/crash_consistency_qualification.rs"
+required-features = ["rocksdb"]
 
 [[test]]
 name = "certified_replacement_delete_reopen"
@@ -375,3 +390,8 @@ required-features = ["storage-benches"]
 name = "exppq_point_query"
 path = "examples/exppq_point_query.rs"
 required-features = ["storage-benches"]
+
+[[example]]
+name = "write_amplification"
+path = "examples/write_amplification.rs"
+required-features = ["storage-benches", "slatedb"]

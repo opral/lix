@@ -8,6 +8,8 @@
 //! untracked overlay.
 
 mod hot;
+#[cfg(test)]
+pub(crate) use hot::hot_decode_entity_pk_probe;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
 #[cfg(test)]
@@ -857,10 +859,10 @@ where
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let key: BranchRefKey = match storage_codec::decode(
                 "tracked working-diff marker key",
                 entry.key.0.as_ref(),
@@ -901,7 +903,7 @@ where
                 },
             );
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -933,17 +935,12 @@ fn encode_working_diff_scope_prefix(
     out
 }
 
-const KEY_ESCAPE: u8 = 0xff;
-const KEY_PART_FINAL: u8 = 0x00;
-const KEY_PART_MORE: u8 = 0x01;
-const FILE_ID_NONE: u8 = 0x00;
-const FILE_ID_SOME: u8 = 0x01;
+// The key byte format is shared with the tracked-state tree and lives in one
+// place; see `crate::order_preserving_key`. Re-exported so this module's
+// children keep resolving these names through `use super::*`.
+pub(crate) use crate::order_preserving_key::*;
+
 const GENERATION_BYTES: usize = 16;
-const ENTITY_PK_CODEC_V1: u8 = 0x01;
-const ENTITY_PK_UUID: u8 = 0x00;
-const ENTITY_PK_INTEGER: u8 = 0x01;
-const ENTITY_PK_STRING: u8 = 0x02;
-const ENTITY_PK_BYTES: u8 = 0x03;
 
 /// Order-preserving tracked-head key encoding.
 ///
@@ -960,67 +957,6 @@ fn encode_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
     out
 }
 
-fn write_entity_pk(out: &mut Vec<u8>, entity_pk: &EntityPk) {
-    debug_assert!(
-        !entity_pk.components.is_empty(),
-        "tracked-head entity primary keys must be non-empty"
-    );
-    out.push(ENTITY_PK_CODEC_V1);
-    for (index, component) in entity_pk.components.iter().enumerate() {
-        let terminator = if index + 1 == entity_pk.components.len() {
-            KEY_PART_FINAL
-        } else {
-            KEY_PART_MORE
-        };
-        match component {
-            crate::entity_pk::EntityPkComponent::Uuid(bytes) => {
-                out.push(ENTITY_PK_UUID);
-                out.extend_from_slice(bytes);
-                out.push(terminator);
-            }
-            crate::entity_pk::EntityPkComponent::Integer(value) => {
-                out.push(ENTITY_PK_INTEGER);
-                let ordered = u64::from_be_bytes(value.to_be_bytes()) ^ (1_u64 << 63);
-                out.extend_from_slice(&ordered.to_be_bytes());
-                out.push(terminator);
-            }
-            crate::entity_pk::EntityPkComponent::String(value) => {
-                out.push(ENTITY_PK_STRING);
-                write_key_bytes(out, value.as_bytes(), terminator);
-            }
-            crate::entity_pk::EntityPkComponent::Bytes(value) => {
-                out.push(ENTITY_PK_BYTES);
-                write_key_bytes(out, value, terminator);
-            }
-        }
-    }
-}
-
-fn write_file_id(out: &mut Vec<u8>, file_id: Option<&str>) {
-    match file_id {
-        None => out.push(FILE_ID_NONE),
-        Some(file_id) => {
-            out.push(FILE_ID_SOME);
-            write_key_string(out, file_id, KEY_PART_FINAL);
-        }
-    }
-}
-
-fn write_key_string(out: &mut Vec<u8>, value: &str, terminator: u8) {
-    write_key_bytes(out, value.as_bytes(), terminator);
-}
-
-fn write_key_bytes(out: &mut Vec<u8>, value: &[u8], terminator: u8) {
-    for &byte in value {
-        if byte == KEY_PART_FINAL {
-            out.extend_from_slice(&[KEY_PART_FINAL, KEY_ESCAPE]);
-        } else {
-            out.push(byte);
-        }
-    }
-    out.extend_from_slice(&[KEY_PART_FINAL, terminator]);
-}
-
 fn read_generation(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixError> {
     let end = offset
         .checked_add(GENERATION_BYTES)
@@ -1032,6 +968,17 @@ fn read_generation(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixErro
     uuid.copy_from_slice(generation);
     *offset = end;
     Ok(CommitId::new(uuid::Uuid::from_bytes(uuid)))
+}
+
+
+/// Test-only shim so the shared codec's three-way differential can drive this
+/// plane's decoder. See `crate::order_preserving_key::tests`.
+#[cfg(test)]
+pub(crate) fn head_decode_entity_pk_probe(bytes: &[u8]) -> Option<(EntityPk, usize)> {
+    let mut offset = 0usize;
+    read_entity_pk(bytes, &mut offset)
+        .ok()
+        .map(|entity_pk| (entity_pk, offset))
 }
 
 fn read_entity_pk(bytes: &[u8], offset: &mut usize) -> Result<EntityPk, LixError> {
@@ -1090,7 +1037,7 @@ fn read_entity_pk_part(
         }
         ENTITY_PK_UUID => {
             let uuid_end = offset
-                .checked_add(16)
+                .checked_add(ENTITY_PK_UUID_BYTES)
                 .ok_or_else(|| key_codec_error("UUIDv7 entity primary key offset overflow"))?;
             let uuid_bytes: [u8; 16] = bytes
                 .get(*offset..uuid_end)
@@ -1101,7 +1048,7 @@ fn read_entity_pk_part(
                 .get(uuid_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("is truncated after UUIDv7 entity primary key"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(
                     "UUIDv7 entity primary key has an invalid terminator",
                 ));
@@ -1114,7 +1061,7 @@ fn read_entity_pk_part(
         }
         ENTITY_PK_INTEGER => {
             let integer_end = offset
-                .checked_add(8)
+                .checked_add(ENTITY_PK_INTEGER_BYTES)
                 .ok_or_else(|| key_codec_error("integer entity primary key offset overflow"))?;
             let ordered = u64::from_be_bytes(
                 bytes
@@ -1127,16 +1074,14 @@ fn read_entity_pk_part(
                 .get(integer_end)
                 .copied()
                 .ok_or_else(|| key_codec_error("is truncated after integer entity primary key"))?;
-            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+            if !is_key_part_terminator(terminator) {
                 return Err(key_codec_error(
                     "integer entity primary key has an invalid terminator",
                 ));
             }
             *offset = integer_end + 1;
             Ok((
-                crate::entity_pk::EntityPkComponent::Integer(i64::from_be_bytes(
-                    (ordered ^ (1_u64 << 63)).to_be_bytes(),
-                )),
+                crate::entity_pk::EntityPkComponent::Integer(i64_from_ordered_integer(ordered)),
                 terminator,
             ))
         }
@@ -2393,7 +2338,7 @@ mod tests {
     async fn scan_test_space(
         read: &(impl StorageAdapterRead + ?Sized),
         space: StorageSpace,
-    ) -> crate::storage_adapter::StorageScanChunk {
+    ) -> Vec<crate::storage_adapter::StorageReadEntry> {
         let range = StoragePrefix {
             bytes: Bytes::new(),
         }
@@ -2404,7 +2349,7 @@ mod tests {
             .await
             .expect("begin test scan");
         cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .collect_all()
             .await
             .expect("read test scan page")
     }
@@ -4040,8 +3985,7 @@ mod tests {
             .await
             .expect("open file schema marker verification read");
         let projection_rows = scan_test_space(&projection_read, FILE_SPACE)
-            .await
-            .entries;
+            .await;
         assert_eq!(
             projection_rows.len(),
             1,
@@ -4624,7 +4568,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file-schema marker verification read");
-        let projections = scan_test_space(&read, FILE_SPACE).await.entries;
+        let projections = scan_test_space(&read, FILE_SPACE).await;
         assert_eq!(projections.len(), 1);
         assert!(
             projections.into_iter().all(|projection| {
@@ -4681,7 +4625,6 @@ mod tests {
             .expect("open corruption fixture read");
         let unrelated_key = scan_test_space(&read, ROW_SPACE)
             .await
-            .entries
             .into_iter()
             .find_map(|entry| {
                 let value = full_value_bytes(entry.value).ok()?;

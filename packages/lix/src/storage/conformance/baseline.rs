@@ -5,6 +5,13 @@ use std::ops::Bound;
 /// the bottom of this file pin space isolation.
 const TEST_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(7), "storage.conformance.test");
 const OTHER_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(8), "storage.conformance.other");
+/// Same id and bytes as [`TEST_SPACE`] would hold, declared with the value
+/// integrity that permits a backend to skip its own value checksum.
+const CONTENT_ADDRESSED_SPACE: StorageSpace = StorageSpace::declare_content_addressed(
+    SpaceId(9),
+    "storage.conformance.content_addressed",
+    ValueSemantics::Mutable,
+);
 
 use bytes::Bytes;
 
@@ -16,7 +23,7 @@ use crate::storage::conformance::{
 use crate::storage::{
     BeginScanOptions, CoreProjection, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Precondition,
     ProjectedValue, ReadEntry, ReadOptions, ScanChunk, ScanOrder, SpaceId, Storage, StorageError,
-    StorageRead, StorageSpace, StorageWrite, WriteOptions,
+    StorageRead, StorageSpace, StorageWrite, ValueSemantics, WriteOptions,
 };
 
 pub(crate) async fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -44,6 +51,10 @@ where
         get_many_returns_requested_slots
     );
     run!("baseline::get_many_empty_key_list", get_many_empty_key_list);
+    run!(
+        "baseline::content_addressed_space_returns_identical_bytes",
+        content_addressed_space_returns_identical_bytes
+    );
     run!(
         "baseline::delete_many_missing_keys_is_idempotent",
         delete_many_missing_keys_is_idempotent
@@ -349,6 +360,128 @@ where
     }
 }
 
+/// `ValueIntegrity::ContentAddressed` must not change what a read returns.
+///
+/// It is a licence to skip a *redundant* corruption check on bytes the engine
+/// authenticates itself, and nothing more. An adapter is free to ignore it
+/// entirely — SlateDB does, because `slatedb::config::ReadOptions` has no
+/// checksum control — but an adapter that acts on it must return byte-identical
+/// values, through both `get_many` and a full-value scan, and must still report
+/// a missing key as missing.
+///
+/// The same rows are written to a `BackendVerified` space and a
+/// `ContentAddressed` one and the two reads are compared to each other, so this
+/// fails if a backend's opted-out path diverges in any way — not merely if it
+/// returns something a hand-written expectation did not anticipate.
+async fn content_addressed_space_returns_identical_bytes<F>(factory: &F) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let storage = open_storage(factory).await;
+    let rows: [(&str, &[u8]); 3] = [
+        ("a", b"A"),
+        ("b", b"a much longer value than the block would like"),
+        ("c", &[0u8; 512]),
+    ];
+
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .map_err(|error| format!("begin_write failed: {error}"))?;
+    for target in [TEST_SPACE, CONTENT_ADDRESSED_SPACE] {
+        write
+            .put_many(
+                target,
+                put_batch(
+                    rows.iter()
+                        .map(|(key_bytes, value_bytes)| full_put(key(key_bytes), *value_bytes)),
+                ),
+            )
+            .await
+            .map_err(|error| format!("put_many into {target} failed: {error}"))?;
+    }
+    write
+        .commit()
+        .await
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    let requested = [key("a"), key("b"), key("c"), key("missing")];
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+
+    let verified = read
+        .get_many_in_space(TEST_SPACE, &requested, GetOptions::default())
+        .await
+        .map_err(|error| format!("get_many on the verified space failed: {error}"))?;
+    let addressed = read
+        .get_many_in_space(CONTENT_ADDRESSED_SPACE, &requested, GetOptions::default())
+        .await
+        .map_err(|error| format!("get_many on the content-addressed space failed: {error}"))?;
+
+    if verified.values != addressed.values {
+        return Err(format!(
+            "content-addressed space returned different values than the verified space: \
+             {:?} vs {:?}",
+            verified.values, addressed.values
+        ));
+    }
+    if addressed.values.last() != Some(&None) {
+        return Err(format!(
+            "a missing key must stay missing on a content-addressed space, got {:?}",
+            addressed.values.last()
+        ));
+    }
+
+    let scanned = collect_full_values(&read, CONTENT_ADDRESSED_SPACE).await?;
+    let expected = rows
+        .iter()
+        .map(|(key_bytes, value_bytes)| (key(key_bytes), Bytes::copy_from_slice(value_bytes)))
+        .collect::<Vec<_>>();
+    if scanned != expected {
+        return Err(format!(
+            "full-value scan of a content-addressed space returned {scanned:?}, expected {expected:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Drains a full-value scan of `space` into `(key, value)` pairs in key order.
+async fn collect_full_values<R>(read: &R, space: StorageSpace) -> Result<Vec<(Key, Bytes)>, String>
+where
+    R: StorageRead,
+{
+    let mut cursor = read
+        .begin_scan(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            BeginScanOptions::default(),
+        )
+        .await
+        .map_err(|error| format!("begin_scan failed: {error}"))?;
+    let entries = cursor
+        .collect_all()
+        .await
+        .map_err(|error| format!("scan collect_all failed: {error}"))?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let ReadEntry {
+            key: entry_key,
+            value: ProjectedValue::FullValue(bytes),
+        } = entry
+        else {
+            return Err("full-value scan yielded a key-only entry".to_string());
+        };
+        out.push((entry_key, bytes));
+    }
+    Ok(out)
+}
+
 async fn delete_many_missing_keys_is_idempotent<F>(factory: &F) -> ConformanceResult
 where
     F: StorageFactory,
@@ -536,7 +669,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let chunk = scan_range(
+    let (chunk, _chunk_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -546,9 +679,9 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("scan_range failed: {error}"))?;
+    .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();
 
-    assert_read_entries(&chunk.entries, &[("a", "B")])
+    assert_read_entries(&chunk, &[("a", "B")])
 }
 
 async fn scan_range_returns_forward_row_bounded_chunks<F>(factory: &F) -> ConformanceResult
@@ -576,21 +709,22 @@ where
         .begin_scan(TEST_SPACE, range, BeginScanOptions::default())
         .await
         .map_err(|error| format!("begin scan_range failed: {error}"))?;
-    let first = cursor
+    let (first, first_has_more) = cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("first scan_range failed: {error}"))?;
-    assert_read_entries(&first.entries, &[("b", "B"), ("c", "C")])?;
-    if !first.has_more {
+        .map_err(|error| format!("first scan_range failed: {error}"))?.into_parts();
+    assert_read_entries(&first, &[("b", "B"), ("c", "C")])?;
+    if !first_has_more {
         return Err("first scan chunk did not report has_more".to_string());
     }
 
-    let second = cursor
+    let (second, second_has_more) = cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("second scan_range failed: {error}"))?;
-    assert_read_entries(&second.entries, &[("d", "D")])?;
-    if second.has_more {
+        .map_err(|error| format!("second scan_range failed: {error}"))?
+        .into_parts();
+    assert_read_entries(&second, &[("d", "D")])?;
+    if second_has_more {
         return Err("last scan chunk unexpectedly reported has_more".to_string());
     }
     Ok(())
@@ -635,37 +769,38 @@ where
         )
         .await
         .map_err(|error| format!("begin capped scan failed: {error}"))?;
-    let first = cursor
+    let (first, first_has_more) = cursor
         .next_page(usize::MAX)
         .await
-        .map_err(|error| format!("first capped scan failed: {error}"))?;
-    if first.entries.len() != MAX_SCAN_PAGE_ROWS || !first.has_more {
+        .map_err(|error| format!("first capped scan failed: {error}"))?.into_parts();
+    if first.len() != MAX_SCAN_PAGE_ROWS || !first_has_more {
         return Err(format!(
             "oversized scan returned {} rows with has_more={} (expected {} and true)",
-            first.entries.len(),
-            first.has_more,
+            first.len(),
+            first_has_more,
             MAX_SCAN_PAGE_ROWS
         ));
     }
 
-    let tail = cursor
+    let (tail, tail_has_more) = cursor
         .next_page(usize::MAX)
         .await
-        .map_err(|error| format!("tail scan failed: {error}"))?;
-    if tail.entries.len() != 1 || tail.has_more {
+        .map_err(|error| format!("tail scan failed: {error}"))?
+        .into_parts();
+    if tail.len() != 1 || tail_has_more {
         return Err(format!(
             "tail scan returned {} rows with has_more={} (expected 1 and false)",
-            tail.entries.len(),
-            tail.has_more
+            tail.len(),
+            tail_has_more
         ));
     }
     let expected_tail = key(u32::try_from(MAX_SCAN_PAGE_ROWS)
         .expect("maximum scan page rows fits u32")
         .to_be_bytes());
-    if tail.entries[0].key != expected_tail {
+    if tail[0].key != expected_tail {
         return Err(format!(
             "tail scan returned key {:?}, expected {:?}",
-            tail.entries[0].key, expected_tail
+            tail[0].key, expected_tail
         ));
     }
     Ok(())
@@ -688,7 +823,7 @@ where
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
 
-    let included = scan_range(
+    let (included, _included_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -698,10 +833,10 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("included range scan failed: {error}"))?;
-    assert_read_entries(&included.entries, &[("b", "B"), ("c", "C")])?;
+    .map_err(|error| format!("included range scan failed: {error}"))?.into_parts();
+    assert_read_entries(&included, &[("b", "B"), ("c", "C")])?;
 
-    let excluded = scan_range(
+    let (excluded, _excluded_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -711,8 +846,8 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("excluded range scan failed: {error}"))?;
-    assert_read_entries(&excluded.entries, &[("c", "C")])
+    .map_err(|error| format!("excluded range scan failed: {error}"))?.into_parts();
+    assert_read_entries(&excluded, &[("c", "C")])
 }
 
 async fn scan_range_resume_before_lower_does_not_widen_range<F>(factory: &F) -> ConformanceResult
@@ -731,7 +866,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let chunk = scan_range(
+    let (chunk, _chunk_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -741,9 +876,9 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("scan_range failed: {error}"))?;
+    .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();
 
-    assert_read_entries(&chunk.entries, &[("c", "C"), ("d", "D")])
+    assert_read_entries(&chunk, &[("c", "C"), ("d", "D")])
 }
 
 async fn scan_range_orders_raw_byte_keys<F>(factory: &F) -> ConformanceResult
@@ -782,7 +917,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let chunk = scan_range(
+    let (chunk, _chunk_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -792,10 +927,10 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("scan_range failed: {error}"))?;
+    .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();
 
     assert_read_entries_bytes(
-        &chunk.entries,
+        &chunk,
         &[
             (Bytes::new(), Bytes::from_static(b"empty")),
             (Bytes::from_static(&[0x00]), Bytes::from_static(b"00")),
@@ -864,12 +999,12 @@ where
             .await
             .map_err(|error| format!("begin scan limit {limit} failed: {error}"))?;
         loop {
-            let chunk = cursor
+            let (chunk, chunk_has_more) = cursor
                 .next_page(limit)
                 .await
-                .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?;
-            actual.extend(entries_to_key_values(&chunk.entries));
-            if !chunk.has_more {
+                .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?.into_parts();
+            actual.extend(entries_to_key_values(&chunk));
+            if !chunk_has_more {
                 break;
             }
             if actual.len() > expected.len() {
@@ -930,12 +1065,12 @@ where
             .await
             .map_err(|error| format!("begin paged scan limit {limit} failed: {error}"))?;
         loop {
-            let result = cursor
+            let (result, result_has_more) = cursor
                 .next_page(limit)
                 .await
-                .map_err(|error| format!("paged scan limit {limit} failed: {error}"))?;
-            actual.extend(entries_to_key_values(&result.entries));
-            if !result.has_more {
+                .map_err(|error| format!("paged scan limit {limit} failed: {error}"))?.into_parts();
+            actual.extend(entries_to_key_values(&result));
+            if !result_has_more {
                 break;
             }
             if actual.len() > expected.len() {
@@ -964,7 +1099,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let chunk = scan_range(
+    let (chunk, _chunk_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -974,11 +1109,11 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("scan_range failed: {error}"))?;
-    if chunk.entries.is_empty() {
+    .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();
+    if chunk.is_empty() {
         Ok(())
     } else {
-        Err(format!("empty range returned entries: {:?}", chunk.entries))
+        Err(format!("empty range returned entries: {:?}", chunk))
     }
 }
 
@@ -1105,7 +1240,7 @@ where
         &[("a", "A")],
     )?;
 
-    let old_scan = scan_range(
+    let (old_scan, _old_scan_has_more) = scan_range(
         &old_read,
         test_space,
         KeyRange {
@@ -1115,8 +1250,8 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("old read scan_range failed: {error}"))?;
-    assert_read_entries(&old_scan.entries, &[("a", "A")])?;
+    .map_err(|error| format!("old read scan_range failed: {error}"))?.into_parts();
+    assert_read_entries(&old_scan, &[("a", "A")])?;
 
     assert_get_entries(&storage, test_space, &[("a", Some("C"))]).await
 }
@@ -1147,12 +1282,12 @@ where
         .begin_scan(TEST_SPACE, full_range.clone(), BeginScanOptions::default())
         .await
         .map_err(|error| format!("begin old cursor failed: {error}"))?;
-    let first = old_cursor
+    let (first, first_has_more) = old_cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("old cursor first page failed: {error}"))?;
-    assert_read_entries(&first.entries, &[("a", "A"), ("b", "B")])?;
-    if !first.has_more {
+        .map_err(|error| format!("old cursor first page failed: {error}"))?.into_parts();
+    assert_read_entries(&first, &[("a", "A"), ("b", "B")])?;
+    if !first_has_more {
         return Err("old cursor ended before its second page".to_string());
     }
 
@@ -1179,12 +1314,12 @@ where
         .await
         .map_err(|error| format!("commit concurrent mutation failed: {error}"))?;
 
-    let second = old_cursor
+    let (second, second_has_more) = old_cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("old cursor second page failed: {error}"))?;
-    assert_read_entries(&second.entries, &[("c", "C"), ("d", "D")])?;
-    if second.has_more {
+        .map_err(|error| format!("old cursor second page failed: {error}"))?.into_parts();
+    assert_read_entries(&second, &[("c", "C"), ("d", "D")])?;
+    if second_has_more {
         return Err("old cursor exposed unexpected rows after its snapshot tail".to_string());
     }
     drop(old_cursor);
@@ -1205,11 +1340,11 @@ where
         )
         .await
         .map_err(|error| format!("begin exclusive restart failed: {error}"))?;
-    let restarted_page = restarted
+    let (restarted_page, _restarted_page_has_more) = restarted
         .next_page(usize::MAX)
         .await
-        .map_err(|error| format!("exclusive restart failed: {error}"))?;
-    assert_read_entries(&restarted_page.entries, &[("c", "C2"), ("e", "E")])
+        .map_err(|error| format!("exclusive restart failed: {error}"))?.into_parts();
+    assert_read_entries(&restarted_page, &[("c", "C2"), ("e", "E")])
 }
 
 async fn descending_scan_is_explicitly_unsupported<F>(factory: &F) -> ConformanceResult
@@ -1264,11 +1399,11 @@ where
         .map_err(|error| format!("begin cursor failed: {error}"))?;
     let unpolled = cursor.next_page(1);
     drop(unpolled);
-    let page = cursor
+    let (page, _page_has_more) = cursor
         .next_page(1)
         .await
-        .map_err(|error| format!("cursor failed after unpolled cancellation: {error}"))?;
-    assert_read_entries(&page.entries, &[("a", "A")])
+        .map_err(|error| format!("cursor failed after unpolled cancellation: {error}"))?.into_parts();
+    assert_read_entries(&page, &[("a", "A")])
 }
 
 async fn invalid_scan_range_fails_closed<F>(factory: &F) -> ConformanceResult
@@ -1338,7 +1473,7 @@ where
         &[key("a")],
     )?;
 
-    let key_only_scan = scan_range(
+    let (key_only_scan, _key_only_scan_has_more) = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -1351,8 +1486,8 @@ where
         },
     )
     .await
-    .map_err(|error| format!("KeyOnly scan_range failed: {error}"))?;
-    assert_key_only_entries(&key_only_scan.entries, &[key("a")])
+    .map_err(|error| format!("KeyOnly scan_range failed: {error}"))?.into_parts();
+    assert_key_only_entries(&key_only_scan, &[key("a")])
 }
 
 fn assert_key_only_entries(entries: &[ReadEntry], expected_keys: &[Key]) -> ConformanceResult {
@@ -1523,7 +1658,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin read failed: {error}"))?;
-    let result = scan_range_in_space(
+    let (result, result_has_more) = scan_range_in_space(
         &read,
         OTHER_SPACE,
         full_key_range(),
@@ -1531,19 +1666,18 @@ where
         MAX_SCAN_PAGE_ROWS,
     )
     .await
-    .map_err(|error| format!("scan failed: {error}"))?;
+    .map_err(|error| format!("scan failed: {error}"))?.into_parts();
     let rows = result
-        .entries
         .iter()
         .map(|entry| entry.key.clone())
         .collect::<Vec<_>>();
-    if rows != vec![key("a"), key("b"), key("c")] || result.has_more {
+    if rows != vec![key("a"), key("b"), key("c")] || result_has_more {
         return Err(format!("scan must observe only its space, got {rows:?}"));
     }
 
     // Resume past the last row: must report exhaustion, never the
     // neighbouring space's rows.
-    let result = scan_range_in_space(
+    let (result, result_has_more) = scan_range_in_space(
         &read,
         OTHER_SPACE,
         KeyRange {
@@ -1554,13 +1688,13 @@ where
         MAX_SCAN_PAGE_ROWS,
     )
     .await
-    .map_err(|error| format!("resume scan failed: {error}"))?;
+    .map_err(|error| format!("resume scan failed: {error}"))?
+    .into_parts();
     let tail = result
-        .entries
         .iter()
         .map(|entry| entry.key.clone())
         .collect::<Vec<_>>();
-    if !tail.is_empty() || result.has_more {
+    if !tail.is_empty() || result_has_more {
         return Err(format!(
             "resume past the space's last key must be empty, got {tail:?}"
         ));
@@ -1623,7 +1757,8 @@ where
         )
         .await
         .map_err(|error| format!("scan failed: {error}"))?
-        .entries
+        .into_parts()
+        .0
         .len();
         if rows != expected {
             return Err(format!(
@@ -1670,7 +1805,7 @@ where
     if result.values[0].as_ref().is_some() {
         return Err("never-written space must miss".to_string());
     }
-    let scan = scan_range_in_space(
+    let (scan, scan_has_more) = scan_range_in_space(
         &read,
         empty,
         full_key_range(),
@@ -1678,8 +1813,9 @@ where
         MAX_SCAN_PAGE_ROWS,
     )
     .await
-    .map_err(|error| format!("scan failed: {error}"))?;
-    if !scan.entries.is_empty() || scan.has_more {
+    .map_err(|error| format!("scan failed: {error}"))?
+    .into_parts();
+    if !scan.is_empty() || scan_has_more {
         return Err("never-written space must scan empty".to_string());
     }
     drop(read);

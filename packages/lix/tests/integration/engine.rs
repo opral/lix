@@ -366,8 +366,11 @@ simulation_test!(
                 .await
                 .expect("uuid after deterministic write should continue"),
             // The tracked write consumes deterministic values for row and
-            // commit metadata, including the branch-ref ChangeRecord ID.
-            "01920000-0000-7000-8000-000000000009",
+            // commit metadata, including the branch-ref ChangeRecord ID. The
+            // commit's own change id is no longer among them — it is derived
+            // from the commit id — so the write draws one fewer value than it
+            // used to.
+            "01920000-0000-7000-8000-000000000008",
         );
     }
 );

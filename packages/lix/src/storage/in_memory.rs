@@ -360,10 +360,7 @@ impl StorageScanSource for MemoryScanSource<'_> {
                 });
             }
             self.pending = self.cursor.next();
-            Ok(ScanChunk {
-                entries,
-                has_more: self.pending.is_some(),
-            })
+            Ok(ScanChunk::new(entries, self.pending.is_some()))
         })
     }
 }
@@ -671,12 +668,12 @@ mod tests {
             )
             .await
             .expect("begin scan after range delete");
-        let chunk = cursor
+        let (chunk, chunk_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan after range delete");
-        assert!(chunk.entries.is_empty());
-        assert!(!chunk.has_more);
+            .expect("scan after range delete").into_parts();
+        assert!(chunk.is_empty());
+        assert!(!chunk_has_more);
     }
 
     #[tokio::test]

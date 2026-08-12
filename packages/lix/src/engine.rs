@@ -480,7 +480,7 @@ async fn repository_has_changelog_commit(
             },
         )
         .await?;
-    Ok(!cursor.next_page(1).await?.entries.is_empty())
+    Ok(!cursor.next_page(1).await?.is_empty())
 }
 
 fn not_initialized_error() -> LixError {
@@ -504,7 +504,7 @@ mod tests {
     async fn scan_test_space(
         read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
         space: StorageSpace,
-    ) -> crate::storage_adapter::StorageScanChunk {
+    ) -> Vec<crate::storage_adapter::StorageReadEntry> {
         let range = StoragePrefix {
             bytes: Bytes::new(),
         }
@@ -515,7 +515,7 @@ mod tests {
             .await
             .expect("begin test scan");
         cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .collect_all()
             .await
             .expect("read test scan page")
     }
@@ -1608,6 +1608,247 @@ mod tests {
         }
     }
 
+    /// A file-scoped working-diff read skips the `HOT_DIFF` index and its
+    /// scope-global coverage proof, enumerating primary `HOT_ROW` rows through
+    /// the file-first prefix seek instead. That is only sound if the primary
+    /// rows are the complete authority for every dirty identity in the file, so
+    /// this asserts the file-scoped answer equals the unfiltered index-driven
+    /// answer restricted to that file — across every reachable row state, and
+    /// for both the bare `file_id` shape (whose schema domain is resolved from
+    /// the `FILE_SPACE` markers) and the `file_id + schema_key` shape.
+    #[tokio::test]
+    async fn file_scoped_working_diff_bypass_matches_the_index_scan() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+
+        let files = [
+            "66696c65-0000-8000-8000-000000000000",
+            "66696c65-0001-8000-8000-000000000001",
+        ];
+        for (index, file) in files.iter().enumerate() {
+            session
+                .execute(
+                    "INSERT INTO lix_file (id, path, content) \
+                     VALUES ($1, $2, CAST($3 AS BYTEA))",
+                    &[
+                        crate::Value::Text((*file).to_string()),
+                        crate::Value::Text(format!("/f{index}.txt")),
+                        crate::Value::Text("seed".to_string()),
+                    ],
+                )
+                .await
+                .expect("file should insert");
+        }
+
+        // Pre-checkpoint rows: one per reachable post-checkpoint fate, spread
+        // over both files and the null-file bucket.
+        for (path, file) in [
+            ("/clean", Some(files[0])),
+            ("/modified", Some(files[0])),
+            ("/removed", Some(files[0])),
+            ("/clean-b", Some(files[1])),
+            ("/modified-b", Some(files[1])),
+            ("/modified-none", None),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, lix_json('{\"v\":0}'), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("pre-checkpoint row should insert");
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish a clean working state");
+
+        session
+            .execute(
+                "UPDATE json_pointer SET value = lix_json('{\"v\":1}') \
+                 WHERE path IN ('/modified', '/modified-b', '/modified-none')",
+                &[],
+            )
+            .await
+            .expect("modify should dirty the rows");
+        session
+            .execute("DELETE FROM json_pointer WHERE path = '/removed'", &[])
+            .await
+            .expect("delete should dirty the row");
+        for (path, file) in [("/added", Some(files[0])), ("/added-b", Some(files[1]))] {
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_file_id) \
+                     VALUES ($1, lix_json('{\"v\":1}'), $2)",
+                    &[
+                        crate::Value::Text(path.to_string()),
+                        file.map_or(crate::Value::Null, |file| {
+                            crate::Value::Text(file.to_string())
+                        }),
+                    ],
+                )
+                .await
+                .expect("post-checkpoint insert should dirty a new identity");
+        }
+        // Dirty the file itself, not just rows inside it. This puts a row of a
+        // *different* schema into file 0's diff, which is the case the bare
+        // `file_id` shape must cover and the `file_id + schema_key` shape must
+        // not. Without it both shapes would return the same json_pointer rows
+        // and the `FILE_SPACE` schema-domain resolution would go unexercised.
+        session
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
+                &[
+                    crate::Value::Text("changed".to_string()),
+                    crate::Value::Text(files[0].to_string()),
+                ],
+            )
+            .await
+            .expect("file content update should dirty the file descriptor");
+
+        // An untracked row cannot live inside a tracked file — file ownership
+        // validation requires a row and its owning file to share one lane — so
+        // the untracked case is only reachable in the null-file bucket. It is
+        // still worth carrying: the bypass must classify it as "no diff entry"
+        // and the unfiltered index scan must agree.
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/untracked', lix_json('{\"v\":1}'), true)",
+                &[],
+            )
+            .await
+            .expect("untracked insert should commit");
+
+        type DiffRow = (String, String, Option<String>, String);
+        fn collect(result: &crate::ExecuteResult) -> Vec<DiffRow> {
+            let mut rows = result
+                .rows()
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<String>("schema_key")
+                            .expect("schema_key should decode"),
+                        row.get::<serde_json::Value>("entity_pk")
+                            .expect("entity_pk should decode")
+                            .to_string(),
+                        // `file_id` is nullable; a NULL surfaces as a decode
+                        // error through the typed accessor.
+                        row.get::<String>("file_id").ok(),
+                        row.get::<String>("diff_type")
+                            .expect("diff_type should decode"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        }
+        const COLUMNS: &str = "SELECT entity_pk, schema_key, file_id, diff_type \
+                               FROM lix_working_diff";
+
+        use std::sync::atomic::Ordering;
+        let hits = &crate::hot_state::WORKING_DIFF_PATH_HITS;
+
+        let index_before = hits.index_scan.load(Ordering::Relaxed);
+        let broad = collect(
+            &session
+                .execute(COLUMNS, &[])
+                .await
+                .expect("unfiltered working-diff read should execute"),
+        );
+        assert!(
+            hits.index_scan.load(Ordering::Relaxed) > index_before,
+            "the unfiltered working-diff read must take the HOT_DIFF index path"
+        );
+        assert!(
+            broad
+                .iter()
+                .any(|(schema, _, file, kind)| schema == "json_pointer"
+                    && file.as_deref() == Some(files[0])
+                    && kind == "removed"),
+            "fixture should produce a removed row inside the probed file"
+        );
+
+        for file in files {
+            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
+            let scoped = collect(
+                &session
+                    .execute(
+                        &format!("{COLUMNS} WHERE file_id = $1"),
+                        &[crate::Value::Text(file.to_string())],
+                    )
+                    .await
+                    .expect("file-scoped working-diff read should execute"),
+            );
+            assert!(
+                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                "the file-scoped working-diff read for {file} must take the primary-row bypass"
+            );
+            let want = broad
+                .iter()
+                .filter(|(_, _, row_file, _)| row_file.as_deref() == Some(file))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                scoped, want,
+                "the file-scoped working-diff bypass disagrees with the index scan for {file}"
+            );
+
+            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
+            let scoped_schema = collect(
+                &session
+                    .execute(
+                        &format!("{COLUMNS} WHERE file_id = $1 AND schema_key = $2"),
+                        &[
+                            crate::Value::Text(file.to_string()),
+                            crate::Value::Text("json_pointer".to_string()),
+                        ],
+                    )
+                    .await
+                    .expect("file+schema working-diff read should execute"),
+            );
+            assert!(
+                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                "the file+schema working-diff read for {file} must take the primary-row bypass"
+            );
+            let want_schema = want
+                .iter()
+                .filter(|(schema, _, _, _)| schema == "json_pointer")
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                scoped_schema, want_schema,
+                "the file+schema working-diff bypass disagrees with the index scan for {file}"
+            );
+            if file == files[0] {
+                // The dirtied file descriptor proves the bare `file_id` shape
+                // resolved a schema domain wider than the one predicate-named
+                // schema, rather than silently answering json_pointer only.
+                assert!(
+                    want.len() > want_schema.len(),
+                    "fixture should put a non-json_pointer schema in {file}'s diff, \
+                     otherwise the FILE_SPACE schema-domain resolution is untested"
+                );
+            }
+        }
+    }
+
     /// `WHERE lixcol_file_id = $1` is now an exact provider constraint, so
     /// DataFusion drops its residual filter and the answer rests entirely on
     /// `HotStateFilter::file_ids`. Rows can live in four authorities — the
@@ -1911,7 +2152,7 @@ mod tests {
         let before_packed =
             scan_test_space(&read, crate::hot_state::PACKED_CURRENT_BASE_SPACE).await;
         assert!(
-            !before_sparse.entries.is_empty() || !before_packed.entries.is_empty(),
+            !before_sparse.is_empty() || !before_packed.is_empty(),
             "tracked mutation must persist a sparse or packed physical dirty epoch"
         );
         drop(read);
@@ -1927,7 +2168,7 @@ mod tests {
             .expect("post-checkpoint inventory read should open");
         let after = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
-            after.entries.len(),
+            after.len(),
             1,
             "the superseded branch epoch must be reclaimed; only the repository-global checkpoint entity may remain dirty"
         );
@@ -1942,7 +2183,7 @@ mod tests {
             .expect("second checkpoint inventory read should open");
         let after_second = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
-            after_second.entries.len(),
+            after_second.len(),
             2,
             "the second immutable checkpoint entity remains while the superseded branch epoch is reclaimed"
         );
@@ -2042,8 +2283,7 @@ mod tests {
             .await
             .expect("read initialized hot rows");
         let hot_rows = scan_test_space(&read, crate::hot_state::ROW_SPACE)
-            .await
-            .entries;
+            .await;
         assert!(
             !hot_rows.is_empty(),
             "initialized repository must have hot rows"
@@ -2243,16 +2483,182 @@ mod tests {
             .await
             .expect("read the index plane");
         let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE)
-            .await
-            .entries;
+            .await;
         let witnesses = entries
             .iter()
             .filter(|entry| match &entry.value {
-                crate::storage::ProjectedValue::FullValue(bytes) => bytes.is_empty(),
+                crate::storage::ProjectedValue::FullValue(bytes) => !bytes.starts_with(b"["),
                 crate::storage::ProjectedValue::KeyOnly => true,
             })
             .count();
         (witnesses, entries.len() - witnesses)
+    }
+
+    /// The witness carries how many entries the plane has published, which is
+    /// what sizes the degradation budget. It must count every published entry
+    /// in the generation, not just this commit's.
+    async fn hot_index_published_count(storage: &Memory) -> u64 {
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read the index plane");
+        let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE).await;
+        let mut total = 0;
+        for entry in &entries {
+            let crate::storage::ProjectedValue::FullValue(bytes) = &entry.value else {
+                continue;
+            };
+            if bytes.starts_with(b"[") {
+                continue;
+            }
+            let count: [u8; 8] = bytes.as_ref().try_into().expect("witness carries a u64");
+            total += u64::from_be_bytes(count);
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn the_index_witness_accumulates_its_published_entry_count() {
+        let (storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("counted_parent", "counted_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        session
+            .execute("INSERT INTO counted_parent (id) VALUES ('parent-0')", &[])
+            .await
+            .expect("parent should insert");
+        assert_eq!(hot_index_published_count(&storage).await, 0);
+        for index in 0..4 {
+            session
+                .execute(
+                    r#"INSERT INTO counted_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    &[crate::Value::Text(format!("child-{index}"))],
+                )
+                .await
+                .expect("child should insert");
+        }
+        assert_eq!(
+            hot_index_published_count(&storage).await,
+            4,
+            "the count must span commits, not restart at each one"
+        );
+        // A delete publishes no entry — the plane is put-only — so the count
+        // stands still while the collection shrinks. That divergence is
+        // exactly what the budget measures.
+        session
+            .execute("DELETE FROM counted_child WHERE id = 'child-0'", &[])
+            .await
+            .expect("child should delete");
+        assert_eq!(hot_index_published_count(&storage).await, 4);
+    }
+
+    /// Past the budget the lookup abandons the index and the caller's ordinary
+    /// scan serves instead. The route is deliberately invisible in the result,
+    /// so what this pins is that it stays invisible: the same rows, through a
+    /// bucket far past the budget, with live rows, superseded rows and deleted
+    /// rows all present.
+    #[tokio::test]
+    async fn a_bucket_past_the_budget_still_answers_exactly() {
+        let (storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("degraded_parent", "degraded_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        for parent in ["parent-0", "parent-1"] {
+            session
+                .execute(
+                    "INSERT INTO degraded_parent (id) VALUES ($1)",
+                    &[crate::Value::Text(parent.into())],
+                )
+                .await
+                .expect("parent should insert");
+        }
+        const ROWS: usize = 200;
+        let values = (0..ROWS)
+            .map(|index| format!("('child-{index}', 'parent-0', 'en')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!(
+                    r#"INSERT INTO degraded_child (id, "parentId", locale) VALUES {values}"#
+                ),
+                &[],
+            )
+            .await
+            .expect("children should insert");
+        // Move half off `parent-0` and delete a quarter, so the `parent-0`
+        // bucket holds every identity while only a quarter still match.
+        let moved = (0..ROWS / 2)
+            .map(|index| format!("'child-{index}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!(
+                    r#"UPDATE degraded_child SET "parentId" = 'parent-1' WHERE id IN ({moved})"#
+                ),
+                &[],
+            )
+            .await
+            .expect("children should move");
+        let deleted = (ROWS / 2..ROWS * 3 / 4)
+            .map(|index| format!("'child-{index}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("DELETE FROM degraded_child WHERE id IN ({deleted})"),
+                &[],
+            )
+            .await
+            .expect("children should delete");
+
+        let published = hot_index_published_count(&storage).await;
+        assert!(
+            published > 64,
+            "the fixture must push the plane past the budget floor, published {published}"
+        );
+
+        async fn ids(session: &SessionContext<Memory>, parent: &str) -> Vec<String> {
+            let rows = session
+                .execute(
+                    r#"SELECT id FROM degraded_child WHERE "parentId" = $1 ORDER BY id"#,
+                    &[crate::Value::Text(parent.into())],
+                )
+                .await
+                .expect("declared-column read should succeed");
+            rows.rows()
+                .iter()
+                .map(|row| match &row.values()[0] {
+                    crate::Value::Text(id) => id.clone(),
+                    other => panic!("unexpected id value {other:?}"),
+                })
+                .collect()
+        }
+
+        let mut expected_zero = (ROWS * 3 / 4..ROWS)
+            .map(|index| format!("child-{index}"))
+            .collect::<Vec<_>>();
+        expected_zero.sort();
+        assert_eq!(ids(&session, "parent-0").await, expected_zero);
+        let mut expected_one = (0..ROWS / 2)
+            .map(|index| format!("child-{index}"))
+            .collect::<Vec<_>>();
+        expected_one.sort();
+        assert_eq!(ids(&session, "parent-1").await, expected_one);
     }
 
     /// Entries are candidates, never answers. A row whose indexed value moves

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use lix::{CreateBranchOptions, MergeBranchOptions, MergeBranchOutcome, Value};
 
-const SEEDS: [u64; 6] = [0, 1, 2, 0x51ce_deed, u64::MAX - 1, u64::MAX];
+const DEFAULT_SEEDS: [u64; 6] = [0, 1, 2, 0x51ce_deed, u64::MAX - 1, u64::MAX];
 const STEPS_PER_SEED: usize = 48;
 const KEYS_PER_LANE: usize = 6;
 
@@ -18,7 +18,7 @@ simulation_test!(
             &engine,
         );
 
-        for seed in SEEDS {
+        for seed in crate::support::fuzz_seeds(&DEFAULT_SEEDS) {
             let prefix = format!("merge-fuzz-{seed:016x}-");
             let branch_id = format!(
                 "01930000-{:04x}-7000-8000-{:012x}",

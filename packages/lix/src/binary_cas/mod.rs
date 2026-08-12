@@ -39,7 +39,6 @@ pub(crate) struct BinaryCasGcSweep {
     pub(crate) reclaimed_manifest_rows: usize,
     pub(crate) reclaimed_manifest_chunk_rows: usize,
     pub(crate) reclaimed_chunk_rows: usize,
-    pub(crate) reclaimed_chunk_bytes: u64,
 }
 
 /// Stages the owner's authenticated binary-CAS reclamation operation.

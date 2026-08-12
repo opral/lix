@@ -90,7 +90,6 @@ pub const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace =
     crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE;
 pub const COMMIT_SPACE: StorageSpace = crate::changelog::COMMIT_SPACE;
 pub const CHANGE_SPACE: StorageSpace = crate::changelog::CHANGE_SPACE;
-pub const COMMIT_CHANGE_ID_SPACE: StorageSpace = crate::changelog::COMMIT_CHANGE_ID_SPACE;
 pub const REVISION_SPACE: StorageSpace = crate::storage_adapter::REVISION_SPACE;
 pub const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace =
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE;
@@ -143,7 +142,6 @@ mod tests {
         BINARY_CAS_CHUNK_PRESENCE_SPACE,
         COMMIT_SPACE,
         CHANGE_SPACE,
-        COMMIT_CHANGE_ID_SPACE,
         REVISION_SPACE,
         EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
         UPLOAD_STATE_SPACE,

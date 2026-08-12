@@ -18,7 +18,7 @@ pub(crate) use codec::decode_change_record;
 pub(crate) use codec::encode_commit_record;
 pub(crate) use context::ChangelogContext;
 #[cfg(test)]
-pub(crate) use gc::{stage_delete_changes, stage_delete_commit_change_ids, stage_delete_commits};
+pub(crate) use gc::{stage_delete_changes, stage_delete_commits};
 pub(crate) use gc::{stage_delete_commit_projection, stage_delete_standalone_change};
 #[cfg(test)]
 pub(crate) use materialization::MaterializedChangeIdentity;
@@ -26,7 +26,7 @@ pub(crate) use materialization::{
     ChangeRecordProjection, MaterializedChangePayload, load_change_records,
     materialize_known_change_payloads, materialize_known_change_payloads_in_order,
 };
-pub(crate) use store::{CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, commit_key};
+pub(crate) use store::{CHANGE_SPACE, COMMIT_SPACE, commit_key};
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,

@@ -1,5 +1,43 @@
 pub mod simulation_test;
 
+/// Seed budget for the randomized replay suites (`*_fuzz`).
+///
+/// The shipped list is the default, so CI keeps paying for exactly the seeds
+/// it pays for today. `LIX_FUZZ_SEEDS=<count>` replaces it with `<count>`
+/// sequential seeds starting at `LIX_FUZZ_SEED_START` (default `0`), which is
+/// how an on-demand soak sweeps an arbitrary range without editing source.
+///
+/// The override **replaces** the shipped seeds instead of extending them. A
+/// sequential range chained onto the shipped list revisits seeds that are
+/// already in it, and a revisited seed re-enters its own per-seed key
+/// namespace: the suites then report constraint failures that are artifacts of
+/// the harness rather than of the engine, which is exactly the noise that
+/// hides a real failure in a wide sweep.
+///
+/// ```text
+/// LIX_FUZZ_SEEDS=512 cargo test -p lix --all-features --test integration -- fuzz
+/// LIX_FUZZ_SEEDS=512 LIX_FUZZ_SEED_START=512 cargo test ...   # next disjoint window
+/// ```
+pub fn fuzz_seeds(default: &[u64]) -> Vec<u64> {
+    let Some(count) = env_u64("LIX_FUZZ_SEEDS") else {
+        return default.to_vec();
+    };
+    let start = env_u64("LIX_FUZZ_SEED_START").unwrap_or(0);
+    (0..count)
+        .map(|offset| start.saturating_add(offset))
+        .collect()
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .map(|raw| {
+            raw.trim().parse::<u64>().unwrap_or_else(|error| {
+                panic!("{name} must be a u64 seed budget, got {raw:?}: {error}")
+            })
+        })
+}
+
 #[macro_export]
 macro_rules! simulation_test {
     ($name:ident, |$sim:ident| $body:expr) => {
