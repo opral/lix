@@ -28,6 +28,52 @@ use crate::storage_adapter::{
 use crate::storage_codec;
 use bytes::Bytes;
 
+/// Engagement census for [`CommitGraphStoreReader::reachable_nodes_within_depth`].
+///
+/// The reachable-node cache is keyed by `(head, depth bound)`. A *bounded*
+/// result can never serve a later *unbounded* request, but an unbounded result
+/// serves every bounded one by truncation. Which of the two a caller asks for
+/// first therefore decides whether the second one traverses storage at all —
+/// and that is invisible from any layer above this function, because both
+/// callers get the same answer either way.
+///
+/// These counters exist so a change to that ordering can be shown to engage
+/// rather than assumed to. They are process-global, incremented once per
+/// traversal request (not per commit and not per row), and read only by tests.
+pub(crate) mod reachable_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The exact `(head, bound)` key was already cached.
+    pub(crate) const EXACT_HIT: usize = 0;
+    /// A bounded request was served by truncating a cached unbounded walk.
+    pub(crate) const BOUNDED_FROM_UNBOUNDED: usize = 1;
+    /// A bounded request had to traverse storage itself.
+    pub(crate) const WALK_BOUNDED: usize = 2;
+    /// An unbounded request had to traverse storage itself.
+    pub(crate) const WALK_UNBOUNDED: usize = 3;
+
+    static COUNTERS: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    pub(crate) fn record(slot: usize) {
+        COUNTERS[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the counters in slot order, for delta comparison around a query.
+    pub(crate) fn snapshot() -> [u64; 4] {
+        [
+            COUNTERS[EXACT_HIT].load(Ordering::Relaxed),
+            COUNTERS[BOUNDED_FROM_UNBOUNDED].load(Ordering::Relaxed),
+            COUNTERS[WALK_BOUNDED].load(Ordering::Relaxed),
+            COUNTERS[WALK_UNBOUNDED].load(Ordering::Relaxed),
+        ]
+    }
+}
+
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 /// Read model for resolving changelog commit facts at a head.
 ///
@@ -201,11 +247,13 @@ where
         max_depth: Option<u32>,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
         if let Some(nodes) = self.reachable_nodes_cache.get(&(*head_commit_id, max_depth)) {
+            reachable_census::record(reachable_census::EXACT_HIT);
             return Ok(Arc::clone(nodes));
         }
         if let Some(max_depth_value) = max_depth
             && let Some(nodes) = self.reachable_nodes_cache.get(&(*head_commit_id, None))
         {
+            reachable_census::record(reachable_census::BOUNDED_FROM_UNBOUNDED);
             let bounded = nodes
                 .iter()
                 .take_while(|reachable| reachable.depth <= max_depth_value)
@@ -215,6 +263,11 @@ where
                 .insert((*head_commit_id, max_depth), Arc::clone(&bounded));
             return Ok(bounded);
         }
+        reachable_census::record(if max_depth.is_some() {
+            reachable_census::WALK_BOUNDED
+        } else {
+            reachable_census::WALK_UNBOUNDED
+        });
         let nodes = Arc::from(walk_reachable_nodes(self, head_commit_id, max_depth).await?);
         self.reachable_nodes_cache
             .insert((*head_commit_id, max_depth), Arc::clone(&nodes));

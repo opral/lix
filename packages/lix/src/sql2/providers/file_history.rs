@@ -1580,11 +1580,21 @@ where
     Load: Fn(HistoryRoute) -> LoadFuture,
     LoadFuture: Future<Output = Result<Vec<HistoryEntry>, LixError>>,
 {
-    let event_entries = load(event_route.clone()).await?;
-    let context_entries = if event_route == context_route {
-        event_entries.clone()
+    // Load the context (anchor-only, unbounded) route FIRST, then the event
+    // (depth-bounded) route.
+    //
+    // Both sets are always computed, so this is ordering only. It matters
+    // because the reachable-node cache is keyed by `(head, depth bound)`: a
+    // bounded traversal cannot satisfy a later unbounded request, while an
+    // unbounded traversal satisfies every bounded one by truncation
+    // (`CommitGraphStoreReader::reachable_nodes_within_depth`). Running the
+    // bounded route first therefore pays for two traversals; running the
+    // unbounded route first pays for one.
+    let context_entries = load(context_route.clone()).await?;
+    let event_entries = if event_route == context_route {
+        context_entries.clone()
     } else {
-        load(context_route.clone()).await?
+        load(event_route.clone()).await?
     };
     Ok((event_entries, context_entries))
 }
@@ -3336,11 +3346,11 @@ mod tests {
         let context_route = route.anchors_only();
         assert_ne!(event_route, context_route);
 
-        let loads = Arc::new(AtomicUsize::new(0));
-        let counted_loads = Arc::clone(&loads);
+        let order = Arc::new(StdMutex::new(Vec::<Option<i64>>::new()));
+        let recorded_order = Arc::clone(&order);
         let (event_entries, context_entries) =
-            load_file_history_entry_sets(&event_route, &context_route, move |_| {
-                counted_loads.fetch_add(1, Ordering::SeqCst);
+            load_file_history_entry_sets(&event_route, &context_route, move |route| {
+                recorded_order.lock().unwrap().push(route.max_depth);
                 async { Ok(Vec::new()) }
             })
             .await
@@ -3348,6 +3358,92 @@ mod tests {
 
         assert!(event_entries.is_empty());
         assert!(context_entries.is_empty());
-        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        // The unbounded context route must be loaded FIRST. The reachable-node
+        // cache is keyed by `(head, depth bound)`, so an unbounded traversal
+        // serves the bounded one by truncation while the reverse forces a
+        // second traversal. Loading them the other way round is silently
+        // correct and costs an extra walk of the whole reachable set.
+        assert_eq!(order.lock().unwrap().as_slice(), &[None, Some(3)]);
+    }
+
+    /// Connectivity check for the route ordering above, at the layer the
+    /// ordering actually pays off: the reachable-node cache.
+    ///
+    /// The counter hooked here is `commit_graph::context::reachable_census`,
+    /// *inside* `reachable_nodes_within_depth`'s `max_depth` fallback branch.
+    /// It is deliberately a different layer from any timing instrument, which
+    /// sits at the SQL surface: a query-level timer cannot distinguish "the
+    /// bounded traversal was skipped" from "the bounded traversal was cheap".
+    ///
+    /// Asserts both a miss (`WALK_UNBOUNDED`, the traversal that is genuinely
+    /// paid for) and a hit (`BOUNDED_FROM_UNBOUNDED`, the traversal the
+    /// ordering removes).
+    #[tokio::test]
+    async fn depth_bounded_file_history_is_served_by_the_unbounded_traversal() {
+        use crate::commit_graph::reachable_census;
+
+        let lix = crate::open_lix().await.expect("open lix");
+        for revision in 0..4u32 {
+            lix.execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                &[
+                    crate::Value::Text("/probe/census.txt".to_string()),
+                    crate::Value::Blob(format!("rev-{revision}").into_bytes().into()),
+                ],
+            )
+            .await
+            .expect("seed commit");
+        }
+        let head = match &lix
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit")
+            .rows()[0]
+            .values()[0]
+        {
+            crate::Value::Text(text) => text.clone(),
+            other => panic!("expected text commit id, got {other:?}"),
+        };
+
+        let before = reachable_census::snapshot();
+        let rows = lix
+            .execute(
+                "SELECT lixcol_depth FROM lix_file_history($1) \
+                 WHERE path = $2 AND lixcol_depth = 0",
+                &[
+                    crate::Value::Text(head),
+                    crate::Value::Text("/probe/census.txt".to_string()),
+                ],
+            )
+            .await
+            .expect("depth-bounded history query");
+        let after = reachable_census::snapshot();
+        assert!(!rows.rows().is_empty(), "probe query returned no rows");
+
+        let delta = |slot: usize| after[slot] - before[slot];
+        let census = format!(
+            "exact_hit={} bounded_from_unbounded={} walk_bounded={} walk_unbounded={}",
+            delta(reachable_census::EXACT_HIT),
+            delta(reachable_census::BOUNDED_FROM_UNBOUNDED),
+            delta(reachable_census::WALK_BOUNDED),
+            delta(reachable_census::WALK_UNBOUNDED),
+        );
+        eprintln!("reachable_census {census}");
+        assert!(
+            delta(reachable_census::WALK_UNBOUNDED) > 0,
+            "expected at least one real (missing) unbounded traversal: {census}"
+        );
+        assert!(
+            delta(reachable_census::BOUNDED_FROM_UNBOUNDED) > 0,
+            "expected the depth-bounded request to be served by truncating the \
+             unbounded traversal: {census}"
+        );
+        assert_eq!(
+            delta(reachable_census::WALK_BOUNDED),
+            0,
+            "a depth-bounded query must not traverse storage on its own: {census}"
+        );
+        lix.close().await.expect("close lix");
     }
 }
