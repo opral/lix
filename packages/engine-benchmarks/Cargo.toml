@@ -375,3 +375,8 @@ required-features = ["storage-benches"]
 name = "exppq_point_query"
 path = "examples/exppq_point_query.rs"
 required-features = ["storage-benches"]
+
+[[example]]
+name = "e6_key_census"
+path = "examples/e6_key_census.rs"
+required-features = ["storage-benches", "slatedb"]
