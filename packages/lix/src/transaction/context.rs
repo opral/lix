@@ -4613,6 +4613,7 @@ where
                     } = prepared;
                     let source_bytes = submitted_bytes.clone();
                     let creates = create_context.creates();
+                    let file_untracked = file_key.untracked;
                     let task = tokio::spawn(async move {
                         let mut actor = factory
                             .instantiate_actor()
@@ -4628,6 +4629,7 @@ where
                                     descriptor,
                                     file: Arc::new(ArcByteSource::new(source_bytes)),
                                     creates,
+                                    certified_packets_available: !file_untracked,
                                 },
                             )
                             .instrument(tracing::debug_span!(
@@ -5733,6 +5735,7 @@ where
                             descriptor,
                             file: Arc::new(source),
                             creates,
+                            certified_packets_available: !file_key.untracked,
                         },
                     )
                     .instrument(tracing::debug_span!(

@@ -424,24 +424,6 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
 /// `change_id` (identity) with a NULL `commit_id` (no history). The change id
 /// is asserted as a property, never as a literal — its value is a function of
 /// UUID draw order.
-/// BLOCKED — see `certified entity batch has no matching published commit`.
-///
-/// Unskipping plugin reconciliation is necessary but not sufficient. A
-/// component plugin's created entities are carried out of the guest in a
-/// host-synthesized *certified entity batch* (`CERTIFIED_CREATED_PACKET_V1`),
-/// and `transaction/commit.rs` materializes those rows by expanding them from
-/// the file's published commit root. An untracked file publishes no commit, so
-/// there is no root to expand from and the write fails.
-///
-/// Dropping the batch for untracked files was tried and does not work: the
-/// ordinary component change list is empty for a fresh-file transition, so the
-/// write then succeeds with zero entity rows. The rows exist only inside the
-/// certified packet. Both outcomes were measured on `ryzen-9950x-V`.
-///
-/// Making this pass needs an untracked representation for a certified root —
-/// a packed root row that is not keyed to a commit — which is a new artifact
-/// shape for untracked state and needs a ruling before it is built.
-#[ignore = "blocked: certified entity batches are commit-rooted; see doc comment"]
 #[tokio::test]
 async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_one() {
     const TRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008a1";
@@ -558,6 +540,247 @@ async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_o
     lix.close()
         .await
         .expect("lane-parity workspace should close");
+}
+
+/// Foreign-key equivalence across lanes on the ordinary decode path.
+///
+/// A tracked complete parse is retained as a certified packet, whose foreign
+/// keys are checked *within the batch* (`validate_certified_snapshot_packets`).
+/// An untracked complete parse takes the ordinary decode path instead, where
+/// foreign keys are resolved against live state by ordinary transaction
+/// validation. Those are different mechanisms, so equivalence has to be
+/// measured rather than argued.
+///
+/// `markdown_node` is the vehicle: it declares a self-referential foreign key
+/// `/parent_id` -> `markdown_node./id`.
+#[tokio::test]
+async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
+    const TRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008b1";
+    const UNTRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008b2";
+    const CONTENT: &[u8] = b"# Title\n\nA paragraph with *emphasis*.\n\n- one\n- two\n";
+
+    let lix = open_lix().await.expect("fk workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+        &[
+            Value::Text(TRACKED_FILE_ID.to_owned()),
+            Value::Text("/fk-tracked.md".to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("tracked markdown file should write");
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text(UNTRACKED_FILE_ID.to_owned()),
+            Value::Text("/fk-untracked.md".to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("untracked markdown file should write");
+
+    // Same bytes through the same plugin must yield the same graph shape on
+    // both lanes. A decode path that dropped or altered rows shows up here.
+    let shape = async |file_id: &str| {
+        let result = lix
+            .execute(
+                "SELECT kind, parent_id FROM markdown_node \
+                 WHERE lixcol_file_id = $1 ORDER BY kind, parent_id",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("markdown nodes should query");
+        result
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("kind").unwrap(),
+                    row.get::<Option<String>>("parent_id").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let tracked_shape = shape(TRACKED_FILE_ID).await;
+    let untracked_shape = shape(UNTRACKED_FILE_ID).await;
+    assert!(
+        tracked_shape.len() > 3,
+        "the fixture must produce a non-trivial node graph, got {tracked_shape:?}"
+    );
+    assert_eq!(
+        untracked_shape, tracked_shape,
+        "the ordinary decode path must produce the same node graph as the certified packet"
+    );
+
+    // Every foreign key must resolve inside its own file, on both lanes. A
+    // dangling parent_id is exactly what weaker validation would let through.
+    for file_id in [TRACKED_FILE_ID, UNTRACKED_FILE_ID] {
+        let dangling = lix
+            .execute(
+                "SELECT child.id FROM markdown_node AS child \
+                 WHERE child.lixcol_file_id = $1 AND child.parent_id IS NOT NULL \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM markdown_node AS parent \
+                     WHERE parent.lixcol_file_id = $1 AND parent.id = child.parent_id)",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("foreign-key resolution should query");
+        assert_eq!(
+            dangling.len(),
+            0,
+            "file '{file_id}' has markdown_node rows whose parent_id does not resolve"
+        );
+    }
+
+    // Enforcement must also be live, not merely satisfied by construction:
+    // deleting a referenced parent has to be rejected on both lanes alike.
+    let delete_parent = async |file_id: &str| {
+        let parents = lix
+            .execute(
+                "SELECT DISTINCT parent_id FROM markdown_node \
+                 WHERE lixcol_file_id = $1 AND parent_id IS NOT NULL LIMIT 1",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("parent lookup should query");
+        let parent_id = parents.rows()[0]
+            .get::<String>("parent_id")
+            .expect("a referenced parent id");
+        lix.execute(
+            "DELETE FROM markdown_node WHERE lixcol_file_id = $1 AND id = $2",
+            &[
+                Value::Text(file_id.to_owned()),
+                Value::Text(parent_id.clone()),
+            ],
+        )
+        .await
+        .err()
+        .map(|error| error.code)
+    };
+    let tracked_delete = delete_parent(TRACKED_FILE_ID).await;
+    let untracked_delete = delete_parent(UNTRACKED_FILE_ID).await;
+    assert_eq!(
+        untracked_delete, tracked_delete,
+        "deleting a referenced parent must fail (or succeed) identically on both lanes"
+    );
+
+    lix.close().await.expect("fk workspace should close");
+}
+
+/// Prior rows plus a fresh parse must compose on the ordinary decode path.
+///
+/// The collection-replacement marker a certified packet carries
+/// (`complete_file_state`) is not produced on the decode path. The argument
+/// that this is harmless is that `open_file` only runs when no prior entity
+/// state exists under the selected plugin, because a previous owner's rows are
+/// tombstoned separately. This measures that argument in the case where it
+/// would fail: rows already exist for the file when it is parsed fresh again.
+#[tokio::test]
+async fn a_fresh_reparse_after_ownership_loss_replaces_untracked_rows_like_tracked_ones() {
+    const TRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008c1";
+    const UNTRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008c2";
+    const TRACKED_PATH: &str = "/replace-tracked.json";
+    const UNTRACKED_PATH: &str = "/replace-untracked.json";
+
+    let lix = open_lix().await.expect("replacement workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let write = async |file_id: &str, path: &str, untracked: bool, body: &str| {
+        let sql = if untracked {
+            "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content"
+        } else {
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content"
+        };
+        lix.execute(
+            sql,
+            &[
+                Value::Text(file_id.to_owned()),
+                Value::Text(path.to_owned()),
+                Value::Blob(body.as_bytes().to_vec().into()),
+            ],
+        )
+        .await
+        .expect("json file should write");
+    };
+    let member_keys = async |file_id: &str| {
+        let result = lix
+            .execute(
+                "SELECT key FROM json_object_member \
+                 WHERE lixcol_file_id = $1 ORDER BY key",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("members should query");
+        result
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("key").unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    write(TRACKED_FILE_ID, TRACKED_PATH, false, r#"{"alpha":"one"}"#).await;
+    write(
+        UNTRACKED_FILE_ID,
+        UNTRACKED_PATH,
+        true,
+        r#"{"alpha":"one"}"#,
+    )
+    .await;
+    assert_eq!(member_keys(TRACKED_FILE_ID).await, vec!["alpha".to_owned()]);
+    assert_eq!(
+        member_keys(UNTRACKED_FILE_ID).await,
+        vec!["alpha".to_owned()]
+    );
+
+    // Dropping the archive retires the owner and tombstones the prior rows, so
+    // the next write parses each file fresh again with history behind it.
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = '/.lix/plugins/plugin_json.lixplugin'",
+        &[],
+    )
+    .await
+    .expect("plugin uninstall should commit");
+    install_plugin(&lix, "plugin_json", &build_json_plugin_archive())
+        .await
+        .expect("plugin reinstall should commit");
+
+    write(TRACKED_FILE_ID, TRACKED_PATH, false, r#"{"beta":"two"}"#).await;
+    write(UNTRACKED_FILE_ID, UNTRACKED_PATH, true, r#"{"beta":"two"}"#).await;
+
+    let tracked_after = member_keys(TRACKED_FILE_ID).await;
+    let untracked_after = member_keys(UNTRACKED_FILE_ID).await;
+    assert_eq!(
+        tracked_after,
+        vec!["beta".to_owned()],
+        "the tracked reparse must not leave the superseded member behind"
+    );
+    assert_eq!(
+        untracked_after, tracked_after,
+        "the untracked reparse must replace its rows exactly like the tracked one"
+    );
+
+    lix.close()
+        .await
+        .expect("replacement workspace should close");
 }
 
 /// Scopes the blast radius of unskipping reconciliation for untracked writes.
