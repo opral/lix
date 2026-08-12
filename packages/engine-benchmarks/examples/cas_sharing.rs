@@ -30,6 +30,7 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lix::integration::{Engine, SessionContext};
@@ -40,7 +41,14 @@ use lix::storage::{
 use lix::storage_adapter::StorageSpace;
 use lix::{CreateBranchOptions, Value};
 use lix_storage_rocksdb::RocksDB;
-use lix_storage_slatedb::SlateDB;
+use lix_storage_slatedb::{
+    SlateDB, SlateDBIoCounters, SlateDBIoSnapshot, SlateDBObjectStoreOptions,
+};
+
+#[path = "support/remote_object_store.rs"]
+mod remote_object_store;
+
+use remote_object_store::{RemoteObjectStore, RemoteProfile};
 
 const MANIFEST_SPACE: SpaceId = SpaceId(0x0005_0001);
 const MANIFEST_CHUNK_SPACE: SpaceId = SpaceId(0x0005_0002);
@@ -91,14 +99,21 @@ fn main() {
         .map(Backend::parse)
         .collect::<Vec<_>>();
 
+    // Absent means the production local open path, exactly as before.
+    let profile = RemoteProfile::from_env();
+    eprintln!(
+        "cas_sharing profile={}",
+        profile.map_or_else(|| "local".to_owned(), |profile| profile.label())
+    );
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("build cas sharing runtime");
-    runtime.block_on(run(&corpus, &backends));
+    runtime.block_on(run(&corpus, &backends, profile));
 }
 
-async fn run(corpus: &Path, backends: &[Backend]) {
+async fn run(corpus: &Path, backends: &[Backend], profile: Option<RemoteProfile>) {
     let mut cases = fs::read_dir(corpus)
         .expect("read corpus directory")
         .map(|entry| entry.expect("read corpus entry").path())
@@ -146,11 +161,12 @@ async fn run(corpus: &Path, backends: &[Backend]) {
 
         for &backend in backends {
             for (shape, v2) in &shapes {
-                let report = measure_pair(backend, &base, v2).await;
+                let report = measure_pair(backend, &base, v2, profile).await;
                 report.print(&name, backend, shape, base.len(), v2.len());
             }
             // Two branches holding different edits of the same base file.
-            let branch = measure_branches(backend, &base, &insert(&base), &overwrite(&base)).await;
+            let branch =
+                measure_branches(backend, &base, &insert(&base), &overwrite(&base), profile).await;
             branch.print(&name, backend, base.len());
         }
     }
@@ -164,6 +180,9 @@ struct PairReport {
     physical_after_v2: u64,
     v1_elapsed: Duration,
     v2_elapsed: Duration,
+    v2_durable: Duration,
+    io_after_v1: SlateDBIoSnapshot,
+    io_after_v2: SlateDBIoSnapshot,
 }
 
 impl PairReport {
@@ -186,7 +205,9 @@ impl PairReport {
              shared_bytes={shared_bytes},sharing_ratio={sharing_ratio:.4},\
              manifest_rows={},manifest_bytes={},manifest_chunk_rows={},manifest_chunk_bytes={},\
              presence_rows={},physical_bytes_v1={},physical_bytes_v2={},\
-             physical_delta={},v1_ms={:.3},v2_ms={:.3}",
+             physical_delta={},v1_ms={:.3},v2_ms={:.3},v2_durable_ms={:.3},\
+             v2_object_write_bytes={},v2_object_write_objects={},\
+             v2_object_read_bytes={},v2_object_read_objects={}",
             self.after_v1.payload_rows,
             self.after_v1.payload_value_bytes,
             self.after_v2.payload_rows,
@@ -204,6 +225,19 @@ impl PairReport {
             i128::from(self.physical_after_v2) - i128::from(self.physical_after_v1),
             self.v1_elapsed.as_secs_f64() * 1_000.0,
             self.v2_elapsed.as_secs_f64() * 1_000.0,
+            self.v2_durable.as_secs_f64() * 1_000.0,
+            self.io_after_v2
+                .write_bytes
+                .saturating_sub(self.io_after_v1.write_bytes),
+            self.io_after_v2
+                .write_objects
+                .saturating_sub(self.io_after_v1.write_objects),
+            self.io_after_v2
+                .read_bytes
+                .saturating_sub(self.io_after_v1.read_bytes),
+            self.io_after_v2
+                .read_objects
+                .saturating_sub(self.io_after_v1.read_objects),
         );
     }
 }
@@ -232,7 +266,9 @@ impl BranchReport {
              shared_bytes={shared_bytes},sharing_ratio={sharing_ratio:.4},\
              manifest_rows={},manifest_bytes={},manifest_chunk_rows={},manifest_chunk_bytes={},\
              presence_rows={},physical_bytes_v1=0,physical_bytes_v2=0,physical_delta=0,\
-             v1_ms=0.000,v2_ms=0.000",
+             v1_ms=0.000,v2_ms=0.000,v2_durable_ms=0.000,\
+             v2_object_write_bytes=0,v2_object_write_objects=0,\
+             v2_object_read_bytes=0,v2_object_read_objects=0",
             self.after_base.payload_rows,
             self.after_base.payload_value_bytes,
             self.after_branches.payload_rows,
@@ -249,17 +285,29 @@ impl BranchReport {
     }
 }
 
-async fn measure_pair(backend: Backend, v1: &[u8], v2: &[u8]) -> PairReport {
-    let fixture = Fixture::new(backend).await;
+async fn measure_pair(
+    backend: Backend,
+    v1: &[u8],
+    v2: &[u8],
+    profile: Option<RemoteProfile>,
+) -> PairReport {
+    let fixture = Fixture::new(backend, profile).await;
     let v1_elapsed = fixture.write(FILE_PATH, v1).await;
     fixture.flush().await;
     let after_v1 = fixture.layout().await;
     let physical_after_v1 = directory_bytes(fixture.root());
+    let io_after_v1 = fixture.io();
 
+    // The durable cost of v2: the SQL write plus the flush that makes it
+    // survive. On a remote store most of that cost is in the flush, so timing
+    // `execute` alone would price the object traffic at zero.
+    let durable_started = Instant::now();
     let v2_elapsed = fixture.write(FILE_PATH, v2).await;
     fixture.flush().await;
+    let v2_durable = durable_started.elapsed();
     let after_v2 = fixture.layout().await;
     let physical_after_v2 = directory_bytes(fixture.root());
+    let io_after_v2 = fixture.io();
 
     PairReport {
         after_v1,
@@ -268,11 +316,20 @@ async fn measure_pair(backend: Backend, v1: &[u8], v2: &[u8]) -> PairReport {
         physical_after_v2,
         v1_elapsed,
         v2_elapsed,
+        v2_durable,
+        io_after_v1,
+        io_after_v2,
     }
 }
 
-async fn measure_branches(backend: Backend, base: &[u8], a: &[u8], b: &[u8]) -> BranchReport {
-    let fixture = Fixture::new(backend).await;
+async fn measure_branches(
+    backend: Backend,
+    base: &[u8],
+    a: &[u8],
+    b: &[u8],
+    profile: Option<RemoteProfile>,
+) -> BranchReport {
+    let fixture = Fixture::new(backend, profile).await;
     fixture.write(FILE_PATH, base).await;
     fixture.flush().await;
     let after_base = fixture.layout().await;
@@ -399,11 +456,11 @@ where
 
 enum Fixture {
     Rocks(BackendFixture<RocksDB>),
-    Slate(BackendFixture<SlateDB>),
+    Slate(BackendFixture<SlateDB>, SlateDBIoCounters),
 }
 
 impl Fixture {
-    async fn new(backend: Backend) -> Self {
+    async fn new(backend: Backend, profile: Option<RemoteProfile>) -> Self {
         let temp_dir = tempfile::tempdir().expect("create cas sharing directory");
         let database_path = temp_dir.path().join("database");
         match backend {
@@ -412,44 +469,76 @@ impl Fixture {
                 Self::Rocks(BackendFixture::create(storage, temp_dir).await)
             }
             Backend::SlateDB => {
-                let storage = SlateDB::open(&database_path).expect("open cas sharing SlateDB");
-                Self::Slate(BackendFixture::create(storage, temp_dir).await)
+                let counters = SlateDBIoCounters::default();
+                let storage = match profile {
+                    // No profile: the production local open path, unchanged,
+                    // so local numbers stay comparable with every prior run.
+                    None => SlateDB::open_with_io_counters(&database_path, counters.clone())
+                        .expect("open cas sharing SlateDB"),
+                    Some(profile) => {
+                        fs::create_dir_all(&database_path)
+                            .expect("create cas sharing SlateDB directory");
+                        let local = object_store::local::LocalFileSystem::new_with_prefix(
+                            &database_path,
+                        )
+                        .expect("open cas sharing local object store");
+                        let remote: Arc<dyn object_store::ObjectStore> =
+                            Arc::new(RemoteObjectStore::new(Arc::new(local), profile));
+                        SlateDB::open_object_store_with_options_and_io_counters(
+                            "db",
+                            remote,
+                            SlateDBObjectStoreOptions::default(),
+                            counters.clone(),
+                        )
+                        .expect("open cas sharing remote SlateDB")
+                    }
+                };
+                Self::Slate(BackendFixture::create(storage, temp_dir).await, counters)
             }
+        }
+    }
+
+    /// Object-store traffic so far. Zero for RocksDB, which has no object
+    /// store: it is a local LSM and its remote profile is its local one.
+    fn io(&self) -> SlateDBIoSnapshot {
+        match self {
+            Self::Rocks(_) => SlateDBIoSnapshot::default(),
+            Self::Slate(_, counters) => counters.snapshot(),
         }
     }
 
     async fn write(&self, path: &str, bytes: &[u8]) -> Duration {
         match self {
             Self::Rocks(fixture) => fixture.write(path, bytes).await,
-            Self::Slate(fixture) => fixture.write(path, bytes).await,
+            Self::Slate(fixture, _) => fixture.write(path, bytes).await,
         }
     }
 
     async fn write_on_branch(&self, id: &str, name: &str, path: &str, bytes: &[u8]) {
         match self {
             Self::Rocks(fixture) => fixture.write_on_branch(id, name, path, bytes).await,
-            Self::Slate(fixture) => fixture.write_on_branch(id, name, path, bytes).await,
+            Self::Slate(fixture, _) => fixture.write_on_branch(id, name, path, bytes).await,
         }
     }
 
     async fn layout(&self) -> Layout {
         match self {
             Self::Rocks(fixture) => fixture.layout().await,
-            Self::Slate(fixture) => fixture.layout().await,
+            Self::Slate(fixture, _) => fixture.layout().await,
         }
     }
 
     fn root(&self) -> &Path {
         match self {
             Self::Rocks(fixture) => &fixture.root,
-            Self::Slate(fixture) => &fixture.root,
+            Self::Slate(fixture, _) => &fixture.root,
         }
     }
 
     async fn flush(&self) {
         match self {
             Self::Rocks(fixture) => fixture.storage.flush().expect("flush cas sharing RocksDB"),
-            Self::Slate(fixture) => fixture
+            Self::Slate(fixture, _) => fixture
                 .storage
                 .flush()
                 .await
