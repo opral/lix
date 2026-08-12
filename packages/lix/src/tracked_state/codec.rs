@@ -752,7 +752,11 @@ fn read_entity_pk_shared(
         match terminator {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
-            _ => unreachable!("shared key decoder validates terminators"),
+            // Sound because every arm of `read_entity_pk_part_shared` gets its
+            // terminator past `is_key_part_terminator`: the string and bytes
+            // arms via `scan_key_part`, the fixed-width arms by checking it
+            // directly.
+            _ => unreachable!("scan_key_part validates terminators"),
         }
     }
     crate::entity_pk::EntityPk::from_components(components).map_err(|error| {
@@ -889,7 +893,9 @@ fn read_entity_pk(
         match terminator {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
-            _ => unreachable!("read_key_string validates terminators"),
+            // Same invariant as `read_entity_pk_shared` above: `scan_key_part`
+            // is now the single place the terminator set is enforced.
+            _ => unreachable!("scan_key_part validates terminators"),
         }
     }
     crate::entity_pk::EntityPk::from_components(components).map_err(|error| {
