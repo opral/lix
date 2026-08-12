@@ -3831,6 +3831,7 @@ async fn scan_packed_current_base_rows(
                     store,
                     base_ref.commit_id,
                     &request.filter.schema_keys,
+                    &[],
                     // This API materializes the complete requested public
                     // result. Segment count is a physical-layout detail, not
                     // a memory budget, so it must not select a different read
@@ -5081,6 +5082,7 @@ where
                 &self.store,
                 commit_id,
                 &[schema_key.to_owned()],
+                &[],
                 // The exclusive publication's live count already defines the
                 // exact materialized result below. Do not impose a second
                 // physical-segment cardinality policy on the same result.

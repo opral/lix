@@ -27,7 +27,8 @@ use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
     TrackedStateKeyBatchBuilder, TrackedStateMutationBatchBuilder, decode_key, decode_key_shared,
     decode_node_ref, decode_value, encode_key_ref, encode_key_ref_into, encode_leaf_node_refs,
-    encode_schema_key_prefix, encode_single_string_key_ref_into, encode_value_ref,
+    encode_schema_file_prefix, encode_schema_key_prefix, encode_single_string_key_ref_into,
+    encode_value_ref,
 };
 pub(crate) use crate::tracked_state::types::{
     CommitDeltaLifecycleSummary, CommitDeltaReplacementScope,
@@ -7689,7 +7690,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
     commit_id: CommitId,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     Ok(
-        load_commit_delta_members_with_payloads_for_schemas(store, commit_id, &[], usize::MAX)
+        load_commit_delta_members_with_payloads_for_schemas(store, commit_id, &[], &[], usize::MAX)
             .await?
             .expect("unbounded commit-delta payload scan cannot exceed its segment limit"),
     )
@@ -7704,6 +7705,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     schema_keys: &[String],
+    file_ids: &[String],
     max_segment_count: usize,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
     let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
@@ -7714,6 +7716,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
             store,
             &state,
             schema_keys,
+            file_ids,
             max_segment_count,
             true,
         )
@@ -7740,6 +7743,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         store,
         &source,
         schema_keys,
+        file_ids,
         max_segment_count.saturating_sub(local_segment_count),
         true,
     )
@@ -7775,6 +7779,7 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
     let Some((members, _)) = load_authenticated_local_commit_delta_members_for_schemas(
         store,
         &state,
+        &[],
         &[],
         usize::MAX,
         false,
@@ -7997,6 +8002,7 @@ pub(crate) async fn load_retained_commit_snapshots_for_schemas(
         store,
         commit_id,
         schema_keys,
+        &[],
         usize::MAX,
     )
     .await?
@@ -8056,6 +8062,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
+    file_ids: &[String],
     max_segment_count: usize,
     hydrate_selected_payloads: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
@@ -8084,6 +8091,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             store,
             state,
             schema_keys,
+            file_ids,
             max_segment_count,
             hydrate_selected_payloads,
         )
@@ -8156,30 +8164,68 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     )))
 }
 
+/// Builds the commit-delta key ranges a member scan should read.
+///
+/// The key codec is `schema_key | file_id | entity_pk`, so a caller that knows
+/// which files it wants can bound the scan on two components instead of one.
+/// Narrowing is semantics-preserving because every consumer of these members
+/// post-filters on exactly these key components — an entry outside the narrowed
+/// range is one the caller would have discarded anyway. It matters because a
+/// selected segment is decoded *whole*: without the file bound, a point lookup
+/// decodes every entity a bulk commit wrote.
+///
+/// The directory router requires sorted, non-overlapping selectors and never
+/// sorts defensively, so the ranges are sorted by encoded start key here rather
+/// than relying on the encoder to preserve `BTreeSet` ordering.
+fn bounded_commit_delta_key_ranges(
+    schema_keys: &[String],
+    file_ids: &[String],
+) -> Vec<super::mutation_directory::MutationDirectoryKeyRange> {
+    fn range_from_prefix(
+        prefix: Vec<u8>,
+    ) -> super::mutation_directory::MutationDirectoryKeyRange {
+        super::mutation_directory::MutationDirectoryKeyRange {
+            end: prefix_successor(&prefix).map(Bytes::from),
+            start: Bytes::from(prefix),
+        }
+    }
+
+    let requested_schemas = schema_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let requested_files = file_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut ranges = if requested_files.is_empty() {
+        requested_schemas
+            .iter()
+            .map(|schema_key| range_from_prefix(encode_schema_key_prefix(schema_key)))
+            .collect::<Vec<_>>()
+    } else {
+        requested_schemas
+            .iter()
+            .flat_map(|schema_key| {
+                requested_files.iter().map(move |file_id| {
+                    range_from_prefix(encode_schema_file_prefix(schema_key, Some(file_id)))
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    ranges.sort_by(|left, right| left.start.cmp(&right.start));
+    ranges
+}
+
 async fn load_bounded_commit_delta_members_for_schemas(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
+    file_ids: &[String],
     max_segment_count: usize,
     hydrate_selected_payloads: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
     let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
         replacement_payload_error("bounded payload scan omitted its mutation-directory root")
     })?;
-    let requested_schemas = schema_keys
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let ranges = requested_schemas
-        .iter()
-        .map(|schema_key| {
-            let start = encode_schema_key_prefix(schema_key);
-            super::mutation_directory::MutationDirectoryKeyRange {
-                end: prefix_successor(&start).map(Bytes::from),
-                start: Bytes::from(start),
-            }
-        })
-        .collect::<Vec<_>>();
+    let ranges = bounded_commit_delta_key_ranges(schema_keys, file_ids);
     let runs = super::mutation_directory::load_mutation_part_read_plan(
         store,
         root,
@@ -15887,6 +15933,7 @@ mod tests {
             &read,
             commit_id,
             &["alpha".to_string()],
+            &[],
             usize::MAX,
         )
         .await
@@ -15908,6 +15955,7 @@ mod tests {
                 &read,
                 commit_id,
                 &["alpha".to_string()],
+                &[],
                 0,
             )
             .await
