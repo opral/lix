@@ -34,7 +34,13 @@ test("forwards opt-in SQL telemetry from browser WASM", async () => {
 	const lix = await openLix({
 		telemetry: {
 			onSpan(span) {
-				if (span.name === "lix.sql.query") resolveSpan(span);
+				if (
+					span.name === "lix.sql.query" &&
+					span.attributes["db.query.text"] ===
+						"SELECT ? AS value, ? AS number"
+				) {
+					resolveSpan(span);
+				}
 			},
 		},
 	});
