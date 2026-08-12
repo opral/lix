@@ -37,6 +37,7 @@ fn test_commit_id(value: &str) -> CommitId {
     CommitId::for_test_label(value)
 }
 
+#[cfg(test)]
 fn test_change_id(value: &str) -> ChangeId {
     ChangeId::for_test_label(value)
 }

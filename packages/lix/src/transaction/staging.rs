@@ -6404,20 +6404,12 @@ mod tests {
         }
     }
 
-    fn test_uuid(index: usize) -> String {
-        test_uuid_value(index).to_string()
-    }
-
     fn test_uuid_value(index: usize) -> uuid::Uuid {
         uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128)
     }
 
     fn test_commit_id(index: usize) -> CommitId {
         CommitId::with_change_address_space(test_uuid_value(index))
-    }
-
-    fn test_change_id(index: usize) -> ChangeId {
-        ChangeId::parse(&test_uuid(index)).expect("test uuid should parse as change id")
     }
 
     fn state_row(key: &str, value: &str) -> TestPreparedStateRow {
