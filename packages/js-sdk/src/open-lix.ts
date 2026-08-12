@@ -136,14 +136,14 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			throw error;
 		}
 
-		const restoredBranchId = await clientState.get<string>(
-			ACTIVE_BRANCH_CLIENT_STATE_KEY,
-		);
-		const restoredAccountId = await clientState.get<string>(
-			ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
-		);
 		let remoteBinding: LixBinding | undefined;
 		try {
+			const restoredBranchId = await clientState.get<string>(
+				ACTIVE_BRANCH_CLIENT_STATE_KEY,
+			);
+			const restoredAccountId = await clientState.get<string>(
+				ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
+			);
 			try {
 				remoteBinding = await openRemoteLixBinding(options.server, {
 					initialActiveBranchId: restoredBranchId,
