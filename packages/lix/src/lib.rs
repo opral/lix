@@ -51,6 +51,9 @@ pub(crate) mod compression;
 #[cfg(feature = "default_wasm_runtime")]
 mod default_wasm_runtime;
 pub(crate) mod domain;
+#[cfg(feature = "storage-benches")]
+pub mod e46_multiroot_probe;
+pub(crate) mod e46_probe;
 mod engine;
 pub(crate) mod entity_columnar;
 pub(crate) mod entity_pk;

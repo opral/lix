@@ -407,9 +407,12 @@ pub(super) fn certify_topology_touched_scope_filter_from_manifests(
     let filter_touched = if touched.is_some() || empty_base {
         touched
     } else {
-        crate::tracked_state::storage::commit_state_inventory_exact_local_touched_scopes(
-            commit_id, inventory, true,
-        )?
+        {
+            crate::e46_probe::bump(7);
+            crate::tracked_state::storage::commit_state_inventory_exact_local_touched_scopes(
+                commit_id, inventory, true,
+            )?
+        }
     };
     Ok(CertifiedCommitStatePhysicalPublication {
         write_set_id: writes.identity(),
@@ -648,13 +651,18 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     account_id: &str,
     inventory: &CommitStateMutationInventory,
 ) -> Result<CertifiedCommitStatePhysicalPublication, LixError> {
+    crate::e46_probe::enter();
     let selected_source_commit_id = selected_source.map(|source| source.commit_id);
+    if selected_source_commit_id.is_none() {
+        crate::e46_probe::bump(1);
+    }
     if selected_source_commit_id != inventory.selected_source_commit_id() {
         return Err(scoped_state_error(
             "selected-source manifest disagrees with mutation authority",
         ));
     }
     let parent_root = serving_base.and_then(|parent| parent.current_state_scoped_ranges);
+    crate::e46_probe::bump(6);
     let touched = crate::tracked_state::storage::commit_state_inventory_exact_local_touched_scopes(
         commit_id,
         inventory,
@@ -675,6 +683,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     let inherited_scope_filter =
         advance_touched_scope_filter_from_topology(graph_parents, selected_source, Some(&[]))?;
     if inventory.columnar_parts.is_some() {
+        crate::e46_probe::bump(2);
         let root = stage_disjoint_columnar_current_state_pages(
             store,
             writes,
@@ -698,6 +707,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
         extend_touched_scope_filter(inherited_scope_filter.clone(), filter_touched.as_deref())?;
 
     if inventory.replacement_generation.is_some() {
+        crate::e46_probe::bump(4);
         let root = stage_complete_replacement_scoped_range_root(
             store,
             writes,
@@ -738,6 +748,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
         });
     };
     if touched.is_empty() {
+        crate::e46_probe::bump(3);
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             commit_id,
@@ -753,6 +764,7 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     }
     touched.sort();
     touched.dedup();
+    crate::e46_probe::bump(5);
     let staged_segments = crate::tracked_state::storage::staged_commit_delta_segment_bytes(
         writes, commit_id, inventory,
     )?;
