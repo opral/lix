@@ -3315,6 +3315,8 @@ dependencies = [
  "duckdb",
  "fastcdc",
  "futures-util",
+ "http",
+ "http-body-util",
  "libc",
  "lix",
  "lix-storage-filesystem",
