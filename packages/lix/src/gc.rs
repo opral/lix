@@ -3793,6 +3793,391 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
     }
 
+    /// A snapshot whose normalized JSON is comfortably past
+    /// `JSON_INLINE_MAX_BYTES`, and distinct for every `revision`.
+    ///
+    /// Both properties are load-bearing and both were got wrong by an earlier
+    /// probe: a payload at or under 1 KiB never reaches the store at all, and
+    /// the store is content addressed, so re-writing byte-identical content
+    /// dedups onto one row and leaks nothing.
+    fn out_of_band_payload(revision: usize) -> String {
+        let filler = format!("rev-{revision:08}-");
+        let mut body = String::with_capacity(2_048);
+        while body.len() < 1_800 {
+            body.push_str(&filler);
+        }
+        serde_json::json!({ "revision": revision, "body": body }).to_string()
+    }
+
+    async fn register_payload_schema<S>(session: &crate::integration::SessionContext<S>)
+    where
+        S: crate::storage::Storage + Clone + Send + Sync + 'static,
+    {
+        let schema = serde_json::json!({
+            "x-lix-key": "gc_payload_row",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (lix_json($1), false, false)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("payload fixture schema should register");
+    }
+
+    async fn run_shipping_repository_gc(backend: &Memory) -> super::RepositoryGcPlan {
+        let storage = StorageAdapter::new(backend.clone());
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("payload GC read should open"),
+        );
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let plan =
+            super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
+                .await
+                .expect("payload GC should stage");
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("payload GC should commit");
+        plan
+    }
+
+    async fn json_payload_refs(backend: &Memory) -> BTreeSet<JsonRef> {
+        let storage = StorageAdapter::new(backend.clone());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("payload census read should open");
+        crate::storage_bench::space_inventory(&read, crate::json_store::JSON_SPACE.name)
+            .await
+            .into_iter()
+            .map(|(key, _)| {
+                JsonRef::from_hash_bytes(
+                    <[u8; 32]>::try_from(key.as_ref()).expect("payload keys are 32-byte hashes"),
+                )
+            })
+            .collect()
+    }
+
+    /// Names the payload row one statement added, without reproducing the
+    /// engine's JSON normalization in the test. Re-deriving the content address
+    /// here would make the fixture depend on a normalization detail rather than
+    /// on the reachability behaviour under test.
+    async fn payload_ref_added_by<F, Fut>(backend: &Memory, publish: F) -> JsonRef
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let before = json_payload_refs(backend).await;
+        publish().await;
+        let after = json_payload_refs(backend).await;
+        let mut added = after.difference(&before).copied().collect::<Vec<_>>();
+        assert_eq!(
+            added.len(),
+            1,
+            "the fixture statement must add exactly one out-of-band payload row"
+        );
+        added.pop().expect("one added payload ref")
+    }
+
+    /// A payload named by two owners, one of which this sweep retires, must
+    /// survive.
+    ///
+    /// This is the case the reclamation exists to *not* break. The store is
+    /// content addressed, so the second row does not write a second payload —
+    /// it resolves onto the first one. Retiring the commit that happened to
+    /// author it first must therefore not be read as "nobody names this".
+    #[tokio::test]
+    async fn repository_gc_keeps_a_payload_a_second_owner_still_names() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("shared-payload repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("shared-payload repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("shared-payload session should open");
+        register_payload_schema(&session).await;
+
+        let shared = out_of_band_payload(0);
+        let shared_ref = payload_ref_added_by(&backend, || async {
+            session
+                .execute(
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/first', lix_json($1))",
+                    &[Value::Text(shared.clone())],
+                )
+                .await
+                .expect("first owner should publish");
+        })
+        .await;
+        let before_second = json_payload_refs(&backend).await;
+        session
+            .execute(
+                "INSERT INTO gc_payload_row (path, value) VALUES ('/second', lix_json($1))",
+                &[Value::Text(shared.clone())],
+            )
+            .await
+            .expect("second owner should publish");
+        assert_eq!(
+            json_payload_refs(&backend).await,
+            before_second,
+            "the premise of this test is that identical content dedups onto one row"
+        );
+        // Churn only `/first`, so the commit that authored the shared payload
+        // becomes retirable while `/second` keeps naming it.
+        for revision in 1..=8 {
+            session
+                .execute(
+                    "UPDATE gc_payload_row SET value = lix_json($1) WHERE path = '/first'",
+                    &[Value::Text(out_of_band_payload(revision))],
+                )
+                .await
+                .expect("churn should publish");
+            session
+                .create_checkpoint()
+                .await
+                .expect("churn checkpoint should publish");
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("releasing checkpoint should publish");
+
+        let plan = run_shipping_repository_gc(&backend).await;
+        assert!(
+            !plan.sweep.tracked_commit_roots.is_empty(),
+            "the fixture must actually retire commits, or nothing is being tested"
+        );
+        assert!(
+            !plan.changelog.sweep.json_payloads.contains(&shared_ref),
+            "a payload a live row still names must never be proposed for deletion"
+        );
+        assert!(
+            plan.changelog.live.payloads.contains(&shared_ref),
+            "the shared payload must be proven live, not merely absent from the sweep"
+        );
+        assert!(
+            json_ref_exists(&backend, crate::json_store::JSON_SPACE, shared_ref).await,
+            "the shared payload row must survive the sweep"
+        );
+
+        let value = session
+            .execute(
+                "SELECT value FROM gc_payload_row WHERE path = '/second'",
+                &[],
+            )
+            .await
+            .expect("second owner should still read")
+            .rows()[0]
+            .get::<String>("value")
+            .expect("second owner should still carry its payload");
+        assert!(value.contains("rev-00000000-"));
+    }
+
+    /// The co-ownership case a naive per-commit delete gets wrong: one payload
+    /// named by tracked history *and* by more than one untracked row.
+    ///
+    /// Untracked rows live only in the hot serving plane — no commit names
+    /// them — so a live set derived from commits alone would delete this
+    /// payload out from under both of them.
+    #[tokio::test]
+    async fn repository_gc_keeps_a_payload_co_owned_by_history_and_untracked_rows() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("co-owned payload repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("co-owned payload repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("co-owned payload session should open");
+        register_payload_schema(&session).await;
+
+        let shared = out_of_band_payload(0);
+        let shared_ref = payload_ref_added_by(&backend, || async {
+            session
+                .execute(
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/tracked', lix_json($1))",
+                    &[Value::Text(shared.clone())],
+                )
+                .await
+                .expect("tracked owner should publish");
+        })
+        .await;
+        for path in ["/untracked-a", "/untracked-b"] {
+            session
+                .execute(
+                    "INSERT INTO gc_payload_row (path, value, lixcol_untracked) \
+                     VALUES ($1, lix_json($2), true)",
+                    &[Value::Text(path.to_owned()), Value::Text(shared.clone())],
+                )
+                .await
+                .expect("untracked owner should publish");
+        }
+        // Retire the tracked owner's commit while both untracked rows stay.
+        session
+            .execute(
+                "DELETE FROM gc_payload_row WHERE path = '/tracked'",
+                &[],
+            )
+            .await
+            .expect("tracked owner should delete");
+        for revision in 1..=4 {
+            session
+                .execute(
+                    "INSERT INTO gc_payload_row (path, value) VALUES ($1, lix_json($2))",
+                    &[
+                        Value::Text(format!("/churn-{revision}")),
+                        Value::Text(out_of_band_payload(revision)),
+                    ],
+                )
+                .await
+                .expect("churn should publish");
+            session
+                .create_checkpoint()
+                .await
+                .expect("churn checkpoint should publish");
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("releasing checkpoint should publish");
+
+        let plan = run_shipping_repository_gc(&backend).await;
+        assert!(
+            !plan.sweep.tracked_commit_roots.is_empty(),
+            "the fixture must actually retire commits, or nothing is being tested"
+        );
+        assert!(
+            !plan.changelog.sweep.json_payloads.contains(&shared_ref),
+            "a payload two untracked rows still name must never be proposed for deletion"
+        );
+        assert!(
+            json_ref_exists(&backend, crate::json_store::JSON_SPACE, shared_ref).await,
+            "the co-owned payload row must survive the sweep"
+        );
+        for path in ["/untracked-a", "/untracked-b"] {
+            let rows = session
+                .execute(
+                    "SELECT value FROM gc_payload_row WHERE path = $1",
+                    &[Value::Text(path.to_owned())],
+                )
+                .await
+                .expect("untracked owner should still read");
+            assert_eq!(rows.rows().len(), 1, "untracked row '{path}' must survive");
+            assert!(
+                rows.rows()[0]
+                    .get::<String>("value")
+                    .expect("untracked owner should still carry its payload")
+                    .contains("rev-00000000-")
+            );
+        }
+    }
+
+    /// The leak this reclamation exists to close: superseded payloads are
+    /// actually reclaimed, and the live one is not.
+    #[tokio::test]
+    async fn repository_gc_reclaims_superseded_out_of_band_payloads() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("superseded payload repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("superseded payload repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("superseded payload session should open");
+        register_payload_schema(&session).await;
+
+        session
+            .execute(
+                "INSERT INTO gc_payload_row (path, value) VALUES ('/row', lix_json($1))",
+                &[Value::Text(out_of_band_payload(0))],
+            )
+            .await
+            .expect("first revision should publish");
+        let mut live_ref = JsonRef::default();
+        for revision in 1..=16 {
+            live_ref = payload_ref_added_by(&backend, || async {
+                session
+                    .execute(
+                        "UPDATE gc_payload_row SET value = lix_json($1) WHERE path = '/row'",
+                        &[Value::Text(out_of_band_payload(revision))],
+                    )
+                    .await
+                    .expect("rewrite should publish");
+            })
+            .await;
+            if revision % 4 == 0 {
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("cadence checkpoint should publish");
+            }
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("releasing checkpoint should publish");
+
+        let before = json_payload_refs(&backend).await.len();
+        let plan = run_shipping_repository_gc(&backend).await;
+        let after = json_payload_refs(&backend).await.len();
+        assert!(
+            !plan.changelog.sweep.json_payloads.is_empty(),
+            "superseded payloads must be proposed for deletion"
+        );
+        assert_eq!(
+            before - after,
+            plan.changelog.sweep.json_payloads.len(),
+            "every proposed payload delete must actually remove a row"
+        );
+        assert!(
+            after < before,
+            "the payload plane must shrink: {before} -> {after}"
+        );
+        assert!(
+            json_ref_exists(&backend, crate::json_store::JSON_SPACE, live_ref).await,
+            "the surviving revision's payload must not be reclaimed"
+        );
+        let value = session
+            .execute("SELECT value FROM gc_payload_row WHERE path = '/row'", &[])
+            .await
+            .expect("live row should still read")
+            .rows()[0]
+            .get::<String>("value")
+            .expect("live row should still carry its payload");
+        assert!(value.contains("rev-00000016-"));
+    }
+
     #[tokio::test]
     async fn repository_gc_keeps_current_untracked_file_blob_across_cold_reopen() {
         let backend = Memory::new();
