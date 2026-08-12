@@ -636,6 +636,16 @@ impl HistoryShaping {
                 .schema_keys
                 .iter()
                 .any(|schema_key| schema_key == COMMIT_SCHEMA_KEY);
+        if std::env::var_os("E19_TRACE_SHAPING").is_some() {
+            eprintln!(
+                "e19shaping schema_keys={:?} file_ids={:?} entity_pks={} member_schema_keys={:?} member_file_ids={:?}",
+                request.schema_keys,
+                request.file_ids,
+                request.entity_pks.len(),
+                member_schema_keys,
+                member_file_ids,
+            );
+        }
         Self {
             member_schema_keys,
             member_file_ids,
