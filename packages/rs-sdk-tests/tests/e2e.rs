@@ -537,6 +537,29 @@ async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_o
         "untracked plugin entity rows must stay outside the commit graph"
     );
 
+    // Editing an entity row must round-trip back into the file's bytes on both
+    // lanes. This probes the read-path boundary deliberately left tracked-only
+    // in `sql2/providers/file.rs`: if an untracked file's content depended on
+    // being re-rendered from entities through that owner lookup, it would fail
+    // here rather than silently later.
+    for (file_id, path) in [
+        (TRACKED_FILE_ID, TRACKED_PATH),
+        (UNTRACKED_FILE_ID, UNTRACKED_PATH),
+    ] {
+        lix.execute(
+            "UPDATE json_object_member SET scalar_json = '\"edited\"' \
+             WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
+            &[Value::Text(file_id.to_owned())],
+        )
+        .await
+        .unwrap_or_else(|error| panic!("entity edit on '{path}' should commit: {error:?}"));
+        assert_eq!(
+            read_file(&lix, path).await.unwrap(),
+            Some(br#"{"alpha":"edited"}"#.to_vec()),
+            "an entity edit must re-render '{path}' irrespective of lane"
+        );
+    }
+
     lix.close()
         .await
         .expect("lane-parity workspace should close");
@@ -591,11 +614,20 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
 
     // Same bytes through the same plugin must yield the same graph shape on
     // both lanes. A decode path that dropped or altered rows shows up here.
+    //
+    // Node ids are per-file UUIDs, so the shape is compared as each node's kind
+    // paired with its parent's *kind* — lane-independent, while still sensitive
+    // to a lost row or a reparented one.
     let shape = async |file_id: &str| {
         let result = lix
             .execute(
-                "SELECT kind, parent_id FROM markdown_node \
-                 WHERE lixcol_file_id = $1 ORDER BY kind, parent_id",
+                "SELECT child.kind AS kind, parent.kind AS parent_kind \
+                 FROM markdown_node AS child \
+                 LEFT JOIN markdown_node AS parent \
+                   ON parent.lixcol_file_id = child.lixcol_file_id \
+                  AND parent.id = child.parent_id \
+                 WHERE child.lixcol_file_id = $1 \
+                 ORDER BY child.kind, parent.kind",
                 &[Value::Text(file_id.to_owned())],
             )
             .await
@@ -606,7 +638,7 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
             .map(|row| {
                 (
                     row.get::<String>("kind").unwrap(),
-                    row.get::<Value>("parent_id").unwrap(),
+                    row.get::<Value>("parent_kind").unwrap(),
                 )
             })
             .collect::<Vec<_>>()

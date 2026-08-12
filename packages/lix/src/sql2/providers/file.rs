@@ -5586,7 +5586,16 @@ async fn plugin_render_context_with_branches(
                 continue;
             }
             let owned_row = row.to_owned();
-            let Some(owner) = PluginFileOwner::from_live_state_row(&owned_row, &branch_id)? else {
+            // KNOWN LANE GAP: this render context resolves owners through
+            // `scan_tracked_batch`, a tracked-only reader, so untracked
+            // plugin-owned files are not rendered from entities here. They do
+            // not need to be - an untracked file's bytes round-trip through its
+            // stored content blob, which is asserted by the lane-parity tests.
+            // Extending this to both lanes means changing the reader and
+            // belongs with the read-path work, not the unskip.
+            let Some(owner) =
+                PluginFileOwner::from_live_state_row(&owned_row, &branch_id, false)?
+            else {
                 continue;
             };
             let candidate_key = candidate_keys_by_branch

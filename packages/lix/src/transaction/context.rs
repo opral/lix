@@ -3916,7 +3916,8 @@ where
             for row in (0..owner_rows.len()).filter_map(|slot| owner_rows.row(slot)) {
                 let branch_id = row.branch_id().to_string();
                 let owner_row = row.to_owned();
-                let Some(owner) = PluginFileOwner::from_live_state_row(&owner_row, &branch_id)?
+                let Some(owner) =
+                    PluginFileOwner::from_live_state_row(&owner_row, &branch_id, lane)?
                 else {
                     continue;
                 };
@@ -11066,7 +11067,9 @@ async fn preflight_owned_generation_upgrades(
     for row in owner_rows.iter() {
         let branch_id = row.branch_id().to_string();
         let owner_row = row.to_owned();
-        let Some(owner) = PluginFileOwner::from_live_state_row(&owner_row, &branch_id)? else {
+        // This preflight is tracked-pinned; see the lane-gap note above.
+        let Some(owner) = PluginFileOwner::from_live_state_row(&owner_row, &branch_id, false)?
+        else {
             continue;
         };
         let Some(index) = upgrade_indexes
