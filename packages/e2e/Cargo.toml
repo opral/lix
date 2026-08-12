@@ -46,7 +46,7 @@ async-trait = "0.1"
 blake3 = "1"
 bytes = "1"
 fastcdc = "3"
-criterion = { package = "codspeed-criterion-compat", version = "*" }
+criterion = { package = "codspeed-criterion-compat", version = "4" }
 datafusion = { version = "53.0.0", default-features = false, features = ["sql"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
