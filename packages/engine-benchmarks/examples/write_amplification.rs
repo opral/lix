@@ -33,6 +33,8 @@
 //! ASCII and cannot contain an unescaped NUL, so a raw run scan is exact.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use lix::integration::Engine;
@@ -42,6 +44,26 @@ use lix::storage_bench::{layout_accounting, space_inventory};
 use lix::{PreparedDmlParameterBatch, Value};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
+
+/// The one thing the two shipping backends do not expose identically: SlateDB
+/// flushes asynchronously, RocksDB synchronously. Everything else this harness
+/// needs is on `Storage`.
+trait BenchStorage: Storage + Clone + Send + Sync + 'static {
+    fn settle(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+impl BenchStorage for SlateDB {
+    fn settle(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { self.flush().await.expect("flush SlateDB") })
+    }
+}
+
+impl BenchStorage for RocksDB {
+    fn settle(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.flush().expect("flush RocksDB");
+        Box::pin(async {})
+    }
+}
 
 const SEED_SQL: &str = "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
 const UPDATE_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
@@ -92,7 +114,7 @@ async fn main() {
     }
 }
 
-async fn seed<S: Storage + Clone + Send + Sync + 'static>(storage: S, rows: usize) {
+async fn seed<S: BenchStorage>(storage: S, rows: usize) {
     Engine::initialize(storage.clone())
         .await
         .expect("initialize repository");
@@ -154,7 +176,7 @@ async fn seed<S: Storage + Clone + Send + Sync + 'static>(storage: S, rows: usiz
 
     drop(session);
     drop(engine);
-    storage.flush().await.expect("flush storage");
+    storage.settle().await;
     println!("SEEDED\trows={rows}");
 }
 
@@ -163,7 +185,7 @@ async fn seed<S: Storage + Clone + Send + Sync + 'static>(storage: S, rows: usiz
 /// One `execute_prepared_dml_batch` is one commit, so `width` is exactly the
 /// number of rows a commit carries. Holding `updates` fixed and varying `width`
 /// separates per-commit fixed cost from per-row marginal cost.
-async fn update<S: Storage + Clone + Send + Sync + 'static>(
+async fn update<S: BenchStorage>(
     storage: S,
     updates: usize,
     width: usize,
@@ -204,7 +226,7 @@ async fn update<S: Storage + Clone + Send + Sync + 'static>(
 
     drop(session);
     drop(engine);
-    storage.flush().await.expect("flush storage");
+    storage.settle().await;
     println!(
         "UPDATED\tupdates={updates}\twidth={width}\tdistinct={distinct}\tcommits={}",
         updates / width
@@ -258,7 +280,7 @@ fn ascii_runs(key: &[u8]) -> Vec<String> {
     runs
 }
 
-async fn census<S: Storage + Clone + Send + Sync + 'static>(backend: S) {
+async fn census<S: BenchStorage>(backend: S) {
     let storage = StorageAdapter::new(backend);
     let read = storage
         .begin_read(StorageReadOptions::default())
