@@ -50,6 +50,8 @@ static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
+static ROOT_BASE_BATCH_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static ROOT_BASE_BATCH_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
@@ -335,6 +337,24 @@ pub fn take_certified_entity_update_value_batch_accounting() -> CrudCertificateA
 pub struct EntityPointSnapshotCacheAccounting {
     pub hits: u64,
     pub misses: u64,
+}
+
+pub(crate) fn record_root_base_batch_cache_hit() {
+    ROOT_BASE_BATCH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_base_batch_cache_miss() {
+    ROOT_BASE_BATCH_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Hits and misses since the last call. A rotated generation that is scanned
+/// repeatedly must show hits; zero hits means the serving cache is not
+/// connected to the lane under test, which is not visible in a timing sweep.
+pub fn take_root_base_batch_cache_accounting() -> (u64, u64) {
+    (
+        ROOT_BASE_BATCH_CACHE_HITS.swap(0, Ordering::Relaxed),
+        ROOT_BASE_BATCH_CACHE_MISSES.swap(0, Ordering::Relaxed),
+    )
 }
 
 pub(crate) fn record_entity_point_snapshot_cache_hit() {

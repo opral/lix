@@ -817,3 +817,59 @@ async fn rotated_generation_read_scaling() {
         }
     }
 }
+
+/// Connectivity guard for the root-base serving cache.
+///
+/// A serving cache that is built but never reached is invisible to a timing
+/// sweep: the numbers simply do not move, which reads as "the change did not
+/// help" rather than "the change is not wired up". That happened once while
+/// building this cache — three plausible reader-construction sites were wired
+/// and the lane that actually serves a SQL collection scan
+/// (`HotStateContextReader::scan_hot_branch_rows`) was not among them, and the
+/// A/B came back flat. This asserts engagement directly instead.
+///
+/// Note the counters are process-global, so under a parallel test run another
+/// test could contribute hits. That can only make this pass spuriously, never
+/// fail spuriously; it is a connectivity guard, not an exact accounting test.
+#[cfg(feature = "storage-benches")]
+#[tokio::test]
+async fn rotated_generation_serving_view_is_cached_after_the_first_read() {
+    let (_storage, session) = open_session().await;
+    register(&session, probe_schema("cachedrow")).await;
+    insert_rows(&session, "cachedrow", 50).await;
+    let branch = session
+        .create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "e51-cache-guard".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("branch should create");
+    session
+        .switch_branch(crate::SwitchBranchOptions {
+            branch_id: branch.id.clone(),
+        })
+        .await
+        .expect("branch should switch");
+
+    // Discard whatever branch creation and the switch themselves recorded.
+    let _ = crate::storage_bench::take_root_base_batch_cache_accounting();
+
+    for _ in 0..5 {
+        let rows = session
+            .execute(&scan_sql("cachedrow"), &[])
+            .await
+            .expect("rotated scan should run");
+        assert_eq!(rows.len(), 1, "the rotated generation must serve one row");
+    }
+    let (hits, misses) = crate::storage_bench::take_root_base_batch_cache_accounting();
+    assert!(
+        misses > 0,
+        "the first rotated read must materialize the serving view (hits={hits} misses={misses})"
+    );
+    assert!(
+        hits > 0,
+        "later rotated reads must be served from the materialized view, \
+         not re-derived from canonical records (hits={hits} misses={misses})"
+    );
+}
