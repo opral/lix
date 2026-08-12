@@ -1526,6 +1526,7 @@ where
     where
         F: for<'runtime> AsyncFnOnce(&'runtime FunctionContext) -> Result<T, LixError>,
     {
+        let mut probe = crate::e46_probe::mark();
         let storage = Arc::new(storage);
         let read = storage.begin_read(StorageReadOptions::default()).await?;
         // SAFETY: `storage` is retained in the transaction behind an `Arc` and
@@ -1534,11 +1535,15 @@ where
         let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
         let opening_read = SharedStorageAdapterRead::new(read);
         let read = opening_read.clone();
+        probe.lap(0);
         let setup_result = async {
             let active_branch_id = session_branch.get()?;
+            probe.lap(1);
             let runtime_functions =
                 FunctionContext::prepare(&read, Some(hot_state.global_key_value_rows())).await?;
+            probe.lap(2);
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
+            probe.lap(3);
             let functions = runtime_functions.provider();
             // Transaction open needs the catalog revision and the tracked
             // mutation fence from the same pinned snapshot. Both live in the
@@ -1550,6 +1555,7 @@ where
             )
             .await?;
             let catalog_revision = catalog_revision.map(CatalogRevision::from_storage_bytes);
+            probe.lap(4);
             let (sql_schema_catalog, tracked_schema_catalog) = {
                 let visible_hot_state = hot_state.reader(&read);
                 let sql_schema_catalog = catalog_context
@@ -1559,6 +1565,7 @@ where
                         catalog_revision.as_ref(),
                     )
                     .await?;
+                probe.lap(5);
                 // SQL planning needs the untracked-visible catalog, while
                 // normal tracked mutations normalize against the tracked
                 // catalog. Pin both under the same revision at open so the
@@ -1570,6 +1577,7 @@ where
                         catalog_revision.as_ref(),
                     )
                     .await?;
+                probe.lap(6);
                 (sql_schema_catalog, tracked_schema_catalog)
             };
             let branch_reader = branch_ctx.ref_reader(&read);
@@ -1580,6 +1588,7 @@ where
             } else {
                 branch_reader.load_head_commit_id(GLOBAL_BRANCH_ID).await?
             };
+            probe.lap(7);
             Ok::<_, LixError>((
                 active_branch_id,
                 runtime_functions,
@@ -1620,6 +1629,8 @@ where
             tracked_schema_catalog,
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
+        probe.lap(8);
+        crate::e46_probe::finish();
         Ok((
             OpenTransaction {
                 transaction: Self {

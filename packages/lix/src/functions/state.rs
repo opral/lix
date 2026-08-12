@@ -148,6 +148,7 @@ async fn load_key_value_row(
     cache: Option<&GlobalKeyValueRowCache>,
     key: &str,
 ) -> Result<Option<MaterializedHotStateRow>, LixError> {
+    let mut probe = crate::e46_probe::mark();
     let Some(control) = BranchHeadControlContext::new()
         .reader(read)
         .load(GLOBAL_BRANCH_ID)
@@ -155,6 +156,7 @@ async fn load_key_value_row(
     else {
         return Ok(None);
     };
+    probe.lap(9);
     // The control is the fence, not just the read's input: it is republished
     // under a CAS by every write to this plane, so an unchanged control means
     // the row below — and the collection closure validated with it — cannot
@@ -165,6 +167,7 @@ async fn load_key_value_row(
         return Ok(row);
     }
     let row = load_key_value_row_under_control(read, control, key).await?;
+    probe.lap(10);
     if let Some(cache) = cache {
         cache.insert(control, key, row.clone());
     }
