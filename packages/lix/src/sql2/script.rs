@@ -1,6 +1,5 @@
 use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement};
 use datafusion::sql::sqlparser::ast::{BeginTransactionKind, Statement as SqlStatement};
-use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 use serde_json::json;
 use std::ops::Range;
@@ -33,9 +32,7 @@ enum TransactionControl {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct PlaceholderUsage {
-    anonymous: usize,
     explicit_max: usize,
-    has_explicit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -49,8 +46,8 @@ struct ParsedStatement {
 /// Multi-statement scripts may be unwrapped, or wrapped by `BEGIN` (optionally
 /// followed by `TRANSACTION`) and a final `COMMIT`. Transaction aliases,
 /// modes, savepoints, rollback, nested controls, and empty transactions are
-/// rejected. Anonymous placeholders consume request parameters sequentially;
-/// numbered placeholders retain their request-wide positions.
+/// rejected. PostgreSQL-style numbered placeholders retain their request-wide
+/// positions.
 pub fn parse_sql_script(sql: &str, provided_param_count: usize) -> Result<SqlScriptPlan, LixError> {
     let statements = parse_statements(sql)?;
     if statements.is_empty() {
@@ -94,7 +91,7 @@ pub fn parse_sql_script(sql: &str, provided_param_count: usize) -> Result<SqlScr
 }
 
 fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>, LixError> {
-    let dialect = GenericDialect {};
+    let dialect = super::dialect::lix_sql_dialect();
     let tokens = Tokenizer::new(&dialect, sql)
         .tokenize_with_location()
         .map_err(tokenizer_error)?;
@@ -157,33 +154,11 @@ fn build_atomic_plan(
             (sql, placeholders)
         })
         .collect::<Vec<_>>();
-    let anonymous_count = statements
+    let expected_param_count = statements
         .iter()
-        .map(|(_, placeholders)| placeholders.anonymous)
-        .sum::<usize>();
-    let has_explicit = statements
-        .iter()
-        .any(|(_, placeholders)| placeholders.has_explicit);
-    if anonymous_count > 0 && has_explicit {
-        return Err(LixError::new(
-            LixError::CODE_PARSE_ERROR,
-            "SQL mixes anonymous and explicit parameter placeholders",
-        )
-        .with_hint(
-            "Use either anonymous placeholders like ?, ? or numbered placeholders like $1, $2, but not both.",
-        )
-        .with_details(json!({ "operation": "execute" })));
-    }
-
-    let expected_param_count = if anonymous_count > 0 {
-        anonymous_count
-    } else {
-        statements
-            .iter()
-            .map(|(_, placeholders)| placeholders.explicit_max)
-            .max()
-            .unwrap_or(0)
-    };
+        .map(|(_, placeholders)| placeholders.explicit_max)
+        .max()
+        .unwrap_or(0);
     if provided_param_count != expected_param_count {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
@@ -198,17 +173,10 @@ fn build_atomic_plan(
         })));
     }
 
-    let mut anonymous_offset = 0usize;
     let statements = statements
         .into_iter()
         .map(|(sql, placeholders)| {
-            let params = if anonymous_count > 0 {
-                let start = anonymous_offset;
-                anonymous_offset += placeholders.anonymous;
-                start..anonymous_offset
-            } else {
-                0..placeholders.explicit_max
-            };
+            let params = 0..placeholders.explicit_max;
             SqlScriptStatement { sql, params }
         })
         .collect();
@@ -221,17 +189,12 @@ fn placeholder_usage(tokens: &[Token]) -> PlaceholderUsage {
         let Token::Placeholder(placeholder) = token else {
             continue;
         };
-        if placeholder == "?" {
-            usage.anonymous += 1;
-            continue;
-        }
         let Some(index) = placeholder
             .strip_prefix('$')
             .and_then(|value| value.parse::<usize>().ok())
         else {
             continue;
         };
-        usage.has_explicit = true;
         usage.explicit_max = usage.explicit_max.max(index);
     }
     usage
@@ -349,19 +312,12 @@ mod tests {
     }
 
     #[test]
-    fn plans_sequential_anonymous_parameters() {
-        let statements = atomic("SELECT ?, ?; SELECT ?", 3);
-        assert_eq!(statements[0].params, 0..2);
-        assert_eq!(statements[1].params, 2..3);
-    }
-
-    #[test]
     fn parser_ignores_delimiters_and_placeholders_in_sql_literals_and_comments() {
         let statements = atomic(
             r#"
                 SELECT '; ? $9' AS value, 1 AS "semi;?;$8", $tag$?; $7$tag$ AS tagged;
                 -- ; ? $6
-                SELECT ? /* ; ? $5 */ AS bound
+                SELECT $1 /* ; ? $5 */ AS bound
             "#,
             1,
         );
@@ -374,7 +330,6 @@ mod tests {
     fn rejects_unsupported_transaction_boundaries() {
         for sql in [
             "BEGIN; COMMIT",
-            "BEGIN IMMEDIATE; SELECT 1; COMMIT",
             "BEGIN WORK; SELECT 1; COMMIT",
             "START TRANSACTION; SELECT 1; COMMIT",
             "BEGIN; SELECT 1; END",
@@ -397,24 +352,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mixed_or_mismatched_parameters() {
-        assert_eq!(
-            parse_sql_script("SELECT ?; SELECT $2", 2)
-                .expect_err("mixed placeholders are invalid")
-                .code,
-            LixError::CODE_PARSE_ERROR
-        );
+    fn rejects_non_postgresql_transaction_syntax() {
+        parse_sql_script("BEGIN IMMEDIATE; SELECT 1; COMMIT", 0)
+            .expect_err("SQLite transaction syntax is unsupported");
+    }
+
+    #[test]
+    fn rejects_mismatched_parameters() {
         assert_eq!(
             parse_sql_script("SELECT $1; SELECT $2", 1)
                 .expect_err("parameter count is invalid")
                 .code,
             LixError::CODE_INVALID_PARAM
         );
+    }
+
+    #[test]
+    fn rejects_anonymous_parameters() {
         assert_eq!(
-            parse_sql_script("SELECT ?; SELECT ?", 1)
-                .expect_err("parameter count is invalid")
+            parse_sql_script("SELECT ?", 1)
+                .expect_err("anonymous parameters are unsupported")
                 .code,
-            LixError::CODE_INVALID_PARAM
+            LixError::CODE_PARSE_ERROR
         );
     }
 

@@ -60,7 +60,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    sql_question_mark_placeholders_bind_positionally,
+    sql_postgresql_numbered_placeholders_bind_positionally,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = engine
@@ -70,22 +70,22 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT * FROM lix_file WHERE id = ?",
+                "SELECT * FROM lix_file WHERE id = $1",
                 &[Value::Text(
                     "6d697373-696e-872d-8669-6c6500000000".to_string(),
                 )],
             )
             .await
-            .expect("anonymous placeholder should still bind when no rows match");
+            .expect("numbered placeholder should bind when no rows match");
         assert_eq!(result.len(), 0);
 
         let result = session
             .execute(
-                "SELECT '?' AS literal, ? AS first, ? AS second",
+                "SELECT '?' AS literal, $1 AS first, $2 AS second",
                 &[Value::Integer(10), Value::Text("second".to_string())],
             )
             .await
-            .expect("anonymous placeholders should bind left to right");
+            .expect("numbered placeholders should bind by index");
         let row = result.rows().first().expect("query should return one row");
         assert_eq!(
             row.values(),
@@ -98,7 +98,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT 'it''s ?' AS escaped_literal, ? AS bound_value -- ? in comment\n",
+                "SELECT 'it''s ?' AS escaped_literal, $1 AS bound_value -- ? in comment\n",
                 &[Value::Integer(42)],
             )
             .await
@@ -110,43 +110,33 @@ simulation_test!(
         );
 
         let error = session
-            .execute("SELECT ? AS missing_param", &[])
+            .execute("SELECT $1 AS missing_param", &[])
             .await
-            .expect_err("anonymous placeholder without a value should fail");
+            .expect_err("numbered placeholder without a value should fail");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     }
 );
 
-simulation_test!(
-    sql_mixed_anonymous_and_explicit_placeholders_are_rejected,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        let error = session
-            .execute(
-                "SELECT ? AS anonymous_value, $2 AS numbered_value",
-                &[Value::Integer(1), Value::Integer(2)],
-            )
+simulation_test!(sql_anonymous_placeholders_are_rejected, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
             .await
-            .expect_err("mixed placeholder styles should fail");
+            .expect("main session should open"),
+        &engine,
+    );
 
-        assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
-        assert!(
-            error.hint().is_some_and(|hint| hint.contains("not both")),
-            "expected mixed-placeholder hint: {error}"
-        );
-    }
-);
+    let error = session
+        .execute("SELECT ? AS anonymous_value", &[Value::Integer(1)])
+        .await
+        .expect_err("anonymous placeholders should fail");
+
+    assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
+});
 
 simulation_test!(
-    sql_transaction_execute_accepts_anonymous_placeholders,
+    sql_transaction_execute_accepts_numbered_placeholders,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -163,11 +153,11 @@ simulation_test!(
 
         let result = transaction
             .execute(
-                "SELECT ? AS first, ? AS second",
+                "SELECT $1 AS first, $2 AS second",
                 &[Value::Integer(1), Value::Text("two".to_string())],
             )
             .await
-            .expect("anonymous parameter read in transaction should succeed");
+            .expect("numbered parameter read in transaction should succeed");
         assert_eq!(
             result.rows()[0].values(),
             &[Value::Integer(1), Value::Text("two".to_string())]
@@ -175,14 +165,14 @@ simulation_test!(
 
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES (?, ?)",
+                "INSERT INTO lix_file (id, path) VALUES ($1, $2)",
                 &[
                     Value::Text("616e6f6e-796d-8f75-832d-7472616e7300".to_string()),
-                    Value::Text("/anonymous-transaction.txt".to_string()),
+                    Value::Text("/numbered-transaction.txt".to_string()),
                 ],
             )
             .await
-            .expect("anonymous parameter write in transaction should succeed");
+            .expect("numbered parameter write in transaction should succeed");
 
         transaction
             .commit()
@@ -191,16 +181,16 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT path FROM lix_file WHERE id = ?",
+                "SELECT path FROM lix_file WHERE id = $1",
                 &[Value::Text(
                     "616e6f6e-796d-8f75-832d-7472616e7300".to_string(),
                 )],
             )
             .await
-            .expect("committed anonymous parameter write should be visible");
+            .expect("committed numbered parameter write should be visible");
         assert_eq!(
             result.rows()[0].values(),
-            &[Value::Text("/anonymous-transaction.txt".to_string())]
+            &[Value::Text("/numbered-transaction.txt".to_string())]
         );
     }
 );
@@ -216,7 +206,7 @@ simulation_test!(sql_explain_is_read_shaped, |sim| async move {
     );
 
     let result = session
-        .execute("EXPLAIN SELECT ? AS explained_value", &[Value::Integer(1)])
+        .execute("EXPLAIN SELECT $1 AS explained_value", &[Value::Integer(1)])
         .await
         .expect("EXPLAIN SELECT should return explain rows");
     assert!(!result.columns().is_empty());
@@ -224,7 +214,7 @@ simulation_test!(sql_explain_is_read_shaped, |sim| async move {
 
     let error = session
         .execute(
-            "EXPLAIN INSERT INTO lix_file (id, path) VALUES (?, ?)",
+            "EXPLAIN INSERT INTO lix_file (id, path) VALUES ($1, $2)",
             &[
                 Value::Text("explained-write".to_string()),
                 Value::Text("/explained-write.txt".to_string()),

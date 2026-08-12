@@ -115,7 +115,6 @@ pub(crate) fn bind_public_column_ref(
 #[cfg(test)]
 mod tests {
     use datafusion::sql::sqlparser::ast::{SetExpr, Statement, TableFactor};
-    use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use serde_json::json;
 
@@ -388,7 +387,8 @@ mod tests {
     }
 
     fn table_name(sql: &str) -> ObjectName {
-        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let mut statements =
+            Parser::parse_sql(&crate::sql2::dialect::lix_sql_dialect(), sql).expect("parse SQL");
         let Some(Statement::Query(query)) = statements.pop() else {
             panic!("expected query");
         };

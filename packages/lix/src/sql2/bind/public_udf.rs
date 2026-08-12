@@ -5,20 +5,19 @@ use datafusion::sql::sqlparser::ast::{
     Expr, Function, FunctionArguments, ObjectNamePart, Statement, Visit, Visitor,
 };
 #[cfg(test)]
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-#[cfg(test)]
 use datafusion::sql::sqlparser::parser::Parser;
 
 use crate::LixError;
 
 #[cfg(test)]
 pub(crate) fn validate_public_udf_calls(sql: &str) -> Result<(), LixError> {
-    let statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| {
-        LixError::new(
-            LixError::CODE_PARSE_ERROR,
-            format!("sql2 SQL parse error: {error}"),
-        )
-    })?;
+    let statements =
+        Parser::parse_sql(&super::super::dialect::lix_sql_dialect(), sql).map_err(|error| {
+            LixError::new(
+                LixError::CODE_PARSE_ERROR,
+                format!("sql2 SQL parse error: {error}"),
+            )
+        })?;
 
     let mut visitor = PublicUdfCallVisitor;
     match statements.visit(&mut visitor) {

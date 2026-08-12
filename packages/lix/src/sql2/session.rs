@@ -213,6 +213,10 @@ pub(crate) async fn build_write_session_with_options(
 
 pub(crate) fn new_sql_session_context() -> SessionContext {
     let config = SessionConfig::new()
+        .set_str(
+            "datafusion.sql_parser.dialect",
+            super::dialect::DATAFUSION_SQL_DIALECT,
+        )
         .with_information_schema(false)
         .with_target_partitions(1)
         .set_bool("datafusion.optimizer.repartition_aggregations", false)
@@ -239,6 +243,22 @@ pub(crate) fn new_sql_session_context() -> SessionContext {
     let session = SessionContext::new_with_state(state);
     register_static_sql2_functions(&session);
     sql_session_from_template(session.state(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::common::config::Dialect;
+
+    use super::new_sql_session_context;
+
+    #[test]
+    fn datafusion_session_uses_postgresql_dialect() {
+        let session = new_sql_session_context();
+        assert_eq!(
+            session.copied_config().options().sql_parser.dialect,
+            Dialect::PostgreSQL
+        );
+    }
 }
 
 /// Builds a Lix SQL session from a template state, gives it its own

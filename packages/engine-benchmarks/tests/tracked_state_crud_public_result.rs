@@ -61,10 +61,10 @@ where
 fn typed_olap_queries_are_plain_datafusion_selects() {
     use datafusion::sql::parser::DFParser;
     use datafusion::sql::sqlparser::ast::{SetExpr, Statement as SqlStatement};
-    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 
     for shape in sql_session::OlapReadShape::ALL {
-        let mut statements = DFParser::parse_sql_with_dialect(shape.sql(), &GenericDialect {})
+        let mut statements = DFParser::parse_sql_with_dialect(shape.sql(), &PostgreSqlDialect {})
             .expect("typed OLAP benchmark SQL should parse");
         let statement = statements.pop_front().expect("one OLAP statement");
         let datafusion::sql::parser::Statement::Statement(statement) = statement else {

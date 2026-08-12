@@ -57,7 +57,7 @@ simulation_test!(
 
         let exact = session
             .execute(
-                "SELECT id, name FROM lix_branch WHERE id = ?",
+                "SELECT id, name FROM lix_branch WHERE id = $1",
                 &[Value::Text(main_id.clone())],
             )
             .await
@@ -73,7 +73,7 @@ simulation_test!(
 
         let in_list = session
             .execute(
-                "SELECT id FROM lix_branch WHERE id IN (?, ?) ORDER BY id",
+                "SELECT id FROM lix_branch WHERE id IN ($1, $2) ORDER BY id",
                 &[
                     Value::Text(global_id.to_string()),
                     Value::Text(main_id.clone()),
@@ -97,7 +97,7 @@ simulation_test!(
 
         let invalid = session
             .execute(
-                "SELECT id FROM lix_branch WHERE id = ?",
+                "SELECT id FROM lix_branch WHERE id = $1",
                 &[Value::Text("not-a-branch-id".to_string())],
             )
             .await

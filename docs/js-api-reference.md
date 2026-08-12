@@ -109,13 +109,13 @@ await storage.syncDiskToLix();
 const result = await lix.execute(sql, params?, options?);
 ```
 
-Executes one DataFusion SQL statement against the active Lix session.
+Executes one PostgreSQL-dialect SQL statement against the active Lix session.
 
 Parameters:
 
 | Parameter | Type                     | Description                                                        |
 | --------- | ------------------------ | ------------------------------------------------------------------ |
-| `sql`     | `string`                 | One SQL statement. Use DataFusion SQL, not SQLite SQL.             |
+| `sql`     | `string`                 | One statement from Lix's PostgreSQL-dialect subset.                |
 | `params`  | `SqlParam[]`             | Optional positional parameters addressed as `$1`, `$2`, and so on. |
 | `options` | `ExecuteOptions`         | Optional execution options. See below.                             |
 
