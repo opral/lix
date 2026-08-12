@@ -9021,7 +9021,10 @@ fn stage_hot_bootstrap(
             file_id: row.file_id,
         };
         let value = HeadValueRef {
-            change_id: None,
+            // Preserved rows are read back from the head, where every untracked
+            // row already carries its minted id. Re-encoding must round-trip it
+            // rather than reset the row to an anonymous one.
+            change_id: row.change_id,
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -11993,7 +11996,9 @@ mod tests {
     fn encoded_test_hot_value(generation: CommitId, untracked: bool, deleted: bool) -> Bytes {
         Bytes::from(
             encode_head_value(&HeadValueRef {
-                change_id: (!untracked).then(|| ChangeId::for_test_label("closure-change")),
+                // Both lanes carry a change id; only the tracked lane carries a
+                // commit id. That asymmetry is the whole untracked model.
+                change_id: Some(ChangeId::for_test_label("closure-change")),
                 commit_id: (!untracked).then_some(generation),
                 untracked,
                 deleted,
@@ -14440,7 +14445,7 @@ mod tests {
             schema_key: "schema\0escaped",
             file_id: Some("file\0id"),
             entity_pk: &first_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-mutation-first")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14454,7 +14459,7 @@ mod tests {
             schema_key: "schema_without_file",
             file_id: None,
             entity_pk: &second_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-mutation-second")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14573,7 +14578,7 @@ mod tests {
             schema_key: "untracked_schema",
             file_id: Some("untracked.json"),
             entity_pk: &untracked_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-untracked-member")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14587,7 +14592,7 @@ mod tests {
             schema_key: "untracked_schema",
             file_id: Some("removed.json"),
             entity_pk: &removed_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-untracked-removed")),
             commit_id: None,
             untracked: true,
             deleted: true,
@@ -14836,7 +14841,7 @@ mod tests {
             schema_key: "ordinary_schema",
             file_id: Some("ordinary.json"),
             entity_pk: &entity_pk,
-            change_id: None,
+            change_id: Some(ChangeId::for_test_label("hot-ordinary-incremental")),
             commit_id: None,
             untracked: true,
             deleted: false,
@@ -14889,7 +14894,7 @@ mod tests {
                 schema_key: "schema",
                 file_id: None,
                 entity_pk,
-                change_id: None,
+                change_id: Some(ChangeId::for_test_label("hot-planned-arena")),
                 commit_id: None,
                 untracked: true,
                 deleted: false,
