@@ -249,6 +249,7 @@ pub(crate) fn require_existing_id_authorities(
     rows: &MaterializedLiveStateExactBatch,
     file_id: &str,
     branch_id: &str,
+    untracked: bool,
 ) -> Result<(), LixError> {
     if keys.len() != rows.len() {
         return Err(LixError::new(
@@ -267,7 +268,8 @@ pub(crate) fn require_existing_id_authorities(
                 && row.file_id() == Some(file_id)
                 && row.branch_id() == branch_id
                 && !row.global()
-                && !row.untracked()
+                // The authority row lives in its own file's lane.
+                && row.untracked() == untracked
         });
         if !valid {
             return Err(LixError::new(
@@ -689,12 +691,26 @@ mod tests {
 
         require_existing_id_authorities(
             &plugin(),
+            &[key.clone()],
+            &MaterializedLiveStateExactBatch::from_rows(vec![Some(row.clone())]),
+            "01920000-0000-7000-8000-0000000000a2",
+            "main",
+            false,
+        )
+        .expect("typed UUID authority must compare without string-only accessors");
+
+        // The authority row must be matched in the requesting file's own lane.
+        // A tracked row can never satisfy an untracked file's create authority
+        // and vice versa, or a create would reserve across the lane boundary.
+        require_existing_id_authorities(
+            &plugin(),
             &[key],
             &MaterializedLiveStateExactBatch::from_rows(vec![Some(row)]),
             "01920000-0000-7000-8000-0000000000a2",
             "main",
+            true,
         )
-        .expect("typed UUID authority must compare without string-only accessors");
+        .expect_err("a tracked authority row must not satisfy an untracked create");
     }
 
     #[test]
