@@ -1708,9 +1708,13 @@ mod scan_source_tests {
             )
             .await
             .expect("CTE should plan");
-        let batches = crate::sql2::runtime::collect_plan(&session.state(), plan, None)
-            .await
-            .expect("CTE should execute");
+        let batches = crate::sql2::runtime::collect_plan(
+            &session.state(),
+            crate::sql2::runtime::RuntimeReadPlan::Bound(plan),
+            None,
+        )
+        .await
+        .expect("CTE should execute");
         let values = batches
             .iter()
             .flat_map(|batch| {

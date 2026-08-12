@@ -77,7 +77,7 @@ pub(crate) const LIX_INSERT_COLUMN_OMITTED_METADATA_KEY: &str = "lix_insert_colu
 
 pub(crate) struct DataFusionLogicalPlan {
     pub(super) state: std::sync::Arc<SessionState>,
-    pub(super) plan: LogicalPlan,
+    pub(super) plan: crate::sql2::runtime::RuntimeReadPlan,
     pub(super) notices: Vec<LixNotice>,
     pub(super) json_predicate_params: BTreeSet<usize>,
     pub(super) expected_parameter_count: usize,
@@ -425,15 +425,25 @@ async fn create_logical_plan_in_session_from_parsed(
         && let Some((cache, catalog)) = &session.planning_environment
         && let Some(cached) = cache.read_plan(sql, params, catalog)
     {
-        let plan = rebind_cached_read_plan(session.context(), cached.plan.clone()).await?;
+        let physical_planning_cache = PhysicalReadPlanCacheKey::new(sql, params, catalog.clone())
+            .map(|key| (std::sync::Arc::clone(cache), key));
+        // With a physical-cache key the runtime rebinds scan providers lazily:
+        // a warm template execution never touches the logical plan, so eagerly
+        // resolving providers into it here would be pure per-statement waste.
+        let plan = if physical_planning_cache.is_some() {
+            crate::sql2::runtime::RuntimeReadPlan::Detached(cached.plan.clone())
+        } else {
+            crate::sql2::runtime::RuntimeReadPlan::Bound(
+                rebind_cached_read_plan(session.context(), cached.plan.clone()).await?,
+            )
+        };
         return Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
             state: std::sync::Arc::clone(session.state()),
             plan,
             notices: Vec::new(),
             json_predicate_params: cached.json_predicate_params.clone(),
             expected_parameter_count: cached.expected_parameter_count,
-            physical_planning_cache: PhysicalReadPlanCacheKey::new(sql, params, catalog.clone())
-                .map(|key| (std::sync::Arc::clone(cache), key)),
+            physical_planning_cache,
         }));
     }
     bind_table_function_parameters(&mut statement, params)?;
@@ -473,7 +483,7 @@ async fn create_logical_plan_in_session_from_parsed(
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
         state: std::sync::Arc::clone(session.state()),
-        plan,
+        plan: crate::sql2::runtime::RuntimeReadPlan::Bound(plan),
         notices: Vec::new(),
         json_predicate_params,
         expected_parameter_count,
@@ -659,7 +669,7 @@ async fn create_transaction_read_logical_plan_from_parsed(
     Ok((
         SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
             state: std::sync::Arc::clone(session.state()),
-            plan,
+            plan: crate::sql2::runtime::RuntimeReadPlan::Bound(plan),
             notices: Vec::new(),
             json_predicate_params,
             expected_parameter_count,
@@ -1346,6 +1356,21 @@ fn validate_history_anchor_predicates_in_logical_plan(plan: &LogicalPlan) -> Res
 ///
 /// Mirrors `DataFrame::with_param_values`, which is exactly
 /// `LogicalPlan::with_param_values` plus a `SessionState` it does not need.
+fn bind_runtime_plan_param_values(
+    plan: crate::sql2::runtime::RuntimeReadPlan,
+    params: &[Value],
+) -> Result<crate::sql2::runtime::RuntimeReadPlan, LixError> {
+    use crate::sql2::runtime::RuntimeReadPlan;
+    Ok(match plan {
+        RuntimeReadPlan::Bound(plan) => {
+            RuntimeReadPlan::Bound(bind_plan_param_values(plan, params)?)
+        }
+        RuntimeReadPlan::Detached(plan) => {
+            RuntimeReadPlan::Detached(bind_plan_param_values(plan, params)?)
+        }
+    })
+}
+
 fn bind_plan_param_values(plan: LogicalPlan, params: &[Value]) -> Result<LogicalPlan, LixError> {
     if params.is_empty() {
         return Ok(plan);
@@ -1382,9 +1407,10 @@ async fn execute_logical_plan(
     // rejects, and otherwise wraps the plan in a `DataFrame` whose only purpose
     // here is to carry a freshly deep-copied `SessionState`. Bind the
     // parameters on the plan directly against the statement's pooled state.
-    let plan = bind_plan_param_values(plan, params)?;
+    let plan = bind_runtime_plan_param_values(plan, params)?;
 
     let result_fields = plan
+        .inner()
         .schema()
         .fields()
         .iter()
@@ -1456,8 +1482,9 @@ async fn execute_logical_plan_stream<'session>(
     // rejects, and otherwise wraps the plan in a `DataFrame` whose only purpose
     // here is to carry a freshly deep-copied `SessionState`. Bind the
     // parameters on the plan directly against the statement's pooled state.
-    let plan = bind_plan_param_values(plan, params)?;
+    let plan = bind_runtime_plan_param_values(plan, params)?;
     let fields = plan
+        .inner()
         .schema()
         .fields()
         .iter()
@@ -1501,8 +1528,9 @@ async fn execute_logical_plan_collected_batches(
     // rejects, and otherwise wraps the plan in a `DataFrame` whose only purpose
     // here is to carry a freshly deep-copied `SessionState`. Bind the
     // parameters on the plan directly against the statement's pooled state.
-    let plan = bind_plan_param_values(plan, params)?;
+    let plan = bind_runtime_plan_param_values(plan, params)?;
     let fields = plan
+        .inner()
         .schema()
         .fields()
         .iter()
