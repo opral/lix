@@ -1143,7 +1143,7 @@ where
     crate::tracked_state::scan_commit_state_manifest_commit_ids(store).await
 }
 
-/// The out-of-band JSON payloads that outlive this sweep.
+/// Plans which out-of-band JSON payloads this sweep may reclaim.
 ///
 /// Every owner class that can hold a `JsonSlot::Ref` after the write set
 /// commits is enumerated here, and each one is reached from the walk rather
@@ -1169,33 +1169,50 @@ where
 /// Being a superset here is always safe and being a subset never is, so where
 /// the two arguments were close — the tracked hot rows, the branch-ref facts —
 /// this deliberately takes the wider set.
-async fn collect_live_json_payload_hashes<S>(
+struct JsonPayloadReclamation {
+    live: BTreeSet<[u8; 32]>,
+    sweep: Vec<JsonRef>,
+}
+
+async fn plan_json_payload_reclamation<S>(
     store: &S,
     controls: &[(String, BranchHeadControl)],
+    retired_commits: &BTreeSet<CommitId>,
     surviving_commits: &BTreeSet<CommitId>,
+    released_part_refs_digests: &BTreeSet<[u8; 32]>,
     retained_part_refs_digests: &BTreeSet<[u8; 32]>,
-) -> Result<BTreeSet<[u8; 32]>, LixError>
+) -> Result<JsonPayloadReclamation, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
-    let mut live = BTreeSet::new();
-    Box::pin(
-        TrackedHeadContext::new()
-            .reader(store.clone())
-            .collect_hot_json_refs(controls, false, &mut live),
+    // Candidates: named only by state this sweep is deleting.
+    let mut candidates = BTreeSet::new();
+    for commit_id in retired_commits {
+        crate::tracked_state::collect_local_commit_delta_json_refs(store, *commit_id, &mut candidates)
+            .await?;
+    }
+    crate::tracked_state::collect_current_state_part_json_refs(
+        store,
+        released_part_refs_digests,
+        &mut candidates,
     )
     .await?;
-    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
+
+    // Live: named by state that outlives this sweep.
+    let mut live = BTreeSet::new();
+    TrackedHeadContext::new()
+        .reader(store.clone())
+        .collect_hot_json_refs(controls, false, &mut live)
+        .await?;
+    crate::tracked_state::collect_current_state_part_json_refs(
         store,
         retained_part_refs_digests,
         &mut live,
-    ))
+    )
     .await?;
     for commit_id in surviving_commits {
-        Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
-            store, *commit_id, &mut live,
-        ))
-        .await?;
+        crate::tracked_state::collect_local_commit_delta_json_refs(store, *commit_id, &mut live)
+            .await?;
     }
     let ref_change_ids = controls
         .iter()
@@ -1211,7 +1228,13 @@ where
             }
         }
     }
-    Ok(live)
+
+    let sweep = candidates
+        .difference(&live)
+        .copied()
+        .map(JsonRef::from_hash_bytes)
+        .collect::<Vec<_>>();
+    Ok(JsonPayloadReclamation { live, sweep })
 }
 
 /// Plans and stages logical repository GC against one pinned read.
@@ -1243,7 +1266,7 @@ where
 /// set is deleting the row that named it — a retired commit's own delta
 /// members, or a native current-state part whose payload-ref summary this
 /// retirement removes. It is **live** if any owner that outlives the sweep
-/// names it; see [`collect_live_json_payload_hashes`] for that enumeration.
+/// names it; see [`plan_json_payload_reclamation`] for that enumeration.
 /// Neither half scans the payload plane, so an unreferenced row that no
 /// retirement produced is left alone rather than swept on the strength of a
 /// live set being complete.
@@ -1372,11 +1395,6 @@ where
     // candidate behind it forever.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
-    // Payload reachability is derived from the same two halves the retirement
-    // loop already computes, never from a payload-plane scan: a hash becomes a
-    // *candidate* only because this write set is deleting the row that named
-    // it, and it survives if any owner that outlives this sweep names it too.
-    let mut candidate_json_hashes = BTreeSet::new();
     let mut released_part_refs_digests = BTreeSet::new();
     for commit_id in candidates {
         if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
@@ -1388,12 +1406,6 @@ where
             continue;
         }
         if reclaimed_commits.insert(commit_id) {
-            Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
-                &store,
-                commit_id,
-                &mut candidate_json_hashes,
-            ))
-            .await?;
             crate::tracked_state::stage_retire_commit_physical_state(
                 &store,
                 writes,
@@ -1408,30 +1420,33 @@ where
             .await?;
         }
     }
-    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
-        &store,
-        &released_part_refs_digests,
-        &mut candidate_json_hashes,
-    ))
-    .await?;
-    let live_json_hashes = Box::pin(collect_live_json_payload_hashes(
+    // One boxed step, not three awaits inlined here. This function's future is
+    // already close to the harness's 2 MiB worker stack: three inline await
+    // points over the segment-decode and hot-scan chains aborted
+    // `cas_gc_history_retention` with a stack overflow, which passes on the
+    // parent commit.
+    let JsonPayloadReclamation {
+        live: live_json_hashes,
+        sweep: sweep_json_payloads,
+    } = Box::pin(plan_json_payload_reclamation(
         &store,
         &controls,
+        &reclaimed_commits,
         &blocked_physical_dependency_ids,
+        &released_part_refs_digests,
         &active_current_part_refs_digests,
     ))
     .await?;
-    let sweep_json_payloads = candidate_json_hashes
-        .difference(&live_json_hashes)
-        .copied()
-        .map(JsonRef::from_hash_bytes)
-        .collect::<Vec<_>>();
     if !sweep_json_payloads.is_empty() {
         JsonStoreContext::new()
             .writer()
             .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
-        crate::json_store::stage_json_reclamation_fence(&store, writes, &mut staged_preconditions)
-            .await?;
+        Box::pin(crate::json_store::stage_json_reclamation_fence(
+            &store,
+            writes,
+            &mut staged_preconditions,
+        ))
+        .await?;
     }
     if !reclaimed_semantic_commits.is_empty() {
         writes.seal_changelog_gc();
