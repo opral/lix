@@ -4,6 +4,8 @@ mod entity_columnar_cache;
 mod entity_decoded_column_cache;
 mod reader;
 mod tracked_head;
+#[cfg(test)]
+pub(crate) use tracked_head::{head_decode_entity_pk_probe, hot_decode_entity_pk_probe};
 mod types;
 pub(crate) mod visibility;
 
