@@ -19,7 +19,7 @@
 //! the four canonical edit geometries are covered for every case.
 //!
 //! ```sh
-//! cargo run -p lix_benchmarks --release --features storage-benches,slatedb \
+//! cargo run -p lix_e2e --release --features storage-benches,slatedb \
 //!   --example cas_sharing -- <corpus-dir>
 //! ```
 //!

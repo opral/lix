@@ -6,7 +6,7 @@
 //! have produced, and how fast does the boundary search itself run?
 //!
 //! ```sh
-//! cargo run -p lix_benchmarks --release --features storage-benches,slatedb \
+//! cargo run -p lix_e2e --release --features storage-benches,slatedb \
 //!   --example chunking_oracle -- <corpus-dir>
 //! ```
 //!

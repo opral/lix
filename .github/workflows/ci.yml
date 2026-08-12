@@ -114,7 +114,7 @@ jobs:
       # roughly ten pull requests because a plain `cargo test -p lix` never
       # built it.
       #
-      # `lix_benchmarks` is excluded from that blanket only because its `tpch`
+      # `lix_e2e` is excluded from that blanket only because its `tpch`
       # feature pulls `duckdb` with the `bundled` C++ build. No test needs it —
       # DuckDB is used solely by `[[bench]] tpch`, and `cargo test` never runs
       # benches — so it was minutes of CI spent compiling a dependency nothing
@@ -131,8 +131,8 @@ jobs:
       - name: Compile Rust workspace tests
         if: matrix.task == 'test'
         run: |
-          cargo test --profile test --workspace --exclude lix_benchmarks --all-features --no-run
-          cargo test --profile test -p lix_benchmarks --features storage-benches,slatedb,root-replay-trace --no-run
+          cargo test --profile test --workspace --exclude lix_e2e --all-features --no-run
+          cargo test --profile test -p lix_e2e --features storage-benches,slatedb,root-replay-trace --no-run
 
       - name: Run Rust workspace tests
         # Deliberately no RUST_MIN_STACK here. Tests that need more than
@@ -148,8 +148,8 @@ jobs:
         # never ran.
         if: matrix.task == 'test'
         run: |
-          cargo test --profile test --workspace --exclude lix_benchmarks --all-features --no-fail-fast
-          cargo test --profile test -p lix_benchmarks --features storage-benches,slatedb,root-replay-trace --no-fail-fast
+          cargo test --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
+          cargo test --profile test -p lix_e2e --features storage-benches,slatedb,root-replay-trace --no-fail-fast
 
       - name: Verify the packaged plugin API contract
         if: matrix.task == 'test'

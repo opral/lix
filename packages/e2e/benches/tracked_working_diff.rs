@@ -9,9 +9,9 @@
 //! working set.
 //!
 //! ```text
-//! cargo bench -p lix_benchmarks --features storage-benches --bench tracked_working_diff -- \
+//! cargo bench -p lix_e2e --features storage-benches --bench tracked_working_diff -- \
 //!   setup rocksdb /tmp/lix-working-diff-repeated repeated 10000 1000 10
-//! cargo bench -p lix_benchmarks --features storage-benches --bench tracked_working_diff -- \
+//! cargo bench -p lix_e2e --features storage-benches --bench tracked_working_diff -- \
 //!   measure rocksdb /tmp/lix-working-diff-repeated 11
 //! ```
 //!

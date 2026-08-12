@@ -19,7 +19,7 @@
 //! LIX_NATIVE_FILE_READ_COMPONENT_FILE_COUNTS=1000,5000 \
 //! LIX_NATIVE_FILE_READ_COMPONENT_HISTORY_COMMITS=100,1000,5000 \
 //! LIX_NATIVE_FILE_READ_COMPONENT_PAIRS=30 \
-//! cargo bench -p lix_benchmarks --bench native_file_read_component \
+//! cargo bench -p lix_e2e --bench native_file_read_component \
 //!   --features storage-benches,slatedb
 //! ```
 //!

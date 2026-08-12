@@ -6,12 +6,12 @@
 //! are rotated on every round to avoid a fixed run-order advantage.
 //!
 //! ```text
-//! LIX_RETURNING_PROFILE=1 cargo bench -p lix_benchmarks \
+//! LIX_RETURNING_PROFILE=1 cargo bench -p lix_e2e \
 //!   --no-default-features --bench registered_entity_returning
 //!
 //! LIX_RETURNING_PROFILE=1 LIX_RETURNING_PROFILE_ROWS=10000 \
 //! LIX_RETURNING_PROFILE_ROUNDS=15 LIX_RETURNING_PROFILE_OPERATIONS=insert \
-//!   cargo bench -p lix_benchmarks --no-default-features \
+//!   cargo bench -p lix_e2e --no-default-features \
 //!   --bench registered_entity_returning
 //! ```
 //!
@@ -260,7 +260,7 @@ fn main() {
 fn print_usage() {
     println!(
         "registered_entity_returning is opt-in; run \
-         LIX_RETURNING_PROFILE=1 cargo bench -p lix_benchmarks \
+         LIX_RETURNING_PROFILE=1 cargo bench -p lix_e2e \
          --no-default-features --bench registered_entity_returning"
     );
 }

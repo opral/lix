@@ -128,7 +128,7 @@ and `a3662a115722435363e83fd9b1dc657d266349eee65c5a1d73b894a0e1e6a9c5`.
 
 ```text
 LIX_MEDIA_QUAL_BACKEND=<rocksdb|slatedb> LIX_MEDIA_QUAL_MIB=<64|512> \
-  cargo test --release -p lix_benchmarks \
+  cargo test --release -p lix_e2e \
   --test large_payload_read_qualification \
   --features storage-benches,slatedb -- \
   --ignored --nocapture --test-threads=1

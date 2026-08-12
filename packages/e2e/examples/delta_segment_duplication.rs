@@ -24,7 +24,7 @@
 //!
 //! Usage:
 //! ```sh
-//! cargo run -p lix_benchmarks --release --features storage-benches \
+//! cargo run -p lix_e2e --release --features storage-benches \
 //!   --example delta_segment_duplication -- [rows] [workloads]
 //! ```
 //! `workloads` is a comma-separated subset of the names in `WORKLOADS`.

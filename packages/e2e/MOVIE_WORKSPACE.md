@@ -6,7 +6,7 @@ history commits, and concurrent project saves. Run the local SlateDB profile
 with:
 
 ```sh
-cargo test -p lix_benchmarks \
+cargo test -p lix_e2e \
   --features 'storage-benches slatedb' \
   --test movie_workspace_qualification \
   slatedb_movie_workspace_interference \
@@ -93,7 +93,7 @@ operation after fixture seeding. It compares one upload part with a four-part
 window while project saves and two proxy streams run concurrently:
 
 ```sh
-cargo test -p lix_benchmarks \
+cargo test -p lix_e2e \
   --features 'storage-benches slatedb' \
   --test movie_workspace_qualification \
   slatedb_movie_workspace_latency_simulation \

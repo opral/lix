@@ -3428,41 +3428,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lix_benchmarks"
-version = "0.11.0"
-dependencies = [
- "ahash",
- "async-trait",
- "blake3",
- "bytes",
- "codspeed-criterion-compat",
- "datafusion",
- "duckdb",
- "fastcdc",
- "futures-util",
- "libc",
- "lix",
- "lix-storage-rocksdb",
- "lix-storage-slatedb",
- "mimalloc",
- "object_store 0.14.0",
- "rustc-hash",
- "serde",
- "serde_json",
- "sha2",
- "slatedb",
- "smallvec",
- "tempfile",
- "tokio",
- "tpchgen",
- "tracing-subscriber",
- "ulid",
- "uuid",
- "xxhash-rust",
- "zstd",
-]
-
-[[package]]
 name = "lix_cli"
 version = "0.11.0"
 dependencies = [
@@ -3494,6 +3459,41 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "lix_e2e"
+version = "0.11.0"
+dependencies = [
+ "ahash",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "codspeed-criterion-compat",
+ "datafusion",
+ "duckdb",
+ "fastcdc",
+ "futures-util",
+ "libc",
+ "lix",
+ "lix-storage-rocksdb",
+ "lix-storage-slatedb",
+ "mimalloc",
+ "object_store 0.14.0",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "sha2",
+ "slatedb",
+ "smallvec",
+ "tempfile",
+ "tokio",
+ "tpchgen",
+ "tracing-subscriber",
+ "ulid",
+ "uuid",
+ "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

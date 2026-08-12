@@ -50,7 +50,7 @@ LIX_SMALL_BLOB_SIZES_KIB=4 \
 LIX_SMALL_BLOB_OPERATIONS=unique_write \
 LIX_SMALL_BLOB_WARMUPS=300 \
 LIX_SMALL_BLOB_SAMPLES=3000 \
-cargo bench -p lix_benchmarks --features storage-benches,slatedb \
+cargo bench -p lix_e2e --features storage-benches,slatedb \
   --bench small_blob_cas
 ```
 

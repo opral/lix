@@ -1,5 +1,5 @@
 [package]
-name = "lix_benchmarks"
+name = "lix_e2e"
 version.workspace = true
 publish = false
 authors.workspace = true
