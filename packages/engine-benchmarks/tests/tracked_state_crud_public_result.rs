@@ -40,7 +40,7 @@ const PUBLIC_RESULT_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 fn run_on_sized_stack<Body, Fut>(name: &str, body: Body)
 where
     Body: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()>,
+    Fut: Future<Output = ()>,
 {
     std::thread::Builder::new()
         .name(name.to_string())
