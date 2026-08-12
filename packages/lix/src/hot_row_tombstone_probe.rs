@@ -827,3 +827,153 @@ async fn undo_restores_a_row_whose_tombstone_was_removed() {
     );
     assert_eq!(restored.len(), 1, "the restored row must be readable");
 }
+
+/// PHASE 6 — is `reject_retention_change` an invariant, or an artefact of
+/// tombstone lifetime?
+///
+/// The fence refuses an untracked INSERT over a tracked-deleted identity, and
+/// it refuses it *because the tombstone is physically present* — `existing` is
+/// the predecessor row. `absence_guards` does not cover this case: those are
+/// pure "must not be live" assertions, so an absent identity and a tombstone
+/// pass identically.
+///
+/// So if any supported operation on `main` already clears that tombstone, the
+/// fence is not durable and the hole is open today — compaction would change
+/// *when* it stops fencing, not *whether*. If nothing clears it, the fence is
+/// real and compaction would breach it.
+///
+/// This tries every route to the no-tombstone state and reports which, if any,
+/// reaches it. Nothing here compacts anything.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn retention_fence_durability_across_supported_operations() {
+    async fn untracked_insert(
+        session: &SessionContext<Memory>,
+        table: &str,
+    ) -> Result<(), String> {
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (id, locale, lixcol_untracked) VALUES ('row-0', 'u', TRUE)"
+                ),
+                &[],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    println!("phase6 | route,tombstones,untracked_insert_result");
+
+    // Each route gets a fresh fixture so the routes cannot contaminate one
+    // another. `base` is the control: no route applied.
+    for route in ["base", "checkpoint", "branch_roundtrip", "on_new_branch"] {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("fencerow")).await;
+        session
+            .execute(
+                "INSERT INTO fencerow (id, locale) VALUES ('row-0', 'keep')",
+                &[],
+            )
+            .await
+            .expect("tracked insert should commit");
+        session
+            .execute("DELETE FROM fencerow WHERE id = 'row-0'", &[])
+            .await
+            .expect("tracked delete should commit");
+
+        let mut session = session;
+        match route {
+            "base" => {}
+            "checkpoint" => {
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("checkpoint should publish");
+            }
+            "branch_roundtrip" => {
+                let main_branch_id = session
+                    .active_branch_id()
+                    .await
+                    .expect("active branch resolves");
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e45-fence-roundtrip".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id,
+                    })
+                    .await
+                    .expect("switch to branch");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: main_branch_id,
+                    })
+                    .await
+                    .expect("switch back to main");
+            }
+            "on_new_branch" => {
+                // The interesting one: a fresh branch's generation is sparse
+                // over a root base and owns no HOT_ROW tombstone of its own.
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e45-fence-newbranch".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id,
+                    })
+                    .await
+                    .expect("switch to branch");
+            }
+            _ => unreachable!(),
+        }
+
+        let census = row_census(&storage).await;
+        let result = untracked_insert(&session, "fencerow").await;
+        let verdict = match &result {
+            Ok(()) => "SUCCEEDED".to_string(),
+            Err(message) => format!("refused: {}", message.replace(',', ";")),
+        };
+        println!("{route},{},{verdict}", census.tombstones);
+
+        // If the untracked insert got in, the identity is now untracked while a
+        // tracked delete of the same identity sits in canonical history. Undo
+        // replays that delete from canonical history (phase 5). If undo brings
+        // the tracked row back, the identity is simultaneously tracked and
+        // untracked.
+        if result.is_ok() {
+            let undo = session.undo().await;
+            match undo {
+                Ok(_) => {
+                    let rows = session
+                        .execute(
+                            "SELECT id, lixcol_untracked FROM fencerow WHERE id = 'row-0'",
+                            &[],
+                        )
+                        .await
+                        .expect("identity reads after undo");
+                    println!(
+                        "{route},POST_UNDO,rows_for_identity={} <- 2 means tracked+untracked \
+                         coexist",
+                        rows.len()
+                    );
+                }
+                Err(error) => println!(
+                    "{route},POST_UNDO,undo_refused: {}",
+                    error.to_string().replace(',', ";")
+                ),
+            }
+        }
+        drop(session);
+    }
+}
