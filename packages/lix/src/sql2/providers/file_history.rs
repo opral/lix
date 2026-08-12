@@ -672,6 +672,7 @@ where
         Arc::clone(&commit_graph),
         query_source.clone(),
         &event_route,
+        &context_route,
         &parent_commit_ids_by_commit,
         metadata_projection,
     )
@@ -1371,7 +1372,18 @@ where
     let snapshot = (rows.len() != 0)
         .then(|| rows.row(rows.len() - 1))
         .and_then(|row| (!row.deleted()).then_some(row.snapshot_content()))
-        .flatten()
+        .flatten();
+    parse_plugin_registry_snapshot(snapshot.map(|snapshot| snapshot.as_str()), observed_commit_id.as_str())
+}
+
+/// Builds the plugin registry a snapshot describes.
+///
+/// A `None` snapshot is an absent or tombstoned registry, i.e. no plugins.
+fn parse_plugin_registry_snapshot(
+    snapshot_content: Option<&str>,
+    observed_commit_id: &str,
+) -> Result<PluginRegistry, LixError> {
+    let snapshot = snapshot_content
         .map(|snapshot| {
             serde_json::from_str::<serde_json::Value>(snapshot).map_err(|error| {
                 LixError::new(
@@ -1697,53 +1709,99 @@ async fn discover_file_history_plugins<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     event_route: &HistoryRoute,
+    context_route: &HistoryRoute,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<FileHistoryPluginDiscovery, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    // The durable registry snapshot is already the complete plugin set at its
-    // observed commit. Read that exact root identity for every reachable commit
-    // instead of inventing a filesystem state from `(anchor, depth)`, which
-    // conflates equal-depth siblings in a DAG.
-    let observed_commit_ids = parent_commit_ids_by_commit
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut reader = TrackedStateContext::new().reader(query_source.store.clone());
-    let mut schema_keys = BTreeSet::new();
-    let mut registries_by_commit = BTreeMap::new();
-    for observed_commit_id in observed_commit_ids {
-        let shared_observed_commit: SharedStr = observed_commit_id.as_str().into();
-        let registry =
-            load_plugin_registry_at_observed_commit(&mut reader, &shared_observed_commit).await?;
-        schema_keys.extend(
-            registry
-                .plugins()
-                .iter()
-                .flat_map(|plugin| plugin.schema_keys().iter().cloned()),
-        );
-        registries_by_commit.insert(observed_commit_id, registry);
-    }
+    let registry_pk = EntityPk::single(PLUGIN_REGISTRY_KEY);
+    let registry_pk_text = registry_pk.as_json_array_text()?;
 
     let mut registry_route = event_route.clone();
-    let registry_pk = EntityPk::single(PLUGIN_REGISTRY_KEY);
-    registry_route.entity_pks = vec![registry_pk.as_json_array_text()?];
-    registry_route.resolved_entity_pks = vec![registry_pk];
+    registry_route.entity_pks = vec![registry_pk_text.clone()];
+    registry_route.resolved_entity_pks = vec![registry_pk.clone()];
     let registry_events = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
         },
-        commit_graph,
-        query_source,
+        Arc::clone(&commit_graph),
+        query_source.clone(),
         &registry_route,
         vec![KEY_VALUE_SCHEMA_KEY.to_string()],
         metadata_projection,
         None,
     )
     .await?;
+
+    // Schema-key discovery reads the registry's change history once instead of
+    // reconstructing the registry at every reachable commit.
+    //
+    // The registry at a reachable commit is whatever the nearest reachable
+    // registry change wrote, so the reachable registry changes carry every
+    // registry value any reachable commit can observe. Taking the union over
+    // those changes is therefore the same schema-key set the per-commit
+    // reconstruction produced, for one traversal instead of one tracked-state
+    // scan per commit. The anchors-only route keeps this independent of a depth
+    // bound, which restricts the rows that are emitted, not which plugins
+    // existed.
+    let mut schema_key_route = context_route.clone();
+    schema_key_route.entity_pks = vec![registry_pk_text];
+    schema_key_route.resolved_entity_pks = vec![registry_pk];
+    let schema_key_entries = if schema_key_route == registry_route {
+        registry_events.clone()
+    } else {
+        load_history_entries(
+            HistoryViewDescriptor {
+                view_name: "lix_file_history",
+                as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
+            },
+            Arc::clone(&commit_graph),
+            query_source.clone(),
+            &schema_key_route,
+            vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+            HistoryMetadataProjection::default(),
+            None,
+        )
+        .await?
+    };
+    let mut schema_keys = BTreeSet::new();
+    for entry in &schema_key_entries {
+        let registry = parse_plugin_registry_snapshot(
+            entry.change.snapshot_content.as_deref(),
+            &entry.observed_commit_id,
+        )?;
+        schema_keys.extend(
+            registry
+                .plugins()
+                .iter()
+                .flat_map(|plugin| plugin.schema_keys().iter().cloned()),
+        );
+    }
+
+    // A registry is only ever compared at a commit whose registry changed and
+    // at that commit's direct parents, so reconstruct exactly those.
+    let mut registry_commit_ids = BTreeSet::new();
+    for entry in &registry_events {
+        registry_commit_ids.insert(entry.observed_commit_id.clone());
+        registry_commit_ids.extend(
+            parent_commit_ids_by_commit
+                .get(&entry.observed_commit_id)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+    }
+    let mut reader = TrackedStateContext::new().reader(query_source.store.clone());
+    let mut registries_by_commit = BTreeMap::new();
+    for observed_commit_id in registry_commit_ids {
+        let shared_observed_commit: SharedStr = observed_commit_id.as_str().into();
+        let registry =
+            load_plugin_registry_at_observed_commit(&mut reader, &shared_observed_commit).await?;
+        registries_by_commit.insert(observed_commit_id, registry);
+    }
 
     Ok(FileHistoryPluginDiscovery {
         schema_keys: schema_keys.into_iter().collect(),
