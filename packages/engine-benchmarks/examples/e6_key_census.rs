@@ -41,7 +41,10 @@ async fn main() {
                 .expect("usage: e6_key_census seed <dir> <rows>")
                 .parse()
                 .expect("row count");
-            seed(&dir, rows).await;
+            // Optional churn phase: single-row updates, one commit each, the
+            // shape `update_one` / `read_one` leave behind.
+            let churn: usize = args.next().map_or(0, |value| value.parse().expect("churn"));
+            seed(&dir, rows, churn).await;
         }
         "census" => {
             let dir = args.next().expect("usage: e6_key_census census <dir>");
@@ -51,7 +54,7 @@ async fn main() {
     }
 }
 
-async fn seed(path: &str, rows: usize) {
+async fn seed(path: &str, rows: usize, churn: usize) {
     let storage = SlateDB::open(path).expect("open SlateDB");
     Engine::initialize(storage.clone())
         .await
@@ -126,10 +129,24 @@ async fn seed(path: &str, rows: usize) {
             .expect("insert untracked fixture row");
     }
 
+    for index in 0..churn {
+        let target = if rows == 0 { 0 } else { index % rows };
+        session
+            .execute(
+                "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2",
+                &[
+                    Value::Text(format!("{{\"ordinal\":{target},\"churn\":{index}}}")),
+                    Value::Text(format!("/fixture/path/{target:08}")),
+                ],
+            )
+            .await
+            .expect("churn update");
+    }
+
     drop(session);
     drop(engine);
     storage.flush().await.expect("flush SlateDB");
-    println!("SEEDED\trows={rows}\tdir={path}");
+    println!("SEEDED\trows={rows}\tchurn={churn}\tdir={path}");
 }
 
 #[derive(Default, Clone)]
