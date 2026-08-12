@@ -45,6 +45,27 @@ use lix::{Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 const INSERT_BATCH: usize = 100;
+/// Directories the seeded files are spread across. Held at 1 by default so the
+/// original file-count curve is unchanged; raised to isolate a term that is
+/// linear in *directories* rather than in resident files. A resolver seeded
+/// from directory descriptors alone is flat in files but not in directories,
+/// and a single-directory fixture cannot tell those apart.
+fn seed_dirs() -> usize {
+    std::env::var("E16_DIRS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(1)
+}
+
+fn seed_path(index: usize) -> String {
+    let dirs = seed_dirs();
+    if dirs <= 1 {
+        format!("/docs/file-{index:07}.txt")
+    } else {
+        format!("/docs/d{:05}/file-{index:07}.txt", index % dirs)
+    }
+}
 /// Above `HOST_CERTIFIED_PACKET_MIN_ROWS` so each seeded file certifies a
 /// dense batch, matching the fixture `e10_branch_file_cost` established.
 const LINES_PER_FILE: usize = 80;
@@ -109,7 +130,8 @@ async fn run_case(
     let seed_started = Instant::now();
     seed_files(&lix, files).await;
     println!(
-        "write_scaling_seed,files={files},seed_ms={:.3}",
+        "write_scaling_seed,files={files},dirs={},seed_ms={:.3}",
+        seed_dirs(),
         seed_started.elapsed().as_secs_f64() * 1_000.0
     );
 
@@ -138,8 +160,9 @@ async fn run_case(
         let mut values = samples.remove(shape).unwrap_or_default();
         values.sort_by(f64::total_cmp);
         println!(
-            "write_scaling,files={files},shape={shape},probes={},\
+            "write_scaling,files={files},dirs={},shape={shape},probes={},\
 p50_ms={:.3},min_ms={:.3},p95_ms={:.3},raw={}",
+            seed_dirs(),
             values.len(),
             percentile(&values, 0.50),
             values.first().copied().unwrap_or(0.0),
@@ -385,7 +408,7 @@ where
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[
-                    Value::Text(format!("/docs/file-{target:07}.txt")),
+                    Value::Text(seed_path(target)),
                     Value::Blob(document(1, probe).into()),
                 ],
             )
@@ -412,7 +435,7 @@ where
             lix.execute(
                 "UPDATE lix_file SET content = $2 WHERE path = $1",
                 &[
-                    Value::Text(format!("/docs/file-{target:07}.txt")),
+                    Value::Text(seed_path(target)),
                     Value::Blob(body.into_bytes().into()),
                 ],
             )
@@ -522,7 +545,7 @@ where
             let parameter = offset * 2;
             sql.push_str(&format!("(${}, ${})", parameter + 1, parameter + 2));
             let index = written + offset;
-            params.push(Value::Text(format!("/docs/file-{index:07}.txt")));
+            params.push(Value::Text(seed_path(index)));
             params.push(Value::Blob(document(LINES_PER_FILE, index).into()));
         }
         lix.execute(&sql, &params)
