@@ -4377,12 +4377,14 @@ async fn stage_tracked_head(
             hot_index_writes_for_commit(state_rows, &root.branch_id, parent_control.as_ref());
         if !index_entries.is_empty() || !index_witnesses.is_empty() {
             crate::hot_state::stage_hot_index_entries(
+                read,
                 writes,
                 &root.branch_id,
                 generation,
                 &index_entries,
                 &index_witnesses,
-            )?;
+            )
+            .await?;
         }
         if let Some(epoch) = working_diff_epoch {
             let next_epoch = TrackedWorkingDiffEpoch {

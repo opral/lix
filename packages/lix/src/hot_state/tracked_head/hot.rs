@@ -4958,13 +4958,16 @@ where
 
     /// Candidate entity primary keys whose indexed column equals `value`.
     ///
-    /// Returns `None` when this collection has no completeness witness for the
-    /// generation, which means the caller must not use the index and must fall
-    /// back to its ordinary scan. `Some` is a candidate set, not an answer:
-    /// entries are never deleted within a generation, so a candidate may name a
-    /// row that has since changed value or been deleted. Callers resolve
-    /// candidates through the exact-entity-pk read and re-apply their own
-    /// predicate. The set never *omits* a live matching row.
+    /// Returns `None` when the caller must not use the index and must fall
+    /// back to its ordinary scan, which happens for two reasons: the
+    /// collection has no completeness witness for the generation, or the
+    /// witness says the plane has degraded far enough that resolving its
+    /// candidates would cost more than the scan (see
+    /// [`hot_index_candidate_budget`]). `Some` is a candidate set, not an
+    /// answer: entries are never deleted within a generation, so a candidate
+    /// may name a row that has since changed value or been deleted. Callers
+    /// resolve candidates through the exact-entity-pk read and re-apply their
+    /// own predicate. The set never *omits* a live matching row.
     pub(crate) async fn scan_hot_index_candidates(
         &self,
         branch_id: &str,
@@ -4980,16 +4983,21 @@ where
             ordinal,
         )));
         let present = PointReadPlan::new(INDEX_SPACE, &[witness])
-            .materialize(
-                &self.store,
-                StorageGetOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                },
-            )
+            .materialize(&self.store, StorageGetOptions::default())
             .await?;
-        if present.value.into_iter().next().flatten().is_none() {
+        let Some(StorageProjectedValue::FullValue(witness_value)) =
+            present.value.into_iter().next().flatten()
+        else {
             return Ok(None);
-        }
+        };
+        // A witness that carries no readable count cannot size the plane, and
+        // an unsized plane is exactly the case this guard exists to refuse.
+        // The next commit that touches the collection republishes the witness
+        // with a count, so this is self-healing rather than permanent.
+        let Some(entries_published) = decode_hot_index_witness(&witness_value) else {
+            return Ok(None);
+        };
+        let budget = hot_index_candidate_budget(entries_published);
         let range = StoragePrefix {
             bytes: Bytes::from(hot_index_value_prefix(
                 branch_id,
@@ -5010,7 +5018,11 @@ where
             .await?;
         let mut candidates = Vec::new();
         loop {
-            let (page, page_has_more) = cursor.next_page(HOT_INDEX_CANDIDATE_PAGE).await?.into_parts();
+            // Never read more than one entry past the budget: the extra entry
+            // is what proves the bucket exceeds it, and everything beyond is
+            // work this route has already decided not to do.
+            let want = (budget + 1 - candidates.len()).min(HOT_INDEX_CANDIDATE_PAGE);
+            let (page, page_has_more) = cursor.next_page(want).await?.into_parts();
             for entry in &page {
                 let StorageProjectedValue::FullValue(value) = &entry.value else {
                     continue;
@@ -5021,6 +5033,9 @@ where
                 candidates.push(EntityPk::from_json_array_text(text).map_err(|error| {
                     head_value_error(format!("hot index entry has an invalid entity pk: {error}"))
                 })?);
+            }
+            if candidates.len() > budget {
+                return Ok(None);
             }
             if !page_has_more {
                 break;
@@ -11688,7 +11703,8 @@ pub(crate) struct HotIndexEntry {
 /// O(changed rows) with no reads. Duplicate `(space, key)` mutations are
 /// rejected by the write set, so identical entries staged twice in one commit
 /// are collapsed here rather than at lowering time.
-pub(crate) fn stage_hot_index_entries(
+pub(crate) async fn stage_hot_index_entries(
+    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     branch_id: &str,
     generation: CommitId,
@@ -11696,6 +11712,7 @@ pub(crate) fn stage_hot_index_entries(
     witnessed_collections: &BTreeSet<(String, u16)>,
 ) -> Result<(), LixError> {
     let mut staged = BTreeSet::new();
+    let mut published_by_collection: BTreeMap<(String, u16), u64> = BTreeMap::new();
     for entry in entries {
         let key = encode_hot_index_entry_key(
             branch_id,
@@ -11718,21 +11735,118 @@ pub(crate) fn stage_hot_index_entries(
                 bytes: Bytes::from(identity.into_bytes()),
             },
         );
+        *published_by_collection
+            .entry((entry.schema_key.clone(), entry.ordinal))
+            .or_default() += 1;
     }
-    for (schema_key, ordinal) in witnessed_collections {
-        let key = encode_hot_index_witness_key(branch_id, generation, schema_key, *ordinal);
-        if !staged.insert(key.clone()) {
+    for collection in witnessed_collections {
+        published_by_collection.entry(collection.clone()).or_default();
+    }
+    if published_by_collection.is_empty() {
+        return Ok(());
+    }
+    // One multi-get and one put per *collection* touched by this commit, not
+    // per row, so maintaining the count is O(collections) and independent of
+    // how many rows the commit carries.
+    let witness_keys = published_by_collection
+        .keys()
+        .map(|(schema_key, ordinal)| {
+            StorageKey(Bytes::from(encode_hot_index_witness_key(
+                branch_id,
+                generation,
+                schema_key,
+                *ordinal,
+            )))
+        })
+        .collect::<Vec<_>>();
+    let previous = PointReadPlan::new(INDEX_SPACE, &witness_keys)
+        .materialize(read, StorageGetOptions::default())
+        .await?
+        .value;
+    for ((collection, published), (key, previous)) in published_by_collection
+        .into_iter()
+        .zip(witness_keys.into_iter().zip(previous.into_iter()))
+    {
+        let existing = match previous {
+            Some(StorageProjectedValue::FullValue(bytes)) => Some(decode_hot_index_witness(&bytes)),
+            Some(StorageProjectedValue::KeyOnly) | None => None,
+        };
+        // Never *create* a witness for a collection that has not asserted
+        // completeness. A witness is the claim that this plane holds every row
+        // of the collection, and inventing one here would turn a partial index
+        // into an authoritative-looking one.
+        if existing.is_none() && !witnessed_collections.contains(&collection) {
+            continue;
+        }
+        // A witness whose previous value could not be decoded restarts the
+        // count from this commit. That undercounts history, which shrinks the
+        // budget and makes the guard fire *earlier* — the safe direction.
+        let total = existing.flatten().unwrap_or(0).saturating_add(published);
+        if !staged.insert(key.0.to_vec()) {
             continue;
         }
         writes.put(
             INDEX_SPACE,
-            StorageKey(Bytes::from(key)),
+            key,
             StorageValue {
-                bytes: Bytes::new(),
+                bytes: Bytes::from(encode_hot_index_witness(total).to_vec()),
             },
         );
     }
     Ok(())
+}
+
+/// Entries published into one `(collection, column)` plane since the
+/// generation began, as carried by the witness record.
+///
+/// This is a monotone upper bound on the plane's size, not an exact count: it
+/// counts staged puts, and a commit that rewrites an unchanged value restages
+/// an identical key. Over-counting only widens the budget, so the bound is
+/// safe in the direction that matters.
+fn encode_hot_index_witness(entries_published: u64) -> [u8; 8] {
+    entries_published.to_be_bytes()
+}
+
+fn decode_hot_index_witness(value: &[u8]) -> Option<u64> {
+    value.try_into().ok().map(u64::from_be_bytes)
+}
+
+/// How many candidates one value lookup may collect before the collection scan
+/// becomes the cheaper route.
+///
+/// **This is a graceful-degradation bound, not a repair.** Entries still
+/// accumulate; past the budget the plane simply stops being consulted, so the
+/// index can never cost more than not having it. Nothing is pruned and no
+/// bytes are reclaimed.
+///
+/// The constant is measured, not chosen. On `ryzen-9950x-I` at base
+/// `a0ccd0dd6`, resolving one candidate costs ≈0.73 µs (point read plus
+/// snapshot parse) while the collection scan costs ≈0.30–0.49 µs per row, so
+/// the index route loses once a bucket exceeds roughly two thirds of the rows
+/// the scan would walk. `entries_published` is an upper bound on the plane's
+/// size and grows with the same entity churn that grows the scan's row count
+/// (deleted rows leave tombstones the scan still walks), which makes it the
+/// available proxy for that row count. Halving it keeps the budget below the
+/// measured crossover.
+///
+/// Checked against every point of the measurement that motivated it: the aged
+/// 100/1000/10000 buckets, the moved 100/1000/10000 buckets and the 100/1000/5000
+/// write-path buckets all exceed their budget, and all were slower than the
+/// scan; the fresh one-candidate arm and the 10-candidate write-path arm stay
+/// under it, and both were faster.
+///
+/// At the boundary the route flips: a bucket of exactly `budget` is served by
+/// the index; one entry more abandons the route after reading that one extra
+/// entry and pays the scan, so the worst case is the scan plus a bounded
+/// key-only prefix read.
+///
+/// The floor exists because below it the absolute cost is smaller than the
+/// measurement's own noise floor — a 64-candidate bucket resolves in ≈47 µs —
+/// so flipping tiny collections to a scan would trade a real access path for
+/// no measurable gain.
+fn hot_index_candidate_budget(entries_published: u64) -> usize {
+    const MIN_CANDIDATE_BUDGET: u64 = 64;
+    usize::try_from((entries_published / 2).max(MIN_CANDIDATE_BUDGET)).unwrap_or(usize::MAX)
 }
 
 /// One indexed value, encoded so that equality is a key prefix.
@@ -15835,6 +15949,68 @@ mod tests {
         assert_eq!(buffers.row_deletes.as_ptr(), row_delete_allocation);
         assert!(buffers.row_puts.capacity() >= ROW_COUNT);
         assert!(buffers.row_deletes.capacity() >= ROW_COUNT);
+    }
+
+    /// The budget is the whole guard, so its shape is pinned here rather than
+    /// inferred from a timing test. Every constant is justified in
+    /// [`hot_index_candidate_budget`]'s own documentation against the
+    /// measurement that produced it.
+    #[test]
+    fn the_candidate_budget_floors_small_planes_and_halves_large_ones() {
+        // Below the floor the absolute cost of resolving a bucket is smaller
+        // than the measurement's noise floor, so tiny planes keep the index.
+        assert_eq!(hot_index_candidate_budget(0), 64);
+        assert_eq!(hot_index_candidate_budget(1), 64);
+        assert_eq!(hot_index_candidate_budget(128), 64);
+        // Above it the budget is half the plane, which sits below the measured
+        // crossover of roughly two thirds.
+        assert_eq!(hot_index_candidate_budget(129), 64);
+        assert_eq!(hot_index_candidate_budget(200), 100);
+        assert_eq!(hot_index_candidate_budget(20_000), 10_000);
+        // The guard must not overflow into a permissive budget on a plane
+        // whose count is nonsense.
+        assert_eq!(hot_index_candidate_budget(u64::MAX), (u64::MAX / 2) as usize);
+    }
+
+    /// Every arm of the measurement that motivated the guard, classified by the
+    /// budget. The aged, moved and large write-path buckets were all slower
+    /// than the collection scan and must be refused; the fresh and small
+    /// write-path buckets were faster and must be kept.
+    #[test]
+    fn the_budget_refuses_exactly_the_buckets_that_lost_to_the_scan() {
+        for (entries_published, bucket, expected_served) in [
+            // arm            plane    bucket  index route beat the scan?
+            /* fresh      */ (1_u64, 1_usize, true),
+            /* write 10   */ (11, 10, true),
+            /* write 100  */ (101, 100, false),
+            /* write 1000 */ (1_001, 1_000, false),
+            /* write 5000 */ (5_001, 5_000, false),
+            /* aged 100   */ (100, 100, false),
+            /* aged 1000  */ (1_000, 1_000, false),
+            /* aged 10000 */ (10_000, 10_000, false),
+            /* moved 100  */ (199, 100, false),
+            /* moved 1000 */ (1_999, 1_000, false),
+            /* moved 10k  */ (19_999, 10_000, false),
+        ] {
+            let served = bucket <= hot_index_candidate_budget(entries_published);
+            assert_eq!(
+                served, expected_served,
+                "plane of {entries_published} entries, bucket of {bucket}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_witness_round_trips_its_published_count() {
+        assert_eq!(decode_hot_index_witness(&encode_hot_index_witness(0)), Some(0));
+        assert_eq!(
+            decode_hot_index_witness(&encode_hot_index_witness(7_919)),
+            Some(7_919)
+        );
+        // An unreadable witness cannot size the plane, and the lookup refuses
+        // the index rather than guessing a budget.
+        assert_eq!(decode_hot_index_witness(&[]), None);
+        assert_eq!(decode_hot_index_witness(&[0, 1, 2]), None);
     }
 
     #[tokio::test]

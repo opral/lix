@@ -74,7 +74,7 @@ async fn index_record_counts(storage: &Memory) -> (usize, usize) {
     let witnesses = entries
         .iter()
         .filter(|entry| match &entry.value {
-            ProjectedValue::FullValue(bytes) => bytes.is_empty(),
+            ProjectedValue::FullValue(bytes) => !bytes.starts_with(b"["),
             ProjectedValue::KeyOnly => true,
         })
         .count();
