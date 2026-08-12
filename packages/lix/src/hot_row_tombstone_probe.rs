@@ -748,3 +748,82 @@ async fn hot_row_tombstone_compaction_premise() {
         );
     }
 }
+
+/// PHASE 5 — write-path question 2: undo/redo must replay from canonical
+/// changes, demonstrated rather than argued.
+///
+/// The code answer is that `session/undo_redo.rs` reads only through
+/// `tracked_state_reader()` — `commit_delta_values_for_schemas` and
+/// `load_projected_batch_at_commit` — both canonical tracked state at a commit,
+/// and never touches `ROW_SPACE`. This is the experiment that shows it.
+///
+/// Delete a row, physically remove its tombstone, reopen the engine cold, then
+/// undo. If undo depended on the `ROW_SPACE` tombstone in any way, the row
+/// could not come back.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn undo_restores_a_row_whose_tombstone_was_removed() {
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("undorow")).await;
+    insert_rows(&session, "undorow", 3).await;
+    let before = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+
+    session
+        .execute("DELETE FROM undorow WHERE id = 'row-1'", &[])
+        .await
+        .expect("delete should commit");
+    let census_after_delete = row_census(&storage).await;
+    let after_delete = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+
+    let removed = drop_all_tombstones(&storage).await;
+    let session = reopen_session(&storage).await;
+    let census_after_drop = row_census(&storage).await;
+    let after_drop = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+
+    session.undo().await.expect("undo should publish");
+    let after_undo = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+    let restored = session
+        .execute("SELECT id, locale FROM undorow WHERE id = 'row-1'", &[])
+        .await
+        .expect("restored row reads");
+
+    println!(
+        "phase5 | before={before} after_delete={after_delete} tombstones_after_delete={} \
+         removed={removed} after_drop={after_drop} tombstones_after_drop={} after_undo={after_undo} \
+         restored_rows={}",
+        census_after_delete.tombstones,
+        census_after_drop.tombstones,
+        restored.len()
+    );
+
+    assert_eq!(before, 3, "fixture should start with three rows");
+    assert_eq!(after_delete, 2, "the delete should be visible");
+    assert_eq!(removed, 1, "the delete should have left exactly one tombstone");
+    assert_eq!(
+        after_drop, 2,
+        "removing the tombstone must not resurrect the row"
+    );
+    assert_eq!(
+        after_undo, 3,
+        "undo must restore the deleted row with its tombstone already gone; \
+         if this fails, undo depends on the ROW_SPACE tombstone and the \
+         never-write design is unsafe"
+    );
+    assert_eq!(restored.len(), 1, "the restored row must be readable");
+}
