@@ -411,6 +411,137 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
         .expect("mixed-batch workspace should close");
 }
 
+/// Plugins behave identically irrespective of lane.
+///
+/// The tracked and untracked arms are deliberately kept in one test so that
+/// "identical behaviour" is *asserted* rather than asserted-about: the same
+/// bytes go through the same plugin and the same projection, and only the lane
+/// differs. Before plugin reconciliation was unskipped for untracked writes,
+/// the untracked arm produced no entity rows at all — an untracked JSON file
+/// was a descriptor plus a content blob whose contents were unqueryable.
+///
+/// The untracked arm's row shape is the one #1346 established: a real
+/// `change_id` (identity) with a NULL `commit_id` (no history). The change id
+/// is asserted as a property, never as a literal — its value is a function of
+/// UUID draw order.
+#[tokio::test]
+async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_one() {
+    const TRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008a1";
+    const UNTRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008a2";
+    const TRACKED_PATH: &str = "/lane-parity-tracked.json";
+    const UNTRACKED_PATH: &str = "/lane-parity-untracked.json";
+    const CONTENT: &[u8] = br#"{"alpha":"plugin"}"#;
+
+    let lix = open_lix().await.expect("lane-parity workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+        &[
+            Value::Text(TRACKED_FILE_ID.to_owned()),
+            Value::Text(TRACKED_PATH.to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("tracked json file should write");
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text(UNTRACKED_FILE_ID.to_owned()),
+            Value::Text(UNTRACKED_PATH.to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("untracked json file should write");
+
+    // Both files must round-trip their bytes regardless of lane.
+    assert_eq!(
+        read_file(&lix, TRACKED_PATH).await.unwrap(),
+        Some(CONTENT.to_vec())
+    );
+    assert_eq!(
+        read_file(&lix, UNTRACKED_PATH).await.unwrap(),
+        Some(CONTENT.to_vec())
+    );
+
+    let member_row = async |file_id: &str| {
+        let result = lix
+            .execute(
+                "SELECT scalar_json, lixcol_untracked, lixcol_change_id, lixcol_commit_id \
+                 FROM json_object_member \
+                 WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("plugin-derived rows should query");
+        let [row] = result.rows() else {
+            panic!(
+                "expected exactly one plugin entity row for file '{file_id}', got {}",
+                result.len()
+            );
+        };
+        row.values().to_vec()
+    };
+
+    // Tracked arm: the pre-existing behaviour, kept beside the untracked arm as
+    // the reference the untracked arm has to match.
+    let [tracked_scalar, tracked_untracked, tracked_change_id, tracked_commit_id] =
+        member_row(TRACKED_FILE_ID).await.try_into().unwrap_or_else(|_| {
+            panic!("expected four projected columns for the tracked plugin entity row")
+        });
+    assert_eq!(tracked_scalar, Value::Text(r#""plugin""#.to_owned()));
+    assert_eq!(tracked_untracked, Value::Boolean(false));
+    assert!(
+        matches!(&tracked_change_id, Value::Text(value)
+            if uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil())),
+        "tracked plugin entity rows must carry a real change id, got {tracked_change_id:?}"
+    );
+    assert!(
+        matches!(&tracked_commit_id, Value::Text(value) if !value.is_empty()),
+        "tracked plugin entity rows enter the commit graph, got {tracked_commit_id:?}"
+    );
+
+    // Untracked arm: the same plugin, the same bytes, the same projection.
+    let [untracked_scalar, untracked_untracked, untracked_change_id, untracked_commit_id] =
+        member_row(UNTRACKED_FILE_ID)
+            .await
+            .try_into()
+            .unwrap_or_else(|_| {
+                panic!("expected four projected columns for the untracked plugin entity row")
+            });
+    assert_eq!(
+        untracked_scalar, tracked_scalar,
+        "the same JSON must parse to the same entity value irrespective of lane"
+    );
+    assert_eq!(
+        untracked_untracked,
+        Value::Boolean(true),
+        "entity rows inherit their file's lane"
+    );
+    assert!(
+        matches!(&untracked_change_id, Value::Text(value)
+            if uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil())),
+        "untracked plugin entity rows are identity-bearing, got {untracked_change_id:?}"
+    );
+    assert_eq!(
+        untracked_commit_id,
+        Value::Null,
+        "untracked plugin entity rows must stay outside the commit graph"
+    );
+
+    lix.close()
+        .await
+        .expect("lane-parity workspace should close");
+}
+
 #[tokio::test]
 async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     let archive = build_csv_plugin_archive();
