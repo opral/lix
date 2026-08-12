@@ -867,7 +867,13 @@ async fn retention_fence_durability_across_supported_operations() {
 
     // Each route gets a fresh fixture so the routes cannot contaminate one
     // another. `base` is the control: no route applied.
-    for route in ["base", "checkpoint", "branch_roundtrip", "on_new_branch"] {
+    for route in [
+        "base",
+        "checkpoint",
+        "branch_roundtrip",
+        "on_new_branch",
+        "tombstone_dropped",
+    ] {
         let (storage, session) = open_session().await;
         register(&session, probe_schema("fencerow")).await;
         session
@@ -934,6 +940,16 @@ async fn retention_fence_durability_across_supported_operations() {
                     })
                     .await
                     .expect("switch to branch");
+            }
+            // The state compaction would create, reached here by removing the
+            // tombstone directly rather than by compacting. No supported
+            // operation reaches this state today; compaction would be the
+            // first. If the fence stops holding here, that is the hole
+            // compaction opens, and it is what PR 1 exists to close.
+            "tombstone_dropped" => {
+                let removed = drop_all_tombstones(&storage).await;
+                assert_eq!(removed, 1, "the tracked delete should leave one tombstone");
+                session = reopen_session(&storage).await;
             }
             _ => unreachable!(),
         }
