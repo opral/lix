@@ -3809,12 +3809,24 @@ mod tests {
         serde_json::json!({ "revision": revision, "body": body }).to_string()
     }
 
-    async fn register_payload_schema<S>(session: &crate::integration::SessionContext<S>)
-    where
+    /// Registers one of several **identically shaped** payload tables.
+    ///
+    /// A row's out-of-band payload is its whole snapshot, and the snapshot
+    /// carries the entity's primary key — so two rows can only share a payload
+    /// when their snapshots are byte-identical, which means the same key with
+    /// the same value under a *different* schema. The schema key lives in the
+    /// storage key, not in the snapshot, so these tables are exactly the
+    /// distinct owners a co-ownership fixture needs. (An earlier version used
+    /// two different paths, believed it had proved dedup, and was measuring two
+    /// unrelated payloads.)
+    async fn register_payload_schema<S>(
+        session: &crate::integration::SessionContext<S>,
+        schema_key: &str,
+    ) where
         S: crate::storage::Storage + Clone + Send + Sync + 'static,
     {
         let schema = serde_json::json!({
-            "x-lix-key": "gc_payload_row",
+            "x-lix-key": schema_key,
             "x-lix-primary-key": ["/path"],
             "type": "object",
             "required": ["path", "value"],
@@ -3904,19 +3916,11 @@ mod tests {
     /// A payload named by two owners, one of which this sweep retires, must
     /// survive.
     ///
-    /// This is the case the reclamation exists to *not* break, and it is the
-    /// dedup hazard stated exactly: the store is content addressed, so writing
-    /// the same content on a second branch does **not** write a second payload
-    /// — it resolves onto the row the first branch already produced. Retiring
-    /// the commit that happened to author it first must therefore not be read
-    /// as "nobody names this".
-    ///
-    /// Two *branches* rather than two rows, because a row's payload is its
-    /// whole snapshot and the snapshot carries the primary key: two distinct
-    /// entities can never share a payload, so a same-entity/different-scope
-    /// fixture is the only one that actually produces co-ownership. An earlier
-    /// version of this test used two paths, believed it had proved dedup, and
-    /// was measuring two unrelated payloads.
+    /// This is the case the reclamation exists to *not* break, and it states
+    /// the dedup hazard exactly: the store is content addressed, so the second
+    /// owner does **not** write a second payload — it resolves onto the row the
+    /// first owner already produced. Retiring the commit that happened to
+    /// author it first must therefore not be read as "nobody names this".
     #[tokio::test]
     async fn repository_gc_keeps_a_payload_a_second_owner_still_names() {
         let backend = Memory::new();
@@ -3930,15 +3934,8 @@ mod tests {
             .open_workspace_session()
             .await
             .expect("shared-payload session should open");
-        register_payload_schema(&session).await;
-        let mirror = session
-            .create_branch(crate::CreateBranchOptions {
-                id: Some("01990000-0000-7000-8000-0000000004a1".to_owned()),
-                name: "payload-mirror".to_owned(),
-                from_commit_id: None,
-            })
-            .await
-            .expect("mirror branch should create");
+        register_payload_schema(&session, "gc_payload_row").await;
+        register_payload_schema(&session, "gc_payload_mirror").await;
 
         let shared = out_of_band_payload(0);
         let shared_ref = payload_ref_added_by(&backend, || async {
@@ -3954,9 +3951,8 @@ mod tests {
         let before_mirror = json_payload_refs(&backend).await;
         session
             .execute(
-                "INSERT INTO gc_payload_row (path, value, lixcol_branch_id) \
-                 VALUES ('/shared', lix_json($1), $2)",
-                &[Value::Text(shared.clone()), Value::Text(mirror.id.clone())],
+                "INSERT INTO gc_payload_mirror (path, value) VALUES ('/shared', lix_json($1))",
+                &[Value::Text(shared.clone())],
             )
             .await
             .expect("second owner should publish");
@@ -3966,8 +3962,8 @@ mod tests {
             "the premise of this test is that identical content dedups onto one row"
         );
 
-        // Churn only the branch that authored it, so that commit becomes
-        // retirable while the mirror branch keeps naming the payload.
+        // Churn only the first owner, so the commit that authored the shared
+        // payload becomes retirable while the mirror row keeps naming it.
         for revision in 1..=8 {
             session
                 .execute(
@@ -4006,8 +4002,8 @@ mod tests {
 
         let value = session
             .execute(
-                "SELECT value FROM gc_payload_row WHERE path = '/shared' AND lixcol_branch_id = $1",
-                &[Value::Text(mirror.id.clone())],
+                "SELECT value FROM gc_payload_mirror WHERE path = '/shared'",
+                &[],
             )
             .await
             .expect("second owner should still read")
@@ -4025,9 +4021,7 @@ mod tests {
     ///
     /// Untracked rows live only in the hot serving plane — no commit names
     /// them — so a live set derived from commits alone deletes this payload out
-    /// from under both of them. They are placed on separate branches for the
-    /// same reason as above: identical content is what makes them co-owners of
-    /// one row, and identical content of one entity means distinct scopes.
+    /// from under both of them.
     #[tokio::test]
     async fn repository_gc_keeps_a_payload_co_owned_by_history_and_untracked_rows() {
         let backend = Memory::new();
@@ -4041,20 +4035,12 @@ mod tests {
             .open_workspace_session()
             .await
             .expect("co-owned payload session should open");
-        register_payload_schema(&session).await;
-        let mut untracked_branches = Vec::new();
-        for (index, name) in ["co-untracked-a", "co-untracked-b"].into_iter().enumerate() {
-            untracked_branches.push(
-                session
-                    .create_branch(crate::CreateBranchOptions {
-                        id: Some(format!("01990000-0000-7000-8000-0000000004b{index}")),
-                        name: name.to_owned(),
-                        from_commit_id: None,
-                    })
-                    .await
-                    .expect("untracked co-owner branch should create")
-                    .id,
-            );
+        for schema_key in [
+            "gc_payload_row",
+            "gc_payload_untracked_a",
+            "gc_payload_untracked_b",
+        ] {
+            register_payload_schema(&session, schema_key).await;
         }
 
         let shared = out_of_band_payload(0);
@@ -4069,12 +4055,14 @@ mod tests {
         })
         .await;
         let before_untracked = json_payload_refs(&backend).await;
-        for branch_id in &untracked_branches {
+        for table in ["gc_payload_untracked_a", "gc_payload_untracked_b"] {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value, lixcol_branch_id, lixcol_untracked) \
-                     VALUES ('/co', lix_json($1), $2, true)",
-                    &[Value::Text(shared.clone()), Value::Text(branch_id.clone())],
+                    &format!(
+                        "INSERT INTO {table} (path, value, lixcol_untracked) \
+                         VALUES ('/co', lix_json($1), true)"
+                    ),
+                    &[Value::Text(shared.clone())],
                 )
                 .await
                 .expect("untracked owner should publish");
@@ -4124,20 +4112,12 @@ mod tests {
             json_ref_exists(&backend, crate::json_store::JSON_SPACE, shared_ref).await,
             "the co-owned payload row must survive the sweep"
         );
-        for branch_id in &untracked_branches {
+        for table in ["gc_payload_untracked_a", "gc_payload_untracked_b"] {
             let rows = session
-                .execute(
-                    "SELECT value FROM gc_payload_row \
-                     WHERE path = '/co' AND lixcol_branch_id = $1",
-                    &[Value::Text(branch_id.clone())],
-                )
+                .execute(&format!("SELECT value FROM {table} WHERE path = '/co'"), &[])
                 .await
                 .expect("untracked owner should still read");
-            assert_eq!(
-                rows.rows().len(),
-                1,
-                "untracked row on branch '{branch_id}' must survive"
-            );
+            assert_eq!(rows.rows().len(), 1, "untracked row in '{table}' must survive");
             let value = rows.rows()[0]
                 .get::<serde_json::Value>("value")
                 .expect("untracked owner should still carry its payload");
@@ -4163,7 +4143,7 @@ mod tests {
             .open_workspace_session()
             .await
             .expect("superseded payload session should open");
-        register_payload_schema(&session).await;
+        register_payload_schema(&session, "gc_payload_row").await;
 
         session
             .execute(
