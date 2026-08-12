@@ -1706,6 +1706,22 @@ mod tests {
                 .await
                 .expect("post-checkpoint insert should dirty a new identity");
         }
+        // Dirty the file itself, not just rows inside it. This puts a row of a
+        // *different* schema into file 0's diff, which is the case the bare
+        // `file_id` shape must cover and the `file_id + schema_key` shape must
+        // not. Without it both shapes would return the same json_pointer rows
+        // and the `FILE_SPACE` schema-domain resolution would go unexercised.
+        session
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
+                &[
+                    crate::Value::Text("changed".to_string()),
+                    crate::Value::Text(files[0].to_string()),
+                ],
+            )
+            .await
+            .expect("file content update should dirty the file descriptor");
+
         // An untracked row cannot live inside a tracked file — file ownership
         // validation requires a row and its owning file to share one lane — so
         // the untracked case is only reachable in the null-file bucket. It is
@@ -1819,6 +1835,16 @@ mod tests {
                 scoped_schema, want_schema,
                 "the file+schema working-diff bypass disagrees with the index scan for {file}"
             );
+            if file == files[0] {
+                // The dirtied file descriptor proves the bare `file_id` shape
+                // resolved a schema domain wider than the one predicate-named
+                // schema, rather than silently answering json_pointer only.
+                assert!(
+                    want.len() > want_schema.len(),
+                    "fixture should put a non-json_pointer schema in {file}'s diff, \
+                     otherwise the FILE_SPACE schema-domain resolution is untested"
+                );
+            }
         }
     }
 
