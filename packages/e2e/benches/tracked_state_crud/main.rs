@@ -648,12 +648,38 @@ fn profile_hot_sql_session_operations(
         black_box(row_count);
         return;
     }
+    let hot_delta_census =
+        std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_DELTA_CENSUS").is_some();
+    if hot_delta_census {
+        // One untimed warm repeat first, so the census counts a steady-state
+        // operation rather than first-touch cache population.
+        runtime.block_on(run_sql_session_operation(operation, &fixture));
+        let _ = lix::storage_bench::take_commit_delta_phase_census();
+    }
     let start = Instant::now();
     let mut row_count = 0;
     for _ in 0..repeats {
         row_count += runtime.block_on(run_sql_session_operation(operation, &fixture));
     }
     let elapsed = start.elapsed();
+    if hot_delta_census {
+        let census = lix::storage_bench::take_commit_delta_phase_census();
+        for (phase, entry) in census.iter().enumerate() {
+            println!(
+                "tracked_state_crud commit-delta census: op={} phase={} repeats={repeats} ordered_load_keys={} leaf_decodes={} leaf_decode_rows={} leaf_decode_bytes={} zstd_calls={} zstd_in_bytes={} zstd_out_bytes={} encodes={}",
+                profile_operation_name(operation),
+                lix::storage_bench::crud_phase_name(phase),
+                entry.ordered_load_keys,
+                entry.leaf_decodes,
+                entry.leaf_decode_rows,
+                entry.leaf_decode_bytes,
+                entry.zstd_calls,
+                entry.zstd_in_bytes,
+                entry.zstd_out_bytes,
+                entry.encodes,
+            );
+        }
+    }
     let profile_detail = format!(
         "{} read_shape={}",
         profile_read_many_detail(operation, read_many_pk_count),
@@ -874,6 +900,11 @@ fn profile_sql_session_operation(
             lix::storage_bench::begin_crud_ownership_accounting();
         }
         let _ = lix::storage_bench::take_crud_current_state_scoped_range_accounting();
+        let delta_census =
+            std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_DELTA_CENSUS").is_some();
+        if delta_census {
+            let _ = lix::storage_bench::take_commit_delta_phase_census();
+        }
         if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
             let _ = lix::storage_bench::take_crud_physical_write_accounting();
             let _ = lix::storage_bench::take_crud_commit_state_manifest_bytes();
@@ -883,6 +914,24 @@ fn profile_sql_session_operation(
         samples.push(start.elapsed());
         black_box(result);
         maybe_print_profile_rss_phase("after_operation");
+        if delta_census {
+            let census = lix::storage_bench::take_commit_delta_phase_census();
+            for (phase, entry) in census.iter().enumerate() {
+                println!(
+                    "tracked_state_crud commit-delta census: op={} phase={} ordered_load_keys={} leaf_decodes={} leaf_decode_rows={} leaf_decode_bytes={} zstd_calls={} zstd_in_bytes={} zstd_out_bytes={} encodes={}",
+                    profile_operation_name(operation),
+                    lix::storage_bench::crud_phase_name(phase),
+                    entry.ordered_load_keys,
+                    entry.leaf_decodes,
+                    entry.leaf_decode_rows,
+                    entry.leaf_decode_bytes,
+                    entry.zstd_calls,
+                    entry.zstd_in_bytes,
+                    entry.zstd_out_bytes,
+                    entry.encodes,
+                );
+            }
+        }
         print_allocation_accounting("operation");
         if ownership_accounting {
             print_ownership_accounting(lix::storage_bench::take_crud_ownership_accounting());
