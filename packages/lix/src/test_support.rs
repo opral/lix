@@ -746,7 +746,7 @@ async fn stage_test_changelog_commit(
         .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
         .unwrap_or_else(test_timestamp);
     let record = CommitRecord {
-        format_version: 3,
+        format_version: 4,
         commit_id: typed_commit_id,
         generation,
         parent_commit_ids: typed_parent_ids,

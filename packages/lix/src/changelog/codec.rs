@@ -136,7 +136,7 @@ mod tests {
         let commit_id = CommitId::for_test_label("codec-segment-commit");
         let base_commit_id = CommitId::for_test_label("codec-segment-base");
         let record = CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation: 70,
             parent_commit_ids: vec![CommitId::for_test_label("codec-segment-parent")],

@@ -2043,12 +2043,13 @@ where
             }
             let parent_start = commits.parent_commit_ids.len();
             let parent_len = commit.parent_commit_ids.len();
+            let change_id = commit.change_id();
             commits
                 .parent_commit_ids
                 .extend(commit.parent_commit_ids.into_iter());
             commits.entries.push(GcCommitInventoryEntry {
                 commit_id: commit.commit_id,
-                change_id: commit.change_id(),
+                change_id,
                 parent_start,
                 parent_len,
             });
@@ -4692,7 +4693,7 @@ mod tests {
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
         let commits = [
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: source_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -4702,7 +4703,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: alias_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -4712,7 +4713,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: authority_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -4722,7 +4723,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![alias_commit, authority_commit],
@@ -4939,7 +4940,7 @@ mod tests {
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
         let commits = vec![
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: live_parent,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -4949,7 +4950,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![live_parent],
@@ -4959,7 +4960,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: dead_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -5259,7 +5260,7 @@ mod tests {
     fn gc_authority_record(label: &str) -> CommitRecord {
         let commit_id = CommitId::for_test_label(label);
         CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
@@ -5284,7 +5285,7 @@ mod tests {
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             parent.map_or((commit_id, 0), |parent| (parent, 1));
         CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation,
             parent_commit_ids: parent.into_iter().collect(),

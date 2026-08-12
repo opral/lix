@@ -612,7 +612,7 @@ async fn stage_init_changelog_commit(
     changes: Vec<ChangeRecord>,
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
-        format_version: 3,
+        format_version: 4,
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),

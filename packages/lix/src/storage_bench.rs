@@ -1123,7 +1123,7 @@ where
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation,
             parent_commit_ids: parents,

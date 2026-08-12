@@ -343,6 +343,8 @@ pub(crate) struct ChangelogAppend {
 #[musli(packed)]
 pub(crate) struct CommitRecord {
     /// Version 3 adds the authenticated first-parent jump certified below.
+    /// Version 4 drops the stored `change_id`: it is now derived from
+    /// `commit_id` by [`CommitRecord::change_id`].
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     /// Longest-path distance from a graph root. Every parent has a strictly
@@ -605,7 +607,7 @@ mod topology_tests {
     fn record(depth: u64, parent: Option<CommitId>, jump: Option<(CommitId, u64)>) -> CommitRecord {
         let commit_id = id(depth);
         CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation: depth,
             parent_commit_ids: parent.into_iter().collect(),
