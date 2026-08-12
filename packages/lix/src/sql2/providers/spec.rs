@@ -1148,7 +1148,7 @@ impl SpecScanExec {
             .filter_map(|column_name| {
                 planned.schema.index_of(column_name).ok().map(|index| {
                     ConstExpr::new(
-                        Arc::new(Column::new(column_name, index)) as Arc<dyn PhysicalExpr>,
+                        Arc::new(Column::new(column_name, index)),
                         AcrossPartitions::Uniform(None),
                     )
                 })
