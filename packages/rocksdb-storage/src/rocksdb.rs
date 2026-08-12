@@ -255,6 +255,17 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
     }
 }
 
+/// MEASUREMENT SCAFFOLD (E37) — remove before shipping.
+///
+/// `LIX_E37_SKIP_CAS_CHECKSUM=1` drops RocksDB's own checksum verification on
+/// full-value reads of the binary CAS chunk space only. Every other space keeps
+/// it. Default is off, i.e. today's behaviour.
+fn e37_skip_cas_checksum(space: StorageSpace) -> bool {
+    const BINARY_CAS_CHUNK_SPACE_ID: u32 = 0x0005_0003;
+    space.id.0 == BINARY_CAS_CHUNK_SPACE_ID
+        && std::env::var("LIX_E37_SKIP_CAS_CHECKSUM").as_deref() == Ok("1")
+}
+
 fn column_family(db: &DB, space: StorageSpace) -> &ColumnFamily {
     match space.value_semantics {
         ValueSemantics::Mutable => mutable_column_family(db),
@@ -352,9 +363,23 @@ impl StorageRead for RocksDBRead<'_> {
                         }
                     }
                     CoreProjection::FullValue => {
-                        let values = self
-                            .snapshot
-                            .multi_get_cf(physical_keys.iter().map(|key| (cf, key.0.as_ref())));
+                        // MEASUREMENT SCAFFOLD (E37) — remove before shipping.
+                        // Sizes the prize of dropping RocksDB's checksum on the
+                        // binary CAS chunk space (0x0005_0003), whose every
+                        // production full-value read is already BLAKE3-verified
+                        // against its key by `binary_cas/kv.rs`. One binary
+                        // produces both arms so codegen cannot differ.
+                        let values = if e37_skip_cas_checksum(request.space) {
+                            let mut opts = rocksdb::ReadOptions::default();
+                            opts.set_verify_checksums(false);
+                            self.snapshot.multi_get_cf_opt(
+                                physical_keys.iter().map(|key| (cf, key.0.as_ref())),
+                                opts,
+                            )
+                        } else {
+                            self.snapshot
+                                .multi_get_cf(physical_keys.iter().map(|key| (cf, key.0.as_ref())))
+                        };
                         results.extend(
                             values
                                 .into_iter()
