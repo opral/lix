@@ -1918,7 +1918,11 @@ fn current_state_delta_from_state_row(
         schema_key: row.schema_key,
         file_id: row.file_id.map(crate::common::SharedStr::as_str),
         entity_pk: row.entity_pk,
-        change_id: (!row.untracked).then_some(change_id),
+        // Untracked rows are identity-bearing but history-free: the minted
+        // change_id travels with the row, while commit_id stays absent so the
+        // row never joins the commit graph. Changelog exclusion is enforced
+        // separately, by the addressable-change filter, not by dropping this.
+        change_id: Some(change_id),
         commit_id,
         untracked: row.untracked,
         deleted: row.snapshot.is_none(),
