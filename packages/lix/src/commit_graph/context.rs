@@ -12,7 +12,10 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitRecord,
-    CommitScanRequest,
+    CommitScanRequest, CommitScopeKey,
+};
+use crate::commit_graph::scope_digest_census::{
+    ScopeDigestOutcome, record_scope_digest_outcome, scope_digest_census,
 };
 use crate::commit_graph::walker::{ReachableWalk, best_common_ancestors, walk_reachable_nodes};
 use crate::commit_graph::{
@@ -445,6 +448,7 @@ where
     ) -> Result<CommitGraphHistory, LixError> {
         let shaping = HistoryShaping::new(request);
         let mut state = HistoryCollection::default();
+        let census_before = scope_digest_census();
 
         // Unbounded row demand still materializes and caches the whole
         // depth-bounded topology, because callers reuse it for commit metadata.
@@ -463,6 +467,9 @@ where
                 )
                 .await?;
             }
+            scope_digest_census()
+                .since(&census_before)
+                .emit(start_commit_id);
             return Ok(CommitGraphHistory {
                 entries: state.entries,
                 reachable_nodes: nodes,
@@ -499,6 +506,9 @@ where
             }
         }
 
+        scope_digest_census()
+            .since(&census_before)
+            .emit(start_commit_id);
         Ok(CommitGraphHistory {
             entries: state.entries,
             reachable_nodes: Arc::from(reachable_nodes),
@@ -537,6 +547,18 @@ where
         if !shaping.may_include_members {
             return Ok(());
         }
+
+        // The per-commit membership test. `node` is already in hand — the
+        // traversal had to load it to find this commit's parents — so proving
+        // that none of the requested scopes has a member here costs no storage
+        // read at all, and skips the replay-state header + inventory pair that
+        // `load_member_changes` would otherwise fetch for this commit.
+        let outcome = scope_digest_outcome(node, request, shaping);
+        record_scope_digest_outcome(outcome);
+        if outcome == ScopeDigestOutcome::Pruned {
+            return Ok(());
+        }
+
         for change in self
             .load_member_changes(node.commit_id, &shaping.member_schema_keys)
             .await?
@@ -656,7 +678,9 @@ fn commit_graph_node_from_record(
         first_parent_jump_commit_id: record.first_parent_jump_commit_id,
         first_parent_jump_span: record.first_parent_jump_span,
         created_at: record.created_at,
+        touched_scope_digest: record.touched_scope_digest,
     };
+    node.touched_scope_digest.validate()?;
     validate_first_parent_jump_summary(&node)?;
     Ok(Some(node))
 }
@@ -773,6 +797,82 @@ where
 fn depth_matches(depth: u32, request: &CommitGraphChangeHistoryRequest) -> bool {
     request.min_depth.is_none_or(|min| depth >= min)
         && request.max_depth.is_none_or(|max| depth <= max)
+}
+
+/// Bound on how many `(schema_key, file_id)` pairs the membership test will
+/// probe before falling back to the schema-family-only test.
+///
+/// Each pair costs one BLAKE3 keyed hash. A history request with a wide file
+/// filter must not turn a free test into a per-commit hashing loop; the
+/// schema-only test still prunes, just less selectively.
+const MAX_PROBED_SCOPE_PAIRS: usize = 32;
+
+/// Decides whether this commit's delta can be skipped without loading it.
+///
+/// Only ever returns [`ScopeDigestOutcome::Pruned`] on an **exact** digest that
+/// proves every requested scope absent. Every other answer loads the delta, so
+/// a wrong digest can only cost time, never rows — except for one real
+/// obligation: the digest must contain a token for every scope the delta has a
+/// member in. That is what `commit_delta_member_scopes` guarantees, and why a
+/// delta whose member scopes are not enumerable publishes `opaque` rather than
+/// a partial filter.
+fn scope_digest_outcome(
+    node: &CommitGraphNode,
+    request: &CommitGraphChangeHistoryRequest,
+    shaping: &HistoryShaping,
+) -> ScopeDigestOutcome {
+    if shaping.member_schema_keys.is_empty() {
+        // An unconstrained request wants every member of every commit; there
+        // is nothing to prove absent.
+        return ScopeDigestOutcome::Unconstrained;
+    }
+    let digest = &node.touched_scope_digest;
+    if digest.is_absent() {
+        return ScopeDigestOutcome::LoadedAbsent;
+    }
+    if !digest.is_exact() {
+        return ScopeDigestOutcome::LoadedOpaque;
+    }
+
+    // Schema-family test first: it is the cheapest and it is the one every
+    // history projection can use, whether or not it also filters by file.
+    let mut family_present = false;
+    for schema_key in &shaping.member_schema_keys {
+        if !digest.proves_absent(&CommitScopeKey {
+            schema_key: schema_key.clone(),
+            file_id: None,
+        }) {
+            family_present = true;
+            break;
+        }
+    }
+    if !family_present {
+        return ScopeDigestOutcome::Pruned;
+    }
+
+    // A request that also pins file ids can ask the sharper question. Entries
+    // with no file id cannot satisfy a non-empty `file_ids` filter (see
+    // `change_matches_history_request`), so probing only the pairs is exact.
+    if request.file_ids.is_empty()
+        || shaping
+            .member_schema_keys
+            .len()
+            .saturating_mul(request.file_ids.len())
+            > MAX_PROBED_SCOPE_PAIRS
+    {
+        return ScopeDigestOutcome::LoadedPresent;
+    }
+    for schema_key in &shaping.member_schema_keys {
+        for file_id in &request.file_ids {
+            if !digest.proves_absent(&CommitScopeKey {
+                schema_key: schema_key.clone(),
+                file_id: Some(file_id.clone()),
+            }) {
+                return ScopeDigestOutcome::LoadedPresent;
+            }
+        }
+    }
+    ScopeDigestOutcome::Pruned
 }
 
 fn change_matches_history_request(
@@ -1423,6 +1523,7 @@ mod tests {
             .stage_append(ChangelogAppend {
                 changes: Vec::new(),
                 commits: vec![CommitRecord {
+                    touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     format_version: 3,
                     commit_id,
                     generation: 0,
@@ -1959,6 +2060,7 @@ mod tests {
             }
 
             let record = CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 3,
                 commit_id,
                 generation,
@@ -2046,6 +2148,7 @@ mod tests {
 
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
         append.commits.push(CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
             generation: 0,

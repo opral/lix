@@ -33,6 +33,14 @@ pub(crate) struct CommitGraphNode {
     pub(crate) first_parent_jump_commit_id: CommitId,
     pub(crate) first_parent_jump_span: u64,
     pub(crate) created_at: LixTimestamp,
+    /// Collection scopes this commit's delta has members in.
+    ///
+    /// This node is already loaded (and cached) once per reached commit by the
+    /// traversal itself, so carrying the digest here makes the per-commit
+    /// history membership test free of any additional point read — the same
+    /// bargain `first_parent_jump_commit_id` already makes for level-ancestor
+    /// queries.
+    pub(crate) touched_scope_digest: crate::changelog::CommitTouchedScopeDigest,
 }
 
 impl ExactValue<CommitId> for CommitGraphNode {

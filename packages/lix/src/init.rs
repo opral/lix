@@ -586,6 +586,7 @@ async fn stage_init_changelog_commit(
     changes: Vec<ChangeRecord>,
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
+        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
         format_version: 4,
         commit_id: plan.commit.id,
         generation: 0,

@@ -197,6 +197,7 @@ pub fn append_ordered_commits(
             .ok_or_else(|| LixError::unknown("ordered benchmark commit index overflow"))?;
         let commit_id = CommitId::with_change_address_space(ordered_bench_uuid(commit_index, 0));
         append.commits.push(CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
             generation: 0,
@@ -229,6 +230,7 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             super::next_first_parent_jump(commit_id, &parent_commit_ids, parent, parent_jump)?;
         append.commits.push(CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
             generation: u64::try_from(commit_index).expect("benchmark commit index fits u64"),
@@ -523,6 +525,7 @@ fn direct_append_with_shape(
             next_change += 1;
         }
         append.commits.push(CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id: typed_commit_id,
             generation: 0,

@@ -6962,6 +6962,7 @@ mod tests {
                     commit_a.as_uuid().as_bytes(),
                 )),
                 crate::changelog::encode_commit_record(&CommitRecord {
+                    touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     format_version: 3,
                     commit_id: commit_a,
                     generation: 2,

@@ -369,6 +369,7 @@ mod tests {
             crate::changelog::COMMIT_SPACE,
             StorageKey(Bytes::copy_from_slice(requested.as_uuid().as_bytes())),
             crate::changelog::encode_commit_record(&CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: embedded,
                 generation: 0,
@@ -410,6 +411,7 @@ mod tests {
             let current_commit_id = commit_id(label);
             let parent_commit_id = commit_id(parent);
             let record = CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: current_commit_id,
                 generation: 1,
@@ -730,6 +732,7 @@ mod tests {
         let left = commit_id("commit-cycle-left");
         let right = commit_id("commit-cycle-right");
         let record = |commit_id, parents| CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
             generation: 2,
@@ -900,6 +903,7 @@ mod tests {
         let child = commit_id("commit-child");
         let mut writes = storage.new_write_set();
         let record = CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id: child,
             generation: 0,
@@ -1459,6 +1463,7 @@ mod tests {
                 },
             };
             let record = CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: typed_commit_id,
                 generation,
