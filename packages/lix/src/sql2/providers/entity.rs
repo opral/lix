@@ -690,7 +690,7 @@ impl TableSpec for EntitySpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     {
-                        crate::sql_profile::record_provider_rows_examined(entity_pks.len());
+// BISECT-A
                         return entity_primary_key_record_batch(&spec, schema, entity_pks);
                     }
                     if let Some(direct_entity_snapshot) = direct_entity_snapshot
@@ -699,7 +699,7 @@ impl TableSpec for EntitySpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     {
-                        crate::sql_profile::record_provider_rows_examined(rows.len());
+// BISECT-B
                         let decoder = EntityProjectionDecoder::new(
                             &spec,
                             schema.fields().iter().map(|field| field.name().as_str()),
@@ -715,9 +715,7 @@ impl TableSpec for EntitySpec {
                         .scan_batch(&request)
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
-                    // Before `row_filters` run: this is the row count a
-                    // predicate without an indexed access path pays for.
-                    crate::sql_profile::record_provider_rows_examined(rows.len());
+// BISECT-C
                     let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                     entity_record_batch_with_parsed(
                         &spec,
