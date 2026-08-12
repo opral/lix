@@ -1777,10 +1777,11 @@ mod tests {
             "the unfiltered working-diff read must take the HOT_DIFF index path"
         );
         assert!(
-            broad.iter().any(|(schema, _, file, kind)| schema
-                == "json_pointer"
-                && file.as_deref() == Some(files[0])
-                && kind == "removed"),
+            broad
+                .iter()
+                .any(|(schema, _, file, kind)| schema == "json_pointer"
+                    && file.as_deref() == Some(files[0])
+                    && kind == "removed"),
             "fixture should produce a removed row inside the probed file"
         );
 
