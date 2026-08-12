@@ -2487,11 +2487,178 @@ mod tests {
         let witnesses = entries
             .iter()
             .filter(|entry| match &entry.value {
-                crate::storage::ProjectedValue::FullValue(bytes) => bytes.is_empty(),
+                crate::storage::ProjectedValue::FullValue(bytes) => !bytes.starts_with(b"["),
                 crate::storage::ProjectedValue::KeyOnly => true,
             })
             .count();
         (witnesses, entries.len() - witnesses)
+    }
+
+    /// The witness carries how many entries the plane has published, which is
+    /// what sizes the degradation budget. It must count every published entry
+    /// in the generation, not just this commit's.
+    async fn hot_index_published_count(storage: &Memory) -> u64 {
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read the index plane");
+        let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE).await;
+        let mut total = 0;
+        for entry in &entries {
+            let crate::storage::ProjectedValue::FullValue(bytes) = &entry.value else {
+                continue;
+            };
+            if bytes.starts_with(b"[") {
+                continue;
+            }
+            let count: [u8; 8] = bytes.as_ref().try_into().expect("witness carries a u64");
+            total += u64::from_be_bytes(count);
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn the_index_witness_accumulates_its_published_entry_count() {
+        let (storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("counted_parent", "counted_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        session
+            .execute("INSERT INTO counted_parent (id) VALUES ('parent-0')", &[])
+            .await
+            .expect("parent should insert");
+        assert_eq!(hot_index_published_count(&storage).await, 0);
+        for index in 0..4 {
+            session
+                .execute(
+                    r#"INSERT INTO counted_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    &[crate::Value::Text(format!("child-{index}"))],
+                )
+                .await
+                .expect("child should insert");
+        }
+        assert_eq!(
+            hot_index_published_count(&storage).await,
+            4,
+            "the count must span commits, not restart at each one"
+        );
+        // A delete publishes no entry — the plane is put-only — so the count
+        // stands still while the collection shrinks. That divergence is
+        // exactly what the budget measures.
+        session
+            .execute("DELETE FROM counted_child WHERE id = 'child-0'", &[])
+            .await
+            .expect("child should delete");
+        assert_eq!(hot_index_published_count(&storage).await, 4);
+    }
+
+    /// Past the budget the lookup abandons the index and the caller's ordinary
+    /// scan serves instead. The route is deliberately invisible in the result,
+    /// so what this pins is that it stays invisible: the same rows, through a
+    /// bucket far past the budget, with live rows, superseded rows and deleted
+    /// rows all present.
+    #[tokio::test]
+    async fn a_bucket_past_the_budget_still_answers_exactly() {
+        let (storage, session) = open_index_probe_session().await;
+        for schema in index_probe_schemas("degraded_parent", "degraded_child") {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        for parent in ["parent-0", "parent-1"] {
+            session
+                .execute(
+                    "INSERT INTO degraded_parent (id) VALUES ($1)",
+                    &[crate::Value::Text(parent.into())],
+                )
+                .await
+                .expect("parent should insert");
+        }
+        const ROWS: usize = 200;
+        let values = (0..ROWS)
+            .map(|index| format!("('child-{index}', 'parent-0', 'en')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!(
+                    r#"INSERT INTO degraded_child (id, "parentId", locale) VALUES {values}"#
+                ),
+                &[],
+            )
+            .await
+            .expect("children should insert");
+        // Move half off `parent-0` and delete a quarter, so the `parent-0`
+        // bucket holds every identity while only a quarter still match.
+        let moved = (0..ROWS / 2)
+            .map(|index| format!("'child-{index}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!(
+                    r#"UPDATE degraded_child SET "parentId" = 'parent-1' WHERE id IN ({moved})"#
+                ),
+                &[],
+            )
+            .await
+            .expect("children should move");
+        let deleted = (ROWS / 2..ROWS * 3 / 4)
+            .map(|index| format!("'child-{index}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("DELETE FROM degraded_child WHERE id IN ({deleted})"),
+                &[],
+            )
+            .await
+            .expect("children should delete");
+
+        let published = hot_index_published_count(&storage).await;
+        assert!(
+            published > 64,
+            "the fixture must push the plane past the budget floor, published {published}"
+        );
+
+        async fn ids(session: &SessionContext<Memory>, parent: &str) -> Vec<String> {
+            let rows = session
+                .execute(
+                    r#"SELECT id FROM degraded_child WHERE "parentId" = $1 ORDER BY id"#,
+                    &[crate::Value::Text(parent.into())],
+                )
+                .await
+                .expect("declared-column read should succeed");
+            rows.rows()
+                .iter()
+                .map(|row| match &row.values()[0] {
+                    crate::Value::Text(id) => id.clone(),
+                    other => panic!("unexpected id value {other:?}"),
+                })
+                .collect()
+        }
+
+        let mut expected_zero = (ROWS * 3 / 4..ROWS)
+            .map(|index| format!("child-{index}"))
+            .collect::<Vec<_>>();
+        expected_zero.sort();
+        assert_eq!(ids(&session, "parent-0").await, expected_zero);
+        let mut expected_one = (0..ROWS / 2)
+            .map(|index| format!("child-{index}"))
+            .collect::<Vec<_>>();
+        expected_one.sort();
+        assert_eq!(ids(&session, "parent-1").await, expected_one);
     }
 
     /// Entries are candidates, never answers. A row whose indexed value moves
