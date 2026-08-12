@@ -87,6 +87,16 @@ async fn run_case(files: usize) {
         .unwrap_or(-1);
     println!("branch_file_cost_plugin_rows,files={files},text_line_rows={plugin_rows}");
 
+    // Control: the same single-file write on the *established* branch, so the
+    // first-write-on-a-fresh-branch number can be read as a branch cost rather
+    // than as "a commit in a big repository".
+    let control_before = snapshot(&storage, &db_path).await;
+    let control_started = Instant::now();
+    write_probe(&lix, "/docs/main-probe.txt").await;
+    let control_ms = control_started.elapsed().as_secs_f64() * 1_000.0;
+    let control_after = snapshot(&storage, &db_path).await;
+    report(files, "control_write_on_main", &control_before, &control_after, control_ms);
+
     let before = snapshot(&storage, &db_path).await;
     if std::env::var_os("E10_INVENTORY").is_some() {
         for (name, counts) in &before.spaces {
@@ -132,18 +142,16 @@ async fn run_case(files: usize) {
     report(files, "switch_branch", &after, &after_switch, switch_ms);
 
     let write_started = Instant::now();
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
-            Value::Text("/docs/branch-probe.txt".to_owned()),
-            Value::Blob(one_document(usize::MAX).into()),
-        ],
-    )
-    .await
-    .expect("write first file on branch-file-cost branch");
+    write_probe(&lix, "/docs/branch-probe-1.txt").await;
     let write_ms = write_started.elapsed().as_secs_f64() * 1_000.0;
     let after_write = snapshot(&storage, &db_path).await;
     report(files, "first_write_on_branch", &after_switch, &after_write, write_ms);
+
+    let second_started = Instant::now();
+    write_probe(&lix, "/docs/branch-probe-2.txt").await;
+    let second_ms = second_started.elapsed().as_secs_f64() * 1_000.0;
+    let after_second = snapshot(&storage, &db_path).await;
+    report(files, "second_write_on_branch", &after_write, &after_second, second_ms);
 
     lix.close().await.expect("close branch-file-cost Lix");
 }
@@ -284,6 +292,21 @@ where
             .expect("seed branch-file-cost files");
         written += batch;
     }
+}
+
+async fn write_probe<StorageImpl>(lix: &Lix<StorageImpl>, path: &str)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+        &[
+            Value::Text(path.to_owned()),
+            Value::Blob(one_document(path.len()).into()),
+        ],
+    )
+    .await
+    .unwrap_or_else(|error| panic!("write branch-file-cost probe {path}: {error:?}"));
 }
 
 fn one_document(index: usize) -> Vec<u8> {
