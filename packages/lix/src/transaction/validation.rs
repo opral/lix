@@ -4738,11 +4738,20 @@ mod tests {
             .await
             .expect_err("tracked file owner must not resolve through pending untracked descriptor");
 
-        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
+        // Same lane mismatch as the committed case: the file is being created
+        // in this very transaction, just in the other lane.
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is untracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
+    /// Pending-descriptor sibling of
+    /// `validation_rejects_untracked_file_owner_reference_committed_as_tracked`.
     #[tokio::test]
-    async fn validation_allows_untracked_file_owner_reference_pending_as_tracked() {
+    async fn validation_rejects_untracked_file_owner_reference_pending_as_tracked() {
         let visible_schemas = vec![
             unique_schema(),
             file_descriptor_schema(),
@@ -4761,13 +4770,21 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &StrictEmptyLiveStateReader,
-        ))
-        .await
-        .expect("untracked file owner should resolve through pending tracked descriptor");
+        let error =
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &StrictEmptyLiveStateReader,
+            ))
+            .await
+            .expect_err("an untracked row must not be owned by a pending tracked file");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is tracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
     #[tokio::test]
