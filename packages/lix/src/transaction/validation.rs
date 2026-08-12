@@ -1798,6 +1798,30 @@ impl FileOwnerReferenceValidator {
             }
         }
 
+        // The file exists, just in the other lane. Saying "missing file_id" for
+        // a file that `SELECT * FROM lix_file` plainly returns sends people
+        // looking for the wrong bug, so name the actual mismatch and both
+        // lanes. This covers each direction: an untracked row pointing at a
+        // tracked file, and a tracked row pointing at an untracked file.
+        let other_lane = row_domain.with_untracked(!row.untracked());
+        let exists_in_other_lane = match pending_file_descriptors
+            .state_in_domain(&other_lane, file_id)
+        {
+            Some(PendingFileDescriptorState::Present) => true,
+            Some(PendingFileDescriptorState::Tombstone) => false,
+            None => {
+                self.committed_file_descriptor_exists_in_domain(
+                    input.live_state,
+                    &other_lane,
+                    file_id,
+                )
+                .await?
+            }
+        };
+        if exists_in_other_lane {
+            return Err(lane_mismatched_file_owner_error(row, file_id)?);
+        }
+
         Err(missing_file_owner_reference_error(row, file_id)?)
     }
 
@@ -1846,6 +1870,29 @@ async fn committed_file_descriptor_exists_in_domain(
         && row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
         && row.entity_pk() == &entity_pk
         && row.file_id() == Some(file_id))
+}
+
+fn lane_mismatched_file_owner_error(
+    row: PreparedValidationRow<'_>,
+    file_id: &str,
+) -> Result<LixError, LixError> {
+    let lane = |untracked: bool| if untracked { "untracked" } else { "tracked" };
+    let row_lane = lane(row.untracked());
+    let file_lane = lane(!row.untracked());
+    Ok(LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "file ownership validation failed for schema '{}': {row_lane} entity '{}' references file_id '{}', which exists but is {file_lane}, on branch '{}'",
+            row.schema_key(),
+            row.entity_pk().as_json_array_text()?,
+            file_id,
+            row.branch_id()
+        ),
+    )
+    .with_hint(
+        "A row and the file that owns it must share one lane. Write the row as \
+         lixcol_untracked = <the file's own value>, or move the file to the row's lane.",
+    ))
 }
 
 fn missing_file_owner_reference_error(
@@ -4831,11 +4878,25 @@ mod tests {
         .await
         .expect_err("tracked file owner must not resolve through committed untracked descriptor");
 
-        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
+        // The file exists, in the other lane, so this is a lane mismatch rather
+        // than a missing file. It used to report CODE_FILE_NOT_FOUND for a file
+        // `SELECT * FROM lix_file` plainly returns.
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is untracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
+    /// The inverse of the behaviour PR D removes.
+    ///
+    /// This test previously asserted that an untracked row *may* be owned by a
+    /// tracked file — the cross-lane pairing that let a tracked file deletion
+    /// silently cascade untracked rows away. Its inversion is the evidence that
+    /// the enforcement seam is live.
     #[tokio::test]
-    async fn validation_allows_untracked_file_owner_reference_committed_as_tracked() {
+    async fn validation_rejects_untracked_file_owner_reference_committed_as_tracked() {
         let visible_schemas = vec![unique_schema()];
         let mut untracked_row = unique_row("post-1", "hello-world", "first");
         mark_prepared_row_untracked(&mut untracked_row);
@@ -4850,13 +4911,22 @@ mod tests {
             )],
         };
 
-        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
+        let error = validate_prepared_writes(
+            TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ),
+        )
         .await
-        .expect("untracked file owner should resolve through committed tracked descriptor");
+        .expect_err("an untracked row must not be owned by a tracked file");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            error.message.contains("which exists but is tracked"),
+            "the error must name the file's actual lane, got: {}",
+            error.message
+        );
     }
 
     #[tokio::test]
