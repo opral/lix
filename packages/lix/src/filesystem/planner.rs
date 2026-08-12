@@ -1568,6 +1568,92 @@ pub(crate) fn directory_path_resolvers_from_path_index(
     Ok(resolvers)
 }
 
+/// Seeds directory resolvers with only the ancestor positions of the paths
+/// being written.
+///
+/// [`directory_path_resolvers_from_path_index`] reserves **every** resident
+/// file into the namespace map so that a later reservation can detect a
+/// name collision. That is O(resident files) per statement, and the collision
+/// question for the written paths is already answered by the cached path index
+/// in O(log n) during write routing.
+///
+/// This seeds what the planner actually walks: for each written path, every
+/// ancestor position from the root plus the leaf, looked up directly. Cost is
+/// O(writes x depth) lookups rather than O(resident files).
+///
+/// **A file found at an ancestor position is reserved as a file, not skipped.**
+/// If `/a/b` exists as a file and `/a/b/c.txt` is written, a directory-only
+/// seed would never see `b`, `reserve_directory` would succeed, and a directory
+/// would be created colliding with a live file. Reserving it keeps
+/// `reserve_directory`'s existing namespace-conflict error firing unchanged.
+pub(crate) fn directory_path_resolvers_for_write_paths<'a>(
+    index: &super::path_index::FilesystemPathIndex,
+    branch_binding: Option<&str>,
+    paths: impl IntoIterator<Item = &'a crate::common::LixPath>,
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
+    let mut resolvers: BTreeMap<String, DirectoryPathResolver> = BTreeMap::new();
+    let mut probed = BTreeSet::<String>::new();
+
+    for path in paths {
+        let segments = path.segments().collect::<Vec<_>>();
+        let mut prefix = String::new();
+        for (depth, segment) in segments.iter().enumerate() {
+            prefix.push('/');
+            prefix.push_str(segment);
+            // Ancestors are probed in directory form; the leaf is probed both
+            // ways because either kind can occupy that name.
+            let is_leaf = depth + 1 == segments.len();
+            let mut lookups = vec![format!("{prefix}/")];
+            if is_leaf {
+                lookups.push(prefix.clone());
+            }
+            for lookup in lookups {
+                if !probed.insert(lookup.clone()) {
+                    continue;
+                }
+                for entry in index.exact_entries(&lookup) {
+                    let storage_branch_id = if entry.key.global() {
+                        GLOBAL_BRANCH_ID
+                    } else {
+                        entry.key.branch_id()
+                    };
+                    let resolver_key = filesystem_storage_scope_key(
+                        storage_branch_id,
+                        entry.key.global(),
+                        entry.key.is_untracked(),
+                        entry.key.file_id(),
+                    );
+                    let resolver = resolvers.entry(resolver_key).or_default();
+                    match entry.kind {
+                        super::path_index::FilesystemPathKind::Directory => resolver
+                            .reserve_directory(
+                                entry.parent_id.clone(),
+                                entry.name.clone(),
+                                entry.id().to_string(),
+                            )?,
+                        super::path_index::FilesystemPathKind::File => resolver.reserve_file(
+                            entry.parent_id.clone(),
+                            entry.name.clone(),
+                            entry.id().to_string(),
+                        )?,
+                    }
+                }
+            }
+        }
+    }
+
+    // Ancestors are seeded root-first, so every seeded directory's parent is
+    // already present and the graph check is over a consistent chain.
+    for resolver in resolvers.values_mut() {
+        resolver.validate_directory_parent_graph()?;
+    }
+    if let Some(branch_id) = branch_binding {
+        let key = filesystem_storage_scope_key(branch_id, false, false, None);
+        resolvers.entry(key).or_default();
+    }
+    Ok(resolvers)
+}
+
 pub(crate) fn filesystem_storage_scope_key(
     branch_id: &str,
     global: bool,

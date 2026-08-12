@@ -86,7 +86,8 @@ use crate::filesystem::{
     FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
     append_blob_ref_tombstone_row, derive_directory_paths,
     directory_path_resolvers_from_hot_state, directory_path_resolvers_from_path_index,
-    directory_path_resolvers_from_state_batch, filesystem_storage_scope_key, plan_file_delete,
+    directory_path_resolvers_for_write_paths, directory_path_resolvers_from_state_batch,
+    filesystem_storage_scope_key, plan_file_delete,
     plan_file_descriptor_write, plan_parsed_file_path_update_with_resolvers,
     plan_parsed_file_path_write_with_resolvers,
 };
@@ -2725,7 +2726,20 @@ async fn indexed_file_path_writes(
         .zip(&existing)
         .any(|(write, entry)| entry.is_none() && write.parsed.parsed_path.segments().count() > 1);
     let path_resolvers = if has_missing_nested {
-        match directory_path_resolvers_from_path_index(&index, Some(active_branch_id)) {
+        // Seed only the ancestor positions the planner will walk. The
+        // whole-index variant reserves every resident file into the namespace
+        // map, which is what made creating a file O(resident files).
+        let missing_paths = writes
+            .iter()
+            .zip(&existing)
+            .filter(|(_, entry)| entry.is_none())
+            .map(|(write, _)| &write.parsed.parsed_path)
+            .collect::<Vec<_>>();
+        match directory_path_resolvers_for_write_paths(
+            &index,
+            Some(active_branch_id),
+            missing_paths,
+        ) {
             Ok(resolvers) => Some(resolvers),
             Err(error) if error.code == LixError::CODE_CONSTRAINT_VIOLATION => return Ok(None),
             Err(error) => return Err(error),
