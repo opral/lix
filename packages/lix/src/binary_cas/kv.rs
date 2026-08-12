@@ -1912,13 +1912,13 @@ fn assemble_blob_bytes(
                 let chunk_hash = ChunkHash::from_bytes(manifest_chunk.chunk_hash);
                 let expected_chunk_size =
                     persisted_size_to_usize(manifest_chunk.chunk_size, "binary CAS chunk")?;
-                let chunk = decode_chunk_from_map(
+                append_chunk_from_map(
+                    &mut out,
                     chunk_rows_by_hash,
                     metadata.hash,
                     chunk_hash,
                     expected_chunk_size,
                 )?;
-                out.extend_from_slice(&chunk);
             }
             if out.len() != expected_blob_size {
                 return Err(LixError::new(
@@ -1968,31 +1968,97 @@ fn decode_chunk_from_map(
     decode_and_verify_chunk(chunk_bytes, expected_chunk_size, blob_hash, chunk_hash)
 }
 
-fn decode_and_verify_chunk(
-    chunk_bytes: &[u8],
-    expected_chunk_size: usize,
+/// Appends one verified chunk directly onto the blob being assembled.
+///
+/// The `Cow`-returning path allocates a fresh buffer per compressed chunk and
+/// then copies it into the blob, so a compressed read paid one allocation and
+/// one extra full copy of every byte that a raw read did not. Assembly already
+/// owns the destination, so the decoder writes into its tail and the content
+/// hash verifies that same memory. Raw chunks keep their single copy.
+fn append_chunk_from_map(
+    out: &mut Vec<u8>,
+    chunk_rows_by_hash: &HashMap<ChunkHash, Option<Bytes>>,
     blob_hash: BlobId,
     chunk_hash: ChunkHash,
-) -> Result<Cow<'_, [u8]>, LixError> {
+    expected_chunk_size: usize,
+) -> Result<(), LixError> {
+    let Some(Some(chunk_bytes)) = chunk_rows_by_hash.get(&chunk_hash) else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS chunk '{}' is missing for blob '{}'",
+                chunk_hash.to_hex(),
+                blob_hash.to_hex()
+            ),
+        ));
+    };
     let (codec, uncompressed_len, chunk_payload) = decode_binary_cas_chunk(chunk_bytes)?;
-    decode_and_verify_payload(
-        codec,
+    if codec != BinaryChunkCodec::Zstd {
+        let decoded = decode_and_verify_payload(
+            codec,
+            uncompressed_len,
+            Cow::Borrowed(chunk_payload),
+            expected_chunk_size,
+            blob_hash,
+            chunk_hash,
+        )?;
+        out.extend_from_slice(&decoded);
+        return Ok(());
+    }
+
+    verify_chunk_extent(
         uncompressed_len,
-        Cow::Borrowed(chunk_payload),
         expected_chunk_size,
         blob_hash,
         chunk_hash,
-    )
+    )?;
+    let start = out.len();
+    out.resize(start + expected_chunk_size, 0);
+    let written = crate::compression::decompress_zstd_into(chunk_payload, &mut out[start..])
+        .map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "binary CAS chunk '{}' for blob '{}' failed zstd decode: {error}",
+                    chunk_hash.to_hex(),
+                    blob_hash.to_hex()
+                ),
+            )
+        })?;
+    if written != expected_chunk_size {
+        out.truncate(start);
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS chunk '{}' for blob '{}' expected {} decoded bytes, got {written}",
+                chunk_hash.to_hex(),
+                blob_hash.to_hex(),
+                expected_chunk_size
+            ),
+        ));
+    }
+    if ChunkHash::from_content(&out[start..]) != chunk_hash {
+        out.truncate(start);
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS chunk '{}' for blob '{}' failed content-address verification",
+                chunk_hash.to_hex(),
+                blob_hash.to_hex()
+            ),
+        ));
+    }
+    Ok(())
 }
 
-fn decode_and_verify_payload(
-    codec: BinaryChunkCodec,
+/// The size preconditions every chunk decode shares, hoisted so the in-place
+/// path bounds its output buffer with exactly the checks the `Cow` path uses.
+fn verify_chunk_extent(
     uncompressed_len: u64,
-    chunk_payload: Cow<'_, [u8]>,
     expected_chunk_size: usize,
     blob_hash: BlobId,
     chunk_hash: ChunkHash,
-) -> Result<Cow<'_, [u8]>, LixError> {
+) -> Result<(), LixError> {
     if expected_chunk_size > MAX_BINARY_CAS_CHUNK_BYTES
         || uncompressed_len > MAX_BINARY_CAS_CHUNK_BYTES as u64
     {
@@ -2018,6 +2084,40 @@ fn decode_and_verify_payload(
             ),
         ));
     }
+    Ok(())
+}
+
+fn decode_and_verify_chunk(
+    chunk_bytes: &[u8],
+    expected_chunk_size: usize,
+    blob_hash: BlobId,
+    chunk_hash: ChunkHash,
+) -> Result<Cow<'_, [u8]>, LixError> {
+    let (codec, uncompressed_len, chunk_payload) = decode_binary_cas_chunk(chunk_bytes)?;
+    decode_and_verify_payload(
+        codec,
+        uncompressed_len,
+        Cow::Borrowed(chunk_payload),
+        expected_chunk_size,
+        blob_hash,
+        chunk_hash,
+    )
+}
+
+fn decode_and_verify_payload(
+    codec: BinaryChunkCodec,
+    uncompressed_len: u64,
+    chunk_payload: Cow<'_, [u8]>,
+    expected_chunk_size: usize,
+    blob_hash: BlobId,
+    chunk_hash: ChunkHash,
+) -> Result<Cow<'_, [u8]>, LixError> {
+    verify_chunk_extent(
+        uncompressed_len,
+        expected_chunk_size,
+        blob_hash,
+        chunk_hash,
+    )?;
     let decoded = match codec {
         BinaryChunkCodec::Raw => chunk_payload,
         // `uncompressed_len` was checked against `expected_chunk_size` above and

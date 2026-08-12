@@ -61,6 +61,45 @@ pub(crate) fn decompress_zstd(
     zstd::bulk::decompress(compressed_payload, uncompressed_len).map_err(|error| error.to_string())
 }
 
+/// Decompresses into a caller-owned buffer instead of a fresh `Vec`.
+///
+/// Blob assembly already owns the output buffer it is filling, so decoding
+/// through an intermediate `Vec` costs one allocation and one full copy of
+/// every compressed chunk. `destination` is the exact expected chunk extent;
+/// a frame that produces a different length is rejected by the caller's
+/// size check, and the content hash still verifies the decoded bytes.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn decompress_zstd_into(
+    compressed_payload: &[u8],
+    destination: &mut [u8],
+) -> Result<usize, String> {
+    zstd::bulk::decompress_to_buffer(compressed_payload, destination)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn decompress_zstd_into(
+    compressed_payload: &[u8],
+    destination: &mut [u8],
+) -> Result<usize, String> {
+    use std::io::Read as _;
+
+    validate_zstd_frame_limits(compressed_payload, destination.len())?;
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed_payload)
+        .map_err(|error| error.to_string())?;
+    decoder
+        .read_exact(destination)
+        .map_err(|error| error.to_string())?;
+    // A frame longer than the destination must not pass silently; one more byte
+    // is enough to tell "exactly filled" from "truncated into place".
+    let mut overflow = [0_u8; 1];
+    match decoder.read(&mut overflow) {
+        Ok(0) => Ok(destination.len()),
+        Ok(_) => Err("zstd frame produced more bytes than the chunk extent".to_string()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 #[cfg(target_family = "wasm")]
 pub(crate) fn decompress_zstd(
     compressed_payload: &[u8],
