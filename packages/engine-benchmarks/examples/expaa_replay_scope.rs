@@ -99,10 +99,8 @@ async fn main() {
         accounting.max_plans_in_one_boundary
     );
     println!(
-        "available_root_probes {} available_root_hits {} ancestry_proof_stagings {}",
-        accounting.available_root_probes,
-        accounting.available_root_hits,
-        accounting.proof_stagings
+        "available_root_probes {} available_root_hits {}",
+        accounting.available_root_probes, accounting.available_root_hits
     );
     println!(
         "plan_load_ms {:.1} stage_ms {:.1} replay_share_of_wall {:.1}%",

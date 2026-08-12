@@ -304,7 +304,6 @@ impl JsonStoreWriter {
         writes.stage_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
     }
 
-    #[allow(dead_code)] // Activated by the checkpoint GC integration.
     #[expect(clippy::unused_self)]
     pub(crate) fn stage_delete_refs<I>(&self, writes: &mut StorageWriteSet, refs: I)
     where

@@ -778,7 +778,6 @@ impl StorageWriteSet {
         self.changelog_gc_sealed
     }
 
-    #[allow(dead_code)] // Activated by the checkpoint GC integration.
     pub(crate) fn seal_changelog_gc(&mut self) {
         self.changelog_gc_sealed = true;
     }

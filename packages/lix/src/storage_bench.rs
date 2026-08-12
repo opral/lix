@@ -473,7 +473,6 @@ static ROOT_REPLAY_PLANS_LOADED: AtomicU64 = AtomicU64::new(0);
 static ROOT_REPLAY_PLANS_STAGED: AtomicU64 = AtomicU64::new(0);
 static ROOT_REPLAY_AVAILABLE_ROOT_PROBES: AtomicU64 = AtomicU64::new(0);
 static ROOT_REPLAY_AVAILABLE_ROOT_HITS: AtomicU64 = AtomicU64::new(0);
-static ROOT_REPLAY_PROOF_STAGINGS: AtomicU64 = AtomicU64::new(0);
 static ROOT_REPLAY_MAX_PLANS: AtomicU64 = AtomicU64::new(0);
 
 static ROOT_REPLAY_PLAN_LOAD_NANOS: AtomicU64 = AtomicU64::new(0);
@@ -492,8 +491,6 @@ pub struct RootReplayAccounting {
     pub plans_staged: u64,
     pub available_root_probes: u64,
     pub available_root_hits: u64,
-    /// Root stagings performed inside the ancestry proof itself.
-    pub proof_stagings: u64,
     pub max_plans_in_one_boundary: u64,
     pub plan_load_nanos: u64,
     pub stage_nanos: u64,
@@ -521,13 +518,6 @@ pub(crate) fn record_root_replay_available_root_probe(hit: bool) {
     }
 }
 
-/// Retained so the base and candidate arms of an A/B expose the same
-/// accounting surface; the bounded availability proof performs no stagings.
-#[allow(dead_code)]
-pub(crate) fn record_root_replay_proof_staging() {
-    ROOT_REPLAY_PROOF_STAGINGS.fetch_add(1, Ordering::Relaxed);
-}
-
 pub(crate) fn record_root_replay_plan_load_nanos(nanos: u64) {
     ROOT_REPLAY_PLAN_LOAD_NANOS.fetch_add(nanos, Ordering::Relaxed);
 }
@@ -543,7 +533,6 @@ pub fn take_root_replay_accounting() -> RootReplayAccounting {
         plans_staged: ROOT_REPLAY_PLANS_STAGED.swap(0, Ordering::Relaxed),
         available_root_probes: ROOT_REPLAY_AVAILABLE_ROOT_PROBES.swap(0, Ordering::Relaxed),
         available_root_hits: ROOT_REPLAY_AVAILABLE_ROOT_HITS.swap(0, Ordering::Relaxed),
-        proof_stagings: ROOT_REPLAY_PROOF_STAGINGS.swap(0, Ordering::Relaxed),
         max_plans_in_one_boundary: ROOT_REPLAY_MAX_PLANS.swap(0, Ordering::Relaxed),
         plan_load_nanos: ROOT_REPLAY_PLAN_LOAD_NANOS.swap(0, Ordering::Relaxed),
         stage_nanos: ROOT_REPLAY_STAGE_NANOS.swap(0, Ordering::Relaxed),

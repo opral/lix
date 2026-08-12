@@ -205,6 +205,9 @@ impl RowGroupManifest {
             .sum()
     }
 
+    /// Only the codec tests reconstruct the full Arrow schema; every read path
+    /// projects columns through `row_group_projected_schema` instead.
+    #[cfg(test)]
     pub(crate) fn schema(&self) -> SchemaRef {
         let fields = self.fields.iter().map(|field| {
             Field::new(&field.name, field.data_type.to_arrow(), field.nullable)
@@ -325,18 +328,27 @@ pub(crate) struct EncodedRowGroupSet {
 }
 
 impl EncodedRowGroupSet {
+    #[cfg(test)]
     fn column_bytes(&self, column: &EncodedColumn) -> &[u8] {
         let start = column.value.offset();
         &self.column_values[start..start + column.value.len()]
     }
 }
 
+/// Whole-set load result. Production readers stream one group at a time via
+/// `load_row_group_batch`; only the codec/storage tests materialize every
+/// group at once.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct LoadedRowGroupSet {
     pub(crate) manifest: RowGroupManifest,
     pub(crate) batches: Vec<RecordBatch>,
 }
 
+/// Encodes a whole set in one shot. The commit path stages pre-encoded groups
+/// through `stage_row_group_set`; this whole-set encoder is a test fixture
+/// helper only.
+#[cfg(test)]
 pub(crate) fn encode_row_group_set(
     namespace: impl Into<String>,
     schema: SchemaRef,
@@ -523,6 +535,7 @@ pub(crate) async fn stage_delete_row_group_set(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn load_row_group_set(
     store: &(impl StorageAdapterRead + ?Sized),
     id: RowGroupSetId,
