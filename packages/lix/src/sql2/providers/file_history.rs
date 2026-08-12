@@ -3478,8 +3478,13 @@ mod tests {
     async fn depth_bounded_file_history_is_served_by_the_unbounded_traversal() {
         use crate::commit_graph::reachable_census;
 
+        // Census every shape BEFORE asserting, so a failure reports the whole
+        // picture instead of stopping at the first shape that regressed.
+        let mut census = Vec::new();
         for shape in ["path", "id", "unfiltered"] {
-            let delta = depth_bounded_history_census(shape).await;
+            census.push((shape, depth_bounded_history_census(shape).await));
+        }
+        for (shape, delta) in census {
             assert!(
                 delta[reachable_census::WALK_UNBOUNDED] > 0,
                 "{shape}: expected at least one real (missing) unbounded traversal"
