@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use lix::registered_spaces::{HOT_ROW_SPACE, PLUGIN_CHECKPOINT_SPACE};
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{
     binary_cas_owner_layout_accounting, binary_manifest_layout_accounting,
@@ -11,20 +12,6 @@ use lix_storage_slatedb::SlateDB;
 use object_store::local::LocalFileSystem;
 use slatedb::{SstReader, ValueDeletable};
 
-/// The hot-row space is versioned in its name, so a hard-coded literal goes
-/// stale the moment the plane is revised — and `space_inventory` panics on a
-/// name the registry does not know, which took the whole non-`--physical-only`
-/// mode down when `hot_row.v20` became `v21`. Resolve it from the registry by
-/// prefix instead so the tool tracks the rename.
-const HOT_SPACE_PREFIX: &str = "live_state.hot_row.";
-
-fn hot_space_name() -> &'static str {
-    layout_space_catalog()
-        .into_iter()
-        .map(|(_, name)| name)
-        .find(|name| name.starts_with(HOT_SPACE_PREFIX))
-        .expect("registry has exactly one hot-row space")
-}
 const IMMUTABLE_BINARY_CAS_CHUNK_DIR: &str = "db/lix-immutable-binary-cas-segment-v4";
 
 #[derive(Default)]
@@ -108,7 +95,7 @@ async fn main() {
     print_binary_cas_owners(&read).await;
     print_plugin_checkpoint_layout(&read).await;
 
-    let inventory = space_inventory(&read, hot_space_name()).await;
+    let inventory = space_inventory(&read, HOT_ROW_SPACE.name).await;
     let mut groups = BTreeMap::<Vec<u8>, HotGroup>::new();
     for (key, value) in inventory {
         let decoded = decode_hot_group(&key).expect("valid HOT V19 key");
@@ -222,7 +209,7 @@ async fn print_plugin_checkpoint_layout(read: &impl lix::storage_adapter::Storag
 
     const DIGEST_BYTES: usize = 32;
 
-    let inventory = space_inventory(read, "plugin.current_checkpoint.v2").await;
+    let inventory = space_inventory(read, PLUGIN_CHECKPOINT_SPACE.name).await;
     let mut runtime_bytes = 0_u64;
     let mut authority_bytes = 0_u64;
     let mut unique_runtime = BTreeSet::new();

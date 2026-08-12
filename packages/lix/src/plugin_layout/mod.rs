@@ -400,12 +400,6 @@ impl CompiledLayout {
         })
     }
 
-    /// Number of compact wire slots reused by each row.
-    #[allow(dead_code)]
-    pub fn wire_slot_count(&self) -> usize {
-        self.wire.len()
-    }
-
     /// JSON object path where the host-generated identity must be inserted.
     pub fn generated_id_path(&self) -> &[String] {
         &self.generated_id_path
@@ -459,11 +453,6 @@ impl Rows<'_, '_> {
             return Err(Error::new("row page ended before its declared row count"));
         }
         self.input.finish()
-    }
-
-    #[allow(dead_code)]
-    pub fn remaining(&self) -> u32 {
-        self.remaining
     }
 
     fn parse_next(&mut self) -> Result<Option<u64>, Error> {
@@ -968,7 +957,9 @@ impl Error {
         }
     }
 
-    #[allow(dead_code)]
+    /// Callers render this error through `Display`; only the layout tests need
+    /// the raw message for substring assertions.
+    #[cfg(test)]
     pub fn message(&self) -> &str {
         &self.message
     }

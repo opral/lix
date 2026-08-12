@@ -1893,7 +1893,11 @@ fn current_state_delta_from_state_row(
         schema_key: row.schema_key,
         file_id: row.file_id.map(crate::common::SharedStr::as_str),
         entity_pk: row.entity_pk,
-        change_id: (!row.untracked).then_some(change_id),
+        // Untracked rows are identity-bearing but history-free: the minted
+        // change_id travels with the row, while commit_id stays absent so the
+        // row never joins the commit graph. Changelog exclusion is enforced
+        // separately, by the addressable-change filter, not by dropping this.
+        change_id: Some(change_id),
         commit_id,
         untracked: row.untracked,
         deleted: row.snapshot.is_none(),
@@ -1967,7 +1971,10 @@ fn current_state_delta_from_engine_row(
         schema_key: &row.change.schema_key,
         file_id: row.change.file_id.as_deref(),
         entity_pk: &row.change.entity_pk,
-        change_id: None,
+        // Engine rows arrive with their change record already built, so the id
+        // is authoritative here. This lane runs beside — not through — the
+        // prepared-row funnel, so the id has to be carried across explicitly.
+        change_id: Some(row.change.change_id),
         commit_id: None,
         untracked: true,
         deleted: row.change.snapshot == crate::json_store::JsonSlot::None,
@@ -9687,7 +9694,10 @@ mod tests {
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
         );
-        assert_eq!(loaded.change_id, None);
+        // Identity without history, asserted in one place: the row keeps the
+        // exact change id it was staged with, and the changelog lookup for that
+        // same id immediately below finds nothing.
+        assert_eq!(loaded.change_id, Some(change_id("change-untracked")));
 
         let mut changelog_reader = ChangelogContext::new().reader(
             storage
@@ -9973,7 +9983,9 @@ mod tests {
             untracked.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
         );
-        assert_eq!(untracked.change_id, None);
+        // The untracked row in this mixed batch keeps its own staged id while
+        // the tracked row alongside it takes a commit-delta address.
+        assert_eq!(untracked.change_id, Some(change_id("change-untracked")));
 
         let sequence_row = live_state
             .reader(

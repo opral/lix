@@ -1769,3 +1769,224 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_directory_recursive_delete_removes_untracked_child_file,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
+                &[],
+            )
+            .await
+            .expect("tracked directory insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content, lixcol_untracked) \
+                 VALUES ('66696c65-2d64-8261-8674-000000000000', '/docs/draft.md', CAST('draft' AS BYTEA), true)",
+                &[],
+            )
+            .await
+            .expect("untracked file insert should reuse the tracked parent directory");
+
+        let delete_result = session
+            .execute("DELETE FROM lix_directory WHERE path = '/docs'", &[])
+            .await
+            .expect("recursive directory delete should succeed");
+        assert_eq!(
+            delete_result,
+            ExecuteResult::from_rows_affected(2),
+            "recursive delete of a tracked directory must also delete its untracked child file"
+        );
+
+        let files = session
+            .execute("SELECT id, path FROM lix_file", &[])
+            .await
+            .expect("file read after recursive delete must not be poisoned by an orphan");
+        assert_eq!(
+            files.len(),
+            0,
+            "the untracked child file must not survive its parent directory"
+        );
+
+        let directories = session
+            .execute("SELECT id, path FROM lix_directory", &[])
+            .await
+            .expect("directory read after recursive delete must not be poisoned by an orphan");
+        assert_eq!(directories.len(), 0, "the directory must be deleted");
+    }
+);
+
+simulation_test!(
+    lix_directory_recursive_delete_removes_untracked_file_under_implicit_parent,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        // `/docs` and `/docs/guides` are created implicitly by the tracked file
+        // insert. Implicit intermediate directories are the common way a
+        // tracked directory ends up above an untracked file.
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('66696c65-2d74-8261-8b65-000000000000', '/docs/guides/tracked.md', CAST('tracked' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("tracked nested file insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content, lixcol_untracked) \
+                 VALUES ('66696c65-2d75-8074-8261-000000000000', '/docs/guides/scratch.md', CAST('scratch' AS BYTEA), true)",
+                &[],
+            )
+            .await
+            .expect("untracked nested file insert should succeed");
+
+        let delete_result = session
+            .execute("DELETE FROM lix_directory WHERE path = '/docs'", &[])
+            .await
+            .expect("recursive directory delete should succeed");
+        assert_eq!(
+            delete_result,
+            ExecuteResult::from_rows_affected(4),
+            "delete must cover /docs, /docs/guides and both nested files"
+        );
+
+        let files = session
+            .execute("SELECT id, path FROM lix_file", &[])
+            .await
+            .expect("file read after recursive delete must not be poisoned by an orphan");
+        assert_eq!(files.len(), 0, "no nested file may survive its parent tree");
+
+        let directories = session
+            .execute("SELECT id, path FROM lix_directory", &[])
+            .await
+            .expect("directory read after recursive delete must not be poisoned by an orphan");
+        assert_eq!(directories.len(), 0, "the whole tree must be deleted");
+    }
+);
+
+simulation_test!(
+    lix_directory_recursive_delete_removes_untracked_child_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
+                &[],
+            )
+            .await
+            .expect("tracked directory insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
+                 VALUES ('6469722d-7375-8062-8000-000000000000', '/docs/sub', true)",
+                &[],
+            )
+            .await
+            .expect("untracked child directory insert should succeed");
+
+        // Before the lane crossing this delete was rejected outright with a
+        // LIX_ERROR_FOREIGN_KEY on the untracked child's /parent_id, leaving
+        // the user no way to remove the tree.
+        let delete_result = session
+            .execute("DELETE FROM lix_directory WHERE path = '/docs'", &[])
+            .await
+            .expect("recursive directory delete should reach the untracked child directory");
+        assert_eq!(delete_result, ExecuteResult::from_rows_affected(2));
+
+        let directories = session
+            .execute("SELECT id, path FROM lix_directory", &[])
+            .await
+            .expect("directory read after recursive delete should succeed");
+        assert_eq!(directories.len(), 0);
+    }
+);
+
+simulation_test!(
+    lix_directory_recursive_delete_survives_reopen_without_orphan,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        {
+            let session = sim.wrap_session(
+                engine
+                    .open_workspace_session()
+                    .await
+                    .expect("main session should open"),
+                &engine,
+            );
+            session
+                .execute(
+                    "INSERT INTO lix_directory (id, path) \
+                     VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
+                    &[],
+                )
+                .await
+                .expect("tracked directory insert should succeed");
+            session
+                .execute(
+                    "INSERT INTO lix_file (id, path, content, lixcol_untracked) \
+                     VALUES ('66696c65-2d64-8261-8674-000000000000', '/docs/draft.md', CAST('draft' AS BYTEA), true)",
+                    &[],
+                )
+                .await
+                .expect("untracked file insert should succeed");
+            session
+                .execute("DELETE FROM lix_directory WHERE path = '/docs'", &[])
+                .await
+                .expect("recursive directory delete should succeed");
+        }
+
+        // The orphan was durable: it survived a restart and left the branch
+        // permanently unreadable. Assert the read surface is intact after one.
+        let rebooted = sim
+            .reboot_engine_from_current_snapshot()
+            .await
+            .expect("engine should reboot from the current snapshot");
+        let session = sim.wrap_session(
+            rebooted
+                .open_workspace_session()
+                .await
+                .expect("session should open after reboot"),
+            &rebooted,
+        );
+
+        let files = session
+            .execute("SELECT id, path FROM lix_file", &[])
+            .await
+            .expect("file read after reboot must not be poisoned by an orphan");
+        assert_eq!(files.len(), 0);
+
+        let directories = session
+            .execute("SELECT id, path FROM lix_directory", &[])
+            .await
+            .expect("directory read after reboot must not be poisoned by an orphan");
+        assert_eq!(directories.len(), 0);
+    }
+);

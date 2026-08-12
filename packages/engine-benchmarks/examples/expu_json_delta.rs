@@ -38,6 +38,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use lix::integration::{Engine, SessionContext};
+use lix::registered_spaces::JSON_SPACE;
 use lix::storage::Storage;
 use lix::storage_adapter::{
     PointReadPlan, StorageAdapter, StorageGetOptions, StorageKey, StorageReadOptions,
@@ -911,7 +912,7 @@ async fn store_report(dir: &Path) {
         .await
         .expect("open report snapshot");
 
-    let inventory = space_inventory(&read, "json_store.json").await;
+    let inventory = space_inventory(&read, JSON_SPACE.name).await;
     let mut raw_bytes = 0_u64;
     let mut stored_bytes = 0_u64;
     let mut zstd_rows = 0_u64;
@@ -989,8 +990,8 @@ async fn read_cost(dir: &Path) {
         .begin_read(StorageReadOptions::default())
         .await
         .expect("open read-cost snapshot");
-    let space = storage_space_by_name("json_store.json");
-    let keys = space_inventory(&read, "json_store.json")
+    let space = storage_space_by_name(JSON_SPACE.name);
+    let keys = space_inventory(&read, JSON_SPACE.name)
         .await
         .into_iter()
         .map(|(key, _)| StorageKey(bytes::Bytes::from(key)))

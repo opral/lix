@@ -14,6 +14,7 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
+use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonRef;
 use crate::live_state::{CertifiedCurrentStatePredecessor, MaterializedLiveStateRow};
 use crate::tracked_state::{OrderedAddressableCommitDeltaStage, TrackedStateDiffIdentity};
@@ -1197,6 +1198,7 @@ impl RawWriteBatch {
         certificate: CertifiedRawWriteBatchPreparation,
         origin_key: Option<&SharedStr>,
         timestamp: LixTimestamp,
+        functions: &FunctionProviderHandle,
     ) -> Result<PreparedStateBatch, LixError> {
         if self.certified_preparation != Some(certificate) {
             return Err(LixError::new(
@@ -1304,6 +1306,18 @@ impl RawWriteBatch {
                 stage_json_from_value(snapshot, "certified prepared row snapshot_content")?;
             prepared_entity_pks.push(entity_pk);
             json.push(snapshot);
+            let untracked = slot.flags & RAW_WRITE_UNTRACKED != 0;
+            // Tracked rows keep the nil placeholder: `addressable_change_id`
+            // means commit planning replaces it with the row's commit-delta
+            // address, so minting here would be a wasted UUID draw per row on
+            // the flagship tracked path. Untracked rows are outside that
+            // address space, so nothing would ever replace the placeholder —
+            // they are the only rows that must be minted here.
+            let change_id = if untracked {
+                ChangeId::from(functions.call_uuid_v7())
+            } else {
+                ChangeId::default()
+            };
             prepared_slots.push(PreparedStateSlot {
                 schema_plan_id: certificate.schema_plan_id,
                 facts: certificate.facts,
@@ -1321,10 +1335,10 @@ impl RawWriteBatch {
                 created_at: timestamp,
                 updated_at: timestamp,
                 global: false,
-                change_id: Some(ChangeId::default()),
+                change_id: Some(change_id),
                 addressable_change_id: true,
                 commit_id: None,
-                untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
+                untracked,
                 branch_id: slot.branch_id,
                 durable_predecessor: None,
             });

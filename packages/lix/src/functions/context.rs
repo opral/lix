@@ -375,7 +375,7 @@ mod tests {
                     schema_key: "lix_key_value",
                     file_id: None,
                     entity_pk: &entity_pk,
-                    change_id: None,
+                    change_id: Some(ChangeId::for_test_label("functions-context-sequence")),
                     commit_id: None,
                     untracked: true,
                     deleted: false,

@@ -1883,64 +1883,82 @@ impl WritePipeline {
         error.map_or(Ok(()), Err)
     }
 
+    /// Obtains a snapshot together with the retirement guard its reader must
+    /// hold until it captures a publication view.
+    ///
+    /// Both paths — cached and freshly fetched — return a `SnapshotFetch`, so
+    /// the guard cannot be omitted by construction. `cleanup_publications`
+    /// retires a publication only while `snapshot_fetches == 0`, and a reader
+    /// holding a snapshot it has not yet captured a view against still depends
+    /// on every publication newer than that snapshot. The cached fast path
+    /// used to return no guard, which let cleanup retire a publication in
+    /// exactly that gap; the reader then observed neither the snapshot value
+    /// nor the overlay value, i.e. a stale point read or scan.
     async fn snapshot(
         &self,
         worker: &SlateDBWorker,
-    ) -> Result<(Arc<DbSnapshot>, Option<SnapshotFetch>), StorageError> {
-        let publication_id = {
+    ) -> Result<(Arc<DbSnapshot>, SnapshotFetch), StorageError> {
+        let (cached, publication_id) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(snapshot) = state.latest_snapshot.clone() {
-                worker.check_open_fast()?;
-                return Ok((snapshot, None));
-            }
             state.snapshot_fetches = state
                 .snapshot_fetches
                 .checked_add(1)
                 .expect("SlateDB snapshot fetch overflow");
-            state.next_publication_id
+            (state.latest_snapshot.clone(), state.next_publication_id)
         };
+        // Constructed immediately after the increment so that every early
+        // return below balances the counter through `SnapshotFetch::drop`.
         let fetch = SnapshotFetch {
             pipeline: self.clone(),
             worker: worker.clone(),
         };
+        if let Some(snapshot) = cached {
+            worker.check_open_fast()?;
+            return Ok((snapshot, fetch));
+        }
         let snapshot = worker
             .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
             .await?;
-        let cacheable = {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.next_publication_id == publication_id
-                && state
-                    .tail
-                    .as_ref()
-                    .is_none_or(|tail| tail.done.load(Ordering::Acquire))
-                && snapshot_covers_persisted_publications(&state, snapshot.seq())
-        };
-        if cacheable {
-            self.install_snapshot(Arc::clone(&snapshot));
-        } else {
+        if !self.try_install_snapshot(publication_id, &snapshot) {
             worker.check_open_fast()?;
         }
-        Ok((snapshot, Some(fetch)))
+        Ok((snapshot, fetch))
     }
 
-    fn install_snapshot(&self, snapshot: Arc<DbSnapshot>) {
+    /// Publishes `snapshot` as the cached snapshot when it is still current,
+    /// reporting whether it was installed.
+    ///
+    /// The freshness test and the install happen under **one** acquisition of
+    /// the pipeline lock. They used to be two, and a commit landing in the gap
+    /// was silently undone: `commit` clears `latest_snapshot` and bumps
+    /// `next_publication_id`, then the later install found `latest_snapshot`
+    /// empty, passed its monotonic guard vacuously, and reinstated a snapshot
+    /// that predated the write that commit had just published.
+    fn try_install_snapshot(&self, publication_id: u64, snapshot: &Arc<DbSnapshot>) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cacheable = state.next_publication_id == publication_id
+            && state
+                .tail
+                .as_ref()
+                .is_none_or(|tail| tail.done.load(Ordering::Acquire))
+            && snapshot_covers_persisted_publications(&state, snapshot.seq());
+        if !cacheable {
+            return false;
+        }
         if state
             .latest_snapshot
             .as_ref()
             .is_none_or(|current| current.seq() <= snapshot.seq())
         {
-            state.latest_snapshot = Some(snapshot);
+            state.latest_snapshot = Some(Arc::clone(snapshot));
         }
+        true
     }
 
     fn capture_with_worker(
@@ -7239,6 +7257,166 @@ mod tests {
                 &key,
             ),
             Some(Some(value))
+        );
+    }
+
+    fn cached_snapshot_test_storage(name: &'static str) -> SlateDB {
+        SlateDB::open_object_store_with_options(
+            name,
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open cached-snapshot coherence storage")
+    }
+
+    async fn cached_snapshot_commit(storage: &SlateDB, space: StorageSpace, value: &'static str) {
+        let mut write = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("begin cached-snapshot write");
+        write
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: Key(Bytes::from_static(b"a")),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(value.as_bytes()),
+                        },
+                    }],
+                },
+            )
+            .await
+            .expect("stage cached-snapshot write");
+        write.commit().await.expect("commit cached-snapshot write");
+    }
+
+    fn snapshot_fetches_of(storage: &SlateDB) -> usize {
+        storage
+            .write_pipeline
+            .state
+            .lock()
+            .expect("lock publication state")
+            .snapshot_fetches
+    }
+
+    /// D2. Companion to
+    /// `dropping_unrelated_view_does_not_reclaim_publication_a_stale_fetch_needs`,
+    /// which proves the `snapshot_fetches` guard protects a reader in the gap
+    /// between obtaining a snapshot and capturing its publication view — but
+    /// only ever exercises the fetch path, pinning `snapshot_fetches = 1`.
+    ///
+    /// The cached fast path used to return no guard, so a cached reader sat in
+    /// the identical gap with the protection switched off and
+    /// `cleanup_publications` could retire the publication its older snapshot
+    /// still needed. Both paths must register the guard.
+    #[tokio::test]
+    async fn cached_snapshot_path_registers_a_retirement_guard() {
+        let storage = cached_snapshot_test_storage("test-cached-snapshot-guard");
+        let space = StorageSpace::mutable(SpaceId(0x91), "test.cached-snapshot-guard");
+        cached_snapshot_commit(&storage, space, "A").await;
+
+        let (snapshot, fetch) = storage
+            .write_pipeline
+            .snapshot(&storage.worker)
+            .await
+            .expect("fetch a snapshot");
+        drop(fetch);
+        assert_eq!(snapshot_fetches_of(&storage), 0);
+
+        // Force the cached fast path deterministically.
+        storage
+            .write_pipeline
+            .state
+            .lock()
+            .expect("lock publication state")
+            .latest_snapshot = Some(Arc::clone(&snapshot));
+
+        let (_cached, cached_fetch) = storage
+            .write_pipeline
+            .snapshot(&storage.worker)
+            .await
+            .expect("take the cached snapshot path");
+        assert_eq!(
+            snapshot_fetches_of(&storage),
+            1,
+            "the cached snapshot path must register the same retirement guard as the fetch path"
+        );
+        drop(cached_fetch);
+        assert_eq!(
+            snapshot_fetches_of(&storage),
+            0,
+            "dropping the guard must balance the counter"
+        );
+    }
+
+    /// D1. `commit` clears `latest_snapshot` and bumps `next_publication_id`
+    /// so the next reader refetches. That invalidation must not be undone by an
+    /// install decided before the commit landed.
+    ///
+    /// The state below is arranged so that **only** the publication-id term can
+    /// reject the install: the racing publication has already persisted and
+    /// been retired from `visible`, so `snapshot_covers_persisted_publications`
+    /// holds, the tail is complete, and `latest_snapshot` is empty, so the
+    /// monotonic guard passes vacuously. That is precisely the state the old
+    /// two-phase structure reached by the time it called `install_snapshot`.
+    #[tokio::test]
+    async fn commit_is_not_undone_by_an_install_decided_before_it() {
+        let storage = cached_snapshot_test_storage("test-cached-snapshot-install-race");
+        let space = StorageSpace::mutable(SpaceId(0x92), "test.cached-snapshot-install-race");
+        cached_snapshot_commit(&storage, space, "A").await;
+
+        let (stale_snapshot, fetch) = storage
+            .write_pipeline
+            .snapshot(&storage.worker)
+            .await
+            .expect("fetch the pre-commit snapshot");
+        let publication_id = storage
+            .write_pipeline
+            .state
+            .lock()
+            .expect("lock publication state")
+            .next_publication_id;
+        drop(fetch);
+
+        // The commit that races the in-flight install, then fully settles:
+        // its publication persists and retires, leaving only the publication
+        // id to witness that the snapshot is stale.
+        cached_snapshot_commit(&storage, space, "B").await;
+        {
+            let mut state = storage
+                .write_pipeline
+                .state
+                .lock()
+                .expect("lock publication state");
+            state.visible.clear();
+            state.tail = None;
+            state.latest_snapshot = None;
+            assert_ne!(
+                state.next_publication_id, publication_id,
+                "the racing commit must advance the publication id"
+            );
+            assert!(
+                snapshot_covers_persisted_publications(&state, stale_snapshot.seq()),
+                "every other cacheability term must hold, isolating the publication-id check"
+            );
+        }
+
+        assert!(
+            !storage
+                .write_pipeline
+                .try_install_snapshot(publication_id, &stale_snapshot),
+            "an install decided before the commit must be rejected"
+        );
+        assert!(
+            storage
+                .write_pipeline
+                .state
+                .lock()
+                .expect("lock publication state")
+                .latest_snapshot
+                .is_none(),
+            "the commit's cache invalidation must not be undone by a stale install"
         );
     }
 
