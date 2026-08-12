@@ -606,7 +606,7 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
             .map(|row| {
                 (
                     row.get::<String>("kind").unwrap(),
-                    row.get::<Option<String>>("parent_id").unwrap(),
+                    row.get::<Value>("parent_id").unwrap(),
                 )
             })
             .collect::<Vec<_>>()
