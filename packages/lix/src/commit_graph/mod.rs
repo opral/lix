@@ -1,5 +1,6 @@
 mod context;
-mod scope_digest_census;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod scope_digest_census;
 mod types;
 mod walker;
 

@@ -46,6 +46,53 @@ static LOADED_OPAQUE: AtomicU64 = AtomicU64::new(0);
 static LOADED_ABSENT: AtomicU64 = AtomicU64::new(0);
 static UNCONSTRAINED: AtomicU64 = AtomicU64::new(0);
 
+/// Per-projection breakdown, test-only.
+///
+/// The aggregate counters answer "is the digest working". They cannot answer
+/// the sharper question this optimization actually has to pass: history-by-path
+/// is **four** independent traversals — what the path pointed at, what blob it
+/// held, which directories moved it, which plugin rendered it — each with its
+/// own schema-key set, and an artifact that only serves one of them buys a
+/// quarter of the win while looking identical in a benchmark. Keying the
+/// breakdown by schema-key set makes that visible per projection.
+///
+/// A `Mutex<HashMap>` has no business on a per-commit path, so this is compiled
+/// only for tests; the aggregate counters above are the shipping instrument.
+#[cfg(test)]
+pub(crate) mod by_projection {
+    use super::ScopeDigestOutcome;
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+
+    type Breakdown = BTreeMap<String, BTreeMap<&'static str, u64>>;
+
+    fn table() -> &'static Mutex<Breakdown> {
+        static TABLE: OnceLock<Mutex<Breakdown>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    pub(crate) fn record(schema_keys: &[String], outcome: ScopeDigestOutcome) {
+        let label = if schema_keys.is_empty() {
+            "<unconstrained>".to_string()
+        } else {
+            schema_keys.join("+")
+        };
+        let bucket = match outcome {
+            ScopeDigestOutcome::Pruned => "pruned",
+            ScopeDigestOutcome::LoadedPresent => "loaded_present",
+            ScopeDigestOutcome::LoadedOpaque => "loaded_opaque",
+            ScopeDigestOutcome::LoadedAbsent => "loaded_absent",
+            ScopeDigestOutcome::Unconstrained => "unconstrained",
+        };
+        let mut table = table().lock().expect("projection census is not poisoned");
+        *table.entry(label).or_default().entry(bucket).or_insert(0) += 1;
+    }
+
+    pub(crate) fn take() -> Breakdown {
+        std::mem::take(&mut *table().lock().expect("projection census is not poisoned"))
+    }
+}
+
 pub(crate) fn record_scope_digest_outcome(outcome: ScopeDigestOutcome) {
     let counter = match outcome {
         ScopeDigestOutcome::Pruned => &PRUNED,

@@ -555,6 +555,11 @@ where
         // `load_member_changes` would otherwise fetch for this commit.
         let outcome = scope_digest_outcome(node, request, shaping);
         record_scope_digest_outcome(outcome);
+        #[cfg(test)]
+        crate::commit_graph::scope_digest_census::by_projection::record(
+            &shaping.member_schema_keys,
+            outcome,
+        );
         if outcome == ScopeDigestOutcome::Pruned {
             return Ok(());
         }

@@ -5933,6 +5933,7 @@ mod tests {
         };
 
         let before = crate::commit_graph::scope_digest_census();
+        let _ = crate::commit_graph::scope_digest_census::by_projection::take();
         let result = session
             .execute(
                 &format!(
@@ -5944,7 +5945,11 @@ mod tests {
             .await
             .expect("by-path history should execute");
         let census = crate::commit_graph::scope_digest_census().since(&before);
+        let by_projection = crate::commit_graph::scope_digest_census::by_projection::take();
         eprintln!("scope_digest_census {census:?}");
+        for (projection, buckets) in &by_projection {
+            eprintln!("scope_digest_projection {projection} {buckets:?}");
+        }
 
         assert!(
             !result.rows().is_empty(),
@@ -5966,6 +5971,28 @@ mod tests {
             census.loaded_absent, 0,
             "a repository written by this build must carry a digest on every commit: {census:?}"
         );
+
+        // Requirement: the digest must serve every projection of history-by-path,
+        // not just the one a benchmark happens to exercise. Each of these is a
+        // separate commit-graph traversal with its own schema-key set.
+        for projection in [
+            "lix_binary_blob_ref+lix_file_descriptor",
+            "lix_directory_descriptor",
+            "lix_key_value",
+        ] {
+            let buckets = by_projection.get(projection).unwrap_or_else(|| {
+                panic!("by-path history should traverse {projection}: {by_projection:?}")
+            });
+            assert!(
+                buckets.get("pruned").copied().unwrap_or(0) > 0,
+                "{projection} must be able to prune commits: {by_projection:?}"
+            );
+            assert_eq!(
+                buckets.get("loaded_absent").copied().unwrap_or(0),
+                0,
+                "{projection} must never hit the pre-digest fallback: {by_projection:?}"
+            );
+        }
     }
 
     #[tokio::test]

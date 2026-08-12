@@ -1068,6 +1068,23 @@ pub struct MergePreparationBenchResult {
     pub source_entries: usize,
 }
 
+/// Scope set stamped on every synthetic merge-base fixture commit.
+///
+/// Chosen to look like an ordinary file commit so the encoded record width
+/// matches what the real commit path writes.
+fn merge_base_bench_touched_scopes() -> Vec<crate::changelog::CommitScopeKey> {
+    vec![
+        crate::changelog::CommitScopeKey {
+            schema_key: "lix_file_descriptor".to_string(),
+            file_id: None,
+        },
+        crate::changelog::CommitScopeKey {
+            schema_key: "lix_binary_blob_ref".to_string(),
+            file_id: Some("01920000-0000-7000-8000-00000000beef".to_string()),
+        },
+    ]
+}
+
 /// Seeds an empty-state commit graph whose only varying dimension is ancestry.
 ///
 /// The manifests deliberately contain no tracked mutations or durable roots so
@@ -1123,8 +1140,15 @@ where
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
-            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
-            format_version: 4,
+            // A realistic full-width digest, not `absent()`. Every commit-topology
+            // consumer pays for this field whether or not it benefits, and
+            // merge-base is the guard for exactly that cost — an `absent()`
+            // fixture encodes no bits, so it would measure a node this build
+            // never writes and report a free change that is not free.
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(
+                merge_base_bench_touched_scopes().iter(),
+            ),
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id,
             generation,
             parent_commit_ids: parents,
