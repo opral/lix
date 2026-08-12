@@ -249,9 +249,16 @@ where
     }
 }
 
-const SHAPES: [&str; 10] = [
+const SHAPES: [&str; 12] = [
     "insert_file_80line",
     "insert_file_1line",
+    // Ten single-row statements inside ONE explicit transaction. The
+    // path-index cache documents an intra-transaction delta advance, so if that
+    // works this costs one whole-repository rebuild rather than ten.
+    "insert_10files_1txn",
+    // The control for it: ten single-row statements in ten autocommit
+    // transactions.
+    "insert_10files_10txn",
     // Same total rows written as ten `insert_file_1line` probes, but in one
     // statement. If the O(files) term is paid once per statement rather than
     // once per written row, this costs about the same as a single-row insert.
@@ -307,6 +314,41 @@ where
             )
             .await
             .expect("insert 1-line probe file");
+        }
+        "insert_10files_1txn" => {
+            let mut transaction = lix
+                .begin_transaction()
+                .await
+                .expect("begin write-scaling transaction");
+            for offset in 0..10 {
+                transaction
+                    .execute(
+                        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                        &[
+                            Value::Text(format!("/probe/t1-{probe:05}-{offset:04}.txt")),
+                            Value::Blob(document(1, probe + offset).into()),
+                        ],
+                    )
+                    .await
+                    .expect("stage write-scaling transaction row");
+            }
+            transaction
+                .commit()
+                .await
+                .expect("commit write-scaling transaction");
+        }
+        "insert_10files_10txn" => {
+            for offset in 0..10 {
+                lix.execute(
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                    &[
+                        Value::Text(format!("/probe/tN-{probe:05}-{offset:04}.txt")),
+                        Value::Blob(document(1, probe + offset).into()),
+                    ],
+                )
+                .await
+                .expect("insert autocommit write-scaling row");
+            }
         }
         "insert_10files_1stmt" => {
             insert_many(lix, "b10", probe, 10).await;
