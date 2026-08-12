@@ -138,7 +138,7 @@ test("updateCargoToml leaves independently released Rust packages untouched", ()
 	mkdirSync(join(root, "packages", "server-protocol"), { recursive: true });
 	writeFileSync(
 		join(root, "Cargo.toml"),
-		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_storage_rocksdb = { path = "packages/rocksdb-storage", version = "0.6.2" }\nlix_storage_slatedb = { path = "packages/slatedb-storage", version = "0.6.2" }\nlix = { path = "packages/lix", version = "0.6.2" }\n`,
+		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_storage_rocksdb = { path = "packages/storage-rocksdb", version = "0.6.2" }\nlix_storage_slatedb = { path = "packages/storage-slatedb", version = "0.6.2" }\nlix = { path = "packages/lix", version = "0.6.2" }\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "js-sdk", "Cargo.toml"),
@@ -157,8 +157,8 @@ test("updateCargoToml leaves independently released Rust packages untouched", ()
 
 	const rootCargoToml = readFileSync(join(root, "Cargo.toml"), "utf8");
 	assert.match(rootCargoToml, /\[workspace\.package\]\nversion = "0\.7\.0"/);
-	assert.match(rootCargoToml, /lix_storage_rocksdb = \{ path = "packages\/rocksdb-storage", version = "0\.6\.2"/);
-	assert.match(rootCargoToml, /lix_storage_slatedb = \{ path = "packages\/slatedb-storage", version = "0\.6\.2"/);
+	assert.match(rootCargoToml, /lix_storage_rocksdb = \{ path = "packages\/storage-rocksdb", version = "0\.6\.2"/);
+	assert.match(rootCargoToml, /lix_storage_slatedb = \{ path = "packages\/storage-slatedb", version = "0\.6\.2"/);
 	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
 	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /version = "0\.6\.2"/);
 	assert.match(readFileSync(join(root, "packages", "rs-sdk-tests", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);

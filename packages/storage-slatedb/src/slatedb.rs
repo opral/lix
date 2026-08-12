@@ -2859,7 +2859,7 @@ fn point_precondition_matches(precondition: &Precondition, value: Option<&Bytes>
 /// object store's rather than a per-read setting.
 ///
 /// So SlateDB keeps verifying exactly as before and stays correct by doing
-/// nothing. This comment exists so the asymmetry with `packages/rocksdb-storage`
+/// nothing. This comment exists so the asymmetry with `packages/storage-rocksdb`
 /// reads as a decision rather than as a missed call site.
 impl StorageRead for SlateDBRead {
     fn snapshot_cache_key(&self) -> Option<u128> {
