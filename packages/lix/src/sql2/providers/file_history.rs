@@ -3431,6 +3431,17 @@ mod tests {
                 "SELECT lixcol_depth FROM lix_file_history($1) WHERE lixcol_depth = 0",
                 vec![crate::Value::Text(head)],
             ),
+            // Resolves to an empty lookup-ID set, so `load_file_history_rows`
+            // returns at its `resolved_lookup_ids.is_empty()` early return and
+            // never reaches `load_file_history_entry_sets` at all.
+            "missing_path" => (
+                "SELECT lixcol_depth FROM lix_file_history($1) \
+                 WHERE path = $2 AND lixcol_depth = 0",
+                vec![
+                    crate::Value::Text(head),
+                    crate::Value::Text("/probe/never-existed.txt".to_string()),
+                ],
+            ),
             other => panic!("unknown shape {other}"),
         };
 
@@ -3440,7 +3451,9 @@ mod tests {
             .await
             .expect("depth-bounded history query");
         let after = reachable_census::snapshot();
-        assert!(!rows.rows().is_empty(), "{shape} query returned no rows");
+        if shape != "missing_path" {
+            assert!(!rows.rows().is_empty(), "{shape} query returned no rows");
+        }
         lix.close().await.expect("close lix");
 
         let delta = [
@@ -3481,10 +3494,13 @@ mod tests {
         // Census every shape BEFORE asserting, so a failure reports the whole
         // picture instead of stopping at the first shape that regressed.
         let mut census = Vec::new();
-        for shape in ["path", "id", "unfiltered"] {
+        for shape in ["path", "id", "unfiltered", "missing_path"] {
             census.push((shape, depth_bounded_history_census(shape).await));
         }
-        for (shape, delta) in census {
+        // `missing_path` short-circuits upstream of the reordered function, so
+        // it is censused for the record but carries no expectation of a
+        // depth-bounded traversal.
+        for (shape, delta) in census.into_iter().filter(|(shape, _)| *shape != "missing_path") {
             assert!(
                 delta[reachable_census::WALK_UNBOUNDED] > 0,
                 "{shape}: expected at least one real (missing) unbounded traversal"
