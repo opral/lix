@@ -86,17 +86,22 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
 
 /// Space ids the constructor check cannot reject yet.
 ///
-/// `gc.rs` re-declares `0x0004_002b` (`tracked_state.commit_state_manifest.v7`)
-/// as mutable so a retention test can delete and overwrite an authority the
-/// engine publishes write-once. Every other engine test states that need
-/// through `StorageSpace::mutable_view_for_corruption_test`, which does not go
-/// through the checked constructors at all. `gc.rs` is owned by the in-flight
-/// GC ledger redesign and is not edited this cycle, so this one id keeps the
-/// weaker, test-enforced treatment: it is reported by
-/// [`tests::no_registered_space_id_is_declared_with_two_value_semantics`], and
-/// [`tests::the_unchecked_ids_are_exactly_the_known_disagreements`] fails the
-/// moment the site goes away and this list becomes stale.
-const UNCHECKED_SPACE_IDS: &[u32] = &[0x0004_002b];
+/// Empty, and it should stay that way. Every engine site that needs to place
+/// chosen bytes under a write-once key states it through
+/// `StorageSpace::mutable_view_for_corruption_test`, which does not go through
+/// the checked constructors at all.
+///
+/// This list previously held `0x0004_002b`
+/// (`tracked_state.commit_state_manifest.v7`) for a raw re-declaration in
+/// `gc.rs`, justified by `gc.rs` being owned by an in-flight redesign and not
+/// editable. Both halves expired: the re-declaration is gone (the site now uses
+/// `mutable_view_for_corruption_test`) and the ownership claim was round-4
+/// residue. The hole outlived its reason by a whole cycle because the guard
+/// meant to catch that compares this list to `tests::KNOWN_DISAGREEMENTS` --
+/// two hand-maintained lists, checked against each other and never against the
+/// code -- so it could not have noticed the site disappearing. Widening a
+/// safety check for one call site needs a guard that watches the call site.
+const UNCHECKED_SPACE_IDS: &[u32] = &[];
 
 /// Whether a space id may be declared with `semantics`.
 ///
@@ -343,7 +348,7 @@ mod tests {
     /// owned by the in-flight GC ledger redesign and is left alone this cycle.
     /// The list is exact, so this also fails once the redesign removes the
     /// site and the entry goes stale.
-    const KNOWN_DISAGREEMENTS: &[(&str, u32)] = &[("lix/src/gc.rs", 0x0004_002b)];
+    const KNOWN_DISAGREEMENTS: &[(&str, u32)] = &[];
 
     #[test]
     fn no_registered_space_id_is_declared_with_two_value_semantics() {

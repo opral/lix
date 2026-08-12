@@ -1142,9 +1142,17 @@ where
 /// The caller must serialize this operation with repository writes and commit
 /// `writes` atomically. Planning and mutation are deliberately separated from
 /// storage commit so checkpoint/session code can retain lifecycle control.
-/// Content-addressed tree/CAS orphan repair is intentionally an offline path;
-/// out-of-band JSON is reclaimed here only from explicit ownership-loss
-/// candidates.
+/// Content-addressed tree/CAS orphan repair is intentionally an offline path.
+///
+/// **Out-of-band JSON is not reclaimed here at all.** This comment used to
+/// claim reclamation "from explicit ownership-loss candidates"; that mechanism
+/// was deleted in 31cb639ae because the candidate hints were write-only, and
+/// nothing replaced it. `stage_delete_refs` and every function that enumerates
+/// payload hashes are `#[cfg(test)]`, and this path stages an empty
+/// `json_payloads`. A repository's out-of-band payload count therefore grows
+/// linearly with edits and is never reclaimed -- measured at 0 rows reclaimed
+/// for 10, 100, and 1000 rewrites of a single row
+/// (`engine-benchmarks/examples/e1_json_leak.rs`).
 /// Ordinary GC derives its candidates from the physical manifest inventory and
 /// proves liveness only from refs: branch-head controls and checkpoint recovery
 /// refs are the complete active-root set, and the walk from those roots through
