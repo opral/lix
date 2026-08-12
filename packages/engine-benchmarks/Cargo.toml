@@ -69,7 +69,7 @@ required-features = ["storage-benches"]
 [[example]]
 name = "expab_plan_load"
 path = "examples/expab_plan_load.rs"
-required-features = ["storage-benches"]
+required-features = ["storage-benches", "slatedb"]
 
 [[example]]
 name = "space_growth"

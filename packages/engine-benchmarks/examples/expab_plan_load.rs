@@ -28,7 +28,7 @@
 //! Usage: `expab_plan_load [commits] [rows_per_commit]`
 //! (defaults: 200 commits, 10 rows).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
@@ -39,6 +39,7 @@ use lix::storage_bench::{
 };
 use lix::{CreateBranchOptions, MergeBranchOptions, Value};
 use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -51,10 +52,27 @@ async fn main() {
         .next()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(10);
+    let backend = args.next().unwrap_or_else(|| "rocksdb".to_owned());
     assert!(commits >= 2, "need at least two commits to measure replay");
 
-    let directory = tempfile::tempdir().expect("create RocksDB directory");
-    let storage = RocksDB::open(directory.path()).expect("open RocksDB");
+    let directory = tempfile::tempdir().expect("create storage directory");
+    match backend.as_str() {
+        "rocksdb" => {
+            let storage = RocksDB::open(directory.path()).expect("open RocksDB");
+            run(storage, &backend, commits, rows_per_commit).await;
+        }
+        "slatedb" => {
+            let storage = SlateDB::open(directory.path()).expect("open SlateDB");
+            run(storage, &backend, commits, rows_per_commit).await;
+        }
+        other => panic!("unknown backend '{other}', expected rocksdb or slatedb"),
+    }
+}
+
+async fn run<S>(storage: S, backend: &str, commits: usize, rows_per_commit: usize)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     Engine::initialize(storage.clone())
         .await
         .expect("initialize repository");
@@ -71,13 +89,16 @@ async fn main() {
     let _ = take_plan_load_attribution();
 
     println!(
-        "expAB_plan_load commits={commits} rows_per_commit={rows_per_commit} trace={}",
+        "expAB_plan_load backend={backend} commits={commits} rows_per_commit={rows_per_commit} trace={}",
         plan_load_trace_enabled()
     );
 
+    let mut latencies = Vec::with_capacity(commits);
     let run_start = Instant::now();
     for index in 0..commits {
+        let start = Instant::now();
         commit_batch(&session, index, rows_per_commit).await;
+        latencies.push(start.elapsed());
     }
     let wall = run_start.elapsed();
 
@@ -96,7 +117,31 @@ async fn main() {
         accounting.plan_load_nanos as f64 / 1e6,
         accounting.stage_nanos as f64 / 1e6
     );
+    // Boundary commits carry the whole root materialization, so the tail of the
+    // latency distribution is where a per-boundary cost shows up.
+    let mut sorted = latencies.clone();
+    sorted.sort_unstable();
+    let boundary_count = (accounting.boundaries as usize).max(1).min(sorted.len());
+    let worst_mean = sorted[sorted.len() - boundary_count..]
+        .iter()
+        .sum::<Duration>()
+        .as_secs_f64()
+        * 1000.0
+        / boundary_count as f64;
+    println!(
+        "commit_latency_ms median {:.3} p95 {:.3} p99 {:.3} max {:.3} worst{}_mean {:.3}",
+        sorted[sorted.len() / 2].as_secs_f64() * 1000.0,
+        sorted[sorted.len() * 95 / 100].as_secs_f64() * 1000.0,
+        sorted[sorted.len() * 99 / 100].as_secs_f64() * 1000.0,
+        sorted[sorted.len() - 1].as_secs_f64() * 1000.0,
+        boundary_count,
+        worst_mean
+    );
     report("commit_loop", &attribution);
+
+    if std::env::var("LIX_EXPAB_OPS").is_err() {
+        return;
+    }
 
     // ---- Is plan loading hot outside replay? -------------------------------
     let _ = take_plan_load_attribution();
