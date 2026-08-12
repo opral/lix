@@ -2045,9 +2045,8 @@ mod tests {
     }
 
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
-        let change_id = format!("{commit_id}-change");
         append.commits.push(CommitRecord {
-            format_version: 3,
+            format_version: 4,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),

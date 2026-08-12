@@ -21,9 +21,7 @@ use crate::sql2::change_materialization::{
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
-use crate::storage_adapter::{
-    StorageAdapterRead,
-};
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};

@@ -2885,9 +2885,8 @@ mod tests {
         let mut records = std::collections::BTreeMap::new();
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
-            let commit_change_id = format!("{commit_id_text}:commit");
             let record = crate::changelog::CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: CommitId::for_test_label(&commit_id_text),
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -3125,7 +3124,7 @@ mod tests {
                 .copied()
                 .map_or((commit_id, 0), |parent| (parent, 1));
             append.commits.push(crate::changelog::CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id,
                 generation,
                 parent_commit_ids: parents,
@@ -3272,7 +3271,6 @@ mod tests {
                 .first()
                 .map(|(change, _, _)| change.created_at)
                 .unwrap_or_else(|| ts("1970-01-01T00:00:00.000Z"));
-            let commit_change_id = format!("{commit_id}:commit");
             let generation = if let Some(parent) = parent_ids.first() {
                 let parent_generation = if let Some(generation) = generations.get(parent) {
                     *generation
@@ -3304,7 +3302,7 @@ mod tests {
                 .map(|id| CommitId::for_test_label(id))
                 .collect::<Vec<_>>();
             let record = crate::changelog::CommitRecord {
-                format_version: 3,
+                format_version: 4,
                 commit_id: CommitId::for_test_label(&commit_id),
                 generation,
                 parent_commit_ids: typed_parent_ids,

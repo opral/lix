@@ -7288,7 +7288,6 @@ mod tests {
             commit_id,
             parent_commit_ids: Vec::new(),
             created_at: timestamp,
-            change_id: change_id("mixed-certified-commit"),
             selected_change_batches: Vec::new(),
         }];
         let read = storage
@@ -9506,14 +9505,12 @@ mod tests {
                 commit_id: CommitId::for_test_label("child-commit"),
                 parent_commit_ids: vec![CommitId::for_test_label("parent-commit")],
                 created_at: ts("2026-01-01T00:00:01Z"),
-                change_id: ChangeId::for_test_label("child-commit-change"),
                 selected_change_batches: Vec::new(),
             },
             FinalizedCommitRow {
                 commit_id: CommitId::for_test_label("parent-commit"),
                 parent_commit_ids: Vec::new(),
                 created_at: ts("2026-01-01T00:00:00Z"),
-                change_id: ChangeId::for_test_label("parent-commit-change"),
                 selected_change_batches: Vec::new(),
             },
         ];
@@ -9650,7 +9647,6 @@ mod tests {
                     .map(|parent| vec![commit_ids[parent]])
                     .unwrap_or_default(),
                 created_at: ts("2026-01-01T00:00:00Z"),
-                change_id: ChangeId::for_test_label(&format!("staged-fence-record-{index}")),
                 selected_change_batches: Vec::new(),
             })
             .collect::<Vec<_>>();
@@ -10181,7 +10177,6 @@ mod tests {
         assert_eq!(rows.tracked_roots.len(), 1);
         let row = &rows.commit_rows[0];
         assert_eq!(row.commit_id, commit_id("test-uuid-1"));
-        assert_eq!(row.change_id, change_id("test-uuid-2"));
         assert_eq!(row.created_at.to_string(), "2026-01-01T00:00:00.001Z");
         assert_eq!(
             row.parent_commit_ids,
@@ -10378,7 +10373,6 @@ mod tests {
     fn prepared_normal_global_commit(
         row_change_label: &str,
         commit_label: &str,
-        commit_change_label: &str,
         branch_ref_change_label: &str,
     ) -> PreparedWriteSet {
         PreparedWriteSet {
@@ -10404,7 +10398,6 @@ mod tests {
         payload: &[u8],
         row_change_label: &str,
         commit_label: &str,
-        commit_change_label: &str,
         branch_ref_change_label: &str,
     ) -> PreparedWriteSet {
         let file_id = "01960000-0000-7000-8000-00000000ca55";

@@ -655,7 +655,6 @@ async fn stage_test_changelog_commit(
         .iter()
         .map(|parent| test_commit_id(parent))
         .collect::<Vec<_>>();
-    let typed_commit_change_id = test_change_id(commit_change_id);
     let parent_records = ChangelogContext::new()
         .reader(&mut *read)
         .load_commits(CommitLoadRequest {
