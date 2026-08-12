@@ -105,9 +105,9 @@ async fn open_session() -> (CountingStorage, SessionContext<CountingStorage>) {
         .await
         .expect("initialized storage should create engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
     (storage, session)
 }
 

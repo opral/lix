@@ -503,7 +503,7 @@ struct PluginActorAcceptedState {
 }
 
 /// One instantiated Component Store together with the admission token that
-/// keeps it within the workspace-wide live-Store bound.
+/// keeps it within the repository-wide live-Store bound.
 ///
 /// Field order is deliberate: Rust drops fields in declaration order, so the
 /// actor (and its Wasmtime Store) is destroyed before the permit is returned.
@@ -572,7 +572,7 @@ struct PluginActorPendingCheckpoint {
     last_used: u64,
 }
 
-/// Workspace-local index and hard admission bound for per-file actors.
+/// Repository-local index and hard admission bound for per-file actors.
 #[derive(Clone)]
 pub(crate) struct PluginActorCache {
     capacity: NonZeroUsize,
@@ -828,14 +828,14 @@ impl PluginActorCache {
         }
     }
 
-    /// Serializes cold actor construction. The gate is workspace-wide rather
+    /// Serializes cold actor construction. The gate is repository-wide rather
     /// than per-key because cold opens are uncommon and may otherwise retain
     /// multiple full semantic snapshots plus Wasm Stores concurrently.
     pub(crate) async fn cold_open_guard(&self) -> OwnedMutexGuard<()> {
         Arc::clone(&self.cold_open_gate).lock_owned().await
     }
 
-    /// Reserves one workspace-wide live Store slot before a Component actor is
+    /// Reserves one repository-wide live Store slot before a Component actor is
     /// instantiated. This intentionally fails fast instead of waiting: a
     /// transaction may already retain a pending actor through its durable
     /// commit point, so waiting could deadlock the transaction against itself.

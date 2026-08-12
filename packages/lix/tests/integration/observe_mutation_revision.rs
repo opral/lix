@@ -74,11 +74,11 @@ fn assert_key_value_row(event: &ObserveEvent, key: &str, value: &str) {
 async fn observe_emits_when_another_engine_commits() {
     let (observer_engine, writer_engine) = open_two_engines().await;
     let observer_session = observer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("observer session should open");
     let writer_session = writer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("writer session should open");
     let mut events = observe_key(&observer_session, "mutation-revision-external");
@@ -104,15 +104,15 @@ async fn observe_emits_when_another_engine_commits() {
 async fn observe_emits_after_local_generation_bump_without_storage_revision_change() {
     let (observer_engine, writer_engine) = open_two_engines().await;
     let observer_session = observer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("observer session should open");
     let local_session = observer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("local session should open");
     let writer_session = writer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("writer session should open");
     let mut events = observe_key(&observer_session, "mutation-revision-after-close");
@@ -144,11 +144,11 @@ async fn observe_emits_after_local_generation_bump_without_storage_revision_chan
 async fn observe_external_transaction_emits_only_after_commit() {
     let (observer_engine, writer_engine) = open_two_engines().await;
     let observer_session = observer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("observer session should open");
     let writer_session = writer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("writer session should open");
     let mut events = observe_key(&observer_session, "mutation-revision-transaction");
@@ -184,11 +184,11 @@ async fn observe_external_transaction_emits_only_after_commit() {
 async fn observe_external_rollback_does_not_emit() {
     let (observer_engine, writer_engine) = open_two_engines().await;
     let observer_session = observer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("observer session should open");
     let writer_session = writer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("writer session should open");
     let mut events = observe_key(&observer_session, "mutation-revision-rollback");
@@ -219,11 +219,11 @@ async fn observe_external_rollback_does_not_emit() {
 async fn observe_external_writes_can_coalesce_to_latest_snapshot() {
     let (observer_engine, writer_engine) = open_two_engines().await;
     let observer_session = observer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("observer session should open");
     let writer_session = writer_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("writer session should open");
     let mut events = observe_key(&observer_session, "mutation-revision-coalesce");

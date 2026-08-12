@@ -6,8 +6,9 @@ use lix::{GLOBAL_BRANCH_ID, LixError, Memory, Value};
 
 // Client-state rows deliberately use ordinary `lix_key_value` entities. The
 // private physical prefix keeps their key identity disjoint from built-in and
-// workspace KV rows even when the client store is inspected through SQL.
+// repository KV rows even when the client store is inspected through SQL.
 const CLIENT_STATE_KEY_PREFIX: &str = "lix_client_state:";
+pub(crate) const PRIMARY_SESSION_BRANCH_KEY: &str = "lix_primary_session_branch_id";
 
 const GET_SQL: &str = "SELECT value \
     FROM lix_key_value_by_branch \
@@ -42,7 +43,7 @@ const DELETE_SQL: &str = "DELETE FROM lix_key_value_by_branch \
 ///
 /// Placement is determined by which Lix owns this handle. Remote SDKs should
 /// construct this handle from their local client-only Lix, not from the remote
-/// workspace Lix.
+/// repository Lix.
 #[derive(Clone, Copy)]
 #[expect(missing_debug_implementations)]
 pub struct ClientState<'lix, StorageImpl = Memory>

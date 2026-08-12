@@ -8003,7 +8003,7 @@ mod tests {
             .await
             .expect("repository should reopen after rootless GC");
         let session = reopened
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("workspace should reopen after rootless GC");
         let main = session

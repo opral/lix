@@ -96,9 +96,9 @@ async fn run(rows: usize, scenario: &str, dir: &Path) {
         .await
         .expect("open anatomy engine");
     let main = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("open anatomy workspace session");
+        .expect("open anatomy session");
     register_schema(&main).await;
     seed_rows(&main, rows).await;
 
@@ -644,7 +644,7 @@ async fn create_branch(main: &SessionContext<SlateDB>, name: &str) -> String {
 
 async fn modify_rows(engine: &Engine<SlateDB>, branch: &str, start: usize, count: usize) {
     let session = engine
-        .open_session(branch.to_owned())
+        .open_session_at(branch.to_owned())
         .await
         .expect("open anatomy branch session");
     let mut written = 0usize;

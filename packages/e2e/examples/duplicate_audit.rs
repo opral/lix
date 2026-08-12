@@ -90,7 +90,7 @@ async fn build(corpus: &str, dir: &Path) {
         .await
         .expect("open corpus engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open corpus workspace");
     register_schema(&session).await;
@@ -132,7 +132,7 @@ async fn build(corpus: &str, dir: &Path) {
                     .await
                     .expect("create audit branch");
                 let branch_session = engine
-                    .open_session(branch.id.clone())
+                    .open_session_at(branch.id.clone())
                     .await
                     .expect("open audit branch session");
                 edit_rows(&branch_session, shape, 3, 100, base).await;
@@ -158,7 +158,7 @@ async fn build(corpus: &str, dir: &Path) {
                 .await
                 .expect("create GC-disposable branch");
             let branch_session = engine
-                .open_session(branch.id.clone())
+                .open_session_at(branch.id.clone())
                 .await
                 .expect("open GC-disposable branch");
             edit_rows(&branch_session, shape, 10, 200, rows / 2).await;

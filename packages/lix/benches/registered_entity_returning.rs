@@ -466,7 +466,7 @@ async fn new_fixture() -> SessionContext<Memory> {
         .await
         .expect("open registered-entity RETURNING benchmark engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open registered-entity RETURNING benchmark session");
     let registration = session

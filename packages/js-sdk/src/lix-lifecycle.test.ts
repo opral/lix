@@ -5,7 +5,6 @@ import { Lix } from "./lix.js";
 
 test("managed Lix close rejects new work and drains an in-flight branch switch", async () => {
 	const remoteSwitch = deferred<{ branchId: string }>();
-	const localPersistence = deferred<void>();
 	const order: string[] = [];
 	const execute = vi.fn(async () => {
 		throw new Error("execute must not reach the binding after close starts");
@@ -22,13 +21,8 @@ test("managed Lix close rejects new work and drains an in-flight branch switch",
 			order.push("remote binding closed");
 		},
 	} as unknown as LixBinding;
-	const clientStateSet = vi.fn(async () => {
-			order.push("client persistence started");
-			await localPersistence.promise;
-			order.push("client persistence finished");
-		});
 	const clientBinding = {
-		clientStateSet,
+		clientStateSet: vi.fn(async () => undefined),
 		close: async () => {
 			order.push("client binding closed");
 		},
@@ -57,25 +51,16 @@ test("managed Lix close rejects new work and drains an in-flight branch switch",
 	await expect(stateWriteAfterClose).rejects.toMatchObject({
 		code: "LIX_ERROR_CLOSED",
 	});
-	expect(clientStateSet).not.toHaveBeenCalled();
 	expect(order).toEqual(["remote switch started"]);
 
 	remoteSwitch.resolve({ branchId: "draft" });
-	await vi.waitFor(() => {
-		expect(order).toContain("client persistence started");
-	});
-	expect(order).not.toContain("client binding closed");
-	expect(order).not.toContain("remote binding closed");
-
-	localPersistence.resolve();
 	await expect(switching).resolves.toEqual({ branchId: "draft" });
+	expect(clientBinding.clientStateSet).not.toHaveBeenCalled();
 	await expect(closing).resolves.toBeUndefined();
 	expect(branchListener).toHaveBeenCalledOnce();
 	expect(order).toEqual([
 		"remote switch started",
 		"remote switch finished",
-		"client persistence started",
-		"client persistence finished",
 		"remote binding closed",
 		"client binding closed",
 	]);

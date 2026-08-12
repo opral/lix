@@ -132,7 +132,7 @@ async fn execute_batch_benchmark_probe() {
     let storage = CountingStorage::new();
     Engine::initialize(storage.clone()).await.unwrap();
     let engine = Engine::new(storage.clone()).await.unwrap();
-    let session = engine.open_workspace_session().await.unwrap();
+    let session = engine.open_session().await.unwrap();
     seed_files(&session, file_count).await;
 
     for (workload, statements) in [

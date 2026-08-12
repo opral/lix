@@ -438,7 +438,7 @@ where
         .await
         .expect("open undo/redo setup engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open undo/redo setup session");
     register_schema(&session).await;
@@ -576,7 +576,7 @@ async fn measure<S>(
         .await
         .expect("open measured undo/redo engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open measured undo/redo session");
     let rows = count_rows(&session).await;

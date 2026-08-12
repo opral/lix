@@ -7,7 +7,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -46,7 +46,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_branch_id())
+                .open_session_at(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -60,7 +60,7 @@ simulation_test!(
         .expect("draft branch should be created");
         let draft = sim.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-000000000016")
+                .open_session_at("01930000-0000-7000-8000-000000000016")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -130,7 +130,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,

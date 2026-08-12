@@ -17,9 +17,9 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
         .await
         .expect("initialized storage should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     for schema in multi_entity_schemas() {
         session
@@ -159,9 +159,9 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
 
     session.close().await.expect("session should close");
     let reopened = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should reopen");
+        .expect("session should reopen");
     assert_eq!(
         reopened
             .execute(MULTI_ENTITY_SQL, &bundle_1)

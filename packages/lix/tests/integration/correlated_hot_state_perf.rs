@@ -334,7 +334,7 @@ async fn seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
         .await
         .expect("benchmark engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("benchmark session should open");
 
@@ -431,7 +431,7 @@ async fn open_case(seed_snapshot: &[u8]) -> (CountingStorage, SessionContext<Cou
         .await
         .expect("benchmark engine should open from seed snapshot");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("benchmark session should open from seed snapshot");
     (storage, session)

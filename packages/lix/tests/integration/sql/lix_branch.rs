@@ -6,7 +6,7 @@ simulation_test!(lix_branch_lists_descriptors_with_refs, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+            .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .await
             .expect("global session should open"),
         &engine,
@@ -47,7 +47,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -112,7 +112,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -139,9 +139,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
         let branch_id = sim.main_branch_id();
@@ -221,9 +221,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -270,9 +270,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -306,9 +306,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -376,9 +376,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -433,9 +433,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -494,9 +494,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -603,9 +603,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -672,9 +672,9 @@ simulation_test!(lix_branch_duplicate_insert_rejects, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -711,9 +711,9 @@ simulation_test!(lix_branch_duplicate_name_insert_rejects, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -745,9 +745,9 @@ simulation_test!(lix_branch_duplicate_name_update_rejects, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -790,9 +790,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -821,9 +821,9 @@ simulation_test!(lix_branch_update_rejects_id_change, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -872,9 +872,9 @@ simulation_test!(lix_branch_update_rejects_global_branch, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -906,9 +906,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -929,9 +929,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -980,9 +980,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -1023,9 +1023,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 

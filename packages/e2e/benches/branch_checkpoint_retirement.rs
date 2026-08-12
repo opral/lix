@@ -265,7 +265,7 @@ where
         .await
         .expect("open branch-delete benchmark engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open branch-delete benchmark workspace");
     session
@@ -286,7 +286,7 @@ where
         .await
         .expect("open branch-delete benchmark engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open branch-delete benchmark workspace");
     session

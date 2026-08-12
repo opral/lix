@@ -129,7 +129,7 @@ async fn run_cell(shape: &str, cadence: usize, edits: usize) {
         .await
         .expect("open leak engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open leak workspace");
     register_schema(&session).await;

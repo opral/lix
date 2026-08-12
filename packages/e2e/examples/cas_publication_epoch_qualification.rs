@@ -218,7 +218,7 @@ async fn run<S>(
         .await
         .expect("open publication repository");
     let session = engine
-        .open_session(initialized.main_branch_id)
+        .open_session_at(initialized.main_branch_id)
         .await
         .expect("open publication session");
     let stable_1k = deterministic_bytes(KIB, 1);

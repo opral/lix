@@ -247,7 +247,7 @@ async fn build(corpus: &str, dir: &Path, log_path: &Path) {
         .await
         .expect("open corpus engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open corpus workspace");
     let mut log = WriteLog::create(log_path);

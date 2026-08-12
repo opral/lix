@@ -359,7 +359,7 @@ where
         .await
         .expect("open checkpoint-query setup engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open checkpoint-query setup session");
     for _ in 0..additional_checkpoints {
@@ -450,7 +450,7 @@ async fn measure_query<StorageImpl>(
         .await
         .expect("open checkpoint-query engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open checkpoint-query session");
     for _ in 0..warmups {

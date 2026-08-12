@@ -22,9 +22,9 @@ where
         .expect("initialize storage");
     let engine = Engine::new(storage).await.expect("open engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("open workspace session");
+        .expect("open session");
 
     assert_eq!(
         session

@@ -1,10 +1,6 @@
 import { invalidArgument } from "./errors.js";
-import {
-	ACTIVE_BRANCH_CLIENT_STATE_KEY,
-	type LixClientState,
-	type ManagedClientState,
-	unavailableClientState,
-} from "./client-state.js";
+import type { LixClientState, ManagedClientState } from "./client-state.js";
+import { unavailableClientState } from "./client-state.js";
 import type {
 	BindingObserveEvent,
 	LixBinding,
@@ -199,18 +195,6 @@ export class Lix {
 	): Promise<SwitchBranchReceipt> {
 		return this.#runOperation(async () => {
 			const receipt = await this.binding.switchBranch(options);
-			try {
-				if (this.managedClientState) {
-					await this.managedClientState.set(
-						ACTIVE_BRANCH_CLIENT_STATE_KEY,
-						receipt.branchId,
-					);
-				}
-			} catch {
-				// The remote branch switch already committed. Client persistence is a
-				// best-effort reopen preference and cannot turn that success into a
-				// rejected switch with ambiguous branch state.
-			}
 			for (const listener of [...this.#activeBranchListeners]) {
 				try {
 					listener();

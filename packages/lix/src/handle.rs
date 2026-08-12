@@ -19,7 +19,7 @@ use crate::client_state::ClientState;
 use crate::engine::{Engine, EngineOptions};
 use crate::session::SessionContext;
 
-/// Configures a Lix workspace session before it is opened.
+/// Configures the primary session for a Lix repository.
 ///
 /// The default builder opens an in-memory Lix. Configure a persistent adapter
 /// with [`OpenLixBuilder::with_storage`] and then await the builder.
@@ -66,7 +66,12 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
     }
 }
 
-/// Starts configuring a Lix workspace session.
+/// Starts configuring the primary session for a Lix repository.
+///
+/// The primary session restores `lix_primary_session_branch_id` from client
+/// state. When that preference is absent or names a deleted branch, it starts
+/// on the repository's tracked `lix_default_branch_id` and records the result
+/// in client state.
 ///
 /// Await the returned builder to open a new in-memory Lix:
 ///
@@ -88,18 +93,24 @@ where
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        Box::pin(
-            async move { open_lix_inner(self.storage, self.wasm_runtime, self.telemetry).await },
-        )
+        // SAFETY: the builder owns Send storage/runtime/telemetry values, and
+        // the returned Lix contains only Send synchronization primitives. The
+        // compiler cannot prove the deeply nested SQL futures are Send across
+        // the primary-session client-state restoration path.
+        Box::pin(unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                open_lix_inner(self.storage, self.wasm_runtime, self.telemetry).await
+            })
+        })
     }
 }
 
-/// Clonable workspace-session handle for a Lix repository.
+/// Clonable session handle for a Lix repository.
 ///
 /// Clones are concurrent handles to the same logical session: they share the
-/// active workspace branch, transaction exclusion, file-view state, and close
+/// active branch, transaction exclusion, file-view state, and close
 /// lifecycle. Use [`Lix::open_session`] when an operation needs an independent
-/// pinned session and lifecycle.
+/// session and lifecycle.
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct Lix<StorageImpl = Memory>
@@ -108,6 +119,7 @@ where
 {
     engine: Arc<Engine<StorageImpl>>,
     session: Arc<SessionContext<StorageImpl>>,
+    primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 async fn open_lix_inner<StorageImpl>(
@@ -119,11 +131,38 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let engine = open_or_initialize_engine(storage, wasm_runtime, telemetry, None).await?;
-    let session = engine.open_workspace_session().await?;
-    Ok(Lix {
+    let session = engine.open_session().await?;
+    let lix = Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
-    })
+        primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
+    };
+    let stored_branch_id = lix
+        .client_state()
+        .get(crate::client_state::PRIMARY_SESSION_BRANCH_KEY)
+        .await?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty());
+    if let Some(branch_id) = stored_branch_id.as_deref()
+        && lix.engine.load_branch_head_commit_id(branch_id).await?.is_some()
+        && branch_id != lix.active_branch_id().await?
+    {
+        lix.session
+            .switch_branch(SwitchBranchOptions {
+                branch_id: branch_id.to_string(),
+            })
+            .await?;
+    }
+    let active_branch_id = lix.active_branch_id().await?;
+    if stored_branch_id.as_deref() != Some(active_branch_id.as_str()) {
+        lix.client_state()
+            .set(
+                crate::client_state::PRIMARY_SESSION_BRANCH_KEY,
+                serde_json::Value::String(active_branch_id),
+            )
+            .await?;
+    }
+    Ok(lix)
 }
 
 impl<StorageImpl> Lix<StorageImpl>
@@ -133,51 +172,46 @@ where
     /// Returns a borrowed handle to JSON state owned by this client storage.
     ///
     /// Remote SDK integrations should expose this handle from a separate
-    /// client-only local Lix while continuing to route workspace operations to
-    /// the remote Lix.
+    /// client-only local Lix while continuing to route repository operations
+    /// to the remote Lix.
     pub fn client_state(&self) -> ClientState<'_, StorageImpl> {
         ClientState::new(self)
     }
 
-    /// Opens another workspace session on this handle's existing engine.
+    /// Opens an independent session on this handle's current branch.
     ///
     /// The returned handle has independent session-local state, including its
     /// acknowledged plugin file views and lifecycle. It deliberately clones
     /// the existing [`Engine`] instead of constructing another engine over the
     /// same storage, so engine-wide collaboration and runtime gates remain
     /// shared by every session.
-    pub async fn open_workspace_session(&self) -> Result<Self, LixError> {
+    pub async fn open_session(&self) -> Result<Self, LixError> {
         if self.session.is_closed() {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
-                "cannot open a workspace session from a closed Lix handle",
+                "cannot open a session from a closed Lix handle",
             ));
         }
-        let session = self.engine.open_workspace_session().await?;
-        Ok(Self {
-            engine: self.engine.clone(),
-            session: Arc::new(session),
-        })
+        let active_branch_id = self.active_branch_id().await?;
+        self.open_session_at(active_branch_id).await
     }
 
-    /// Opens an independent session pinned to `active_branch_id` on this
-    /// handle's existing engine.
+    /// Opens an independent session on `active_branch_id` using this handle's
+    /// existing engine.
     ///
-    /// Unlike a workspace session, a pinned session never reads or writes the
-    /// shared workspace branch selector. The requested branch is validated
-    /// before the child handle is returned. Branch switches update this
-    /// handle and its clones in place.
-    pub async fn open_session(
+    /// The requested branch is validated before the new handle is returned.
+    /// Branch switches update that handle and its clones in place.
+    pub async fn open_session_at(
         &self,
         active_branch_id: impl Into<String>,
     ) -> Result<Self, LixError> {
-        self.open_session_with_account(active_branch_id, lix::ANONYMOUS_ACCOUNT_ID)
+        self.open_session_at_with_account(active_branch_id, lix::ANONYMOUS_ACCOUNT_ID)
             .await
     }
 
-    /// Opens an independent branch-pinned session whose changes are attributed
-    /// to `active_account_id`.
-    pub async fn open_session_with_account(
+    /// Opens an independent session on `active_branch_id` whose changes are
+    /// attributed to `active_account_id`.
+    pub async fn open_session_at_with_account(
         &self,
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
@@ -185,7 +219,7 @@ where
         if self.session.is_closed() {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
-                "cannot open a pinned session from a closed Lix handle",
+                "cannot open a session from a closed Lix handle",
             ));
         }
         let active_branch_id = active_branch_id.into();
@@ -203,11 +237,12 @@ where
         }
         let session = self
             .engine
-            .open_session_with_account(active_branch_id, active_account_id)
+            .open_session_at_with_account(active_branch_id, active_account_id)
             .await?;
         Ok(Self {
             engine: self.engine.clone(),
             session: Arc::new(session),
+            primary_switch_gate: None,
         })
     }
 
@@ -436,7 +471,7 @@ where
     pub async fn ensure_account(&self, id: &str, name: &str, kind: &str) -> Result<(), LixError> {
         let branch_id = self.active_branch_id().await?;
         let system = self
-            .open_session_with_account(branch_id, lix::SYSTEM_ACCOUNT_ID)
+            .open_session_at_with_account(branch_id, lix::SYSTEM_ACCOUNT_ID)
             .await?;
         system
             .execute(
@@ -477,11 +512,31 @@ where
         self.session.redo().await
     }
 
-    pub async fn switch_branch(
+    pub fn switch_branch(
         &self,
         options: SwitchBranchOptions,
-    ) -> Result<SwitchBranchReceipt, LixError> {
-        self.session.switch_branch(options).await
+    ) -> impl Future<Output = Result<SwitchBranchReceipt, LixError>> + Send + '_ {
+        // SAFETY: the future borrows a Send + Sync Lix handle and owns its
+        // switch options. The compiler cannot prove the nested client-state
+        // SQL future is Send for every storage read lifetime.
+        unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                let _primary_switch_guard = match &self.primary_switch_gate {
+                    Some(gate) => Some(gate.lock().await),
+                    None => None,
+                };
+                let receipt = self.session.switch_branch(options).await?;
+                if self.primary_switch_gate.is_some() {
+                    self.client_state()
+                        .set(
+                            crate::client_state::PRIMARY_SESSION_BRANCH_KEY,
+                            serde_json::Value::String(receipt.branch_id.clone()),
+                        )
+                        .await?;
+                }
+                Ok(receipt)
+            })
+        }
     }
 
     pub async fn merge_branch(
@@ -644,14 +699,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn workspace_sessions_share_one_engine_but_have_independent_lifecycles() {
+    async fn sessions_share_one_engine_but_have_independent_lifecycles() {
         let root = open_lix().await.expect("open root Lix");
         let first = root
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("open first child session");
         let second = root
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("open second child session");
 
@@ -672,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_sessions_validate_and_retain_branch_switches() {
+    async fn sessions_validate_and_retain_branch_switches() {
         let root = open_lix().await.expect("open root Lix");
         let main_branch_id = root.active_branch_id().await.expect("main branch");
         let draft = root
@@ -684,33 +739,107 @@ mod tests {
             .await
             .expect("create draft");
 
-        let pinned = root
-            .open_session(main_branch_id.clone())
+        let session = root
+            .open_session_at(main_branch_id.clone())
             .await
-            .expect("open pinned main session");
-        let pinned_clone = pinned.clone();
-        let receipt = pinned
+            .expect("open main session");
+        let session_clone = session.clone();
+        let receipt = session
             .switch_branch(SwitchBranchOptions {
                 branch_id: draft.id.clone(),
             })
             .await
-            .expect("switch pinned session");
+            .expect("switch session");
 
         assert_eq!(receipt.branch_id, draft.id);
         assert_eq!(
-            pinned.active_branch_id().await.unwrap(),
+            session.active_branch_id().await.unwrap(),
             "01920000-0000-7000-8000-000000000501"
         );
         assert_eq!(
-            pinned_clone.active_branch_id().await.unwrap(),
+            session_clone.active_branch_id().await.unwrap(),
             "01920000-0000-7000-8000-000000000501"
         );
         assert_eq!(root.active_branch_id().await.unwrap(), main_branch_id);
 
-        let Err(error) = root.open_session("missing-branch").await else {
+        let Err(error) = root.open_session_at("missing-branch").await else {
             panic!("missing branch must not open");
         };
         assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn primary_session_restores_its_branch_without_changing_repository_default() {
+        let storage = Memory::new();
+        let primary = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("open primary session");
+        let main_branch_id = primary.active_branch_id().await.expect("main branch");
+        let draft = primary
+            .create_branch(CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-000000000502".to_string()),
+                name: "Primary draft".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create draft");
+
+        primary
+            .switch_branch(SwitchBranchOptions {
+                branch_id: draft.id.clone(),
+            })
+            .await
+            .expect("switch primary session");
+        let secondary = primary.open_session().await.expect("open secondary session");
+        secondary
+            .switch_branch(SwitchBranchOptions {
+                branch_id: main_branch_id.clone(),
+            })
+            .await
+            .expect("switch secondary session");
+        secondary.close().await.expect("close secondary session");
+        primary.close().await.expect("close primary session");
+
+        let reopened = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("reopen primary session");
+        assert_eq!(reopened.active_branch_id().await.unwrap(), draft.id);
+
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("reopen repository engine");
+        let repository_default = engine.open_session().await.expect("open default session");
+        assert_eq!(
+            repository_default.active_branch_id().await.unwrap(),
+            main_branch_id,
+            "primary-session switching must not mutate lix_default_branch_id"
+        );
+
+        repository_default
+            .execute(
+                "DELETE FROM lix_branch WHERE id = $1",
+                &[Value::Text(draft.id)],
+            )
+            .await
+            .expect("non-default draft should delete");
+        reopened.close().await.expect("close restored primary session");
+        repository_default
+            .close()
+            .await
+            .expect("close repository-default session");
+        drop(engine);
+
+        let fallback = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("missing primary preference should fall back");
+        assert_eq!(
+            fallback.active_branch_id().await.unwrap(),
+            main_branch_id,
+            "a deleted primary preference must fall back to lix_default_branch_id"
+        );
     }
 
     #[tokio::test]
@@ -727,7 +856,7 @@ mod tests {
             .expect("provision unused account");
 
         let author = root
-            .open_session_with_account(
+            .open_session_at_with_account(
                 root.active_branch_id().await.expect("active branch"),
                 AUTHOR_ID,
             )
@@ -767,7 +896,7 @@ mod tests {
         );
 
         let system = root
-            .open_session_with_account(
+            .open_session_at_with_account(
                 root.active_branch_id().await.expect("active branch"),
                 lix::SYSTEM_ACCOUNT_ID,
             )
@@ -797,7 +926,7 @@ mod tests {
         );
 
         let unused = root
-            .open_session_with_account(
+            .open_session_at_with_account(
                 root.active_branch_id().await.expect("active branch"),
                 UNUSED_ID,
             )

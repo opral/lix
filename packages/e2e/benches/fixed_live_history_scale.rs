@@ -183,7 +183,7 @@ where
             .expect("initialize repository");
         let engine = Engine::new(storage.clone()).await.expect("open engine");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("open workspace");
         register_schema(&session).await;

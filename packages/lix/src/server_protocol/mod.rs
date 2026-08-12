@@ -1745,7 +1745,7 @@ where
         let child = match self
             .inner
             .root
-            .open_session_with_account(active_branch_id, active_account_id)
+            .open_session_at_with_account(active_branch_id, active_account_id)
             .await
         {
             Ok(child) => child,

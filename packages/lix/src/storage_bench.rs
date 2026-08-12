@@ -3521,7 +3521,7 @@ mod tests {
             .await
             .expect("open benchmark engine");
         let main = engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("open benchmark main session");
         let schema = serde_json::json!({
@@ -3551,7 +3551,7 @@ mod tests {
             .await
             .expect("create benchmark branch");
         let branch_session = engine
-            .open_session(branch.id.clone())
+            .open_session_at(branch.id.clone())
             .await
             .expect("open benchmark branch session");
         for commit_index in 0..10 {

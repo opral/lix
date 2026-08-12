@@ -60,7 +60,7 @@ async fn open_initialized(path: &Path) -> (SlateDB, SessionContext<SlateDB>) {
         .await
         .expect("open point-query engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open point-query session");
     (storage, session)
@@ -77,7 +77,7 @@ async fn setup(path: &Path, rows: usize) {
         .await
         .expect("open initialized point-query fixture");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open point-query setup session");
     let schema = serde_json::json!({

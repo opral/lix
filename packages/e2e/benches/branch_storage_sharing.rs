@@ -210,9 +210,9 @@ async fn run_case<S>(
         .await
         .expect("open branch-sharing engine");
     let main = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("open branch-sharing workspace session");
+        .expect("open branch-sharing session");
     register_schema(&main).await;
     let seed_started = Instant::now();
     seed_rows(&main, rows).await;
@@ -431,7 +431,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session = engine
-        .open_session(branch.to_owned())
+        .open_session_at(branch.to_owned())
         .await
         .expect("open branch-sharing branch session");
     let mut written = 0usize;

@@ -16,7 +16,7 @@ simulation_test!(subquery_reads_do_not_leak_storage_read_handles, |sim| async mo
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,

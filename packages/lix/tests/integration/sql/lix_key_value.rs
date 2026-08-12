@@ -6,7 +6,7 @@ simulation_test!(lix_key_value_roundtrips_arbitrary_json, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -37,14 +37,14 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
         );
         let global_session = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -107,7 +107,7 @@ simulation_test!(lix_key_value_duplicate_insert_rejects, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -154,7 +154,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -206,7 +206,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -248,7 +248,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -291,14 +291,14 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
         );
         let global_session = sim.wrap_session(
             engine
-                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -349,7 +349,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,

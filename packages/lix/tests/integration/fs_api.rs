@@ -10,9 +10,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -48,9 +48,9 @@ simulation_test!(sql_path_only_file_reads_as_empty, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -73,9 +73,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -133,11 +133,11 @@ async fn raw_stale_writes_use_whole_file_last_writer_wins() {
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
     let session_a = engine
-        .open_session(receipt.main_branch_id.clone())
+        .open_session_at(receipt.main_branch_id.clone())
         .await
         .expect("session A should open");
     let session_b = engine
-        .open_session(receipt.main_branch_id)
+        .open_session_at(receipt.main_branch_id)
         .await
         .expect("session B should open");
 
@@ -167,9 +167,9 @@ async fn sql_update_path_to_plugin_storage_rejects_archive_rename() {
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session should open");
+        .expect("session should open");
 
     write_file(&session, "/normal.txt", b"normal".to_vec())
         .await
@@ -198,9 +198,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -230,9 +230,9 @@ simulation_test!(sql_write_file_upserts_existing_data, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -271,9 +271,9 @@ simulation_test!(sql_rm_file_and_recursive_directory, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -310,9 +310,9 @@ simulation_test!(sql_file_directory_path_constraints, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 

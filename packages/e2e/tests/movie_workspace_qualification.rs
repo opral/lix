@@ -354,7 +354,7 @@ where
         .expect("initialize movie workspace");
     let engine = Engine::new(storage).await.expect("open movie workspace");
     let seed = engine
-        .open_session(receipt.main_branch_id.clone())
+        .open_session_at(receipt.main_branch_id.clone())
         .await
         .expect("open seed session");
     for revision in 0..HISTORY_COMMITS {
@@ -387,25 +387,25 @@ where
 
     let ingest = Arc::new(
         engine
-            .open_session(receipt.main_branch_id.clone())
+            .open_session_at(receipt.main_branch_id.clone())
             .await
             .expect("open ingest session"),
     );
     let saver = Arc::new(
         engine
-            .open_session(receipt.main_branch_id.clone())
+            .open_session_at(receipt.main_branch_id.clone())
             .await
             .expect("open project-save session"),
     );
     let first_reader = Arc::new(
         engine
-            .open_session(receipt.main_branch_id.clone())
+            .open_session_at(receipt.main_branch_id.clone())
             .await
             .expect("open first playback session"),
     );
     let second_reader = Arc::new(
         engine
-            .open_session(receipt.main_branch_id)
+            .open_session_at(receipt.main_branch_id)
             .await
             .expect("open second playback session"),
     );
@@ -548,7 +548,7 @@ where
         .expect("initialize restart fixture");
     let engine = Engine::new(storage).await.expect("open first engine");
     let session = engine
-        .open_session(receipt.main_branch_id)
+        .open_session_at(receipt.main_branch_id)
         .await
         .expect("open first restart session");
     let total = FILE_UPLOAD_PART_BYTES as u64 + 9;
@@ -571,7 +571,7 @@ where
 {
     let engine = Engine::new(storage).await.expect("reopen engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open resumed session");
     let total = FILE_UPLOAD_PART_BYTES as u64 + 9;

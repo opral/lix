@@ -10,7 +10,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -171,7 +171,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -194,7 +194,7 @@ simulation_test!(
 
         let branch = sim.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-000000000006")
+                .open_session_at("01930000-0000-7000-8000-000000000006")
                 .await
                 .expect("branch session should open"),
             &engine,
@@ -256,7 +256,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -286,7 +286,7 @@ simulation_test!(
 
         let branch_a = sim.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-000000000007")
+                .open_session_at("01930000-0000-7000-8000-000000000007")
                 .await
                 .expect("01930000-0000-7000-8000-000000000007 session should open"),
             &engine,
@@ -301,7 +301,7 @@ simulation_test!(
 
         let branch_b = sim.wrap_session(
             engine
-                .open_session("01930000-0000-7000-8000-000000000008")
+                .open_session_at("01930000-0000-7000-8000-000000000008")
                 .await
                 .expect("01930000-0000-7000-8000-000000000008 session should open"),
             &engine,
@@ -336,7 +336,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -367,7 +367,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("main session should open"),
             &engine,

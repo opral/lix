@@ -2647,7 +2647,7 @@ fn internal_metadata_crud_is_centralized_in_owner_storage() {
 
     assert!(
         violations.is_empty(),
-        "internal metadata CRUD for workspace selectors, commit idempotency, and undo/redo log should live in owner-local `storage.rs` seams, not scattered through `api/*`, `init/*`, `session/*`, or `transaction/*`.\n\nCurrent violations:\n{}",
+        "internal metadata CRUD for primary-session state, commit idempotency, and undo/redo log should live in owner-local `storage.rs` seams, not scattered through `api/*`, `init/*`, `session/*`, or `transaction/*`.\n\nCurrent violations:\n{}",
         render_grouped_raw_sql_execution_violations(&violations),
     );
 }

@@ -6,9 +6,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -55,9 +55,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -98,9 +98,9 @@ simulation_test!(read_only_history_views_reject_dml, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -130,9 +130,9 @@ simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open"),
+            .expect("session should open"),
         &engine,
     );
 
@@ -168,14 +168,14 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let reader = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("reader session should open"),
             &engine,
         );
         let writer = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("writer session should open"),
             &engine,

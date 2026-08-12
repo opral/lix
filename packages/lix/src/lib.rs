@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Rust SDK for Lix.
 //!
 //! Embedded version control for files and data.
@@ -11,7 +13,7 @@
 //! # }
 //! ```
 //!
-//! [`open_lix`] opens an in-memory workspace. Add a storage adapter with
+//! [`open_lix`] opens an in-memory repository. Add a storage adapter with
 //! [`OpenLixBuilder::with_storage`] when persistence is needed.
 
 #![recursion_limit = "256"]
@@ -123,7 +125,7 @@ pub mod wasm;
 ///
 /// Most applications should use [`open_lix`] and [`Lix`] instead. This module
 /// is intentionally separate so the everyday SDK surface stays focused on a
-/// workspace handle, while storage adapters can still compose with the
+/// repository handle, while storage adapters can still compose with the
 /// initialized engine they need to provide host behavior.
 pub mod integration {
     pub use crate::engine::{Engine, EngineOptions};

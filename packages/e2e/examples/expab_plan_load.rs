@@ -78,7 +78,7 @@ where
         .expect("initialize repository");
     let engine = Engine::new(storage.clone()).await.expect("open engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open workspace");
     register_schema(&session).await;
@@ -196,7 +196,7 @@ where
         .expect("create branch")
         .id;
     let branch_session = engine
-        .open_session(branch.clone())
+        .open_session_at(branch.clone())
         .await
         .expect("open branch session");
     for index in 0..8 {

@@ -320,7 +320,7 @@ where
         .expect("initialize Lix TPC-H storage");
     let engine = Engine::new(storage).await.expect("open Lix TPC-H engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open Lix TPC-H session");
     for schema in [

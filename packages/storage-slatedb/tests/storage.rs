@@ -63,9 +63,9 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
         .expect("initialize SlateDB storage");
     let engine = Engine::new(storage.clone()).await.expect("open engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("open workspace session");
+        .expect("open session");
 
     session
         .execute(
@@ -122,9 +122,9 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
     let reopened = SlateDB::open(&path).expect("reopen SlateDB storage");
     let engine = Engine::new(reopened).await.expect("reopen engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("reopen workspace session");
+        .expect("reopen session");
     let result = session
         .execute(
             "SELECT content, OCTET_LENGTH(content) AS octets FROM lix_file WHERE path = $1",

@@ -77,7 +77,7 @@ where
         .expect("initialize benchmark storage");
     let engine = Engine::new(storage).await.expect("open benchmark engine");
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("open benchmark session");
 

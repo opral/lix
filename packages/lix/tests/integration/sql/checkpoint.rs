@@ -9,9 +9,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
         let initial_commit_id = sim.initial_commit_id().to_string();
@@ -236,9 +236,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -281,9 +281,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 
@@ -355,9 +355,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
         let file_id = "01950000-0000-7000-8000-000000000099";
@@ -490,9 +490,9 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("workspace session should open"),
+                .expect("session should open"),
             &engine,
         );
 

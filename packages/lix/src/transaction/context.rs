@@ -21,8 +21,8 @@ use tracing::Instrument as _;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{
-    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchLifecycle,
-    BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
+    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchRefReader,
+    branch_ref_stage_row,
 };
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogRevision, CatalogSnapshot, SchemaPlanId,
@@ -78,7 +78,7 @@ use crate::plugin::{
     transport_splice_preserves_utf8, validate_create_changes, validate_create_reservation,
 };
 use crate::session::{
-    EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
+    EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionBranch,
     encode_receipt,
 };
 use crate::sql2::{
@@ -1510,7 +1510,7 @@ where
 
     /// Opens an execution-scoped staging area for SQL/provider hooks.
     async fn open<T, F>(
-        mode: &SessionMode,
+        session_branch: &SessionBranch,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         hot_state: Arc<HotStateContext>,
@@ -1535,9 +1535,7 @@ where
         let opening_read = SharedStorageAdapterRead::new(read);
         let read = opening_read.clone();
         let setup_result = async {
-            let active_branch_id =
-                resolve_active_branch_id(mode, hot_state.as_ref(), branch_ctx.as_ref(), &read)
-                    .await?;
+            let active_branch_id = session_branch.get()?;
             let runtime_functions = FunctionContext::prepare(&read).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
@@ -2528,7 +2526,7 @@ where
         };
 
         // Static conflict resolution is short lived, but it still owns a
-        // Wasmtime Store and must honor the same workspace-wide admission
+        // Wasmtime Store and must honor the same repository-wide admission
         // bound as retained document actors.
         let permit = self.plugin_host.actor_cache().admit_store()?;
         let actor = factory
@@ -6602,6 +6600,7 @@ where
     }
 
     /// Convenience helper for programmatic APIs that only stage state rows.
+    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_rows(
         &mut self,
         rows: RawWriteBatch,
@@ -8985,7 +8984,7 @@ pub(crate) struct OpenTransaction<StorageImpl: Storage + 'static = Memory> {
 }
 
 pub(crate) async fn open_transaction<StorageImpl>(
-    mode: &SessionMode,
+    session_branch: &SessionBranch,
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     hot_state: Arc<HotStateContext>,
@@ -9001,7 +9000,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let (opened, ()) = Transaction::open(
-        mode,
+        session_branch,
         active_account_id,
         storage,
         hot_state,
@@ -9019,7 +9018,7 @@ where
 }
 
 pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
-    mode: &SessionMode,
+    session_branch: &SessionBranch,
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     hot_state: Arc<HotStateContext>,
@@ -9037,7 +9036,7 @@ where
     F: for<'runtime> AsyncFnOnce(&'runtime FunctionContext) -> Result<T, LixError>,
 {
     Transaction::open(
-        mode,
+        session_branch,
         active_account_id,
         storage,
         hot_state,
@@ -11858,45 +11857,6 @@ fn require_valid_storage_scope(branch_id: &str, global: bool) -> Result<(), LixE
     Ok(())
 }
 
-async fn resolve_active_branch_id(
-    mode: &SessionMode,
-    _hot_state: &HotStateContext,
-    branch_ctx: &BranchContext,
-    read: &(impl StorageAdapterRead + ?Sized),
-) -> Result<String, LixError> {
-    match mode {
-        SessionMode::Pinned { branch_id } => branch_id
-            .read()
-            .map(|branch_id| branch_id.clone())
-            .map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "session branch selector is poisoned",
-                )
-            }),
-        SessionMode::Workspace { branch_id } => {
-            let branch_id = branch_id
-                .read()
-                .map(|branch_id| branch_id.clone())
-                .map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "workspace branch selector cache is poisoned",
-                    )
-                })?;
-            let branch_ref = branch_ctx.ref_reader(read);
-            BranchLifecycle::new(&branch_ref)
-                .require_existing_ref(
-                    &branch_id,
-                    BranchOperation::LoadWorkspaceSelector,
-                    BranchReferenceRole::WorkspaceSelector,
-                )
-                .await?;
-            Ok(branch_id.clone())
-        }
-    }
-}
-
 fn validated_uuid_entity_pk(value: &str) -> Result<EntityPk, LixError> {
     EntityPk::uuid_from_canonical(value).map_err(|error| {
         LixError::new(
@@ -12785,9 +12745,9 @@ mod tests {
             .await
             .expect("engine should open initialized storage");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
 
         let values = (0..32)
             .map(|index| format!("('/seed-{index:02}.md', CAST('byte-01' AS BYTEA))"))
@@ -12874,9 +12834,9 @@ mod tests {
             .await
             .expect("engine should open initialized storage");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
 
         let values = (0..file_count)
             .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
@@ -12971,9 +12931,9 @@ mod tests {
             .await
             .expect("engine should open initialized storage");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
 
         let values = (0..file_count)
             .map(|index| {
@@ -13066,9 +13026,9 @@ mod tests {
             .await
             .expect("engine should open initialized storage");
         let session = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("workspace session should open");
+            .expect("session should open");
 
         session
             .execute(
@@ -13134,9 +13094,7 @@ mod tests {
         let branch_ctx = Arc::new(BranchContext::new());
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
-            &SessionMode::Pinned {
-                branch_id: Arc::new(std::sync::RwLock::new(GLOBAL_BRANCH_ID.to_string())),
-            },
+            &SessionBranch::new(GLOBAL_BRANCH_ID.to_string()),
             crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             storage.clone(),
             Arc::clone(&hot_state),
@@ -13460,9 +13418,7 @@ mod tests {
         let branch_ctx = Arc::new(BranchContext::new());
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
-            &SessionMode::Pinned {
-                branch_id: Arc::new(std::sync::RwLock::new(GLOBAL_BRANCH_ID.to_string())),
-            },
+            &SessionBranch::new(GLOBAL_BRANCH_ID.to_string()),
             crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             storage.clone(),
             Arc::clone(&hot_state),
@@ -13913,9 +13869,7 @@ mod tests {
         let branch_ctx = Arc::new(BranchContext::new());
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
-            &SessionMode::Pinned {
-                branch_id: Arc::new(std::sync::RwLock::new(GLOBAL_BRANCH_ID.to_string())),
-            },
+            &SessionBranch::new(GLOBAL_BRANCH_ID.to_string()),
             crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             storage,
             Arc::clone(&hot_state),

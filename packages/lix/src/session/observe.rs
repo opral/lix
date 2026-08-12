@@ -11,7 +11,7 @@ use crate::storage_adapter::Memory;
 use crate::storage_adapter::Storage;
 use crate::{ExecuteResult, LixError, Value, sql2};
 
-use super::{SessionContext, SessionMode};
+use super::SessionContext;
 
 #[derive(Debug, Clone)]
 struct ObserveQuery {
@@ -289,19 +289,10 @@ where
     }
 
     fn observe_scope(&self) -> ObserveSessionScope {
-        match &self.mode {
-            SessionMode::Workspace { branch_id } => ObserveSessionScope::Branch(
-                branch_id
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-            ),
-            SessionMode::Pinned { branch_id } => ObserveSessionScope::Branch(
-                branch_id
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-            ),
-        }
+        ObserveSessionScope::Branch(
+            self.branch
+                .get()
+                .expect("session branch selector should be readable"),
+        )
     }
 }

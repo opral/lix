@@ -40,9 +40,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session = engine
-        .open_workspace_session()
+        .open_session()
         .await
-        .expect("workspace session opens");
+        .expect("session opens");
     session
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ($1, 'a0'), ($2, 'b0')",
@@ -91,7 +91,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session = engine
-        .open_session(branch_id)
+        .open_session_at(branch_id)
         .await
         .expect("cold session opens after undo");
     assert_values(&session, "a1", "b0").await;
@@ -104,7 +104,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session = engine
-        .open_session(branch_id)
+        .open_session_at(branch_id)
         .await
         .expect("cold session opens after redo");
     assert_values(&session, "a1", "b1").await;
