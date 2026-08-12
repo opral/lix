@@ -313,6 +313,7 @@ fn accumulate(out: &mut SqlReadProfile, value: SqlReadProfile) {
     out.scan_rows += value.scan_rows;
     out.scan_batches += value.scan_batches;
     out.scan_arrow_bytes += value.scan_arrow_bytes;
+    out.provider_rows_examined += value.provider_rows_examined;
 }
 
 fn micros(value: Duration, rounds: u32) -> f64 {
@@ -326,10 +327,12 @@ fn report(bundles: usize, name: &str, profile: SqlReadProfile, rounds: u32) {
         + profile.public_result_materialization;
     println!(
         "bundles={bundles} scenario={name} rounds={rounds} \
+         provider_rows_examined_per_query={:.1} \
          scan_rows_per_query={:.1} scan_batches_per_query={:.1} scan_arrow_bytes_per_query={:.1} \
          total_us={:.3} logical_planning_us={:.3} physical_planning_us={:.3} \
          arrow_execution_us={:.3} result_materialization_us={:.3} unattributed_us={:.3} \
          scan_elapsed_us={:.3}",
+        profile.provider_rows_examined as f64 / f64::from(rounds),
         profile.scan_rows as f64 / f64::from(rounds),
         profile.scan_batches as f64 / f64::from(rounds),
         profile.scan_arrow_bytes as f64 / f64::from(rounds),
