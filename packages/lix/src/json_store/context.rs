@@ -9,6 +9,7 @@ use crate::storage_adapter::{
 use bytes::Bytes;
 use std::collections::HashSet;
 
+#[cfg(test)]
 const JSON_REF_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy)]

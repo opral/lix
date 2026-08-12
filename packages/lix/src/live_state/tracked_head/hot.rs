@@ -11456,6 +11456,7 @@ fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixErro
     ))
 }
 
+#[cfg(test)]
 fn collect_hot_untracked_refs(value: HeadValueView<'_>, refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>) {
     if !value.untracked {
         return;
