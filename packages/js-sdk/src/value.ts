@@ -5,9 +5,9 @@ export class Value {
 	readonly kind: LixValue["kind"];
 	readonly #raw: LixValue;
 
-	private constructor(raw: LixValue) {
+	private constructor(raw: LixValue, clone = true) {
 		validateExplicitValue(raw);
-		this.#raw = cloneValue(raw);
+		this.#raw = clone ? cloneValue(raw) : raw;
 		this.kind = this.#raw.kind;
 	}
 
@@ -44,7 +44,11 @@ export class Value {
 	}
 
 	static _fromNative(value: LixValue) {
-		return new Value(value);
+		// Native execute results are newly materialized for this result set. Keep
+		// the native value as-is and defer the defensive copy until toJS(). This
+		// avoids cloning every structured result once during row wrapping and
+		// again when callers read it.
+		return new Value(value, false);
 	}
 
 	_toNative() {

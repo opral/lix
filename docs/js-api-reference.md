@@ -4,7 +4,7 @@ description: "Reference for opening local and remote Lix instances, running SQL,
 
 # JavaScript API Reference
 
-The main JavaScript SDK exports are `openLix()` and `LocalFilesystem` from `@lix-js/sdk`. `openLix()` returns a `Lix` instance connected to a local or remote repository.
+The main JavaScript SDK exports are `openLix()`, `IndexedDbStorage`, and `LocalFilesystem` from `@lix-js/sdk`. `openLix()` returns a `Lix` instance connected to a local or remote repository.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -22,8 +22,8 @@ Options:
 
 | Option      | Type                                     | Description                                                                      |
 | ----------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
-| `storage`   | `LocalFilesystem \| LixSnapshotStorage` | Local storage. Omit it for memory.                                               |
-| `server`    | `RemoteLixServerOptions`                 | Connect to a remote Lix server. Cannot be combined with local workspace storage. |
+| `storage`   | `LocalFilesystem \| IndexedDbStorage`   | Local storage. Omit it for memory.                                               |
+| `server`    | `RemoteLixServerOptions`                 | Connect to a remote Lix server. When present, `storage` contains only client state. |
 | `telemetry` | `LixTelemetryOptions`                    | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only. |
 
 Connect to a remote server:
@@ -38,7 +38,17 @@ const lix = await openLix({
 });
 ```
 
-Remote file content, SQL rows, and branches live on the server. An optional `LixSnapshotStorage` in remote mode stores only private client state. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
+Remote file content, SQL rows, and branches live on the server. An optional `IndexedDbStorage` in remote mode stores only private client state. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
+
+Use `IndexedDbStorage` to persist a complete local browser Lix across reloads:
+
+```ts
+import { IndexedDbStorage, openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  storage: new IndexedDbStorage({ name: "atelier" }),
+});
+```
 
 Use `LocalFilesystem` for a filesystem workspace directory backed by RocksDB at
 `<workspace>/.lix/.internal/rocksdb`:
@@ -412,7 +422,7 @@ Closes the Lix handle and its storage resources.
 
 ### clientState
 
-`lix.clientState` stores private client-local JSON state with `get`, `set`, `delete`, and `subscribe`; it is available when the storage supports client state, for example a `LixSnapshotStorage` in remote mode.
+`lix.clientState` stores private client-local JSON state with `get`, `set`, `delete`, and `subscribe`; pass `IndexedDbStorage` in remote mode to persist it locally.
 
 ## Transaction
 

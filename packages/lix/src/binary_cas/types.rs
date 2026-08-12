@@ -312,20 +312,31 @@ mod tests {
 
     #[test]
     fn payload_carries_exact_canonical_chunk_receipts() {
-        let bytes = (0..MEDIA_CHUNK_BYTES * 2 + 17)
-            .map(|index| (index as u8).wrapping_mul(31))
-            .collect::<Vec<_>>();
+        // A byte pattern with real variety: the gear hash finds no cut point in
+        // a short repeating sequence, so a periodic fixture would collapse to
+        // one max-sized chunk and prove nothing about receipt ordering.
+        let mut bytes = vec![0u8; MEDIA_CHUNK_BYTES * 5 + 17];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for chunk in bytes.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+        }
         let payload = BlobPayload::from_bytes(bytes.clone());
 
-        assert_eq!(payload.chunks().len(), 3);
-        assert_eq!(payload.chunks()[0].size_bytes, MEDIA_CHUNK_BYTES as u64);
-        assert_eq!(payload.chunks()[1].size_bytes, MEDIA_CHUNK_BYTES as u64);
-        assert_eq!(payload.chunks()[2].size_bytes, 17);
+        // Boundaries are content-defined, so the receipts are asserted by the
+        // properties staging relies on rather than by fixed sizes: they tile
+        // the payload in order and each names its own slice.
+        assert!(payload.chunks().len() > 1);
         assert_eq!(payload.hash(), Some(BlobId::from_content(&bytes)));
-        for (receipt, chunk) in payload.chunks().iter().zip(bytes.chunks(MEDIA_CHUNK_BYTES)) {
-            assert_eq!(receipt.hash, ChunkHash::from_content(chunk));
-            assert_eq!(receipt.size_bytes, chunk.len() as u64);
+        let mut cursor = 0usize;
+        for receipt in payload.chunks() {
+            let end = cursor + receipt.size_bytes as usize;
+            assert_eq!(receipt.hash, ChunkHash::from_content(&bytes[cursor..end]));
+            cursor = end;
         }
+        assert_eq!(cursor, bytes.len());
 
         let clone = payload.clone();
         assert!(std::ptr::eq(
