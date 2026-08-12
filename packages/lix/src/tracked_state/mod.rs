@@ -34,6 +34,8 @@ pub(crate) use commit_root_rebuild::{
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
+#[cfg(test)]
+pub(crate) use context::DIFF_ROW_CREATED_AT_VALIDATIONS;
 pub(crate) use current_state_data_part::{
     CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE,
     decode_current_state_data_part_commit_ids, decode_current_state_data_part_refs,
