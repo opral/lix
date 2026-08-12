@@ -2455,7 +2455,10 @@ async fn validate_committed_delete_restrictions(
             else {
                 continue;
             };
-            for source_domain in tombstone.identity.domain().fk_source_domains_for_target() {
+            for source_domain in delete_restriction_source_domains(
+                &tombstone.identity,
+                reference.source_key.schema_key.as_str(),
+            ) {
                 normal_batches
                     .entry(NormalDeleteRestrictionBatchKey {
                         source_key: reference.source_key.clone(),
@@ -2476,6 +2479,43 @@ async fn validate_committed_delete_restrictions(
     )
     .await?;
     Ok(())
+}
+
+/// Delete-side mirror of [`foreign_key_target_domain`].
+///
+/// The insert side rewrites the *target* domain of a
+/// `lix_file_descriptor -> lix_directory_descriptor` reference to
+/// `Exact(None)`, because a file-descriptor row carries `file_id = own id`
+/// while the directory row it points at carries `file_id = NULL`. The delete
+/// side has to invert that rewrite: given the deleted directory, which file
+/// scopes can hold a file descriptor that still references it?
+///
+/// Because `canonicalize_descriptor_file_id` forces
+/// `lix_file_descriptor.file_id` to equal the row's own entity id, the answer
+/// is "every file scope, and at most one row per scope". `DomainFileScope::Any`
+/// is therefore *exact* for this one pair rather than a widening: no two
+/// file-descriptor rows can share a file scope, so nothing can be conflated
+/// across scopes.
+///
+/// This stays a targeted rewrite instead of widening
+/// `fk_source_domains_for_target` for every schema. For an ordinary
+/// file-scoped schema the same referenced key may legitimately exist in two
+/// different files, and a source row in file G is satisfied by the target in
+/// file G; scanning every file scope would let the copy in G block a delete of
+/// the copy in F and turn a legal delete into a foreign-key error. See
+/// `widening_delete_source_domain_to_any_file_falsely_rejects`.
+fn delete_restriction_source_domains(
+    deleted_identity: &DomainRowIdentity,
+    source_schema_key: &str,
+) -> Vec<Domain> {
+    let domain = deleted_identity.domain();
+    if deleted_identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+        && source_schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+    {
+        return Domain::any_file(domain.branch_id().to_string(), domain.untracked())
+            .fk_source_domains_for_target();
+    }
+    domain.fk_source_domains_for_target()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -6182,27 +6222,108 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 
-    /// Reachability probe: `lix_file_descriptor./directory_id` is a declared
-    /// foreign key, but a file descriptor row lives in file scope
-    /// `Exact(Some(own id))` while the directory row lives in `Exact(None)`,
-    /// and the committed delete side never widens the source file scope.
+    /// A file descriptor row lives in file scope `Exact(Some(own id))` while
+    /// the directory it references lives in `Exact(None)`. Before
+    /// `delete_restriction_source_domains`, the committed delete side scanned
+    /// only `file_id IS NULL` and this declared foreign key could never fire.
     #[tokio::test]
-    async fn committed_delete_restriction_scope_probe_tracked_file_child() {
-        let outcome = directory_delete_with_committed_file_child_outcome(false).await;
+    async fn committed_delete_restriction_rejects_tracked_file_child_of_deleted_directory() {
+        let error = directory_delete_with_committed_file_child_outcome(false)
+            .await
+            .expect_err("tracked lane: committed file child must block the directory delete");
 
-        assert!(
-            outcome.is_ok(),
-            "tracked lane: expected the declared restriction to be unreachable, got {outcome:?}"
-        );
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 
     #[tokio::test]
-    async fn committed_delete_restriction_scope_probe_untracked_file_child() {
-        let outcome = directory_delete_with_committed_file_child_outcome(true).await;
+    async fn committed_delete_restriction_rejects_untracked_file_child_of_deleted_directory() {
+        let error = directory_delete_with_committed_file_child_outcome(true)
+            .await
+            .expect_err("untracked lane: committed file child must block the directory delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    /// The mirror must not reach across branches, and must not fire for a
+    /// file descriptor that sits in a different directory.
+    #[tokio::test]
+    async fn committed_delete_restriction_allows_directory_delete_without_file_children() {
+        let other_directory = "01920000-0000-7000-8000-0000000000d8";
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+
+        let outcome = committed_delete_restriction_outcome(
+            vec![directory_delete],
+            vec![
+                MaterializedLiveStateRow::from(directory_descriptor_row(
+                    FK_SCOPE_DIRECTORY_ID,
+                    None,
+                    "docs",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+                // same branch, different parent directory
+                MaterializedLiveStateRow::from(file_descriptor_row_in_directory(
+                    FK_SCOPE_FILE_ID,
+                    Some(other_directory),
+                    "readme.md",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+                // same directory id, different branch
+                MaterializedLiveStateRow::from(file_descriptor_row_in_directory(
+                    "01920000-0000-7000-8000-0000000000f2",
+                    Some(FK_SCOPE_DIRECTORY_ID),
+                    "readme.md",
+                    "01920000-0000-7000-8000-0000000000b1",
+                )),
+            ],
+        )
+        .await;
 
         assert!(
             outcome.is_ok(),
-            "untracked lane: expected the declared restriction to be unreachable, got {outcome:?}"
+            "unrelated file descriptors must not block the delete, got {outcome:?}"
+        );
+    }
+
+    /// A file descriptor staged as a tombstone in the same transaction is not
+    /// a live reference, so deleting its directory alongside it is legal --
+    /// this is the shape the recursive directory-delete planner produces.
+    #[tokio::test]
+    async fn committed_delete_restriction_allows_directory_delete_with_staged_file_tombstone() {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let mut file_delete = file_descriptor_row_in_directory(
+            FK_SCOPE_FILE_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "readme.md",
+            FK_SCOPE_BRANCH_ID,
+        );
+        file_delete.snapshot = None;
+
+        let outcome = committed_delete_restriction_outcome(
+            vec![directory_delete, file_delete],
+            vec![
+                MaterializedLiveStateRow::from(directory_descriptor_row(
+                    FK_SCOPE_DIRECTORY_ID,
+                    None,
+                    "docs",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+                MaterializedLiveStateRow::from(file_descriptor_row_in_directory(
+                    FK_SCOPE_FILE_ID,
+                    Some(FK_SCOPE_DIRECTORY_ID),
+                    "readme.md",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+            ],
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a cascading recursive delete must stay legal, got {outcome:?}"
         );
     }
 

@@ -860,63 +860,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_delete_probe_untracked_file_child,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path) \
-                 VALUES ('6469722d-7072-8f62-8500-000000000001', '/docs')",
-                &[],
-            )
-            .await
-            .expect("tracked directory insert should succeed");
-
-        session
-            .execute(
-                "INSERT INTO lix_file (id, path, content, lixcol_untracked) \
-                 VALUES ('66696c65-7072-8f62-8500-000000000001', '/docs/readme.md', CAST('hello' AS BYTEA), true)",
-                &[],
-            )
-            .await
-            .expect("untracked file insert under a tracked directory should succeed");
-
-        // The declared foreign key
-        // `lix_file_descriptor./directory_id -> lix_directory_descriptor./id`
-        // does not reject this delete: the untracked file descriptor is
-        // invisible to the committed delete-restriction scan.
-        session
-            .execute("DELETE FROM lix_directory WHERE path = '/docs'", &[])
-            .await
-            .expect("directory delete is accepted even though a file still references it");
-
-        // The branch's file read surface is now permanently unreadable.
-        let error = session
-            .execute(
-                "SELECT id, path FROM lix_file \
-                 WHERE id = '66696c65-7072-8f62-8500-000000000001'",
-                &[],
-            )
-            .await
-            .expect_err("orphaned file descriptor bricks the file read surface");
-        assert_eq!(error.code, "LIX_ERROR_FOREIGN_KEY");
-        assert!(
-            error.message.contains("references missing directory_id"),
-            "unexpected orphan error: {}",
-            error.message
-        );
-    }
-);
-
-simulation_test!(
     lix_directory_by_branch_expands_global_rows,
     |sim| async move {
         let engine = sim.boot_engine().await;
