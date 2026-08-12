@@ -6134,6 +6134,7 @@ where
                 group.path,
                 group.filename,
                 file_key.branch_id.clone(),
+                file_key.untracked,
                 hash,
                 rendered_bytes,
                 same_length_output_splice,
@@ -10816,17 +10817,20 @@ fn semantic_rendered_file_content(
     path: String,
     filename: String,
     branch_id: String,
+    untracked: bool,
     base_blob_hash: BlobId,
     rendered_bytes: crate::Blob,
     same_length_output_splice: Option<ValidatedSameLengthOutputSplice>,
 ) -> TransactionFileContent {
+    // The re-rendered payload replaces the file in its own lane. Keying it as
+    // tracked would leave an untracked file's materialization unmatched.
     let mut rendered_file = TransactionFileContent::new(
         file_id,
         Some(path),
         Some(filename),
         branch_id,
         false,
-        false,
+        untracked,
         rendered_bytes,
     )
     .with_had_blob_ref(true)
@@ -12116,6 +12120,7 @@ mod tests {
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
+            false,
             base_blob_hash,
             b"abXYef".as_slice().into(),
             Some(ValidatedSameLengthOutputSplice {
@@ -12139,6 +12144,7 @@ mod tests {
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
+            false,
             base_blob_hash,
             b"abXYef".as_slice().into(),
             Some(ValidatedSameLengthOutputSplice {
