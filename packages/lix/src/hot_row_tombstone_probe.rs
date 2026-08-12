@@ -873,3 +873,258 @@ async fn rotated_generation_serving_view_is_cached_after_the_first_read() {
          not re-derived from canonical records (hits={hits} misses={misses})"
     );
 }
+
+/// PHASE 6 — write-path question 2: undo/redo must replay from canonical
+/// changes, demonstrated rather than argued.
+///
+/// The code answer is that `session/undo_redo.rs` reads only through
+/// `tracked_state_reader()` — `commit_delta_values_for_schemas` and
+/// `load_projected_batch_at_commit` — both canonical tracked state at a commit,
+/// and never touches `ROW_SPACE`. This is the experiment that shows it.
+///
+/// Delete a row, physically remove its tombstone, reopen the engine cold, then
+/// undo. If undo depended on the `ROW_SPACE` tombstone in any way, the row
+/// could not come back.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn undo_restores_a_row_whose_tombstone_was_removed() {
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("undorow")).await;
+    insert_rows(&session, "undorow", 3).await;
+    let before = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+
+    session
+        .execute("DELETE FROM undorow WHERE id = 'row-1'", &[])
+        .await
+        .expect("delete should commit");
+    let census_after_delete = row_census(&storage).await;
+    let after_delete = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+
+    let removed = drop_all_tombstones(&storage).await;
+    let session = reopen_session(&storage).await;
+    let census_after_drop = row_census(&storage).await;
+    let after_drop = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+
+    session.undo().await.expect("undo should publish");
+    let after_undo = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+    let restored = session
+        .execute("SELECT id, locale FROM undorow WHERE id = 'row-1'", &[])
+        .await
+        .expect("restored row reads");
+
+    println!(
+        "phase6 | before={before} after_delete={after_delete} tombstones_after_delete={} \
+         removed={removed} after_drop={after_drop} tombstones_after_drop={} after_undo={after_undo} \
+         restored_rows={}",
+        census_after_delete.tombstones,
+        census_after_drop.tombstones,
+        restored.len()
+    );
+
+    assert_eq!(before, 3, "fixture should start with three rows");
+    assert_eq!(after_delete, 2, "the delete should be visible");
+    assert_eq!(removed, 1, "the delete should have left exactly one tombstone");
+    assert_eq!(
+        after_drop, 2,
+        "removing the tombstone must not resurrect the row"
+    );
+    assert_eq!(
+        after_undo, 3,
+        "undo must restore the deleted row with its tombstone already gone; \
+         if this fails, undo depends on the ROW_SPACE tombstone and the \
+         never-write design is unsafe"
+    );
+    assert_eq!(restored.len(), 1, "the restored row must be readable");
+}
+
+/// PHASE 7 — is `reject_retention_change` an invariant, or an artefact of
+/// tombstone lifetime?
+///
+/// The fence refuses an untracked INSERT over a tracked-deleted identity, and
+/// it refuses it *because the tombstone is physically present* — `existing` is
+/// the predecessor row. `absence_guards` does not cover this case: those are
+/// pure "must not be live" assertions, so an absent identity and a tombstone
+/// pass identically.
+///
+/// So if any supported operation on `main` already clears that tombstone, the
+/// fence is not durable and the hole is open today — compaction would change
+/// *when* it stops fencing, not *whether*. If nothing clears it, the fence is
+/// real and compaction would breach it.
+///
+/// This tries every route to the no-tombstone state and reports which, if any,
+/// reaches it. Nothing here compacts anything.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn retention_fence_durability_across_supported_operations() {
+    async fn untracked_insert(
+        session: &SessionContext<Memory>,
+        table: &str,
+    ) -> Result<(), String> {
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (id, locale, lixcol_untracked) VALUES ('row-0', 'u', TRUE)"
+                ),
+                &[],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    println!("phase6 | route,tombstones,untracked_insert_result");
+
+    // Each route gets a fresh fixture so the routes cannot contaminate one
+    // another. `base` is the control: no route applied.
+    for route in [
+        "base",
+        "checkpoint",
+        "branch_roundtrip",
+        "on_new_branch",
+        "tombstone_dropped",
+    ] {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("fencerow")).await;
+        session
+            .execute(
+                "INSERT INTO fencerow (id, locale) VALUES ('row-0', 'keep')",
+                &[],
+            )
+            .await
+            .expect("tracked insert should commit");
+        session
+            .execute("DELETE FROM fencerow WHERE id = 'row-0'", &[])
+            .await
+            .expect("tracked delete should commit");
+
+        let mut session = session;
+        match route {
+            "base" => {}
+            "checkpoint" => {
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("checkpoint should publish");
+            }
+            "branch_roundtrip" => {
+                let main_branch_id = session
+                    .active_branch_id()
+                    .await
+                    .expect("active branch resolves");
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e45-fence-roundtrip".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id,
+                    })
+                    .await
+                    .expect("switch to branch");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: main_branch_id,
+                    })
+                    .await
+                    .expect("switch back to main");
+            }
+            "on_new_branch" => {
+                // The interesting one: a fresh branch's generation is sparse
+                // over a root base and owns no HOT_ROW tombstone of its own.
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e45-fence-newbranch".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id,
+                    })
+                    .await
+                    .expect("switch to branch");
+            }
+            // The state compaction would create, reached here by removing the
+            // tombstone directly rather than by compacting. No supported
+            // operation reaches this state today; compaction would be the
+            // first. If the fence stops holding here, that is the hole
+            // compaction opens, and it is what PR 1 exists to close.
+            "tombstone_dropped" => {
+                let removed = drop_all_tombstones(&storage).await;
+                assert_eq!(removed, 1, "the tracked delete should leave one tombstone");
+                session = reopen_session(&storage).await;
+            }
+            _ => unreachable!(),
+        }
+
+        let census = row_census(&storage).await;
+        let result = untracked_insert(&session, "fencerow").await;
+        // Every route, including the one that removes the tombstone the fence
+        // used to ride on, must refuse. Before the narrowed fence landed,
+        // `tombstone_dropped` SUCCEEDED here while the other four refused —
+        // that gap is what the fence closes, and this assertion is what proves
+        // it rather than restating it.
+        assert!(
+            result.is_err(),
+            "route '{route}' let an untracked row take a tracked-deleted identity; \
+             the retention fence does not survive this state"
+        );
+        let verdict = match &result {
+            Ok(()) => "SUCCEEDED".to_string(),
+            Err(message) => format!("refused: {}", message.replace(',', ";")),
+        };
+        println!("{route},{},{verdict}", census.tombstones);
+
+        // If the untracked insert got in, the identity is now untracked while a
+        // tracked delete of the same identity sits in canonical history. Undo
+        // replays that delete from canonical history (phase 5). If undo brings
+        // the tracked row back, the identity is simultaneously tracked and
+        // untracked.
+        if result.is_ok() {
+            let undo = session.undo().await;
+            match undo {
+                Ok(_) => {
+                    let rows = session
+                        .execute(
+                            "SELECT id, lixcol_untracked FROM fencerow WHERE id = 'row-0'",
+                            &[],
+                        )
+                        .await
+                        .expect("identity reads after undo");
+                    println!(
+                        "{route},POST_UNDO,rows_for_identity={} <- 2 means tracked+untracked \
+                         coexist",
+                        rows.len()
+                    );
+                }
+                Err(error) => println!(
+                    "{route},POST_UNDO,undo_refused: {}",
+                    error.to_string().replace(',', ";")
+                ),
+            }
+        }
+        drop(session);
+    }
+}

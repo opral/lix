@@ -8093,6 +8093,82 @@ where
                 *previous = None;
             }
         }
+        // Narrowed retention fence.
+        //
+        // `reject_retention_change` below only runs when a predecessor
+        // resolves — from a HOT row, or in a sparse generation from the root
+        // base. An untracked write whose identity has neither skips the check
+        // entirely, so the fence is today only as durable as the tombstone
+        // that carries it. `hot_row_tombstone_probe`'s `tombstone_dropped`
+        // route measures the consequence: the untracked insert that four
+        // supported routes refuse gets in once the tombstone is gone, and
+        // `undo` is refused afterwards instead. The throw moves off the
+        // operation that caused it and onto an innocent one.
+        //
+        // Consulting canonical state at the branch head restores the fence
+        // where the serving view cannot carry it, and keeps the refusal on the
+        // insert. Cost is bounded to commits that actually contain an
+        // untracked write with an unresolvable predecessor; every other commit
+        // builds an empty key list and performs no additional I/O.
+        {
+            let unresolved = sorted
+                .iter()
+                .zip(&previous_values)
+                .filter(|(delta, previous)| {
+                    delta.untracked && !delta.deleted && previous.is_none()
+                })
+                .map(|(delta, _)| TrackedStateKeyRef {
+                    schema_key: delta.schema_key,
+                    file_id: delta.file_id,
+                    entity_pk: delta.entity_pk,
+                })
+                .collect::<Vec<_>>();
+            if !unresolved.is_empty()
+                && let Some(control) = BranchHeadControlContext::new()
+                    .reader(self.store)
+                    .load(branch_id)
+                    .await?
+                // A branch control can legitimately name a head with no
+                // canonical commit state. Replaying against it would turn a
+                // legal write into an internal error, which is worse than the
+                // hole this closes. No canonical authority means no canonical
+                // predecessor, so there is nothing to fence against. This is
+                // the same authority check `validate_diff_row_created_at`
+                // already uses before it trusts an ancestry lookup.
+                && crate::tracked_state::load_commit_state_authority_ids(
+                    self.store,
+                    std::slice::from_ref(&control.head_commit_id),
+                )
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .is_some()
+            {
+                let mut reader = crate::tracked_state::TrackedStateContext::new().reader(self.store);
+                let canonical = reader
+                    .load_projected_batch_at_commit_refs(
+                        &control.head_commit_id.to_string(),
+                        &unresolved,
+                        &ChangeRecordProjection::identity_only(),
+                    )
+                    .await?;
+                for (slot, key) in unresolved.iter().enumerate() {
+                    // Any canonical row for the identity — live or tombstoned —
+                    // means it has been tracked, which is exactly what
+                    // `reject_retention_change` refuses to flip.
+                    if canonical.row(slot).is_some() {
+                        return Err(LixError::new(
+                            LixError::CODE_UNIQUE,
+                            format!(
+                                "cannot insert untracked row in schema '{}' entity_pk {:?}: a tracked row with this identity exists in canonical history; retention is immutable for an identity",
+                                key.schema_key, key.entity_pk,
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         let mut created_ats = Vec::with_capacity(sorted.len());
         for (delta, previous) in sorted.iter().zip(&previous_values) {
             let Some(previous) = previous else {
