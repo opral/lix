@@ -3275,28 +3275,27 @@ mod tests {
         .await;
 
         assert_eq!(first.swept_commits, 10);
-        assert_eq!(first.swept_standalone_changes, 10);
+        // Superseded branch-ref facts are no longer GC debt: each publication
+        // deletes the ref change its own control supersedes, and the branch
+        // deletion deletes the last one, all in the publishing write set.
+        assert_eq!(first.swept_standalone_changes, 0);
         assert_eq!(first.deleted_commit_state_manifests, 10);
         assert_eq!(first.deleted_mutation_inventories, 10);
         // The ten branch-only commits are reclaimable, while the branch base
         // remains the active main head and therefore keeps its semantic
         // projection in the authenticated serving-dependency closure.
         assert_eq!(first.deleted_semantic_commit_projections, 10);
-        // Each reclaimed projection owns one change fact and reverse-index
-        // row; the other ten change deletes are retired branch-ref facts.
-        assert_eq!(first.deleted_semantic_change_rows, 20);
+        // Each reclaimed projection owns one change fact and reverse-index row.
+        assert_eq!(first.deleted_semantic_change_rows, 10);
         assert_eq!(first.deleted_semantic_reverse_index_rows, 10);
-        // The deleted branch also strands the whole serving generation it was
-        // reading from. No live branch control can select it again, so the
-        // same pass retires it: ten commits of ten rows, plus the generation's
-        // collection control and root current base.
-        assert_eq!(first.reclaimed_generation_rows, 102);
+        // The stranded serving generation is gone too, but the branch deletion
+        // retired it rather than this sweep: a generation is reachable from
+        // exactly one branch control, so the write set that removes the control
+        // is the one that can prove nothing will read it again.
+        assert_eq!(first.reclaimed_generation_rows, 0);
         assert_eq!(
             first.delete_counts_by_space,
             vec![
-                (crate::live_state::HOT_ROW_SPACE.id.0, 100), // stranded serving rows
-                (crate::live_state::HOT_COLLECTION_CONTROL_SPACE.id.0, 1), // its collection control
-                (crate::live_state::ROOT_CURRENT_BASE_SPACE.id.0, 1), // its root current base
                 (
                     crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
                         .id
@@ -3309,8 +3308,8 @@ mod tests {
                         .0,
                     10,
                 ), // mutation inventory authority
-                (crate::changelog::COMMIT_SPACE.id.0, 10),    // branch-only commit projections
-                (crate::changelog::CHANGE_SPACE.id.0, 20),    // projection and branch-ref changes
+                (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
+                (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
                 (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 10), // commit -> change reverse index
             ]
         );
@@ -3332,35 +3331,11 @@ mod tests {
         const FENCE_KEY_BYTES: usize =
             crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
-        // Canonical-record deletes are UUID keyed, so each descriptor is
-        // exactly 16 bytes. Generation-scoped serving rows are keyed by
-        // `(branch, generation, schema, entity, file)` and are wider, so assert
-        // the UUID-keyed floor instead of restating that key layout here.
-        let uuid_keyed_deletes = first
-            .delete_counts_by_space
-            .iter()
-            .filter(|(space, _)| {
-                [
-                    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
-                        .id
-                        .0,
-                    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
-                        .id
-                        .0,
-                    crate::changelog::COMMIT_SPACE.id.0,
-                    crate::changelog::CHANGE_SPACE.id.0,
-                    crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0,
-                ]
-                .contains(space)
-            })
-            .map(|(_, count)| *count)
-            .sum::<usize>();
-        let generation_keyed_deletes = first.staged_deletes as usize - uuid_keyed_deletes;
-        assert_eq!(generation_keyed_deletes, 102);
-        assert!(
-            first.key_shared_bytes
-                > uuid_keyed_deletes * 16 + generation_keyed_deletes * 16 + FENCE_KEY_BYTES,
-            "generation-scoped delete keys must be wider than a bare UUID"
+        // Every canonical-record delete is UUID keyed, so each descriptor is
+        // exactly 16 bytes.
+        assert_eq!(
+            first.key_shared_bytes,
+            first.staged_deletes as usize * 16 + FENCE_KEY_BYTES
         );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);

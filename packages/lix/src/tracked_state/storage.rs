@@ -3787,6 +3787,56 @@ fn decode_point_replay_commit_state_values(
 }
 
 /// Bulk-loads commit authorities in request order.
+/// Every commit that still owns physical tracked state.
+///
+/// The manifest header is the physical state's own authority: it exists exactly
+/// while the commit owns a delta segment, and [`stage_retire_commit_physical_state`]
+/// deletes it. Enumerating it is therefore an inventory of the thing being
+/// collected — it costs Theta(unretired commits) and shrinks as collection
+/// succeeds — and never a rediscovery of liveness, which stays with the refs.
+///
+/// GC needs this because a commit can stop being reachable from any ref (a
+/// deleted branch's commits, for one) while still owning physical state. A
+/// walk that starts at refs cannot name those commits at all.
+pub(crate) async fn scan_commit_state_manifest_commit_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<Vec<CommitId>, LixError> {
+    // Key-only: the caller wants the commit ids, and a manifest body is the one
+    // thing this plane stores that is expensive to read.
+    let mut cursor = store
+        .begin_scan(
+            TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    let mut commit_ids = Vec::new();
+    loop {
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await?;
+        for entry in &page.entries {
+            let bytes: [u8; 16] = entry.key.0.as_ref().try_into().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "commit state manifest key is not a commit id",
+                )
+            })?;
+            commit_ids.push(CommitId::new(uuid::Uuid::from_bytes(bytes)));
+        }
+        if !page.has_more {
+            break;
+        }
+    }
+    Ok(commit_ids)
+}
+
 pub(crate) async fn load_commit_state_manifests(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_ids: &[CommitId],

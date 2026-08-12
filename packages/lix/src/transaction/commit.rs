@@ -246,9 +246,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
     let mut writes = StorageWriteSet::new();
     let mut preconditions = Vec::new();
-    #[cfg(test)]
-    let seeded_reachability_queue =
-        crate::gc::ensure_reachability_queue_for_test(&*read, &mut writes).await?;
     for publication in &prepared_writes.checkpoint_publications {
         crate::gc::stage_recovery_ref_rotation(&mut writes, &publication.recovery_ref)?;
         crate::gc::stage_checkpoint_gc_state(&mut writes, &publication.gc_state)?;
@@ -380,11 +377,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &deleted_checkpoint_files,
     )
     .await?;
-    // Branch-owned plugin checkpoints are derived serving state.  Branch
-    // deletion publishes the authenticated lifecycle/control retirement here;
-    // the GC reachability consumer reclaims the UUID range after the retired
-    // root is proven unreachable.  Avoid scanning the entire checkpoint range
-    // in the foreground write transaction.
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.first_commit_parent_override_by_branch,
@@ -766,7 +758,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     )
     .await?;
     let mut root_backed_branch_publications = BTreeSet::new();
-    let mut root_reachability_deltas = Vec::new();
     let published_branch_controls = stage_branch_head_control_publications(
         read,
         &mut writes,
@@ -780,29 +771,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut preconditions,
         &branch_control_observations,
         &mut root_backed_branch_publications,
-        &mut root_reachability_deltas,
     )
     .await?;
-    #[cfg(test)]
-    if seeded_reachability_queue {
-        // The seed and first publication share this test-only bootstrap write
-        // set; the production initializer always commits the queue before any
-        // branch publication, so no delta can be lost in live repositories.
-        root_reachability_deltas.clear();
-    }
-    let checkpoint_roots = prepared_writes
-        .checkpoint_publications
-        .iter()
-        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
-        .collect::<Vec<_>>();
-    crate::gc::stage_reachability_delta_batch(
-        read,
-        &mut writes,
-        &root_reachability_deltas,
-        &checkpoint_roots,
-        &mut preconditions,
-    )
-    .await?;
+    // The binary-CAS publication fence used to ride along with the reachability
+    // delta writer. It is an authenticated root-publication fence in its own
+    // right, so it stages here even when the transition only revives an
+    // existing commit and stages no blob bytes.
+    crate::binary_cas::stage_cas_publication_fence(read, &mut writes, &mut preconditions).await?;
     if !published_branch_controls.contains_key(crate::GLOBAL_BRANCH_ID) {
         let global = branch_control_observations
             .get(crate::GLOBAL_BRANCH_ID)
@@ -4998,7 +4973,6 @@ async fn stage_branch_head_control_publications(
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     root_backed_branch_publications: &mut BTreeSet<String>,
-    root_reachability_deltas: &mut Vec<crate::gc::RootReachabilityDelta>,
 ) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
     if let Some(branch_id) = branch_checkpoint_bridges
@@ -5124,31 +5098,40 @@ async fn stage_branch_head_control_publications(
             branch_id,
             observation.raw_token.clone(),
         )?);
-        let old_root = observation.control.map(|control| control.head_commit_id);
-        let new_root = desired.as_ref().map(|control| control.head_commit_id);
-        // An explicit deletion is a lifecycle transition even when this
-        // pinned observation has no rooted control.  Publishing the
-        // authenticated None -> None delta gives deferred consumers a durable
-        // branch-retirement signal for checkpoints staged before the branch
-        // ever acquired a tracked root.
-        if old_root != new_root || desired.is_none() {
-            root_reachability_deltas.push(crate::gc::RootReachabilityDelta {
-                branch_id: branch_id.clone(),
-                old_root,
-                new_root,
-                old_control: observation.control,
-                new_control: *desired,
-                old_control_digest: crate::gc::root_control_digest_for_control(
-                    observation.control.as_ref(),
-                )?,
-                new_control_digest: crate::gc::root_control_digest_for_control(desired.as_ref())?,
-            });
+        // Everything a superseded control still owned is retired right here,
+        // in the same atomic write set that supersedes it. These are all
+        // control-scoped facts — the branch's derived serving generations, its
+        // superseded standalone branch-ref change, and, on deletion, its
+        // plugin-checkpoint prefix — reachable from exactly one place: this
+        // control. Once it moves, nothing can ever read them again, so there is
+        // nothing to defer and nothing for a publication ledger to remember.
+        if let Some(old_control) = observation.control.as_ref() {
+            let generation = old_control.tracked_generation;
+            if !desired.is_some_and(|new_control| new_control.tracked_generation == generation) {
+                crate::live_state::stage_retire_hot_generation(read, writes, branch_id, generation)
+                    .await?;
+            }
+            if desired.is_none_or(|new_control| new_control.ref_change_id != old_control.ref_change_id)
+            {
+                crate::changelog::stage_delete_standalone_change(
+                    read,
+                    writes,
+                    old_control.ref_change_id,
+                )
+                .await?;
+            }
         }
         match desired {
             Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
             None => {
                 stage_delete_branch_head_control(writes, branch_id)?;
                 crate::gc::stage_delete_recovery_ref(writes, branch_id)?;
+                // A deleted branch must not keep its derived plugin-checkpoint
+                // prefix alive; a recreated branch republishes it.
+                crate::transaction::stage_delete_branch_plugin_checkpoints(
+                    read, writes, branch_id,
+                )
+                .await?;
             }
         }
     }
@@ -6533,14 +6516,6 @@ mod tests {
     #[tokio::test]
     async fn branch_creation_owner_publishes_checkpoint_serving_context() {
         let storage = StorageAdapter::new(Memory::new());
-        let mut seed = storage.new_write_set();
-        crate::gc::stage_reachability_queue_seed(&mut seed)
-            .expect("reachability queue should seed");
-        storage
-            .commit_write_set(seed, StorageWriteOptions::default())
-            .await
-            .expect("reachability queue seed should commit");
-
         let branch_id = "01960000-0000-7000-8000-0000000000b1";
         let recovered_head = commit_id("branch-bridge-recovered-head");
         let checkpoint = commit_id("branch-bridge-checkpoint");
@@ -6563,7 +6538,6 @@ mod tests {
         let mut writes = storage.new_write_set();
         let mut preconditions = Vec::new();
         let mut root_backed = BTreeSet::new();
-        let mut reachability_deltas = Vec::new();
         let controls = stage_branch_head_control_publications(
             &read,
             &mut writes,
@@ -6583,7 +6557,6 @@ mod tests {
                 },
             )]),
             &mut root_backed,
-            &mut reachability_deltas,
         )
         .await
         .expect("branch owner should stage checkpoint serving context");
@@ -6594,19 +6567,6 @@ mod tests {
         assert_eq!(control.head_commit_id, recovered_head);
         assert_eq!(control.working_diff_checkpoint_commit_id, Some(checkpoint));
         assert!(root_backed.contains(branch_id));
-        assert_eq!(reachability_deltas.len(), 1);
-        assert_eq!(reachability_deltas[0].old_root, None);
-        assert_eq!(reachability_deltas[0].new_root, Some(recovered_head));
-        assert_eq!(reachability_deltas[0].new_control, Some(control));
-        crate::gc::stage_reachability_delta_batch(
-            &read,
-            &mut writes,
-            &reachability_deltas,
-            &[],
-            &mut preconditions,
-        )
-        .await
-        .expect("branch publication should stage the exact queue fence");
         drop(read);
         storage
             .commit_write_set(
@@ -7748,7 +7708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rootless_branch_delete_defers_checkpoint_cleanup_through_gc_and_reopen() {
+    async fn rootless_branch_delete_reclaims_its_checkpoint_prefix_and_survives_reopen() {
         let backend = Memory::new();
         crate::engine::Engine::initialize(backend.clone())
             .await
@@ -7833,9 +7793,9 @@ mod tests {
                 blob_hash,
             )
             .await
-            .expect("retained rootless checkpoint should load")
-            .is_some(),
-            "foreground branch deletion must leave checkpoint reclamation to GC"
+            .expect("retired rootless checkpoint should load")
+            .is_none(),
+            "branch deletion reclaims its own checkpoint prefix in the same write set"
         );
         drop(retained_read);
 
