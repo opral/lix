@@ -1706,11 +1706,16 @@ mod tests {
                 .await
                 .expect("post-checkpoint insert should dirty a new identity");
         }
+        // An untracked row cannot live inside a tracked file — file ownership
+        // validation requires a row and its owning file to share one lane — so
+        // the untracked case is only reachable in the null-file bucket. It is
+        // still worth carrying: the bypass must classify it as "no diff entry"
+        // and the unfiltered index scan must agree.
         session
             .execute(
-                "INSERT INTO json_pointer (path, value, lixcol_file_id, lixcol_untracked) \
-                 VALUES ('/untracked', lix_json('{\"v\":1}'), $1, true)",
-                &[crate::Value::Text(files[0].to_string())],
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/untracked', lix_json('{\"v\":1}'), true)",
+                &[],
             )
             .await
             .expect("untracked insert should commit");
