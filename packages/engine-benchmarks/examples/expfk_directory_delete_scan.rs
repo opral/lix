@@ -179,13 +179,12 @@ where
 {
     let result = session
         .execute(
-            "SELECT count(*) FROM lix_file WHERE path LIKE '/data/%'",
+            "SELECT count(*) AS files FROM lix_file WHERE path LIKE '/data/%'",
             &[],
         )
         .await
         .expect("count seeded files");
-    match result.rows().first().and_then(|row| row.first()) {
-        Some(Value::Integer(value)) => *value,
-        other => panic!("unexpected count result: {other:?}"),
-    }
+    result.rows()[0]
+        .get::<i64>("files")
+        .expect("count column should be an integer")
 }
