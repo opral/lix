@@ -805,6 +805,15 @@ where
             let Some(control) = scope.branch_heads.get(branch_id).copied() else {
                 return Ok(Some(rewritten));
             };
+            // A branch the control proves holds no row of this schema
+            // contributes no candidates, so it needs no witness. The bloom has
+            // no false negatives, so this skip cannot hide a row. Without it a
+            // branch that never stores the schema — the global branch, for
+            // every ordinary user collection — would be permanently
+            // unwitnessed and would veto the index for everyone.
+            if !control.may_have_schema(&predicate.schema_key) {
+                continue;
+            }
             let Some(candidates) = self
                 .tracked_head
                 .reader(&self.store)
