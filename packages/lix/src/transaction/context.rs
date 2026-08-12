@@ -5931,7 +5931,9 @@ where
                 row.branch_id.as_str() != file_key.branch_id
                     || row.file_id.map(SharedStr::as_str) != Some(file_key.file_id.as_str())
                     || row.global
-                    || row.untracked
+                    // Semantic rows stay in their file's lane, not the tracked
+                    // lane: an untracked file's entities are untracked.
+                    || row.untracked != file_key.untracked
                     || group
                         .plugin
                         .schema_keys()
