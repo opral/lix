@@ -79,7 +79,26 @@ async fn run_case(files: usize) {
     seed_files(&lix, files).await;
     let seed_ms = seed_started.elapsed().as_secs_f64() * 1_000.0;
 
+    let plugin_rows = lix
+        .execute("SELECT COUNT(*) AS n FROM text_line", &[])
+        .await
+        .map(|result| result.rows()[0].get::<i64>("n").unwrap_or(-1))
+        .unwrap_or(-1);
+    println!("branch_file_cost_plugin_rows,files={files},text_line_rows={plugin_rows}");
+
     let before = snapshot(&storage, &db_path).await;
+    if std::env::var_os("E10_INVENTORY").is_some() {
+        for (name, counts) in &before.spaces {
+            if counts.rows == 0 {
+                continue;
+            }
+            println!(
+                "branch_file_cost_inventory,files={files},space={name},rows={},bytes={}",
+                counts.rows,
+                counts.key_bytes + counts.value_bytes
+            );
+        }
+    }
 
     let branch_started = Instant::now();
     lix.create_branch(CreateBranchOptions {
