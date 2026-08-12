@@ -156,6 +156,29 @@ fn directory_bytes(path: &Path) -> u64 {
     total
 }
 
+fn extension_bytes(path: &Path, extension: &str) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == extension)
+            {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
@@ -244,8 +267,19 @@ async fn main() {
 
     let after_rounds = usage(&storage).await;
     drop(lix);
+
+    // Three on-disk figures, because they answer different questions and
+    // claim-2 quoted only the first. A "clean close" leaves every memtable
+    // resident, so the WAL still holds a complete second copy of everything not
+    // yet flushed — that is a durability artifact of when the measurement was
+    // taken, not a property of the layout.
+    let on_disk_closed = directory_bytes(&db_dir);
+    let wal_closed = extension_bytes(&db_dir, "log");
+    storage.flush().expect("flush column families");
+    let on_disk_flushed = directory_bytes(&db_dir);
+    let wal_flushed = extension_bytes(&db_dir, "log");
     drop(storage);
-    let on_disk = directory_bytes(&db_dir);
+    let on_disk = on_disk_flushed;
 
     let mut spaces: Vec<(u32, &'static str)> = after_import.keys().copied().collect();
     spaces.extend(after_rounds.keys().copied());
@@ -288,6 +322,14 @@ async fn main() {
     println!(
         "\ne26 totals raw_corpus_bytes={raw_bytes} logical_after_import={logical_import} \
          logical_after_{rounds}_rounds={logical_rounds} on_disk_bytes={on_disk}"
+    );
+    println!(
+        "e26 ondisk closed={on_disk_closed} wal_closed={wal_closed} \
+         flushed={on_disk_flushed} wal_flushed={wal_flushed} \
+         closed_over_raw={:.3} flushed_over_raw={:.3} wal_share_of_closed={:.1}%",
+        on_disk_closed as f64 / raw_bytes.max(1) as f64,
+        on_disk_flushed as f64 / raw_bytes.max(1) as f64,
+        wal_closed as f64 / on_disk_closed.max(1) as f64 * 100.0,
     );
     println!(
         "e26 ratios logical_import_over_raw={:.3} logical_after_over_raw={:.3} \
