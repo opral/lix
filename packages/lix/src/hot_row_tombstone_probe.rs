@@ -143,7 +143,7 @@ async fn reopen_session(storage: &Memory) -> SessionContext<Memory> {
         .await
         .expect("engine should reopen");
     engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("session should reopen")
 }

@@ -16,7 +16,6 @@
 //! [`open_lix`] opens an in-memory repository. Add a storage adapter with
 //! [`OpenLixBuilder::with_storage`] when persistence is needed.
 
-#![recursion_limit = "256"]
 #![cfg_attr(
     test,
     allow(
@@ -98,7 +97,12 @@ pub mod storage;
 pub mod storage_adapter;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod storage_adapter;
-#[cfg(feature = "storage-benches")]
+// `gc.rs`'s `cfg(test)` census helpers consume `space_inventory`, so this module
+// needs the same gate as `registered_spaces` above rather than the feature
+// alone. Without the `test` arm a plain `cargo test -p lix` cannot compile the
+// crate, while every `--all-features` command still passes — the features-OFF
+// blind spot running in reverse.
+#[cfg(any(test, feature = "storage-benches"))]
 pub mod storage_bench;
 pub(crate) mod storage_codec;
 // Unconditional: `StorageSpace::mutable`/`::immutable` check the id they are
