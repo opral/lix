@@ -105,6 +105,10 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
     use crate::{Value, open_lix};
 
+    /// The cache is one process-wide static, so the tests that assert on its
+    /// contents take turns rather than racing each other.
+    static CACHE_TESTS: Mutex<()> = Mutex::new(());
+
     fn token(byte: u8) -> Bytes {
         Bytes::from(vec![byte; 16])
     }
@@ -220,12 +224,14 @@ mod tests {
 
     #[test]
     fn a_missing_token_never_matches() {
+        let _guard = CACHE_TESTS.lock().expect("cache test guard");
         record_account_proven_active(None, "account-a");
         assert!(!account_proven_active(None, "account-a"));
     }
 
     #[test]
     fn a_different_token_misses() {
+        let _guard = CACHE_TESTS.lock().expect("cache test guard");
         clear_validated_accounts_for_test();
         record_account_proven_active(Some(&token(1)), "account-a");
         assert!(account_proven_active(Some(&token(1)), "account-a"));
@@ -241,6 +247,7 @@ mod tests {
 
     #[test]
     fn the_cache_is_bounded() {
+        let _guard = CACHE_TESTS.lock().expect("cache test guard");
         clear_validated_accounts_for_test();
         for index in 0..(MAX_VALIDATED_ACCOUNTS as u8 + 8) {
             record_account_proven_active(Some(&token(index)), "account-a");
