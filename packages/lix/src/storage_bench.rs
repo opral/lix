@@ -3143,8 +3143,6 @@ pub fn content_address_rule(space_id: u32) -> ContentAddressRule {
         0x0005_0003 => ContentAddressRule::BinaryCasChunkPayload,
         // json_store.json
         0x0002_0001 => ContentAddressRule::JsonStorePayload,
-        // json_store.untracked_reclaim_candidate.v1
-        0x0002_0002 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
         // binary_cas.chunk_presence
         0x0005_0004 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
         _ => ContentAddressRule::NotContentAddressed,

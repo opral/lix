@@ -107,6 +107,9 @@ use crate::transaction::normalization::{
     remember_pending_registered_schema,
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
+use crate::transaction::staged_commit_changes::{
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder,
+};
 use crate::transaction::staging::{
     ImmutableMutationChunkStage, ImmutableMutationJournalChunk, PreparedStateRowOverlay,
     PreparedWriteSet, TransactionWriteBuffer, TransactionWriteBufferCheckpoint,
@@ -114,13 +117,13 @@ use crate::transaction::staging::{
 use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
-use crate::transaction::types::{
+use crate::transaction_types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
     PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
-    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
-    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
-    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
-    TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
+    TransactionFileContent, TransactionJson, TransactionWrite, TransactionWriteMode,
+    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
+    TransactionWriteRow, TypedMutationJournalBatch, canonicalize_transaction_json_batch,
+    stage_json_from_value,
 };
 
 pub(crate) struct CertifiedHistoryStoreReader<S> {
@@ -6635,50 +6638,6 @@ where
         Ok(())
     }
 
-    /// Reports whether visible untracked state is owned by any requested file.
-    pub(crate) async fn has_untracked_file_scoped_rows(
-        &mut self,
-        file_ids: &[String],
-    ) -> Result<bool, LixError> {
-        if file_ids.is_empty() {
-            return Ok(false);
-        }
-        let branch_id = self.active_branch_id.clone();
-        let rows = self
-            .scan_visible_live_state_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    branch_ids: vec![branch_id],
-                    file_ids: file_ids
-                        .iter()
-                        .cloned()
-                        .map(NullableKeyFilter::Value)
-                        .collect(),
-                    untracked: Some(true),
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection::default(),
-                limit: Some(1),
-            })
-            .await?;
-        Ok(!rows.is_empty())
-    }
-
-    /// Reports whether the active branch has any visible untracked state.
-    pub(crate) async fn has_untracked_rows(&mut self) -> Result<bool, LixError> {
-        let branch_id = self.active_branch_id.clone();
-        let rows = self
-            .scan_visible_live_state_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    branch_ids: vec![branch_id],
-                    untracked: Some(true),
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection::default(),
-                limit: Some(1),
-            })
-            .await?;
-        Ok(!rows.is_empty())
-    }
 
     /// Stages the protocol replay receipt into this transaction's final
     /// storage write set. The receipt is guarded by `KeyAbsent` during commit,
@@ -8926,7 +8885,9 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
     }) || prepared_writes
         .commit_change_refs_by_branch
         .values()
-        .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
+        .flat_map(
+            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
+        )
         .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
 }
 
@@ -8941,7 +8902,9 @@ fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWr
     }) || prepared_writes
         .commit_change_refs_by_branch
         .values()
-        .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
+        .flat_map(
+            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
+        )
         .any(|change_ref| {
             matches!(
                 change_ref.schema_key(),
@@ -11895,9 +11858,10 @@ mod tests {
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateKey, TrackedStateScanRequest,
     };
-    use crate::transaction::types::{
-        StagedCommitChangeBatchBuilder, StagedCommitChangeRefs, TransactionJson,
+    use crate::transaction::staged_commit_changes::{
+        StagedCommitChangeBatchBuilder, StagedCommitChangeRefs,
     };
+    use crate::transaction_types::TransactionJson;
     use crate::wasm::WasmEntity;
 
     fn raw_write_rows(rows: Vec<TransactionWriteRow>) -> RawWriteBatch {

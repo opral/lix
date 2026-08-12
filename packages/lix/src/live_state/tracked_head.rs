@@ -55,7 +55,6 @@ use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
-    JsonStoreWriter,
 };
 use crate::live_state::{
     MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
@@ -585,29 +584,6 @@ fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixE
             delta.schema_key, delta.entity_pk, delta.file_id
         ),
     )
-}
-
-fn collect_retired_untracked_json_refs(
-    existing: HeadValueView<'_>,
-    delta: &CurrentStateDeltaRef<'_>,
-    retired: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) {
-    debug_assert!(existing.untracked);
-    if !delta.untracked {
-        return;
-    }
-    for old_slot in [existing.snapshot, existing.metadata] {
-        let HeadSlotView::Ref(old_ref) = old_slot else {
-            continue;
-        };
-        let retained_by_successor = !delta.physically_deletes()
-            && [delta.snapshot, delta.metadata].into_iter().any(
-                |new_slot| matches!(new_slot, JsonSlotRef::Ref(new_ref) if new_ref == &old_ref),
-            );
-        if !retained_by_successor {
-            retired.insert(*old_ref.as_hash_array());
-        }
-    }
 }
 
 fn reject_guarded_live_member(

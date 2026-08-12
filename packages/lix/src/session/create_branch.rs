@@ -4,7 +4,7 @@ use crate::branch::{
     branch_ref_stage_row,
 };
 use crate::storage_adapter::Storage;
-use crate::transaction::types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
+use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 
 use super::context::SessionContext;
 
