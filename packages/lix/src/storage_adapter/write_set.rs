@@ -755,6 +755,25 @@ impl StorageWriteSet {
             .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
     }
 
+    /// Keys this write set already declares in `space`.
+    ///
+    /// A caller that reclaims a whole key range needs this when another writer
+    /// in the same transaction may already have declared some of those keys:
+    /// restating one is a duplicate mutation, not an idempotent delete.
+    pub(crate) fn declared_keys(&self, space: StorageSpace) -> std::collections::BTreeSet<Vec<u8>> {
+        self.group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))
+            .map(|group| {
+                (0..group.puts.len())
+                    .map(MutationIndex::Put)
+                    .chain((0..group.deletes.len()).map(MutationIndex::Delete))
+                    .map(|mutation| group.mutation_key(mutation).to_vec())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn changelog_gc_is_sealed(&self) -> bool {
         self.changelog_gc_sealed
     }
