@@ -4838,12 +4838,16 @@ mod tests {
                 ],
             ]
         );
-        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        // An `IN` list over the whole primary key is an exact identity set, so
+        // the provider routes it through the registered entity-snapshot reader
+        // and never needs the generic visibility scan. The reader is handed the
+        // deduplicated identities and no residual predicate, because the
+        // identity access path applies that predicate in full.
+        assert_eq!(scans.load(Ordering::SeqCst), 0);
         let requests = requests.lock().expect("captured snapshot requests lock");
-        assert!(
-            requests.is_empty(),
-            "DataFusion reads must not invoke the deleted native snapshot route"
-        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].filter.entity_pks.len(), 2);
+        assert!(requests[0].filter.constraints.is_empty());
     }
 
     #[tokio::test]
