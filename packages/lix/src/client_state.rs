@@ -10,6 +10,14 @@ use lix::{GLOBAL_BRANCH_ID, LixError, Memory, Value};
 const CLIENT_STATE_KEY_PREFIX: &str = "lix_client_state:";
 pub(crate) const PRIMARY_SESSION_BRANCH_KEY: &str = "lix_primary_session_branch_id";
 
+/// Physical entity key of the primary-session branch preference.
+///
+/// `open_lix` point-reads this row instead of running [`ClientState::get`],
+/// so the prefix has to be reachable without building a SQL context.
+pub(crate) fn primary_session_branch_physical_key() -> String {
+    format!("{CLIENT_STATE_KEY_PREFIX}{PRIMARY_SESSION_BRANCH_KEY}")
+}
+
 const GET_SQL: &str = "SELECT value \
     FROM lix_key_value_by_branch \
     WHERE key = $1 \

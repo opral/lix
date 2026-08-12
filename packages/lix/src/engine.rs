@@ -223,6 +223,52 @@ where
         Ok(result)
     }
 
+    /// Point-reads one global, untracked `lix_key_value` row by physical key.
+    ///
+    /// Client-state rows are ordinary global untracked KV entities, so a single
+    /// preference lookup does not need a SQL context. `open_lix` runs before any
+    /// statement in the process, where routing through `execute` would pay
+    /// catalog construction and DataFusion planning for one key.
+    pub(crate) async fn load_untracked_global_key_value(
+        &self,
+        physical_key: &str,
+    ) -> Result<Option<serde_json::Value>, LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let Some(row) = self
+            .hot_state
+            .reader(read)
+            .load_row(&HotStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                entity_pk: EntityPk::single(physical_key),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Client state is only ever written untracked; a tracked row under the
+        // same key is not client state and must not answer this read.
+        if row.deleted || !row.untracked {
+            return Ok(None);
+        }
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            return Ok(None);
+        };
+        let snapshot: serde_json::Value =
+            serde_json::from_str(snapshot_content).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("invalid lix_key_value snapshot JSON: {error}"),
+                )
+            })?;
+        Ok(snapshot.get("value").cloned())
+    }
+
     pub async fn open_session_at(
         &self,
         active_branch_id: impl Into<String>,

@@ -137,9 +137,13 @@ where
         session: Arc::new(session),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
     };
+    // A point read on the same context `load_branch_head_commit_id` uses.
+    // Opening must not build a SQL context to answer one key.
     let stored_branch_id = lix
-        .client_state()
-        .get(crate::client_state::PRIMARY_SESSION_BRANCH_KEY)
+        .engine
+        .load_untracked_global_key_value(
+            &crate::client_state::primary_session_branch_physical_key(),
+        )
         .await?
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|value| !value.is_empty());
@@ -153,6 +157,11 @@ where
             })
             .await?;
     }
+    // The writeback stays on the open path. It only runs when the stored key
+    // does not already name the active branch, so it costs nothing after the
+    // first open -- and `ClientState::entries`/`get` are public API, so making
+    // the key appear only after an explicit switch would change observable
+    // output for a repository that has never switched.
     let active_branch_id = lix.active_branch_id().await?;
     if stored_branch_id.as_deref() != Some(active_branch_id.as_str()) {
         lix.client_state()
