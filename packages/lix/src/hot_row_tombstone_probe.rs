@@ -19,7 +19,8 @@ use crate::session::SessionContext;
 use crate::storage::ProjectedValue;
 use crate::storage_adapter::{
     Memory, SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead,
-    StorageBeginScanOptions, StoragePrefix, StorageReadOptions, StorageWriteOptions,
+    StorageBeginScanOptions, StoragePrefix, StorageReadOptions, StorageSpace,
+    StorageWriteOptions,
 };
 
 fn sizes_from_env(var: &str, default: &[usize]) -> Vec<usize> {
@@ -77,7 +78,10 @@ impl RowCensus {
 /// this probe out of the private value codec.
 const HEAD_VALUE_DELETED_BIT: u8 = 0b0000_0001;
 
-async fn count_space(read: &(impl StorageAdapterRead + ?Sized), space: crate::storage::StorageSpace) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+async fn space_values(
+    read: &(impl StorageAdapterRead + ?Sized),
+    space: StorageSpace,
+) -> Vec<bytes::Bytes> {
     let range = StoragePrefix {
         bytes: bytes::Bytes::new(),
     }
@@ -92,12 +96,9 @@ async fn count_space(read: &(impl StorageAdapterRead + ?Sized), space: crate::st
         .await
         .expect("collect serving entries")
         .into_iter()
-        .map(|entry| {
-            let value = match entry.value {
-                ProjectedValue::FullValue(bytes) => bytes,
-                ProjectedValue::KeyOnly => bytes::Bytes::new(),
-            };
-            (entry.key, value)
+        .map(|entry| match entry.value {
+            ProjectedValue::FullValue(bytes) => bytes,
+            ProjectedValue::KeyOnly => bytes::Bytes::new(),
         })
         .collect()
 }
@@ -108,12 +109,12 @@ async fn row_census(storage: &Memory) -> RowCensus {
         .begin_read(StorageReadOptions::default())
         .await
         .expect("read the hot row plane");
-    let rows = count_space(&read, crate::hot_state::ROW_SPACE).await;
+    let rows = space_values(&read, crate::hot_state::ROW_SPACE).await;
     let tombstones = rows
         .iter()
-        .filter(|(_, value)| value.len() > 1 && value[1] & HEAD_VALUE_DELETED_BIT != 0)
+        .filter(|value| value.len() > 1 && value[1] & HEAD_VALUE_DELETED_BIT != 0)
         .count();
-    let packed_bases = count_space(&read, crate::hot_state::PACKED_CURRENT_BASE_SPACE)
+    let packed_bases = space_values(&read, crate::hot_state::PACKED_CURRENT_BASE_SPACE)
         .await
         .len();
     RowCensus {
@@ -121,6 +122,26 @@ async fn row_census(storage: &Memory) -> RowCensus {
         tombstones,
         packed_bases,
     }
+}
+
+/// Plans and commits a repository GC sweep against the same physical store the
+/// session writes through.
+async fn run_repository_gc(storage: &Memory) {
+    let adapter = StorageAdapter::new(storage.clone());
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("gc read"),
+    );
+    let mut gc_writes = adapter.new_write_set();
+    crate::gc::stage_repository_gc(read, &mut gc_writes)
+        .await
+        .expect("repository gc should plan");
+    adapter
+        .commit_write_set(gc_writes, StorageWriteOptions::default())
+        .await
+        .expect("gc write set should commit");
 }
 
 fn probe_schema(key: &str) -> serde_json::Value {
@@ -324,22 +345,7 @@ async fn hot_row_tombstone_reclamation_events() {
     report("after_checkpoint", census, scan);
 
     // (c) repository GC.
-    let read = SharedStorageAdapterRead::new(
-        session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("gc read"),
-    );
-    let mut gc_writes = session.storage.new_write_set();
-    crate::gc::stage_repository_gc(read, &mut gc_writes)
-        .await
-        .expect("repository gc should plan");
-    session
-        .storage
-        .commit_write_set(gc_writes, StorageWriteOptions::default())
-        .await
-        .expect("gc write set should commit");
+    run_repository_gc(&storage).await;
     let census = row_census(&storage).await;
     let scan = timed_scan(&session, &scan_sql("evtrow"), 1, reps).await;
     report("after_gc", census, scan);
@@ -357,22 +363,7 @@ async fn hot_row_tombstone_reclamation_events() {
         .create_checkpoint()
         .await
         .expect("second checkpoint should publish");
-    let read = SharedStorageAdapterRead::new(
-        session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("gc read"),
-    );
-    let mut gc_writes = session.storage.new_write_set();
-    crate::gc::stage_repository_gc(read, &mut gc_writes)
-        .await
-        .expect("second repository gc should plan");
-    session
-        .storage
-        .commit_write_set(gc_writes, StorageWriteOptions::default())
-        .await
-        .expect("second gc write set should commit");
+    run_repository_gc(&storage).await;
     let census = row_census(&storage).await;
     let scan = timed_scan(&session, &scan_sql("evtrow"), 1, reps).await;
     report("after_ckpt2_gc", census, scan);
