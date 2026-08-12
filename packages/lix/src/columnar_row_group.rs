@@ -5,10 +5,6 @@
 //! provide a stable 16-byte owner and publish the returned immutable writes
 //! inside their own atomic visibility transaction.
 
-// This intentionally lands before its publication/read-path integration. Its
-// crate-private API is exercised by the codec and storage tests below.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
