@@ -1057,3 +1057,4 @@ mod assume_send_future_proofs {
         assert_sync::<Lix<S>>();
     }
 }
+
