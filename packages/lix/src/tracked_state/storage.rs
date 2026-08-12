@@ -7694,16 +7694,15 @@ pub(crate) async fn load_commit_delta_change_records(
     commit_id: CommitId,
     keys: &[TrackedStateKey],
 ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
+    #[cfg(feature = "storage-benches")]
+    for key in keys {
+        crate::storage_bench::record_commit_delta_request_key_clone(
+            key.schema_key.len() + key.file_id.as_ref().map_or(0, String::len),
+        );
+    }
     let requests = keys
         .iter()
         .cloned()
-        .inspect(|key| {
-            #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_commit_delta_request_key_clone(
-                key.schema_key.len() + key.file_id.as_ref().map_or(0, String::len),
-            );
-            let _ = key;
-        })
         .map(|key| (commit_id, key))
         .collect::<Vec<_>>();
     Ok(load_owned_commit_delta_entries(store, &requests)
