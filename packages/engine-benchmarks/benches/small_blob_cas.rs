@@ -3,6 +3,10 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use lix::registered_spaces::{
+    BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
+    BINARY_CAS_MANIFEST_SPACE,
+};
 use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, Precondition, ProjectedValue, PutBatch,
     PutEntry, ReadDurability, ReadOptions, SpaceId, Storage, StorageSpace, StorageWrite,
@@ -423,12 +427,12 @@ where
             .expect("open layout accounting read");
         let spaces = layout_accounting(&read).await;
         Layout {
-            manifest_rows: rows(&spaces, "binary_cas.manifest"),
-            manifest_value_bytes: value_bytes(&spaces, "binary_cas.manifest"),
-            manifest_chunk_rows: rows(&spaces, "binary_cas.manifest_chunk"),
-            payload_rows: rows(&spaces, "binary_cas.chunk"),
-            payload_value_bytes: value_bytes(&spaces, "binary_cas.chunk"),
-            presence_rows: rows(&spaces, "binary_cas.chunk_presence"),
+            manifest_rows: rows(&spaces, BINARY_CAS_MANIFEST_SPACE.name),
+            manifest_value_bytes: value_bytes(&spaces, BINARY_CAS_MANIFEST_SPACE.name),
+            manifest_chunk_rows: rows(&spaces, BINARY_CAS_MANIFEST_CHUNK_SPACE.name),
+            payload_rows: rows(&spaces, BINARY_CAS_CHUNK_SPACE.name),
+            payload_value_bytes: value_bytes(&spaces, BINARY_CAS_CHUNK_SPACE.name),
+            presence_rows: rows(&spaces, BINARY_CAS_CHUNK_PRESENCE_SPACE.name),
         }
     }
 }
@@ -669,18 +673,43 @@ struct Layout {
     presence_rows: u64,
 }
 
-fn rows(spaces: &[lix::storage_bench::StorageLayoutAccounting], name: &str) -> u64 {
+/// The accounting row for one space, or a panic naming what was actually there.
+///
+/// `layout_accounting` emits a row for **every** registered space, empty ones
+/// included, so a miss here never means "this space holds nothing" — it means
+/// the name is not a registered space name. These lookups used to answer that
+/// with `map_or(0, ..)`, which made a renamed space report `0 rows / 0 bytes`
+/// as a measurement: the bench stayed green and published zeroes. Renames are
+/// routine, because a space name carries its record encoding version
+/// (`branch.head_control.v10` -> `v11`), so this was a live way to publish a
+/// silently wrong CAS byte count. Callers now pass a registry handle's `.name`
+/// and a miss is loud.
+fn space<'a>(
+    spaces: &'a [lix::storage_bench::StorageLayoutAccounting],
+    name: &str,
+) -> &'a lix::storage_bench::StorageLayoutAccounting {
     spaces
         .iter()
         .find(|space| space.space == name)
-        .map_or(0, |space| space.rows)
+        .unwrap_or_else(|| {
+            let known = spaces
+                .iter()
+                .map(|space| space.space)
+                .collect::<Vec<_>>()
+                .join(", ");
+            panic!(
+                "storage space '{name}' is not in the layout accounting, so this \
+                 bench cannot measure it. Registered spaces: {known}"
+            )
+        })
+}
+
+fn rows(spaces: &[lix::storage_bench::StorageLayoutAccounting], name: &str) -> u64 {
+    space(spaces, name).rows
 }
 
 fn value_bytes(spaces: &[lix::storage_bench::StorageLayoutAccounting], name: &str) -> u64 {
-    spaces
-        .iter()
-        .find(|space| space.space == name)
-        .map_or(0, |space| space.value_bytes)
+    space(spaces, name).value_bytes
 }
 
 fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
