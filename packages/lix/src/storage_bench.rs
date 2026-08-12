@@ -50,6 +50,9 @@ static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_DURABLE_ROOT: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_EXACT_KEYS: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_ROOTLESS_REPLAY: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
@@ -335,6 +338,32 @@ pub fn take_certified_entity_update_value_batch_accounting() -> CrudCertificateA
 pub struct EntityPointSnapshotCacheAccounting {
     pub hits: u64,
     pub misses: u64,
+}
+
+pub(crate) fn record_tracked_scan_durable_root() {
+    TRACKED_SCAN_DURABLE_ROOT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_tracked_scan_exact_keys() {
+    TRACKED_SCAN_EXACT_KEYS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_tracked_scan_rootless_replay() {
+    TRACKED_SCAN_ROOTLESS_REPLAY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Which arm of `scan_batch_at_commit` ran, since the last call:
+/// `(durable_root, exact_keys, rootless_replay)`.
+///
+/// Symbol presence in a profile is not attribution — a claim about which arm
+/// executed has to come from the branch itself. This exists because inferring
+/// it from which symbols appeared got it exactly backwards once.
+pub fn take_tracked_scan_branch_accounting() -> (u64, u64, u64) {
+    (
+        TRACKED_SCAN_DURABLE_ROOT.swap(0, Ordering::Relaxed),
+        TRACKED_SCAN_EXACT_KEYS.swap(0, Ordering::Relaxed),
+        TRACKED_SCAN_ROOTLESS_REPLAY.swap(0, Ordering::Relaxed),
+    )
 }
 
 pub(crate) fn record_entity_point_snapshot_cache_hit() {

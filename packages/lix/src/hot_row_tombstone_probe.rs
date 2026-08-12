@@ -748,3 +748,112 @@ async fn hot_row_tombstone_compaction_premise() {
         );
     }
 }
+
+/// PHASE 6 — is the rotated-generation read cost a **checkpoint-distance** term?
+///
+/// `scan_batch_at_commit` has two arms. If the commit carries a sealed durable
+/// tracked-state root it scans that tree; if it does not, it falls back to
+/// replaying the first-parent commit interval. A branch's base commit is
+/// whatever the head happened to be, so whether a rotated read walks a tree or
+/// replays an interval depends on how far the head is from the last checkpoint.
+///
+/// If that is the mechanism, the rotated read cost is a function of
+/// **commits since the last durable root**, not of anything about the branch —
+/// and the fix belongs at the root-sealing boundary rather than in the codec.
+/// If it is not, the cost is in the per-row commit-delta segment search and the
+/// distance sweep will be flat.
+///
+/// Every arm holds the base at `n` rows and the answer at one row, and varies
+/// only `distance`: the number of ordinary commits published after the
+/// checkpoint and before the branch is created. The `no_ckpt` arm never
+/// checkpoints at all and is the control.
+///
+/// `cold_us` is the very first read of the rotated generation — the one that
+/// pays the full re-derivation. `warm_us` is the median of the reps after it.
+/// Both are reported because the serving cache added in #1417 collapses the
+/// warm number and would hide the effect entirely if only the median were
+/// taken; this probe is built to run on either side of that change.
+///
+/// The branch counters are read from the engine's own accounting rather than
+/// inferred from timings, because inferring which arm ran from which symbols
+/// appeared in a profile got this exactly backwards once.
+#[cfg(feature = "storage-benches")]
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn rotated_generation_checkpoint_distance() {
+    let n = sizes_from_env("LIX_TOMBSTONE_SIZES", &[1_000])[0];
+    let distances = sizes_from_env("LIX_CKPT_DISTANCES", &[0, 1, 2, 4, 8, 16, 32, 64]);
+    let reps = reps_from_env(9);
+    println!(
+        "phase6 | arm,n,distance,row_entries,root_bases,cold_durable,cold_exact,cold_replay,warm_durable,warm_exact,warm_replay,cold_us,warm_us"
+    );
+    let scan = scan_sql("distrow");
+    for distance in distances {
+        for checkpoint in [true, false] {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("distrow")).await;
+            register(&session, probe_schema("otherrow")).await;
+            insert_rows(&session, "distrow", n).await;
+            if checkpoint {
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("checkpoint should publish");
+            }
+            // Each of these is one ordinary commit past the checkpoint.
+            for index in 0..distance {
+                session
+                    .execute(
+                        "INSERT INTO otherrow (id, locale) VALUES ($1, 'x')",
+                        &[crate::Value::Text(format!("d-{index}"))],
+                    )
+                    .await
+                    .expect("distance commit should publish");
+            }
+            let branch = session
+                .create_branch(crate::CreateBranchOptions {
+                    id: None,
+                    name: format!("e51-distance-{distance}"),
+                    from_commit_id: None,
+                })
+                .await
+                .expect("branch should create");
+            session
+                .switch_branch(crate::SwitchBranchOptions {
+                    branch_id: branch.id.clone(),
+                })
+                .await
+                .expect("branch should switch");
+            let census = row_census(&storage).await;
+
+            let _ = crate::storage_bench::take_tracked_scan_branch_accounting();
+            let started = Instant::now();
+            let rows = session.execute(&scan, &[]).await.expect("cold scan");
+            let cold = started.elapsed();
+            assert_eq!(rows.len(), 1, "the cold rotated scan must answer one row");
+            let (cold_durable, cold_exact, cold_replay) =
+                crate::storage_bench::take_tracked_scan_branch_accounting();
+
+            let mut samples = Vec::new();
+            for _ in 0..reps {
+                let started = Instant::now();
+                let rows = session.execute(&scan, &[]).await.expect("warm scan");
+                samples.push(started.elapsed());
+                assert_eq!(rows.len(), 1, "the warm rotated scan must answer one row");
+            }
+            samples.sort();
+            let warm = samples[samples.len() / 2];
+            let (warm_durable, warm_exact, warm_replay) =
+                crate::storage_bench::take_tracked_scan_branch_accounting();
+
+            println!(
+                "{},{n},{distance},{},{},{cold_durable},{cold_exact},{cold_replay},{warm_durable},{warm_exact},{warm_replay},{},{}",
+                if checkpoint { "ckpt" } else { "no_ckpt" },
+                census.entries,
+                census.root_bases,
+                cold.as_micros(),
+                warm.as_micros()
+            );
+        }
+    }
+}
