@@ -24,6 +24,10 @@ pub(crate) const REVISION_SPACE: StorageSpace = StorageSpace::declare(
     ValueSemantics::Mutable,
 );
 
+/// Active-account visibility token. Rotated only by a commit that writes an
+/// account row or moves a branch ref, so an ordinary CRUD commit leaves it
+/// alone and a disabled account rotates it.
+pub(crate) const REVISION_KEY_ACCOUNT: &[u8] = b"a";
 /// Binary-CAS reclamation token. Rotated only by an authenticated CAS sweep,
 /// and asserted unchanged by every CAS publisher, so a publisher that planned
 /// against payload rows a sweep then deleted cannot commit.

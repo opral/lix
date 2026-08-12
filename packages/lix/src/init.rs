@@ -506,6 +506,7 @@ where
         }
     }
     crate::catalog::stage_catalog_revision(&mut writes);
+    crate::account::stage_account_revision(&mut writes);
     stage_repository_protocol(&mut writes);
 
     storage

@@ -301,6 +301,18 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                 "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
             )
         });
+    // Which account rows are visible changes when an account row is written
+    // and when a branch ref moves (the account rows live in the global
+    // branch's tracked state, so a head move can change the view without any
+    // account row in this commit). Both cases rotate the token; ordinary CRUD
+    // does not, which is the whole point.
+    let account_view_changed = prepared_writes.state_rows.iter().any(|row| {
+        matches!(row.schema_key.as_str(), ACCOUNT_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY)
+    }) || prepared_writes
+        .commit_change_refs_by_branch
+        .values()
+        .flat_map(StagedCommitChangeRefs::selected_changes)
+        .any(|change_ref| change_ref.schema_key() == ACCOUNT_SCHEMA_KEY);
     let mut state_rows = prepared_writes.state_rows;
     #[cfg(feature = "storage-benches")]
     state_rows.record_ownership(crate::storage_bench::CRUD_OWNERSHIP_AUTHORITY);
@@ -874,6 +886,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
     if filesystem_view_changed {
         stage_path_index_revision(&mut writes);
+    }
+    if account_view_changed {
+        crate::account::stage_account_revision(&mut writes);
     }
     Ok(MaterializedCommit {
         writes,
@@ -3321,6 +3336,7 @@ async fn build_lifecycle_tracked_snapshots(
         .collect()
 }
 
+const ACCOUNT_SCHEMA_KEY: &str = "lix_account";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -6430,6 +6446,22 @@ async fn validate_active_account_and_account_rows(
             format!("active account id '{active_account_id}' is not a canonical UUID"),
         )
     })?;
+    // Proving the account is active is a hot-state point read plus a JSON
+    // parse of its snapshot, and it re-proves the same fact on every commit.
+    // The account token identifies the account view this snapshot sees: a
+    // commit that could change that view rotates it, so an equal token means
+    // an equal view and the proof still holds. A commit that writes account
+    // rows itself always re-reads — it is the one changing the answer.
+    let account_revision = crate::account::load_account_revision(&*read).await?;
+    let writes_account_rows = prepared_writes
+        .state_rows
+        .iter()
+        .any(|row| row.schema_key.as_str() == "lix_account");
+    if !writes_account_rows
+        && crate::account::account_proven_active(account_revision.as_ref(), active_account_id)
+    {
+        return validate_prepared_account_rows(prepared_writes);
+    }
     let account = HotStateContext::new(
         TrackedStateContext::new(),
         crate::commit_graph::CommitGraphContext::new(),
@@ -6466,6 +6498,7 @@ async fn validate_active_account_and_account_rows(
                 format!("active account '{active_account_id}' is disabled"),
             ));
         }
+        crate::account::record_account_proven_active(account_revision.as_ref(), active_account_id);
     } else if crate::init::repository_protocol_status(&*read).await?
         == crate::init::RepositoryProtocolStatus::Current
     {
@@ -6475,6 +6508,12 @@ async fn validate_active_account_and_account_rows(
         ));
     }
 
+    validate_prepared_account_rows(prepared_writes)
+}
+
+/// Shape rules for account rows carried by this commit. These read nothing and
+/// run on every commit, cached account proof or not.
+fn validate_prepared_account_rows(prepared_writes: &PreparedWriteSet) -> Result<(), LixError> {
     for row in prepared_writes
         .state_rows
         .iter()
