@@ -249,9 +249,14 @@ where
     }
 }
 
-const SHAPES: [&str; 8] = [
+const SHAPES: [&str; 10] = [
     "insert_file_80line",
     "insert_file_1line",
+    // Same total rows written as ten `insert_file_1line` probes, but in one
+    // statement. If the O(files) term is paid once per statement rather than
+    // once per written row, this costs about the same as a single-row insert.
+    "insert_10files_1stmt",
+    "insert_100files_1stmt",
     // Root-level path (one segment). `indexed_file_path_writes` only builds a
     // whole-repository `DirectoryPathResolver` when a *nested* path is missing,
     // so a root-level create isolates the path-index build from the resolver
@@ -302,6 +307,12 @@ where
             )
             .await
             .expect("insert 1-line probe file");
+        }
+        "insert_10files_1stmt" => {
+            insert_many(lix, "b10", probe, 10).await;
+        }
+        "insert_100files_1stmt" => {
+            insert_many(lix, "b100", probe, 100).await;
         }
         "insert_root_file" => {
             lix.execute(
@@ -477,6 +488,28 @@ where
             .expect("seed write-scaling files");
         written += batch;
     }
+}
+
+async fn insert_many<StorageImpl>(lix: &Lix<StorageImpl>, tag: &str, probe: usize, count: usize)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let mut sql = String::from("INSERT INTO lix_file (path, content) VALUES ");
+    let mut params: Vec<Value> = Vec::with_capacity(count * 2);
+    for offset in 0..count {
+        if offset > 0 {
+            sql.push(',');
+        }
+        let parameter = offset * 2;
+        sql.push_str(&format!("(${}, ${})", parameter + 1, parameter + 2));
+        params.push(Value::Text(format!(
+            "/probe/{tag}-{probe:05}-{offset:04}.txt"
+        )));
+        params.push(Value::Blob(document(1, probe + offset).into()));
+    }
+    lix.execute(&sql, &params)
+        .await
+        .unwrap_or_else(|error| panic!("insert {count} probe files: {error:?}"));
 }
 
 fn document_string(lines: usize, index: usize) -> String {
