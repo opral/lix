@@ -1185,42 +1185,59 @@ async fn plan_json_payload_reclamation<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
+    // Every await here is boxed. This planner is reached from
+    // `stage_repository_gc_with_preconditions`, whose future is already close
+    // to the test harness's 2 MiB worker stack; inlining these state machines
+    // aborted `cas_gc_history_retention` with a stack overflow, which passes on
+    // the parent commit. Keep them boxed.
+    //
     // Candidates: named only by state this sweep is deleting.
     let mut candidates = BTreeSet::new();
     for commit_id in retired_commits {
-        crate::tracked_state::collect_local_commit_delta_json_refs(store, *commit_id, &mut candidates)
-            .await?;
+        Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
+            store,
+            *commit_id,
+            &mut candidates,
+        ))
+        .await?;
     }
-    crate::tracked_state::collect_current_state_part_json_refs(
+    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
         store,
         released_part_refs_digests,
         &mut candidates,
-    )
+    ))
     .await?;
 
     // Live: named by state that outlives this sweep.
     let mut live = BTreeSet::new();
-    TrackedHeadContext::new()
-        .reader(store.clone())
-        .collect_hot_json_refs(controls, false, &mut live)
-        .await?;
-    crate::tracked_state::collect_current_state_part_json_refs(
+    Box::pin(
+        TrackedHeadContext::new()
+            .reader(store.clone())
+            .collect_hot_json_refs(controls, false, &mut live),
+    )
+    .await?;
+    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
         store,
         retained_part_refs_digests,
         &mut live,
-    )
+    ))
     .await?;
     for commit_id in surviving_commits {
-        crate::tracked_state::collect_local_commit_delta_json_refs(store, *commit_id, &mut live)
-            .await?;
+        Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
+            store, *commit_id, &mut live,
+        ))
+        .await?;
     }
     let ref_change_ids = controls
         .iter()
         .map(|(_, control)| control.ref_change_id)
         .collect::<BTreeSet<_>>();
-    for record in crate::changelog::load_change_records(store, ref_change_ids.into_iter())
-        .await?
-        .values()
+    for record in Box::pin(crate::changelog::load_change_records(
+        store,
+        ref_change_ids.into_iter(),
+    ))
+    .await?
+    .values()
     {
         for slot in [&record.snapshot, &record.metadata] {
             if let JsonSlot::Ref(json_ref) = slot {
