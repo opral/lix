@@ -716,6 +716,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &state_rows,
+        entity_schema_catalog,
         &entity_columnar_write_sets,
         &engine_rows,
         &row_index.tracked_row_indices_by_commit,
@@ -1868,6 +1869,107 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
         base_coordinate: None,
         authored: false,
     })
+}
+
+/// A schema registration is the moment a collection's index is complete for
+/// free: no row can exist for a schema that is not registered yet, so an empty
+/// index is a correct index and the witness costs one key per declared column.
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+
+/// Builds this commit's index entries, plus witnesses for schemas it registers.
+///
+/// Put-only: rows whose indexed value changed publish a new entry and leave the
+/// superseded one behind, and deleted rows publish nothing. Both cases are
+/// resolved on read by re-checking candidates against the row, which is what
+/// lets this stay one pass over the commit's own rows with no reads.
+fn hot_index_writes_for_commit(
+    entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
+    state_rows: &PreparedStateBatch,
+    branch_id: &str,
+) -> Result<(Vec<crate::live_state::HotIndexEntry>, BTreeSet<(String, u16)>), LixError> {
+    let mut entries = Vec::new();
+    let mut witnesses = BTreeSet::new();
+    let mut specs: BTreeMap<String, Option<Arc<crate::sql2::EntitySurfaceSpec>>> =
+        BTreeMap::new();
+    for row in state_rows.iter() {
+        if row.branch_id.as_str() != branch_id {
+            continue;
+        }
+        let Some(snapshot) = row.snapshot else {
+            continue;
+        };
+        if row.schema_key.as_str() == REGISTERED_SCHEMA_KEY {
+            let registered = serde_json::from_str::<serde_json::Value>(snapshot.normalized())
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("registered schema snapshot is not valid JSON: {error}"),
+                    )
+                })?;
+            // The registration row is the `lix_registered_schema` entity, whose
+            // `value` column carries the schema document itself.
+            let registered = registered.get("value").unwrap_or(&registered);
+            if let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(registered) {
+                for column in &spec.indexed_columns {
+                    witnesses.insert((spec.schema_key.clone(), column.ordinal));
+                }
+            }
+            continue;
+        }
+        let spec = specs
+            .entry(row.schema_key.as_str().to_owned())
+            .or_insert_with(|| {
+                entity_schema_catalog
+                    .and_then(|catalog| catalog.schema(row.schema_key.as_str()))
+                    .and_then(|schema| {
+                        crate::sql2::derive_entity_surface_spec_from_schema(schema).ok()
+                    })
+                    .map(Arc::new)
+            });
+        let Some(spec) = spec.as_ref() else {
+            continue;
+        };
+        if spec.indexed_columns.is_empty() {
+            continue;
+        }
+        let snapshot = serde_json::from_str::<serde_json::Value>(snapshot.normalized())
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "snapshot for schema '{}' is not valid JSON: {error}",
+                        row.schema_key
+                    ),
+                )
+            })?;
+        for column in &spec.indexed_columns {
+            let Some(value) = hot_index_value(&snapshot, column) else {
+                continue;
+            };
+            entries.push(crate::live_state::HotIndexEntry {
+                schema_key: row.schema_key.as_str().to_owned(),
+                ordinal: column.ordinal,
+                value,
+                entity_pk: row.entity_pk.clone(),
+            });
+        }
+    }
+    Ok((entries, witnesses))
+}
+
+fn hot_index_value(
+    snapshot: &serde_json::Value,
+    column: &crate::sql2::EntityIndexedColumn,
+) -> Option<crate::live_state::HotIndexValue> {
+    match snapshot.get(&column.name)? {
+        serde_json::Value::String(value) => {
+            Some(crate::live_state::HotIndexValue::String(value.clone()))
+        }
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .map(crate::live_state::HotIndexValue::Integer),
+        _ => None,
+    }
 }
 
 fn current_state_delta_from_state_row(
@@ -3422,6 +3524,7 @@ async fn stage_tracked_head(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
+    entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
     entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
     engine_rows: &[EngineCurrentRow],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
@@ -4304,6 +4407,20 @@ async fn stage_tracked_head(
             ))
             .await?
         };
+        // The index plane is staged from this commit's own rows, so it is
+        // correct whichever physical route above published them, and it lands
+        // in the same write set as the rows themselves.
+        let (index_entries, index_witnesses) =
+            hot_index_writes_for_commit(entity_schema_catalog, state_rows, &root.branch_id)?;
+        if !index_entries.is_empty() || !index_witnesses.is_empty() {
+            crate::live_state::stage_hot_index_entries(
+                writes,
+                &root.branch_id,
+                generation,
+                &index_entries,
+                &index_witnesses,
+            )?;
+        }
         if let Some(epoch) = working_diff_epoch {
             let next_epoch = TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: epoch.checkpoint_commit_id,

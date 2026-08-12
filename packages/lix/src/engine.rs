@@ -2111,4 +2111,97 @@ mod tests {
         };
         assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
     }
+
+    /// The hot index plane's write half: a schema registration publishes a
+    /// witness for each declared column, and ordinary inserts publish one entry
+    /// per row per declared column.
+    ///
+    /// Also pins the shape of what is *not* indexed. `locale` is declared by
+    /// nothing, so it gets no entries and the collection scan keeps serving it.
+    #[tokio::test]
+    async fn declared_columns_publish_index_entries_and_a_witness() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("session should open");
+        for schema in [
+            json!({
+                "x-lix-key": "index_probe_parent",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            json!({
+                "x-lix-key": "index_probe_child",
+                "x-lix-primary-key": ["/id"],
+                "x-lix-foreign-keys": [{
+                    "properties": ["/parentId"],
+                    "references": { "schemaKey": "index_probe_parent", "properties": ["/id"] }
+                }],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "parentId": { "type": "string" },
+                    "locale": { "type": "string" }
+                },
+                "required": ["id", "parentId", "locale"],
+                "additionalProperties": false
+            }),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+        }
+        session
+            .execute(
+                "INSERT INTO index_probe_parent (id) VALUES ('parent-0')",
+                &[],
+            )
+            .await
+            .expect("parent should insert");
+        for index in 0..3 {
+            session
+                .execute(
+                    r#"INSERT INTO index_probe_child (id, "parentId", locale) VALUES ($1, 'parent-0', 'en')"#,
+                    &[crate::Value::Text(format!("child-{index}"))],
+                )
+                .await
+                .expect("child should insert");
+        }
+
+        let storage_adapter = StorageAdapter::new(storage);
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read the index plane");
+        let entries = scan_test_space(&read, crate::live_state::HOT_INDEX_SPACE)
+            .await
+            .entries;
+        let witnesses = entries
+            .iter()
+            .filter(|entry| match &entry.value {
+                crate::storage::ProjectedValue::FullValue(bytes) => bytes.is_empty(),
+                crate::storage::ProjectedValue::KeyOnly => true,
+            })
+            .count();
+        let rows = entries.len() - witnesses;
+        assert_eq!(
+            (witnesses, rows),
+            (1, 3),
+            "expected one witness for the one declared column and one entry per child row"
+        );
+    }
 }
