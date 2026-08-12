@@ -140,9 +140,18 @@ pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::decl
     "hot_state.certified_entity_batch.v1",
     ValueSemantics::Mutable,
 );
+/// Maps one branch generation to the certified batches published under it.
+///
+/// The value carries the batch's schema-key set ahead of the content key, so a
+/// schema-filtered scan can decide from the manifest alone whether a batch can
+/// contribute rows. Without it the only way to learn a batch's schemas was to
+/// fetch and parse its content header, which made every schema-filtered scan
+/// read every batch on the branch.
+///
+/// `.v2` because the value layout changed; `.v1` bytes must not parse.
 pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0021),
-    "hot_state.certified_entity_batch_manifest.v1",
+    "hot_state.certified_entity_batch_manifest.v2",
     ValueSemantics::Mutable,
 );
 pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::declare(
@@ -783,12 +792,81 @@ pub(crate) async fn stage_certified_entity_batches(
                 CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
                 StorageKey(Bytes::from(manifest_key)),
                 StorageValue {
-                    bytes: Bytes::from(content_key),
+                    bytes: Bytes::from(encode_certified_manifest_value(
+                        &batch.schema_keys,
+                        &content_key,
+                    )?),
                 },
             );
         }
     }
     Ok(())
+}
+
+/// Encodes one certified manifest value: the batch's schema-key set, then the
+/// content key it points at.
+///
+/// The schema set is a covering column over the batch header's own list, not a
+/// second authority: both are written from `batch.schema_keys` in the same
+/// write set, and inheritance copies the whole value, so the two cannot drift.
+fn encode_certified_manifest_value(
+    schema_keys: &[String],
+    content_key: &[u8],
+) -> Result<Vec<u8>, LixError> {
+    let schema_bytes = schema_keys
+        .iter()
+        .try_fold(2usize, |total, schema| total.checked_add(2 + schema.len()))
+        .ok_or_else(|| head_value_error("certified manifest schema list size overflowed"))?;
+    let mut value = Vec::with_capacity(schema_bytes + content_key.len());
+    value.extend_from_slice(
+        &u16::try_from(schema_keys.len())
+            .map_err(|_| head_value_error("certified manifest has too many schemas"))?
+            .to_le_bytes(),
+    );
+    for schema_key in schema_keys {
+        append_batch_text(&mut value, schema_key)?;
+    }
+    value.extend_from_slice(content_key);
+    Ok(value)
+}
+
+/// Returns where the content key starts, or `None` when this manifest's schema
+/// set cannot satisfy `wanted` and the batch therefore need not be fetched.
+///
+/// A manifest with no declared schemas is never pruned: an empty set means the
+/// batch declared nothing, not that it matches nothing.
+fn certified_manifest_content_offset(
+    value: &[u8],
+    wanted: Option<&HashSet<String>>,
+) -> Result<Option<usize>, LixError> {
+    let count_bytes = value
+        .get(..2)
+        .ok_or_else(|| head_value_error("certified manifest value is truncated"))?;
+    let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
+    let mut offset = 2usize;
+    let mut matched = wanted.is_none() || count == 0;
+    for _ in 0..count {
+        let length_bytes = value
+            .get(offset..offset + 2)
+            .ok_or_else(|| head_value_error("certified manifest schema length is truncated"))?;
+        let length = u16::from_le_bytes([length_bytes[0], length_bytes[1]]) as usize;
+        offset += 2;
+        let schema_bytes = value
+            .get(offset..offset + length)
+            .ok_or_else(|| head_value_error("certified manifest schema key is truncated"))?;
+        offset += length;
+        if let Some(wanted) = wanted
+            && !matched
+        {
+            let schema_key = std::str::from_utf8(schema_bytes)
+                .map_err(|_| head_value_error("certified manifest schema key is not utf-8"))?;
+            matched = wanted.contains(schema_key);
+        }
+    }
+    if offset > value.len() {
+        return Err(head_value_error("certified manifest content key is truncated"));
+    }
+    Ok(matched.then_some(offset))
 }
 
 fn append_batch_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
@@ -1092,10 +1170,24 @@ async fn scan_certified_entity_batch_rows(
         }
         return Ok(MaterializedHotStateBatch::default());
     }
-    let content_keys = manifest_entries
-        .into_iter()
-        .map(|entry| full_value_bytes(entry.value).map(StorageKey))
-        .collect::<Result<Vec<_>, _>>()?;
+    let filter_index = CertifiedScanFilterIndex::new(request);
+    // Prune from the manifest alone. The manifest value carries the batch's
+    // schema-key set, so a batch that cannot match the requested schemas is
+    // never fetched; previously the only way to learn its schemas was to read
+    // and parse the content header, so every batch on the branch was fetched.
+    let mut content_keys = Vec::with_capacity(manifest_entries.len());
+    for entry in manifest_entries {
+        let value = full_value_bytes(entry.value)?;
+        let Some(offset) =
+            certified_manifest_content_offset(&value, filter_index.schema_keys.as_ref())?
+        else {
+            continue;
+        };
+        content_keys.push(StorageKey(value.slice(offset..)));
+    }
+    if content_keys.is_empty() {
+        return Ok(MaterializedHotStateBatch::default());
+    }
     let contents = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_SPACE, &content_keys)
         .materialize(store, StorageGetOptions::default())
         .await?
@@ -1107,7 +1199,6 @@ async fn scan_certified_entity_batch_rows(
             .columns
             .iter()
             .any(|column| column == "snapshot_content");
-    let filter_index = CertifiedScanFilterIndex::new(request);
     let mut decode_inputs = Vec::with_capacity(content_keys.len());
     let mut page_routes = Vec::new();
     let mut page_keys = Vec::new();
@@ -13894,7 +13985,10 @@ mod tests {
             CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
             StorageKey(Bytes::from(manifest_key)),
             StorageValue {
-                bytes: malformed_content_key.0.clone(),
+                bytes: Bytes::from(
+                    encode_certified_manifest_value(&[], &malformed_content_key.0)
+                        .expect("manifest value should encode"),
+                ),
             },
         );
         writes.put(
@@ -13975,7 +14069,10 @@ mod tests {
             CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
             StorageKey(Bytes::from(manifest_key)),
             StorageValue {
-                bytes: malformed_content_key.0.clone(),
+                bytes: Bytes::from(
+                    encode_certified_manifest_value(&[], &malformed_content_key.0)
+                        .expect("manifest value should encode"),
+                ),
             },
         );
         writes.put(
@@ -14375,6 +14472,130 @@ mod tests {
                 return total;
             }
         }
+    }
+
+    /// A schema-filtered scan must not fetch a batch whose manifest already
+    /// says it cannot match.
+    ///
+    /// The non-matching file's content batch is deliberately malformed. Before
+    /// the manifest carried the schema set, the scan had to fetch and parse
+    /// every content header to learn its schemas, so it would reach these bytes
+    /// and fail. Passing proves the batch was never fetched.
+    #[tokio::test]
+    async fn schema_filtered_certified_scan_skips_non_matching_batches() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000001a4";
+        const WANTED_FILE: &str = "wanted.csv";
+        const WANTED_SCHEMA: &str = "wanted_schema";
+        const OTHER_FILE: &str = "other.csv";
+        const OTHER_SCHEMA: &str = "other_schema";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let head_commit_id = CommitId::for_test_label("schema-prune-head");
+        let generation = CommitId::for_test_label("schema-prune-generation");
+        let created_at = timestamp();
+        let control = BranchHeadControl {
+            head_commit_id,
+            tracked_generation: generation,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at,
+            updated_at: created_at,
+            ref_change_id: ChangeId::for_test_label("schema-prune-ref"),
+        };
+
+        let wanted = [certified_batch_for_schema(WANTED_SCHEMA, 0)];
+        let files = [CertifiedEntityBatchFileRef {
+            branch_id: BRANCH_ID,
+            file_id: WANTED_FILE,
+            batches: &wanted,
+        }];
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("schema prune seed read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, BRANCH_ID, control)
+            .expect("schema prune control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &files,
+            &BTreeMap::from([(BRANCH_ID.to_owned(), control)]),
+            &BTreeMap::from([(
+                BRANCH_ID.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: Some(control),
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::from([(head_commit_id, created_at)]),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("schema prune batch should stage");
+
+        // A second file whose manifest declares only OTHER_SCHEMA, pointing at
+        // content that cannot be parsed.
+        let poison_content_key = StorageKey(Bytes::from_static(b"schema-prune-poison"));
+        let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
+        append_batch_text(&mut manifest_key, OTHER_FILE).unwrap();
+        manifest_key.extend_from_slice(&1_u32.to_le_bytes());
+        manifest_key.extend_from_slice(head_commit_id.as_uuid().as_bytes());
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+            StorageKey(Bytes::from(manifest_key)),
+            StorageValue {
+                bytes: Bytes::from(
+                    encode_certified_manifest_value(
+                        &[OTHER_SCHEMA.to_owned()],
+                        &poison_content_key.0,
+                    )
+                    .expect("poison manifest should encode"),
+                ),
+            },
+        );
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_SPACE,
+            poison_content_key,
+            StorageValue {
+                bytes: Bytes::from_static(b"malformed"),
+            },
+        );
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("schema prune fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("schema prune verification read should open");
+        let rows = scan_certified_entity_batch_rows(
+            &read,
+            BRANCH_ID,
+            generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![WANTED_SCHEMA.to_owned()],
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("a manifest that cannot match must never be fetched or decoded");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0).file_id(), Some(WANTED_FILE));
+        assert_eq!(rows.row(0).schema_key(), WANTED_SCHEMA);
     }
 
     /// Pins why a `LIMIT` cannot be pushed into the certified manifest scan.
