@@ -1154,7 +1154,7 @@ where
 ///
 /// The rate is **one leaked payload per superseded edit**, and it is
 /// independent of checkpoint cadence. Measured by
-/// `engine-benchmarks/examples/e1_json_leak.rs` over a
+/// `e2e/examples/e1_json_leak.rs` over a
 /// shape x cadence x edits matrix: rewriting one row 1000 times leaves 1004
 /// payload rows where 1 is live, at every cadence (never / every 10 / every
 /// 100), i.e. `leaked_per_edit` 1.300 -> 1.030 -> 1.003 at 10 -> 100 -> 1000

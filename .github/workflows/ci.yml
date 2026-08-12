@@ -122,7 +122,7 @@ jobs:
       # feature its tests actually require.
       #
       # That feature list is exhaustive, not a guess: every `[[test]]` target in
-      # `packages/engine-benchmarks/Cargo.toml` declares `required-features`
+      # `packages/e2e/Cargo.toml` declares `required-features`
       # within {storage-benches, slatedb, rocksdb}, and `storage-benches`
       # implies `rocksdb`. `root-replay-trace` carries no test of its own but
       # gates instrumentation sources, so it is listed to keep them compiling —

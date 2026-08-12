@@ -1275,7 +1275,7 @@ fn slatedb_durable_acknowledgement_survives_sigkill() {
 /// silently non-syncing adapter is exactly the state this is here to prevent.
 #[test]
 fn rocksdb_honours_await_durable_by_syncing_the_wal_before_acknowledging() {
-    let source = include_str!("../../rocksdb-storage/src/rocksdb.rs");
+    let source = include_str!("../../storage-rocksdb/src/rocksdb.rs");
     assert!(
         source.contains("await_durable: opts.await_durable"),
         "the RocksDB adapter no longer carries await_durable from WriteOptions onto the write \
@@ -1391,7 +1391,7 @@ fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
 #[cfg(feature = "slatedb")]
 #[test]
 fn slatedb_honours_await_durable_and_acknowledges_non_durable_writes_early() {
-    let source = include_str!("../../slatedb-storage/src/slatedb.rs");
+    let source = include_str!("../../storage-slatedb/src/slatedb.rs");
     assert!(
         source.contains("if await_durable && !apply_backpressure {"),
         "the SlateDB adapter no longer waits for write completion on await_durable — \

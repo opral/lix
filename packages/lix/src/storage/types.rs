@@ -178,7 +178,7 @@ impl StorageSpace {
     /// A test that must corrupt an immutable value on a real backend has to
     /// delete the key in one committed write set and publish the replacement
     /// through the canonical immutable space in a second — see
-    /// `engine-benchmarks/tests/corruption_recovery_qualification.rs`'s
+    /// `e2e/tests/corruption_recovery_qualification.rs`'s
     /// `replace_immutable_value_with_corruption`.
     #[cfg(test)]
     pub(crate) const fn mutable_view_for_corruption_test(self) -> Self {
