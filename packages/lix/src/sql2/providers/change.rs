@@ -8,7 +8,7 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
 use crate::LixError;
 use crate::changelog::{
-    COMMIT_CHANGE_ID_SPACE, ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
     ChangelogContext, ChangelogReader, CommitId,
 };
 use crate::serialize_row_metadata;
@@ -274,34 +274,19 @@ where
         return Ok(Some(LixChangeRow::Direct(change)));
     }
 
-    let index_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
-    let indexed_commit =
-        PointReadPlan::new(COMMIT_CHANGE_ID_SPACE, std::slice::from_ref(&index_key))
-            .materialize(&store, StorageGetOptions::default())
-            .await?
-            .value
-            .into_iter()
-            .next()
-            .flatten();
-    let Some(StorageProjectedValue::FullValue(commit_id)) = indexed_commit else {
+    // A commit's synthetic `lix_commit` change is its commit id at ordinal
+    // zero of the commit's own change address space, so the reverse lookup is
+    // arithmetic plus the commit read we would have done anyway.
+    let Some(commit_id) = change_id.as_commit_change() else {
         return Ok(None);
     };
-    let commit_id = CommitId::new(uuid::Uuid::from_slice(&commit_id).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("changelog commit change-id index has invalid commit id: {error}"),
-        )
-    })?);
-    let commit = crate::commit_graph::CommitGraphContext::new()
+    let Some(commit) = crate::commit_graph::CommitGraphContext::new()
         .reader(store)
         .load_node(&commit_id)
         .await?
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("changelog commit change-id index references missing commit '{commit_id}'"),
-            )
-        })?;
+    else {
+        return Ok(None);
+    };
     Ok(Some(LixChangeRow::DerivedCommit(
         crate::commit_graph::canonical_commit_change(&commit),
     )))

@@ -1464,7 +1464,6 @@ pub struct RepositoryGcBenchResult {
     pub deleted_mutation_inventories: usize,
     pub deleted_semantic_commit_projections: usize,
     pub deleted_semantic_change_rows: usize,
-    pub deleted_semantic_reverse_index_rows: usize,
     pub staged_written_bytes: u64,
     pub delete_descriptors: usize,
     pub delete_descriptor_capacity: usize,
@@ -1686,8 +1685,6 @@ where
     );
     let deleted_semantic_commit_projections = delete_count(crate::changelog::COMMIT_SPACE.id.0);
     let deleted_semantic_change_rows = delete_count(crate::changelog::CHANGE_SPACE.id.0);
-    let deleted_semantic_reverse_index_rows =
-        delete_count(crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0);
     Ok(RepositoryGcBenchResult {
         live_commits: plan.changelog.live.commits.len(),
         swept_commits: plan
@@ -1716,7 +1713,6 @@ where
         deleted_mutation_inventories,
         deleted_semantic_commit_projections,
         deleted_semantic_change_rows,
-        deleted_semantic_reverse_index_rows,
         staged_written_bytes: stats.written_bytes,
         delete_descriptors: arena.delete_descriptors,
         delete_descriptor_capacity: arena.delete_descriptor_capacity,
@@ -3520,7 +3516,6 @@ mod tests {
         assert_eq!(first.deleted_semantic_commit_projections, 10);
         // Each reclaimed projection owns one change fact and reverse-index row.
         assert_eq!(first.deleted_semantic_change_rows, 10);
-        assert_eq!(first.deleted_semantic_reverse_index_rows, 10);
         // The stranded serving generation is gone too, but the branch deletion
         // retired it rather than this sweep: a generation is reachable from
         // exactly one branch control, so the write set that removes the control
@@ -3543,7 +3538,6 @@ mod tests {
                 ), // mutation inventory authority
                 (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
                 (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
-                (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 10), // commit -> change reverse index
             ]
         );
         assert_eq!(

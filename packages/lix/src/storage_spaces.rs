@@ -62,7 +62,6 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
     crate::changelog::COMMIT_SPACE,
     crate::changelog::CHANGE_SPACE,
-    crate::changelog::COMMIT_CHANGE_ID_SPACE,
     crate::storage_adapter::REVISION_SPACE,
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
     crate::session::UPLOAD_STATE_SPACE,

@@ -1952,10 +1952,6 @@ where
             )?;
         }
     }
-    crate::changelog::stage_delete_commit_change_ids(
-        writes,
-        sweep_commit_change_ids.iter().copied(),
-    );
     crate::changelog::stage_delete_changes(writes, sweep_changes.iter().copied());
     JsonStoreContext::new()
         .writer()

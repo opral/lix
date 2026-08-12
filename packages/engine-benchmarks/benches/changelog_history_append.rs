@@ -154,7 +154,6 @@ async fn run_case(
     stage_timings.sort_unstable();
     commit_timings.sort_unstable();
     total_timings.sort_unstable();
-    let expected_seed_index_mapping_rows = fixture.expected_seed_index_mapping_rows();
     let sample_count = u64::try_from(samples).expect("benchmark sample count should fit in u64");
 
     println!(
@@ -171,8 +170,7 @@ async fn run_case(
          physical_manifest_read_objects={},physical_manifest_read_bytes={},\
          physical_compacted_read_objects={},physical_compacted_read_bytes={},\
          physical_other_read_objects={},physical_other_read_bytes={},\
-         physical_reader_read_requests={},physical_main_read_requests={},\
-         expected_seed_commit_change_id_index_mapping_rows={}",
+         physical_reader_read_requests={},physical_main_read_requests={}",
         micros(percentile(&stage_timings, 50, 100)),
         micros(percentile(&stage_timings, 95, 100)),
         micros(percentile(&stage_timings, 99, 100)),
@@ -203,7 +201,6 @@ async fn run_case(
         physical_io.other.read_bytes,
         physical_io.reader.read_requests,
         physical_io.main.read_requests,
-        expected_seed_index_mapping_rows,
     );
 }
 
@@ -459,7 +456,6 @@ where
     _temp_dir: TempDir,
     stats: Arc<Mutex<IoStats>>,
     physical_io: Option<SlateDBIoCounters>,
-    seed_index_mapping_rows: u64,
     history_commit_change_id: String,
     version: u64,
 }
@@ -513,9 +509,6 @@ where
             _temp_dir: temp_dir,
             stats,
             physical_io,
-            seed_index_mapping_rows: history_commits
-                .try_into()
-                .expect("history commit count should fit in u64"),
             history_commit_change_id: format!("{first_batch_name}-commit-0:commit"),
             version: 0,
         }
@@ -567,10 +560,6 @@ where
 
     fn io(&self) -> IoStats {
         *self.stats.lock().expect("io stats mutex")
-    }
-
-    fn expected_seed_index_mapping_rows(&self) -> u64 {
-        self.seed_index_mapping_rows
     }
 
     fn physical_io(&self) -> SlateDBIoSnapshot {
@@ -670,13 +659,6 @@ impl Fixture {
         match self {
             Self::Rocks(fixture) => fixture.io(),
             Self::Slate(fixture) => fixture.io(),
-        }
-    }
-
-    fn expected_seed_index_mapping_rows(&self) -> u64 {
-        match self {
-            Self::Rocks(fixture) => fixture.expected_seed_index_mapping_rows(),
-            Self::Slate(fixture) => fixture.expected_seed_index_mapping_rows(),
         }
     }
 

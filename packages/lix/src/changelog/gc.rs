@@ -9,8 +9,8 @@ use bytes::Bytes;
 
 use super::context::ChangelogContext;
 use super::store::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangelogReader, change_key,
-    commit_change_id_key, commit_key,
+    CHANGE_SPACE, COMMIT_SPACE, ChangelogReader, change_key,
+    commit_key,
 };
 use super::types::{ChangeId, CommitId, CommitLoadRequest};
 use crate::LixError;
@@ -56,12 +56,8 @@ where
     }
     writes.delete(COMMIT_SPACE, StorageKey(Bytes::from(commit_key(commit_id))));
     writes.delete(
-        COMMIT_CHANGE_ID_SPACE,
-        StorageKey(Bytes::from(commit_change_id_key(record.change_id))),
-    );
-    writes.delete(
         CHANGE_SPACE,
-        StorageKey(Bytes::from(change_key(record.change_id))),
+        StorageKey(Bytes::from(change_key(record.change_id()))),
     );
     Ok(())
 }
@@ -109,18 +105,6 @@ pub(crate) fn stage_delete_commits(
     commit_ids: impl IntoIterator<Item = CommitId>,
 ) {
     writes.delete_batch(COMMIT_SPACE, commit_ids.into_iter().map(commit_key));
-}
-
-/// Removes commit-derived reverse-index rows in bulk.
-#[cfg(test)]
-pub(crate) fn stage_delete_commit_change_ids(
-    writes: &mut StorageWriteSet,
-    change_ids: impl IntoIterator<Item = ChangeId>,
-) {
-    writes.delete_batch(
-        COMMIT_CHANGE_ID_SPACE,
-        change_ids.into_iter().map(commit_change_id_key),
-    );
 }
 
 /// Removes change records in bulk.
