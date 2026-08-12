@@ -178,7 +178,10 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = session
-        .execute("SELECT count(*) FROM lix_file WHERE path LIKE '/data/%'", &[])
+        .execute(
+            "SELECT count(*) FROM lix_file WHERE path LIKE '/data/%'",
+            &[],
+        )
         .await
         .expect("count seeded files");
     match result.rows().first().and_then(|row| row.first()) {

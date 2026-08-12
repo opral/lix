@@ -6327,10 +6327,7 @@ mod tests {
         );
     }
 
-    fn fk_row_in_file(
-        mut row: TestPreparedStateRow,
-        file_id: &str,
-    ) -> MaterializedLiveStateRow {
+    fn fk_row_in_file(mut row: TestPreparedStateRow, file_id: &str) -> MaterializedLiveStateRow {
         row.file_id = Some(file_id.into());
         MaterializedLiveStateRow::from(row)
     }
@@ -6350,8 +6347,9 @@ mod tests {
                 fk_row_in_file(fk_child_row("child-1", "parent-1", branch_id), file_g),
             ],
         };
-        let catalog = CatalogSnapshot::from_visible_schemas(&[fk_parent_schema(), fk_child_schema()])
-            .expect("fk schemas should compile");
+        let catalog =
+            CatalogSnapshot::from_visible_schemas(&[fk_parent_schema(), fk_child_schema()])
+                .expect("fk schemas should compile");
         let reference = catalog
             .delete_plan_for_key("fk_parent_schema")
             .foreign_key_references
