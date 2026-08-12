@@ -141,6 +141,18 @@ async fn run_case(files: usize) {
     let after_switch = snapshot(&storage, &db_path).await;
     report(files, "switch_branch", &after, &after_switch, switch_ms);
 
+    // The branch inherited zero per-file rows. Confirm it nevertheless serves
+    // the full plugin-materialized state, i.e. the planes are shared and not
+    // silently missing.
+    let branch_plugin_rows = lix
+        .execute("SELECT COUNT(*) AS n FROM text_line", &[])
+        .await
+        .map(|result| result.rows()[0].get::<i64>("n").unwrap_or(-1))
+        .unwrap_or(-1);
+    println!(
+        "branch_file_cost_branch_rows,files={files},text_line_rows_on_branch={branch_plugin_rows}"
+    );
+
     let write_started = Instant::now();
     write_probe(&lix, "/docs/branch-probe-1.txt").await;
     let write_ms = write_started.elapsed().as_secs_f64() * 1_000.0;
