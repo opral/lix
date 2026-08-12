@@ -376,7 +376,7 @@ impl StorageScanSource for CountingScanSource<'_> {
                 .map(|entry| projected_value_len(&entry.value))
                 .sum::<usize>();
             drop(stats);
-            Ok(chunk)
+            Ok(ScanChunk::new(chunk, chunk_has_more))
         })
     }
 }

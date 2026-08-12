@@ -119,7 +119,7 @@ impl StorageScanSource for CountingScanSource<'_> {
             let (chunk, chunk_has_more) = self.inner.next_page(limit_rows).await?.into_parts();
             self.scanned_rows
                 .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-            Ok(chunk)
+            Ok(ScanChunk::new(chunk, chunk_has_more))
         })
     }
 }

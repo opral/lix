@@ -2152,7 +2152,7 @@ mod tests {
         let before_packed =
             scan_test_space(&read, crate::hot_state::PACKED_CURRENT_BASE_SPACE).await;
         assert!(
-            !before_sparse.entries.is_empty() || !before_packed.entries.is_empty(),
+            !before_sparse.is_empty() || !before_packed.is_empty(),
             "tracked mutation must persist a sparse or packed physical dirty epoch"
         );
         drop(read);
@@ -2168,7 +2168,7 @@ mod tests {
             .expect("post-checkpoint inventory read should open");
         let after = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
-            after.entries.len(),
+            after.len(),
             1,
             "the superseded branch epoch must be reclaimed; only the repository-global checkpoint entity may remain dirty"
         );
@@ -2183,7 +2183,7 @@ mod tests {
             .expect("second checkpoint inventory read should open");
         let after_second = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
-            after_second.entries.len(),
+            after_second.len(),
             2,
             "the second immutable checkpoint entity remains while the superseded branch epoch is reclaimed"
         );

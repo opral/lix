@@ -1499,10 +1499,11 @@ where
                         1_001,
                     ))
                     .expect("direct materialized scan");
-                    assert_eq!(chunk.entries.len(), 1_000);
-                    assert!(!chunk.has_more);
+                    let (chunk_entries, chunk_has_more) = chunk.into_parts();
+                    assert_eq!(chunk_entries.len(), 1_000);
+                    assert!(!chunk_has_more);
                     drop(read);
-                    black_box(chunk);
+                    black_box(chunk_entries);
                 });
             });
         }
@@ -1533,7 +1534,7 @@ where
                     assert_eq!(chunk.entries.len(), rows as usize);
                     assert!(!chunk.has_more);
                     drop(read);
-                    black_box(chunk);
+                    black_box(chunk_entries);
                 });
             });
         }
@@ -1557,7 +1558,7 @@ where
                     assert_eq!(chunk.entries.len(), rows as usize);
                     assert!(!chunk.has_more);
                     drop(read);
-                    black_box(chunk);
+                    black_box(chunk_entries);
                 });
             });
         }

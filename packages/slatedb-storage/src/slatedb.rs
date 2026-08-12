@@ -5788,10 +5788,12 @@ mod tests {
             },
         ))
         .expect("begin immutable chunk scan");
-        let scan = block_on(cursor.next_page(16)).expect("scan immutable chunk");
-        assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.entries[0].key, key);
-        assert_eq!(scan.entries[0].value, ProjectedValue::FullValue(value));
+        let (scan, scan_has_more) = block_on(cursor.next_page(16))
+            .expect("scan immutable chunk")
+            .into_parts();
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].key, key);
+        assert_eq!(scan[0].value, ProjectedValue::FullValue(value));
 
         let matching = block_on(storage.begin_write(WriteOptions {
             preconditions: vec![Precondition::KeyValueHashEquals {
@@ -6551,12 +6553,16 @@ mod tests {
             },
         ))
         .expect("begin cursor-test scan");
-        let first = block_on(cursor.next_page(1)).expect("scan first cursor-test page");
-        assert_eq!(first.entries[0].key, keys[0]);
-        assert!(first.has_more);
-        let second = block_on(cursor.next_page(1)).expect("scan second cursor-test page");
-        assert_eq!(second.entries[0].key, keys[1]);
-        assert!(second.has_more);
+        let (first, first_has_more) = block_on(cursor.next_page(1))
+            .expect("scan first cursor-test page")
+            .into_parts();
+        assert_eq!(first[0].key, keys[0]);
+        assert!(first_has_more);
+        let (second, second_has_more) = block_on(cursor.next_page(1))
+            .expect("scan second cursor-test page")
+            .into_parts();
+        assert_eq!(second[0].key, keys[1]);
+        assert!(second_has_more);
 
         // A changed projection requires a new cursor with an explicit exclusive
         // authenticated restart boundary.
@@ -6572,10 +6578,12 @@ mod tests {
             },
         ))
         .expect("begin projected restart scan");
-        let third = block_on(key_cursor.next_page(1)).expect("scan projected restart page");
-        assert_eq!(third.entries[0].key, keys[2]);
-        assert_eq!(third.entries[0].value, ProjectedValue::KeyOnly);
-        assert!(!third.has_more);
+        let (third, third_has_more) = block_on(key_cursor.next_page(1))
+            .expect("scan projected restart page")
+            .into_parts();
+        assert_eq!(third[0].key, keys[2]);
+        assert_eq!(third[0].value, ProjectedValue::KeyOnly);
+        assert!(!third_has_more);
 
         let mut restarted_cursor = block_on(read.begin_scan(
             space,
@@ -6586,11 +6594,13 @@ mod tests {
             },
         ))
         .expect("begin restarted cursor-test scan");
-        let restarted = block_on(restarted_cursor.next_page(1)).expect("scan restarted first page");
-        assert_eq!(restarted.entries[0].key, keys[0]);
+        let (restarted, restarted_has_more) = block_on(restarted_cursor.next_page(1))
+            .expect("scan restarted first page")
+            .into_parts();
+        assert_eq!(restarted[0].key, keys[0]);
         let restarted_second =
             block_on(restarted_cursor.next_page(1)).expect("scan restarted second page");
-        assert_eq!(restarted_second.entries[0].key, keys[1]);
+        assert_eq!(restarted_second[0].key, keys[1]);
     }
 
     #[test]

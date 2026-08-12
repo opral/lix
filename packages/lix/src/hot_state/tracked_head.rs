@@ -4623,7 +4623,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file-schema marker verification read");
-        let projections = scan_test_space(&read, FILE_SPACE).await.entries;
+        let projections = scan_test_space(&read, FILE_SPACE).await;
         assert_eq!(projections.len(), 1);
         assert!(
             projections.into_iter().all(|projection| {

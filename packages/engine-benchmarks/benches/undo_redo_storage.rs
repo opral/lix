@@ -262,7 +262,7 @@ impl StorageScanSource for CountingScanSource<'_> {
                 })
                 .sum::<u64>();
             drop(stats);
-            Ok(chunk)
+            Ok(ScanChunk::new(chunk, chunk_has_more))
         })
     }
 }
