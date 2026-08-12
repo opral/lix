@@ -37,17 +37,25 @@
 //! in this file for the separate, statically-decidable half of that question.
 //!
 //! There is a second, sharper distinction that only shows up once a second
-//! backend is swept. `WriteOptions::await_durable` asks the adapter not to
-//! acknowledge until it has crossed its durable persistence boundary, and lix
-//! sets it for atomic content-addressed publications. RocksDB ignores the flag
-//! but writes its WAL synchronously inside `db.write()`, so an acknowledged
-//! commit is already in the kernel and survives process death regardless.
-//! SlateDB honours the flag, but its adapter acknowledges a *non*-durable commit
-//! as soon as the write set is queued on an in-process pipeline
-//! (`slatedb.rs:3784-3806`), which SIGKILL discards. The two arms therefore
-//! measure genuinely different acknowledgement contracts, and the sweep reports
-//! consistency violations and lost acknowledgements separately so the difference
-//! is visible rather than averaged away.
+//! backend is swept: the two adapters do not acknowledge the same thing.
+//!
+//! * RocksDB stages into one `WriteBatch` and applies it inside `db.write()`
+//!   before `commit()` returns, so an acknowledged commit is already in the
+//!   kernel's page cache. SIGKILL cannot take it back; only power loss can,
+//!   because the WAL is never fsynced.
+//! * SlateDB's adapter publishes the write set onto an in-process pipeline and
+//!   returns (`slatedb.rs:3784-3806`). Unless `WriteOptions::await_durable` is
+//!   set, the bytes are still in the dying process's heap when `commit()`
+//!   returns `Ok`, and SIGKILL discards them.
+//!
+//! `WriteOptions::await_durable` is the flag that closes that gap, and **no SQL
+//! path sets it**: `stage_atomic_cas_publication`, the only writer that does, is
+//! reachable solely from the resumable media-upload session API
+//! (`session/media_upload.rs:441`). The sweep therefore measures the flag
+//! directly — `LIX_CRASH_AWAIT_DURABLE=1` forces it on at the storage boundary
+//! and reruns the identical schedule — and reports consistency violations and
+//! lost acknowledgements in separate columns, so a durability contract
+//! difference is never collapsed into a corruption-shaped number.
 //!
 //! ## Cost
 //!
@@ -208,13 +216,25 @@ impl CrashBackend for SlateDB {
 struct CrashStorage<B> {
     inner: B,
     killer: Arc<Killer>,
+    /// Overrides [`WriteOptions::await_durable`] to `true` on every write
+    /// transaction the engine opens.
+    ///
+    /// No SQL path sets the flag on its own — `stage_atomic_cas_publication`,
+    /// the only writer that does, is reachable only from the resumable
+    /// media-upload session API (`session/media_upload.rs:441`), never from
+    /// `INSERT INTO lix_file`. Forcing it at the storage boundary is therefore
+    /// the only way to run the same workload, the same kill schedule and the
+    /// same invariants with the one bit changed, which is what "does
+    /// `await_durable` change the outcome" actually asks.
+    force_await_durable: bool,
 }
 
 impl<B: CrashBackend> CrashStorage<B> {
-    fn open(path: &Path, killer: Arc<Killer>) -> Self {
+    fn open(path: &Path, killer: Arc<Killer>, force_await_durable: bool) -> Self {
         Self {
             inner: B::open_at(path).expect("open crash-consistency backend fixture"),
             killer,
+            force_await_durable,
         }
     }
 }
@@ -242,7 +262,10 @@ impl<B: CrashBackend> Storage for CrashStorage<B> {
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         let killer = self.killer.clone();
+        let force_await_durable = self.force_await_durable;
         async move {
+            let mut opts = opts;
+            opts.await_durable |= force_await_durable;
             killer.record_write(opts.await_durable);
             killer.tick("begin_write");
             let inner = self.inner.begin_write(opts).await?;
@@ -319,12 +342,19 @@ struct Workload {
     commits: u64,
     /// Bytes of binary file content rewritten in the same transaction.
     ///
-    /// A non-zero size routes each publication through the atomic
-    /// content-addressed path (`stage_atomic_cas_publication`), which stages
-    /// blob chunks, a prepared manifest and a publication fence alongside the
-    /// row write set — a materially different publication shape from a plain
-    /// row commit, and the one the engine marks `await_durable`.
+    /// A non-zero size routes each publication through the content-addressed
+    /// blob path, which stages blob chunks and a publication fence alongside the
+    /// row write set — a materially different publication shape from a plain row
+    /// commit, and one that widens the swept window.
+    ///
+    /// Note it does **not** set `await_durable`; measured, not assumed. See
+    /// [`Workload::force_await_durable`].
     blob_bytes: usize,
+    /// Force `WriteOptions::await_durable` on at the storage boundary.
+    ///
+    /// The A/B for "what does the durability flag buy" — same workload, same
+    /// kill schedule, same invariants, one bit changed.
+    force_await_durable: bool,
 }
 
 impl Workload {
@@ -337,6 +367,7 @@ impl Workload {
                 "LIX_CRASH_CONSISTENCY_BLOB_BYTES",
                 if deep { 128 * 1024 } else { 64 * 1024 },
             ),
+            force_await_durable: env_flag("LIX_CRASH_AWAIT_DURABLE"),
         }
     }
 }
@@ -424,7 +455,7 @@ async fn child_main<B: CrashBackend>(
     killer: Arc<Killer>,
     workload: Workload,
 ) {
-    let storage = CrashStorage::<B>::open(&db, killer.clone());
+    let storage = CrashStorage::<B>::open(&db, killer.clone(), workload.force_await_durable);
     let lix = open_lix()
         .with_storage(storage.clone())
         .await
@@ -551,12 +582,20 @@ async fn verify_after_crash<B: CrashBackend>(
     // 0 or `rows` and the generations must still be uniform.
     let observed = match read_generations(&lix).await {
         Ok(observed) => observed,
-        Err(ReadFailure::TableAbsent) if !setup_complete => Vec::new(),
         Err(ReadFailure::TableAbsent) => {
-            return Err(
-                "plain SELECT failed after crash: the table is gone even though setup completed"
-                    .to_owned(),
-            );
+            if setup_complete {
+                // Schema registration and the seed commit both returned `Ok`
+                // before `setup.done` was fsynced, so the table's absence means
+                // acknowledged commits are gone. The store is not damaged — it
+                // is empty, which is a legal state a fresh store also has — so
+                // this is a durability outcome, not a consistency one.
+                lost_acknowledgement = Some(
+                    "acknowledged commit lost: schema registration and the seed commit both \
+                     returned Ok (setup.done is fsynced) but the table is gone"
+                        .to_owned(),
+                );
+            }
+            Vec::new()
         }
         Err(ReadFailure::Other(error)) => {
             return Err(format!("plain SELECT failed after crash: {error}"));
@@ -569,7 +608,7 @@ async fn verify_after_crash<B: CrashBackend>(
         ));
     }
     let generation = if observed.is_empty() {
-        if setup_complete {
+        if setup_complete && lost_acknowledgement.is_none() {
             // `setup.done` is fsynced only after the seed commit returned `Ok`,
             // so an empty store here means an acknowledged commit is gone. The
             // store is still whole — it is simply older than the writer was
@@ -1290,6 +1329,10 @@ fn run_child<B: CrashBackend>(
         .env(
             "LIX_CRASH_CONSISTENCY_BLOB_BYTES",
             workload.blob_bytes.to_string(),
+        )
+        .env(
+            "LIX_CRASH_AWAIT_DURABLE",
+            if workload.force_await_durable { "1" } else { "0" },
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
