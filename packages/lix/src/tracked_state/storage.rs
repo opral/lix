@@ -10556,6 +10556,61 @@ pub(crate) struct RetainedPhysicalState<'a> {
     pub(crate) native_parts: &'a BTreeSet<[u8; 32]>,
 }
 
+/// Reclaims the change-locator rows owned by one retired commit.
+///
+/// A locator row is neither content addressed nor deduped: it belongs to
+/// exactly one change, and an authored change belongs to exactly one physical
+/// commit. Its lifetime is therefore exactly the lifetime of the segments it
+/// addresses, which is why reclaiming it needs no fence of its own. Binary CAS
+/// needs `stage_cas_publication_fence` because a publisher may *reuse* a
+/// deduped payload row it never wrote, so a sweep planned from an older
+/// snapshot could delete a row a newer publication now depends on. No publisher
+/// can reuse another change's locator, so that hazard does not exist here, and
+/// the sweep's existing branch-head-control preconditions already void the
+/// whole write set if any publication lands after the reachability plan.
+///
+/// The delete is verified rather than assumed. Only a row that still names
+/// `commit_id` is removed, so a locator naming a different owner — a selected
+/// member this commit merely referenced, or a locator GC relocated onto a
+/// retained commit — survives even though it appears in this commit's
+/// inventory.
+async fn stage_reclaim_retired_change_locators(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+) -> Result<(), LixError> {
+    let change_ids = scan_commit_delta_members(store, commit_id)
+        .await?
+        .into_iter()
+        .map(|(_, value)| value.change_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if change_ids.is_empty() {
+        return Ok(());
+    }
+    let locator_keys = change_ids
+        .iter()
+        .map(|change_id| StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes())))
+        .collect::<Vec<_>>();
+    let stored = PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &locator_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let mut reclaimed = Vec::new();
+    for (change_id, value) in change_ids.iter().copied().zip(stored.value) {
+        let Some(bytes) = value.and_then(full_value_bytes) else {
+            continue;
+        };
+        if decode_change_locator(change_id, &bytes)?.commit_id == commit_id {
+            reclaimed.push(change_id.as_uuid().as_bytes().to_vec());
+        }
+    }
+    if !reclaimed.is_empty() {
+        writes.delete_batch(TRACKED_STATE_CHANGE_LOCATOR_SPACE, reclaimed);
+    }
+    Ok(())
+}
+
 /// Retires every physical tracked-state row owned by one unreachable commit.
 ///
 /// GC proves unreachability from refs and hands the proof here; the layout of
@@ -10576,6 +10631,7 @@ pub(crate) async fn stage_retire_commit_physical_state(
                 format!("retired GC root '{commit_id}' has no authenticated manifest"),
             )
         })?;
+    stage_reclaim_retired_change_locators(store, writes, commit_id).await?;
     let retired_root = load_commit_mutation_directory_roots(store, &[commit_id])
         .await?
         .into_iter()

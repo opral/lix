@@ -2736,6 +2736,11 @@ mod tests {
         let owner_stage = stage_commit_deltas_for_commit_state(&mut writes, &owner_deltas)
             .expect("selected owner payload should stage");
         stage_change_locators(&mut writes, &owner_stage.locators);
+        let selected_locator_change_id = owner_stage
+            .locators
+            .first()
+            .expect("the owner stages one locator")
+            .change_id;
         let mut checkpoint_deltas =
             commit_delta_refs(checkpoint.commit_id, std::slice::from_ref(&selected_change));
         checkpoint_deltas[0].authored = false;
@@ -2810,6 +2815,13 @@ mod tests {
                 .is_some(),
             "the finite selected locator keeps its physical owner live"
         );
+        // Co-ownership guard for locator reclamation: the checkpoint also
+        // carries this change as a selected member, so a sweep that retired
+        // anything must not have taken the row out from under the live owner.
+        assert!(
+            locator_row_exists(&read, selected_locator_change_id).await,
+            "a locator whose owner is retained must survive the sweep"
+        );
         drop(read);
 
         publish_branch_head_release(&storage, "main", released_control, released_manifest).await;
@@ -2832,6 +2844,25 @@ mod tests {
                 .is_none(),
             "the owner is reclaimable after the final checkpoint releases the selection"
         );
+        assert!(
+            !locator_row_exists(&read, selected_locator_change_id).await,
+            "retiring the owning commit reclaims its change-locator row"
+        );
+    }
+
+    /// Is there still a row in the change-locator plane for `change_id`?
+    async fn locator_row_exists<R>(read: &R, change_id: ChangeId) -> bool
+    where
+        R: crate::storage_adapter::StorageAdapterRead,
+    {
+        let wanted = change_id.as_uuid().as_bytes().to_vec();
+        crate::storage_bench::space_inventory(
+            read,
+            crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE.name,
+        )
+        .await
+        .into_iter()
+        .any(|(key, _)| key == wanted)
     }
 
     #[tokio::test]

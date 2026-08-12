@@ -144,21 +144,59 @@ async fn main() {
             .await
             .expect("insert the first revision");
 
-        // Each rewrite is its own commit, so each one retires the previous
-        // commit's physical authority while the live collection stays at one
-        // row. New entity keys are deliberately not used here: this arm asks
-        // what an in-place rewrite stream leaves behind.
+        // Two churn shapes, because they produce different change-id
+        // populations: an in-place rewrite stream reuses one entity key, while
+        // distinct inserts mint a new entity (and a new change) every time.
+        //
+        // Checkpoints matter more than either. Without one the shipping sweep
+        // proves nothing retirable — every commit stays a physical authority of
+        // the live head — so a probe that never checkpoints measures a sweep
+        // with no work to do and cannot tell "this plane is not wired into GC"
+        // apart from "GC retired nothing at all".
+        let checkpoint_every = std::env::var("E29_CHECKPOINT_EVERY")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(10);
+        let insert_arm = std::env::var("E29_SHAPE").as_deref() == Ok("insert");
         for revision in 1..=rewrites {
+            if insert_arm {
+                session
+                    .execute(
+                        "INSERT INTO locator_row (path, value) VALUES ($1, lix_json($2))",
+                        &[
+                            Value::Text(format!("/agent/file-{revision}")),
+                            Value::Text(serde_json::json!({ "revision": revision }).to_string()),
+                        ],
+                    )
+                    .await
+                    .expect("insert a distinct row");
+            } else {
+                session
+                    .execute(
+                        "UPDATE locator_row SET value = lix_json($2) WHERE path = $1",
+                        &[
+                            Value::Text("/agent/file".to_owned()),
+                            Value::Text(serde_json::json!({ "revision": revision }).to_string()),
+                        ],
+                    )
+                    .await
+                    .expect("rewrite the same row");
+            }
+            if checkpoint_every > 0 && revision % checkpoint_every == 0 {
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("create a checkpoint");
+            }
+        }
+        if checkpoint_every > 0 {
+            // A checkpoint releases the *previous* checkpoint's pins, so the
+            // last one needs a successor before its predecessors are provably
+            // retirable.
             session
-                .execute(
-                    "UPDATE locator_row SET value = lix_json($2) WHERE path = $1",
-                    &[
-                        Value::Text("/agent/file".to_owned()),
-                        Value::Text(serde_json::json!({ "revision": revision }).to_string()),
-                    ],
-                )
+                .create_checkpoint()
                 .await
-                .expect("rewrite the same row");
+                .expect("create the releasing checkpoint");
         }
 
         let storage = StorageAdapter::new(memory.clone());
@@ -183,14 +221,16 @@ async fn main() {
         let (chg_after, _) = space_rows(&storage, CHANGE_SPACE.name).await;
 
         println!(
-            "E29LOC rewrites={rewrites} \
+            "E29LOC shape={} rewrites={rewrites} \
              locators_before={loc_before} locators_after={loc_after} \
              locator_bytes_before={loc_bytes_before} locator_bytes_after={loc_bytes_after} \
              manifests_before={man_before} manifests_after={man_after} \
              segments_before={seg_before} segments_after={seg_after} \
              changes_before={chg_before} changes_after={chg_after} \
-             reclaimed_locators={}",
-            loc_before.saturating_sub(loc_after)
+             reclaimed_locators={} retired_manifests={}",
+            if insert_arm { "insert" } else { "rewrite" },
+            loc_before.saturating_sub(loc_after),
+            man_before.saturating_sub(man_after)
         );
 
         // Which surviving locators name a change the public ledger no longer
