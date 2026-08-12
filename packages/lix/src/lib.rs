@@ -16,7 +16,6 @@
 //! [`open_lix`] opens an in-memory repository. Add a storage adapter with
 //! [`OpenLixBuilder::with_storage`] when persistence is needed.
 
-#![recursion_limit = "256"]
 #![cfg_attr(
     test,
     allow(
