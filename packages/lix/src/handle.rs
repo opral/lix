@@ -137,9 +137,13 @@ where
         session: Arc::new(session),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
     };
+    // A point read on the same context `load_branch_head_commit_id` uses.
+    // Opening must not build a SQL context to answer one key.
     let stored_branch_id = lix
-        .client_state()
-        .get(crate::client_state::PRIMARY_SESSION_BRANCH_KEY)
+        .engine
+        .load_untracked_global_key_value(
+            &crate::client_state::primary_session_branch_physical_key(),
+        )
         .await?
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|value| !value.is_empty());
@@ -153,15 +157,11 @@ where
             })
             .await?;
     }
-    let active_branch_id = lix.active_branch_id().await?;
-    if stored_branch_id.as_deref() != Some(active_branch_id.as_str()) {
-        lix.client_state()
-            .set(
-                crate::client_state::PRIMARY_SESSION_BRANCH_KEY,
-                serde_json::Value::String(active_branch_id),
-            )
-            .await?;
-    }
+    // No writeback here. An absent preference already means "follow the
+    // repository's default branch", which is exactly what this function
+    // computes when the key is missing, so materializing it bought nothing and
+    // made the first open of any repository perform a commit before returning
+    // a usable handle. `switch_branch` persists the key on every actual change.
     Ok(lix)
 }
 
