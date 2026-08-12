@@ -30,8 +30,8 @@ mod undo_redo;
 pub(crate) use media_upload::stage_reclaimable_upload_receipts;
 #[cfg(feature = "storage-benches")]
 pub(crate) use merge::{MergeCommitsForBench, analyze_merge_for_bench};
-// Owner facade for the storage-space registry (`crate::storage_spaces`).
-#[cfg(any(test, feature = "storage-benches"))]
+// Owner facade for the storage-space registry (`crate::storage_spaces`),
+// which is compiled in every configuration.
 pub(crate) use media_upload::{UPLOAD_MANIFEST_LEAF_SPACE, UPLOAD_STATE_SPACE};
 
 pub use crate::common::{
