@@ -6,7 +6,7 @@ pub(crate) mod surface;
 
 pub(crate) use capability::SurfaceCapabilities;
 pub(crate) use entity_surface::{
-    EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec,
+    EntityColumnType, EntityIndexedColumn, EntitySurfaceShape, EntitySurfaceSpec,
     derive_entity_surface_spec_from_schema, entity_surface_schema, entity_visible_fields,
     schema_exposed_as_entity_history_surface, schema_exposed_as_entity_surface,
 };

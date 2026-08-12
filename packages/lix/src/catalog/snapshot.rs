@@ -697,6 +697,18 @@ impl SchemaPlan {
             && self.foreign_keys.is_empty()
     }
 
+    /// Compiles one standalone plan for tests that need the same constraint
+    /// projection production uses, without building a whole catalog.
+    #[cfg(test)]
+    pub(crate) fn compile_standalone_for_test(
+        key: SchemaCatalogKey,
+        schema: JsonValue,
+        key_index: &BTreeMap<SchemaCatalogKey, SchemaPlanId>,
+        schema_index: &BTreeMap<SchemaCatalogKey, &JsonValue>,
+    ) -> Result<Self, LixError> {
+        Self::compile(key, schema, key_index, schema_index)
+    }
+
     fn compile(
         key: SchemaCatalogKey,
         schema: JsonValue,

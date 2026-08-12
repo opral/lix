@@ -40,7 +40,8 @@ pub(crate) use bind::{
     statement_has_durable_runtime_function,
 };
 pub(crate) use catalog::{
-    EntityColumnType, EntitySurfaceSpec, PublicCatalog, derive_entity_surface_spec_from_schema,
+    EntityColumnType, EntityIndexedColumn, EntitySurfaceSpec, PublicCatalog,
+    derive_entity_surface_spec_from_schema,
     entity_visible_fields,
 };
 pub(crate) use change_materialization::MaterializedChange;

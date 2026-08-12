@@ -46,7 +46,8 @@ use crate::transaction::staging::{
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteOrigin;
 use crate::transaction_types::{
-    PreparedStateBatch, PreparedStateRowRef, TransactionWriteOperation,
+    PreparedStateBatch, PreparedStateRowRef, StagedIndexRow, StagedIndexValues,
+    TransactionWriteOperation,
 };
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -256,6 +257,45 @@ async fn scan_committed_constraint_rows(
     })
 }
 
+/// The tracked committed rows of one collection whose declared column equals a
+/// value, resolved through the hot index plane when it can serve the column.
+///
+/// The index resolves to candidate identities inside the live-state reader; if
+/// the collection has no completeness witness the reader silently keeps its
+/// ordinary scan, so this is an access-path choice and never a semantic one.
+/// The caller re-checks every returned row's actual value.
+async fn scan_committed_constraint_rows_by_declared_column(
+    live_state: &dyn LiveStateReader,
+    domain: &Domain,
+    schema_key: &str,
+    declared_column_eq: crate::live_state::DeclaredColumnEq,
+) -> Result<CommittedLiveStateRows, LixError> {
+    let request = LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: vec![schema_key.to_string()],
+            branch_ids: vec![domain.branch_id().to_string()],
+            file_ids: domain.file_filters(),
+            untracked: Some(domain.untracked()),
+            declared_column_eq: Some(declared_column_eq),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let batch = live_state
+        .scan_domain_batch(
+            &request,
+            if domain.untracked() {
+                LiveStateReadDomain::Untracked
+            } else {
+                LiveStateReadDomain::Tracked
+            },
+        )
+        .await?;
+    CommittedLiveStateRows::select(batch, |row| {
+        domain.contains_ref(row) && row.schema_key() == schema_key
+    })
+}
+
 async fn scan_committed_canonical_rows(
     live_state: &dyn LiveStateReader,
     domain: &Domain,
@@ -342,7 +382,7 @@ async fn load_committed_constraint_rows(
 /// coalesced staged write set.
 pub(crate) async fn validate_prepared_writes(
     input: TransactionValidationInput<'_>,
-) -> Result<(), LixError> {
+) -> Result<StagedIndexValues, LixError> {
     validate_foreign_key_definitions(input.schema_catalog)?;
     let staged_rows = input.staged_writes.rows().collect::<Vec<_>>();
     let constraint_rows = input.staged_writes.constraint_rows().collect::<Vec<_>>();
@@ -361,13 +401,22 @@ pub(crate) async fn validate_prepared_writes(
                 "lix.perf.validation.insert_identities"
             ))
             .await?;
-        return Ok(());
+        // Extraction is skipped here, and that is sound rather than lucky.
+        // Every row on this path carries `!requires_transaction_validation`,
+        // which `normalization.rs` grants only when the schema declares no
+        // uniques and no foreign keys — precisely the schemas whose
+        // `indexed_columns` is empty — or when `constraints_unchanged` proves
+        // an UPDATE assigned none of the primary key, uniques, or foreign-key
+        // local properties, a strict superset of the indexed columns. See
+        // `declared_column_rows_never_bypass_extraction`.
+        return Ok(StagedIndexValues::default());
     }
     let mut pending_constraints = PendingConstraintIndexes::default();
     let mut validated_constraint_rows =
         BTreeMap::<DomainRowIdentity, ValidatedRowContent<'_>>::new();
     let mut file_owner_validator = FileOwnerReferenceValidator::default();
     let mut staged_snapshots = Vec::new();
+    let mut index_extractor = StagedIndexExtractor::new(input.schema_catalog);
     for row in &constraint_rows {
         let row = *row;
         let Some(snapshot) = row.snapshot_json() else {
@@ -405,6 +454,13 @@ pub(crate) async fn validate_prepared_writes(
                 validate_primary_key_identity(row, schema_plan, snapshot)?;
             }
             pending_constraints.remember_foreign_key_references(row, schema_plan, snapshot)?;
+            // The hot index plane's values are lifted out here, where the
+            // snapshot is already a parsed `JsonValue` that validation owns.
+            // Commit therefore receives them pre-extracted and never decodes a
+            // snapshot again — `StageJson::value()` panics after this point on
+            // purpose, and routing around it with a second
+            // `serde_json::from_str` was a whole extra parse of every row.
+            index_extractor.observe(row, snapshot);
             staged_snapshots.push((row, schema_plan, snapshot));
         } else {
             pending_constraints.remember_tombstone(row);
@@ -457,7 +513,94 @@ pub(crate) async fn validate_prepared_writes(
             "lix.perf.validation.filesystem_namespace"
         ))
         .await?;
-    Ok(())
+    Ok(index_extractor.finish())
+}
+
+/// Lifts declared-column values out of snapshots validation has already
+/// parsed, so the commit-time hot index hook needs no JSON decode of its own.
+///
+/// Entity surface specs are derived once per schema key and memoized, because
+/// a bulk insert visits one schema thousands of times.
+struct StagedIndexExtractor<'a> {
+    schema_catalog: &'a CatalogSnapshot,
+    specs: BTreeMap<String, Option<std::sync::Arc<crate::sql2::EntitySurfaceSpec>>>,
+    values: StagedIndexValues,
+}
+
+impl<'a> StagedIndexExtractor<'a> {
+    fn new(schema_catalog: &'a CatalogSnapshot) -> Self {
+        Self {
+            schema_catalog,
+            specs: BTreeMap::new(),
+            values: StagedIndexValues::default(),
+        }
+    }
+
+    fn observe(&mut self, row: PreparedValidationRow<'_>, snapshot: &JsonValue) {
+        if row.schema_key() == REGISTERED_SCHEMA_KEY {
+            // A schema registration is the moment a collection's index is
+            // complete for free: no row can exist for a schema that is not
+            // registered yet, so an empty index is a correct index and the
+            // witness costs one key per declared column. The registration
+            // row's `value` column carries the schema document itself.
+            let registered = snapshot.get("value").unwrap_or(snapshot);
+            if let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(registered) {
+                for column in &spec.indexed_columns {
+                    self.values
+                        .registered_collections
+                        .insert((spec.schema_key.clone(), column.ordinal));
+                }
+            }
+            return;
+        }
+        let schema_catalog = self.schema_catalog;
+        let spec = self
+            .specs
+            .entry(row.schema_key().to_owned())
+            .or_insert_with(|| {
+                schema_catalog
+                    .schema(row.schema_key())
+                    .and_then(|schema| {
+                        crate::sql2::derive_entity_surface_spec_from_schema(schema).ok()
+                    })
+                    .map(std::sync::Arc::new)
+            })
+            .clone();
+        let Some(spec) = spec else {
+            return;
+        };
+        if spec.indexed_columns.is_empty() {
+            return;
+        }
+        let PreparedValidationRow::State(state_row) = row;
+        self.values.rows.push(StagedIndexRow {
+            branch_id: state_row.branch_id.clone(),
+            schema_key: state_row.schema_key.clone(),
+            entity_pk: state_row.entity_pk.clone(),
+            columns: spec
+                .indexed_columns
+                .iter()
+                .map(|column| (column.ordinal, hot_index_value(snapshot, column)))
+                .collect(),
+        });
+    }
+
+    fn finish(self) -> StagedIndexValues {
+        self.values
+    }
+}
+
+/// The two JSON scalar shapes the index plane has an order-preserving key
+/// encoding for. Everything else stays on the collection scan.
+fn hot_index_value(
+    snapshot: &JsonValue,
+    column: &crate::sql2::EntityIndexedColumn,
+) -> Option<crate::live_state::HotIndexValue> {
+    match snapshot.get(&column.name)? {
+        JsonValue::String(value) => Some(crate::live_state::HotIndexValue::String(value.clone())),
+        JsonValue::Number(value) => value.as_i64().map(crate::live_state::HotIndexValue::Integer),
+        _ => None,
+    }
 }
 
 fn row_local_certificates_cover_validation(staged_rows: &[PreparedValidationRow<'_>]) -> bool {
@@ -2897,62 +3040,147 @@ async fn validate_committed_unique_constraints(
     }
 
     for (scope, pending_values) in pending_by_scope {
-        let committed_rows = scan_committed_constraint_rows(
-            input.live_state,
-            &scope.domain,
-            vec![scope.schema_key.clone()],
-            Vec::new(),
-            false,
-        )
-        .await?;
+        // A scope with exactly one pending value becomes a point probe instead
+        // of a whole-collection scan with a parse per row. Everything else —
+        // composite groups, columns the plane cannot key, and scopes holding
+        // several pending values — keeps the single scan it always had.
+        match declared_column_probe(input.schema_catalog, &scope, &pending_values) {
+            Some(probe) => {
+                let committed_rows = scan_committed_constraint_rows_by_declared_column(
+                    input.live_state,
+                    &scope.domain,
+                    &scope.schema_key,
+                    probe,
+                )
+                .await?;
+                reject_committed_unique_conflicts(
+                    &committed_rows,
+                    &scope,
+                    &pending_values,
+                    pending_constraints,
+                )?;
+            }
+            None => {
+                let committed_rows = scan_committed_constraint_rows(
+                    input.live_state,
+                    &scope.domain,
+                    vec![scope.schema_key.clone()],
+                    Vec::new(),
+                    false,
+                )
+                .await?;
+                reject_committed_unique_conflicts(
+                    &committed_rows,
+                    &scope,
+                    &pending_values,
+                    pending_constraints,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
 
-        for committed_row in committed_rows.iter() {
-            if !committed_row_is_in_exact_unique_scope(committed_row, &scope) {
+/// The one `declared_column_eq` predicate that can replace this scope's scan,
+/// or `None` when the scope must keep scanning.
+///
+/// **Deliberately one value only.** Probing per distinct value would turn one
+/// scan-per-scope into N probes, and a collection with no completeness witness
+/// silently falls back to its ordinary scan — so each of those N probes would
+/// become a *full scan*. That is exactly the population this change must not
+/// hurt: repositories whose collections predate the index plane. Capping at
+/// one value makes the probe route weakly better than the scan route in every
+/// case, which is what lets it be chosen here without first asking whether the
+/// index can serve. Lifting the cap needs that question answered first.
+///
+/// Declines unless the scope is a single-column group the schema's
+/// `indexed_columns` cover **and** the value round-trips exactly through the
+/// index's key encoding. A probe built from a value that does not round-trip
+/// could miss a committed conflict — a unique violation silently accepted, not
+/// a slow query — so an inexact value goes back to the scan.
+fn declared_column_probe(
+    schema_catalog: &CatalogSnapshot,
+    scope: &PendingUniqueConstraintScope,
+    pending_values: &BTreeMap<UniqueConstraintValue, Vec<&EntityPk>>,
+) -> Option<crate::live_state::DeclaredColumnEq> {
+    let [pointer] = scope.pointer_group.as_slice() else {
+        return None;
+    };
+    let [property] = pointer.as_slice() else {
+        return None;
+    };
+    let [value] = pending_values.keys().collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let schema = schema_catalog.schema(&scope.schema_key)?;
+    let spec = crate::sql2::derive_entity_surface_spec_from_schema(schema).ok()?;
+    let ordinal = spec
+        .indexed_columns
+        .iter()
+        .find(|column| column.name == *property)?
+        .ordinal;
+    Some(crate::live_state::DeclaredColumnEq {
+        schema_key: scope.schema_key.clone(),
+        ordinal,
+        value: value.exact_hot_index_value()?,
+    })
+}
+
+/// The committed-row half of the unique check, shared by the probe and scan
+/// routes so both reject exactly the same conflicts.
+fn reject_committed_unique_conflicts(
+    committed_rows: &CommittedLiveStateRows,
+    scope: &PendingUniqueConstraintScope,
+    pending_values: &BTreeMap<UniqueConstraintValue, Vec<&EntityPk>>,
+    pending_constraints: &PendingConstraintIndexes,
+) -> Result<(), LixError> {
+    for committed_row in committed_rows.iter() {
+        if !committed_row_is_in_exact_unique_scope(committed_row, scope) {
+            continue;
+        }
+        if pending_constraints.tombstones_identity(committed_row) {
+            continue;
+        }
+        let Some(snapshot_content) = committed_row
+            .snapshot_content()
+            .map(|snapshot| snapshot.as_str())
+        else {
+            continue;
+        };
+        let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "committed snapshot_content for schema '{}' is invalid JSON: {error}",
+                    committed_row.schema_key()
+                ),
+            )
+        })?;
+        let Some(committed_value) =
+            UniqueConstraintValue::from_snapshot(&snapshot, &scope.pointer_group)
+        else {
+            continue;
+        };
+        // Index entries are candidates, never answers: a probe can return a
+        // row whose value has since changed. This lookup is what rejects it.
+        let Some(pending_entity_pks) = pending_values.get(&committed_value) else {
+            continue;
+        };
+        for pending_entity_pk in pending_entity_pks {
+            if committed_row.entity_pk() == *pending_entity_pk {
                 continue;
             }
-            if pending_constraints.tombstones_identity(committed_row) {
-                continue;
-            }
-            let Some(snapshot_content) = committed_row
-                .snapshot_content()
-                .map(|snapshot| snapshot.as_str())
-            else {
-                continue;
-            };
-            let snapshot =
-                serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_VALIDATION,
-                        format!(
-                            "committed snapshot_content for schema '{}' is invalid JSON: {error}",
-                            committed_row.schema_key()
-                        ),
-                    )
-                })?;
-            let Some(committed_value) =
-                UniqueConstraintValue::from_snapshot(&snapshot, &scope.pointer_group)
-            else {
-                continue;
-            };
-            let Some(pending_entity_pks) = pending_values.get(&committed_value) else {
-                continue;
-            };
-            for pending_entity_pk in pending_entity_pks {
-                if committed_row.entity_pk() == *pending_entity_pk {
-                    continue;
-                }
-                return Err(LixError::new(
-                    LixError::CODE_UNIQUE,
-                    format!(
-                        "unique constraint violation on {}.{} for value {}: committed row '{}' conflicts with staged row '{}'",
-                        scope.schema_key,
-                        format_pointer_group(&scope.pointer_group),
-                        committed_value.display(),
-                        committed_row.entity_pk().as_json_array_text()?,
-                        pending_entity_pk.as_json_array_text()?
-                    ),
-                ));
-            }
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "unique constraint violation on {}.{} for value {}: committed row '{}' conflicts with staged row '{}'",
+                    scope.schema_key,
+                    format_pointer_group(&scope.pointer_group),
+                    committed_value.display(),
+                    committed_row.entity_pk().as_json_array_text()?,
+                    pending_entity_pk.as_json_array_text()?
+                ),
+            ));
         }
     }
     Ok(())
@@ -3072,6 +3300,27 @@ impl UniqueConstraintValue {
             values.push(stable_unique_value(value));
         }
         Some(Self(values))
+    }
+
+    /// The hot index plane's encoding of a single-column value, but only when
+    /// the recovered value re-encodes to exactly this stable form.
+    ///
+    /// `stable_unique_value` is lossy for anything the index cannot key
+    /// anyway, and an approximate probe would be a missed conflict rather
+    /// than a slow one. The round-trip check makes "recoverable" provable
+    /// instead of assumed.
+    fn exact_hot_index_value(&self) -> Option<crate::live_state::HotIndexValue> {
+        let [encoded] = self.0.as_slice() else {
+            return None;
+        };
+        if let Ok(text) = serde_json::from_str::<String>(encoded)
+            && stable_unique_value(&JsonValue::String(text.clone())) == *encoded
+        {
+            return Some(crate::live_state::HotIndexValue::String(text));
+        }
+        let number = encoded.parse::<i64>().ok()?;
+        (stable_unique_value(&JsonValue::Number(number.into())) == *encoded)
+            .then_some(crate::live_state::HotIndexValue::Integer(number))
     }
 
     fn display(&self) -> String {
@@ -4577,6 +4826,143 @@ mod tests {
         validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("pending registered schema should be visible to later staged rows");
+    }
+
+    /// A commit that both registers a schema and writes rows of it must
+    /// publish the collection's witness **and** those rows' entries.
+    ///
+    /// This is the one failure the hot index plane cannot have. The
+    /// registration alone earns the collection a completeness witness, so if
+    /// the same commit's rows are missing from the index the read path trusts
+    /// a complete-looking index that holds nothing and returns no rows —
+    /// silently, for every reader, until the next generation.
+    ///
+    /// The commit-time hook that this rework replaced resolved schemas through
+    /// the catalog snapshot taken when the transaction opened, which by
+    /// construction cannot contain a registration the transaction is still
+    /// staging. Extraction now runs here instead, against the same
+    /// transaction-visible catalog that
+    /// `validation_allows_pending_registered_schema_to_validate_later_rows`
+    /// pins — so the fix is structural, not a special case.
+    ///
+    /// (The SQL surface cannot currently reach this shape: an entity table
+    /// registered inside an explicit transaction is not bindable until that
+    /// transaction commits. The prepared-write path can, which is why the
+    /// invariant is pinned at this level rather than through SQL.)
+    #[tokio::test]
+    async fn a_schema_registered_in_this_commit_indexes_its_own_rows() {
+        let visible_schemas = vec![registered_schema()];
+        let global_unique_row = |entity_pk: &str, slug: &str| {
+            let mut row = staged_row(
+                "unique_schema",
+                Some(
+                    json!({ "id": entity_pk, "slug": slug, "title": "title" })
+                        .to_string(),
+                ),
+            );
+            row.entity_pk = EntityPk::single(entity_pk);
+            row
+        };
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![
+                pending_registered_schema_from_definition(unique_schema()),
+                global_unique_row("entity-1", "slug-1"),
+                global_unique_row("entity-2", "slug-2"),
+            ],
+            ..empty_staged_write_set()
+        };
+
+        let extracted = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
+            .await
+            .expect("registration plus rows of that schema should validate");
+
+        assert_eq!(
+            extracted
+                .registered_collections
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![("unique_schema".to_string(), 0_u16)],
+            "the registration must witness its one declared column"
+        );
+        let indexed = extracted
+            .rows
+            .iter()
+            .flat_map(|row| {
+                row.columns.iter().map(move |(ordinal, value)| {
+                    (row.schema_key.as_str().to_owned(), *ordinal, value.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexed,
+            vec![
+                (
+                    "unique_schema".to_string(),
+                    0,
+                    Some(crate::live_state::HotIndexValue::String("slug-1".into()))
+                ),
+                (
+                    "unique_schema".to_string(),
+                    0,
+                    Some(crate::live_state::HotIndexValue::String("slug-2".into()))
+                ),
+            ],
+            "every row of the freshly registered schema must be extracted, or the \
+             witness above publishes an index that is missing them"
+        );
+    }
+
+    /// Every declared ordinal is carried, `None` included.
+    ///
+    /// Commit earns a witness per `(schema, ordinal)` from the row's presence,
+    /// not from a value being found, so a row that omits an indexable value
+    /// must still report that ordinal. Dropping it would leave the column
+    /// unwitnessed and silently un-indexable for the whole collection.
+    #[tokio::test]
+    async fn extraction_reports_declared_ordinals_without_a_value() {
+        let schema = json!({
+            "x-lix-key": "sparse_index_schema",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/slug"], ["/rank"]],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "slug": { "type": ["string", "null"] },
+                "rank": { "type": ["integer", "null"] }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let mut row = staged_row(
+            "sparse_index_schema",
+            Some(json!({ "id": "entity-1", "slug": null, "rank": 7 }).to_string()),
+        );
+        row.entity_pk = EntityPk::single("entity-1");
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![
+                pending_registered_schema_from_definition(schema),
+                row,
+            ],
+            ..empty_staged_write_set()
+        };
+
+        let extracted =
+            validate_prepared_writes(validation_input(&staged_writes, &vec![registered_schema()]))
+                .await
+                .expect("sparse indexed row should validate");
+
+        let [row] = extracted.rows.as_slice() else {
+            panic!("expected exactly one extracted row, got {:?}", extracted.rows);
+        };
+        assert_eq!(
+            row.columns,
+            vec![
+                (0_u16, Some(crate::live_state::HotIndexValue::Integer(7))),
+                (1_u16, None),
+            ],
+            "a null indexed value must still report its ordinal"
+        );
     }
 
     #[test]
@@ -7291,6 +7677,72 @@ mod tests {
         assert!(!prepared_tracked_rows_have_row_local_certificates(
             &prepared_rows![reserved]
         ));
+    }
+
+    /// A row that carries an indexed column must never reach commit without
+    /// passing through the extraction inside `validate_prepared_writes`.
+    ///
+    /// The hot index plane's one inviolable property is "never a false
+    /// negative". A bypassed row that still earns its collection a witness
+    /// would publish a complete-looking index that is missing that row, and
+    /// every read of it would silently return nothing. Seven certificates can
+    /// skip validation; this pins all seven.
+    ///
+    /// Four live in `bound_public_write.rs` — the insert batch, the two update
+    /// batches, and the path-value replacement program — and each declines
+    /// outright on `spec.has_inter_row_constraints`. That is sufficient
+    /// because a column is only indexable if `x-lix-unique` or
+    /// `x-lix-foreign-keys` declared it, which is the same predicate; see
+    /// `indexed_columns_imply_inter_row_constraints`.
+    ///
+    /// The remaining three are asserted here directly: they all require
+    /// `!requires_transaction_validation` on every row, which
+    /// `normalization.rs` grants to a snapshot row only when its schema plan
+    /// declares no uniques and no foreign keys — hence no indexed columns — or
+    /// when `constraints_unchanged` proves the UPDATE assigned none of them;
+    /// see `every_indexed_column_revokes_the_constraints_unchanged_certificate`.
+    #[test]
+    fn declared_column_rows_never_bypass_extraction() {
+        let mut row = staged_row("indexed_schema", Some(r#"{"id":"row"}"#.to_string()));
+        row.facts.row_content_validated = true;
+        row.facts.requires_transaction_validation = true;
+
+        // Site 5: `prepared_tracked_rows_have_row_local_certificates`, the
+        // early return in `validate_prepared_writes_by_branch`.
+        assert!(
+            !prepared_tracked_rows_have_row_local_certificates(&prepared_rows![row.clone()]),
+            "a row needing transaction validation must not skip the validation index"
+        );
+
+        // Site 6: `row_local_certificates_cover_validation`, the early return
+        // inside `validate_prepared_writes` itself.
+        let borrowed = row.borrowed();
+        assert!(
+            !row_local_certificates_cover_validation(&[PreparedValidationRow::State(borrowed)]),
+            "a row needing transaction validation must not skip per-schema validation"
+        );
+
+        // Site 7: `fresh_plugin_file_import_certificate` under
+        // `trust_filesystem_planner`. Its plugin-owned rows are admitted only
+        // while `requires_transaction_validation` is clear.
+        let mut writes = fresh_plugin_file_import_write_set();
+        assert!(
+            fresh_plugin_file_import_certificate(&writes).is_some(),
+            "the unmodified fixture must certify, or this test proves nothing"
+        );
+        let mut constrained = staged_row("indexed_schema", Some(r#"{"id":"root"}"#.to_string()));
+        constrained.entity_pk = EntityPk::single("root");
+        constrained.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
+        constrained.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
+        constrained.global = false;
+        constrained.facts.row_content_validated = true;
+        constrained.facts.requires_transaction_validation = true;
+        constrained.origin = Some(plugin_reconciliation_update_origin());
+        writes.state_rows.push_test_row(constrained);
+        assert!(
+            fresh_plugin_file_import_certificate(&writes).is_none(),
+            "an indexed-schema row inside a plugin import must revoke the certificate"
+        );
     }
 
     #[test]

@@ -46,6 +46,14 @@ pub(crate) struct EntitySurfaceSpec {
     pub(crate) primary_key_component_types: Vec<EntityPkComponentType>,
     pub(crate) columns: Vec<EntitySurfaceColumn>,
     pub(crate) defaults: crate::catalog::DefaultPlan,
+    /// Columns this schema already declares as a foreign key or as unique,
+    /// which are therefore the columns the hot index plane can serve.
+    ///
+    /// Derived from `x-lix-foreign-keys` and `x-lix-unique` so indexing adds no
+    /// user-facing concept. Order is stable and defines each column's ordinal
+    /// in the index key, so it must not be reordered without retiring the
+    /// index namespace.
+    pub(crate) indexed_columns: Vec<EntityIndexedColumn>,
     /// Whether changing one row can invalidate another row.
     ///
     /// Homogeneous point updates may be lowered into one physical write batch
@@ -221,10 +229,12 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
                         | EntityColumnType::Boolean
                 )
         });
+    let indexed_columns = derive_indexed_columns(schema, &columns, &primary_key_paths);
     Ok(EntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         primary_key_paths,
         primary_key_component_types,
+        indexed_columns,
         columns,
         defaults: crate::catalog::DefaultPlan::from_schema(schema),
         has_inter_row_constraints: ["x-lix-unique", "x-lix-foreign-keys"].into_iter().any(
@@ -238,6 +248,97 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
         certifies_path_value_replacement,
         columnar_snapshot_bijective,
     })
+}
+
+/// One column the hot index plane can serve, and its position in the index key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EntityIndexedColumn {
+    pub(crate) name: String,
+    pub(crate) ordinal: u16,
+    pub(crate) column_type: EntityColumnType,
+}
+
+/// Indexable columns, from declarations the schema already carries.
+///
+/// Deliberately narrow, and every exclusion is a case the collection scan still
+/// serves correctly:
+///
+/// - single-column groups only — a composite group needs a composite key
+///   encoding and no measured workload asks for one yet;
+/// - `String` and `Integer` only — those are the types with an order-preserving
+///   key encoding;
+/// - primary-key columns are skipped — the hot row key already indexes them,
+///   and a second access path to the same rows would be a second mechanism.
+fn derive_indexed_columns(
+    schema: &JsonValue,
+    columns: &[EntitySurfaceColumn],
+    primary_key_paths: &[Vec<String>],
+) -> Vec<EntityIndexedColumn> {
+    let mut names = Vec::new();
+    let mut push = |name: &str| {
+        if !names.iter().any(|existing: &String| existing == name) {
+            names.push(name.to_string());
+        }
+    };
+    for group in schema
+        .get("x-lix-unique")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some([pointer]) = group.as_array().map(Vec::as_slice)
+            && let Some(name) = pointer.as_str().and_then(single_property_pointer)
+        {
+            push(name);
+        }
+    }
+    for foreign_key in schema
+        .get("x-lix-foreign-keys")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some([pointer]) = foreign_key
+            .get("properties")
+            .and_then(JsonValue::as_array)
+            .map(Vec::as_slice)
+            && let Some(name) = pointer.as_str().and_then(single_property_pointer)
+        {
+            push(name);
+        }
+    }
+    names.sort();
+    names
+        .into_iter()
+        .filter(|name| {
+            !primary_key_paths
+                .iter()
+                .any(|path| matches!(path.as_slice(), [component] if component == name))
+        })
+        .filter_map(|name| {
+            let column = columns.iter().find(|column| column.name == name)?;
+            matches!(
+                column.column_type,
+                EntityColumnType::String | EntityColumnType::Integer
+            )
+            .then(|| EntityIndexedColumn {
+                name,
+                ordinal: 0,
+                column_type: column.column_type,
+            })
+        })
+        .enumerate()
+        .map(|(ordinal, column)| EntityIndexedColumn {
+            ordinal: u16::try_from(ordinal).unwrap_or(u16::MAX),
+            ..column
+        })
+        .collect()
+}
+
+/// `"/name"` for a top-level property, `None` for anything nested.
+fn single_property_pointer(pointer: &str) -> Option<&str> {
+    let name = pointer.strip_prefix('/')?;
+    (!name.is_empty() && !name.contains('/')).then_some(name)
 }
 
 fn certifies_path_value_replacement(schema: &JsonValue) -> bool {
@@ -754,6 +855,78 @@ mod tests {
         assert_eq!(
             string_spec.columnar_layout_fingerprint(),
             string_spec.clone().columnar_layout_fingerprint()
+        );
+    }
+
+    /// The load-bearing bridge under every certificate fast path: a column is
+    /// only indexable because the schema declared it through `x-lix-unique` or
+    /// `x-lix-foreign-keys`, and those are exactly the declarations that set
+    /// `has_inter_row_constraints`.
+    ///
+    /// Four write certificates in `bound_public_write.rs` decline outright on
+    /// `has_inter_row_constraints`. This implication is what turns those four
+    /// bails into a proof that no row carrying an indexed column can reach
+    /// commit without passing through transaction validation, where the hot
+    /// index values are extracted.
+    #[test]
+    fn indexed_columns_imply_inter_row_constraints() {
+        let cases = [
+            json!({
+                "x-lix-key": "bypass_pk_only",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }
+            }),
+            json!({
+                "x-lix-key": "bypass_unique",
+                "x-lix-primary-key": ["/id"],
+                "x-lix-unique": [["/slug"]],
+                "type": "object",
+                "properties": { "id": { "type": "string" }, "slug": { "type": "string" } }
+            }),
+            json!({
+                "x-lix-key": "bypass_fk",
+                "x-lix-primary-key": ["/id"],
+                "x-lix-foreign-keys": [{
+                    "properties": ["/parentId"],
+                    "references": { "schemaKey": "bypass_pk_only", "properties": ["/id"] }
+                }],
+                "type": "object",
+                "properties": { "id": { "type": "string" }, "parentId": { "type": "string" } }
+            }),
+            json!({
+                "x-lix-key": "bypass_composite_unique",
+                "x-lix-primary-key": ["/id"],
+                "x-lix-unique": [["/a", "/b"]],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "a": { "type": "string" },
+                    "b": { "type": "string" }
+                }
+            }),
+        ];
+        for schema in cases {
+            let spec = derive_entity_surface_spec_from_schema(&schema).expect("spec");
+            assert!(
+                spec.indexed_columns.is_empty() || spec.has_inter_row_constraints,
+                "{} declares indexed columns without inter-row constraints",
+                spec.schema_key
+            );
+        }
+
+        let unique = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "bypass_unique",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/slug"]],
+            "type": "object",
+            "properties": { "id": { "type": "string" }, "slug": { "type": "string" } }
+        }))
+        .expect("spec");
+        assert_eq!(
+            unique.indexed_columns.len(),
+            1,
+            "a single-column unique group is the indexable shape this relies on"
         );
     }
 }

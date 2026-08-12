@@ -33,6 +33,7 @@ pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v21";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
 pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
+pub(crate) const HOT_INDEX_NAMESPACE: &str = "live_state.hot_index.v1";
 pub(crate) const HOT_ROW_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_001b),
     HOT_ROW_NAMESPACE,
@@ -52,6 +53,36 @@ pub(crate) const HOT_FILE_SPACE: StorageSpace = StorageSpace::declare(
 pub(crate) const HOT_DIFF_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_001d),
     HOT_DIFF_NAMESPACE,
+    ValueSemantics::Mutable,
+);
+/// Declared-column access path over the hot rows: `value -> entity_pk`.
+///
+/// A predicate on a non-primary-key column has no access path in the hot row
+/// key, whose only searchable dimensions are `(branch, generation, schema,
+/// file, entity)`. Serving one costs a scan of the whole collection plus a
+/// snapshot parse per row — on the read path, and again inside
+/// `validate_committed_unique_constraints` on the write path.
+///
+/// This plane indexes exactly the columns a schema already declares through
+/// `x-lix-unique` and `x-lix-foreign-keys`, so it introduces no new
+/// user-facing concept. It is a disposable cache in the sense of layout
+/// invariant 3: every entry is derivable from the hot rows, the rows remain
+/// the only authority for content, and dropping the plane costs nothing but
+/// speed.
+///
+/// **Maintenance is put-only, and the invariant is "never a false negative".**
+/// An entry is written when a row's indexed value is written and is never
+/// deleted when that value is superseded, exactly as [`HOT_FILE_SPACE`]
+/// markers behave. A superseded or deleted row therefore leaves a stale entry
+/// behind, so a lookup returns *candidates*, never answers. Candidates are
+/// resolved through the ordinary exact-entity-pk read and re-checked by the
+/// caller's own predicate. That is what makes maintenance one key-only put per
+/// changed row with no pre-image read, which is in turn what keeps write cost
+/// flat in collection size — the property this whole plane exists to buy on
+/// the read side.
+pub(crate) const HOT_INDEX_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0004_0033),
+    HOT_INDEX_NAMESPACE,
     ValueSemantics::Mutable,
 );
 pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
@@ -4840,6 +4871,79 @@ where
             }
         }
         Ok(dependencies)
+    }
+
+    /// Candidate entity primary keys whose indexed column equals `value`.
+    ///
+    /// Returns `None` when this collection has no completeness witness for the
+    /// generation, which means the caller must not use the index and must fall
+    /// back to its ordinary scan. `Some` is a candidate set, not an answer:
+    /// entries are never deleted within a generation, so a candidate may name a
+    /// row that has since changed value or been deleted. Callers resolve
+    /// candidates through the exact-entity-pk read and re-apply their own
+    /// predicate. The set never *omits* a live matching row.
+    pub(crate) async fn scan_hot_index_candidates(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        schema_key: &str,
+        ordinal: u16,
+        value: &HotIndexValue,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        let witness = StorageKey(Bytes::from(encode_hot_index_witness_key(
+            branch_id,
+            generation,
+            schema_key,
+            ordinal,
+        )));
+        let present = PointReadPlan::new(HOT_INDEX_SPACE, &[witness])
+            .materialize(
+                &self.store,
+                StorageGetOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                },
+            )
+            .await?;
+        if present.value.into_iter().next().flatten().is_none() {
+            return Ok(None);
+        }
+        let range = StoragePrefix {
+            bytes: Bytes::from(hot_index_value_prefix(
+                branch_id,
+                generation,
+                schema_key,
+                ordinal,
+                value,
+            )),
+        }
+        .to_range()?;
+        let mut cursor = self
+            .store
+            .begin_scan(
+                HOT_INDEX_SPACE,
+                range,
+                StorageBeginScanOptions::default(),
+            )
+            .await?;
+        let mut candidates = Vec::new();
+        loop {
+            let page = cursor.next_page(HOT_INDEX_CANDIDATE_PAGE).await?;
+            for entry in &page.entries {
+                let StorageProjectedValue::FullValue(value) = &entry.value else {
+                    continue;
+                };
+                let text = std::str::from_utf8(value).map_err(|error| {
+                    head_value_error(format!("hot index entry is not utf-8: {error}"))
+                })?;
+                candidates.push(EntityPk::from_json_array_text(text).map_err(|error| {
+                    head_value_error(format!("hot index entry has an invalid entity pk: {error}"))
+                })?);
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+        Ok(Some(candidates))
     }
 
     pub(crate) async fn has_schema_rows(
@@ -11326,6 +11430,156 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
     })
 }
 
+/// Distinguishes the two record kinds sharing [`HOT_INDEX_SPACE`]: entries and
+/// the per-collection completeness witness. Entries sort after the witness for
+/// a given schema, so a witness probe is a point read and never scans entries.
+const HOT_INDEX_WITNESS_TAG: u8 = 0x00;
+const HOT_INDEX_ENTRY_TAG: u8 = 0x01;
+const HOT_INDEX_CANDIDATE_PAGE: usize = 256;
+
+/// One index entry to publish: the row's indexed value and its identity.
+#[derive(Debug, Clone)]
+pub(crate) struct HotIndexEntry {
+    pub(crate) schema_key: String,
+    pub(crate) ordinal: u16,
+    pub(crate) value: HotIndexValue,
+    pub(crate) entity_pk: EntityPk,
+}
+
+/// Stages index entries and, optionally, the collection witnesses that make
+/// them selectable.
+///
+/// Put-only by construction: there is no delete path, which is what keeps this
+/// O(changed rows) with no reads. Duplicate `(space, key)` mutations are
+/// rejected by the write set, so identical entries staged twice in one commit
+/// are collapsed here rather than at lowering time.
+pub(crate) fn stage_hot_index_entries(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    entries: &[HotIndexEntry],
+    witnessed_collections: &BTreeSet<(String, u16)>,
+) -> Result<(), LixError> {
+    let mut staged = BTreeSet::new();
+    for entry in entries {
+        let key = encode_hot_index_entry_key(
+            branch_id,
+            generation,
+            &entry.schema_key,
+            entry.ordinal,
+            &entry.value,
+            &entry.entity_pk,
+        );
+        if !staged.insert(key.clone()) {
+            continue;
+        }
+        let identity = entry.entity_pk.as_json_array_text().map_err(|error| {
+            head_value_error(format!("hot index entity pk is not encodable: {error}"))
+        })?;
+        writes.put(
+            HOT_INDEX_SPACE,
+            StorageKey(Bytes::from(key)),
+            StorageValue {
+                bytes: Bytes::from(identity.into_bytes()),
+            },
+        );
+    }
+    for (schema_key, ordinal) in witnessed_collections {
+        let key = encode_hot_index_witness_key(branch_id, generation, schema_key, *ordinal);
+        if !staged.insert(key.clone()) {
+            continue;
+        }
+        writes.put(
+            HOT_INDEX_SPACE,
+            StorageKey(Bytes::from(key)),
+            StorageValue {
+                bytes: Bytes::new(),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// One indexed value, encoded so that equality is a key prefix.
+///
+/// Integers use the same order-preserving flip as entity-pk components so a
+/// future range predicate can reuse this encoding unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum HotIndexValue {
+    String(String),
+    Integer(i64),
+}
+
+impl HotIndexValue {
+    fn write(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::String(value) => {
+                out.push(ENTITY_PK_STRING);
+                write_key_string(out, value, KEY_PART_FINAL);
+            }
+            Self::Integer(value) => {
+                out.push(ENTITY_PK_INTEGER);
+                let ordered = u64::from_be_bytes(value.to_be_bytes()) ^ (1_u64 << 63);
+                out.extend_from_slice(&ordered.to_be_bytes());
+                out.push(KEY_PART_FINAL);
+            }
+        }
+    }
+}
+
+/// `scope | schema | ENTRY | ordinal | value | entity_pk`.
+pub(crate) fn encode_hot_index_entry_key(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    ordinal: u16,
+    value: &HotIndexValue,
+    entity_pk: &EntityPk,
+) -> Vec<u8> {
+    let mut key = hot_index_value_prefix(branch_id, generation, schema_key, ordinal, value);
+    write_entity_pk(&mut key, entity_pk);
+    key
+}
+
+/// Every entry for one `(collection, column, value)`: the equality access path.
+pub(crate) fn hot_index_value_prefix(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    ordinal: u16,
+    value: &HotIndexValue,
+) -> Vec<u8> {
+    let mut key = hot_scope_prefix(branch_id, generation);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    key.push(HOT_INDEX_ENTRY_TAG);
+    key.extend_from_slice(&ordinal.to_be_bytes());
+    value.write(&mut key);
+    key
+}
+
+/// Asserts that this plane holds every row of one `(collection, column)` for
+/// one generation.
+///
+/// **This is not a compatibility shim and must not be deleted as one.** It
+/// gates *access-path selection* over a scan path that is permanently present:
+/// columns a schema does not declare are never indexed, so the collection scan
+/// can never be retired. Without the witness a generation whose rows predate
+/// this plane would look like an empty index and silently return no rows,
+/// which is the one failure mode this design must not have. A repository
+/// upgrades by publishing its next generation, not by rebuilding at open.
+pub(crate) fn encode_hot_index_witness_key(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    ordinal: u16,
+) -> Vec<u8> {
+    let mut key = hot_scope_prefix(branch_id, generation);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    key.push(HOT_INDEX_WITNESS_TAG);
+    key.extend_from_slice(&ordinal.to_be_bytes());
+    key
+}
+
 fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(
         scope
@@ -11507,6 +11761,7 @@ fn collect_hot_untracked_refs(value: HeadValueView<'_>, refs: &mut BTreeSet<[u8;
 /// absent: their rows are shared across generations and are reclaimed by
 /// content reachability, not by scope.
 const GENERATION_SCOPED_SPACES: &[StorageSpace] = &[
+    HOT_INDEX_SPACE,
     HOT_ROW_SPACE,
     HOT_FILE_SPACE,
     HOT_COLLECTION_CONTROL_SPACE,

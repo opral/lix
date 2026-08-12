@@ -698,6 +698,18 @@ where
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedLiveStateBatch::default());
         }
+        // Resolve a declared-column equality through the index plane before any
+        // route is chosen, so every route below sees an ordinary entity-pk
+        // request. Candidates are not answers: the caller keeps its own
+        // predicate and rejects stale ones.
+        let resolved;
+        let request = match self.resolve_declared_column_eq(request, &scope).await? {
+            Some(rewritten) => {
+                resolved = rewritten;
+                &resolved
+            }
+            None => request,
+        };
         if let Some(rows) = self.scan_direct_entity_pk_batch(request, &scope).await? {
             return Ok(rows);
         }
@@ -757,6 +769,73 @@ where
                 limit: request.limit,
             },
         ))
+    }
+
+    /// Rewrites a declared-column equality into an entity-pk request.
+    ///
+    /// Returns `None` when the predicate cannot be served — no predicate, more
+    /// than one branch in scope, or no completeness witness for the collection
+    /// — in which case the caller's ordinary scan runs unchanged and still
+    /// produces correct rows, only slower.
+    ///
+    /// An empty candidate set becomes `LiveStateRowFilter::None`, never an
+    /// empty `entity_pks` list: an empty list means "no identity filter" and
+    /// would silently widen the scan to the whole collection.
+    async fn resolve_declared_column_eq(
+        &self,
+        request: &LiveStateScanRequest,
+        scope: &LiveStateScanScope,
+    ) -> Result<Option<LiveStateScanRequest>, LixError> {
+        let Some(predicate) = request.filter.declared_column_eq.as_ref() else {
+            return Ok(None);
+        };
+        if !request.filter.entity_pks.is_empty() {
+            let mut rewritten = request.clone();
+            rewritten.filter.declared_column_eq = None;
+            return Ok(Some(rewritten));
+        }
+        let mut rewritten = request.clone();
+        rewritten.filter.declared_column_eq = None;
+        // Every branch in scope must be witnessed. A branch whose index is
+        // incomplete would contribute no candidates and silently drop its
+        // rows, which is the false negative this design cannot have — so one
+        // unwitnessed branch sends the whole read back to the scan.
+        let mut unique = std::collections::BTreeSet::new();
+        for branch_id in &scope.storage_branch_ids {
+            let Some(control) = scope.branch_heads.get(branch_id).copied() else {
+                return Ok(Some(rewritten));
+            };
+            // A branch the control proves holds no row of this schema
+            // contributes no candidates, so it needs no witness. The bloom has
+            // no false negatives, so this skip cannot hide a row. Without it a
+            // branch that never stores the schema — the global branch, for
+            // every ordinary user collection — would be permanently
+            // unwitnessed and would veto the index for everyone.
+            if !control.may_have_schema(&predicate.schema_key) {
+                continue;
+            }
+            let Some(candidates) = self
+                .tracked_head
+                .reader(&self.store)
+                .scan_hot_index_candidates(
+                    branch_id,
+                    control.tracked_generation,
+                    &predicate.schema_key,
+                    predicate.ordinal,
+                    &predicate.value,
+                )
+                .await?
+            else {
+                return Ok(Some(rewritten));
+            };
+            unique.extend(candidates);
+        }
+        if unique.is_empty() {
+            rewritten.filter.rows = LiveStateRowFilter::None;
+        } else {
+            rewritten.filter.entity_pks = unique.into_iter().collect();
+        }
+        Ok(Some(rewritten))
     }
 
     /// Serves finite entity-PK scans from the hot current-state index. Every
@@ -1117,6 +1196,20 @@ where
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedLiveStateBatch::default());
         }
+        // The tracked domain is the constraint validator's route, and
+        // `validate_committed_unique_constraints` reaches it with an equality
+        // on a declared column. Resolving it here is the same access-path
+        // choice the combined route already makes, and it is what stops an
+        // insert into an `x-lix-unique` collection from scanning that
+        // collection.
+        let resolved;
+        let request = match self.resolve_declared_column_eq(request, &scope).await? {
+            Some(rewritten) => {
+                resolved = rewritten;
+                &resolved
+            }
+            None => request,
+        };
         let derived_rows = MaterializedLiveStateBatch::from_rows(
             scan_derived_rows(
                 store,
@@ -1172,6 +1265,14 @@ where
         request: &LiveStateScanRequest,
         scope: &LiveStateScanScope,
     ) -> Result<Vec<HotBranchRows>, LixError> {
+        // `LiveStateRowFilter::None` means "no identity can match", which is
+        // exactly what an index probe with no candidates produces. The tracked
+        // request below carries only `entity_pks`, where an empty list means
+        // "no identity filter" — the opposite — so the empty case has to be
+        // answered before the request is lowered.
+        if matches!(request.filter.rows, LiveStateRowFilter::None) {
+            return Ok(Vec::new());
+        }
         let store = &self.store;
         let tracked_request = tracked_scan_request_from_live(request);
         let branches = scope

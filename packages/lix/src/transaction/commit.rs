@@ -1870,6 +1870,58 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
     })
 }
 
+/// Builds this commit's index entries, plus witnesses for schemas it registers.
+///
+/// Put-only: rows whose indexed value changed publish a new entry and leave the
+/// superseded one behind, and deleted rows publish nothing. Both cases are
+/// resolved on read by re-checking candidates against the row, which is what
+/// lets this stay one pass over the commit's own rows with no reads.
+///
+/// The values arrive **pre-extracted** on the batch. Transaction validation
+/// already parses every staged snapshot, and `StageJson::value()` panics once
+/// that decoded column is released, so decoding again here would be both a
+/// second full parse of the commit and a deliberate route around that guard.
+/// A batch whose rows never reached extraction carries an empty
+/// [`StagedIndexValues`] and therefore publishes nothing at all — no entries
+/// and, critically, no witnesses, so those collections keep scanning instead of
+/// trusting an incomplete index.
+fn hot_index_writes_for_commit(
+    state_rows: &PreparedStateBatch,
+    branch_id: &str,
+    parent_control: Option<&BranchHeadControl>,
+) -> (Vec<crate::live_state::HotIndexEntry>, BTreeSet<(String, u16)>) {
+    let staged = state_rows.staged_index_values();
+    let mut entries = Vec::new();
+    let mut witnesses = staged.registered_collections.clone();
+    for row in &staged.rows {
+        if row.branch_id.as_str() != branch_id {
+            continue;
+        }
+        // A schema the parent generation proves absent has an empty
+        // collection in this branch, so indexing it from this commit forward
+        // is complete and the witness is free. The bloom filter has no false
+        // negatives, so "absent" here is a proof, not a guess. A collection
+        // that predates this plane never gets a witness and keeps scanning.
+        let collection_starts_here =
+            parent_control.is_none_or(|control| !control.may_have_schema(row.schema_key.as_str()));
+        for (ordinal, value) in &row.columns {
+            if collection_starts_here {
+                witnesses.insert((row.schema_key.as_str().to_owned(), *ordinal));
+            }
+            let Some(value) = value else {
+                continue;
+            };
+            entries.push(crate::live_state::HotIndexEntry {
+                schema_key: row.schema_key.as_str().to_owned(),
+                ordinal: *ordinal,
+                value: value.clone(),
+                entity_pk: row.entity_pk.clone(),
+            });
+        }
+    }
+    (entries, witnesses)
+}
+
 fn current_state_delta_from_state_row(
     row: PreparedStateRowRef<'_>,
 ) -> Result<crate::live_state::CurrentStateDeltaRef<'_>, LixError> {
@@ -4311,6 +4363,20 @@ async fn stage_tracked_head(
             ))
             .await?
         };
+        // The index plane is staged from this commit's own rows, so it is
+        // correct whichever physical route above published them, and it lands
+        // in the same write set as the rows themselves.
+        let (index_entries, index_witnesses) =
+            hot_index_writes_for_commit(state_rows, &root.branch_id, parent_control.as_ref());
+        if !index_entries.is_empty() || !index_witnesses.is_empty() {
+            crate::live_state::stage_hot_index_entries(
+                writes,
+                &root.branch_id,
+                generation,
+                &index_entries,
+                &index_witnesses,
+            )?;
+        }
         if let Some(epoch) = working_diff_epoch {
             let next_epoch = TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: epoch.checkpoint_commit_id,

@@ -365,3 +365,13 @@ harness = false
 name = "registered_entity_returning"
 path = "benches/registered_entity_returning.rs"
 harness = false
+
+[[example]]
+name = "exppq_write_scaling"
+path = "examples/exppq_write_scaling.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "exppq_point_query"
+path = "examples/exppq_point_query.rs"
+required-features = ["storage-benches"]

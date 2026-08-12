@@ -222,7 +222,7 @@ where
     let validation_read = SharedStorageAdapterRead::new(validation_read);
     if leader
         .transaction
-        .validate_prepared_writes_by_branch(&validation_read, &merged_writes)
+        .validate_prepared_writes_by_branch(&validation_read, &mut merged_writes)
         .await
         .is_err()
     {

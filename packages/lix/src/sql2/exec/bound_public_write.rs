@@ -7940,3 +7940,97 @@ mod splice_provenance_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod constraints_unchanged_tests {
+    use std::collections::{BTreeMap, HashSet};
+
+    use serde_json::{Value as JsonValue, json};
+
+    use super::assigned_columns_preserve_constraints;
+    use crate::catalog::{SchemaCatalogKey, SchemaPlan};
+    use crate::sql2::derive_entity_surface_spec_from_schema;
+
+    fn schema() -> JsonValue {
+        json!({
+            "x-lix-key": "constraint_probe",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/slug"]],
+            "x-lix-foreign-keys": [{
+                "properties": ["/parentId"],
+                "references": { "schemaKey": "constraint_probe_parent", "properties": ["/id"] }
+            }],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "slug": { "type": "string" },
+                "parentId": { "type": "string" },
+                "payload": { "type": "string" }
+            },
+            "required": ["id", "slug", "parentId", "payload"],
+            "additionalProperties": false
+        })
+    }
+
+    /// `constraints_unchanged` is the one way a row of an indexed schema can
+    /// reach commit with `requires_transaction_validation == false`, so the
+    /// index's completeness rests on it never being granted to an UPDATE that
+    /// touches an indexed column.
+    ///
+    /// It is granted through `assigned_columns_preserve_constraints`, which
+    /// refuses whenever the assignment set touches the primary key, a unique
+    /// group, or a foreign key's local properties — a strict superset of
+    /// `indexed_columns`. This test states that superset relation directly:
+    /// every indexed column, individually, revokes the certificate.
+    #[test]
+    fn every_indexed_column_revokes_the_constraints_unchanged_certificate() {
+        let schema = schema();
+        let spec = derive_entity_surface_spec_from_schema(&schema).expect("spec");
+        assert_eq!(
+            spec.indexed_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parentId", "slug"],
+            "the probe schema must actually declare indexed columns"
+        );
+        let parent = json!({
+            "x-lix-key": "constraint_probe_parent",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let parent_key = SchemaCatalogKey {
+            schema_key: "constraint_probe_parent".to_owned(),
+        };
+        let schema_index = BTreeMap::from([(parent_key.clone(), &parent)]);
+        let key_index = BTreeMap::from([(parent_key, crate::catalog::SchemaPlanId::for_test(0))]);
+        let plan = SchemaPlan::compile_standalone_for_test(
+            SchemaCatalogKey {
+                schema_key: "constraint_probe".to_owned(),
+            },
+            schema,
+            &key_index,
+            &schema_index,
+        )
+        .expect("schema should compile");
+
+        for column in &spec.indexed_columns {
+            let assigned = HashSet::from([column.name.as_str()]);
+            assert!(
+                !assigned_columns_preserve_constraints(&plan, &assigned),
+                "assigning indexed column '{}' must revoke constraints_unchanged",
+                column.name
+            );
+        }
+
+        let untouched = HashSet::from(["payload"]);
+        assert!(
+            assigned_columns_preserve_constraints(&plan, &untouched),
+            "an assignment touching no declared column keeps the certificate, \
+             which is what makes skipping extraction for it sound"
+        );
+    }
+}

@@ -80,6 +80,9 @@ pub const CURRENT_STATE_DATA_PART_SPACE: StorageSpace =
 pub const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace =
     crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE;
 pub const SCOPED_RANGE_NODE_SPACE: StorageSpace = crate::tracked_state::SCOPED_RANGE_NODE_SPACE;
+/// Declared-column access path over the hot rows. Disposable: derived from the
+/// hot rows and reclaimed with its generation.
+pub const HOT_INDEX_SPACE: StorageSpace = crate::live_state::HOT_INDEX_SPACE;
 pub const BINARY_CAS_MANIFEST_SPACE: StorageSpace = crate::binary_cas::BINARY_CAS_MANIFEST_SPACE;
 pub const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace =
     crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE;
@@ -134,6 +137,7 @@ mod tests {
         CURRENT_STATE_DATA_PART_SPACE,
         CURRENT_STATE_DATA_PART_REFS_SPACE,
         SCOPED_RANGE_NODE_SPACE,
+        HOT_INDEX_SPACE,
         BINARY_CAS_MANIFEST_SPACE,
         BINARY_CAS_MANIFEST_CHUNK_SPACE,
         BINARY_CAS_CHUNK_SPACE,

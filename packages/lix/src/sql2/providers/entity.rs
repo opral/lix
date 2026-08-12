@@ -316,6 +316,7 @@ impl EntitySpec {
         apply_exact_branch_id_filter(&mut request, exact_branch_ids);
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
         apply_exact_file_id_filter(&mut request, exact_file_ids_from_filters(filters)?);
+        request.filter.declared_column_eq = declared_column_eq(&self.spec, &row_filters);
         Ok((projected_schema, request, row_filters))
     }
 
@@ -1786,6 +1787,43 @@ pub(super) fn entity_pks_from_primary_key_filters(
             )
         })
         .map(|ids| ids.into_iter().collect()))
+}
+
+/// The first equality on a column this schema declares as unique or as a
+/// foreign key, which the hot index plane can serve as an access path.
+///
+/// The matched filter is deliberately **left in `row_filters`**. Index entries
+/// are never deleted when a value is superseded, so a lookup returns
+/// candidates and this predicate is what rejects the stale ones. It is not a
+/// redundant re-check over a handful of rows — it is the correctness half of
+/// the access path, and removing it reintroduces rows that no longer match.
+fn declared_column_eq(
+    spec: &EntitySurfaceSpec,
+    row_filters: &[EntityRowFilter],
+) -> Option<crate::live_state::DeclaredColumnEq> {
+    row_filters.iter().find_map(|filter| {
+        let EntityRowFilter::ColumnEq { column, value, .. } = filter else {
+            return None;
+        };
+        let indexed = spec
+            .indexed_columns
+            .iter()
+            .find(|candidate| candidate.name == *column)?;
+        let value = match value {
+            EntityFilterValue::String(value) => {
+                crate::live_state::HotIndexValue::String(value.clone())
+            }
+            EntityFilterValue::Integer(value) => {
+                crate::live_state::HotIndexValue::Integer(*value)
+            }
+            _ => return None,
+        };
+        Some(crate::live_state::DeclaredColumnEq {
+            schema_key: spec.schema_key.clone(),
+            ordinal: indexed.ordinal,
+            value,
+        })
+    })
 }
 
 fn apply_exact_entity_pk_filters(
