@@ -249,9 +249,14 @@ where
     }
 }
 
-const SHAPES: [&str; 4] = [
+const SHAPES: [&str; 5] = [
     "insert_file_80line",
     "insert_file_1line",
+    // Byte-identical work to `insert_file_1line`, but the ON CONFLICT clause
+    // makes the planner classify the write as `UpdateContent` instead of
+    // `None`, which is the discriminator for taking the indexed staging route
+    // rather than the whole-branch descriptor scan.
+    "upsert_file_1line",
     "update_file_1line",
     "key_value_write",
 ];
@@ -288,6 +293,18 @@ where
             )
             .await
             .expect("insert 1-line probe file");
+        }
+        "upsert_file_1line" => {
+            lix.execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                &[
+                    Value::Text(format!("/probe/upsert-{probe:05}.txt")),
+                    Value::Blob(document(1, probe).into()),
+                ],
+            )
+            .await
+            .expect("upsert 1-line probe file");
         }
         "update_file_1line" => {
             // Rewrites a resident seeded file, changing exactly one line.
