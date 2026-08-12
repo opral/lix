@@ -933,17 +933,12 @@ fn encode_working_diff_scope_prefix(
     out
 }
 
-const KEY_ESCAPE: u8 = 0xff;
-const KEY_PART_FINAL: u8 = 0x00;
-const KEY_PART_MORE: u8 = 0x01;
-const FILE_ID_NONE: u8 = 0x00;
-const FILE_ID_SOME: u8 = 0x01;
+// The key byte format is shared with the tracked-state tree and lives in one
+// place; see `crate::order_preserving_key`. Re-exported so this module's
+// children keep resolving these names through `use super::*`.
+pub(crate) use crate::order_preserving_key::*;
+
 const GENERATION_BYTES: usize = 16;
-const ENTITY_PK_CODEC_V1: u8 = 0x01;
-const ENTITY_PK_UUID: u8 = 0x00;
-const ENTITY_PK_INTEGER: u8 = 0x01;
-const ENTITY_PK_STRING: u8 = 0x02;
-const ENTITY_PK_BYTES: u8 = 0x03;
 
 /// Order-preserving tracked-head key encoding.
 ///
@@ -958,67 +953,6 @@ fn encode_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
     write_key_string(&mut out, branch_id, KEY_PART_FINAL);
     out.extend_from_slice(generation.as_uuid().as_bytes());
     out
-}
-
-fn write_entity_pk(out: &mut Vec<u8>, entity_pk: &EntityPk) {
-    debug_assert!(
-        !entity_pk.components.is_empty(),
-        "tracked-head entity primary keys must be non-empty"
-    );
-    out.push(ENTITY_PK_CODEC_V1);
-    for (index, component) in entity_pk.components.iter().enumerate() {
-        let terminator = if index + 1 == entity_pk.components.len() {
-            KEY_PART_FINAL
-        } else {
-            KEY_PART_MORE
-        };
-        match component {
-            crate::entity_pk::EntityPkComponent::Uuid(bytes) => {
-                out.push(ENTITY_PK_UUID);
-                out.extend_from_slice(bytes);
-                out.push(terminator);
-            }
-            crate::entity_pk::EntityPkComponent::Integer(value) => {
-                out.push(ENTITY_PK_INTEGER);
-                let ordered = u64::from_be_bytes(value.to_be_bytes()) ^ (1_u64 << 63);
-                out.extend_from_slice(&ordered.to_be_bytes());
-                out.push(terminator);
-            }
-            crate::entity_pk::EntityPkComponent::String(value) => {
-                out.push(ENTITY_PK_STRING);
-                write_key_bytes(out, value.as_bytes(), terminator);
-            }
-            crate::entity_pk::EntityPkComponent::Bytes(value) => {
-                out.push(ENTITY_PK_BYTES);
-                write_key_bytes(out, value, terminator);
-            }
-        }
-    }
-}
-
-fn write_file_id(out: &mut Vec<u8>, file_id: Option<&str>) {
-    match file_id {
-        None => out.push(FILE_ID_NONE),
-        Some(file_id) => {
-            out.push(FILE_ID_SOME);
-            write_key_string(out, file_id, KEY_PART_FINAL);
-        }
-    }
-}
-
-fn write_key_string(out: &mut Vec<u8>, value: &str, terminator: u8) {
-    write_key_bytes(out, value.as_bytes(), terminator);
-}
-
-fn write_key_bytes(out: &mut Vec<u8>, value: &[u8], terminator: u8) {
-    for &byte in value {
-        if byte == KEY_PART_FINAL {
-            out.extend_from_slice(&[KEY_PART_FINAL, KEY_ESCAPE]);
-        } else {
-            out.push(byte);
-        }
-    }
-    out.extend_from_slice(&[KEY_PART_FINAL, terminator]);
 }
 
 fn read_generation(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixError> {

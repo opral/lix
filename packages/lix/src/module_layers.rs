@@ -36,6 +36,11 @@ const MODULE_LAYERS: &[&[&str]] = &[
     // Value types and generic containers layered directly on the key space.
     &["binary_cas", "columnar_row_group", "common", "json_store"],
     &["entity_pk"],
+    // The order-preserving key byte format. A pure encoding over `entity_pk`
+    // with no repository semantics, and the single authority for how a key
+    // encodes. Both state planes store rows in the order it defines, so it must
+    // sit below both and must never read either back.
+    &["order_preserving_key"],
     // The canonical facts: changes, commits, commit-change ids.
     &["changelog"],
     // The collection-replacement marker. Both state planes read it to decide
