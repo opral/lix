@@ -116,6 +116,11 @@ path = "examples/cas_sharing.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
+name = "e3_cas_reclaim_scan"
+path = "examples/e3_cas_reclaim_scan.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
 name = "cas_gc_qualification"
 path = "examples/cas_gc_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
