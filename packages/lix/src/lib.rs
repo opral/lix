@@ -66,6 +66,7 @@ pub(crate) mod hot_state;
 mod module_layers;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
+pub(crate) mod order_preserving_key;
 pub(crate) mod plugin;
 mod plugin_arena;
 mod plugin_layout;
