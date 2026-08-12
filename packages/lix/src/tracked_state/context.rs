@@ -8648,6 +8648,110 @@ mod tests {
         );
     }
 
+    /// The commit-path availability probe proves the resume point is
+    /// *addressable*, not that its whole chunk closure is intact; explicit
+    /// repair still proves the whole closure. Pins both halves, because the
+    /// difference between them is the entire cost argument: the commit path
+    /// walks one root-to-leaf path, repair walks every row.
+    #[tokio::test]
+    async fn availability_proof_is_bounded_on_commit_and_total_on_repair() {
+        use crate::tracked_state::commit_root_rebuild::RootAvailabilityProof;
+
+        let tracked_state = TrackedStateContext::new();
+        let storage = StorageAdapter::new(Memory::new());
+        // Wide enough that the tree is more than one chunk, so "the root chunk"
+        // and "the closure" are actually different sets.
+        let rows = (0..4000)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:06}"),
+                    &format!("gen-change-{index}"),
+                    "gen",
+                    "gen",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_root_for_test(&storage, &tracked_state, "gen", None, &rows)
+            .await
+            .expect("wide genesis root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "a1",
+            "gen",
+            &[row_with_value("entity-a1", "a1-change", "a1", "a1")],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("root read should open");
+        let root_id = storage::load_root(&read, "gen")
+            .await
+            .expect("genesis root should load")
+            .expect("genesis root should exist");
+        drop(read);
+        let chunks = stored_tree_chunk_hashes_for_test(&storage).await;
+        assert!(
+            chunks.len() > 2,
+            "fixture must build a multi-chunk tree, got {} chunks",
+            chunks.len()
+        );
+
+        // Damage a chunk that is not the root and not on the leftmost path, so
+        // only a total traversal can notice it.
+        let mut damaged_chunk = None;
+        for chunk in chunks.iter() {
+            if chunk != root_id.as_bytes() {
+                damaged_chunk = Some(*chunk);
+            }
+        }
+        let damaged_chunk = damaged_chunk.expect("a non-root chunk exists");
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&damaged_chunk)),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("chunk delete should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("probe read should open");
+        let bounded = crate::tracked_state::commit_root_rebuild::
+            load_rebuild_plans_to_nearest_available_root_with_proof(
+                &read,
+                "a1",
+                true,
+                RootAvailabilityProof::Addressable,
+            )
+            .await
+            .expect("bounded probe should load plans");
+        assert_eq!(
+            bounded.len(),
+            1,
+            "the commit path resumes from an addressable root and does not re-derive closure completeness"
+        );
+
+        let total = crate::tracked_state::commit_root_rebuild::
+            load_rebuild_plans_to_nearest_available_root_with_proof(
+                &read,
+                "a1",
+                true,
+                RootAvailabilityProof::Complete,
+            )
+            .await
+            .expect("total probe should load plans");
+        assert_eq!(
+            total.len(),
+            2,
+            "explicit repair must reject a resume point with a damaged closure and replay past it"
+        );
+    }
+
     async fn stored_tree_chunk_hashes_for_test(
         storage: &StorageAdapter,
     ) -> HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]> {
