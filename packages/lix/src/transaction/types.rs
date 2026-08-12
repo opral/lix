@@ -4521,6 +4521,87 @@ mod tests {
     use super::*;
     use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKey};
 
+    fn expdl_probe_certificate(plan: u16) -> CertifiedRawWriteBatchPreparation {
+        CertifiedRawWriteBatchPreparation {
+            schema_plan_id: SchemaPlanId::for_test(plan),
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: None,
+        }
+    }
+
+    fn expdl_probe_batch(keys: &[&str], untracked: bool) -> PreparedStateBatch {
+        let entity_pks = keys.iter().map(|key| EntityPk::single(key)).collect();
+        let snapshots = keys
+            .iter()
+            .map(|key| {
+                TransactionJson::from_certified_shared_normalized_row_content(
+                    format!(r#"{{"id":"{key}"}}"#).into(),
+                )
+            })
+            .collect::<Vec<_>>();
+        CertifiedParameterInsertBatch::new_with_lane(
+            entity_pks,
+            snapshots,
+            "expdl_probe".into(),
+            "main".into(),
+            untracked,
+            expdl_probe_certificate(7),
+        )
+        .expect("certified rows should construct")
+        .into_dense_prepared(
+            None,
+            LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z"),
+        )
+        .expect("certified rows should prepare")
+    }
+
+    /// A dense certified batch must report the same durability lane through
+    /// both of its projections. The borrowed accessor reads
+    /// `dense.untracked`; expansion into row slots must not invent one.
+    #[test]
+    fn expdl_dense_certified_expansion_preserves_untracked_lane() {
+        let mut prepared = expdl_probe_batch(&["a", "b"], true);
+
+        assert!(prepared.is_dense_certified_parameter());
+        assert!(
+            prepared.iter().all(|row| row.untracked),
+            "dense projection must report the untracked lane"
+        );
+
+        prepared.set_durable_predecessor(0, None);
+
+        assert!(!prepared.is_dense_certified_parameter());
+        assert!(
+            prepared.iter().all(|row| row.untracked),
+            "expansion must not move untracked rows into the tracked lane"
+        );
+    }
+
+    /// Two dense cohorts only merge when every batch-common fact matches.
+    /// The durability lane is batch-common, so a tracked cohort must never
+    /// absorb an untracked one.
+    #[test]
+    fn expdl_dense_certified_cohort_merge_keeps_lanes_apart() {
+        let mut tracked = expdl_probe_batch(&["a", "b"], false);
+        let untracked = expdl_probe_batch(&["c", "d"], true);
+
+        tracked.append(untracked);
+
+        assert_eq!(tracked.len(), 4);
+        assert_eq!(
+            tracked
+                .iter()
+                .map(|row| row.untracked)
+                .collect::<Vec<_>>(),
+            vec![false, false, true, true],
+            "merging cohorts must preserve each row's durability lane"
+        );
+    }
+
     #[test]
     fn certified_parameter_rows_keep_batch_common_prepared_facts_dense() {
         let entity_pks = vec![EntityPk::single("a"), EntityPk::single("b")];
