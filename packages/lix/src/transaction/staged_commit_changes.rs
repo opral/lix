@@ -24,7 +24,6 @@ use crate::tracked_state::TrackedStateDiffIdentity;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedCommitChangeRefs {
     pub(crate) commit_id: CommitId,
-    pub(crate) commit_change_id: ChangeId,
     /// Every normal branch-head publication has a distinct public
     /// `lixcol_change_id`, even though v6 stores the moving ref directly
     /// rather than as a flat current row.
@@ -52,7 +51,6 @@ impl Default for StagedCommitChangeRefs {
     fn default() -> Self {
         Self {
             commit_id: CommitId::default(),
-            commit_change_id: ChangeId::default(),
             branch_ref_change_id: ChangeId::default(),
             created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
             tracked_change_count: 0,
@@ -299,13 +297,11 @@ impl StagedCommitChangeRefs {
 
     pub(crate) fn new(
         commit_id: CommitId,
-        commit_change_id: ChangeId,
         branch_ref_change_id: ChangeId,
         created_at: LixTimestamp,
     ) -> Self {
         Self {
             commit_id,
-            commit_change_id,
             branch_ref_change_id,
             created_at,
             tracked_change_count: 0,

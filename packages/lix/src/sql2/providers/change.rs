@@ -9,7 +9,7 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
-    ChangelogContext, ChangelogReader, CommitId,
+    ChangelogContext, ChangelogReader,
 };
 use crate::serialize_row_metadata;
 
@@ -22,9 +22,8 @@ use crate::sql2::change_materialization::{
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
+    StorageAdapterRead,
 };
-use bytes::Bytes;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};

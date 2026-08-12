@@ -6185,7 +6185,6 @@ struct FinalizedCommitRow {
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
     created_at: LixTimestamp,
-    change_id: ChangeId,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
 }
 
@@ -6213,14 +6212,12 @@ async fn finalize_commit_rows(
         let change_refs = intermediate.change_refs;
         let commit_id = change_refs.commit_id;
         let created_at = change_refs.created_at;
-        let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let selected_change_batches = change_refs.into_selected_change_batches();
         commit_rows.push(FinalizedCommitRow {
             commit_id,
             parent_commit_ids: vec![intermediate.parent_commit_id],
             created_at,
-            change_id: commit_change_id,
             selected_change_batches,
         });
         tracked_roots.push(PendingTrackedRoot {
@@ -6239,7 +6236,6 @@ async fn finalize_commit_rows(
         }
 
         let commit_id = change_refs.commit_id;
-        let commit_change_id = change_refs.commit_change_id;
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let timestamp = change_refs.created_at;
         let selected_change_batches = change_refs.into_selected_change_batches();
@@ -6272,7 +6268,6 @@ async fn finalize_commit_rows(
             commit_id,
             parent_commit_ids: parent_commit_ids.clone(),
             created_at: timestamp,
-            change_id: commit_change_id,
             selected_change_batches,
         });
         tracked_roots.push(PendingTrackedRoot {
@@ -7958,7 +7953,6 @@ mod tests {
                 change_refs_with(
                     [row_change],
                     target_commit,
-                    "same-write-branch-commit-change",
                     "same-write-global-ref-change",
                 ),
             )]),
@@ -8445,7 +8439,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-first-change"],
                         "rootless-first-commit",
-                        "rootless-first-commit-change",
                         "rootless-first-branch-ref-change",
                     ),
                 )]),
@@ -8498,7 +8491,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-second-change"],
                         "rootless-second-commit",
-                        "rootless-second-commit-change",
                         "rootless-second-branch-ref-change",
                     ),
                 )]),
@@ -8551,7 +8543,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-third-change"],
                         "rootless-third-commit",
-                        "rootless-third-commit-change",
                         "rootless-third-branch-ref-change",
                     ),
                 )]),
@@ -8596,7 +8587,6 @@ mod tests {
                     change_refs_with(
                         ["rootless-delete-change"],
                         "rootless-delete-commit",
-                        "rootless-delete-commit-change",
                         "rootless-delete-branch-ref-change",
                     ),
                 )]),
@@ -8758,7 +8748,6 @@ mod tests {
                     change_refs_with(
                         ["fence-normal-change"],
                         "fence-normal-commit",
-                        "fence-normal-commit-change",
                         "fence-normal-branch-ref-change",
                     ),
                 )]),
@@ -8783,7 +8772,6 @@ mod tests {
         let mut fence_refs = change_refs_with(
             [],
             "fence-commit",
-            "fence-commit-change",
             "fence-branch-ref-change",
         );
         fence_refs.add_selected_change_batch(selected_change_batch_from(
@@ -9039,7 +9027,6 @@ mod tests {
                     change_refs_with(
                         ["first-local-change"],
                         "first-local-commit",
-                        "first-local-commit-change",
                         "first-local-branch-ref-change",
                     ),
                 )]),
@@ -9083,7 +9070,6 @@ mod tests {
                     change_refs_with(
                         ["second-local-change"],
                         "second-local-commit",
-                        "second-local-commit-change",
                         "second-local-branch-ref-change",
                     ),
                 )]),
@@ -9136,7 +9122,6 @@ mod tests {
                     change_refs_with(
                         ["epoch-first-change"],
                         "epoch-first-commit",
-                        "epoch-first-commit-change",
                         "epoch-first-branch-ref-change",
                     ),
                 )]),
@@ -9197,7 +9182,6 @@ mod tests {
                     change_refs_with(
                         ["epoch-second-change"],
                         "epoch-second-commit",
-                        "epoch-second-commit-change",
                         "epoch-second-branch-ref-change",
                     ),
                 )]),
@@ -9270,7 +9254,6 @@ mod tests {
                     change_refs_with(
                         ["global-override-change", "global-fallback-change"],
                         "global-head",
-                        "global-head-commit-change",
                         "global-head-ref-change",
                     ),
                 )]),
@@ -9310,7 +9293,6 @@ mod tests {
                     change_refs_with(
                         ["branch-override-change"],
                         "branch-head",
-                        "branch-head-commit-change",
                         "branch-head-ref-change",
                     ),
                 )]),
@@ -9424,7 +9406,6 @@ mod tests {
                     change_refs_with(
                         ["branch-tombstone-change"],
                         "branch-tombstone-head",
-                        "branch-tombstone-head-commit-change",
                         "branch-tombstone-head-ref-change",
                     ),
                 )]),
@@ -9886,7 +9867,6 @@ mod tests {
                         change_refs_with(
                             ["setup-tracked-change"],
                             "setup-commit",
-                            "setup-commit-change",
                             "setup-branch-ref-change",
                         ),
                     )]),
@@ -10409,7 +10389,6 @@ mod tests {
                 change_refs_with(
                     [row_change_label],
                     commit_label,
-                    commit_change_label,
                     branch_ref_change_label,
                 ),
             )]),
@@ -10453,7 +10432,6 @@ mod tests {
                 change_refs_with(
                     [row_change_label],
                     commit_label,
-                    commit_change_label,
                     branch_ref_change_label,
                 ),
             )]),
@@ -10528,18 +10506,16 @@ mod tests {
     }
 
     fn change_refs<const N: usize>(change_ids: [&str; N]) -> StagedCommitChangeRefs {
-        change_refs_with(change_ids, "test-uuid-1", "test-uuid-2", "test-uuid-3")
+        change_refs_with(change_ids, "test-uuid-1", "test-uuid-3")
     }
 
     fn change_refs_with<const N: usize>(
         change_ids: [&str; N],
         commit_id_label: &str,
-        commit_change_id_label: &str,
         branch_ref_change_id_label: &str,
     ) -> StagedCommitChangeRefs {
         let mut change_refs = StagedCommitChangeRefs::new(
             commit_id(commit_id_label),
-            change_id(commit_change_id_label),
             change_id(branch_ref_change_id_label),
             ts("2026-01-01T00:00:00.001Z"),
         );

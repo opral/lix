@@ -110,12 +110,6 @@ impl EncodedChangelogBatch {
         Ok(())
     }
 
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        let start = self.value_bytes.len();
-        self.value_bytes.extend_from_slice(value);
-        self.put_range(key, start..self.value_bytes.len());
-    }
-
     fn put_range(&mut self, key: &[u8], value: std::ops::Range<usize>) {
         let key_start = self.key_bytes.len();
         self.key_bytes.extend_from_slice(key);
@@ -485,6 +479,9 @@ where
             })?;
         }
         for commit in &commits {
+            commit_batch.try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
+                append_commit_record(bytes, commit)
+            })?;
         }
         change_batch.stage(self.writes, CHANGE_SPACE);
         commit_batch.stage(self.writes, COMMIT_SPACE);

@@ -433,7 +433,7 @@ pub(crate) fn next_first_parent_jump(
 
 #[cfg(test)]
 mod topology_tests {
-    use super::{ChangeId, CommitId, CommitRecord, next_first_parent_jump};
+    use super::{CommitId, CommitRecord, next_first_parent_jump};
     use crate::common::LixTimestamp;
 
     #[test]
