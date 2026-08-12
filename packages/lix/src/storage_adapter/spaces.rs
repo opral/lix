@@ -4,7 +4,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue, SpaceId,
-    StorageError, StorageSpace,
+    StorageError, StorageSpace, ValueSemantics,
 };
 use crate::storage_adapter::{StorageAdapterRead, exact_get_many};
 
@@ -18,8 +18,11 @@ use crate::storage_adapter::{StorageAdapterRead, exact_get_many};
 ///
 /// Every key holds an opaque uuid-v7 token whose only meaningful operation is
 /// equality: "did this fact change since I read it".
-pub(crate) const REVISION_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0007_0000), "lix.revision.v1");
+pub(crate) const REVISION_SPACE: StorageSpace = StorageSpace::declare(
+    SpaceId(0x0007_0000),
+    "lix.revision.v1",
+    ValueSemantics::Mutable,
+);
 
 /// Binary-CAS reclamation token. Rotated only by an authenticated CAS sweep,
 /// and asserted unchanged by every CAS publisher, so a publisher that planned

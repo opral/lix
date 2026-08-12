@@ -65,8 +65,6 @@ pub(crate) use row_materialization::{
 pub(crate) use scoped_current_state::attest_scoped_range_root;
 pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
 pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
-#[cfg(not(any(test, feature = "storage-benches")))]
-pub(crate) use storage::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE;
 pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::stage_commit_state_manifest;
@@ -101,12 +99,11 @@ pub(crate) use storage::{
     RetainedPhysicalState, load_native_current_state_part_owners,
     stage_retire_commit_physical_state,
 };
-// The storage-space constants are what the space registry
-// (`crate::storage_spaces`) and its layout invariants are built from, so they
-// must be reachable whenever tests compile, not only under `storage-benches`.
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::decode_change_locator;
-#[cfg(any(test, feature = "storage-benches"))]
+// The storage-space constants are what the space registry
+// (`crate::storage_spaces`) and its layout invariants are built from. The
+// registry is compiled in every configuration, so these are too.
 pub(crate) use storage::{
     TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
     TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,

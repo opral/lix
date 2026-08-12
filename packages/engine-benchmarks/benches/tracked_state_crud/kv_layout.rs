@@ -9,8 +9,12 @@ use lix::storage_adapter::{
 use crate::storage::{ProfileStorage as RawProfileStorage, RocksDB, StorageProfile};
 use crate::workload::{WorkloadRow, snapshot_value};
 
+/// This microbench drives a standalone RocksDB store, not a repository, so it
+/// owns its space outright. It used to borrow `0x0002_0001`, which the engine
+/// registers as `json_store.json`; bench-owned ids live in `0x00ff_....`,
+/// which the registry never allocates.
 const ROW_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0002_0001), "tracked_state.crud.row.v1");
+    StorageSpace::mutable(SpaceId(0x00ff_0007), "tracked_state.crud.row.v1");
 
 #[derive(Clone)]
 struct BenchRow {

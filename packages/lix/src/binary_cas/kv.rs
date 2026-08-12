@@ -17,8 +17,8 @@ use crate::binary_cas::{
 use crate::storage_adapter::StoragePrefix;
 use crate::storage_adapter::{
     PointReadPlan, REVISION_KEY_BINARY_CAS_PUBLICATION, REVISION_KEY_BINARY_CAS_RECLAMATION,
-    REVISION_SPACE, StorageAdapterRead, StorageSpace, StorageWriteSet, load_revision,
-    load_revisions, revision_key,
+    REVISION_SPACE, StorageAdapterRead, StorageSpace, StorageWriteSet, ValueSemantics,
+    load_revision, load_revisions, revision_key,
 };
 use crate::storage_adapter::{
     StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange,
@@ -45,17 +45,25 @@ pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
 pub(crate) const BINARY_CAS_CHUNK_PRESENCE_NAMESPACE: &str = "binary_cas.chunk_presence";
-pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
-pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0005_0001),
+    BINARY_CAS_MANIFEST_NAMESPACE,
+    ValueSemantics::Mutable,
+);
+pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0005_0002),
     BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
+    ValueSemantics::Mutable,
 );
-pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace =
-    StorageSpace::immutable(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
-pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0005_0003),
+    BINARY_CAS_CHUNK_NAMESPACE,
+    ValueSemantics::Immutable,
+);
+pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0005_0004),
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
+    ValueSemantics::Mutable,
 );
 fn fresh_revision_token() -> StorageValue {
     StorageValue {

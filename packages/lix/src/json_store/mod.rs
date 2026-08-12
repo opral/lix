@@ -6,8 +6,8 @@ pub(crate) mod types;
 
 #[allow(unused_imports)]
 pub(crate) use context::{JsonStoreContext, JsonStoreReader, JsonStoreWriter};
-// Owner facade for the storage-space registry (`crate::storage_spaces`).
-#[cfg(any(test, feature = "storage-benches"))]
+// Owner facade for the storage-space registry (`crate::storage_spaces`),
+// which is compiled in every configuration.
 pub(crate) use store::JSON_SPACE;
 pub(crate) use types::{
     JSON_INLINE_MAX_BYTES, JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef,

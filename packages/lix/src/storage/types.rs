@@ -30,19 +30,94 @@ pub struct StorageSpace {
 }
 
 impl StorageSpace {
-    pub const fn mutable(id: SpaceId, name: &'static str) -> Self {
+    /// Declares the one value semantics a space id has.
+    ///
+    /// This is the registry's constructor and nothing else should reach for
+    /// it. `mutable` and `immutable` below *check* their argument against
+    /// `storage_spaces::ALL_STORAGE_SPACES`, so the declarations that registry
+    /// is built from cannot go through them without a const-evaluation cycle.
+    /// The split is the point: one constructor states a pairing, the other two
+    /// are uses that must agree with it.
+    pub(crate) const fn declare(
+        id: SpaceId,
+        name: &'static str,
+        value_semantics: ValueSemantics,
+    ) -> Self {
         Self {
             id,
             name,
-            value_semantics: ValueSemantics::Mutable,
+            value_semantics,
         }
     }
 
+    /// A mutable space. Registered ids are checked against the registry.
+    ///
+    /// A space id has exactly one value semantics, and both adapters *place*
+    /// data by that declaration rather than merely recording it: RocksDB puts
+    /// immutable spaces in a separate column family (`rocksdb.rs:253-265`) and
+    /// SlateDB moves immutable values out of the LSM into per-publication
+    /// object segments, leaving a locator behind (`slatedb.rs:3395-3460`). A
+    /// space handed to a backend as mutable on one path and immutable on
+    /// another therefore writes one physical location and reads another.
+    ///
+    /// So this is an assertion in const context, which is a compile error:
+    /// re-declaring a registered space with the other semantics does not
+    /// build. Ids the registry does not own are unconstrained, because adapter
+    /// and conformance suites legitimately reuse small ids such as
+    /// `SpaceId(7)` for both semantics.
+    pub const fn mutable(id: SpaceId, name: &'static str) -> Self {
+        assert!(
+            crate::storage_spaces::may_declare(id, ValueSemantics::Mutable),
+            "this space id is registered immutable in ALL_STORAGE_SPACES; read \
+             the space back from the registry instead of re-declaring it"
+        );
+        Self::declare(id, name, ValueSemantics::Mutable)
+    }
+
+    /// An immutable space. Registered ids are checked against the registry;
+    /// see [`StorageSpace::mutable`] for why that check is worth a panic.
     pub const fn immutable(id: SpaceId, name: &'static str) -> Self {
+        assert!(
+            crate::storage_spaces::may_declare(id, ValueSemantics::Immutable),
+            "this space id is registered mutable in ALL_STORAGE_SPACES; read \
+             the space back from the registry instead of re-declaring it"
+        );
+        Self::declare(id, name, ValueSemantics::Immutable)
+    }
+
+    /// The same space id and name, re-declared mutable, for corruption tests.
+    ///
+    /// A space id has exactly one value semantics
+    /// (`storage_spaces::ALL_STORAGE_SPACES`), and both adapters act on that
+    /// declaration physically: RocksDB routes immutable spaces to a separate
+    /// column family (`rocksdb.rs:253-265`) and SlateDB stores only a locator
+    /// in the LSM while the value moves to a per-publication object segment
+    /// (`slatedb.rs:3395-3460`). Handing the same id to a backend with two
+    /// different semantics therefore writes one physical location and reads
+    /// another.
+    ///
+    /// Corruption tests still need to place chosen bytes under a key the
+    /// engine publishes write-once. This constructor exists so that need is
+    /// spelled out at the call site instead of being smuggled in as a second
+    /// `StorageSpace::mutable(SOME_SPACE.id, ..)` declaration that reads like
+    /// a canonical one. It is `cfg(test)`, so no production path can reach it,
+    /// and the registry drift guard treats every remaining raw re-declaration
+    /// as a defect.
+    ///
+    /// **The state it fabricates is faithful only on the in-memory backend**,
+    /// which stores mutable and immutable values under the same physical key
+    /// and differs only in the write-once check (`storage/in_memory.rs:388`).
+    /// A test that must corrupt an immutable value on a real backend has to
+    /// delete the key in one committed write set and publish the replacement
+    /// through the canonical immutable space in a second — see
+    /// `engine-benchmarks/tests/corruption_recovery_qualification.rs`'s
+    /// `replace_immutable_value_with_corruption`.
+    #[cfg(test)]
+    pub(crate) const fn mutable_view_for_corruption_test(self) -> Self {
         Self {
-            id,
-            name,
-            value_semantics: ValueSemantics::Immutable,
+            id: self.id,
+            name: self.name,
+            value_semantics: ValueSemantics::Mutable,
         }
     }
 }

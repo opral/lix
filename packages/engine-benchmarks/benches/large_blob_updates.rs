@@ -32,6 +32,15 @@ const MANIFEST_SPACE: SpaceId = SpaceId(0x0005_0001);
 const MANIFEST_CHUNK_SPACE: SpaceId = SpaceId(0x0005_0002);
 const PAYLOAD_SPACE: SpaceId = SpaceId(0x0005_0003);
 const PRESENCE_SPACE: SpaceId = SpaceId(0x0005_0004);
+/// The null-control lane's own space, outside the engine registry.
+///
+/// `raw_backend_initial_write` deliberately bypasses the binary CAS and stores
+/// plain payload bytes. It used to write those bytes to `PAYLOAD_SPACE`, which
+/// the engine registers as `binary_cas.chunk` with immutable semantics, so the
+/// same id reached the backend as mutable on this lane and immutable
+/// everywhere else — one physical location written, another read. Bench-owned
+/// ids live in `0x00ff_....`, which the registry never allocates.
+const RAW_PAYLOAD_SPACE: SpaceId = SpaceId(0x00ff_0006);
 const UPSERT_SQL: &str = "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                           ON CONFLICT (path) DO UPDATE SET content = excluded.content";
 
@@ -375,7 +384,7 @@ where
     async fn write(&self, prepared: PreparedWrite) -> u64 {
         if matches!(self.workload.operation, Operation::RawBackendInitialWrite) {
             let adapter = StorageAdapter::new(self.storage.clone());
-            let payload_space = StorageSpace::mutable(SpaceId(0x0005_0003), "bench.raw_payload");
+            let payload_space = StorageSpace::mutable(RAW_PAYLOAD_SPACE, "bench.raw_payload");
             let mut offset = 0usize;
             while offset < self.workload.size {
                 let len = (self.workload.size - offset).min(lix::FILE_UPLOAD_PART_BYTES);
@@ -515,12 +524,16 @@ struct SpaceAccounting {
     value_bytes: u64,
 }
 
-/// A physical space id has exactly one value semantics per fixture, and the
-/// accounting scan must use the one the operation under test actually wrote
-/// with. `raw_backend_initial_write` deliberately bypasses the binary CAS and
-/// stores plain payload bytes in the payload space, so scanning that space as
-/// `immutable` would hand raw payload bytes to the immutable-locator decoder
-/// and fail with `Corruption("immutable segment locator is invalid")`.
+/// A physical space id has exactly one value semantics, and it is declared in
+/// the engine registry, not here. Reading it back through
+/// `storage_bench::storage_space_by_id` is what keeps this scan pointed at the
+/// physical location the engine actually wrote: scanning `binary_cas.chunk` as
+/// mutable reads the wrong RocksDB column family, and scanning a mutable space
+/// as immutable hands raw bytes to the immutable-locator decoder and fails
+/// with `Corruption("immutable segment locator is invalid")`.
+///
+/// The null-control lane is the one space this bench owns, so it is the one
+/// space this bench declares.
 async fn space_accounting<S>(
     storage: &S,
     space: SpaceId,
@@ -529,13 +542,11 @@ async fn space_accounting<S>(
 where
     S: Storage,
 {
-    let payload_is_immutable = !matches!(operation, Operation::RawBackendInitialWrite);
-    let space = if space == PAYLOAD_SPACE && payload_is_immutable {
-        StorageSpace::immutable(space, "benchmark.binary_cas_payload")
-    } else if space == PAYLOAD_SPACE {
-        StorageSpace::mutable(space, "bench.raw_payload")
+    let space = if space == PAYLOAD_SPACE && matches!(operation, Operation::RawBackendInitialWrite)
+    {
+        StorageSpace::mutable(RAW_PAYLOAD_SPACE, "bench.raw_payload")
     } else {
-        StorageSpace::mutable(space, "benchmark.binary_cas_metadata")
+        lix::storage_bench::storage_space_by_id(space.0)
     };
     let read = storage
         .begin_read(ReadOptions::default())
