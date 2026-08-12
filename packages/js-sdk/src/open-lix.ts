@@ -7,11 +7,10 @@ import {
 	ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
 	ACTIVE_BRANCH_CLIENT_STATE_KEY,
 	openClientState,
-	openStoredClientState,
 } from "./client-state.js";
 import { Lix } from "./lix.js";
 import type {
-	LixSnapshotStorage,
+	IndexedDbStorageOptions,
 	LocalFilesystemOptions,
 	OpenLixOptions,
 } from "./types.js";
@@ -19,6 +18,18 @@ import type {
 export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
 
 const openLocalFilesystems = new WeakMap<LocalFilesystem, LixBinding | null>();
+const openIndexedDbStorageNames = new Set<string>();
+
+export class IndexedDbStorage {
+	readonly name: string;
+
+	constructor(options: IndexedDbStorageOptions) {
+		if (!options || typeof options.name !== "string" || options.name.length === 0) {
+			throw new TypeError("IndexedDbStorage requires a non-empty name");
+		}
+		this.name = options.name;
+	}
+}
 
 export class LocalFilesystem {
 	readonly path: string;
@@ -100,11 +111,30 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		if (options.storage === undefined) {
 			return new Lix(await openRemoteLixBinding(options.server));
 		}
-		assertSnapshotStorage(options.storage);
-		const clientState = await openStoredClientState({
-			storage: options.storage,
-			namespace: remoteClientStateNamespace(options.server.url),
-		});
+		assertIndexedDbStorage(options.storage);
+		const storage = options.storage;
+		const databaseName = remoteIndexedDbName(storage.name, options.server.url);
+		const { openLixWorkerBinding } = await import("./worker/client.js");
+		if (openIndexedDbStorageNames.has(databaseName)) {
+			throw new Error("IndexedDbStorage is already open");
+		}
+		openIndexedDbStorageNames.add(databaseName);
+		let clientBinding: LixBinding | undefined;
+		let clientState: Awaited<ReturnType<typeof openClientState>> | undefined;
+		try {
+			clientBinding = await openLixWorkerBinding(
+				{ kind: "indexedDb", name: databaseName },
+				() => openIndexedDbStorageNames.delete(databaseName),
+			);
+			clientState = await openClientState({
+				binding: clientBinding,
+				closeBinding: true,
+			});
+		} catch (error) {
+			openIndexedDbStorageNames.delete(databaseName);
+			await clientBinding?.close().catch(() => undefined);
+			throw error;
+		}
 
 		const restoredBranchId = clientState.get<string>(
 			ACTIVE_BRANCH_CLIENT_STATE_KEY,
@@ -174,47 +204,40 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			throw error;
 		}
 	}
-	if (isSnapshotStorage(options.storage)) {
-		const { openPersistentLixWorkerBinding } =
-			await import("./worker/client.js");
-		const binding = await openPersistentLixWorkerBinding({
-			storage: options.storage,
-			namespace: "local",
-			telemetry: options.telemetry,
-		});
+	if (options.storage instanceof IndexedDbStorage) {
+		const storage = options.storage;
+		const databaseName = storage.name;
+		if (openIndexedDbStorageNames.has(databaseName)) {
+			throw new Error("IndexedDbStorage is already open");
+		}
+		openIndexedDbStorageNames.add(databaseName);
+		let binding: LixBinding | undefined;
 		try {
+			binding = await openLixWorkerBinding(
+				{ kind: "indexedDb", name: databaseName },
+				() => openIndexedDbStorageNames.delete(databaseName),
+				options.telemetry,
+			);
 			const clientState = await openClientState({ binding });
 			return new Lix(binding, clientState);
 		} catch (error) {
-			await binding.close().catch(() => undefined);
+			openIndexedDbStorageNames.delete(databaseName);
+			await binding?.close().catch(() => undefined);
 			throw error;
 		}
 	}
 	throw new TypeError(
-		"openLix() requires storage to be LocalFilesystem or a Lix snapshot storage adapter",
+		"openLix() requires storage to be LocalFilesystem or IndexedDbStorage",
 	);
 }
 
-function isSnapshotStorage(value: unknown): value is LixSnapshotStorage {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		typeof (value as Partial<LixSnapshotStorage>).load === "function" &&
-		typeof (value as Partial<LixSnapshotStorage>).save === "function"
-	);
-}
-
-function assertSnapshotStorage(
-	value: unknown,
-): asserts value is LixSnapshotStorage {
-	if (!isSnapshotStorage(value)) {
-		throw new TypeError(
-			"openLix() remote storage must implement load() and save()",
-		);
+function assertIndexedDbStorage(value: unknown): asserts value is IndexedDbStorage {
+	if (!(value instanceof IndexedDbStorage)) {
+		throw new TypeError("openLix() remote storage must be IndexedDbStorage");
 	}
 }
 
-function remoteClientStateNamespace(value: string | URL): string {
+function remoteIndexedDbName(storageName: string, value: string | URL): string {
 	let url: URL;
 	try {
 		url = new URL(value);
@@ -224,7 +247,7 @@ function remoteClientStateNamespace(value: string | URL): string {
 	url.pathname = url.pathname.replace(/\/$/, "");
 	url.search = "";
 	url.hash = "";
-	return `remote:${url.href}`;
+	return `${storageName}:remote:${url.href}`;
 }
 
 function isBranchNotFoundError(

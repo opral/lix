@@ -264,7 +264,7 @@ where
             let chunks = if content.is_empty() {
                 Vec::new()
             } else {
-                writer.stage_fixed_part(&content).await?
+                writer.stage_upload_part(&content).await?
             };
             drop(writer);
             let leaf = UploadManifestLeaf {
@@ -411,7 +411,7 @@ where
         let receipt = self
             .binary_cas
             .writer_skipping_existing_chunks(&read, &mut finalization_writes)
-            .stage_fixed_manifest(&receipts)?;
+            .stage_upload_manifest(&receipts)?;
         let complete = UploadState::Complete(UploadComplete {
             path: state.path.clone(),
             total_size: state.total_size,
@@ -659,12 +659,12 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
     let part_size = u64::from_be_bytes(
         value[8..16]
             .try_into()
-            .expect("fixed upload manifest leaf part size"),
+            .expect("upload manifest leaf part size"),
     );
     let chunk_count = u32::from_be_bytes(
         value[16..20]
             .try_into()
-            .expect("fixed upload manifest leaf chunk count"),
+            .expect("upload manifest leaf chunk count"),
     ) as usize;
     let expected_len = HEADER_BYTES
         .checked_add(chunk_count.saturating_mul(40))
@@ -682,7 +682,7 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
         let size_bytes = u64::from_be_bytes(
             encoded[32..]
                 .try_into()
-                .expect("fixed upload manifest leaf chunk size"),
+                .expect("upload manifest leaf chunk size"),
         );
         chunks.push(BlobChunkReceipt {
             hash: ChunkHash::from_bytes(hash),
@@ -905,15 +905,15 @@ mod tests {
         let mut writes = storage.new_write_set();
         let receipts = crate::binary_cas::BinaryCasContext::new()
             .writer_skipping_existing_chunks(&read, &mut writes)
-            .stage_fixed_part(payload)
+            .stage_upload_part(payload)
             .await
-            .expect("orphan fixed chunk should stage");
+            .expect("orphan upload chunk should stage");
         assert_eq!(receipts.len(), 1);
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("orphan fixed chunk should commit");
+            .expect("orphan upload chunk should commit");
         receipts[0].hash
     }
 
@@ -979,7 +979,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         let chunks = crate::binary_cas::BinaryCasContext::new()
             .writer_skipping_existing_chunks(read, &mut writes)
-            .stage_fixed_part(payload)
+            .stage_upload_part(payload)
             .await
             .expect("deduplicated receipt chunk should stage");
         assert_eq!(
@@ -1635,7 +1635,12 @@ mod tests {
                 panic!("manifest leaf scan must return values");
             };
             let leaf = decode_upload_manifest_leaf(&value).expect("decode manifest leaf");
-            assert_eq!(leaf.chunks.len(), FILE_UPLOAD_PART_BYTES / (1024 * 1024));
+            assert!(!leaf.chunks.is_empty());
+            assert_eq!(
+                leaf.chunks.iter().map(|chunk| chunk.size_bytes).sum::<u64>(),
+                FILE_UPLOAD_PART_BYTES as u64,
+                "a part's content-defined chunks must tile the part exactly"
+            );
         }
         drop(cursor);
         drop(read);

@@ -7,6 +7,7 @@ type ContractLix = Awaited<ReturnType<ContractSdk["openLix"]>>;
 export type MemoryStorageContractOptions = {
 	name: string;
 	loadSdk: () => Promise<ContractSdk>;
+	openStorage?: () => Promise<ContractLix>;
 	operationTimeoutMs?: number;
 	supportsPluginExecution?: boolean;
 };
@@ -14,6 +15,7 @@ export type MemoryStorageContractOptions = {
 export function registerMemoryStorageContract({
 	name,
 	loadSdk,
+	openStorage,
 	operationTimeoutMs = 5_000,
 	supportsPluginExecution = true,
 }: MemoryStorageContractOptions): void {
@@ -23,7 +25,7 @@ export function registerMemoryStorageContract({
 	describe(`${name} memory-storage public contract`, () => {
 		test("round-trips values, blobs, and JSON and preserves structured errors", async () => {
 			const { openLix, Value } = await loadSdk();
-			const lix = await wait(openLix(), "open memory Lix");
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 
 			try {
 				const scalar = await lix.execute("SELECT $1 AS text, $2 AS flag, $3 AS count", [
@@ -79,7 +81,7 @@ export function registerMemoryStorageContract({
 
 		test("commits and rolls back transactions and survives a rejected close", async () => {
 			const { openLix } = await loadSdk();
-			const lix = await wait(openLix(), "open memory Lix");
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 
 			const committed = await lix.beginTransaction();
 			await committed.execute(
@@ -118,7 +120,7 @@ export function registerMemoryStorageContract({
 
 		test("executes ordered atomic batches with per-statement parameters", async () => {
 			const { openLix } = await loadSdk();
-			const lix = await wait(openLix(), "open memory Lix");
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 
 			try {
 				const oneStatement = await lix.executeBatch([
@@ -256,7 +258,7 @@ export function registerMemoryStorageContract({
 
 		test("creates, switches, previews, and merges branches", async () => {
 			const { openLix } = await loadSdk();
-			const lix = await wait(openLix(), "open memory Lix");
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 
 			try {
 				const main = await lix.activeBranchId();
@@ -286,7 +288,7 @@ export function registerMemoryStorageContract({
 
 		test("observe emits its initial snapshot and a committed update", async () => {
 			const { openLix } = await loadSdk();
-			const lix = await wait(openLix(), "open memory Lix");
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 			const events = lix.observe(
 				"SELECT key, value FROM lix_key_value WHERE key = $1",
 				["contract-observe"],
@@ -312,7 +314,7 @@ export function registerMemoryStorageContract({
 
 		test("observe reports only the final committed batch state", async () => {
 			const { openLix } = await loadSdk();
-			const lix = await wait(openLix(), "open memory Lix");
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 			const events = lix.observe(
 				"SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
 				["batch-observe-a", "batch-observe-b"],
@@ -361,7 +363,7 @@ export function registerMemoryStorageContract({
 
 		test("observe rejects concurrent next and close resolves the pending next", async () => {
 			const { openLix } = await loadSdk();
-			const lix = await wait(openLix(), "open memory Lix");
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 			const events = lix.observe(
 				"SELECT key FROM lix_key_value WHERE key = $1",
 				["contract-observe-pending"],
@@ -383,7 +385,7 @@ export function registerMemoryStorageContract({
 			"executes the bundled CSV plugin",
 			async () => {
 				const { bundledPluginArchives, openLix } = await loadSdk();
-				const lix = await wait(openLix(), "open memory Lix");
+				const lix = await wait((openStorage ?? openLix)(), "open Lix");
 				try {
 					const archives = await wait(
 						bundledPluginArchives(),
@@ -421,7 +423,7 @@ export function registerMemoryStorageContract({
 
 		test("close is idempotent and rejects later operations", async () => {
 			const { openLix } = await loadSdk();
-			const lix = await wait(openLix(), "open memory Lix");
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 			const branchId = await lix.activeBranchId();
 
 			await lix.close();
