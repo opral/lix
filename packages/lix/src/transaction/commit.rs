@@ -4448,7 +4448,7 @@ async fn stage_tracked_head(
         }
         let mut control = normal_branch_head_control(
             root,
-            parent_control.as_ref(),
+            parent_control,
             generation,
             working_diff_checkpoint_commit_id,
         )?;
