@@ -238,6 +238,14 @@ impl StorageWrite for CrashWrite {
 struct Workload {
     rows: usize,
     commits: u64,
+    /// Bytes of binary file content rewritten in the same transaction.
+    ///
+    /// A non-zero size routes each publication through the atomic
+    /// content-addressed path (`stage_atomic_cas_publication`), which stages
+    /// blob chunks, a prepared manifest and a publication fence alongside the
+    /// row write set — a materially different publication shape from a plain
+    /// row commit, and the one the engine marks `await_durable`.
+    blob_bytes: usize,
 }
 
 impl Workload {
@@ -246,8 +254,21 @@ impl Workload {
         Self {
             rows: env_usize("LIX_CRASH_CONSISTENCY_ROWS", if deep { 64 } else { 8 }),
             commits: env_u64("LIX_CRASH_CONSISTENCY_COMMITS", if deep { 12 } else { 3 }),
+            blob_bytes: env_usize(
+                "LIX_CRASH_CONSISTENCY_BLOB_BYTES",
+                if deep { 128 * 1024 } else { 64 * 1024 },
+            ),
         }
     }
+}
+
+const BLOB_PATH: &str = "/crash-consistency.bin";
+
+/// Deterministic content whose every byte depends on the generation, so a blob
+/// left over from a different generation cannot masquerade as the current one.
+fn blob_for(generation: i64, size: usize) -> Vec<u8> {
+    let mut rng = SplitMix64::new(0xb10b_0000_0000_0000 ^ generation as u64);
+    (0..size).map(|_| (rng.next() >> 24) as u8).collect()
 }
 
 fn env_flag(name: &str) -> bool {
@@ -318,7 +339,7 @@ async fn child_main(db: PathBuf, ack: PathBuf, killer: Arc<Killer>, workload: Wo
     // --- setup, deliberately not armed -------------------------------------
     let setup_started = Instant::now();
     register_schema(&lix).await;
-    write_generation(&lix, workload.rows, 0).await;
+    write_generation(&lix, workload, 0).await;
     // A fsynced marker so the verifier knows whether a crash landed in setup
     // (where the row invariant does not hold yet) or in the measured window.
     let marker = db.parent().expect("trial directory").join("setup.done");
@@ -333,7 +354,7 @@ async fn child_main(db: PathBuf, ack: PathBuf, killer: Arc<Killer>, workload: Wo
     // --- measured publication window ---------------------------------------
     killer.arm();
     for generation in 1..=workload.commits {
-        write_generation(&lix, workload.rows, generation as i64).await;
+        write_generation(&lix, workload, generation as i64).await;
         // Acknowledge only after `commit()` returned Ok. Whatever is in this
         // file must be visible after the crash; that is the durability half of
         // the invariant set.
@@ -371,9 +392,10 @@ async fn verify_after_crash(
     path: PathBuf,
     acked: Option<i64>,
     attempted: i64,
-    rows: usize,
+    workload: Workload,
     setup_complete: bool,
 ) -> Result<Recovered, String> {
+    let rows = workload.rows;
     // 1. Does the store open at all?
     let storage = RocksDB::open(&path).map_err(|error| format!("store did not open: {error}"))?;
     let lix = open_lix()
@@ -489,6 +511,35 @@ async fn verify_after_crash(
         }
     }
 
+    // The binary file is published through the content-addressed path in the
+    // same transaction as the rows. Its bytes must belong to the same
+    // generation the rows report, or the write set reached the store in pieces.
+    if workload.blob_bytes > 0
+        && let Some(visible) = generation
+    {
+        let content = read_blob(&lix)
+            .await
+            .map_err(|error| format!("binary file unreadable after crash: {error}"))?;
+        match content {
+            Some(bytes) if bytes == blob_for(visible, workload.blob_bytes) => {}
+            Some(bytes) => {
+                let matching = (0..=attempted)
+                    .chain(std::iter::once(visible))
+                    .find(|candidate| bytes == blob_for(*candidate, workload.blob_bytes));
+                return Err(format!(
+                    "TORN WRITE SET: rows report generation {visible} but the CAS-published file \
+                     holds generation {matching:?} ({} bytes)",
+                    bytes.len()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "TORN WRITE SET: rows report generation {visible} but the CAS-published file is absent"
+                ));
+            }
+        }
+    }
+
     // 5. Does the next commit after recovery succeed?
     if observed.is_empty() {
         // The crash landed before the schema or the seed published; recovering
@@ -498,7 +549,7 @@ async fn verify_after_crash(
         }
     }
     let recovery_generation = generation.unwrap_or(0) + RECOVERY_MARK;
-    upsert_generation(&lix, rows, recovery_generation, observed.is_empty())
+    upsert_generation(&lix, workload, recovery_generation, observed.is_empty())
         .await
         .map_err(|error| format!("first commit after recovery failed: {error}"))?;
     lix.close()
@@ -579,28 +630,24 @@ async fn register_schema<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<S
 /// write set reached the store in stages.
 async fn write_generation<S: Storage + Clone + Send + Sync + 'static>(
     lix: &Lix<S>,
-    rows: usize,
+    workload: Workload,
     generation: i64,
 ) {
-    write_generation_checked(lix, rows, generation)
+    upsert_generation(lix, workload, generation, generation == 0)
         .await
         .expect("crash-consistency generation commit");
 }
 
-async fn write_generation_checked<S: Storage + Clone + Send + Sync + 'static>(
-    lix: &Lix<S>,
-    rows: usize,
-    generation: i64,
-) -> Result<(), lix::LixError> {
-    upsert_generation(lix, rows, generation, generation == 0).await
-}
-
+/// One publication that rewrites every row *and* the binary file to the same
+/// generation, so a torn write set is visible either as mixed row generations or
+/// as a blob that disagrees with the rows.
 async fn upsert_generation<S: Storage + Clone + Send + Sync + 'static>(
     lix: &Lix<S>,
-    rows: usize,
+    workload: Workload,
     generation: i64,
     insert: bool,
 ) -> Result<(), lix::LixError> {
+    let rows = workload.rows;
     let mut transaction = lix.begin_transaction().await?;
     for index in 0..rows {
         let payload = format!("gen-{generation}-row-{index}");
@@ -628,6 +675,24 @@ async fn upsert_generation<S: Storage + Clone + Send + Sync + 'static>(
                         Value::Text(payload),
                         Value::Text(format!("row-{index}")),
                     ],
+                )
+                .await?;
+        }
+    }
+    if workload.blob_bytes > 0 {
+        let content = Value::Blob(blob_for(generation, workload.blob_bytes).into());
+        if insert {
+            transaction
+                .execute(
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                    &[Value::Text(BLOB_PATH.to_owned()), content],
+                )
+                .await?;
+        } else {
+            transaction
+                .execute(
+                    "UPDATE lix_file SET content = $1 WHERE path = $2",
+                    &[content, Value::Text(BLOB_PATH.to_owned())],
                 )
                 .await?;
         }
@@ -666,6 +731,26 @@ async fn read_generations<S: Storage + Clone + Send + Sync + 'static>(
         .iter()
         .map(|row| row.get::<i64>("generation").expect("generation is an integer"))
         .collect())
+}
+
+async fn read_blob<S: Storage + Clone + Send + Sync + 'static>(
+    lix: &Lix<S>,
+) -> Result<Option<Vec<u8>>, String> {
+    let result = lix
+        .execute(
+            "SELECT content FROM lix_file WHERE path = $1",
+            &[Value::Text(BLOB_PATH.to_owned())],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let rows = result.rows();
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    rows[0]
+        .get::<Vec<u8>>("content")
+        .map(Some)
+        .map_err(|error| format!("content was not a blob: {error}"))
 }
 
 async fn scalar_text<S: Storage + Clone + Send + Sync + 'static>(
@@ -758,7 +843,7 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
             control_database,
             control_acked,
             workload.commits as i64,
-            workload.rows,
+            workload,
             true,
         )
     });
@@ -800,13 +885,7 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
         let acked = child.acked;
         let setup_complete = child.setup_complete;
         let outcome = block_on(move || {
-            verify_after_crash(
-                database,
-                acked,
-                workload.commits as i64,
-                workload.rows,
-                setup_complete,
-            )
+            verify_after_crash(database, acked, workload.commits as i64, workload, setup_complete)
         });
         match &outcome {
             Ok(recovered) => recovered_generations.push(recovered.generation),
@@ -847,13 +926,7 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
         let acked = child.acked;
         let setup_complete = child.setup_complete;
         let outcome = block_on(move || {
-            verify_after_crash(
-                database,
-                acked,
-                workload.commits as i64,
-                workload.rows,
-                setup_complete,
-            )
+            verify_after_crash(database, acked, workload.commits as i64, workload, setup_complete)
         });
         match &outcome {
             Ok(recovered) => recovered_generations.push(recovered.generation),
