@@ -1169,6 +1169,12 @@ async fn recreated_identity_created_at_without_compaction() {
         .execute("INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')", &[])
         .await
         .expect("first insert should commit");
+    // Mirrors the compacted arm's shape exactly, so the only difference
+    // between the two is whether the tombstone survives.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
     let first = created_at_of(&session, "c8row", "row-0").await;
 
     session
@@ -1222,6 +1228,17 @@ async fn recreated_identity_created_at_after_compaction() {
         .execute("INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')", &[])
         .await
         .expect("first insert should commit");
+    // The insert has to be checkpointed before the delete, or the two cancel
+    // within one checkpoint interval and canonical records the identity as
+    // never having existed. In that case a fresh `created_at` on re-insert is
+    // the correct answer and there is nothing to recover — measured: the
+    // lookup fires with the right key and canonical returns nothing. The
+    // interesting case, and the one compaction actually creates, is a delete
+    // whose *insert* is already canonical.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
     let first = created_at_of(&session, "c8row", "row-0").await;
 
     session
