@@ -34,7 +34,7 @@ use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
-use crate::transaction::types::{
+use crate::transaction_types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
     CertifiedRawWriteBatchPreparation, CompleteCollectionReplacementProof, PreparedRowFacts,
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,

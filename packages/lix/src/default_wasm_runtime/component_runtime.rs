@@ -3432,6 +3432,11 @@ struct CursorState {
     transition: WasmTransitionHandle,
     pages: VecDeque<PendingChangePage>,
     complete_file_state: bool,
+    /// Whether a complete parse may be retained as a certified packet. See
+    /// [`WasmOpenFileInput::certified_packets_available`]: a file with no
+    /// published commit has no root to expand a packet from, so its pages take
+    /// the ordinary decode path instead.
+    certified_packets_available: bool,
     certified_all_entity_keys: CertifiedPacketEntityKeys,
     certified_packet_pages: Vec<Bytes>,
     certified_packet_rows: u64,
@@ -3680,6 +3685,7 @@ impl WasmComponentActor for ComponentActor {
             self.execution_scheduler(),
         )
         .await?;
+        let certified_packets_available = input.certified_packets_available;
         let output = self.worker.open_file(document, limits, input);
         let output = match output {
             Ok(output) => output,
@@ -3695,6 +3701,7 @@ impl WasmComponentActor for ComponentActor {
                 transition,
                 pages: output.pages,
                 complete_file_state: true,
+                certified_packets_available,
                 certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
@@ -3796,6 +3803,7 @@ impl WasmComponentActor for ComponentActor {
                 transition,
                 pages: output.pages,
                 complete_file_state: false,
+                certified_packets_available: true,
                 certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
@@ -3843,6 +3851,7 @@ impl WasmComponentActor for ComponentActor {
                 transition,
                 pages: output.pages,
                 complete_file_state: false,
+                certified_packets_available: true,
                 certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
@@ -4047,7 +4056,13 @@ impl WasmComponentActor for ComponentActor {
                         // ordinary row overlays: this lets validation observe
                         // their durable base directly and avoids paying a new
                         // segment/manifest lifecycle for one or two rows.
-                        if !cursor.complete_file_state {
+                        //
+                        // A file that publishes no commit takes the same
+                        // ordinary path even for a complete parse, because a
+                        // certified packet is materialized by expanding it from
+                        // the file's commit root and there is none to expand
+                        // from. Same entities, row-shaped instead of packed.
+                        if !cursor.complete_file_state || !cursor.certified_packets_available {
                             let decoded = PendingChangePage::Packet {
                                 record_count,
                                 payload,

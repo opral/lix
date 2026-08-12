@@ -4543,7 +4543,7 @@ mod tests {
     use crate::telemetry::{
         CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TelemetryValue,
     };
-    use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
+    use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
     use crate::{
         Memory,
         engine::{Engine, EngineOptions},
@@ -6741,6 +6741,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(before.rows(), after.rows());
+    }
+
+    /// A file and its rows share one durability lane. An untracked
+    /// parameter batch large enough to reach the dense certified transport
+    /// must still land untracked — the lane is not a function of batch size.
+    #[tokio::test]
+    async fn expdl_dense_scale_untracked_parameter_batch_stays_untracked() {
+        // The dense certified transport engages at this row count, so this is
+        // the smallest batch that can exercise the dense projection.
+        const ROW_COUNT: usize = 32 * 1024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "expdl_dense_untracked_lane_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "anyOf": [
+                        { "type": "object" },
+                        { "type": "array" },
+                        { "type": "string" },
+                        { "type": "number" },
+                        { "type": "boolean" },
+                        { "type": "null" }
+                    ]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema \
+                 (value, lixcol_global, lixcol_untracked) \
+                 VALUES (lix_json($1), false, true)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("untracked schema registration should succeed");
+
+        let sql = "INSERT INTO expdl_dense_untracked_lane_probe \
+                   (path, value, lixcol_untracked) VALUES ($1, lix_json($2), TRUE)";
+        let statements = (0..ROW_COUNT)
+            .map(|index| ExecuteBatchStatement {
+                label: None,
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text(format!("/p-{index:05}")),
+                    Value::Text(format!("\"v-{index:05}\"")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&statements)
+            .await
+            .expect("dense-scale untracked parameter batch should commit");
+
+        let totals = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM expdl_dense_untracked_lane_probe",
+                &[],
+            )
+            .await
+            .expect("probe rows should read");
+        assert_eq!(
+            totals.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64
+        );
+
+        let lanes = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM expdl_dense_untracked_lane_probe \
+                 WHERE lixcol_untracked",
+                &[],
+            )
+            .await
+            .expect("probe lanes should read");
+        assert_eq!(
+            lanes.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64,
+            "every row of an untracked batch must stay in the untracked lane"
+        );
+
+        let commits = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM expdl_dense_untracked_lane_probe \
+                 WHERE lixcol_commit_id IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("probe commit ids should read");
+        assert_eq!(
+            commits.rows()[0].get::<i64>("entries").unwrap(),
+            0,
+            "untracked rows carry no commit id"
+        );
     }
 
     #[tokio::test]

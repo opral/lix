@@ -46,8 +46,8 @@ use crate::sql2::write_normalization::{
     defaultable_text_insert_value, insert_column_is_omitted,
 };
 #[cfg(test)]
-use crate::transaction::types::TransactionWriteRow;
-use crate::transaction::types::{
+use crate::transaction_types::TransactionWriteRow;
+use crate::transaction_types::{
     LogicalPrimaryKey, RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWriteOperation,
     TransactionWriteOrigin,
 };
@@ -66,7 +66,7 @@ use crate::filesystem::{
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
-use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
+use crate::transaction_types::{TransactionWrite, TransactionWriteMode};
 
 use super::file::{
     FileIdConstraint, FilePathPredicate, exact_string_column_constraint_from_filters,
@@ -1846,7 +1846,7 @@ fn attach_lix_directory_insert_origin(
 
 fn lix_directory_insert_origin(surface_name: &str, directory_id: &str) -> TransactionWriteOrigin {
     TransactionWriteOrigin {
-        surface: crate::transaction::types::shared_origin_surface(surface_name),
+        surface: crate::transaction_types::shared_origin_surface(surface_name),
         operation: TransactionWriteOperation::Insert,
         primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(directory_id))),
     }
@@ -2405,7 +2405,7 @@ mod tests {
         LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateRow,
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{
+    use crate::transaction_types::{
         RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
         TransactionWriteOutcome, TransactionWriteRow,
     };
@@ -2680,7 +2680,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            _rows: crate::transaction::types::TypedMutationJournalBatch,
+            _rows: crate::transaction_types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,

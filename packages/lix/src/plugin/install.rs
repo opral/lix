@@ -12,7 +12,7 @@ use crate::plugin::{
     plugin_storage_archive_file_id,
 };
 use crate::schema::registered_schema_entity_pk;
-use crate::transaction::types::{RawWriteBatch, TransactionJson};
+use crate::transaction_types::{RawWriteBatch, TransactionJson};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 

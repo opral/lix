@@ -47,7 +47,7 @@ use crate::sql2::{
     EntitySnapshotReader, SqlHistoryQuerySource, SqlWriteContext, WriteAccess,
     WriteContextLiveStateReader,
 };
-use crate::transaction::types::{
+use crate::transaction_types::{
     RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 
@@ -3479,15 +3479,15 @@ mod tests {
 
         async fn stage_write(
             &mut self,
-            _write: crate::transaction::types::TransactionWrite,
-        ) -> Result<crate::transaction::types::TransactionWriteOutcome, LixError> {
+            _write: crate::transaction_types::TransactionWrite,
+        ) -> Result<crate::transaction_types::TransactionWriteOutcome, LixError> {
             panic!("raw DataFusion entity INSERT must never stage writes");
         }
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            _rows: crate::transaction::types::TypedMutationJournalBatch,
-        ) -> Result<crate::transaction::types::TransactionWriteOutcome, LixError> {
+            _rows: crate::transaction_types::TypedMutationJournalBatch,
+        ) -> Result<crate::transaction_types::TransactionWriteOutcome, LixError> {
             panic!("raw DataFusion entity INSERT must never stage transaction journals");
         }
 
@@ -4183,7 +4183,7 @@ mod tests {
             }))
             .expect("schema should derive entity surface spec"),
         );
-        let branch_snapshot = crate::transaction::types::TransactionJson::from_value(
+        let branch_snapshot = crate::transaction_types::TransactionJson::from_value(
             json!({
                 "body": "branch-row",
                 "rating": 4.5,
@@ -4194,7 +4194,7 @@ mod tests {
             "canonical branch projection test",
         )
         .expect("branch snapshot should normalize");
-        let global_snapshot = crate::transaction::types::TransactionJson::from_value(
+        let global_snapshot = crate::transaction_types::TransactionJson::from_value(
             json!({
                 "body": "global-row",
                 "rating": 1.5,

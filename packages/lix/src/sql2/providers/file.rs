@@ -70,8 +70,8 @@ use crate::sql2::write_normalization::{
 };
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 #[cfg(test)]
-use crate::transaction::types::TransactionWriteRow;
-use crate::transaction::types::{RawWriteBatch, TransactionJson};
+use crate::transaction_types::TransactionWriteRow;
+use crate::transaction_types::{RawWriteBatch, TransactionJson};
 use crate::{
     GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
     serialize_row_metadata,
@@ -96,7 +96,7 @@ use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{
     SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
 };
-use crate::transaction::types::{
+use crate::transaction_types::{
     FileContent, LogicalPrimaryKey, TransactionFileContent, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin,
 };
@@ -4249,7 +4249,7 @@ fn attach_lix_file_insert_origin(rows: &mut RawWriteBatch, surface_name: &str, f
 
 fn lix_file_insert_origin(surface_name: &str, file_id: &str) -> TransactionWriteOrigin {
     TransactionWriteOrigin {
-        surface: crate::transaction::types::shared_origin_surface(surface_name),
+        surface: crate::transaction_types::shared_origin_surface(surface_name),
         operation: TransactionWriteOperation::Insert,
         primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(file_id))),
     }
@@ -5586,7 +5586,16 @@ async fn plugin_render_context_with_branches(
                 continue;
             }
             let owned_row = row.to_owned();
-            let Some(owner) = PluginFileOwner::from_live_state_row(&owned_row, &branch_id)? else {
+            // KNOWN LANE GAP: this render context resolves owners through
+            // `scan_tracked_batch`, a tracked-only reader, so untracked
+            // plugin-owned files are not rendered from entities here. They do
+            // not need to be - an untracked file's bytes round-trip through its
+            // stored content blob, which is asserted by the lane-parity tests.
+            // Extending this to both lanes means changing the reader and
+            // belongs with the read-path work, not the unskip.
+            let Some(owner) =
+                PluginFileOwner::from_live_state_row(&owned_row, &branch_id, false)?
+            else {
                 continue;
             };
             let candidate_key = candidate_keys_by_branch
@@ -6920,7 +6929,7 @@ mod tests {
     use crate::sql2::dml::InsertSink;
     use crate::sql2::providers::upsert::UpsertConflictTarget;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext, WriteContextBranchRefReader};
-    use crate::transaction::types::{
+    use crate::transaction_types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
     use crate::wasm::UnsupportedWasmRuntime;
@@ -8642,7 +8651,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            _rows: crate::transaction::types::TypedMutationJournalBatch,
+            _rows: crate::transaction_types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
@@ -8751,7 +8760,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            _rows: crate::transaction::types::TypedMutationJournalBatch,
+            _rows: crate::transaction_types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,

@@ -42,15 +42,15 @@ use crate::tracked_state::{
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
+#[cfg(test)]
+use crate::transaction::staged_commit_changes::StagedCommitChangeBatchBuilder;
+use crate::transaction::staged_commit_changes::{
+    StagedCommitChangeBatch, StagedCommitChangeRef, StagedCommitChangeRefs,
+};
 use crate::transaction::staging::{
     OrderedMutationJournal, PreparedInsertSelection, PreparedWriteSet,
 };
-#[cfg(test)]
-use crate::transaction::types::StagedCommitChangeBatchBuilder;
-use crate::transaction::types::{
-    PreparedStateBatch, PreparedStateRowRef, StagedCommitChangeBatch, StagedCommitChangeRef,
-    StagedCommitChangeRefs,
-};
+use crate::transaction_types::{PreparedStateBatch, PreparedStateRowRef};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
@@ -1606,11 +1606,11 @@ fn transaction_change_record_from_state_row<'a>(
         file_id: row.file_id.map(crate::common::SharedStr::as_str),
         snapshot: row.snapshot.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         metadata: row.metadata.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         created_at: row.updated_at,
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
@@ -1747,11 +1747,11 @@ fn tracked_commit_delta_from_state_row(
         delta: tracked_delta_from_state_row(row)?,
         snapshot: row.snapshot.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         metadata: row.metadata.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
         base_coordinate: None,
@@ -1957,11 +1957,11 @@ fn current_state_delta_from_state_row(
         updated_at: row.updated_at,
         snapshot: row.snapshot.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         metadata: row.metadata.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         columnar_base_coordinate: None,
     })
@@ -2004,11 +2004,11 @@ impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
                 updated_at: row.updated_at,
                 snapshot: row.snapshot.map_or(
                     crate::json_store::JsonSlotRef::None,
-                    crate::transaction::types::StageJson::slot_ref,
+                    crate::transaction_types::StageJson::slot_ref,
                 ),
                 metadata: row.metadata.map_or(
                     crate::json_store::JsonSlotRef::None,
-                    crate::transaction::types::StageJson::slot_ref,
+                    crate::transaction_types::StageJson::slot_ref,
                 ),
                 columnar_base_coordinate: None,
             },
@@ -6571,7 +6571,7 @@ mod tests {
         Memory, MemoryRead, MemoryWrite, StorageAdapter, StorageAdapterReadScope, StorageKey,
         StorageReadOptions, StorageSpace, StorageWriteOptions,
     };
-    use crate::transaction::types::{
+    use crate::transaction_types::{
         PreparedRowFacts, TestPreparedStateRow, TransactionFileContent,
     };
     use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
@@ -7235,8 +7235,8 @@ mod tests {
             "ordinary_schema".into(),
             None,
             Some(
-                crate::transaction::types::stage_json_from_value(
-                    crate::transaction::types::TransactionJson::from_value_for_test(
+                crate::transaction_types::stage_json_from_value(
+                    crate::transaction_types::TransactionJson::from_value_for_test(
                         serde_json::from_str(large_snapshot.as_str())
                             .expect("large ordinary snapshot should parse"),
                     ),
@@ -8467,8 +8467,8 @@ mod tests {
         second.created_at = ts("2026-01-02T00:00:00Z");
         second.updated_at = second.created_at;
         second.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "value": 2 }),
                 ),
                 "second rootless tracked row snapshot",
@@ -8520,8 +8520,8 @@ mod tests {
         third.created_at = ts("2026-01-03T00:00:00Z");
         third.updated_at = third.created_at;
         third.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "value": 3 }),
                 ),
                 "third rootless tracked row snapshot",
@@ -10429,14 +10429,12 @@ mod tests {
         row.schema_key = "lix_binary_blob_ref".into();
         row.file_id = Some(file_id.into());
         row.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
-                    serde_json::json!({
-                        "id": file_id,
-                        "blob_hash": blob_id.to_hex(),
-                        "size_bytes": payload.len(),
-                    }),
-                ),
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(serde_json::json!({
+                    "id": file_id,
+                    "blob_hash": blob_id.to_hex(),
+                    "size_bytes": payload.len(),
+                })),
                 "ordinary CAS epoch test blob reference",
             )
             .expect("ordinary file blob reference should stage"),
@@ -10583,8 +10581,8 @@ mod tests {
             schema_key: "test_schema".into(),
             file_id: None,
             snapshot: Some(
-                crate::transaction::types::stage_json_from_value(
-                    crate::transaction::types::TransactionJson::from_value_for_test(
+                crate::transaction_types::stage_json_from_value(
+                    crate::transaction_types::TransactionJson::from_value_for_test(
                         serde_json::json!({ "value": 1 }),
                     ),
                     "test tracked row snapshot",
@@ -10619,8 +10617,8 @@ mod tests {
     fn untracked_global_row(change_id: &str) -> TestPreparedStateRow {
         let mut row = tracked_global_row(change_id);
         row.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "value": "untracked" }),
                 ),
                 "test untracked row snapshot",
@@ -10644,13 +10642,11 @@ mod tests {
         row.entity_pk = EntityPk::single(branch_id);
         row.schema_key = BRANCH_REF_SCHEMA_KEY.into();
         row.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
-                    serde_json::json!({
-                        "id": branch_id,
-                        "commit_id": commit_id(target_commit_label).to_string(),
-                    }),
-                ),
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(serde_json::json!({
+                    "id": branch_id,
+                    "commit_id": commit_id(target_commit_label).to_string(),
+                })),
                 "test direct branch-ref snapshot",
             )
             .expect("branch-ref snapshot should stage"),
@@ -10667,8 +10663,8 @@ mod tests {
         row.entity_pk = EntityPk::single(key);
         row.schema_key = "lix_key_value".into();
         row.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "key": key, "value": value }),
                 ),
                 "test untracked key-value snapshot",
