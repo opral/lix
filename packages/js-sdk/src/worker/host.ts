@@ -125,8 +125,6 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredLix().activeBranchId();
 			case "activeAccountId":
 				return requiredLix().activeAccountId();
-			case "clientState.entries":
-				return requiredClientStateMethod("clientStateEntries")();
 			case "clientState.get":
 				return requiredClientStateMethod("clientStateGet")(operation.key);
 			case "clientState.set":
@@ -190,7 +188,6 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 
 	function requiredClientStateMethod<
 		Key extends
-			| "clientStateEntries"
 			| "clientStateGet"
 			| "clientStateSet"
 			| "clientStateDelete",

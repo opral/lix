@@ -422,7 +422,12 @@ Closes the Lix handle and its storage resources.
 
 ### clientState
 
-`lix.clientState` stores private client-local JSON state with `get`, `set`, `delete`, and `subscribe`; pass `IndexedDbStorage` in remote mode to persist it locally.
+`lix.clientState` stores private client-local JSON state with asynchronous `get`, `set`, and `delete` methods plus `subscribe`; pass `IndexedDbStorage` in remote mode to persist it locally.
+
+```ts
+const preference = await lix.clientState.get("preference");
+await lix.clientState.set("preference", { sidebar: "history" });
+```
 
 ## Transaction
 

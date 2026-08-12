@@ -215,7 +215,7 @@ test("remote client state and active branch survive reopen without reaching the 
 	const second = await openLix(options);
 	try {
 		expect(await second.activeBranchId()).toBe("draft");
-		expect(second.clientState.get("atelier")).toEqual({
+		await expect(second.clientState.get("atelier")).resolves.toEqual({
 			focusedPanel: "right",
 		});
 		expect(requestBodies).toEqual([JSON.stringify({ branchId: "draft" })]);
@@ -337,12 +337,16 @@ test("remote IndexedDbStorage isolates client state by server URL", async () => 
 	await workspaceA.close();
 
 	const workspaceB = await openRemote("https://lixray.test/@acme/b");
-	expect(workspaceB.clientState.get("selected-panel")).toBeUndefined();
+	await expect(
+		workspaceB.clientState.get("selected-panel"),
+	).resolves.toBeUndefined();
 	await workspaceB.clientState.set("selected-panel", "files");
 	await workspaceB.close();
 
 	const reopenedA = await openRemote("https://lixray.test/@acme/a/");
-	expect(reopenedA.clientState.get("selected-panel")).toBe("history");
+	await expect(reopenedA.clientState.get("selected-panel")).resolves.toBe(
+		"history",
+	);
 	await reopenedA.close();
 });
 
@@ -362,7 +366,9 @@ test("IndexedDbStorage close can retry after an active transaction", async () =>
 	await lix.close();
 
 	const reopened = await openLix({ storage });
-	expect(reopened.clientState.get("after-failed-close")).toBe(true);
+	await expect(reopened.clientState.get("after-failed-close")).resolves.toBe(
+		true,
+	);
 	await reopened.close();
 });
 

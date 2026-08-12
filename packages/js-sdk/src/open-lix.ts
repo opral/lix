@@ -120,13 +120,13 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		}
 		openIndexedDbStorageNames.add(databaseName);
 		let clientBinding: LixBinding | undefined;
-		let clientState: Awaited<ReturnType<typeof openClientState>> | undefined;
+		let clientState: ReturnType<typeof openClientState> | undefined;
 		try {
 			clientBinding = await openLixWorkerBinding(
 				{ kind: "indexedDb", name: databaseName },
 				() => openIndexedDbStorageNames.delete(databaseName),
 			);
-			clientState = await openClientState({
+			clientState = openClientState({
 				binding: clientBinding,
 				closeBinding: true,
 			});
@@ -136,14 +136,14 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			throw error;
 		}
 
-		const restoredBranchId = clientState.get<string>(
-			ACTIVE_BRANCH_CLIENT_STATE_KEY,
-		);
-		const restoredAccountId = clientState.get<string>(
-			ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
-		);
 		let remoteBinding: LixBinding | undefined;
 		try {
+			const restoredBranchId = await clientState.get<string>(
+				ACTIVE_BRANCH_CLIENT_STATE_KEY,
+			);
+			const restoredAccountId = await clientState.get<string>(
+				ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
+			);
 			try {
 				remoteBinding = await openRemoteLixBinding(options.server, {
 					initialActiveBranchId: restoredBranchId,
@@ -218,7 +218,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				() => openIndexedDbStorageNames.delete(databaseName),
 				options.telemetry,
 			);
-			const clientState = await openClientState({ binding });
+			const clientState = openClientState({ binding });
 			return new Lix(binding, clientState);
 		} catch (error) {
 			openIndexedDbStorageNames.delete(databaseName);

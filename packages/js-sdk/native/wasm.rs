@@ -209,20 +209,6 @@ impl WasmLix {
         Ok(self.inner.active_account_id().to_string())
     }
 
-    #[wasm_bindgen(js_name = clientStateEntries)]
-    pub async fn client_state_entries(&self) -> Result<JsValue, JsValue> {
-        let entries = self
-            .inner
-            .client_state()
-            .entries()
-            .await
-            .map_err(lix_error_to_js)?
-            .into_iter()
-            .map(|(key, value)| ClientStateEntryDto { key, value })
-            .collect::<Vec<_>>();
-        to_js(&entries)
-    }
-
     #[wasm_bindgen(js_name = clientStateGet)]
     pub async fn client_state_get(&self, key: String) -> Result<JsValue, JsValue> {
         match self
@@ -441,13 +427,6 @@ impl WasmObserveEvents {
 #[serde(rename_all = "camelCase")]
 struct ExecuteOptionsDto {
     origin_key: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClientStateEntryDto {
-    key: String,
-    value: serde_json::Value,
 }
 
 #[derive(Serialize)]
