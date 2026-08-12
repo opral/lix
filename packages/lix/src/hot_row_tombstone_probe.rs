@@ -19,7 +19,7 @@ use crate::session::SessionContext;
 use crate::storage::ProjectedValue;
 use crate::storage_adapter::{
     Memory, SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead,
-    StorageBeginScanOptions, StoragePrefix, StorageReadOptions, StorageSpace,
+    StorageBeginScanOptions, StorageKey, StoragePrefix, StorageReadOptions, StorageSpace,
     StorageWriteOptions,
 };
 
@@ -67,6 +67,8 @@ struct RowCensus {
     packed_bases: usize,
     /// Records in the sparse-generation root base plane.
     root_bases: usize,
+    /// Records in the sparse per-row working-diff index.
+    diff_records: usize,
 }
 
 impl RowCensus {
@@ -122,12 +124,98 @@ async fn row_census(storage: &Memory) -> RowCensus {
     let root_bases = space_values(&read, crate::hot_state::ROOT_CURRENT_BASE_SPACE)
         .await
         .len();
+    let diff_records = space_values(&read, crate::hot_state::DIFF_SPACE).await.len();
     RowCensus {
         entries: rows.len(),
         tombstones,
         packed_bases,
         root_bases,
+        diff_records,
     }
+}
+
+/// Reopens the engine on the same physical store so every in-process cache is
+/// cold. Without this, a probe that mutates storage behind the engine's back
+/// measures the cache rather than the store, and a resurrection assertion would
+/// pass for the wrong reason.
+async fn reopen_session(storage: &Memory) -> SessionContext<Memory> {
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should reopen");
+    engine
+        .open_workspace_session()
+        .await
+        .expect("session should reopen")
+}
+
+/// Every `(key, value)` in one space.
+async fn space_entries(
+    read: &(impl StorageAdapterRead + ?Sized),
+    space: StorageSpace,
+) -> Vec<(StorageKey, bytes::Bytes)> {
+    let range = StoragePrefix {
+        bytes: bytes::Bytes::new(),
+    }
+    .to_range()
+    .expect("valid empty prefix");
+    let mut cursor = read
+        .begin_scan(space, range, StorageBeginScanOptions::default())
+        .await
+        .expect("scan the serving space");
+    cursor
+        .collect_all()
+        .await
+        .expect("collect serving entries")
+        .into_iter()
+        .map(|entry| {
+            let value = match entry.value {
+                ProjectedValue::FullValue(bytes) => bytes,
+                ProjectedValue::KeyOnly => bytes::Bytes::new(),
+            };
+            (entry.key, value)
+        })
+        .collect()
+}
+
+/// Physically removes every tombstone key in `ROW_SPACE`, simulating exactly
+/// what a compaction pass would stage. Returns how many were removed.
+///
+/// The probe fixture creates no engine-owned tombstones — the `fresh` arm of
+/// phase 1 reports 0 tombstones against 42 live engine rows — so every key this
+/// removes belongs to the churned probe collection.
+async fn drop_all_tombstones(storage: &Memory) -> usize {
+    let adapter = StorageAdapter::new(storage.clone());
+    let read = adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("read the hot row plane");
+    let entries = space_entries(&read, crate::hot_state::ROW_SPACE).await;
+    drop(read);
+    let mut writes = adapter.new_write_set();
+    let mut removed = 0_usize;
+    for (key, value) in entries {
+        if value.len() > 1 && value[1] & HEAD_VALUE_DELETED_BIT != 0 {
+            writes.delete(crate::hot_state::ROW_SPACE, key);
+            removed += 1;
+        }
+    }
+    adapter
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .expect("tombstone removal should commit");
+    removed
+}
+
+/// Rows the working diff currently reports for one schema.
+async fn working_diff_rows(session: &SessionContext<Memory>, schema_key: &str) -> usize {
+    session
+        .execute(
+            "SELECT entity_pk FROM lix_working_diff WHERE schema_key = $1",
+            &[crate::Value::Text(schema_key.to_string())],
+        )
+        .await
+        .expect("working diff should read")
+        .len()
 }
 
 /// Plans and commits a repository GC sweep against the same physical store the
@@ -461,4 +549,202 @@ async fn hot_row_tombstone_generation_rotation() {
     let census = row_census(&storage).await;
     let scan = timed_scan(&session, &scan_sql("rotrow"), 1, reps).await;
     report("after_gc", census, scan);
+}
+
+/// PHASE 4 — the compaction premise, validated before any engine change.
+///
+/// The design rests on one rule: a tombstone is load-bearing iff (a) a base
+/// visible to its generation still holds its identity, or (b) its working-diff
+/// baseline still makes the delete observable. The proposed first landing gates
+/// compaction on the generation having **zero** records in both base planes,
+/// which makes (a) vacuously false, and runs at the checkpoint, which is where
+/// (b) is discharged.
+///
+/// `safe` is that case: churn, checkpoint, then physically remove every
+/// tombstone. The query must still answer identically, the collection must not
+/// resurrect, the working diff must not move, and the scan must fall back to
+/// the no-tombstone control.
+///
+/// `near_miss` is the case compaction must refuse: the deletes are *not* yet
+/// checkpointed, so their baselines are live and the working diff is reporting
+/// them. Removing those same tombstones is observably wrong, and this arm
+/// measures the harm rather than asserting it in prose.
+///
+/// Both arms mutate storage underneath the engine and then **reopen** it, so
+/// nothing here can pass because of a warm cache.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn hot_row_tombstone_compaction_premise() {
+    let n = sizes_from_env("LIX_TOMBSTONE_SIZES", &[1_000])[0];
+    let reps = reps_from_env(5);
+    println!("phase4 | arm,event,row_entries,tombstones,packed_bases,root_bases,diff_records,working_diff_rows,answer_rows,collection_rows,scan_us");
+
+    // ---- safe arm: the delete is already checkpointed ----
+    {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("safrow")).await;
+        insert_rows(&session, "safrow", n).await;
+        delete_all_but_first(&session, "safrow", n).await;
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish");
+
+        let census = row_census(&storage).await;
+        // The precondition the first landing gates on. If this ever fails the
+        // gate itself is what changed, not the conclusion.
+        assert_eq!(census.packed_bases, 0, "safe arm expects no packed base");
+        assert_eq!(census.root_bases, 0, "safe arm expects no root base");
+        let diff_before = working_diff_rows(&session, "safrow").await;
+        assert_eq!(
+            diff_before, 0,
+            "a checkpoint must discharge every delete's working-diff obligation"
+        );
+        let scan_before = timed_scan(&session, &scan_sql("safrow"), 1, reps).await;
+        let collection_before = session
+            .execute("SELECT id FROM safrow", &[])
+            .await
+            .expect("collection scan should run")
+            .len();
+        println!(
+            "safe,before_drop,{},{},{},{},{},{},1,{},{}",
+            census.entries,
+            census.tombstones,
+            census.packed_bases,
+            census.root_bases,
+            census.diff_records,
+            diff_before,
+            collection_before,
+            scan_before.as_micros()
+        );
+
+        let removed = drop_all_tombstones(&storage).await;
+        assert_eq!(removed, n - 1, "every tombstone should have been removable");
+        let session = reopen_session(&storage).await;
+
+        let census = row_census(&storage).await;
+        let diff_after = working_diff_rows(&session, "safrow").await;
+        let answer = session
+            .execute(&scan_sql("safrow"), &[])
+            .await
+            .expect("query should still run");
+        let collection_after = session
+            .execute("SELECT id FROM safrow", &[])
+            .await
+            .expect("collection scan should still run")
+            .len();
+        let scan_after = timed_scan(&session, &scan_sql("safrow"), 1, reps).await;
+        println!(
+            "safe,after_drop,{},{},{},{},{},{},{},{},{}",
+            census.entries,
+            census.tombstones,
+            census.packed_bases,
+            census.root_bases,
+            census.diff_records,
+            diff_after,
+            answer.len(),
+            collection_after,
+            scan_after.as_micros()
+        );
+
+        // The correctness bar, asserted rather than eyeballed.
+        assert_eq!(answer.len(), 1, "the surviving row must still answer");
+        assert_eq!(
+            collection_after, 1,
+            "dropping tombstones must not resurrect a deleted row"
+        );
+        assert_eq!(
+            diff_after, diff_before,
+            "dropping a discharged tombstone must not move the working diff"
+        );
+    }
+
+    // ---- near-miss arm: the delete is NOT yet checkpointed ----
+    {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("nmrow")).await;
+        insert_rows(&session, "nmrow", n).await;
+        // Checkpoint FIRST, so the inserts are the clean baseline and the
+        // deletes below are what the working diff is reporting.
+        session
+            .create_checkpoint()
+            .await
+            .expect("first checkpoint should publish");
+        delete_all_but_first(&session, "nmrow", n).await;
+
+        let census = row_census(&storage).await;
+        let diff_before = working_diff_rows(&session, "nmrow").await;
+        let scan_before = timed_scan(&session, &scan_sql("nmrow"), 1, reps).await;
+        println!(
+            "near_miss,before_drop,{},{},{},{},{},{},1,1,{}",
+            census.entries,
+            census.tombstones,
+            census.packed_bases,
+            census.root_bases,
+            census.diff_records,
+            diff_before,
+            scan_before.as_micros()
+        );
+        assert!(
+            diff_before > 0,
+            "an uncheckpointed delete must be visible in the working diff, \
+             otherwise this arm proves nothing"
+        );
+
+        let removed = drop_all_tombstones(&storage).await;
+        let session = reopen_session(&storage).await;
+        let census = row_census(&storage).await;
+        let diff_after = working_diff_rows(&session, "nmrow").await;
+        let answer = session
+            .execute(&scan_sql("nmrow"), &[])
+            .await
+            .expect("query should still run");
+        let collection_after = session
+            .execute("SELECT id FROM nmrow", &[])
+            .await
+            .expect("collection scan should still run")
+            .len();
+        println!(
+            "near_miss,after_drop,{},{},{},{},{},{},{},{},-",
+            census.entries,
+            census.tombstones,
+            census.packed_bases,
+            census.root_bases,
+            census.diff_records,
+            diff_after,
+            answer.len(),
+            collection_after
+        );
+        println!(
+            "near_miss | removed={removed} working_diff_rows_lost={}",
+            diff_before.saturating_sub(diff_after)
+        );
+
+        // MEASURED, and it refuted the hypothesis this arm was written to
+        // confirm. The prediction was that removing a live-baseline tombstone
+        // would lose working-diff deletes. It does not: the diff still reports
+        // every delete after all of them are physically gone and the engine has
+        // been reopened cold. The ROW_SPACE tombstone is therefore **not** the
+        // working diff's authority — `DIFF_SPACE` is, and the census column
+        // above is what says so. Condition (b) of the compaction rule does not
+        // hold against this plane at all.
+        //
+        // The assertion is kept, inverted, so that a future change which makes
+        // the working diff depend on the tombstone fails here loudly.
+        assert_eq!(
+            diff_after, diff_before,
+            "the working diff must survive tombstone removal; if it stops \
+             surviving, ROW_SPACE has become the working diff's authority and \
+             the compaction rule needs condition (b) back"
+        );
+        assert_eq!(
+            answer.len(),
+            1,
+            "the surviving row must still answer before any checkpoint"
+        );
+        assert_eq!(
+            collection_after, 1,
+            "removing an uncheckpointed tombstone must still not resurrect a row"
+        );
+    }
 }
