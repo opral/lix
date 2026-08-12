@@ -1245,73 +1245,14 @@ where
         MaterializedTrackedStateExactBatch::new(batch, slots)
     }
 
-    /// Loads certified packet rows for exact identities that are intentionally
-    /// absent from the ordinary tracked root. This is a narrow historical
-    /// fallback for consumers, such as semantic merge, that need the complete
-    /// base snapshot of a host-certified fresh import.
-    pub(crate) async fn load_certified_rows_at_commit(
-        &mut self,
-        commit_id: &str,
-        keys: &[TrackedStateKey],
-    ) -> Result<BTreeMap<TrackedStateKey, crate::live_state::MaterializedLiveStateRow>, LixError>
-    {
-        if keys.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let exact = keys.iter().cloned().collect::<BTreeSet<_>>();
-        let schema_keys = keys
-            .iter()
-            .map(|key| key.schema_key.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let entity_pks = keys
-            .iter()
-            .map(|key| key.entity_pk.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let mut file_ids = Vec::new();
-        for key in keys {
-            let filter = match &key.file_id {
-                Some(file_id) => NullableKeyFilter::Value(file_id.clone()),
-                None => NullableKeyFilter::Null,
-            };
-            if !file_ids.contains(&filter) {
-                file_ids.push(filter);
-            }
-        }
-        let rows = crate::live_state::scan_certified_history_rows(
-            &self.store,
-            &BTreeSet::from([CommitId::parse_lix(
-                commit_id,
-                "certified historical fallback commit_id",
-            )?]),
-            &TrackedStateScanRequest {
-                filter: crate::tracked_state::TrackedStateFilter {
-                    schema_keys,
-                    entity_pks,
-                    file_ids,
-                    include_tombstones: true,
-                },
-                read_columns: crate::tracked_state::TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
-                },
-                limit: None,
-            },
-        )
-        .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let key = TrackedStateKey {
-                    schema_key: row.schema_key.clone(),
-                    file_id: row.file_id.clone(),
-                    entity_pk: row.entity_pk.clone(),
-                };
-                exact.contains(&key).then_some((key, row))
-            })
-            .collect())
+    /// Borrows the storage snapshot this reader was opened over.
+    ///
+    /// Callers use it to run a read that belongs to a *different* plane against
+    /// the same snapshot — notably the live-state certified-history fallback in
+    /// semantic merge. Keeping that call on the caller's side is what lets this
+    /// module stay free of references into the derived hot plane.
+    pub(crate) fn store(&self) -> &S {
+        &self.store
     }
 
     #[cfg(any(test, feature = "storage-benches"))]
