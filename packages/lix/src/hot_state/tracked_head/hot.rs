@@ -7,6 +7,7 @@
 //! the physical mutation unit, and stores each value only in the authoritative
 //! file-first row index.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::mem::size_of;
@@ -9974,6 +9975,148 @@ pub(crate) struct WorkingDiffPathHits {
     pub(crate) finite_bypass: std::sync::atomic::AtomicUsize,
 }
 
+/// Decides whether a working-diff read may skip the `HOT_DIFF` scope scan and
+/// enumerate primary `HOT_ROW` rows instead, and under which filter.
+///
+/// `None` means "no bounded primary route exists — take the index scan".
+///
+/// # Why this is sound without the coverage proof
+///
+/// The `HOT_DIFF` coverage proof is scope-global and cannot be partitioned (see
+/// [`append_hot_diff_key_parts`]), so a *filtered* index scan still has to
+/// enumerate the whole `(branch, checkpoint, generation)` scope to reconstruct
+/// it. The proof exists to certify that the sparse index names **every** dirty
+/// identity. A reader that never consults the index does not need it certified:
+/// it needs the primary rows it enumerates to be the complete authority for the
+/// identities it claims to cover.
+///
+/// That is exactly the invariant the finite bypass already rests on, and it is
+/// a property of `HOT_ROW`, not of the filter shape:
+///
+/// * `HOT_DIFF` keys are only written for `!delta.untracked` deltas.
+/// * A primary row is physically removed only by
+///   `CurrentStateDelta::physically_deletes` (`untracked && deleted`); a tracked
+///   delete leaves a tombstone that keeps its baseline.
+/// * `reject_retention_change` forbids flipping retention while a physical
+///   member exists.
+///
+/// So every dirty tracked identity has a branch-local `HOT_ROW` row carrying its
+/// own `working_diff_baseline` — **except** identities whose current authority
+/// is a packed current base published inside this checkpoint window, which own
+/// no `HOT_ROW` row at all. Those are precisely what the caller's
+/// `packed_refs.is_empty()` guard excludes before calling this, and that guard
+/// is unchanged.
+///
+/// The only thing this function adds is *which* bounded routes count. The
+/// caller previously admitted one (a finite `schema_key + entity_pk` identity
+/// batch); a file-scoped read is equally bounded, because `HOT_ROW` is keyed
+/// `scope ++ schema_key ++ file_id ++ entity_pk` and `hot_scan_entries` already
+/// owns the file-first prefix route over it. Admitting it trades
+/// O(dirty rows in the branch) for O(live rows in the file).
+async fn hot_working_diff_bypass_filter<'a>(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    filter: &'a TrackedStateFilter,
+) -> Result<Option<Cow<'a, TrackedStateFilter>>, LixError> {
+    // A finite identity batch resolves as point reads and needs no file bound.
+    if !filter.entity_pks.is_empty() {
+        return Ok((!filter.schema_keys.is_empty()).then_some(Cow::Borrowed(filter)));
+    }
+    // Every remaining bounded route is a file-first `HOT_ROW` prefix seek, so
+    // every requested file id must be an exact value. `Any` and `Null` name no
+    // prefix.
+    if filter.file_ids.is_empty()
+        || filter
+            .file_ids
+            .iter()
+            .any(|file_id| !matches!(file_id, NullableKeyFilter::Value(_)))
+    {
+        return Ok(None);
+    }
+    if !filter.schema_keys.is_empty() {
+        return Ok(Some(Cow::Borrowed(filter)));
+    }
+    // No schema predicate. `HOT_ROW` is schema-major, so a file bound alone
+    // names no prefix. `FILE_SPACE` holds one marker per
+    // `(branch, generation, schema)` that has ever written a file-backed row,
+    // which is the schema domain a file-scoped read must cover: a row with a
+    // non-null `file_id` cannot exist without its schema's marker. Markers are
+    // conservative in the safe direction — never removed within a generation,
+    // so a stale one costs one empty seek and cannot hide a live row.
+    let schema_keys = hot_file_backed_schema_keys(store, branch_id, generation).await?;
+    if schema_keys.is_empty() {
+        // Nothing in this generation is file-backed. Fall back rather than
+        // inventing an empty-prefix scan; the index path answers this
+        // (necessarily empty) case correctly and it is not hot.
+        return Ok(None);
+    }
+    let mut bypass = filter.clone();
+    bypass.schema_keys = schema_keys;
+    Ok(Some(Cow::Owned(bypass)))
+}
+
+/// Names every schema with a file-backed row in this `(branch, generation)`,
+/// read from the conservative `FILE_SPACE` markers.
+///
+/// The markers carry no value, so this is a key-only scan bounded by the number
+/// of schemas, not by the number of rows.
+async fn hot_file_backed_schema_keys(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+) -> Result<Vec<String>, LixError> {
+    let scope = hot_scope_prefix(branch_id, generation);
+    let range = StoragePrefix {
+        bytes: Bytes::from(scope.clone()),
+    }
+    .to_range()?;
+    let mut schema_keys = Vec::new();
+    let mut cursor = store
+        .begin_scan(
+            FILE_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    loop {
+        let page = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await?;
+        for entry in page.entries {
+            schema_keys.push(decode_hot_file_schema_key_in_scope(entry.key.0, &scope)?);
+        }
+        if !page.has_more {
+            break;
+        }
+    }
+    schema_keys.sort();
+    schema_keys.dedup();
+    Ok(schema_keys)
+}
+
+fn decode_hot_file_schema_key_in_scope(key: Bytes, scope: &[u8]) -> Result<String, LixError> {
+    if !key.starts_with(scope) {
+        return Err(key_codec_error(
+            "hot file marker does not begin with its scanned scope",
+        ));
+    }
+    let mut offset = scope.len();
+    let (schema_key, terminator) = read_hot_scan_key_string(&key, &mut offset, "schema key")?;
+    if terminator != KEY_PART_FINAL {
+        return Err(key_codec_error(
+            "hot file marker schema key has an invalid terminator",
+        ));
+    }
+    if offset != key.len() {
+        return Err(key_codec_error("hot file marker key has trailing bytes"));
+    }
+    Ok(schema_key.as_str(&key).to_string())
+}
+
 /// Resolves a checkpoint diff from row-local first-before images. Broad diffs
 /// enumerate the sparse dirty-key index; finite PK queries read only the
 /// primary rows that can answer the request.
@@ -9990,15 +10133,19 @@ async fn hot_working_diff_entries(
         .into_iter()
         .filter(|base| base.checkpoint_commit_id == Some(checkpoint_commit_id))
         .collect::<Vec<_>>();
-    if packed_refs.is_empty() && !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
-        return hot_working_diff_entries_for_finite_filter(
-            store,
-            branch_id,
-            checkpoint_commit_id,
-            generation,
-            filter,
-        )
-        .await;
+    if packed_refs.is_empty() {
+        if let Some(bypass) =
+            hot_working_diff_bypass_filter(store, branch_id, generation, filter).await?
+        {
+            return hot_working_diff_entries_for_finite_filter(
+                store,
+                branch_id,
+                checkpoint_commit_id,
+                generation,
+                bypass.as_ref(),
+            )
+            .await;
+        }
     }
 
     #[cfg(test)]
@@ -11046,13 +11193,15 @@ fn encode_hot_diff_key_parts(
 /// prefix-seeks `HOT_DIFF` below its `(branch, checkpoint, generation)`
 /// scope.
 ///
-/// - `hot_working_diff_entries` must enumerate the entire scope to
+/// - Any reader that *consults* this index must enumerate the entire scope to
 ///   reconstruct the [`WorkingDiffIndexCoverage`] count/XOR proof before the
-///   sparse index may be trusted, so even file- or schema-filtered diff
-///   queries visit every entry and filter in memory. A sub-scope seek can
-///   never satisfy the proof.
-/// - Finite (schema + entity) diff queries bypass this space entirely and
-///   read the `working_diff_baseline` inline on primary `HOT_ROW` rows.
+///   sparse index may be trusted, so a schema-filtered diff query that takes
+///   the index path visits every entry and filters in memory. A sub-scope seek
+///   can never satisfy the proof.
+/// - Finite (schema + entity) and file-scoped diff queries bypass this space
+///   entirely and read the `working_diff_baseline` inline on primary `HOT_ROW`
+///   rows, so they never pay the proof at all. See
+///   [`hot_working_diff_bypass_filter`].
 /// - Batches of `HOT_DIFF_PACK_MIN_IDENTITIES` or more identities are packed
 ///   into segments keyed by `scope ++ digest`; the identity components leave
 ///   the key for the segment value altogether.
@@ -11090,22 +11239,27 @@ fn encode_hot_diff_key_parts(
 ///   re-paying the scope and a 32-byte digest — and most publications stop
 ///   reaching `HOT_DIFF_PACK_MIN_IDENTITIES` per partition at all.
 ///
-/// Measured consequence of leaving the proof scope-global (rocksdb,
-/// hetzner-cpx62-II, `working_diff_file_scope`, 9 reps, four dirty rows in the
-/// probed file): `WHERE file_id = $1` costs 0.61 ms at 1k total dirty rows and
-/// 51.6 ms at 100k — linear in the dirty set, flat in the answer — while the
-/// finite `schema_key + entity_pk + file_id` shape that bypasses this space
-/// stays at ~0.5 ms across the same range.
+/// Measured consequence of routing a file-scoped read *through* this proof
+/// (rocksdb, hetzner-cpx62-II, `working_diff_file_scope`, 9 reps, four dirty
+/// rows in the probed file): `WHERE file_id = $1` cost 0.61 ms at 1k total
+/// dirty rows and 51.6 ms at 100k — linear in the dirty set, flat in the
+/// answer — while the finite `schema_key + entity_pk + file_id` shape that
+/// bypasses this space stayed at ~0.5 ms across the same range.
 ///
-/// The route that would remove that scan does not need this space at all:
-/// `HOT_ROW` is already keyed `schema_key ++ file_id ++ entity_pk` and
-/// `hot_scan_entries` already owns a file-first prefix route, so a
-/// `schema_key + file_id` working-diff read could enumerate primary rows the
-/// way the finite bypass does. That trades O(dirty rows in the branch) for
-/// O(live rows in the file). It is still not implemented *for the working
-/// diff*, because a diff must also see identities whose current authority is a
-/// packed current base published inside this checkpoint window, and those
-/// contribute exactly the whole-commit coverage groups described above.
+/// That is why file-scoped reads no longer take this path. The route that
+/// removes the scan does not need this space at all: `HOT_ROW` is keyed
+/// `schema_key ++ file_id ++ entity_pk` and `hot_scan_entries` owns a
+/// file-first prefix route, so a file-scoped working-diff read enumerates
+/// primary rows the way the finite bypass does, trading O(dirty rows in the
+/// branch) for O(live rows in the file). [`hot_working_diff_bypass_filter`]
+/// implements it and carries the soundness argument.
+///
+/// The one obligation that route cannot discharge is a packed current base
+/// published inside this checkpoint window, whose members own no `HOT_ROW` row
+/// and contribute exactly the whole-commit coverage groups described above.
+/// That case is excluded by the caller's pre-existing `packed_refs.is_empty()`
+/// guard and still reads the index, proof and all — which is why the proof
+/// stays scope-global and this key order stays as it is.
 ///
 /// The ordinary **entity** surface has no such obligation and does take that
 /// route: `lixcol_file_id` is an exact provider constraint that lands in
