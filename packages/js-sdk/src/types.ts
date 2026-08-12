@@ -4,6 +4,14 @@ export type LocalFilesystemOptions = {
 	syncAllFiles: boolean;
 };
 
+export type IndexedDbStorageOptions = {
+	/**
+	 * Identifies one persistent Lix database within the current origin.
+	 * A database name can be opened by only one Lix handle at a time.
+	 */
+	name: string;
+};
+
 export type RemoteLixFetch = (
 	input: RequestInfo | URL,
 	init?: RequestInit,
@@ -29,32 +37,17 @@ export type LixTelemetryOptions = {
 	onSpan(span: LixTelemetrySpan): void;
 };
 
-/**
- * Persists opaque Lix snapshots under SDK-provided namespaces.
- *
- * Implementations must treat snapshots as bytes owned by Lix. The namespace
- * selects one logical Lix and allows a single adapter to persist more than one
- * instance without collisions.
- */
-export interface LixSnapshotStorage {
-	load(namespace: string): Promise<Uint8Array | undefined>;
-	save(namespace: string, snapshot: Uint8Array): Promise<void>;
-}
-
 export type OpenLixOptions =
 	| {
 			storage?:
 				| import("./open-lix.js").LocalFilesystem
-				| LixSnapshotStorage;
+				| import("./open-lix.js").IndexedDbStorage;
 			server?: never;
 			telemetry?: LixTelemetryOptions;
 	  }
 	| {
-			/**
-			 * Optional client-local storage. In remote mode workspace SQL remains on
-			 * the server; only `lix.clientState` is stored here.
-			 */
-			storage?: LixSnapshotStorage;
+			/** Optional local storage for `lix.clientState`. */
+			storage?: import("./open-lix.js").IndexedDbStorage;
 			server: RemoteLixServerOptions;
 			telemetry?: never;
 	  };

@@ -1174,7 +1174,10 @@ async fn entity_columnar_scan_source(
             // never reaches here and never counts.
             //
             // Mapped over the stream rather than recorded inside the future
-            // above, so nothing is added to that future's state machine.
+            // above, so nothing is added to that future's state machine. These
+            // OLAP plans have very little stack headroom: before #1334 sized
+            // these test threads, adding one `u64` to `SqlReadProfile` was
+            // enough to overflow them. Keep additions off this future.
             let batches = futures_util::StreamExt::map(batches, |batch| {
                 if let Ok(batch) = &batch {
                     crate::sql_profile::record_provider_rows_examined(batch.num_rows());

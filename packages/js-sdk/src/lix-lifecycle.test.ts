@@ -119,43 +119,48 @@ test("an active-transaction close preflight preserves client state and observati
 	expect(clientBinding.close).toHaveBeenCalledOnce();
 });
 
-test("automatic branch preference persistence is best effort but direct writes reject", async () => {
-	const storage = {
-		save: vi.fn(async () => {
-			throw new Error("storage.save failed");
+test("a terminal commit failure releases the transaction from its parent Lix", async () => {
+	const transactionBinding = {
+		execute: vi.fn(),
+		commit: vi.fn(async () => {
+			throw new Error("durable commit failed");
 		}),
+		rollback: vi.fn(async () => undefined),
 	};
+	const binding = {
+		beginTransaction: vi.fn(async () => transactionBinding),
+		close: vi.fn(async () => undefined),
+	} as unknown as LixBinding;
+	const lix = new Lix(binding);
+	const transaction = await lix.beginTransaction();
+
+	await expect(transaction.commit()).rejects.toThrow("durable commit failed");
+	await expect(transaction.rollback()).rejects.toMatchObject({
+		code: "LIX_INVALID_TRANSACTION_STATE",
+	});
+	await expect(lix.close()).resolves.toBeUndefined();
+	expect(binding.close).toHaveBeenCalledOnce();
+	expect(transactionBinding.rollback).not.toHaveBeenCalled();
+});
+
+test("a remote close failure still closes managed local client state", async () => {
+	const binding = {
+		close: vi.fn(async () => {
+			throw new Error("remote close failed");
+		}),
+	} as unknown as LixBinding;
 	const clientBinding = {
-		clientStateSet: vi.fn(async () => undefined),
-		exportSnapshot: vi.fn(async () => new Uint8Array([1, 2, 3])),
 		close: vi.fn(async () => undefined),
 	} as unknown as LixBinding;
 	const clientState = new ManagedLixClientState(
-		{ binding: clientBinding, saveSnapshot: storage.save },
+		{ binding: clientBinding, closeBinding: true },
 		new Map(),
 	);
-	const binding = {
-		switchBranch: vi.fn(async ({ branchId }: { branchId: string }) => ({
-			branchId,
-		})),
-		close: vi.fn(async () => undefined),
-	} as unknown as LixBinding;
 	const lix = new Lix(binding, clientState);
-	const branchListener = vi.fn();
-	lix.subscribeActiveBranch(branchListener);
 
-	await expect(lix.clientState.set("direct", true)).rejects.toThrow(
-		"storage.save failed",
-	);
-	expect(lix.clientState.get("direct")).toBe(true);
-	await expect(lix.switchBranch({ branchId: "draft" })).resolves.toEqual({
-		branchId: "draft",
-	});
-	expect(branchListener).toHaveBeenCalledOnce();
-	expect(binding.switchBranch).toHaveBeenCalledWith({ branchId: "draft" });
-	expect(storage.save).toHaveBeenCalledTimes(2);
-
-	await lix.close();
+	await expect(lix.close()).rejects.toThrow("remote close failed");
+	expect(binding.close).toHaveBeenCalledOnce();
+	expect(clientBinding.close).toHaveBeenCalledOnce();
 });
 
 function deferred<T>() {

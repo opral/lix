@@ -20,6 +20,43 @@ async fn serialized_public_result_test() -> tokio::sync::MutexGuard<'static, ()>
     PUBLIC_RESULT_TEST_LOCK.lock().await
 }
 
+/// Stack budget for the OLAP parity bodies below.
+///
+/// These tests build and optimize real DataFusion plans over a seeded fixture.
+/// Plan construction and the optimizer recurse per plan node, and an
+/// unoptimized build needs several times the stack that an optimized one does,
+/// so the bodies overflow libtest's 2 MiB worker-stack default in the `test`
+/// profile while passing in `--release`. Running them on an explicitly sized
+/// thread makes the suite independent of the build profile and of whether
+/// `RUST_MIN_STACK` happens to be exported by the caller.
+const PUBLIC_RESULT_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
+
+/// Runs an async test body on a thread with [`PUBLIC_RESULT_TEST_STACK_SIZE`]
+/// of stack, driven by a current-thread runtime so the concurrency semantics
+/// match the `#[tokio::test]` default these bodies were written against.
+///
+/// Panics (including assertion failures) propagate to the libtest worker
+/// through the join handle, so a failing assertion still fails the test.
+fn run_on_sized_stack<Body, Fut>(name: &str, body: Body)
+where
+    Body: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(PUBLIC_RESULT_TEST_STACK_SIZE)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build public-result test runtime")
+                .block_on(body());
+        })
+        .expect("spawn public-result test thread")
+        .join()
+        .expect("public-result test body panicked");
+}
+
 #[test]
 fn typed_olap_queries_are_plain_datafusion_selects() {
     use datafusion::sql::parser::DFParser;
@@ -49,28 +86,14 @@ fn typed_olap_queries_are_plain_datafusion_selects() {
     }
 }
 
-/// Explicitly sized thread: see
-/// [`typed_olap_shapes_validate_above_columnar_publication_threshold`]. Every
-/// OLAP-shape test in this file builds the same deep DataFusion plans and none
-/// of them fit the default test-thread stack with any margin.
 #[test]
 fn typed_olap_shapes_validate_exact_results_on_every_adapter() {
-    std::thread::Builder::new()
-        .name("every-adapter-olap-validation".to_string())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build every-adapter OLAP runtime")
-                .block_on(validate_every_adapter_olap_shapes());
-        })
-        .expect("spawn every-adapter OLAP validation thread")
-        .join()
-        .expect("join every-adapter OLAP validation thread");
+    run_on_sized_stack("olap-exact-results", || async {
+        validate_exact_olap_shapes().await;
+    });
 }
 
-async fn validate_every_adapter_olap_shapes() {
+async fn validate_exact_olap_shapes() {
     let _test_guard = serialized_public_result_test().await;
     let rows = workload::fixture_rows(128);
     for &profile in storage::STORAGE_PROFILES {
@@ -94,33 +117,14 @@ async fn validate_every_adapter_olap_shapes() {
     }
 }
 
-/// Runs on an explicitly sized thread for the same reason
-/// `typed_olap_shapes_validate_exact_results_after_sparse_and_moderate_mutations`
-/// below does: the OLAP shapes over a 2,048-row fixture build deep DataFusion
-/// plans whose unoptimized frames do not fit the default test-thread stack.
-///
-/// This test had been running on the default stack with no measurable margin —
-/// adding one `u64` field to `SqlReadProfile`, with no other change, was enough
-/// to abort it. Nothing about the assertions changes here; it just gets the
-/// stack its sibling already has.
 #[test]
 fn typed_olap_shapes_validate_above_columnar_publication_threshold() {
-    std::thread::Builder::new()
-        .name("columnar-threshold-olap-validation".to_string())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build columnar-threshold OLAP runtime")
-                .block_on(validate_columnar_threshold_olap_shapes());
-        })
-        .expect("spawn columnar-threshold OLAP validation thread")
-        .join()
-        .expect("join columnar-threshold OLAP validation thread");
+    run_on_sized_stack("olap-above-columnar-threshold", || async {
+        validate_above_columnar_publication_threshold().await;
+    });
 }
 
-async fn validate_columnar_threshold_olap_shapes() {
+async fn validate_above_columnar_publication_threshold() {
     let _test_guard = serialized_public_result_test().await;
     let rows = workload::fixture_rows(2_048);
     for &profile in storage::STORAGE_PROFILES {
@@ -146,22 +150,10 @@ async fn validate_columnar_threshold_olap_shapes() {
 
 #[test]
 fn typed_olap_shapes_validate_exact_results_after_sparse_and_moderate_mutations() {
-    std::thread::Builder::new()
-        .name("post-update-olap-validation".to_string())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build post-update OLAP runtime")
-                .block_on(async {
-                    let _test_guard = serialized_public_result_test().await;
-                    validate_post_update_olap_shapes().await;
-                });
-        })
-        .expect("spawn post-update OLAP validation thread")
-        .join()
-        .expect("join post-update OLAP validation thread");
+    run_on_sized_stack("post-update-olap-validation", || async {
+        let _test_guard = serialized_public_result_test().await;
+        validate_post_update_olap_shapes().await;
+    });
 }
 
 async fn validate_post_update_olap_shapes() {
@@ -181,8 +173,14 @@ async fn validate_post_update_olap_shapes() {
     }
 }
 
-#[tokio::test]
-async fn insert_benchmark_hits_certified_parameter_batch_on_every_adapter() {
+#[test]
+fn insert_benchmark_hits_certified_parameter_batch_on_every_adapter() {
+    run_on_sized_stack("certified-parameter-batch", || async {
+        validate_certified_parameter_batch().await;
+    });
+}
+
+async fn validate_certified_parameter_batch() {
     let _test_guard = serialized_public_result_test().await;
     let rows = [
         WorkloadRow {
@@ -204,8 +202,14 @@ async fn insert_benchmark_hits_certified_parameter_batch_on_every_adapter() {
     }
 }
 
-#[tokio::test]
-async fn certified_insert_counter_deltas_are_isolated_across_sequential_fixtures() {
+#[test]
+fn certified_insert_counter_deltas_are_isolated_across_sequential_fixtures() {
+    run_on_sized_stack("sequential-counter-isolation", || async {
+        validate_sequential_counter_isolation().await;
+    });
+}
+
+async fn validate_sequential_counter_isolation() {
     let _test_guard = serialized_public_result_test().await;
     let rows = [WorkloadRow {
         path: "/sequential".to_string(),
@@ -230,8 +234,14 @@ async fn certified_insert_counter_deltas_are_isolated_across_sequential_fixtures
     assert_eq!(slatedb.insert_all().await, 1);
 }
 
-#[tokio::test]
-async fn certified_insert_counter_deltas_are_isolated_for_concurrent_fixtures() {
+#[test]
+fn certified_insert_counter_deltas_are_isolated_for_concurrent_fixtures() {
+    run_on_sized_stack("concurrent-counter-isolation", || async {
+        validate_concurrent_counter_isolation().await;
+    });
+}
+
+async fn validate_concurrent_counter_isolation() {
     let rows = [WorkloadRow {
         path: "/concurrent".to_string(),
         value_json: r#"{"enabled":true}"#.to_string(),
@@ -261,6 +271,10 @@ async fn insert_one_counter_fixture(
 
 /// Regression for the automatic-write future retaining SlateDB's large
 /// adapter-specific open and commit futures on Tokio's default test stack.
+///
+/// Deliberately NOT wrapped in [`run_on_sized_stack`]: asserting that this
+/// path still fits the default worker stack is the entire point of the test.
+/// It must keep running on whatever stack libtest hands it.
 #[cfg(feature = "slatedb")]
 #[tokio::test]
 async fn slatedb_automatic_write_runs_on_default_stack() {

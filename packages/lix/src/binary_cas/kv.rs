@@ -1,7 +1,7 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::LixError;
-use crate::binary_cas::chunking::MAX_BINARY_CAS_CHUNK_BYTES;
+use crate::binary_cas::chunking::{CHUNK_ANCHOR_BYTES, MAX_BINARY_CAS_CHUNK_BYTES, chunk_ranges};
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, StorageBinaryCasDeltaBaseLayout,
     StorageBinaryCasDeltaSegment, decode_binary_cas_chunk, decode_binary_cas_manifest,
@@ -178,7 +178,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
             "active upload receipt",
         )?;
     }
-    let mut live_manifest_chunk_counts = BTreeMap::<BlobId, u64>::new();
+    let mut live_manifest_sizes = BTreeMap::<BlobId, u64>::new();
 
     for root in blob_roots {
         mark_live_blob(
@@ -186,7 +186,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
             *root,
             &mut live_blobs,
             &mut live_chunks,
-            &mut live_manifest_chunk_counts,
+            &mut live_manifest_sizes,
         )
         .await?;
     }
@@ -267,10 +267,10 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
             .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
             .await?;
         for entry in page.entries {
-            let (blob_id, ordinal) = decode_manifest_chunk_key(&entry.key)?;
-            let keep = live_manifest_chunk_counts
+            let (blob_id, offset) = decode_manifest_chunk_key(&entry.key)?;
+            let keep = live_manifest_sizes
                 .get(&blob_id)
-                .is_some_and(|chunk_count| ordinal < *chunk_count);
+                .is_some_and(|size_bytes| offset < *size_bytes);
             if !keep {
                 writes.delete(BINARY_CAS_MANIFEST_CHUNK_SPACE, entry.key);
                 result.reclaimed_manifest_chunk_rows += 1;
@@ -378,7 +378,7 @@ async fn mark_live_blob(
     root_blob_id: BlobId,
     live_blobs: &mut BTreeSet<BlobId>,
     live_chunks: &mut BTreeMap<ChunkHash, u64>,
-    live_manifest_chunk_counts: &mut BTreeMap<BlobId, u64>,
+    live_manifest_sizes: &mut BTreeMap<BlobId, u64>,
 ) -> Result<(), LixError> {
     let mut pending = vec![root_blob_id];
     while let Some(blob_id) = pending.pop() {
@@ -415,8 +415,8 @@ async fn mark_live_blob(
                 size_bytes: declared_size,
                 chunk_count,
             } => {
-                live_manifest_chunk_counts.insert(blob_id, u64::from(chunk_count));
-                let chunks = load_declared_manifest_chunks(store, blob_id, chunk_count).await?;
+                live_manifest_sizes.insert(blob_id, declared_size);
+                let chunks = load_declared_manifest_chunks(store, blob_id, declared_size).await?;
                 if chunks.len() != chunk_count as usize {
                     return Err(LixError::new(
                         LixError::CODE_STORAGE_ERROR,
@@ -625,8 +625,8 @@ fn decode_manifest_chunk_key(key: &StorageKey) -> Result<(BlobId, u64), LixError
         ));
     }
     let blob_id = BlobId::from_bytes(key.0[..32].try_into().expect("checked blob hash width"));
-    let ordinal = u64::from_be_bytes(key.0[32..].try_into().expect("checked ordinal width"));
-    Ok((blob_id, ordinal))
+    let offset = u64::from_be_bytes(key.0[32..].try_into().expect("checked offset width"));
+    Ok((blob_id, offset))
 }
 
 async fn verify_live_chunk_presence(
@@ -741,53 +741,36 @@ pub(crate) async fn scan_manifest_chunks(
 /// Blob roots are content-addressed by their complete bytes, while chunk rows
 /// are a mutable physical representation. A later valid writer may select a
 /// different layout for the same content hash. Restricting reads to the
-/// declared ordinal range keeps stale suffix rows harmless; the caller still
+/// declared byte extent keeps stale suffix rows harmless; the caller still
 /// rejects missing declared rows by comparing the resulting count.
 async fn load_declared_manifest_chunks(
     store: &(impl StorageAdapterRead + ?Sized),
     blob_hash: BlobId,
-    chunk_count: u32,
+    size_bytes: u64,
 ) -> Result<Vec<KvBlobManifestChunk>, LixError> {
-    if chunk_count == 0 {
-        return Ok(Vec::new());
-    }
-    let range = StorageKeyRange {
-        lower: Bound::Included(StorageKey(Bytes::from(manifest_chunk_key(blob_hash, 0)))),
-        upper: Bound::Excluded(StorageKey(Bytes::from(manifest_chunk_key(
-            blob_hash,
-            u64::from(chunk_count),
-        )))),
-    };
-    scan_all_values_for_range(store, BINARY_CAS_MANIFEST_CHUNK_SPACE, range)
-        .await?
-        .into_iter()
-        .map(|value| {
-            let (chunk_hash, chunk_size) = decode_binary_cas_manifest_chunk(&value)?;
-            Ok(KvBlobManifestChunk {
-                chunk_hash,
-                chunk_size,
-            })
-        })
-        .collect()
+    load_declared_manifest_chunk_range(store, blob_hash, 0, size_bytes).await
 }
 
-/// Loads one ordinal interval from a fixed-size media manifest.
+/// Loads the manifest rows covering one byte interval of a chunked blob.
+///
+/// `start_offset` must name a chunk start. Callers align it to
+/// [`CHUNK_ANCHOR_BYTES`], which the chunker forces to be a boundary.
 async fn load_declared_manifest_chunk_range(
     store: &(impl StorageAdapterRead + ?Sized),
     blob_hash: BlobId,
-    start_index: u64,
-    end_index: u64,
+    start_offset: u64,
+    end_offset: u64,
 ) -> Result<Vec<KvBlobManifestChunk>, LixError> {
-    if start_index >= end_index {
+    if start_offset >= end_offset {
         return Ok(Vec::new());
     }
     let range = StorageKeyRange {
         lower: Bound::Included(StorageKey(Bytes::from(manifest_chunk_key(
             blob_hash,
-            start_index,
+            start_offset,
         )))),
         upper: Bound::Excluded(StorageKey(Bytes::from(manifest_chunk_key(
-            blob_hash, end_index,
+            blob_hash, end_offset,
         )))),
     };
     scan_all_values_for_range(store, BINARY_CAS_MANIFEST_CHUNK_SPACE, range)
@@ -806,12 +789,12 @@ async fn load_declared_manifest_chunk_range(
 pub(crate) fn stage_manifest_chunk(
     writes: &mut StorageWriteSet,
     blob_hash: BlobId,
-    chunk_index: u64,
+    chunk_offset: u64,
     chunk: &KvBlobManifestChunk,
 ) {
     writes.put(
         BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        key(manifest_chunk_key(blob_hash, chunk_index)),
+        key(manifest_chunk_key(blob_hash, chunk_offset)),
         value(encode_binary_cas_manifest_chunk(
             &chunk.chunk_hash,
             chunk.chunk_size,
@@ -874,7 +857,7 @@ fn stage_content_chunk(
     Ok(())
 }
 
-pub(in crate::binary_cas) async fn stage_fixed_part_skipping_existing(
+pub(in crate::binary_cas) async fn stage_upload_part_skipping_existing(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     transaction_chunk_keys: &mut HashSet<Vec<u8>>,
@@ -888,11 +871,16 @@ pub(in crate::binary_cas) async fn stage_fixed_part_skipping_existing(
     }
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_media_upload_chunk_payload_hash_bytes(bytes.len());
-    let receipts = bytes
-        .chunks(crate::binary_cas::chunking::MEDIA_CHUNK_BYTES)
-        .map(|chunk| crate::binary_cas::BlobChunkReceipt {
-            hash: ChunkHash::from_content(chunk),
-            size_bytes: chunk.len() as u64,
+    // A part is anchor-aligned and at most one anchor long, so chunking it in
+    // isolation reproduces exactly the boundaries a whole-buffer write of the
+    // same file would choose. That is what keeps parts independent and lets up
+    // to four of them complete out of order.
+    let ranges = chunk_ranges(bytes);
+    let receipts = ranges
+        .iter()
+        .map(|&(start, end)| crate::binary_cas::BlobChunkReceipt {
+            hash: ChunkHash::from_content(&bytes[start..end]),
+            size_bytes: (end - start) as u64,
         })
         .collect::<Vec<_>>();
     let mut candidates = Vec::with_capacity(receipts.len());
@@ -909,18 +897,15 @@ pub(in crate::binary_cas) async fn stage_fixed_part_skipping_existing(
         .zip(existing)
         .filter_map(|((hash, _), exists)| (!exists).then_some(hash))
         .collect::<HashSet<_>>();
-    for (chunk, receipt) in bytes
-        .chunks(crate::binary_cas::chunking::MEDIA_CHUNK_BYTES)
-        .zip(&receipts)
-    {
+    for (&(start, end), receipt) in ranges.iter().zip(&receipts) {
         if missing.remove(&receipt.hash) {
-            stage_content_chunk(writes, receipt.hash, chunk)?;
+            stage_content_chunk(writes, receipt.hash, &bytes[start..end])?;
         }
     }
     Ok(receipts)
 }
 
-pub(in crate::binary_cas) fn stage_fixed_manifest(
+pub(in crate::binary_cas) fn stage_upload_manifest(
     writes: &mut StorageWriteSet,
     chunks: &[crate::binary_cas::BlobChunkReceipt],
 ) -> Result<BlobWriteReceipt, LixError> {
@@ -931,16 +916,11 @@ pub(in crate::binary_cas) fn stage_fixed_manifest(
         )
     })?;
     let mut size_bytes = 0u64;
-    for (index, chunk) in chunks.iter().enumerate() {
-        let is_last = index + 1 == chunks.len();
-        if chunk.size_bytes == 0
-            || chunk.size_bytes > crate::binary_cas::chunking::MEDIA_CHUNK_BYTES as u64
-            || (!is_last
-                && chunk.size_bytes != crate::binary_cas::chunking::MEDIA_CHUNK_BYTES as u64)
-        {
+    for chunk in chunks.iter() {
+        if chunk.size_bytes == 0 || chunk.size_bytes > MAX_BINARY_CAS_CHUNK_BYTES as u64 {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "resumable file receipts are not canonical fixed chunks",
+                "resumable file receipts are not canonical chunks",
             ));
         }
         size_bytes = size_bytes.checked_add(chunk.size_bytes).ok_or_else(|| {
@@ -986,19 +966,21 @@ pub(in crate::binary_cas) fn stage_fixed_manifest(
                     chunk_count: *chunk_count,
                 },
             );
-            for (index, chunk) in chunks.iter().enumerate() {
+            let mut chunk_offset = 0u64;
+            for chunk in chunks.iter() {
                 stage_manifest_chunk(
                     writes,
                     hash,
-                    index as u64,
+                    chunk_offset,
                     &KvBlobManifestChunk {
                         chunk_hash: chunk.hash.into_bytes(),
                         chunk_size: chunk.size_bytes,
                     },
                 );
+                chunk_offset += chunk.size_bytes;
             }
         }
-        BlobLayout::Delta { .. } => unreachable!("fixed upload cannot produce delta layout"),
+        BlobLayout::Delta { .. } => unreachable!("resumable upload cannot produce delta layout"),
     }
     Ok(BlobWriteReceipt {
         hash,
@@ -1176,7 +1158,7 @@ pub(crate) async fn load_bytes_many(
             };
             seen_manifest_hashes
                 .insert(metadata.hash)
-                .then_some((metadata.hash, *chunk_count))
+                .then_some((metadata.hash, *chunk_count, metadata.size_bytes))
         })
         .collect::<Vec<_>>();
     let scan_count = chunked_blobs.len();
@@ -1184,10 +1166,10 @@ pub(crate) async fn load_bytes_many(
     // the bounded window from refilling. Results cross the gate below only in
     // first-request order, preserving deterministic error selection.
     let mut scans = stream::iter(chunked_blobs.into_iter().enumerate())
-        .map(|(order, (blob_hash, chunk_count))| async move {
+        .map(|(order, (blob_hash, chunk_count, size_bytes))| async move {
             let result = async {
                 let manifest_chunks =
-                    load_declared_manifest_chunks(store, blob_hash, chunk_count).await?;
+                    load_declared_manifest_chunks(store, blob_hash, size_bytes).await?;
                 if manifest_chunks.len() != chunk_count as usize {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -1450,75 +1432,67 @@ async fn load_blob_range(
             decoded[start..end].to_vec()
         }
         BlobLayout::Chunked { chunk_count } => {
-            let fixed_chunk_bytes = crate::binary_cas::chunking::MEDIA_CHUNK_BYTES as u64;
-            let first_chunk_index = range.start / fixed_chunk_bytes;
-            let end_chunk_index = range
-                .end
-                .div_ceil(fixed_chunk_bytes)
-                .min(u64::from(*chunk_count));
+            // Content-defined boundaries mean the chunk holding an offset
+            // cannot be named by division. The chunker forces a boundary at
+            // every anchor, so the anchor at or below the requested start is
+            // always an exact manifest key: one range scan from there covers
+            // the request without reading the whole manifest.
+            let anchor_bytes = CHUNK_ANCHOR_BYTES as u64;
+            let scan_start = range.start - range.start % anchor_bytes;
             let manifest = load_declared_manifest_chunk_range(
                 store,
                 metadata.hash,
-                first_chunk_index,
-                end_chunk_index,
+                scan_start,
+                range.end,
             )
             .await?;
-            let expected_manifest_len = usize::try_from(end_chunk_index - first_chunk_index)
-                .map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "binary CAS selected manifest range exceeds this runtime",
-                    )
-                })?;
-            if manifest.len() != expected_manifest_len {
+            if manifest.is_empty() || manifest.len() > *chunk_count as usize {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
-                        "binary CAS blob '{}' expected {} selected chunks, found {}",
+                        "binary CAS blob '{}' has no usable manifest rows for the requested range",
                         metadata.hash.to_hex(),
-                        expected_manifest_len,
-                        manifest.len()
                     ),
                 ));
             }
             let mut selected = Vec::with_capacity(manifest.len());
-            for (selected_index, chunk) in manifest.into_iter().enumerate() {
-                let chunk_index = first_chunk_index
-                    + u64::try_from(selected_index).map_err(|_| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "binary CAS selected chunk index exceeds u64",
-                        )
-                    })?;
-                let chunk_start = chunk_index.checked_mul(fixed_chunk_bytes).ok_or_else(|| {
+            let mut cursor = scan_start;
+            for chunk in manifest {
+                let chunk_start = cursor;
+                cursor = chunk_start.checked_add(chunk.chunk_size).ok_or_else(|| {
                     LixError::new("LIX_ERROR_UNKNOWN", "binary CAS chunk offsets overflow u64")
                 })?;
-                let expected_chunk_size = if chunk_index + 1 == u64::from(*chunk_count) {
-                    metadata
-                        .size_bytes
-                        .checked_sub(chunk_start)
-                        .ok_or_else(|| {
-                            LixError::new(
-                                "LIX_ERROR_UNKNOWN",
-                                "binary CAS final chunk starts beyond the declared blob size",
-                            )
-                        })?
-                } else {
-                    fixed_chunk_bytes
-                };
-                if chunk.chunk_size != expected_chunk_size {
+                if chunk.chunk_size == 0
+                    || chunk.chunk_size > MAX_BINARY_CAS_CHUNK_BYTES as u64
+                    || cursor > metadata.size_bytes
+                {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
-                            "binary CAS blob '{}' chunk {} has size {}, expected {}",
+                            "binary CAS blob '{}' chunk at offset {} has size {}",
                             metadata.hash.to_hex(),
-                            chunk_index,
+                            chunk_start,
                             chunk.chunk_size,
-                            expected_chunk_size,
                         ),
                     ));
                 }
-                selected.push((chunk_start, chunk));
+                if cursor > range.start {
+                    selected.push((chunk_start, chunk));
+                }
+                if cursor >= range.end {
+                    break;
+                }
+            }
+            if cursor < range.end {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS blob '{}' manifest ends at {} before the requested {}",
+                        metadata.hash.to_hex(),
+                        cursor,
+                        range.end,
+                    ),
+                ));
             }
             let hashes = selected
                 .iter()
@@ -2147,7 +2121,7 @@ where
     }
 
     let Ok(base_chunks) =
-        load_declared_manifest_chunks(&store, splice.base_blob_hash, chunk_count).await
+        load_declared_manifest_chunks(&store, splice.base_blob_hash, metadata.size_bytes).await
     else {
         return Ok(false);
     };
@@ -2205,7 +2179,7 @@ where
             chunk_count,
         },
     );
-    for (chunk_index, (chunk, changed)) in chunks.into_iter().enumerate() {
+    for (chunk, changed) in chunks {
         let chunk_data = &bytes[chunk.start..chunk.end];
         if changed && chunk_hashes_to_stage.remove(&chunk.hash) {
             stage_content_chunk(writes, chunk.hash, chunk_data)?;
@@ -2213,7 +2187,7 @@ where
         stage_manifest_chunk(
             writes,
             blob_hash,
-            chunk_index as u64,
+            chunk.start as u64,
             &KvBlobManifestChunk {
                 chunk_hash: *chunk.hash.as_bytes(),
                 chunk_size: chunk_data.len() as u64,
@@ -2605,7 +2579,7 @@ fn stage_prepared_blob_write(
                 },
             );
 
-            for (chunk_index, chunk) in chunks.iter().copied().enumerate() {
+            for chunk in chunks.iter().copied() {
                 let chunk_data = &bytes[chunk.start..chunk.end];
                 let chunk_hash = chunk.hash;
                 if should_stage_chunk(chunk_hash)? {
@@ -2615,7 +2589,7 @@ fn stage_prepared_blob_write(
                 stage_manifest_chunk(
                     writes,
                     plan.blob_hash,
-                    chunk_index as u64,
+                    chunk.start as u64,
                     &KvBlobManifestChunk {
                         chunk_hash: *chunk_hash.as_bytes(),
                         chunk_size: chunk_data.len() as u64,
@@ -2879,10 +2853,14 @@ fn manifest_chunk_prefix(blob_hash: BlobId) -> Vec<u8> {
     blob_hash.as_bytes().to_vec()
 }
 
-fn manifest_chunk_key(blob_hash: BlobId, chunk_index: u64) -> Vec<u8> {
+/// Manifest chunk rows are keyed by the chunk's byte offset in the blob rather
+/// than by its ordinal, because content-defined boundaries make the ordinal
+/// unrelated to the offset. Offsets keep a ranged read to one range scan that
+/// starts at a key the anchor rule guarantees exists.
+fn manifest_chunk_key(blob_hash: BlobId, chunk_offset: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(40);
     out.extend_from_slice(blob_hash.as_bytes());
-    out.extend_from_slice(&chunk_index.to_be_bytes());
+    out.extend_from_slice(&chunk_offset.to_be_bytes());
     out
 }
 
@@ -3189,12 +3167,13 @@ mod tests {
                     .expect("test chunk count should fit in u32"),
             },
         );
-        for (index, chunk) in chunks.iter().enumerate() {
+        let mut chunk_offset = 0u64;
+        for chunk in chunks.iter() {
             let chunk_hash = ChunkHash::from_content(chunk);
             stage_manifest_chunk(
                 writes,
                 blob_hash,
-                index as u64,
+                chunk_offset,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_hash.into_bytes(),
                     chunk_size: chunk.len() as u64,
@@ -3207,6 +3186,7 @@ mod tests {
                 chunk.len() as u64,
                 chunk,
             );
+            chunk_offset += chunk.len() as u64;
         }
         (blob_hash, bytes)
     }
@@ -3293,16 +3273,18 @@ mod tests {
                 chunk_count: chunks.len() as u32,
             },
         );
-        for (index, (chunk_hash, chunk_size)) in chunks.iter().copied().enumerate() {
+        let mut chunk_offset = 0u64;
+        for (chunk_hash, chunk_size) in chunks.iter().copied() {
             stage_manifest_chunk(
                 writes,
                 blob_id,
-                index as u64,
+                chunk_offset,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_hash.into_bytes(),
                     chunk_size,
                 },
             );
+            chunk_offset += chunk_size;
         }
         blob_id
     }
@@ -3783,7 +3765,7 @@ mod tests {
             stage_manifest_chunk(
                 &mut writes,
                 blob_hash,
-                1,
+                6,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_b_hash,
                     chunk_size: 6,
@@ -3847,7 +3829,7 @@ mod tests {
             stage_manifest_chunk(
                 &mut writes,
                 fixture.0,
-                2,
+                fixture.1.len() as u64,
                 &KvBlobManifestChunk {
                     chunk_hash: ChunkHash::from_content(b"stale manifest suffix").into_bytes(),
                     chunk_size: 1,
@@ -4117,7 +4099,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_hash_keys_are_compact_and_manifest_chunks_sort_by_index() {
+    fn binary_hash_keys_are_compact_and_manifest_chunks_sort_by_offset() {
         let blob_hash = BlobId::from_content(b"blob");
         let manifest_key = manifest_key(blob_hash);
         let chunk_key = chunk_key(ChunkHash::from_content(b"chunk"));
@@ -4255,10 +4237,27 @@ mod tests {
             data[requested.start as usize..requested.end as usize]
         );
 
+        // Content-defined boundaries are not known statically, so locate the
+        // first manifest row that starts after the requested range and delete
+        // it: a ranged read must never need it.
+        let mut trailing_offset = 0u64;
+        for chunk in scan_manifest_chunks(&store, blob_hash)
+            .await
+            .expect("manifest rows should scan")
+        {
+            if trailing_offset >= requested.end {
+                break;
+            }
+            trailing_offset += chunk.chunk_size;
+        }
+        assert!(
+            trailing_offset < data.len() as u64,
+            "the fixture must have a manifest row past the requested range"
+        );
         let mut writes = storage.new_write_set();
         writes.delete(
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
-            manifest_chunk_key(blob_hash, 2),
+            key(manifest_chunk_key(blob_hash, trailing_offset)),
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -4286,7 +4285,7 @@ mod tests {
         let data = definitely_multi_chunk_blob_bytes();
         let payload = BlobPayload::from_bytes(data.clone());
         let blob_hash = payload.hash().expect("payload should have a hash");
-        let chunk_ranges = crate::binary_cas::chunking::chunk_ranges(&data);
+        let chunk_ranges = chunk_ranges(&data);
         assert!(chunk_ranges.len() > 1);
         let chunk_hashes = chunk_ranges
             .iter()
@@ -4714,7 +4713,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("result read should open");
-        let expected_hashes = crate::binary_cas::chunking::chunk_ranges(&after)
+        let expected_hashes = chunk_ranges(&after)
             .into_iter()
             .map(|(start, end)| BlobId::from_content(&after[start..end]).into_bytes())
             .collect::<Vec<_>>();
@@ -4726,7 +4725,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             actual_hashes, expected_hashes,
-            "fallback must retain the canonical chunk layout"
+            "fallback must retain the content-defined layout"
         );
         assert_eq!(
             load_bytes_many(&store, &[after_blob_hash])
