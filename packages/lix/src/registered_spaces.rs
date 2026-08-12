@@ -38,42 +38,62 @@
 use crate::storage_adapter::StorageSpace;
 
 pub const JSON_SPACE: StorageSpace = crate::json_store::JSON_SPACE;
-pub const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace = crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE;
-pub const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE;
+pub const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace =
+    crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE;
+pub const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace =
+    crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE;
 pub const REPOSITORY_PROTOCOL_SPACE: StorageSpace = crate::init::REPOSITORY_PROTOCOL_SPACE;
-pub const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE;
-pub const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE;
+pub const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace =
+    crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE;
+pub const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace =
+    crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE;
 pub const HOT_ROW_SPACE: StorageSpace = crate::live_state::HOT_ROW_SPACE;
 pub const HOT_FILE_SPACE: StorageSpace = crate::live_state::HOT_FILE_SPACE;
 pub const HOT_DIFF_SPACE: StorageSpace = crate::live_state::HOT_DIFF_SPACE;
-pub const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE;
-pub const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE;
+pub const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace =
+    crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE;
+pub const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace =
+    crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE;
 pub const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = crate::branch::BRANCH_HEAD_CONTROL_SPACE;
-pub const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE;
-pub const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE;
-pub const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = crate::live_state::HOT_COLLECTION_CONTROL_SPACE;
+pub const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace =
+    crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE;
+pub const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace =
+    crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE;
+pub const HOT_COLLECTION_CONTROL_SPACE: StorageSpace =
+    crate::live_state::HOT_COLLECTION_CONTROL_SPACE;
 pub const PACKED_CURRENT_BASE_SPACE: StorageSpace = crate::live_state::PACKED_CURRENT_BASE_SPACE;
-pub const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = crate::live_state::PACKED_CURRENT_BASE_CONTROL_SPACE;
+pub const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace =
+    crate::live_state::PACKED_CURRENT_BASE_CONTROL_SPACE;
 pub const PLUGIN_CHECKPOINT_SPACE: StorageSpace = crate::transaction::PLUGIN_CHECKPOINT_SPACE;
-pub const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = crate::live_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE;
+pub const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace =
+    crate::live_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE;
 pub const ROOT_CURRENT_BASE_SPACE: StorageSpace = crate::live_state::ROOT_CURRENT_BASE_SPACE;
-pub const ROW_GROUP_MANIFEST_SPACE: StorageSpace = crate::columnar_row_group::ROW_GROUP_MANIFEST_SPACE;
+pub const ROW_GROUP_MANIFEST_SPACE: StorageSpace =
+    crate::columnar_row_group::ROW_GROUP_MANIFEST_SPACE;
 pub const ROW_GROUP_COLUMN_SPACE: StorageSpace = crate::columnar_row_group::ROW_GROUP_COLUMN_SPACE;
-pub const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE;
-pub const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE: StorageSpace = crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE;
-pub const MUTATION_DIRECTORY_NODE_SPACE: StorageSpace = crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE;
-pub const CURRENT_STATE_DATA_PART_SPACE: StorageSpace = crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE;
-pub const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace = crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE;
+pub const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace =
+    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE;
+pub const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE: StorageSpace =
+    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE;
+pub const MUTATION_DIRECTORY_NODE_SPACE: StorageSpace =
+    crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE;
+pub const CURRENT_STATE_DATA_PART_SPACE: StorageSpace =
+    crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE;
+pub const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace =
+    crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE;
 pub const SCOPED_RANGE_NODE_SPACE: StorageSpace = crate::tracked_state::SCOPED_RANGE_NODE_SPACE;
 pub const BINARY_CAS_MANIFEST_SPACE: StorageSpace = crate::binary_cas::BINARY_CAS_MANIFEST_SPACE;
-pub const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE;
+pub const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace =
+    crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE;
 pub const BINARY_CAS_CHUNK_SPACE: StorageSpace = crate::binary_cas::BINARY_CAS_CHUNK_SPACE;
-pub const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE;
+pub const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace =
+    crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE;
 pub const COMMIT_SPACE: StorageSpace = crate::changelog::COMMIT_SPACE;
 pub const CHANGE_SPACE: StorageSpace = crate::changelog::CHANGE_SPACE;
 pub const COMMIT_CHANGE_ID_SPACE: StorageSpace = crate::changelog::COMMIT_CHANGE_ID_SPACE;
 pub const REVISION_SPACE: StorageSpace = crate::storage_adapter::REVISION_SPACE;
-pub const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace = crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE;
+pub const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace =
+    crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE;
 pub const UPLOAD_STATE_SPACE: StorageSpace = crate::session::UPLOAD_STATE_SPACE;
 pub const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = crate::session::UPLOAD_MANIFEST_LEAF_SPACE;
 pub const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = crate::gc::CHECKPOINT_RECOVERY_REF_SPACE;
