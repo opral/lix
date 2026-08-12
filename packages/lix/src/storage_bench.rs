@@ -3176,9 +3176,7 @@ pub fn recompute_content_address(
 
 /// Decodes one `binary_cas.manifest_chunk` row into the chunk it references
 /// and that chunk's logical size.
-pub fn decode_binary_cas_chunk_reference(
-    value: &[u8],
-) -> Result<([u8; 32], u64), crate::LixError> {
+pub fn decode_binary_cas_chunk_reference(value: &[u8]) -> Result<([u8; 32], u64), crate::LixError> {
     crate::binary_cas::decode_binary_cas_manifest_chunk(value)
 }
 
@@ -3216,7 +3214,8 @@ where
         let (result, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan complete storage bench layout space").into_parts();
+            .expect("scan complete storage bench layout space")
+            .into_parts();
         for entry in result {
             accounting.rows = accounting
                 .rows
@@ -3268,7 +3267,8 @@ where
         let (result, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan complete storage bench layout space").into_parts();
+            .expect("scan complete storage bench layout space")
+            .into_parts();
         entries.extend(result);
         if !has_more {
             return entries;

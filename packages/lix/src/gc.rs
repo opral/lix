@@ -20,13 +20,13 @@ use crate::changelog::{ChangeRecord, CommitScanRequest};
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::changelog::{ChangeScanRequest, ChangelogContext, ChangelogReader};
 use crate::commit_graph::CommitGraphContext;
+use crate::hot_state::TrackedHeadContext;
+#[cfg(test)]
+use crate::hot_state::stage_collect_stale_working_diff_indexes;
 #[cfg(test)]
 use crate::json_store::JsonRef;
 #[cfg(test)]
 use crate::json_store::{JsonSlot, JsonStoreContext};
-use crate::hot_state::TrackedHeadContext;
-#[cfg(test)]
-use crate::hot_state::stage_collect_stale_working_diff_indexes;
 #[cfg(test)]
 use crate::storage_adapter::StorageCoreProjection;
 use crate::storage_adapter::{
@@ -280,7 +280,6 @@ pub(crate) fn stage_checkpoint_gc_state(
     Ok(())
 }
 
-
 /// Resolves a still-pending checkpoint replacement for an explicit branch
 /// source, or proves that the source remains reachable through ordinary
 /// canonical chronology.
@@ -442,7 +441,8 @@ pub(crate) async fn load_recovery_refs(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let StorageProjectedValue::FullValue(bytes) = entry.value else {
                 return Err(LixError::new(
@@ -2138,15 +2138,15 @@ mod tests {
     };
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
+    use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::json_store::{
         JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
         NormalizedJsonRef,
     };
-    use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
-        StorageKey, StorageReadOptions, StorageSpace, StorageValue,
-        StorageWriteOptions, StorageWriteSet,
+        StorageKey, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
+        StorageWriteSet,
     };
     use crate::tracked_state::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
@@ -2167,10 +2167,10 @@ mod tests {
 
     use super::{
         CHECKPOINT_GC_STATE_SPACE, CheckpointGcState, CheckpointRecoveryRef,
-        authenticated_control_commit_reachability,
-        derive_retirement_candidates, load_checkpoint_gc_state, load_recovery_ref,
-        load_recovery_refs, resolve_pending_checkpoint_replacement, retirement_is_proven,
-        stage_checkpoint_gc_state, stage_delete_recovery_ref, stage_recovery_ref_rotation,
+        authenticated_control_commit_reachability, derive_retirement_candidates,
+        load_checkpoint_gc_state, load_recovery_ref, load_recovery_refs,
+        resolve_pending_checkpoint_replacement, retirement_is_proven, stage_checkpoint_gc_state,
+        stage_delete_recovery_ref, stage_recovery_ref_rotation,
     };
 
     #[tokio::test]
@@ -4627,7 +4627,6 @@ mod tests {
         assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
     }
 
-
     #[tokio::test]
     async fn authority_gc_rejects_missing_live_commit_state_before_staging_deletes() {
         let storage = StorageAdapter::new(Memory::new());
@@ -5199,7 +5198,6 @@ mod tests {
         );
     }
 
-
     async fn run_repository_gc(storage: &Memory) {
         let storage_adapter = StorageAdapter::new(storage.clone());
         let read = SharedStorageAdapterRead::new(
@@ -5466,7 +5464,8 @@ mod tests {
             let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await
-                .expect("generation census page should load").into_parts();
+                .expect("generation census page should load")
+                .into_parts();
             rows += page.len();
             if !page_has_more {
                 break;
@@ -5712,10 +5711,9 @@ mod tests {
             .scan()
             .await
             .expect("offline authority controls should load");
-        let closure_error =
-            super::load_authenticated_repository_retention(&read, &controls)
-                .await
-                .expect_err("the retention closure must fail closed");
+        let closure_error = super::load_authenticated_repository_retention(&read, &controls)
+            .await
+            .expect_err("the retention closure must fail closed");
         let audit_error = super::audit_repository_gc_standalone_refs(&read)
             .await
             .expect_err("standalone audit must fail closed");

@@ -8,10 +8,7 @@
 use bytes::Bytes;
 
 use super::context::ChangelogContext;
-use super::store::{
-    CHANGE_SPACE, COMMIT_SPACE, ChangelogReader, change_key,
-    commit_key,
-};
+use super::store::{CHANGE_SPACE, COMMIT_SPACE, ChangelogReader, change_key, commit_key};
 use super::types::{ChangeId, CommitId, CommitLoadRequest};
 use crate::LixError;
 use crate::storage_adapter::{

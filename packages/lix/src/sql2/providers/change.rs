@@ -8,8 +8,7 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
 use crate::LixError;
 use crate::changelog::{
-    ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
-    ChangelogContext, ChangelogReader,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogContext, ChangelogReader,
 };
 use crate::serialize_row_metadata;
 

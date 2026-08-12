@@ -638,9 +638,9 @@ mod tests {
                 };
                 let name = name.trim();
                 if name.is_empty()
-                    || !name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
                 {
                     continue;
                 }
@@ -648,9 +648,9 @@ mod tests {
                     continue;
                 };
                 let id = match declared_type.trim() {
-                    "SpaceId" | "StorageSpaceId" => literal_space_id(
-                        &expression.split_whitespace().collect::<String>(),
-                    ),
+                    "SpaceId" | "StorageSpaceId" => {
+                        literal_space_id(&expression.split_whitespace().collect::<String>())
+                    }
                     "StorageSpace" => construction_sites(expression)
                         .first()
                         .and_then(|site| literal_space_id(&site.id_expression)),

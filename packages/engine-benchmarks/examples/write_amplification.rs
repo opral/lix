@@ -73,7 +73,9 @@ const MIN_RUN: usize = 6;
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let mode = args.next().expect("usage: write_amplification <mode> <dir> ...");
+    let mode = args
+        .next()
+        .expect("usage: write_amplification <mode> <dir> ...");
     let dir = args
         .next()
         .expect("usage: write_amplification <mode> <dir> ...");
@@ -98,9 +100,21 @@ async fn main() {
             let width = next("width");
             let distinct = next("distinct");
             if rocksdb {
-                update(RocksDB::open(&dir).expect("open RocksDB"), updates, width, distinct).await;
+                update(
+                    RocksDB::open(&dir).expect("open RocksDB"),
+                    updates,
+                    width,
+                    distinct,
+                )
+                .await;
             } else {
-                update(SlateDB::open(&dir).expect("open SlateDB"), updates, width, distinct).await;
+                update(
+                    SlateDB::open(&dir).expect("open SlateDB"),
+                    updates,
+                    width,
+                    distinct,
+                )
+                .await;
             }
         }
         "census" => {
@@ -185,12 +199,7 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize) {
 /// One `execute_prepared_dml_batch` is one commit, so `width` is exactly the
 /// number of rows a commit carries. Holding `updates` fixed and varying `width`
 /// separates per-commit fixed cost from per-row marginal cost.
-async fn update<S: BenchStorage>(
-    storage: S,
-    updates: usize,
-    width: usize,
-    distinct: usize,
-) {
+async fn update<S: BenchStorage>(storage: S, updates: usize, width: usize, distinct: usize) {
     assert!(width > 0 && distinct > 0, "width and distinct must be > 0");
     assert!(
         updates % width == 0,
