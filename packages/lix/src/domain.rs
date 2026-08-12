@@ -165,8 +165,18 @@ impl Domain {
         self.source_domains_that_can_reach()
     }
 
+    /// A row must live in the same durability lane as the file that owns it.
+    ///
+    /// Unlike foreign keys and directory parents — where an untracked row may
+    /// reference a tracked target, see [`Self::reachable_target_domains`] —
+    /// file ownership is exact in both directions. A file and its rows are
+    /// tracked or untracked together, so an untracked row may not attach
+    /// itself to a tracked file any more than a tracked row may attach itself
+    /// to an untracked one. Widening this to the tracked lane is what let an
+    /// untracked row hide under a tracked file and be silently destroyed when
+    /// a version-control operation removed that file's descriptor.
     pub(crate) fn file_owner_domains(&self) -> Vec<Self> {
-        self.reachable_target_domains()
+        vec![self.clone()]
     }
 
     pub(crate) fn directory_parent_domains(&self) -> Vec<Self> {

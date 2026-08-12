@@ -1771,10 +1771,8 @@ impl FileOwnerReferenceValidator {
             return Ok(());
         };
 
-        let row_domain = row.domain();
-        let target_domains = row_domain
-            .with_untracked(row.untracked())
-            .file_owner_domains();
+        let owner_domain = row.domain().with_untracked(row.untracked());
+        let target_domains = owner_domain.file_owner_domains();
 
         for domain in &target_domains {
             if pending_file_descriptors.state_in_domain(domain, file_id)
@@ -1798,7 +1796,39 @@ impl FileOwnerReferenceValidator {
             }
         }
 
+        // The file is absent from the row's own durability lane. Probe the
+        // opposite lane before reporting, so a file that plainly exists in
+        // `lix_file` is never described as missing: that diagnostic sends the
+        // reader looking for the wrong bug.
+        if self
+            .file_descriptor_exists_in_domain(
+                input,
+                pending_file_descriptors,
+                &owner_domain.with_untracked(!row.untracked()),
+                file_id,
+            )
+            .await?
+        {
+            return Err(file_owner_lane_mismatch_error(row, file_id)?);
+        }
+
         Err(missing_file_owner_reference_error(row, file_id)?)
+    }
+
+    async fn file_descriptor_exists_in_domain(
+        &mut self,
+        input: &TransactionValidationInput<'_>,
+        pending_file_descriptors: &PendingFileDescriptorIndex,
+        domain: &Domain,
+        file_id: &str,
+    ) -> Result<bool, LixError> {
+        match pending_file_descriptors.state_in_domain(domain, file_id) {
+            Some(PendingFileDescriptorState::Present) => return Ok(true),
+            Some(PendingFileDescriptorState::Tombstone) => return Ok(false),
+            _ => {}
+        }
+        self.committed_file_descriptor_exists_in_domain(input.live_state, domain, file_id)
+            .await
     }
 
     async fn committed_file_descriptor_exists_in_domain(
@@ -1846,6 +1876,35 @@ async fn committed_file_descriptor_exists_in_domain(
         && row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
         && row.entity_pk() == &entity_pk
         && row.file_id() == Some(file_id))
+}
+
+/// Reports a row whose durability lane does not match its file's.
+///
+/// The file exists and is readable; only the lane is wrong. Saying "missing
+/// file_id" here would be a lie the reader can check against `lix_file` in one
+/// query, so name both lanes instead.
+fn file_owner_lane_mismatch_error(
+    row: PreparedValidationRow<'_>,
+    file_id: &str,
+) -> Result<LixError, LixError> {
+    let (row_lane, file_lane) = if row.untracked() {
+        ("untracked", "tracked")
+    } else {
+        ("tracked", "untracked")
+    };
+    Ok(LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "file ownership validation failed for schema '{}': {row_lane} entity '{}' cannot reference {file_lane} file_id '{}' on branch '{}'",
+            row.schema_key(),
+            row.entity_pk().as_json_array_text()?,
+            file_id,
+            row.branch_id()
+        ),
+    )
+    .with_hint(
+        "A file and the rows it owns share one durability lane. Write this row with lixcol_untracked matching the file's, or write it against a file in the same lane.",
+    ))
 }
 
 fn missing_file_owner_reference_error(
