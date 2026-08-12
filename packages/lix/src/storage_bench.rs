@@ -1741,7 +1741,6 @@ pub struct RepositoryGcCommitBenchResult {
     pub reclaimed_manifest_rows: usize,
     pub reclaimed_manifest_chunk_rows: usize,
     pub reclaimed_chunk_rows: usize,
-    pub reclaimed_chunk_bytes: u64,
     pub plan_us: u64,
     pub commit_us: u64,
 }
@@ -1800,7 +1799,6 @@ where
                     reclaimed_manifest_rows: binary_cas.reclaimed_manifest_rows,
                     reclaimed_manifest_chunk_rows: binary_cas.reclaimed_manifest_chunk_rows,
                     reclaimed_chunk_rows: binary_cas.reclaimed_chunk_rows,
-                    reclaimed_chunk_bytes: binary_cas.reclaimed_chunk_bytes,
                     plan_us,
                     commit_us: commit_started.elapsed().as_micros() as u64,
                 });

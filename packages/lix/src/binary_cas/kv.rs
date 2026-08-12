@@ -38,8 +38,13 @@ const MANIFEST_SCAN_CONCURRENCY: usize = 8;
 const MAX_DELTA_SEGMENTS: usize = 32;
 const MAX_DELTA_INSERT_BYTES: usize = 64 * 1024;
 const MAX_DELTA_INSERT_FRACTION_DIVISOR: usize = 8;
-const CAS_RECLAIM_MANIFEST_PAGE_ROWS: usize = 256;
-const CAS_RECLAIM_CHUNK_PAGE_ROWS: usize = 1;
+// Every reclamation scan is bounded by rows because every reclamation scan now
+// carries bounded per-row payloads: three of the four planes are scanned
+// key-only (32- or 40-byte keys), and the manifest plane's values are a fixed
+// header. The chunk plane deliberately does *not* project its value: chunk
+// payloads are 256 KiB-4 MiB, so a row-bounded window over them would be
+// unbounded in bytes, which is why this used to be paged one row at a time.
+const CAS_RECLAIM_PAGE_ROWS: usize = 256;
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
@@ -165,11 +170,11 @@ pub(crate) struct KvBlobManifestChunk {
 /// Stages deletion of binary-CAS rows not reachable from authenticated blob
 /// roots and active upload receipts.
 ///
-/// This is intentionally an explicit maintenance operation. It scans in
-/// single-row payload windows, retains only hashes and bounded manifest
-/// metadata in memory, and never reconstructs a full blob. Any malformed live
-/// manifest or missing live chunk fails closed before the caller can commit
-/// the write set.
+/// This is intentionally an explicit maintenance operation. Reachability is
+/// decided entirely from keys and bounded manifest metadata, so no scan here
+/// projects a chunk payload and no blob is ever reconstructed. Any malformed
+/// live manifest or missing live chunk fails closed before the caller can
+/// commit the write set.
 pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -226,7 +231,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
         .await?;
     loop {
         let (page, page_has_more) = manifest_cursor
-            .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
+            .next_page(CAS_RECLAIM_PAGE_ROWS)
             .await?.into_parts();
         for entry in page {
             let blob_id = BlobId::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
@@ -272,7 +277,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
         .await?;
     loop {
         let (page, page_has_more) = manifest_chunk_cursor
-            .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
+            .next_page(CAS_RECLAIM_PAGE_ROWS)
             .await?.into_parts();
         for entry in page {
             let (blob_id, offset) = decode_manifest_chunk_key(&entry.key)?;
@@ -289,6 +294,13 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
         }
     }
 
+    // Orphan selection is a key-set difference, so this scan must never
+    // project chunk payloads. On SlateDB the chunk plane is
+    // `ValueSemantics::Immutable`: its values live in object-store segments and
+    // a full-value page pays one segment fetch round trip. The page is
+    // hydrated before this loop can decide a row is live, so that round trip
+    // was charged for every chunk in the repository, not only the reclaimed
+    // ones. Key-only keeps the whole plane inside the LSM index.
     let mut chunk_cursor = store
         .begin_scan(
             BINARY_CAS_CHUNK_SPACE,
@@ -297,13 +309,15 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                 upper: Bound::Unbounded,
             },
             StorageBeginScanOptions {
-                projection: StorageCoreProjection::FullValue,
+                projection: StorageCoreProjection::KeyOnly,
                 ..StorageBeginScanOptions::default()
             },
         )
         .await?;
     loop {
-        let (page, page_has_more) = chunk_cursor.next_page(CAS_RECLAIM_CHUNK_PAGE_ROWS).await?.into_parts();
+        let (page, page_has_more) = chunk_cursor
+            .next_page(CAS_RECLAIM_PAGE_ROWS)
+            .await?.into_parts();
         for entry in page {
             let chunk_hash =
                 ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
@@ -315,29 +329,8 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
             if live_chunks.contains_key(&chunk_hash) {
                 continue;
             }
-            let StorageProjectedValue::FullValue(bytes) = entry.value else {
-                return Err(LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    "binary CAS chunk scan omitted its value",
-                ));
-            };
-            let byte_count = u64::try_from(bytes.len()).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "binary CAS orphan chunk size exceeds u64",
-                )
-            })?;
-            writes.delete(BINARY_CAS_CHUNK_SPACE, entry.key.clone());
+            writes.delete(BINARY_CAS_CHUNK_SPACE, entry.key);
             result.reclaimed_chunk_rows += 1;
-            result.reclaimed_chunk_bytes = result
-                .reclaimed_chunk_bytes
-                .checked_add(byte_count)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "binary CAS reclaimed byte count overflowed",
-                    )
-                })?;
         }
         if !page_has_more {
             break;
@@ -359,7 +352,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
         .await?;
     loop {
         let (page, page_has_more) = presence_cursor
-            .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
+            .next_page(CAS_RECLAIM_PAGE_ROWS)
             .await?.into_parts();
         for entry in page {
             let chunk_hash =
