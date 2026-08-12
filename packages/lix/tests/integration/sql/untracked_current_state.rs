@@ -498,10 +498,27 @@ async fn assert_untracked_current_state(
     let [row] = result.rows() else {
         panic!("expected exactly one current row for key '{key}'");
     };
+    // Untracked state is identity-bearing but history-free: it exposes a real
+    // change id and no commit id. The change id is asserted as a property
+    // rather than as a literal on purpose — the value is a function of UUID
+    // draw order, so pinning it here would turn any unrelated change in draw
+    // order into a spurious failure that invites re-recording. History
+    // freedom itself is asserted directly against the changelog and history
+    // views elsewhere in this file, which is where it belongs.
+    let [change_id, commit_id, untracked] = row.values() else {
+        panic!("expected three projected columns for key '{key}'");
+    };
+    match change_id {
+        Value::Text(value) => assert!(
+            uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil()),
+            "untracked state must expose a real change id, got '{value}' for key '{key}'"
+        ),
+        other => panic!("untracked state must expose a change id, got {other:?}"),
+    }
     assert_eq!(
-        row.values(),
-        &[Value::Null, Value::Null, Value::Boolean(true)],
-        "ordinary untracked state must expose neither a change nor commit id"
+        (commit_id, untracked),
+        (&Value::Null, &Value::Boolean(true)),
+        "ordinary untracked state must expose no commit id and stay untracked"
     );
 }
 
