@@ -3526,13 +3526,15 @@ where
                 branch_ids.insert(row.branch_id.to_string());
                 continue;
             }
-            if row.global || row.untracked {
+            if row.global {
                 continue;
             }
+            // Deleting an untracked plugin-owned file must clean up its owner
+            // and entity rows the same way a tracked deletion does.
             let key = PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: false,
+                untracked: row.untracked,
                 file_id,
             };
             deleted_file_keys
