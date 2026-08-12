@@ -11,12 +11,13 @@ Lix has pluggable storage. A storage adapter decides where the bytes live. The L
 | Adapter            | Available in     | Use for                                        |
 | ------------------ | ---------------- | ---------------------------------------------- |
 | `Memory` (default) | JavaScript, Rust | tests, demos, and ephemeral work               |
+| `IndexedDbStorage` | JavaScript       | persistent local browser repositories          |
 | `LocalFilesystem`  | JavaScript, Rust | a local directory synchronized with Lix        |
 | `RocksDB`          | Rust             | native embedded persistence                    |
 | `SlateDB`          | Rust             | object storage, for example S3                 |
 | Remote server      | any client       | shared workspaces; the server owns persistence |
 
-In JavaScript, `LocalFilesystem` requires Node.js. The default `Memory` storage also works in browsers.
+In JavaScript, `LocalFilesystem` requires Node.js. The default `Memory` storage and `IndexedDbStorage` work in browsers.
 
 ## In-memory (default)
 
@@ -51,6 +52,25 @@ Two options change this behavior:
 
 - `lixDir` stores the repository state outside the workspace. The workspace does not receive a `.lix` directory.
 - `syncAllFiles: false` starts without importing files. Import exact file paths with `storage.importPaths(["notes/today.md"])`.
+
+## IndexedDB
+
+Persist a complete local browser repository across reloads with
+`IndexedDbStorage`:
+
+```ts
+import { IndexedDbStorage, openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  storage: new IndexedDbStorage({ name: "atelier" }),
+});
+```
+
+The name identifies one Lix database within the current browser origin. Only
+one Lix handle may open that database name at a time, including from other tabs.
+IndexedDB commits use the same transactional storage boundary as native Lix
+storage; Lix does not export or replace a complete repository snapshot after
+each mutation.
 
 Filesystem sync handles regular files only. Symbolic links and other special entries are not imported.
 
@@ -102,4 +122,4 @@ let report = run_storage_conformance(&factory).await;
 report.assert_no_failures();
 ```
 
-PostgreSQL, IndexedDB, OPFS, Cloudflare D1, and similar targets need such a custom implementation.
+PostgreSQL, OPFS, Cloudflare D1, and similar targets need such a custom implementation.

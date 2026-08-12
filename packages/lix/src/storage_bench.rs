@@ -458,6 +458,548 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
     }
 }
 
+// ---------------------------------------------------------------------------
+// Commit-root replay accounting (experiment AA).
+//
+// Answers "how many ancestor commits does one root-materialization boundary
+// replay, and where does the per-replayed-commit cost go". The coarse counters
+// tick once per boundary/plan and are always compiled under `storage-benches`.
+// The per-node cost attribution is behind `root-replay-trace` so no timing A/B
+// ever pays for an `Instant::now()` inside `hash_bytes`.
+// ---------------------------------------------------------------------------
+
+static ROOT_REPLAY_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_PLANS_LOADED: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_PLANS_STAGED: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_AVAILABLE_ROOT_PROBES: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_AVAILABLE_ROOT_HITS: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_PROOF_STAGINGS: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_MAX_PLANS: AtomicU64 = AtomicU64::new(0);
+
+static ROOT_REPLAY_PLAN_LOAD_NANOS: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_STAGE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-boundary replay-set sizes, in boundary order.
+static ROOT_REPLAY_PLAN_HISTOGRAM: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RootReplayAccounting {
+    /// Distinct durable rootless parents that forced a replay.
+    pub boundaries: u64,
+    /// Total rebuild plans returned by the nearest-available-root walk.
+    pub plans_loaded: u64,
+    /// Plans actually replayed through the tracked-state root writer.
+    pub plans_staged: u64,
+    pub available_root_probes: u64,
+    pub available_root_hits: u64,
+    /// Root stagings performed inside the ancestry proof itself.
+    pub proof_stagings: u64,
+    pub max_plans_in_one_boundary: u64,
+    pub plan_load_nanos: u64,
+    pub stage_nanos: u64,
+    /// Replay-set size per boundary, in boundary order.
+    pub plans_per_boundary: Vec<u64>,
+}
+
+pub(crate) fn record_root_replay_boundary(plans: usize) {
+    ROOT_REPLAY_BOUNDARIES.fetch_add(1, Ordering::Relaxed);
+    ROOT_REPLAY_PLANS_LOADED.fetch_add(plans as u64, Ordering::Relaxed);
+    ROOT_REPLAY_MAX_PLANS.fetch_max(plans as u64, Ordering::Relaxed);
+    if let Ok(mut histogram) = ROOT_REPLAY_PLAN_HISTOGRAM.lock() {
+        histogram.push(plans as u64);
+    }
+}
+
+pub(crate) fn record_root_replay_plan_staged() {
+    ROOT_REPLAY_PLANS_STAGED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_replay_available_root_probe(hit: bool) {
+    ROOT_REPLAY_AVAILABLE_ROOT_PROBES.fetch_add(1, Ordering::Relaxed);
+    if hit {
+        ROOT_REPLAY_AVAILABLE_ROOT_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Retained so the base and candidate arms of an A/B expose the same
+/// accounting surface; the bounded availability proof performs no stagings.
+#[allow(dead_code)]
+pub(crate) fn record_root_replay_proof_staging() {
+    ROOT_REPLAY_PROOF_STAGINGS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_replay_plan_load_nanos(nanos: u64) {
+    ROOT_REPLAY_PLAN_LOAD_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_replay_stage_nanos(nanos: u64) {
+    ROOT_REPLAY_STAGE_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+pub fn take_root_replay_accounting() -> RootReplayAccounting {
+    RootReplayAccounting {
+        boundaries: ROOT_REPLAY_BOUNDARIES.swap(0, Ordering::Relaxed),
+        plans_loaded: ROOT_REPLAY_PLANS_LOADED.swap(0, Ordering::Relaxed),
+        plans_staged: ROOT_REPLAY_PLANS_STAGED.swap(0, Ordering::Relaxed),
+        available_root_probes: ROOT_REPLAY_AVAILABLE_ROOT_PROBES.swap(0, Ordering::Relaxed),
+        available_root_hits: ROOT_REPLAY_AVAILABLE_ROOT_HITS.swap(0, Ordering::Relaxed),
+        proof_stagings: ROOT_REPLAY_PROOF_STAGINGS.swap(0, Ordering::Relaxed),
+        max_plans_in_one_boundary: ROOT_REPLAY_MAX_PLANS.swap(0, Ordering::Relaxed),
+        plan_load_nanos: ROOT_REPLAY_PLAN_LOAD_NANOS.swap(0, Ordering::Relaxed),
+        stage_nanos: ROOT_REPLAY_STAGE_NANOS.swap(0, Ordering::Relaxed),
+        plans_per_boundary: ROOT_REPLAY_PLAN_HISTOGRAM
+            .lock()
+            .map(|mut histogram| std::mem::take(&mut *histogram))
+            .unwrap_or_default(),
+    }
+}
+
+/// Per-node cost attribution for replayed commits.
+///
+/// Every bucket records `(in_replay, total)` so a run can say what fraction of
+/// all tracked-state tree CPU is spent inside commit-root replay rather than on
+/// the commit's own mutations.
+#[cfg(feature = "root-replay-trace")]
+mod replay_trace {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    macro_rules! bucket {
+        ($replay_ns:ident, $total_ns:ident, $replay_bytes:ident, $total_bytes:ident,
+         $replay_count:ident, $total_count:ident, $record:ident) => {
+            static $replay_ns: AtomicU64 = AtomicU64::new(0);
+            static $total_ns: AtomicU64 = AtomicU64::new(0);
+            static $replay_bytes: AtomicU64 = AtomicU64::new(0);
+            static $total_bytes: AtomicU64 = AtomicU64::new(0);
+            static $replay_count: AtomicU64 = AtomicU64::new(0);
+            static $total_count: AtomicU64 = AtomicU64::new(0);
+
+            pub(crate) fn $record(nanos: u64, bytes: u64) {
+                $total_ns.fetch_add(nanos, Ordering::Relaxed);
+                $total_bytes.fetch_add(bytes, Ordering::Relaxed);
+                $total_count.fetch_add(1, Ordering::Relaxed);
+                if in_replay() {
+                    $replay_ns.fetch_add(nanos, Ordering::Relaxed);
+                    $replay_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    $replay_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        };
+    }
+
+    thread_local! {
+        static REPLAY_DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn in_replay() -> bool {
+        REPLAY_DEPTH.with(|depth| depth.get() > 0)
+    }
+
+    pub(crate) fn enter() {
+        REPLAY_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    }
+
+    pub(crate) fn exit() {
+        REPLAY_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+
+    bucket!(
+        READ_NS,
+        READ_TOTAL_NS,
+        READ_BYTES,
+        READ_TOTAL_BYTES,
+        READ_COUNT,
+        READ_TOTAL_COUNT,
+        record_chunk_read
+    );
+    bucket!(
+        DECODE_NS,
+        DECODE_TOTAL_NS,
+        DECODE_BYTES,
+        DECODE_TOTAL_BYTES,
+        DECODE_COUNT,
+        DECODE_TOTAL_COUNT,
+        record_node_decode
+    );
+    bucket!(
+        ENCODE_NS,
+        ENCODE_TOTAL_NS,
+        ENCODE_BYTES,
+        ENCODE_TOTAL_BYTES,
+        ENCODE_COUNT,
+        ENCODE_TOTAL_COUNT,
+        record_node_encode
+    );
+    bucket!(
+        HASH_NS,
+        HASH_TOTAL_NS,
+        HASH_BYTES,
+        HASH_TOTAL_BYTES,
+        HASH_COUNT,
+        HASH_TOTAL_COUNT,
+        record_node_hash
+    );
+
+    pub(crate) fn take() -> super::RootReplayCostAttribution {
+        let bucket = |ns: &AtomicU64,
+                      total_ns: &AtomicU64,
+                      bytes: &AtomicU64,
+                      total_bytes: &AtomicU64,
+                      count: &AtomicU64,
+                      total_count: &AtomicU64| {
+            super::RootReplayCostBucket {
+                replay_nanos: ns.swap(0, Ordering::Relaxed),
+                total_nanos: total_ns.swap(0, Ordering::Relaxed),
+                replay_bytes: bytes.swap(0, Ordering::Relaxed),
+                total_bytes: total_bytes.swap(0, Ordering::Relaxed),
+                replay_count: count.swap(0, Ordering::Relaxed),
+                total_count: total_count.swap(0, Ordering::Relaxed),
+            }
+        };
+        super::RootReplayCostAttribution {
+            storage_read: bucket(
+                &READ_NS,
+                &READ_TOTAL_NS,
+                &READ_BYTES,
+                &READ_TOTAL_BYTES,
+                &READ_COUNT,
+                &READ_TOTAL_COUNT,
+            ),
+            decode: bucket(
+                &DECODE_NS,
+                &DECODE_TOTAL_NS,
+                &DECODE_BYTES,
+                &DECODE_TOTAL_BYTES,
+                &DECODE_COUNT,
+                &DECODE_TOTAL_COUNT,
+            ),
+            encode: bucket(
+                &ENCODE_NS,
+                &ENCODE_TOTAL_NS,
+                &ENCODE_BYTES,
+                &ENCODE_TOTAL_BYTES,
+                &ENCODE_COUNT,
+                &ENCODE_TOTAL_COUNT,
+            ),
+            hash: bucket(
+                &HASH_NS,
+                &HASH_TOTAL_NS,
+                &HASH_BYTES,
+                &HASH_TOTAL_BYTES,
+                &HASH_COUNT,
+                &HASH_TOTAL_COUNT,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootReplayCostBucket {
+    pub replay_nanos: u64,
+    pub total_nanos: u64,
+    pub replay_bytes: u64,
+    pub total_bytes: u64,
+    pub replay_count: u64,
+    pub total_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootReplayCostAttribution {
+    pub storage_read: RootReplayCostBucket,
+    pub decode: RootReplayCostBucket,
+    pub encode: RootReplayCostBucket,
+    pub hash: RootReplayCostBucket,
+}
+
+/// True when this build carries the per-node replay cost attribution.
+pub fn root_replay_trace_enabled() -> bool {
+    cfg!(feature = "root-replay-trace")
+}
+
+pub fn take_root_replay_cost_attribution() -> RootReplayCostAttribution {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        replay_trace::take()
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    {
+        RootReplayCostAttribution::default()
+    }
+}
+
+/// Marks the dynamic extent of one commit-root replay for cost attribution.
+pub(crate) struct RootReplayScope;
+
+impl RootReplayScope {
+    pub(crate) fn enter() -> Self {
+        #[cfg(feature = "root-replay-trace")]
+        replay_trace::enter();
+        Self
+    }
+}
+
+impl Drop for RootReplayScope {
+    fn drop(&mut self) {
+        #[cfg(feature = "root-replay-trace")]
+        replay_trace::exit();
+    }
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_chunk_read(nanos: u64, bytes: u64) {
+    replay_trace::record_chunk_read(nanos, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_node_decode(nanos: u64, bytes: u64) {
+    replay_trace::record_node_decode(nanos, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_node_encode(nanos: u64, bytes: u64) {
+    replay_trace::record_node_encode(nanos, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_node_hash(nanos: u64, bytes: u64) {
+    replay_trace::record_node_hash(nanos, bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Plan-load phase attribution (experiment AB).
+//
+// Splits one commit-root rebuild plan load into named phases and, for every
+// phase, separates the time spent inside the storage adapter's `get_many`
+// boundary (I/O) from everything else (decode + allocation + setup). Also
+// counts physical read batches and keys per phase, so "how many physical reads
+// does one plan load issue" is answered by a counter rather than a guess.
+//
+// Gated behind `root-replay-trace` exactly like the AA attribution, so no A/B
+// timing build pays for an `Instant::now()` inside `get_many`.
+// ---------------------------------------------------------------------------
+
+/// Named phases of one commit-root rebuild plan load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanLoadPhase {
+    /// Everything outside a plan load.
+    Other = 0,
+    /// `load_available_root` — the bounded durable-root availability probe.
+    AvailProbe = 1,
+    /// `ChangelogReader::load_commits` for the one replayed commit.
+    CommitRecord = 2,
+    /// `load_point_replay_commit_state` — commit-state header + inventory.
+    ReplayState = 3,
+    /// Mutation-directory routing plus packed commit-delta segment reads and
+    /// leaf decode.
+    DeltaSegments = 4,
+    /// Owned-key materialization of the decoded batch into plan deltas.
+    Collect = 5,
+    /// `commit_root_tree_is_readable` — the full tracked-state tree scan the
+    /// availability probe runs to prove the addressed chunk closure is
+    /// physically readable. Nested inside `AvailProbe`.
+    AvailTreeScan = 6,
+}
+
+pub const PLAN_LOAD_PHASE_COUNT: usize = 7;
+
+pub const PLAN_LOAD_PHASE_NAMES: [&str; PLAN_LOAD_PHASE_COUNT] = [
+    "other",
+    "avail_probe",
+    "commit_record",
+    "replay_state",
+    "delta_segments",
+    "collect",
+    "avail_tree_scan",
+];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanLoadPhaseMetric {
+    /// Wall time inside the phase guard.
+    pub wall_nanos: u64,
+    /// Wall time inside `StorageAdapterRead::get_many` while in this phase.
+    pub io_nanos: u64,
+    /// `StorageAdapterRead::get_many` invocations issued while in this phase.
+    pub read_calls: u64,
+    /// Logical per-space requests inside those invocations.
+    pub read_batches: u64,
+    /// Keys requested across those batches.
+    pub read_keys: u64,
+    /// Keys that returned a value.
+    pub read_hits: u64,
+    /// Bytes returned by those batches.
+    pub read_bytes: u64,
+    /// Times the phase guard was entered.
+    pub entries: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanLoadAttribution {
+    pub phases: [PlanLoadPhaseMetric; PLAN_LOAD_PHASE_COUNT],
+    /// Plan loads completed (one per replayed ancestor).
+    pub plans: u64,
+    /// Commit-delta members decoded across those plan loads.
+    pub members_decoded: u64,
+    /// Members kept in the returned plan.
+    pub members_kept: u64,
+    /// Bytes of packed commit-delta segment payload decoded.
+    pub member_payload_bytes: u64,
+}
+
+/// True when this build carries the plan-load phase attribution.
+pub fn plan_load_trace_enabled() -> bool {
+    cfg!(feature = "root-replay-trace")
+}
+
+#[cfg(feature = "root-replay-trace")]
+mod plan_load_trace {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{PLAN_LOAD_PHASE_COUNT, PlanLoadAttribution, PlanLoadPhase, PlanLoadPhaseMetric};
+
+    const FIELDS: usize = 8;
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    static COUNTERS: [AtomicU64; PLAN_LOAD_PHASE_COUNT * FIELDS] =
+        [ZERO; PLAN_LOAD_PHASE_COUNT * FIELDS];
+    static PLANS: AtomicU64 = AtomicU64::new(0);
+    static MEMBERS_DECODED: AtomicU64 = AtomicU64::new(0);
+    static MEMBERS_KEPT: AtomicU64 = AtomicU64::new(0);
+    static MEMBER_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static PHASE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn add(phase: usize, field: usize, value: u64) {
+        COUNTERS[phase * FIELDS + field].fetch_add(value, Ordering::Relaxed);
+    }
+
+    pub(super) fn current_phase() -> usize {
+        PHASE.with(Cell::get)
+    }
+
+    pub(super) fn set_phase(phase: usize) -> usize {
+        PHASE.with(|slot| slot.replace(phase))
+    }
+
+    pub(super) fn record_phase_wall(phase: usize, nanos: u64) {
+        add(phase, 0, nanos);
+        add(phase, 6, 1);
+    }
+
+    pub(super) fn record_io(nanos: u64, batches: u64, keys: u64, hits: u64, bytes: u64) {
+        let phase = current_phase();
+        add(phase, 1, nanos);
+        add(phase, 2, batches);
+        add(phase, 3, keys);
+        add(phase, 4, hits);
+        add(phase, 5, bytes);
+        add(phase, 7, 1);
+    }
+
+    pub(super) fn record_plan(members_decoded: u64, members_kept: u64, payload_bytes: u64) {
+        PLANS.fetch_add(1, Ordering::Relaxed);
+        MEMBERS_DECODED.fetch_add(members_decoded, Ordering::Relaxed);
+        MEMBERS_KEPT.fetch_add(members_kept, Ordering::Relaxed);
+        MEMBER_PAYLOAD_BYTES.fetch_add(payload_bytes, Ordering::Relaxed);
+    }
+
+    pub(super) fn take() -> PlanLoadAttribution {
+        let mut phases = [PlanLoadPhaseMetric::default(); PLAN_LOAD_PHASE_COUNT];
+        for (index, phase) in phases.iter_mut().enumerate() {
+            let get = |field: usize| COUNTERS[index * FIELDS + field].swap(0, Ordering::Relaxed);
+            *phase = PlanLoadPhaseMetric {
+                wall_nanos: get(0),
+                io_nanos: get(1),
+                read_batches: get(2),
+                read_keys: get(3),
+                read_hits: get(4),
+                read_bytes: get(5),
+                entries: get(6),
+                read_calls: get(7),
+            };
+        }
+        PlanLoadAttribution {
+            phases,
+            plans: PLANS.swap(0, Ordering::Relaxed),
+            members_decoded: MEMBERS_DECODED.swap(0, Ordering::Relaxed),
+            members_kept: MEMBERS_KEPT.swap(0, Ordering::Relaxed),
+            member_payload_bytes: MEMBER_PAYLOAD_BYTES.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn phase_index(phase: PlanLoadPhase) -> usize {
+        phase as usize
+    }
+}
+
+pub fn take_plan_load_attribution() -> PlanLoadAttribution {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        plan_load_trace::take()
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    {
+        PlanLoadAttribution::default()
+    }
+}
+
+/// RAII guard marking the dynamic extent of one plan-load phase.
+///
+/// Phases nest: the guard restores the enclosing phase on drop, and wall time
+/// is charged to the phase named by the guard (so an inner phase's time is
+/// counted in both, exactly like a call-tree self/total split at one level).
+pub(crate) struct PlanLoadPhaseScope {
+    #[cfg(feature = "root-replay-trace")]
+    phase: usize,
+    #[cfg(feature = "root-replay-trace")]
+    previous: usize,
+    #[cfg(feature = "root-replay-trace")]
+    start: std::time::Instant,
+}
+
+impl PlanLoadPhaseScope {
+    #[allow(unused_variables)]
+    pub(crate) fn enter(phase: PlanLoadPhase) -> Self {
+        #[cfg(feature = "root-replay-trace")]
+        {
+            let phase = plan_load_trace::phase_index(phase);
+            let previous = plan_load_trace::set_phase(phase);
+            Self {
+                phase,
+                previous,
+                start: std::time::Instant::now(),
+            }
+        }
+        #[cfg(not(feature = "root-replay-trace"))]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for PlanLoadPhaseScope {
+    fn drop(&mut self) {
+        #[cfg(feature = "root-replay-trace")]
+        {
+            plan_load_trace::record_phase_wall(self.phase, self.start.elapsed().as_nanos() as u64);
+            plan_load_trace::set_phase(self.previous);
+        }
+    }
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_plan_load_io(nanos: u64, batches: u64, keys: u64, hits: u64, bytes: u64) {
+    plan_load_trace::record_io(nanos, batches, keys, hits, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_plan_load_plan(members_decoded: u64, members_kept: u64, payload_bytes: u64) {
+    plan_load_trace::record_plan(members_decoded, members_kept, payload_bytes);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BinaryCasWriteAccounting {
     pub chunk_lookup_count: u64,
@@ -2968,28 +3510,27 @@ mod tests {
         .await;
 
         assert_eq!(first.swept_commits, 10);
-        assert_eq!(first.swept_standalone_changes, 10);
+        // Superseded branch-ref facts are no longer GC debt: each publication
+        // deletes the ref change its own control supersedes, and the branch
+        // deletion deletes the last one, all in the publishing write set.
+        assert_eq!(first.swept_standalone_changes, 0);
         assert_eq!(first.deleted_commit_state_manifests, 10);
         assert_eq!(first.deleted_mutation_inventories, 10);
         // The ten branch-only commits are reclaimable, while the branch base
         // remains the active main head and therefore keeps its semantic
         // projection in the authenticated serving-dependency closure.
         assert_eq!(first.deleted_semantic_commit_projections, 10);
-        // Each reclaimed projection owns one change fact and reverse-index
-        // row; the other ten change deletes are retired branch-ref facts.
-        assert_eq!(first.deleted_semantic_change_rows, 20);
+        // Each reclaimed projection owns one change fact and reverse-index row.
+        assert_eq!(first.deleted_semantic_change_rows, 10);
         assert_eq!(first.deleted_semantic_reverse_index_rows, 10);
-        // The deleted branch also strands the whole serving generation it was
-        // reading from. No live branch control can select it again, so the
-        // same pass retires it: ten commits of ten rows, plus the generation's
-        // collection control and root current base.
-        assert_eq!(first.reclaimed_generation_rows, 102);
+        // The stranded serving generation is gone too, but the branch deletion
+        // retired it rather than this sweep: a generation is reachable from
+        // exactly one branch control, so the write set that removes the control
+        // is the one that can prove nothing will read it again.
+        assert_eq!(first.reclaimed_generation_rows, 0);
         assert_eq!(
             first.delete_counts_by_space,
             vec![
-                (crate::live_state::HOT_ROW_SPACE.id.0, 100), // stranded serving rows
-                (crate::live_state::HOT_COLLECTION_CONTROL_SPACE.id.0, 1), // its collection control
-                (crate::live_state::ROOT_CURRENT_BASE_SPACE.id.0, 1), // its root current base
                 (
                     crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
                         .id
@@ -3002,8 +3543,8 @@ mod tests {
                         .0,
                     10,
                 ), // mutation inventory authority
-                (crate::changelog::COMMIT_SPACE.id.0, 10),    // branch-only commit projections
-                (crate::changelog::CHANGE_SPACE.id.0, 20),    // projection and branch-ref changes
+                (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
+                (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
                 (crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0, 10), // commit -> change reverse index
             ]
         );
@@ -3025,35 +3566,11 @@ mod tests {
         const FENCE_KEY_BYTES: usize =
             crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
-        // Canonical-record deletes are UUID keyed, so each descriptor is
-        // exactly 16 bytes. Generation-scoped serving rows are keyed by
-        // `(branch, generation, schema, entity, file)` and are wider, so assert
-        // the UUID-keyed floor instead of restating that key layout here.
-        let uuid_keyed_deletes = first
-            .delete_counts_by_space
-            .iter()
-            .filter(|(space, _)| {
-                [
-                    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
-                        .id
-                        .0,
-                    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
-                        .id
-                        .0,
-                    crate::changelog::COMMIT_SPACE.id.0,
-                    crate::changelog::CHANGE_SPACE.id.0,
-                    crate::changelog::COMMIT_CHANGE_ID_SPACE.id.0,
-                ]
-                .contains(space)
-            })
-            .map(|(_, count)| *count)
-            .sum::<usize>();
-        let generation_keyed_deletes = first.staged_deletes as usize - uuid_keyed_deletes;
-        assert_eq!(generation_keyed_deletes, 102);
-        assert!(
-            first.key_shared_bytes
-                > uuid_keyed_deletes * 16 + generation_keyed_deletes * 16 + FENCE_KEY_BYTES,
-            "generation-scoped delete keys must be wider than a bare UUID"
+        // Every canonical-record delete is UUID keyed, so each descriptor is
+        // exactly 16 bytes.
+        assert_eq!(
+            first.key_shared_bytes,
+            first.staged_deletes as usize * 16 + FENCE_KEY_BYTES
         );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);

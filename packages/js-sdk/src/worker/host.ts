@@ -154,16 +154,6 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredLix().importFilesystemPaths(operation.paths);
 			case "syncDiskToLix":
 				return requiredLix().syncDiskToLix();
-			case "exportSnapshot": {
-				const lix = requiredLix();
-				const exportSnapshot = lix.exportSnapshot;
-				if (!exportSnapshot) {
-					throw workerStateError(
-						"The open Lix storage does not support snapshot export",
-					);
-				}
-				return exportSnapshot.call(lix);
-			}
 			case "observe": {
 				const events = await requiredLix().observe(
 					operation.sql,

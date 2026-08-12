@@ -63,8 +63,6 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::session::UPLOAD_MANIFEST_LEAF_SPACE,
     crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
     crate::gc::CHECKPOINT_GC_STATE_SPACE,
-    crate::gc::GC_REACHABILITY_DELTA_SPACE,
-    crate::gc::GC_REACHABILITY_QUEUE_SPACE,
 ];
 
 /// Space ids that belonged to spaces this protocol has cut.
@@ -78,6 +76,10 @@ pub(crate) const RETIRED_STORAGE_SPACE_IDS: &[StorageSpaceId] = &[
     StorageSpaceId(0x0001_0002),
     // live_state.index.branch_root.v1
     StorageSpaceId(0x0004_0005),
+    // gc.reachability_delta.v1
+    StorageSpaceId(0x0008_0003),
+    // gc.reachability_queue.v1
+    StorageSpaceId(0x0008_0004),
     // gc.tree_sweep_epoch.v1
     StorageSpaceId(0x0008_0005),
     // gc.tree_sweep_mark.v1
