@@ -23,10 +23,7 @@ use crate::commit_graph::CommitGraphContext;
 use crate::hot_state::TrackedHeadContext;
 #[cfg(test)]
 use crate::hot_state::stage_collect_stale_working_diff_indexes;
-#[cfg(test)]
-use crate::json_store::JsonRef;
-#[cfg(test)]
-use crate::json_store::{JsonSlot, JsonStoreContext};
+use crate::json_store::{JsonRef, JsonSlot, JsonStoreContext};
 #[cfg(test)]
 use crate::storage_adapter::StorageCoreProjection;
 use crate::storage_adapter::{
@@ -827,6 +824,12 @@ struct AuthenticatedServingDependencyClosure {
     mutation_nodes: BTreeSet<[u8; 32]>,
     scoped_nodes: BTreeSet<[u8; 32]>,
     native_parts: BTreeSet<[u8; 32]>,
+    /// Payload-ref summary digests of the retained native current-state parts.
+    ///
+    /// The scoped-range descriptor is the only place the `content_digest ->
+    /// payload_refs_digest` pairing exists, so the walk has to carry it out.
+    /// Rediscovering it later would mean re-reading the scoped-range trees.
+    native_part_refs_digests: BTreeSet<[u8; 32]>,
 }
 
 async fn load_authenticated_serving_dependency_closure<S>(
@@ -901,6 +904,7 @@ where
 
     let mut scoped_nodes = BTreeSet::new();
     let mut native_parts = BTreeSet::new();
+    let mut native_part_refs_digests = BTreeSet::new();
     let scoped_roots = manifests
         .values()
         .filter_map(|manifest| {
@@ -925,6 +929,7 @@ where
                 }
                 1 => {
                     native_parts.insert(descriptor.content_digest);
+                    native_part_refs_digests.insert(descriptor.payload_refs_digest);
                 }
                 _ => {
                     return Err(LixError::new(
@@ -1042,6 +1047,7 @@ where
         mutation_nodes,
         scoped_nodes,
         native_parts,
+        native_part_refs_digests,
     })
 }
 
@@ -1137,6 +1143,73 @@ where
     crate::tracked_state::scan_commit_state_manifest_commit_ids(store).await
 }
 
+/// The out-of-band JSON payloads that outlive this sweep.
+///
+/// Every owner class that can hold a `JsonSlot::Ref` after the write set
+/// commits is enumerated here, and each one is reached from the walk rather
+/// than from a scan of the payload plane or of the changelog:
+///
+/// 1. **Published hot rows.** The serving plane of every live branch
+///    generation, tracked rows included. Untracked rows are the only owner of
+///    their payload; tracked rows are a derived cache, but a serving read
+///    materializes a payload straight out of this plane, so a ref here that no
+///    longer resolves is a read failure.
+/// 2. **Retained native current-state parts.** Their payload-ref summaries are
+///    carried out of the scoped-range walk by the retention closure.
+/// 3. **Surviving commit deltas.** `surviving_commits` is exactly the candidate
+///    set this sweep could not prove retirable, which is exactly the set of
+///    physical manifests still standing afterwards, so this is a bounded
+///    per-commit inventory walk over the commits GC has already decided to
+///    keep — not a repository-global commit scan.
+/// 4. **Standalone branch-ref facts.** The shipping sweep never deletes a
+///    standalone change, so the fact each control names stays an owner. Branch
+///    ref snapshots are small enough to inline today; enumerating them anyway
+///    costs one point read per branch and removes the dependence on that.
+///
+/// Being a superset here is always safe and being a subset never is, so where
+/// the two arguments were close — the tracked hot rows, the branch-ref facts —
+/// this deliberately takes the wider set.
+async fn collect_live_json_payload_hashes<S>(
+    store: &S,
+    controls: &[(String, BranchHeadControl)],
+    surviving_commits: &BTreeSet<CommitId>,
+    retained_part_refs_digests: &BTreeSet<[u8; 32]>,
+) -> Result<BTreeSet<[u8; 32]>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let mut live = BTreeSet::new();
+    TrackedHeadContext::new()
+        .reader(store.clone())
+        .collect_hot_json_refs(controls, false, &mut live)
+        .await?;
+    crate::tracked_state::collect_current_state_part_json_refs(
+        store,
+        retained_part_refs_digests,
+        &mut live,
+    )
+    .await?;
+    for commit_id in surviving_commits {
+        crate::tracked_state::collect_local_commit_delta_json_refs(store, *commit_id, &mut live)
+            .await?;
+    }
+    let ref_change_ids = controls
+        .iter()
+        .map(|(_, control)| control.ref_change_id)
+        .collect::<BTreeSet<_>>();
+    for record in crate::changelog::load_change_records(store, ref_change_ids.into_iter())
+        .await?
+        .values()
+    {
+        for slot in [&record.snapshot, &record.metadata] {
+            if let JsonSlot::Ref(json_ref) = slot {
+                live.insert(*json_ref.as_hash_array());
+            }
+        }
+    }
+    Ok(live)
+}
+
 /// Plans and stages logical repository GC against one pinned read.
 ///
 /// The caller must serialize this operation with repository writes and commit
@@ -1144,33 +1217,33 @@ where
 /// storage commit so checkpoint/session code can retain lifecycle control.
 /// Content-addressed tree/CAS orphan repair is intentionally an offline path.
 ///
-/// **Out-of-band JSON is not reclaimed here at all.** This comment used to
-/// claim reclamation "from explicit ownership-loss candidates"; that mechanism
-/// was deleted in 31cb639ae because the candidate hints were write-only, and
-/// nothing replaced it. `stage_delete_refs` and every function that enumerates
-/// payload hashes are `#[cfg(test)]`, and this path stages an empty
-/// `json_payloads`. A repository's out-of-band payload count therefore grows
-/// linearly with edits and is never reclaimed.
+/// **Out-of-band JSON payloads are reclaimed here**, by descending the same
+/// walk one level further rather than by any second authority. Until this
+/// change the plane leaked at **one payload per superseded edit**, independent
+/// of checkpoint cadence: measured by `e2e/examples/e1_json_leak.rs` over a
+/// shape x cadence x edits matrix, rewriting one row 1000 times left 1004
+/// payload rows where 1 was live, at every cadence (never / every 10 / every
+/// 100). The `insert` control arm, where every payload stays live, leaked
+/// exactly 3 rows at every size, so `leaked = edits + 3` and the rewrite arm's
+/// growth was the superseded payloads and nothing else.
 ///
-/// The rate is **one leaked payload per superseded edit**, and it is
-/// independent of checkpoint cadence. Measured by
-/// `e2e/examples/e1_json_leak.rs` over a
-/// shape x cadence x edits matrix: rewriting one row 1000 times leaves 1004
-/// payload rows where 1 is live, at every cadence (never / every 10 / every
-/// 100), i.e. `leaked_per_edit` 1.300 -> 1.030 -> 1.003 at 10 -> 100 -> 1000
-/// edits, converging on 1.0 over a fixed ~3-row bootstrap. The `insert` control
-/// arm, where every payload stays live, leaks exactly those 3 rows at every
-/// size -- so the rewrite arm's growth is the superseded payloads and nothing
-/// else.
+/// **That baseline is only meaningful because the probe checkpoints.** Without
+/// one the sweep proves *nothing* retirable -- 0 commit-state manifests retired
+/// across 1000 edits -- so "0 payloads reclaimed" was equally consistent with
+/// "the sweep had no work to do". With a checkpoint every 10 edits the same
+/// stream retires 1095 manifests, which is what established that the owning
+/// commits really were being retired underneath the payloads.
 ///
-/// **That measurement is only meaningful because the probe checkpoints.** An
-/// earlier version of this comment cited the same probe before it did, and that
-/// evidence could not support the claim: without a checkpoint the sweep proves
-/// *nothing* retirable -- 0 commit-state manifests retired across 1000 edits --
-/// so "0 payloads reclaimed" was equally consistent with "the sweep had no work
-/// to do". With a checkpoint every 10 edits the same stream retires 1095
-/// manifests and *still* reclaims 0 payloads. That is what establishes the
-/// leak: the owning commits really are being retired underneath the payloads.
+/// The reclamation keeps the plane's two halves on opposite sides of the
+/// retirement decision. A hash becomes a **candidate** only because this write
+/// set is deleting the row that named it — a retired commit's own delta
+/// members, or a native current-state part whose payload-ref summary this
+/// retirement removes. It is **live** if any owner that outlives the sweep
+/// names it; see [`collect_live_json_payload_hashes`] for that enumeration.
+/// Neither half scans the payload plane, so an unreferenced row that no
+/// retirement produced is left alone rather than swept on the strength of a
+/// live set being complete.
+///
 /// Ordinary GC derives its candidates from the physical manifest inventory and
 /// proves liveness only from refs: branch-head controls and checkpoint recovery
 /// refs are the complete active-root set, and the walk from those roots through
@@ -1234,6 +1307,7 @@ where
         mutation_nodes: active_mutation_nodes,
         scoped_nodes: active_scoped_nodes,
         native_parts: active_current_parts,
+        native_part_refs_digests: active_current_part_refs_digests,
     } = load_authenticated_repository_retention(&store, &controls).await?;
 
     // Retirement candidates are derived here, not read from a ledger.
@@ -1294,6 +1368,12 @@ where
     // candidate behind it forever.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
+    // Payload reachability is derived from the same two halves the retirement
+    // loop already computes, never from a payload-plane scan: a hash becomes a
+    // *candidate* only because this write set is deleting the row that named
+    // it, and it survives if any owner that outlives this sweep names it too.
+    let mut candidate_json_hashes = BTreeSet::new();
+    let mut released_part_refs_digests = BTreeSet::new();
     for commit_id in candidates {
         if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
             && reclaimed_semantic_commits.insert(commit_id)
@@ -1304,6 +1384,12 @@ where
             continue;
         }
         if reclaimed_commits.insert(commit_id) {
+            crate::tracked_state::collect_local_commit_delta_json_refs(
+                &store,
+                commit_id,
+                &mut candidate_json_hashes,
+            )
+            .await?;
             crate::tracked_state::stage_retire_commit_physical_state(
                 &store,
                 writes,
@@ -1313,9 +1399,35 @@ where
                     scoped_nodes: &active_scoped_nodes,
                     native_parts: &active_current_parts,
                 },
+                &mut released_part_refs_digests,
             )
             .await?;
         }
+    }
+    crate::tracked_state::collect_current_state_part_json_refs(
+        &store,
+        &released_part_refs_digests,
+        &mut candidate_json_hashes,
+    )
+    .await?;
+    let live_json_hashes = collect_live_json_payload_hashes(
+        &store,
+        &controls,
+        &blocked_physical_dependency_ids,
+        &active_current_part_refs_digests,
+    )
+    .await?;
+    let sweep_json_payloads = candidate_json_hashes
+        .difference(&live_json_hashes)
+        .copied()
+        .map(JsonRef::from_hash_bytes)
+        .collect::<Vec<_>>();
+    if !sweep_json_payloads.is_empty() {
+        JsonStoreContext::new()
+            .writer()
+            .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
+        crate::json_store::stage_json_reclamation_fence(&store, writes, &mut staged_preconditions)
+            .await?;
     }
     if !reclaimed_semantic_commits.is_empty() {
         writes.seal_changelog_gc();
@@ -1332,13 +1444,16 @@ where
             live: GcLiveSet {
                 commits: retained_root_ids.into_iter().collect(),
                 changes: Vec::new(),
-                payloads: Vec::new(),
+                payloads: live_json_hashes
+                    .into_iter()
+                    .map(JsonRef::from_hash_bytes)
+                    .collect(),
             },
             sweep: GcSweepSet {
                 commits: Vec::new(),
                 commit_change_ids: Vec::new(),
                 changes: Vec::new(),
-                json_payloads: Vec::new(),
+                json_payloads: sweep_json_payloads,
             },
             repair: GcRepairSet::default(),
         },
@@ -4176,6 +4291,7 @@ mod tests {
                 scoped_nodes: &BTreeSet::new(),
                 native_parts: &BTreeSet::new(),
             },
+            &mut BTreeSet::new(),
         )
         .await
         .expect("orphan physical state should retire");

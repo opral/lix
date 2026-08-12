@@ -817,6 +817,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     // right, so it stages here even when the transition only revives an
     // existing commit and stages no blob bytes.
     crate::binary_cas::stage_cas_publication_fence(read, &mut writes, &mut preconditions).await?;
+    // The out-of-band JSON payload fence, for the same reason and staged
+    // unconditionally for the same reason: payload rows are content addressed,
+    // so this transition may resolve onto a row it did not write, and a sweep
+    // planned before it must not be able to reclaim that row underneath it.
+    crate::json_store::stage_json_publication_fence(read, &mut writes, &mut preconditions).await?;
     if !published_branch_controls.contains_key(crate::GLOBAL_BRANCH_ID) {
         let global = branch_control_observations
             .get(crate::GLOBAL_BRANCH_ID)

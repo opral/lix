@@ -37,6 +37,18 @@ pub(crate) const REVISION_KEY_BINARY_CAS_RECLAMATION: &[u8] = b"b";
 /// unchanged by every sweep, so a sweep whose reachability plan predates a
 /// concurrent publication cannot commit.
 pub(crate) const REVISION_KEY_BINARY_CAS_PUBLICATION: &[u8] = b"p";
+/// `json_store` reclamation token. Rotated only by an authenticated payload
+/// sweep, and asserted unchanged by every payload publisher.
+///
+/// Deliberately a second pair rather than a reuse of the binary-CAS pair: the
+/// two planes have different publisher sets and different sweeps, and sharing
+/// one token would make a media upload abort a JSON sweep and a JSON write
+/// abort a CAS sweep for no reachability reason.
+pub(crate) const REVISION_KEY_JSON_STORE_RECLAMATION: &[u8] = b"j";
+/// `json_store` publication token. Rewritten by every payload publisher with no
+/// precondition on itself — publishers are mutually independent — and asserted
+/// unchanged by every payload sweep.
+pub(crate) const REVISION_KEY_JSON_STORE_PUBLICATION: &[u8] = b"k";
 /// Registered-schema catalog visibility token.
 pub(crate) const REVISION_KEY_CATALOG: &[u8] = b"c";
 /// Filesystem path-index cache-freshness token.

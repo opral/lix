@@ -64,7 +64,7 @@ pub(crate) async fn stage_sequence(
     sequence: DeterministicSequence,
     timestamp: LixTimestamp,
     change_id: ChangeId,
-) -> Result<StoragePrecondition, LixError> {
+) -> Result<Vec<StoragePrecondition>, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
         "value": sequence.highest_seen,
@@ -88,11 +88,15 @@ pub(crate) async fn stage_sequence(
             "global branch control is missing while staging deterministic state",
         )
     })?;
+    let mut preconditions = Vec::with_capacity(2);
     JsonStoreContext::new().writer().stage_batch(
         writes,
         JsonWritePlacementRef::OutOfBand,
         [NormalizedJsonRef::from(&snapshot)],
     )?;
+    // This lane commits its own write set, outside the ordinary commit path's
+    // fence, so it takes the publisher half itself.
+    crate::json_store::stage_json_publication_fence(read, writes, &mut preconditions).await?;
     let snapshot_slot = JsonSlot::from_json(snapshot.as_str());
     let next_revision = control
         .next_current_state_revision()?
@@ -129,7 +133,11 @@ pub(crate) async fn stage_sequence(
     next_control.current_state_revision = next_revision;
     next_control.note_schema(KEY_VALUE_SCHEMA_KEY);
     stage_branch_head_control(writes, GLOBAL_BRANCH_ID, next_control)?;
-    branch_head_control_precondition(GLOBAL_BRANCH_ID, observation.raw_token)
+    preconditions.push(branch_head_control_precondition(
+        GLOBAL_BRANCH_ID,
+        observation.raw_token,
+    )?);
+    Ok(preconditions)
 }
 
 async fn load_key_value_row(

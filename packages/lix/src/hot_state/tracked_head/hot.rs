@@ -6223,6 +6223,27 @@ where
         controls: &[(String, BranchHeadControl)],
     ) -> Result<Vec<JsonRef>, LixError> {
         let mut refs = BTreeSet::new();
+        self.collect_hot_json_refs(controls, true, &mut refs).await?;
+        Ok(refs.into_iter().map(JsonRef::from_hash_bytes).collect())
+    }
+
+    /// Collects the out-of-band JSON payload refs the published hot generation
+    /// of every live branch names.
+    ///
+    /// `untracked_only` selects the *authority* subset: an untracked row exists
+    /// nowhere else, so it is the only owner of its payload. Repository GC
+    /// deliberately passes `false` and takes the tracked rows too. Those rows
+    /// are a derived cache and their payloads are also named by a retained
+    /// commit, so including them cannot change which payloads are provably
+    /// dead — but a serving read materializes them straight out of this plane,
+    /// so a ref here that no longer resolves is a read failure, and the cost of
+    /// being wrong about the argument is unrecoverable.
+    pub(crate) async fn collect_hot_json_refs(
+        &self,
+        controls: &[(String, BranchHeadControl)],
+        untracked_only: bool,
+        refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+    ) -> Result<(), LixError> {
         for (branch_id, control) in controls {
             let scope = hot_scope_prefix(branch_id, control.tracked_generation);
             let range = StoragePrefix {
@@ -6236,18 +6257,19 @@ where
             loop {
                 let (page, page_has_more) = cursor
                     .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                    .await?.into_parts();
+                    .await?
+                    .into_parts();
                 for entry in page {
                     let bytes = full_value_bytes(entry.value)?;
                     let value = decode_head_value(&bytes)?;
-                    collect_hot_untracked_refs(value, &mut refs);
+                    collect_hot_row_refs(value, untracked_only, refs);
                 }
                 if !page_has_more {
                     break;
                 }
             }
         }
-        Ok(refs.into_iter().map(JsonRef::from_hash_bytes).collect())
+        Ok(())
     }
 
     pub(crate) async fn working_diff_for_control(
@@ -12228,8 +12250,12 @@ fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixErro
 }
 
 #[cfg(test)]
-fn collect_hot_untracked_refs(value: HeadValueView<'_>, refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>) {
-    if !value.untracked {
+fn collect_hot_row_refs(
+    value: HeadValueView<'_>,
+    untracked_only: bool,
+    refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+) {
+    if untracked_only && !value.untracked {
         return;
     }
     for slot in [value.snapshot, value.metadata] {
