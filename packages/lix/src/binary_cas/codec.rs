@@ -6,9 +6,17 @@ use crate::storage_codec;
 
 const HASH_BYTES: usize = 32;
 
+/// How a chunk's stored payload relates to its content-addressed bytes.
+///
+/// The discriminant is chosen per chunk at staging time by trying zstd and
+/// keeping whichever encoding is smaller, so a payload class decides its own
+/// answer. Media chunks are already compressed and stay `Raw`; text chunks
+/// shrink by roughly 3x. The chunk hash always addresses the *decoded* bytes,
+/// so the codec never participates in content identity or dedupe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum BinaryChunkCodec {
     Raw,
+    Zstd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]

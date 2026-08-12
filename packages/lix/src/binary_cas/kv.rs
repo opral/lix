@@ -843,19 +843,45 @@ pub(crate) fn stage_chunk(
     );
 }
 
+/// A compressed chunk is only kept when it saves more than 1/16 of the payload.
+///
+/// Below that the read path would pay a decompression pass for a rounding error
+/// in stored bytes. zstd emits stored (uncompressed) blocks when it cannot beat
+/// the input, so an incompressible chunk lands just above its input size and is
+/// rejected by this test rather than by a special case.
+const CHUNK_COMPRESSION_MIN_SAVING_SHIFT: usize = 4;
+
 fn stage_content_chunk(
     writes: &mut StorageWriteSet,
     chunk_hash: ChunkHash,
     chunk_data: &[u8],
 ) -> Result<(), LixError> {
+    let (codec, payload) = encode_content_chunk_payload(chunk_data);
     stage_chunk(
         writes,
         chunk_hash,
-        BinaryChunkCodec::Raw,
+        codec,
         chunk_data.len() as u64,
-        chunk_data,
+        payload.as_ref(),
     );
     Ok(())
+}
+
+/// Picks the smaller of the raw and zstd encodings for one chunk.
+///
+/// This is the only place a content chunk's codec is decided. Compression
+/// failure is not an error: the raw encoding is always a valid answer, so a
+/// compressor that refuses a payload simply loses the comparison.
+fn encode_content_chunk_payload(chunk_data: &[u8]) -> (BinaryChunkCodec, Cow<'_, [u8]>) {
+    let budget = chunk_data
+        .len()
+        .saturating_sub(chunk_data.len() >> CHUNK_COMPRESSION_MIN_SAVING_SHIFT);
+    match crate::compression::compress_zstd_level_1(chunk_data) {
+        Ok(compressed) if compressed.len() < budget => {
+            (BinaryChunkCodec::Zstd, Cow::Owned(compressed))
+        }
+        _ => (BinaryChunkCodec::Raw, Cow::Borrowed(chunk_data)),
+    }
 }
 
 pub(in crate::binary_cas) async fn stage_upload_part_skipping_existing(
@@ -1994,6 +2020,22 @@ fn decode_and_verify_payload(
     }
     let decoded = match codec {
         BinaryChunkCodec::Raw => chunk_payload,
+        // `uncompressed_len` was checked against `expected_chunk_size` above and
+        // `expected_chunk_size` against the format maximum, so the output buffer
+        // is bounded before a single byte is decompressed.
+        BinaryChunkCodec::Zstd => Cow::Owned(
+            crate::compression::decompress_zstd(chunk_payload.as_ref(), expected_chunk_size)
+                .map_err(|error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "binary CAS chunk '{}' for blob '{}' failed zstd decode: {error}",
+                            chunk_hash.to_hex(),
+                            blob_hash.to_hex()
+                        ),
+                    )
+                })?,
+        ),
     };
     if decoded.len() != expected_chunk_size {
         return Err(LixError::new(
