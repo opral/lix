@@ -576,12 +576,12 @@ where
         .begin_scan(TEST_SPACE, range, BeginScanOptions::default())
         .await
         .map_err(|error| format!("begin scan_range failed: {error}"))?;
-    let first = cursor
+    let (first, first_has_more) = cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("first scan_range failed: {error}"))?;
-    assert_read_entries(&first.entries, &[("b", "B"), ("c", "C")])?;
-    if !first.has_more {
+        .map_err(|error| format!("first scan_range failed: {error}"))?.into_parts();
+    assert_read_entries(&first, &[("b", "B"), ("c", "C")])?;
+    if !first_has_more {
         return Err("first scan chunk did not report has_more".to_string());
     }
 
@@ -635,15 +635,15 @@ where
         )
         .await
         .map_err(|error| format!("begin capped scan failed: {error}"))?;
-    let first = cursor
+    let (first, first_has_more) = cursor
         .next_page(usize::MAX)
         .await
-        .map_err(|error| format!("first capped scan failed: {error}"))?;
-    if first.entries.len() != MAX_SCAN_PAGE_ROWS || !first.has_more {
+        .map_err(|error| format!("first capped scan failed: {error}"))?.into_parts();
+    if first.len() != MAX_SCAN_PAGE_ROWS || !first_has_more {
         return Err(format!(
             "oversized scan returned {} rows with has_more={} (expected {} and true)",
-            first.entries.len(),
-            first.has_more,
+            first.len(),
+            first_has_more,
             MAX_SCAN_PAGE_ROWS
         ));
     }
@@ -864,12 +864,12 @@ where
             .await
             .map_err(|error| format!("begin scan limit {limit} failed: {error}"))?;
         loop {
-            let chunk = cursor
+            let (chunk, chunk_has_more) = cursor
                 .next_page(limit)
                 .await
-                .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?;
-            actual.extend(entries_to_key_values(&chunk.entries));
-            if !chunk.has_more {
+                .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?.into_parts();
+            actual.extend(entries_to_key_values(&chunk));
+            if !chunk_has_more {
                 break;
             }
             if actual.len() > expected.len() {
@@ -930,12 +930,12 @@ where
             .await
             .map_err(|error| format!("begin paged scan limit {limit} failed: {error}"))?;
         loop {
-            let result = cursor
+            let (result, result_has_more) = cursor
                 .next_page(limit)
                 .await
-                .map_err(|error| format!("paged scan limit {limit} failed: {error}"))?;
-            actual.extend(entries_to_key_values(&result.entries));
-            if !result.has_more {
+                .map_err(|error| format!("paged scan limit {limit} failed: {error}"))?.into_parts();
+            actual.extend(entries_to_key_values(&result));
+            if !result_has_more {
                 break;
             }
             if actual.len() > expected.len() {
@@ -1147,12 +1147,12 @@ where
         .begin_scan(TEST_SPACE, full_range.clone(), BeginScanOptions::default())
         .await
         .map_err(|error| format!("begin old cursor failed: {error}"))?;
-    let first = old_cursor
+    let (first, first_has_more) = old_cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("old cursor first page failed: {error}"))?;
-    assert_read_entries(&first.entries, &[("a", "A"), ("b", "B")])?;
-    if !first.has_more {
+        .map_err(|error| format!("old cursor first page failed: {error}"))?.into_parts();
+    assert_read_entries(&first, &[("a", "A"), ("b", "B")])?;
+    if !first_has_more {
         return Err("old cursor ended before its second page".to_string());
     }
 
@@ -1179,12 +1179,12 @@ where
         .await
         .map_err(|error| format!("commit concurrent mutation failed: {error}"))?;
 
-    let second = old_cursor
+    let (second, second_has_more) = old_cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("old cursor second page failed: {error}"))?;
-    assert_read_entries(&second.entries, &[("c", "C"), ("d", "D")])?;
-    if second.has_more {
+        .map_err(|error| format!("old cursor second page failed: {error}"))?.into_parts();
+    assert_read_entries(&second, &[("c", "C"), ("d", "D")])?;
+    if second_has_more {
         return Err("old cursor exposed unexpected rows after its snapshot tail".to_string());
     }
     drop(old_cursor);
@@ -1205,11 +1205,11 @@ where
         )
         .await
         .map_err(|error| format!("begin exclusive restart failed: {error}"))?;
-    let restarted_page = restarted
+    let (restarted_page, restarted_page_has_more) = restarted
         .next_page(usize::MAX)
         .await
-        .map_err(|error| format!("exclusive restart failed: {error}"))?;
-    assert_read_entries(&restarted_page.entries, &[("c", "C2"), ("e", "E")])
+        .map_err(|error| format!("exclusive restart failed: {error}"))?.into_parts();
+    assert_read_entries(&restarted_page, &[("c", "C2"), ("e", "E")])
 }
 
 async fn descending_scan_is_explicitly_unsupported<F>(factory: &F) -> ConformanceResult
@@ -1264,11 +1264,11 @@ where
         .map_err(|error| format!("begin cursor failed: {error}"))?;
     let unpolled = cursor.next_page(1);
     drop(unpolled);
-    let page = cursor
+    let (page, page_has_more) = cursor
         .next_page(1)
         .await
-        .map_err(|error| format!("cursor failed after unpolled cancellation: {error}"))?;
-    assert_read_entries(&page.entries, &[("a", "A")])
+        .map_err(|error| format!("cursor failed after unpolled cancellation: {error}"))?.into_parts();
+    assert_read_entries(&page, &[("a", "A")])
 }
 
 async fn invalid_scan_range_fails_closed<F>(factory: &F) -> ConformanceResult

@@ -1060,11 +1060,11 @@ where
             },
         )
         .await?;
-    let chunk = cursor.next_page(limit).await?;
-    let has_more = chunk.has_more;
-    let mut keys = Vec::with_capacity(chunk.entries.len());
-    let mut values = Vec::with_capacity(chunk.entries.len());
-    for entry in chunk.entries {
+    let (chunk, chunk_has_more) = cursor.next_page(limit).await?.into_parts();
+    let has_more = chunk_has_more;
+    let mut keys = Vec::with_capacity(chunk.len());
+    let mut values = Vec::with_capacity(chunk.len());
+    for entry in chunk {
         keys.push(entry.key.0.to_vec());
         if let StorageProjectedValue::FullValue(bytes) = entry.value {
             values.push(bytes.to_vec());

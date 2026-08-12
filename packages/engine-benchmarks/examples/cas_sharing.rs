@@ -575,11 +575,11 @@ where
         .await
         .expect("begin accounting scan");
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan accounting space");
-        rows += page.entries.len() as u64;
+            .expect("scan accounting space").into_parts();
+        rows += page.len() as u64;
         value_bytes += page
             .entries
             .iter()
@@ -588,7 +588,7 @@ where
                 ProjectedValue::FullValue(value) => value.len() as u64,
             })
             .sum::<u64>();
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }

@@ -5915,10 +5915,10 @@ mod tests {
             )
             .await
             .expect("begin fresh worker-cancellation cursor");
-        let restarted = restart
+        let (restarted, restarted_has_more) = restart
             .next_page(2)
             .await
-            .expect("drain fresh worker-cancellation cursor");
+            .expect("drain fresh worker-cancellation cursor").into_parts();
         assert_eq!(
             restarted
                 .entries
@@ -6008,14 +6008,14 @@ mod tests {
             )
             .await
             .expect("begin explicit exclusive restart");
-        let restarted = restart
+        let (restarted, restarted_has_more) = restart
             .next_page(1)
             .await
-            .expect("read explicit exclusive restart page");
-        assert_eq!(restarted.entries.len(), 1);
-        assert_eq!(restarted.entries[0].key, second_key);
+            .expect("read explicit exclusive restart page").into_parts();
+        assert_eq!(restarted.len(), 1);
+        assert_eq!(restarted[0].key, second_key);
         assert_eq!(
-            restarted.entries[0].value,
+            restarted[0].value,
             ProjectedValue::FullValue(Bytes::from_static(b"second-value"))
         );
     }

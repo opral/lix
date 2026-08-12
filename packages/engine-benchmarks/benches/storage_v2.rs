@@ -1810,16 +1810,16 @@ where
         .map_err(|error| error.to_string())?;
 
     loop {
-        let result = cursor
+        let (result, result_has_more) = cursor
             .next_page(chunk_size)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?.into_parts();
 
-        scanned += result.entries.len();
-        chunks += usize::from(!result.entries.is_empty() || result.has_more);
-        keys.extend(result.entries.into_iter().map(|entry| entry.key));
+        scanned += result.len();
+        chunks += usize::from(!result.is_empty() || result_has_more);
+        keys.extend(result.into_iter().map(|entry| entry.key));
 
-        if !result.has_more {
+        if !result_has_more {
             break;
         }
     }
@@ -1882,15 +1882,15 @@ where
     }
 
     loop {
-        let chunk = cursor.next_page(chunk_size).await?;
+        let (chunk, chunk_has_more) = cursor.next_page(chunk_size).await?.into_parts();
 
-        let entries = &chunk.entries;
+        let entries = &chunk;
         stats.scanned += entries.len();
         stats.storage_calls += 1;
-        stats.chunks += usize::from(!entries.is_empty() || chunk.has_more);
+        stats.chunks += usize::from(!entries.is_empty() || chunk_has_more);
         stats.read_stats.storage_calls += 1;
         stats.read_stats.scan_rows += entries.len() as u64;
-        stats.read_stats.scan_has_more += u64::from(chunk.has_more);
+        stats.read_stats.scan_has_more += u64::from(chunk_has_more);
         stats.read_stats.scan_limit_rows_total += effective_chunk as u64;
         stats.read_stats.scan_limit_rows_max = stats
             .read_stats
@@ -1903,7 +1903,7 @@ where
             stats.read_stats.range_scan_chunks += 1;
         }
 
-        if !chunk.has_more {
+        if !chunk_has_more {
             break;
         }
     }

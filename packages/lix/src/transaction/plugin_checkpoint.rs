@@ -125,17 +125,17 @@ pub(crate) async fn stage_delete_branch_plugin_checkpoints(
         )
         .await?;
     loop {
-        let chunk = cursor
+        let (chunk, chunk_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        if chunk.entries.is_empty() {
+            .await?.into_parts();
+        if chunk.is_empty() {
             break;
         }
         writes.delete_batch(
             PLUGIN_CHECKPOINT_SPACE,
-            chunk.entries.into_iter().map(|entry| entry.key),
+            chunk.into_iter().map(|entry| entry.key),
         );
-        if !chunk.has_more {
+        if !chunk_has_more {
             break;
         }
     }

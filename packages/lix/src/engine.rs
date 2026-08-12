@@ -480,7 +480,7 @@ async fn repository_has_changelog_commit(
             },
         )
         .await?;
-    Ok(!cursor.next_page(1).await?.entries.is_empty())
+    Ok(!cursor.next_page(1).await?.is_empty())
 }
 
 fn not_initialized_error() -> LixError {

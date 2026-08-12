@@ -857,10 +857,10 @@ where
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let key: BranchRefKey = match storage_codec::decode(
                 "tracked working-diff marker key",
                 entry.key.0.as_ref(),
@@ -901,7 +901,7 @@ where
                 },
             );
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }

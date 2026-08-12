@@ -79,16 +79,16 @@ where
         .await
         .expect("HOT member scan should begin");
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(lix::storage::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("HOT members should scan");
+            .expect("HOT members should scan").into_parts();
         sequence_entries.extend(
-            page.entries
+            page
                 .into_iter()
                 .filter(|entry| contains_subslice(entry.key.0.as_ref(), SEQUENCE_IDENTITY)),
         );
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }

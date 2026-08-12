@@ -203,9 +203,9 @@ impl StorageScanSource for CountingScanSource<'_> {
         limit_rows: usize,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
         Box::pin(async move {
-            let chunk = self.inner.next_page(limit_rows).await?;
+            let (chunk, chunk_has_more) = self.inner.next_page(limit_rows).await?.into_parts();
             let mut stats = self.stats.lock().expect("I/O stats mutex");
-            stats.scan_entries += chunk.entries.len() as u64;
+            stats.scan_entries += chunk.len() as u64;
             stats.scan_value_bytes += chunk
                 .entries
                 .iter()
