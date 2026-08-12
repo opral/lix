@@ -23,7 +23,6 @@ use crate::storage_adapter::StorageSpaceId;
 /// checked against.
 pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::json_store::JSON_SPACE,
-    crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
     crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
     crate::init::REPOSITORY_PROTOCOL_SPACE,
     crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
@@ -74,6 +73,8 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
 pub(crate) const RETIRED_STORAGE_SPACE_IDS: &[StorageSpaceId] = &[
     // untracked_state.row.v1
     StorageSpaceId(0x0001_0002),
+    // json_store.untracked_reclaim_candidate.v1
+    StorageSpaceId(0x0002_0002),
     // live_state.index.branch_root.v1
     StorageSpaceId(0x0004_0005),
     // gc.reachability_delta.v1

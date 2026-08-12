@@ -23,9 +23,7 @@ use crate::commit_graph::CommitGraphContext;
 #[cfg(test)]
 use crate::json_store::JsonRef;
 #[cfg(test)]
-use crate::json_store::{
-    JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
-};
+use crate::json_store::{JsonSlot, JsonStoreContext};
 use crate::live_state::TrackedHeadContext;
 #[cfg(test)]
 use crate::live_state::stage_collect_stale_working_diff_indexes;
@@ -1387,57 +1385,6 @@ where
     // maintenance work, but delta rows have no shared ownership and must be
     // reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
-    // The changelog plan contains every payload reachable from tracked
-    // history plus the active untracked roots supplied above. A retired
-    // untracked JSON ref is only a deletion candidate: content-addressed
-    // payloads can be shared with another current row or reachable history,
-    // so absence from this complete live set is the required proof.
-    let live_payloads = changelog_plan
-        .live
-        .payloads
-        .iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
-    // `collect_garbage` already staged deletes for dead changelog payloads.
-    // Avoid emitting a second mutation for a content hash shared with a stale
-    // untracked generation; `StorageWriteSet` deliberately rejects duplicate
-    // final mutations, even when both are deletes.
-    let changelog_swept_payloads = changelog_plan
-        .sweep
-        .json_payloads
-        .iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
-    let mut reclaimable_untracked_refs = BTreeSet::new();
-    let mut consumed_candidate_keys = Vec::new();
-    for candidate in JsonStoreContext::new()
-        .scan_untracked_reclaim_candidates(&store)
-        .await?
-    {
-        let UntrackedJsonReclaimCandidate { key, json_ref } = candidate;
-        let Some(json_ref) = json_ref else {
-            // Candidate records are derived hints. A malformed one cannot
-            // safely name a JSON payload, but it must not become permanent
-            // maintenance debt.
-            consumed_candidate_keys.push(key);
-            continue;
-        };
-        if !live_payloads.contains(json_ref.as_hash_array()) {
-            reclaimable_untracked_refs.insert(*json_ref.as_hash_array());
-            consumed_candidate_keys.push(key);
-        }
-        // Keep a live candidate. If a shared owner later disappears through a
-        // different lifecycle path, the next GC can still prove reclamation
-        // without relying on that path to recreate this hint.
-    }
-    let reclaimable_untracked_refs = reclaimable_untracked_refs
-        .into_iter()
-        .filter(|hash| !live_payloads.contains(hash) && !changelog_swept_payloads.contains(hash))
-        .map(JsonRef::from_hash_bytes)
-        .collect::<Vec<_>>();
-    let json_writer = JsonStoreContext::new().writer();
-    json_writer.stage_delete_refs(writes, reclaimable_untracked_refs);
-    JsonStoreWriter::stage_delete_untracked_reclaim_candidates(writes, consumed_candidate_keys);
     // Checkpoint publication leaves prior dirty-index generations unreachable
     // in O(1). Reclaim those auxiliary records only in the asynchronous GC
     // pass so a foreground checkpoint never pays a history-sized delete cost.
@@ -2188,7 +2135,7 @@ mod tests {
     use crate::entity_pk::EntityPk;
     use crate::json_store::{
         JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
-        NormalizedJsonRef, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
+        NormalizedJsonRef,
     };
     use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
@@ -4367,85 +4314,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_gc_reclaims_retired_untracked_update_without_inventory_sweep() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let old_value = serde_json::json!({
-            "payload": "old-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let old_json = old_value.to_string();
-        let old_ref = key_value_snapshot_ref("gc-update-untracked", &old_value);
-        let new_value = serde_json::json!({
-            "payload": "new-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let new_json = new_value.to_string();
-        let new_ref = key_value_snapshot_ref("gc-update-untracked", &new_value);
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-                 VALUES ('gc-update-untracked', lix_json($1), true)",
-                &[Value::Text(old_json)],
-            )
-            .await
-            .expect("old untracked value should write");
-        session
-            .execute(
-                "UPDATE lix_key_value SET value = lix_json($1) \
-                 WHERE key = 'gc-update-untracked'",
-                &[Value::Text(new_json)],
-            )
-            .await
-            .expect("untracked value should update in the same generation");
-
-        // A bare JSON object has no reclaim candidate. It proves this GC is
-        // deliberately targeted rather than a full JSON-store inventory scan.
-        let bare_orphan_ref =
-            stage_bare_json(&storage, &format!("\"{}\"", "bare-".repeat(1024))).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, old_ref).await,
-            "the superseded untracked payload should be reclaimed"
-        );
-        assert!(
-            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, new_ref).await,
-            "the current untracked payload must remain stored"
-        );
-        assert!(
-            json_ref_exists(
-                &storage,
-                crate::json_store::store::JSON_SPACE,
-                bare_orphan_ref,
-            )
-            .await,
-            "candidate GC must not scan and sweep unrelated JSON"
-        );
-        assert!(
-            !json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, old_ref,).await,
-            "a dead payload should consume its reclamation candidate"
-        );
-
-        let visible = session
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'gc-update-untracked'",
-                &[],
-            )
-            .await
-            .expect("live untracked value should remain readable after GC");
-        assert_eq!(visible.rows()[0].values(), &[Value::Json(new_value.into())]);
-    }
-
-    #[tokio::test]
     async fn repository_gc_retains_active_history_diff_undo_redo_and_reclaims_deleted_branch_refs()
     {
         let storage = Memory::new();
@@ -4754,111 +4622,6 @@ mod tests {
         assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
     }
 
-    #[tokio::test]
-    async fn repository_gc_reclaims_retired_untracked_delete() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let deleted_value = serde_json::json!({
-            "payload": "delete-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let deleted_json = deleted_value.to_string();
-        let deleted_ref = key_value_snapshot_ref("gc-delete-untracked", &deleted_value);
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-                 VALUES ('gc-delete-untracked', lix_json($1), true)",
-                &[Value::Text(deleted_json)],
-            )
-            .await
-            .expect("untracked value should write");
-        session
-            .execute(
-                "DELETE FROM lix_key_value WHERE key = 'gc-delete-untracked'",
-                &[],
-            )
-            .await
-            .expect("untracked value should delete physically");
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, deleted_ref,).await,
-            "a deleted untracked payload should be reclaimed"
-        );
-        assert!(
-            !json_ref_exists(
-                &storage,
-                UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-                deleted_ref,
-            )
-            .await,
-            "a reclaimed deletion should consume its candidate"
-        );
-    }
-
-    #[tokio::test]
-    async fn repository_gc_keeps_candidate_reachable_from_tracked_history() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("repository should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let shared_value = serde_json::json!({
-            "payload": "shared-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-        });
-        let shared_json = shared_value.to_string();
-        let shared_ref = key_value_snapshot_ref("gc-tracked-candidate", &shared_value);
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('gc-tracked-candidate', lix_json($1))",
-                &[Value::Text(shared_json)],
-            )
-            .await
-            .expect("tracked owner should write");
-
-        // Candidate records are merely ownership-loss hints. Injecting one
-        // for a tracked payload exercises the exact same liveness proof that
-        // protects a hash shared with retained history.
-        stage_untracked_reclaim_candidate(&storage, shared_ref).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
-            "reachable tracked history must retain a candidate payload"
-        );
-        assert!(
-            json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
-            "a candidate rooted by history must survive for later re-evaluation"
-        );
-        let tracked = session
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'gc-tracked-candidate'",
-                &[],
-            )
-            .await
-            .expect("tracked owner should remain readable");
-        assert_eq!(
-            tracked.rows()[0].values(),
-            &[Value::Json(shared_value.into())]
-        );
-    }
 
     #[tokio::test]
     async fn authority_gc_rejects_missing_live_commit_state_before_staging_deletes() {
@@ -5438,126 +5201,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn repository_gc_reclaims_candidate_after_last_live_untracked_owner_disappears() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("repository should initialize");
-        let shared_ref = stage_bare_json(
-            &storage,
-            &serde_json::json!({
-                "payload": "shared-untracked-"
-                    .repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-            })
-            .to_string(),
-        )
-        .await;
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-a", Some(shared_ref)).await;
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-b", Some(shared_ref)).await;
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-a", None).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
-            "the second live untracked owner must retain its payload"
-        );
-        assert!(
-            json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
-            "the candidate must survive until the last untracked owner disappears"
-        );
-
-        stage_untracked_current_owner(&storage, "gc-untracked-owner-b", None).await;
-
-        run_repository_gc(&storage).await;
-
-        assert!(
-            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
-            "the final owner's payload should be reclaimed after its deletion"
-        );
-        assert!(
-            !json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
-            "reclaiming the payload should consume the durable candidate"
-        );
-    }
-
-    async fn stage_untracked_current_owner(
-        storage: &Memory,
-        entity_pk_value: &str,
-        snapshot: Option<JsonRef>,
-    ) {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let read = storage_adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("current-state owner read should open");
-        let control = BranchHeadControlContext::new()
-            .reader(&read)
-            .load(GLOBAL_BRANCH_ID)
-            .await
-            .expect("global control should load")
-            .expect("global control should exist");
-        let entity_pk = EntityPk::single(entity_pk_value);
-        let snapshot_slot = snapshot.map_or(JsonSlot::None, JsonSlot::Ref);
-        let timestamp =
-            LixTimestamp::expect_parse("untracked GC owner timestamp", "2026-01-01T00:00:00Z");
-        let mut writes = storage_adapter.new_write_set();
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        TrackedHeadContext::new()
-            .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
-                GLOBAL_BRANCH_ID,
-                Some(control.tracked_generation),
-                control.head_commit_id,
-                &[CurrentStateDeltaRef {
-                    schema_key: "gc_untracked_owner",
-                    file_id: None,
-                    entity_pk: &entity_pk,
-                    change_id: Some(ChangeId::for_test_label("gc-untracked-owner")),
-                    commit_id: None,
-                    untracked: true,
-                    deleted: snapshot.is_none(),
-                    created_at: timestamp,
-                    updated_at: timestamp,
-                    snapshot: snapshot_slot.as_ref_slot(),
-                    metadata: JsonSlotRef::None,
-                    columnar_base_coordinate: None,
-                }],
-                &BTreeSet::new(),
-                None,
-                None,
-                None,
-                &mut coverage,
-            )
-            .await
-            .expect("untracked current-state owner should stage");
-        stage_branch_head_control(
-            &mut writes,
-            GLOBAL_BRANCH_ID,
-            control
-                .next_current_state_revision()
-                .expect("current-state revision should advance"),
-        )
-        .expect("current-state control should stage");
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("untracked current-state owner should commit");
-    }
-
-    async fn stage_untracked_reclaim_candidate(storage: &Memory, json_ref: JsonRef) {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let mut writes = storage_adapter.new_write_set();
-        crate::json_store::JsonStoreWriter::stage_untracked_reclaim_candidates(
-            &mut writes,
-            [json_ref],
-        );
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("reclaim candidate should commit");
-    }
 
     async fn run_repository_gc(storage: &Memory) {
         let storage_adapter = StorageAdapter::new(storage.clone());
@@ -6239,15 +5882,6 @@ mod tests {
         .next()
         .flatten()
         .is_some()
-    }
-
-    fn key_value_snapshot_ref(key: &str, value: &serde_json::Value) -> JsonRef {
-        let snapshot = serde_json::json!({
-            "key": key,
-            "value": value,
-        })
-        .to_string();
-        JsonRef::for_content(snapshot.as_bytes())
     }
 
     fn recovery(branch_id: &str, recovered_head: &str, checkpoint: &str) -> CheckpointRecoveryRef {
