@@ -91,41 +91,64 @@ pub(crate) enum KeyPartError {
 /// accept/reject-neutral because every call site already re-validated the
 /// terminator it was handed — what changes is only *where* a couple of
 /// malformed shapes are rejected, and hence which message they carry.
+/// `#[inline]` is load-bearing, not decoration. This replaced byte loops that
+/// were inlined into their callers; measured on `tracked_state_crud`, letting
+/// it stay a real call cost **+5.3%** on `transaction/read_all_rows/10k` (the
+/// `hot_state` scan path) while the escape-free path is otherwise one `memchr`
+/// plus one compare. The unescaping tail is deliberately out of line so only
+/// the fast path is duplicated into each of the five call sites.
+#[inline]
 pub(crate) fn scan_key_part(bytes: &[u8], start: usize) -> Result<ScannedKeyPart, KeyPartError> {
-    let mut segment_start = start;
-    let mut decoded: Option<Vec<u8>> = None;
+    let tail = bytes.get(start..).ok_or(KeyPartError::Truncated)?;
+    let relative_zero = memchr::memchr(KEY_PART_FINAL, tail).ok_or(KeyPartError::Truncated)?;
+    let zero = start + relative_zero;
+    let escape = *bytes.get(zero + 1).ok_or(KeyPartError::EscapeTruncated)?;
+    if is_key_part_terminator(escape) {
+        // No escaped NUL: the part is exactly a span of the input, so no
+        // ownership mode has to copy.
+        return Ok(ScannedKeyPart {
+            value: ScannedKeyValue::Verbatim(start..zero),
+            terminator: escape,
+            end: zero + 2,
+        });
+    }
+    if escape != KEY_ESCAPE {
+        return Err(KeyPartError::UnknownEscape(escape));
+    }
+    scan_key_part_escaped(bytes, start, zero)
+}
+
+/// The rare tail: the part contains at least one escaped NUL, so it cannot be a
+/// span of the input and has to be unescaped into an owned buffer.
+#[cold]
+#[inline(never)]
+fn scan_key_part_escaped(
+    bytes: &[u8],
+    start: usize,
+    first_zero: usize,
+) -> Result<ScannedKeyPart, KeyPartError> {
+    let mut out = Vec::with_capacity(first_zero.saturating_sub(start).saturating_add(16));
+    out.extend_from_slice(&bytes[start..first_zero]);
+    out.push(KEY_PART_FINAL);
+    let mut segment_start = first_zero + 2;
     loop {
         let tail = bytes.get(segment_start..).ok_or(KeyPartError::Truncated)?;
-        let relative_zero =
-            memchr::memchr(KEY_PART_FINAL, tail).ok_or(KeyPartError::Truncated)?;
+        let relative_zero = memchr::memchr(KEY_PART_FINAL, tail).ok_or(KeyPartError::Truncated)?;
         let zero = segment_start + relative_zero;
         let escape = *bytes.get(zero + 1).ok_or(KeyPartError::EscapeTruncated)?;
-        let end = zero + 2;
-        match escape {
-            KEY_ESCAPE => {
-                let out = decoded.get_or_insert_with(|| {
-                    Vec::with_capacity(zero.saturating_sub(start).saturating_add(16))
-                });
-                out.extend_from_slice(&bytes[segment_start..zero]);
-                out.push(KEY_PART_FINAL);
-                segment_start = end;
-            }
-            terminator if is_key_part_terminator(terminator) => {
-                let value = match decoded {
-                    None => ScannedKeyValue::Verbatim(start..zero),
-                    Some(mut out) => {
-                        out.extend_from_slice(&bytes[segment_start..zero]);
-                        ScannedKeyValue::Unescaped(out)
-                    }
-                };
-                return Ok(ScannedKeyPart {
-                    value,
-                    terminator,
-                    end,
-                });
-            }
-            other => return Err(KeyPartError::UnknownEscape(other)),
+        out.extend_from_slice(&bytes[segment_start..zero]);
+        if is_key_part_terminator(escape) {
+            return Ok(ScannedKeyPart {
+                value: ScannedKeyValue::Unescaped(out),
+                terminator: escape,
+                end: zero + 2,
+            });
         }
+        if escape != KEY_ESCAPE {
+            return Err(KeyPartError::UnknownEscape(escape));
+        }
+        out.push(KEY_PART_FINAL);
+        segment_start = zero + 2;
     }
 }
 
