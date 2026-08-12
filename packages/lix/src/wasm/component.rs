@@ -1136,6 +1136,15 @@ pub struct WasmOpenFileInput {
     pub descriptor: WasmFileDescriptor,
     pub file: Arc<dyn WasmByteSource>,
     pub creates: WasmCreateContext,
+    /// Whether this file may represent a complete parse as a certified entity
+    /// packet instead of ordinary per-entity changes.
+    ///
+    /// A certified packet is materialized by expanding it from the file's
+    /// published commit root, so the caller must set this to `false` for any
+    /// file that publishes no commit. The same rows are then produced through
+    /// the ordinary change path instead. This is a representation choice made
+    /// by the host; the guest emits the same entities either way.
+    pub certified_packets_available: bool,
 }
 
 impl fmt::Debug for WasmOpenFileInput {
@@ -1145,6 +1154,10 @@ impl fmt::Debug for WasmOpenFileInput {
             .field("descriptor", &self.descriptor)
             .field("file_len", &self.file.len())
             .field("creates", &self.creates)
+            .field(
+                "certified_packets_available",
+                &self.certified_packets_available,
+            )
             .finish()
     }
 }
