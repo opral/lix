@@ -4599,6 +4599,39 @@ mod tests {
         }
     }
 
+    /// The revocation guard refuses a retired write context instead of
+    /// dereferencing a pointer into a destroyed `Transaction`.
+    ///
+    /// The first half is load-bearing: it proves the guard is *reached* on this
+    /// path. Without it a green result could mean "never checked" rather than
+    /// "checked and live", which is exactly how a null instrument result lies.
+    #[tokio::test]
+    async fn retired_write_context_is_refused_instead_of_dereferenced() {
+        const BRANCH: &str = "01920000-0000-7000-8000-0000000000a1";
+        const REFUSAL: &str = "refusing to dereference a retired context";
+
+        let (mut ctx, _staged, _scans) = counting_write_context(vec![]);
+        let write_ctx = crate::sql2::SqlWriteContext::new(&mut ctx);
+
+        let live = write_ctx.load_branch_head(BRANCH).await;
+        assert!(
+            !format!("{live:?}").contains(REFUSAL),
+            "guard must not fire while the borrowed context is live: {live:?}"
+        );
+
+        // Exactly what `Transaction::drop` does.
+        write_ctx.liveness_for_test().retire();
+
+        let error = write_ctx
+            .load_branch_head(BRANCH)
+            .await
+            .expect_err("a retired write context must be refused");
+        assert!(
+            format!("{error:?}").contains(REFUSAL),
+            "retired context produced the wrong failure: {error:?}"
+        );
+    }
+
     fn counting_write_context(
         rows: Vec<MaterializedHotStateRow>,
     ) -> (
