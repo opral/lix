@@ -3391,7 +3391,7 @@ mod tests {
             .await
             .expect("seed commit");
         }
-        let text = |result: crate::SqlQueryResult, column: usize| match &result.rows()[0].values()
+        let text = |result: crate::ExecuteResult, column: usize| match &result.rows()[0].values()
             [column]
         {
             crate::Value::Text(text) => text.clone(),
