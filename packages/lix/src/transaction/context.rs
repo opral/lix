@@ -1810,14 +1810,22 @@ where
         // *projectability* is decided here, because the revision the cached
         // views are keyed on has to be read before the commit publishes its
         // successor.
-        let filesystem_delta_projectable =
+        let stages_projectable_filesystem_rows =
             prepared_writes_stage_filesystem_rows(&prepared_writes)
                 && !prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
-        let previous_filesystem_revision = if filesystem_delta_projectable {
-            load_path_index_revision(&read).await.ok().flatten()
+        // A failed revision read must not collapse into "no revision yet".
+        // `None` is itself a live cache key — the state before the first
+        // filesystem commit — so treating an error as `None` would rekey
+        // entries built at an unknown revision onto this commit's successor and
+        // make a stale index reachable. The outer `Option` is "the read
+        // succeeded"; only that licenses a projection.
+        let loaded_filesystem_revision = if stages_projectable_filesystem_rows {
+            load_path_index_revision(&read).await.ok()
         } else {
             None
         };
+        let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
+        let previous_filesystem_revision = loaded_filesystem_revision.flatten();
         let (mut writes, materialization_preconditions, filesystem_delta_rows) =
             match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
