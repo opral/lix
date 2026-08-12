@@ -824,7 +824,7 @@ where
                 Ok(Some(rewritten))
             }
             Some(candidates) => {
-                let mut unique = candidates.into_iter().collect::<BTreeSet<_>>();
+                let mut unique = candidates.into_iter().collect::<std::collections::BTreeSet<_>>();
                 rewritten.filter.entity_pks = std::mem::take(&mut unique).into_iter().collect();
                 Ok(Some(rewritten))
             }
