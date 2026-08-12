@@ -27,5 +27,5 @@ pub use types::{
     EncodedMutationBatchError, EncodedPut, GetManyRequest, GetManyResult, GetOptions, Key,
     KeyRange, MAX_SCAN_PAGE_ROWS, Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency,
     ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOrder, SnapshotRef, SpaceId,
-    StorageSpace, StoredValue, ValueSemantics, WriteOptions, WriteStats,
+    StorageSpace, StoredValue, ValueIntegrity, ValueSemantics, WriteOptions, WriteStats,
 };

@@ -60,7 +60,27 @@ pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::d
     BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
     ValueSemantics::Mutable,
 );
-pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace = StorageSpace::declare(
+/// The chunk payload plane, and the one space whose values authenticate
+/// themselves.
+///
+/// Every row's key **is** the BLAKE3-256 digest of its own payload, and every
+/// production full-value read of this space passes through
+/// [`decode_and_verify_payload`], which recomputes that digest and compares it
+/// before returning the bytes — unconditionally, in release builds too. The
+/// two read sites are [`load_chunk_rows`] (which serves [`load_bytes_many`])
+/// and [`verify_live_chunk_presence`]; the GC orphan scan projects
+/// `KeyOnly` and never materializes a payload.
+///
+/// So a backend checksum over these same bytes is a strictly weaker duplicate
+/// of a check the engine has already paid for, and the declaration below lets
+/// a backend skip it. Measured on a 640 MiB read where RocksDB was on its
+/// software CRC32C — the path aarch64 cannot leave — that duplicate was 33.8%
+/// of all cycles.
+///
+/// **If you ever add a full-value read of this space that does not verify the
+/// digest, this declaration becomes false** and must be reverted to
+/// `StorageSpace::declare` in the same commit.
+pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace = StorageSpace::declare_content_addressed(
     StorageSpaceId(0x0005_0003),
     BINARY_CAS_CHUNK_NAMESPACE,
     ValueSemantics::Immutable,
