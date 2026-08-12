@@ -699,6 +699,26 @@ impl CertifiedParameterBatch {
         origin_key: Option<&SharedStr>,
         timestamp: LixTimestamp,
     ) -> Result<PreparedStateBatch, LixError> {
+        // The dense certified representation is tracked-only *by construction*,
+        // and this assertion is where that invariant is stated. Fixing the two
+        // projections below to agree on the lane does not make the dense lane
+        // correct for untracked rows: it derives every change id from the
+        // commit-delta address space and reports `addressable_change_id: true`
+        // unconditionally, neither of which holds for untracked state. The
+        // routing guard lives at `sql2::exec::bound_public_write`
+        // (`dense_lane_supports_batch`), which sends untracked certified
+        // batches to the raw lane before they can reach this constructor.
+        //
+        // That guard is a call-site predicate one edit away from deletion, so
+        // restate it here at the construction boundary — where a future caller
+        // would actually violate it — rather than leaving it to a comment.
+        // Verified to hold today: this assertion was run as a hard `assert!`
+        // over the full CI-scope suite with zero hits.
+        debug_assert!(
+            !self.untracked,
+            "the dense certified lane is tracked-only; untracked certified \
+             batches take the raw lane"
+        );
         self.into_dense_prepared_timestamps(origin_key, DenseParameterTimestamps::Scalar(timestamp))
     }
 
@@ -3387,7 +3407,11 @@ impl PreparedStateBatch {
                 )),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
-                untracked: false,
+                // The durability lane is a batch-common fact carried by the
+                // dense header, exactly like `commit_id` and `branch_id` above.
+                // Reading it from anywhere else would let the same batch report
+                // one lane through `get()` and another through its row slots.
+                untracked: dense.untracked,
                 branch_id: dense.branch_id,
                 durable_predecessor,
             });
@@ -3434,6 +3458,11 @@ impl PreparedStateBatch {
                         == other.strings[right.branch_id as usize]
                     && same_origin_key
                     && left.commit_id == right.commit_id
+                    // The merged cohort keeps one dense header, so every
+                    // batch-common fact must already agree. The durability
+                    // lane is one of them: without this, a cohort silently
+                    // adopts the leader's lane.
+                    && left.untracked == right.untracked
                     && left.direct_change_ids.is_none()
                     && right.direct_change_ids.is_none()
                     && left.entity_columnar.is_none()
@@ -4552,9 +4581,17 @@ mod tests {
             expdl_probe_certificate(7),
         )
         .expect("certified rows should construct")
-        .into_dense_prepared(
+        // Deliberately the inner constructor. `into_dense_prepared` asserts
+        // that no untracked batch reaches the dense lane, which is the
+        // invariant these probes are the backstop for: they prove that if the
+        // routing guard ever goes, the projections still agree on the lane
+        // instead of silently flipping it.
+        .into_dense_prepared_timestamps(
             None,
-            LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z"),
+            DenseParameterTimestamps::Scalar(LixTimestamp::expect_parse(
+                "timestamp",
+                "2026-08-02T00:00:00.000Z",
+            )),
         )
         .expect("certified rows should prepare")
     }
@@ -4593,10 +4630,7 @@ mod tests {
 
         assert_eq!(tracked.len(), 4);
         assert_eq!(
-            tracked
-                .iter()
-                .map(|row| row.untracked)
-                .collect::<Vec<_>>(),
+            tracked.iter().map(|row| row.untracked).collect::<Vec<_>>(),
             vec![false, false, true, true],
             "merging cohorts must preserve each row's durability lane"
         );
