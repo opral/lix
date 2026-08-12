@@ -1179,19 +1179,23 @@ where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
     let mut live = BTreeSet::new();
-    TrackedHeadContext::new()
-        .reader(store.clone())
-        .collect_hot_json_refs(controls, false, &mut live)
-        .await?;
-    crate::tracked_state::collect_current_state_part_json_refs(
+    Box::pin(
+        TrackedHeadContext::new()
+            .reader(store.clone())
+            .collect_hot_json_refs(controls, false, &mut live),
+    )
+    .await?;
+    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
         store,
         retained_part_refs_digests,
         &mut live,
-    )
+    ))
     .await?;
     for commit_id in surviving_commits {
-        crate::tracked_state::collect_local_commit_delta_json_refs(store, *commit_id, &mut live)
-            .await?;
+        Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
+            store, *commit_id, &mut live,
+        ))
+        .await?;
     }
     let ref_change_ids = controls
         .iter()
@@ -1384,11 +1388,11 @@ where
             continue;
         }
         if reclaimed_commits.insert(commit_id) {
-            crate::tracked_state::collect_local_commit_delta_json_refs(
+            Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
                 &store,
                 commit_id,
                 &mut candidate_json_hashes,
-            )
+            ))
             .await?;
             crate::tracked_state::stage_retire_commit_physical_state(
                 &store,
@@ -1404,18 +1408,18 @@ where
             .await?;
         }
     }
-    crate::tracked_state::collect_current_state_part_json_refs(
+    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
         &store,
         &released_part_refs_digests,
         &mut candidate_json_hashes,
-    )
+    ))
     .await?;
-    let live_json_hashes = collect_live_json_payload_hashes(
+    let live_json_hashes = Box::pin(collect_live_json_payload_hashes(
         &store,
         &controls,
         &blocked_physical_dependency_ids,
         &active_current_part_refs_digests,
-    )
+    ))
     .await?;
     let sweep_json_payloads = candidate_json_hashes
         .difference(&live_json_hashes)

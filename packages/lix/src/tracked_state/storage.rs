@@ -10632,16 +10632,21 @@ pub(crate) async fn collect_local_commit_delta_json_refs(
     commit_id: CommitId,
     refs: &mut BTreeSet<[u8; 32]>,
 ) -> Result<(), LixError> {
-    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
+    // Boxed, not inlined. This runs inside the repository sweep's already very
+    // large future, once per retired and once per surviving commit; leaving the
+    // segment-decode chain inline grew that future past the test harness's
+    // 2 MiB worker stack and aborted `cas_gc_history_retention` with a stack
+    // overflow rather than a failure.
+    let Some(state) = Box::pin(load_point_replay_commit_state(store, commit_id)).await? else {
         return Ok(());
     };
-    let Some((members, _)) = load_authenticated_local_commit_delta_members_for_schemas(
+    let Some((members, _)) = Box::pin(load_authenticated_local_commit_delta_members_for_schemas(
         store,
         &state,
         &[],
         usize::MAX,
         false,
-    )
+    ))
     .await?
     else {
         unreachable!("unbounded commit-delta payload inventory cannot exceed its segment limit")

@@ -671,15 +671,22 @@ mod tests {
         let point_update = fixture.update_one_by_pk_accounting().await;
         assert_eq!(point_update.logical_rows, 1);
         // The point write keeps the compact current-state certificate,
-        // publishes its authenticated branch control, and rotates the mandatory
-        // binary-CAS publication/reclamation epoch. It touches eight spaces, not
-        // eleven: the binary-CAS epoch and the tracked mutation fence are two
-        // keys in the one revision space, the retirement candidates a sweep
-        // needs are derived from the commit graph instead of being published
-        // into a reachability delta row plus its queue control, and the
-        // commit-derived change id is computed from the commit id instead of
-        // being mirrored into a reverse-index space.
-        assert_eq!(point_update.staged_puts, 9, "{point_update:?}");
+        // publishes its authenticated branch control, and rotates the two
+        // mandatory publication epochs — binary-CAS and json_store. It touches
+        // eight spaces, not eleven: those epochs and the tracked mutation fence
+        // are all keys in the one revision space, the retirement candidates a
+        // sweep needs are derived from the commit graph instead of being
+        // published into a reachability delta row plus its queue control, and
+        // the commit-derived change id is computed from the commit id instead
+        // of being mirrored into a reverse-index space.
+        //
+        // The json_store epoch is the tenth staged put and is why this is 10
+        // rather than 9. It costs no extra space, batch, or storage call — the
+        // revision space is already in this write set and its one-byte keys are
+        // adjacent — and it is what lets the payload sweep reclaim superseded
+        // out-of-band JSON at all: those rows are content addressed, so a
+        // publisher can resolve onto a row an earlier sweep plan marked dead.
+        assert_eq!(point_update.staged_puts, 10, "{point_update:?}");
         assert_eq!(point_update.touched_spaces, 8, "{point_update:?}");
         assert_eq!(point_update.put_batches, 8, "{point_update:?}");
 
