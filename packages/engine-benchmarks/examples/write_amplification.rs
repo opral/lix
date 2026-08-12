@@ -36,9 +36,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use lix::integration::Engine;
+use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{layout_accounting, space_inventory};
 use lix::{PreparedDmlParameterBatch, Value};
+use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
 const SEED_SQL: &str = "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
@@ -59,24 +61,38 @@ async fn main() {
             .parse()
             .unwrap_or_else(|_| panic!("argument {what} must be an unsigned integer"))
     };
+    let rocksdb = std::env::var("LIX_WA_BACKEND").is_ok_and(|value| value == "rocksdb");
     match mode.as_str() {
         "seed" => {
             let rows = next("rows");
-            seed(&dir, rows).await;
+            if rocksdb {
+                seed(RocksDB::open(&dir).expect("open RocksDB"), rows).await;
+            } else {
+                seed(SlateDB::open(&dir).expect("open SlateDB"), rows).await;
+            }
         }
         "update" => {
             let updates = next("updates");
             let width = next("width");
             let distinct = next("distinct");
-            update(&dir, updates, width, distinct).await;
+            if rocksdb {
+                update(RocksDB::open(&dir).expect("open RocksDB"), updates, width, distinct).await;
+            } else {
+                update(SlateDB::open(&dir).expect("open SlateDB"), updates, width, distinct).await;
+            }
         }
-        "census" => census(&dir).await,
+        "census" => {
+            if rocksdb {
+                census(RocksDB::open(&dir).expect("open RocksDB")).await;
+            } else {
+                census(SlateDB::open(&dir).expect("open SlateDB")).await;
+            }
+        }
         other => panic!("unknown mode {other}"),
     }
 }
 
-async fn seed(path: &str, rows: usize) {
-    let storage = SlateDB::open(path).expect("open SlateDB");
+async fn seed<S: Storage + Clone + Send + Sync + 'static>(storage: S, rows: usize) {
     Engine::initialize(storage.clone())
         .await
         .expect("initialize repository");
@@ -138,7 +154,7 @@ async fn seed(path: &str, rows: usize) {
 
     drop(session);
     drop(engine);
-    storage.flush().await.expect("flush SlateDB");
+    storage.flush().await.expect("flush storage");
     println!("SEEDED\trows={rows}");
 }
 
@@ -147,13 +163,17 @@ async fn seed(path: &str, rows: usize) {
 /// One `execute_prepared_dml_batch` is one commit, so `width` is exactly the
 /// number of rows a commit carries. Holding `updates` fixed and varying `width`
 /// separates per-commit fixed cost from per-row marginal cost.
-async fn update(path: &str, updates: usize, width: usize, distinct: usize) {
+async fn update<S: Storage + Clone + Send + Sync + 'static>(
+    storage: S,
+    updates: usize,
+    width: usize,
+    distinct: usize,
+) {
     assert!(width > 0 && distinct > 0, "width and distinct must be > 0");
     assert!(
         updates % width == 0,
         "updates must be a whole number of commits"
     );
-    let storage = SlateDB::open(path).expect("open SlateDB");
     let engine = Engine::new(storage.clone())
         .await
         .expect("open engine over initialized repository");
@@ -184,7 +204,7 @@ async fn update(path: &str, updates: usize, width: usize, distinct: usize) {
 
     drop(session);
     drop(engine);
-    storage.flush().await.expect("flush SlateDB");
+    storage.flush().await.expect("flush storage");
     println!(
         "UPDATED\tupdates={updates}\twidth={width}\tdistinct={distinct}\tcommits={}",
         updates / width
@@ -238,8 +258,8 @@ fn ascii_runs(key: &[u8]) -> Vec<String> {
     runs
 }
 
-async fn census(path: &str) {
-    let storage = StorageAdapter::new(SlateDB::open(path).expect("open SlateDB"));
+async fn census<S: Storage + Clone + Send + Sync + 'static>(backend: S) {
+    let storage = StorageAdapter::new(backend);
     let read = storage
         .begin_read(StorageReadOptions::default())
         .await
