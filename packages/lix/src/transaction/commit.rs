@@ -1886,6 +1886,7 @@ fn hot_index_writes_for_commit(
     entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
     state_rows: &PreparedStateBatch,
     branch_id: &str,
+    parent_control: Option<&crate::branch::BranchHeadControl>,
 ) -> Result<(Vec<crate::live_state::HotIndexEntry>, BTreeSet<(String, u16)>), LixError> {
     let mut entries = Vec::new();
     let mut witnesses = BTreeSet::new();
@@ -1942,7 +1943,17 @@ fn hot_index_writes_for_commit(
                     ),
                 )
             })?;
+        // A schema the parent generation proves absent has an empty
+        // collection in this branch, so indexing it from this commit forward
+        // is complete and the witness is free. The bloom filter has no false
+        // negatives, so "absent" here is a proof, not a guess. A collection
+        // that predates this plane never gets a witness and keeps scanning.
+        let collection_starts_here =
+            parent_control.is_none_or(|control| !control.may_have_schema(row.schema_key.as_str()));
         for column in &spec.indexed_columns {
+            if collection_starts_here {
+                witnesses.insert((row.schema_key.as_str().to_owned(), column.ordinal));
+            }
             let Some(value) = hot_index_value(&snapshot, column) else {
                 continue;
             };
@@ -4410,8 +4421,12 @@ async fn stage_tracked_head(
         // The index plane is staged from this commit's own rows, so it is
         // correct whichever physical route above published them, and it lands
         // in the same write set as the rows themselves.
-        let (index_entries, index_witnesses) =
-            hot_index_writes_for_commit(entity_schema_catalog, state_rows, &root.branch_id)?;
+        let (index_entries, index_witnesses) = hot_index_writes_for_commit(
+            entity_schema_catalog,
+            state_rows,
+            &root.branch_id,
+            parent_control,
+        )?;
         if !index_entries.is_empty() || !index_witnesses.is_empty() {
             crate::live_state::stage_hot_index_entries(
                 writes,

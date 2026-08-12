@@ -794,58 +794,39 @@ where
             rewritten.filter.declared_column_eq = None;
             return Ok(Some(rewritten));
         }
-        if std::env::var_os("EXPPQ_IDX").is_some() && scope.storage_branch_ids.len() != 1 {
-            eprintln!(
-                "EXPPQ_IDX multi_branch schema={} branches={:?}",
-                predicate.schema_key, scope.storage_branch_ids
-            );
-        }
-        let [branch_id] = scope.storage_branch_ids.as_slice() else {
-            let mut rewritten = request.clone();
-            rewritten.filter.declared_column_eq = None;
-            return Ok(Some(rewritten));
-        };
-        let Some(control) = scope.branch_heads.get(branch_id).copied() else {
-            let mut rewritten = request.clone();
-            rewritten.filter.declared_column_eq = None;
-            return Ok(Some(rewritten));
-        };
-        if std::env::var_os("EXPPQ_IDX").is_some() {
-            eprintln!(
-                "EXPPQ_IDX resolve schema={} branches={:?} generation={}",
-                predicate.schema_key,
-                scope.storage_branch_ids,
-                control.tracked_generation,
-            );
-        }
-        let candidates = self
-            .tracked_head
-            .reader(&self.store)
-            .scan_hot_index_candidates(
-                branch_id,
-                control.tracked_generation,
-                &predicate.schema_key,
-                predicate.ordinal,
-                &predicate.value,
-            )
-            .await?;
         let mut rewritten = request.clone();
         rewritten.filter.declared_column_eq = None;
-        if std::env::var_os("EXPPQ_IDX").is_some() {
-            eprintln!("EXPPQ_IDX candidates={:?}", candidates.as_ref().map(Vec::len));
+        // Every branch in scope must be witnessed. A branch whose index is
+        // incomplete would contribute no candidates and silently drop its
+        // rows, which is the false negative this design cannot have — so one
+        // unwitnessed branch sends the whole read back to the scan.
+        let mut unique = std::collections::BTreeSet::new();
+        for branch_id in &scope.storage_branch_ids {
+            let Some(control) = scope.branch_heads.get(branch_id).copied() else {
+                return Ok(Some(rewritten));
+            };
+            let Some(candidates) = self
+                .tracked_head
+                .reader(&self.store)
+                .scan_hot_index_candidates(
+                    branch_id,
+                    control.tracked_generation,
+                    &predicate.schema_key,
+                    predicate.ordinal,
+                    &predicate.value,
+                )
+                .await?
+            else {
+                return Ok(Some(rewritten));
+            };
+            unique.extend(candidates);
         }
-        match candidates {
-            None => Ok(Some(rewritten)),
-            Some(candidates) if candidates.is_empty() => {
-                rewritten.filter.rows = LiveStateRowFilter::None;
-                Ok(Some(rewritten))
-            }
-            Some(candidates) => {
-                let mut unique = candidates.into_iter().collect::<std::collections::BTreeSet<_>>();
-                rewritten.filter.entity_pks = std::mem::take(&mut unique).into_iter().collect();
-                Ok(Some(rewritten))
-            }
+        if unique.is_empty() {
+            rewritten.filter.rows = LiveStateRowFilter::None;
+        } else {
+            rewritten.filter.entity_pks = unique.into_iter().collect();
         }
+        Ok(Some(rewritten))
     }
 
     /// Serves finite entity-PK scans from the hot current-state index. Every
