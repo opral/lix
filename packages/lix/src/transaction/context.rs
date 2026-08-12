@@ -1805,30 +1805,28 @@ where
                 .await;
             return Err(error);
         }
-        let filesystem_delta_rows =
-            if prepared_writes_require_filesystem_index_rebuild(&prepared_writes) {
-                Vec::new()
-            } else {
-                prepared_writes
-                    .state_rows
-                    .iter()
-                    .filter(|row| {
-                        matches!(
-                            row.schema_key.as_str(),
-                            "lix_file_descriptor"
-                                | "lix_directory_descriptor"
-                                | BLOB_REF_SCHEMA_KEY
-                        )
-                    })
-                    .map(MaterializedHotStateRow::from)
-                    .collect::<Vec<_>>()
-            };
-        let previous_filesystem_revision = if filesystem_delta_rows.is_empty() {
-            None
+        // The delta itself is projected out of the commit below, once
+        // addressable rows hold their final commit-delta change ids. Only its
+        // *projectability* is decided here, because the revision the cached
+        // views are keyed on has to be read before the commit publishes its
+        // successor.
+        let stages_projectable_filesystem_rows =
+            prepared_writes_stage_filesystem_rows(&prepared_writes)
+                && !prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
+        // A failed revision read must not collapse into "no revision yet".
+        // `None` is itself a live cache key — the state before the first
+        // filesystem commit — so treating an error as `None` would rekey
+        // entries built at an unknown revision onto this commit's successor and
+        // make a stale index reachable. The outer `Option` is "the read
+        // succeeded"; only that licenses a projection.
+        let loaded_filesystem_revision = if stages_projectable_filesystem_rows {
+            load_path_index_revision(&read).await.ok()
         } else {
-            load_path_index_revision(&read).await.ok().flatten()
+            None
         };
-        let (mut writes, materialization_preconditions) =
+        let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
+        let previous_filesystem_revision = loaded_filesystem_revision.flatten();
+        let (mut writes, materialization_preconditions, filesystem_delta_rows) =
             match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
                 &transaction.tracked_state,
@@ -1846,7 +1844,15 @@ where
             ))
             .await
             {
-                Ok(writes) => writes,
+                Ok(commit) => (
+                    commit.writes,
+                    commit.preconditions,
+                    if filesystem_delta_projectable {
+                        commit.filesystem_delta_rows
+                    } else {
+                        Vec::new()
+                    },
+                ),
                 Err(error) => {
                     transaction
                         .discard_pending_plugin_actor_publications()
@@ -8912,10 +8918,36 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
         .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
 }
 
+/// Whether this commit's staged filesystem rows are an incomplete description
+/// of how the visible filesystem changed, so cached path indexes must be
+/// rebuilt from hot state rather than advanced by a delta.
+///
+/// Three shapes are incomplete, and all are about *which rows exist*, not about
+/// when their identities are assigned:
+///
+/// * a **branch ref move** republishes the branch's entire visible filesystem;
+///   the difference is between two commits, not between staged rows;
+/// * a **change selected into this commit from another commit** (merge,
+///   checkpoint, cherry-pick) enters the branch's visible filesystem without
+///   appearing in `state_rows` at all;
+/// * a **global or untracked filesystem row** changes visibility in every
+///   branch at once, so a single-branch delta cannot describe it.
+///
+/// The last one is also the only shape whose staged rows can be *dropped*
+/// between here and the capture point: `retain_untracked_rows_not_superseded_by_engine`
+/// removes untracked rows that an engine row supersedes. Deciding it here, off
+/// the complete pre-materialization row set, is what keeps the capture point
+/// from silently projecting a delta that lost a row. `advance_committed`
+/// evicts on the same condition, but it can only see the rows it is handed.
+///
+/// An ordinary create, rename, delete, or content write is fully described by
+/// its staged rows and is therefore projectable. Those rows are read back out
+/// of the commit once materialization has assigned their final change ids —
+/// see [`commit::MaterializedCommit::filesystem_delta_rows`].
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
     prepared_writes.state_rows.iter().any(|row| {
         row.schema_key == BRANCH_REF_SCHEMA_KEY
-            || (row.addressable_change_id
+            || ((row.global || row.untracked)
                 && matches!(
                     row.schema_key.as_str(),
                     "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
@@ -8932,6 +8964,16 @@ fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWr
                 "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
             )
         })
+}
+
+/// Whether this commit stages any row that the cached path index projects.
+fn prepared_writes_stage_filesystem_rows(prepared_writes: &PreparedWriteSet) -> bool {
+    prepared_writes.state_rows.iter().any(|row| {
+        matches!(
+            row.schema_key.as_str(),
+            "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+        )
+    })
 }
 
 pub(crate) struct OpenTransaction<StorageImpl: Storage + 'static = Memory> {
@@ -12015,8 +12057,14 @@ mod tests {
         ));
     }
 
+    /// An addressable filesystem row carries a provisional change id into
+    /// materialization, which is why the delta is projected out of the commit
+    /// rather than out of the caller's `PreparedWriteSet`. Addressability alone
+    /// says nothing about whether the staged rows describe the whole change,
+    /// so it must not force a rebuild — that is what made every file *create*
+    /// discard the cached path index.
     #[test]
-    fn addressable_filesystem_row_requires_index_rebuild() {
+    fn addressable_filesystem_row_does_not_require_index_rebuild() {
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let mut state_rows = PreparedStateBatch::with_capacity(1);
         state_rows.push_parts_with_change_addressability(
@@ -12049,9 +12097,99 @@ mod tests {
             file_content_writes: Vec::new(),
         };
 
+        assert!(prepared_writes_stage_filesystem_rows(&prepared_writes));
+        assert!(!prepared_writes_require_filesystem_index_rebuild(
+            &prepared_writes
+        ));
+    }
+
+    /// A branch ref move republishes the branch's whole visible filesystem, so
+    /// the staged rows cannot describe the difference.
+    #[test]
+    fn branch_ref_write_requires_filesystem_index_rebuild() {
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+        let mut state_rows = PreparedStateBatch::with_capacity(1);
+        state_rows.push_parts_with_change_addressability(
+            SchemaPlanId::for_test(0),
+            PreparedRowFacts::default(),
+            EntityPk::single("main"),
+            BRANCH_REF_SCHEMA_KEY.into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            timestamp,
+            timestamp,
+            true,
+            Some(ChangeId::for_test_label("branch-ref")),
+            false,
+            Some(CommitId::for_test_label("commit")),
+            false,
+            "main".into(),
+        );
+        let prepared_writes = PreparedWriteSet {
+            state_rows,
+            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+        };
+
         assert!(prepared_writes_require_filesystem_index_rebuild(
             &prepared_writes
         ));
+    }
+
+    /// A global or untracked filesystem row changes visibility in every branch,
+    /// which a single-branch delta cannot describe. It is also the only staged
+    /// filesystem row that can be dropped before the delta is captured, by
+    /// `retain_untracked_rows_not_superseded_by_engine`, so the rebuild has to
+    /// be decided here rather than left to `advance_committed`'s own eviction —
+    /// that only sees the rows it is handed.
+    #[test]
+    fn global_or_untracked_filesystem_row_requires_index_rebuild() {
+        for (global, untracked) in [(true, false), (false, true), (true, true)] {
+            let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+            let mut state_rows = PreparedStateBatch::with_capacity(1);
+            state_rows.push_parts_with_change_addressability(
+                SchemaPlanId::for_test(0),
+                PreparedRowFacts::default(),
+                EntityPk::single("file-a"),
+                "lix_file_descriptor".into(),
+                Some("file-a".into()),
+                None,
+                None,
+                None,
+                None,
+                timestamp,
+                timestamp,
+                global,
+                Some(ChangeId::for_test_label("provisional")),
+                true,
+                Some(CommitId::for_test_label("commit")),
+                untracked,
+                "main".into(),
+            );
+            let prepared_writes = PreparedWriteSet {
+                state_rows,
+                insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
+                commit_change_refs_by_branch: BTreeMap::new(),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
+                file_content_writes: Vec::new(),
+            };
+
+            assert!(
+                prepared_writes_require_filesystem_index_rebuild(&prepared_writes),
+                "global={global} untracked={untracked} must force a rebuild"
+            );
+        }
     }
 
     #[test]
@@ -12899,6 +13037,87 @@ mod tests {
                 "committed singleton updates must not rebuild or rescan descriptors"
             );
         }
+    }
+
+    /// Creating a file must advance the cached path index, not discard it.
+    ///
+    /// This is the create analogue of the `(0, 0)` assertion in
+    /// `committed_filesystem_path_index_benchmark_probe`, and it is a
+    /// *deterministic* statement of the property: a rebuild count does not
+    /// depend on machine, store shape, or fixture size, so it holds where a
+    /// timing comparison would be contaminated by the fixture — seeding this
+    /// workload runs through the very path the fix changes.
+    ///
+    /// Each insert also has to chain: the index advanced to revision N is what
+    /// insert N+1 must find, otherwise only the first create would be cheap.
+    #[tokio::test]
+    async fn committed_file_creates_advance_the_path_index_without_rebuilding() {
+        if !incremental_filesystem_index_enabled() {
+            return;
+        }
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("engine should open initialized storage");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) \
+                 VALUES ('/seed.md', CAST('byte-01' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("seed file should commit");
+        session
+            .execute("SELECT id FROM lix_file WHERE path = '/seed.md'", &[])
+            .await
+            .expect("path index should warm");
+        crate::filesystem::reset_full_rebuild_stats();
+
+        // Reading after each create is what makes this discriminating. A create
+        // that fails to advance the index leaves the cache keyed on the
+        // superseded revision; nothing observes that until the next read
+        // arrives at the new revision, misses, and rebuilds.
+        for index in 0..8 {
+            session
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_file (path, content) \
+                         VALUES ('/created-{index:02}.md', CAST('byte-01' AS BYTEA))"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("created file should commit");
+            // The advanced index must be *correct*, not merely present: an
+            // under-projected delta that lost a row surfaces here as a missing
+            // path rather than as a slow read.
+            let result = session
+                .execute(
+                    &format!("SELECT id FROM lix_file WHERE path = '/created-{index:02}.md'"),
+                    &[],
+                )
+                .await
+                .expect("created path should resolve through the advanced index");
+            assert_eq!(
+                result.len(),
+                1,
+                "created path /created-{index:02}.md must resolve after the index advanced"
+            );
+        }
+
+        assert_eq!(
+            crate::filesystem::full_rebuild_stats(),
+            (0, 0),
+            "committed file creates must advance the cached path index, not rebuild it"
+        );
     }
 
     #[tokio::test]

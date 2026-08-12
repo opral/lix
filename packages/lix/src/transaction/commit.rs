@@ -154,7 +154,7 @@ pub(crate) async fn commit_prepared_writes(
     let tracked_state = TrackedStateContext::new();
     let commit_parent_heads =
         resolve_prepared_commit_parent_heads(branch_ctx, &*read, &prepared_writes, false).await?;
-    commit_prepared_writes_with_parent_heads(
+    let outcome = commit_prepared_writes_with_parent_heads(
         binary_cas,
         &tracked_state,
         None,
@@ -165,7 +165,30 @@ pub(crate) async fn commit_prepared_writes(
         &BTreeMap::new(),
         prepared_writes,
     )
-    .await
+    .await?;
+    Ok((outcome.writes, outcome.preconditions))
+}
+
+/// A materialized commit: the atomic storage write set, the preconditions it
+/// must publish under, and the filesystem rows it staged.
+pub(crate) struct MaterializedCommit {
+    pub(crate) writes: StorageWriteSet,
+    pub(crate) preconditions: Vec<StoragePrecondition>,
+    /// Filesystem descriptor and blob-ref rows staged by this commit, carrying
+    /// their **final** identities.
+    ///
+    /// Addressable rows only receive their commit-delta change id during
+    /// materialization, so the caller's pre-commit `PreparedWriteSet` cannot
+    /// supply a projectable delta: it still holds the provisional change id
+    /// that `set_ordered_addressable_change_ids` overwrites. Projecting here is
+    /// what lets a file *create* advance the cached path index rather than
+    /// invalidate it.
+    ///
+    /// Empty when the commit changes no filesystem row. Non-empty does not by
+    /// itself license a projection — a branch-ref move or a change selected in
+    /// from another commit alters the visible filesystem without appearing in
+    /// these rows, and the caller must rebuild for those shapes.
+    pub(crate) filesystem_delta_rows: Vec<MaterializedHotStateRow>,
 }
 
 /// Materializes a prepared commit with branch heads already resolved from the
@@ -180,7 +203,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     read: &mut impl StorageAdapterRead,
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     prepared_writes: PreparedWriteSet,
-) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
+) -> Result<MaterializedCommit, LixError> {
     Box::pin(validate_active_account_and_account_rows(
         read,
         &prepared_writes,
@@ -543,7 +566,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         && engine_rows.is_empty()
         && writes.is_empty()
     {
-        return Ok((writes, preconditions));
+        return Ok(MaterializedCommit {
+            writes,
+            preconditions,
+            filesystem_delta_rows: Vec::new(),
+        });
     }
 
     let selected_change_records = load_selected_change_records(read, &commit_rows).await?;
@@ -812,6 +839,25 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     .await?;
     #[cfg(feature = "storage-benches")]
     state_rows.record_ownership(crate::storage_bench::CRUD_OWNERSHIP_ROOT_PUBLICATION);
+    // Every staging pass that can rewrite a row's identity has run, so these
+    // rows now match what a cold rebuild would read back out of hot state.
+    // `stage_tracked_commit_delta_index` above is the one that matters: it
+    // replaces the provisional change id every addressable row carried into
+    // this function with the row's commit-delta address.
+    let filesystem_delta_rows = if filesystem_view_changed {
+        state_rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.schema_key.as_str(),
+                    "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
+                )
+            })
+            .map(MaterializedHotStateRow::from)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if !staged_hot_heads.deferred_fresh_hot_plans.is_empty() {
         if staged_hot_heads.deferred_fresh_hot_plans.len() != 1 {
             return Err(LixError::new(
@@ -829,7 +875,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     if filesystem_view_changed {
         stage_path_index_revision(&mut writes);
     }
-    Ok((writes, preconditions))
+    Ok(MaterializedCommit {
+        writes,
+        preconditions,
+        filesystem_delta_rows,
+    })
 }
 
 fn certified_batch_requires_root_expansion(batch: &crate::wasm::WasmCertifiedEntityBatch) -> bool {
