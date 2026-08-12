@@ -72,8 +72,15 @@ async fn rebuild_commit_root_at_inner<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plans =
-        load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
+    // Explicit repair is the caller whose job is to distrust the chunk plane,
+    // so it — and only it — pays for the total closure proof.
+    let plans = load_rebuild_plans_to_nearest_available_root_with_proof(
+        rebuilder.store,
+        commit_id,
+        true,
+        RootAvailabilityProof::Complete,
+    )
+    .await?;
     let mut report = None;
     let context = TrackedStateContext::new();
     let mut state = TrackedStateTransientRebuildState::default();
@@ -154,10 +161,48 @@ where
     Ok(report)
 }
 
+/// How much of a candidate resume point's chunk closure a caller demands to be
+/// proved readable before it may resume from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootAvailabilityProof {
+    /// Prove the root is *addressable*: the root chunk and one root-to-leaf
+    /// path load and decode. `O(tree depth)`.
+    ///
+    /// Closure completeness is not re-derived. Chunks are staged in the same
+    /// atomic write set that publishes the root and the manifest, and GC
+    /// reaches them from refs, so the write path and GC are already its single
+    /// authority. This is what the commit path uses.
+    Addressable,
+    /// Prove the whole addressed closure loads and decodes. `O(tree rows)`.
+    ///
+    /// Used only by explicit repair (`rebuild_commit_root_at`), whose contract
+    /// is to distrust the chunk plane: rejecting a damaged resume point is what
+    /// makes it walk back and re-stage every chunk, so repair stays total.
+    Complete,
+}
+
 pub(crate) async fn load_rebuild_plans_to_nearest_available_root<S>(
     store: &S,
     commit_id: &str,
     force_head: bool,
+) -> Result<Vec<CommitRootRebuildPlan>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    load_rebuild_plans_to_nearest_available_root_with_proof(
+        store,
+        commit_id,
+        force_head,
+        RootAvailabilityProof::Addressable,
+    )
+    .await
+}
+
+pub(crate) async fn load_rebuild_plans_to_nearest_available_root_with_proof<S>(
+    store: &S,
+    commit_id: &str,
+    force_head: bool,
+    proof: RootAvailabilityProof,
 ) -> Result<Vec<CommitRootRebuildPlan>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
@@ -180,7 +225,7 @@ where
             let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
                 crate::storage_bench::PlanLoadPhase::AvailProbe,
             );
-            let available = load_available_root(store, &current_commit_id).await?;
+            let available = load_available_root(store, &current_commit_id, proof).await?;
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_root_replay_available_root_probe(available.is_some());
             if available.is_some() {
@@ -219,19 +264,16 @@ where
 /// only ever succeed by reaching genesis, which makes every interval closure
 /// replay the entire history.
 ///
-/// Obligation (2) is also bounded, to one root-to-leaf path. Chunk-closure
-/// completeness is not a fact this probe owns: chunks are staged in the same
-/// atomic write set that publishes the root and the manifest, and GC reaches
-/// them from refs, so the write path and GC are the single authority for it.
-/// Re-deriving it here by full traversal made a commit-path probe cost
-/// `O(total state)` and, at one boundary per `COMMIT_STATE_MAX_REPLAY_DEPTH`
-/// commits, put an `O(N^2)` term back into commit. What the probe must still
-/// catch is a resume point that is *not addressable at all* — the damage shape
-/// the root-chunk delete/corrupt paths produce — and that is decided by the
-/// root node and the first path below it.
+/// How much of obligation (2) is proved is the caller's choice — see
+/// [`RootAvailabilityProof`]. The commit path proves addressability only:
+/// re-deriving closure completeness there cost `O(total state)` per boundary
+/// and, at one boundary per `COMMIT_STATE_MAX_REPLAY_DEPTH` commits, put an
+/// `O(N^2)` term back into commit for a fact atomic publication and GC already
+/// own. Explicit repair still proves the whole closure.
 async fn load_available_root<S>(
     store: &S,
     commit_id: &str,
+    proof: RootAvailabilityProof,
 ) -> Result<Option<TrackedStateRootId>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
@@ -244,7 +286,7 @@ where
         let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
             crate::storage_bench::PlanLoadPhase::AvailTreeScan,
         );
-        commit_root_tree_is_readable(store, &metadata).await?
+        commit_root_tree_is_readable(store, &metadata, proof).await?
     };
     if !readable {
         return Ok(None);
@@ -255,15 +297,19 @@ where
 async fn commit_root_tree_is_readable<S>(
     store: &S,
     metadata: &TrackedStateCommitRoot,
+    proof: RootAvailabilityProof,
 ) -> Result<bool, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    // One row is enough: the scan walks root -> leftmost overlapping child ->
-    // leaf and stops, so a missing or corrupt root chunk still fails while the
-    // probe stays `O(tree depth)` instead of `O(tree rows)`.
+    // One row is enough for addressability: the scan walks root -> leftmost
+    // overlapping child -> leaf and stops, so a missing or corrupt root chunk
+    // still fails while the probe stays `O(tree depth)`.
     let request = TrackedStateTreeScanRequest {
-        limit: Some(1),
+        limit: match proof {
+            RootAvailabilityProof::Addressable => Some(1),
+            RootAvailabilityProof::Complete => None,
+        },
         ..TrackedStateTreeScanRequest::default()
     };
     match TrackedStateTree::new()
