@@ -91,6 +91,24 @@ pub(crate) const COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     COLLECTION_CONTROL_NAMESPACE,
     ValueSemantics::Mutable,
 );
+
+/// Engagement counters for the canonical `created_at` recovery that shares the
+/// retention fence's batch.
+///
+/// These sit *inside* the route they measure: `LOOKUPS` counts commits that
+/// submitted a non-empty key list, `KEYS` the identities submitted, and `HITS`
+/// the inheritances actually applied. A timing instrument one layer up cannot
+/// distinguish "the recovery is free" from "the recovery never ran", so the
+/// counts are read directly rather than inferred from a flat measurement.
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static BROAD_CANONICAL_CREATED_AT_LOOKUPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static BROAD_CANONICAL_CREATED_AT_KEYS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static BROAD_CANONICAL_CREATED_AT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Generation-local immutable current-state bases.
 ///
 /// Each tiny record points at one already-authored packed commit delta. Fresh
@@ -8071,7 +8089,15 @@ where
         // so checkpoint-expanded tombstones do not decrement the freshly reset
         // live count.
         apply_incremental_collection_generation_deltas(&mut collection_controls, &sorted)?;
-        for (delta, previous) in sorted.iter().zip(&mut previous_values) {
+        // A predecessor nulled here is absent for a reason that has nothing to
+        // do with a missing serving row: its generation was retired. Canonical
+        // state still holds that identity, so a canonical `created_at` lookup
+        // would happily resolve it and silently change the timestamp a
+        // re-insert after a generation retirement reports today. Remember which
+        // slots were nulled for that reason so the lookup below can exclude
+        // them. This is transaction-local and durably stores nothing.
+        let mut retired_predecessor = vec![false; previous_values.len()];
+        for (index, (delta, previous)) in sorted.iter().zip(&mut previous_values).enumerate() {
             if delta.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
                 continue;
             }
@@ -8091,6 +8117,7 @@ where
                 });
             if belongs_to_retired_generation {
                 *previous = None;
+                retired_predecessor[index] = true;
             }
         }
         // Narrowed retention fence.
@@ -8110,19 +8137,43 @@ where
         // insert. Cost is bounded to commits that actually contain an
         // untracked write with an unresolvable predecessor; every other commit
         // builds an empty key list and performs no additional I/O.
+        // The same batch answers a second question. A tracked insert whose
+        // predecessor is absent is either a genuinely new identity — canonical
+        // holds nothing, the lookup misses, and `delta.created_at` stands — or
+        // an identity whose serving-view predecessor is gone while canonical
+        // still carries its `created_at`. Serving-layer tombstone compaction
+        // creates exactly the second case, and nothing else in the engine
+        // rejects the fresh timestamp that would otherwise be minted, so the
+        // recovery has to happen here.
+        //
+        // This rides the retention fence's existing read: same commit, same
+        // key list, same `identity_only` projection. `created_at` is a
+        // descriptor column rather than a change-record payload, so it is
+        // already materialized and the projection does not widen. What does
+        // change is how often the block runs: the untracked-only filter left
+        // it empty on ordinary tracked inserts, and it now executes whenever a
+        // commit introduces a new identity.
+        let mut canonical_created_ats: Vec<Option<crate::common::LixTimestamp>> = Vec::new();
         {
-            let unresolved = sorted
-                .iter()
-                .zip(&previous_values)
-                .filter(|(delta, previous)| {
-                    delta.untracked && !delta.deleted && previous.is_none()
-                })
-                .map(|(delta, _)| TrackedStateKeyRef {
+            let mut unresolved = Vec::new();
+            let mut unresolved_slots = Vec::new();
+            for (index, (delta, previous)) in sorted.iter().zip(&previous_values).enumerate() {
+                if delta.deleted || previous.is_some() || retired_predecessor[index] {
+                    continue;
+                }
+                unresolved.push(TrackedStateKeyRef {
                     schema_key: delta.schema_key,
                     file_id: delta.file_id,
                     entity_pk: delta.entity_pk,
-                })
-                .collect::<Vec<_>>();
+                });
+                unresolved_slots.push((index, delta.untracked));
+            }
+            #[cfg(any(test, feature = "storage-benches"))]
+            if !unresolved.is_empty() {
+                BROAD_CANONICAL_CREATED_AT_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                BROAD_CANONICAL_CREATED_AT_KEYS
+                    .fetch_add(unresolved.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             if !unresolved.is_empty()
                 && let Some(control) = BranchHeadControlContext::new()
                     .reader(self.store)
@@ -8153,11 +8204,17 @@ where
                         &ChangeRecordProjection::identity_only(),
                     )
                     .await?;
-                for (slot, key) in unresolved.iter().enumerate() {
-                    // Any canonical row for the identity — live or tombstoned —
-                    // means it has been tracked, which is exactly what
-                    // `reject_retention_change` refuses to flip.
-                    if canonical.row(slot).is_some() {
+                canonical_created_ats = vec![None; sorted.len()];
+                for (slot, (index, untracked)) in unresolved_slots.iter().copied().enumerate() {
+                    let Some(row) = canonical.row(slot) else {
+                        continue;
+                    };
+                    if untracked {
+                        // Any canonical row for the identity — live or
+                        // tombstoned — means it has been tracked, which is
+                        // exactly what `reject_retention_change` refuses to
+                        // flip.
+                        let key = &unresolved[slot];
                         return Err(LixError::new(
                             LixError::CODE_UNIQUE,
                             format!(
@@ -8166,13 +8223,30 @@ where
                             ),
                         ));
                     }
+                    // A tracked insert over an identity canonical still knows.
+                    // Inherit its first `created_at` rather than minting a new
+                    // one, which is what the serving view's predecessor would
+                    // have supplied had it still been there.
+                    canonical_created_ats[index] = Some(row.created_at());
+                    #[cfg(any(test, feature = "storage-benches"))]
+                    BROAD_CANONICAL_CREATED_AT_HITS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
         let mut created_ats = Vec::with_capacity(sorted.len());
-        for (delta, previous) in sorted.iter().zip(&previous_values) {
+        for (index, (delta, previous)) in sorted.iter().zip(&previous_values).enumerate() {
             let Some(previous) = previous else {
-                created_ats.push(delta.created_at);
+                // Canonical supplies the timestamp when it still knows the
+                // identity; otherwise this is a genuinely new row and mints
+                // its own.
+                created_ats.push(
+                    canonical_created_ats
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(delta.created_at),
+                );
                 continue;
             };
             let existing = previous.view()?;

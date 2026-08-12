@@ -38,6 +38,11 @@ pub(crate) use tracked_head::hot_generation_scope_prefix;
 #[cfg(test)]
 pub(crate) use tracked_head::stage_collect_stale_working_diff_indexes;
 pub(crate) use tracked_head::stage_retire_hot_generation;
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use tracked_head::{
+    BROAD_CANONICAL_CREATED_AT_HITS, BROAD_CANONICAL_CREATED_AT_KEYS,
+    BROAD_CANONICAL_CREATED_AT_LOOKUPS,
+};
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,

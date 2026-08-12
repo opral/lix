@@ -1360,6 +1360,12 @@ async fn recreated_identity_created_at_after_compaction() {
     assert!(removed > 0, "the delete must have left a tombstone to remove");
 
     let session = reopen_session(&storage).await;
+    let hits_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let keys_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_KEYS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let lookups_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_LOOKUPS
+        .load(std::sync::atomic::Ordering::Relaxed);
     session
         .execute(
             "INSERT INTO c8row (id, locale) VALUES ('row-0', 'second')",
@@ -1367,13 +1373,35 @@ async fn recreated_identity_created_at_after_compaction() {
         )
         .await
         .expect("re-insert should commit");
+    let hits = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - hits_before;
+    let keys = crate::hot_state::BROAD_CANONICAL_CREATED_AT_KEYS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - keys_before;
+    let lookups = crate::hot_state::BROAD_CANONICAL_CREATED_AT_LOOKUPS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - lookups_before;
     let second = created_at_of(&session, "c8row", "row-0").await;
     println!(
         "phase8 | arm=compacted first_created_at={first} second_created_at={second} \
-         inherited={}",
+         inherited={} lookups={lookups} keys={keys} hits={hits}",
         first == second
     );
     drop(session);
+
+    // Engagement, counted inside the route rather than inferred from a timing
+    // result. A hit proves the recovery fired; the run below proves it can
+    // also miss, so the route is not trivially returning a constant.
+    assert!(lookups > 0, "the canonical lookup must have run");
+    assert!(
+        hits > 0,
+        "the re-insert over a compacted identity must have inherited from canonical"
+    );
+    assert_eq!(
+        second, first,
+        "canonical must supply the created_at the compacted tombstone used to carry"
+    );
 
     // `validate_diff_row_created_at` derives its expectation from the parent
     // commit's canonical tracked-state index value and never inspects
@@ -1406,5 +1434,43 @@ async fn recreated_identity_created_at_after_compaction() {
         "phase8 | verdict inherited={} rebuild_ok={} created_at_validations={validations}",
         first == second,
         rebuild.is_ok()
+    );
+}
+
+/// The miss side of the same route. A commit that introduces genuinely new
+/// identities submits keys to the canonical lookup and must come back empty —
+/// a route that only ever hits would be inheriting timestamps for rows that
+/// have no canonical ancestor, which is the failure this pairs against.
+#[tokio::test]
+async fn broad_canonical_created_at_recovery_misses_for_new_identities() {
+    let (_storage, session) = open_session().await;
+    register(&session, probe_schema("c8new")).await;
+
+    let keys_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_KEYS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let hits_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    session
+        .execute(
+            "INSERT INTO c8new (id, locale) VALUES ('new-0', 'a'), ('new-1', 'b')",
+            &[],
+        )
+        .await
+        .expect("new rows should commit");
+    let keys = crate::hot_state::BROAD_CANONICAL_CREATED_AT_KEYS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - keys_before;
+    let hits = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - hits_before;
+
+    println!("phase8 | arm=new_identities keys={keys} hits={hits}");
+    assert!(
+        keys >= 2,
+        "both new identities must reach the canonical lookup"
+    );
+    assert_eq!(
+        hits, 0,
+        "a genuinely new identity has no canonical ancestor to inherit from"
     );
 }
