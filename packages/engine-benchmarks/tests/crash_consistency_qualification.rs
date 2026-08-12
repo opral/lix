@@ -357,8 +357,11 @@ struct Workload {
     /// row write set — a materially different publication shape from a plain row
     /// commit, and one that widens the swept window.
     ///
-    /// Note it does **not** set `await_durable`; measured, not assumed. See
-    /// [`Workload::force_await_durable`].
+    /// Note it does **not** set `await_durable`; measured, not assumed. The
+    /// blob is written with `INSERT INTO lix_file`, and the engine raises that
+    /// flag only in the resumable media-upload session, which is exercised by
+    /// `await_durable_publication_round_trips_through_the_resumable_upload_path`
+    /// below. See also [`Workload::force_await_durable`].
     blob_bytes: usize,
     /// Force `WriteOptions::await_durable` on at the storage boundary.
     ///
@@ -1249,8 +1252,9 @@ fn slatedb_durable_acknowledgement_survives_sigkill() {
 
 /// `WriteOptions::await_durable` is documented as "do not acknowledge the commit
 /// until the backend has crossed its durable persistence boundary". The engine
-/// sets it for atomic content-addressed publications and media uploads; SlateDB
-/// waits for its WAL upload; RocksDB must fsync the WAL before acknowledging.
+/// raises it on the resumable media-upload path — the per-part commit and the
+/// finalizing CAS publication. SlateDB waits for its WAL upload; RocksDB must
+/// fsync the WAL before acknowledging.
 ///
 /// The adapter used to accept the flag and silently drop it — `commit()` never
 /// saw the options it was opened with, and `rocksdb::WriteOptions` was never
@@ -1259,9 +1263,16 @@ fn slatedb_durable_acknowledgement_survives_sigkill() {
 /// the guarantee is invisible from inside the process, so nothing else in the
 /// suite would notice it disappearing again.
 ///
-/// If this fails, re-run the fsync census in the PR body for #1388/#E35 before
-/// changing it — a green suite with a silently non-syncing adapter is exactly
-/// the state this is here to prevent.
+/// This is deliberately a source assertion. There is no in-process observation
+/// that distinguishes a synced commit from an unsynced one — the difference
+/// only appears if the machine loses power — so pinning the code that produces
+/// the syscall is the strongest check available without `dm-log-writes`. It is
+/// paired with an strace census (in the PR body) that measured the syscall
+/// itself: two WAL fsyncs per single-part upload on the candidate, zero on the
+/// base, and an unchanged sync count on ordinary commits.
+///
+/// If this fails, re-run that census before changing it — a green suite with a
+/// silently non-syncing adapter is exactly the state this is here to prevent.
 #[test]
 fn rocksdb_honours_await_durable_by_syncing_the_wal_before_acknowledging() {
     let source = include_str!("../../rocksdb-storage/src/rocksdb.rs");
@@ -1284,21 +1295,32 @@ fn rocksdb_honours_await_durable_by_syncing_the_wal_before_acknowledging() {
     );
 }
 
-/// A publication that requests durable acknowledgement must still be a correct
-/// publication: same rows, same content-addressed bytes, readable after reopen.
+/// Exercises the one path that actually requests durable acknowledgement, and
+/// proves that requesting it did not change what gets written.
 ///
-/// The fsync itself is not observable from inside the process (see the strace
-/// census in the PR body); what this pins is that turning it on did not change
-/// what gets written.
+/// This matters because the *set* of durable writers is narrower than the
+/// module docs above might suggest. `await_durable` is raised in exactly two
+/// places, both in the resumable media-upload session
+/// (`session/media_upload.rs`): the per-part commit, and the finalization,
+/// which reaches `Transaction::stage_atomic_cas_publication` — the only caller
+/// of that function. An ordinary `INSERT INTO lix_file` carrying blob content
+/// still chunks through the content-addressed path but does **not** raise the
+/// flag, so it neither syncs before nor after this fix. A test that wrote its
+/// blob with SQL would therefore assert nothing about durability while looking
+/// like it did.
+///
+/// The fsync itself is not observable from inside the process — it is verified
+/// by the strace census in the PR body, whose slope is exactly two WAL fsyncs
+/// per upload of this shape: one for the part, one for the finalization.
 #[test]
-fn await_durable_publications_round_trip_unchanged() {
+fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
+    const UPLOAD_PATH: &str = "/durable-round-trip.bin";
     let temp = tempfile::tempdir().expect("create durable round-trip fixture");
     let path = temp.path().join("database");
-    let workload = Workload {
-        rows: 8,
-        commits: 2,
-        blob_bytes: 128 * 1024,
-    };
+    // One part: well under `lix::FILE_UPLOAD_PART_BYTES`, so this is a single
+    // part commit followed by the atomic CAS publication.
+    let content = blob_for(7, 256 * 1024);
+    let expected = content.clone();
 
     block_on(move || async move {
         {
@@ -1307,14 +1329,21 @@ fn await_durable_publications_round_trip_unchanged() {
                 .with_storage(storage.clone())
                 .await
                 .expect("open durable round-trip Lix");
-            register_schema(&lix).await;
-            // Every one of these publishes a binary file, so every one of them
-            // takes the `await_durable` path.
-            for generation in 0..=workload.commits as i64 {
-                upsert_generation(&lix, workload, generation, generation == 0)
-                    .await
-                    .expect("durable round-trip commit");
-            }
+            let total_size = content.len() as u64;
+            let progress = lix
+                .upsert_file_content_part(
+                    "e35-durable-round-trip".to_owned(),
+                    UPLOAD_PATH.to_owned(),
+                    0,
+                    total_size,
+                    content,
+                )
+                .await
+                .expect("publish durable round-trip upload");
+            assert_eq!(
+                progress.next_offset, total_size,
+                "the durable upload did not consume the whole part"
+            );
             lix.close().await.expect("close durable round-trip Lix");
         }
 
@@ -1323,21 +1352,24 @@ fn await_durable_publications_round_trip_unchanged() {
             .with_storage(storage)
             .await
             .expect("reopen durable round-trip Lix");
-        let observed = read_generations(&lix)
+        let result = lix
+            .execute(
+                "SELECT content FROM lix_file WHERE path = $1",
+                &[Value::Text(UPLOAD_PATH.to_owned())],
+            )
             .await
-            .expect("read durable round-trip rows");
-        assert_eq!(observed.len(), workload.rows);
-        assert!(
-            observed.iter().all(|value| *value == workload.commits as i64),
-            "durable publication did not land whole: {observed:?}"
-        );
-        let content = read_blob(&lix)
-            .await
-            .expect("read durable round-trip blob")
-            .expect("durable round-trip blob is present");
+            .expect("read durable round-trip file");
+        let rows = result.rows();
         assert_eq!(
-            content,
-            blob_for(workload.commits as i64, workload.blob_bytes),
+            rows.len(),
+            1,
+            "the durable upload did not publish exactly one file row"
+        );
+        let observed: Vec<u8> = rows[0]
+            .get("content")
+            .expect("durable round-trip content was not a blob");
+        assert_eq!(
+            observed, expected,
             "durable publication wrote the wrong content-addressed bytes"
         );
         lix.close().await.expect("close reopened durable Lix");
