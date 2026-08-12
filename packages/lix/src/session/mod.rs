@@ -73,8 +73,18 @@ impl<F> AssumeSendFuture<F> {
 }
 
 // SAFETY: `AssumeSendFuture::new` is private and unsafe; each call site must
-// establish the wrapped future's complete suspension state is movable.
-unsafe impl<F> Send for AssumeSendFuture<F> {}
+// establish the wrapped future's complete suspension state is movable. Every
+// current call site is pinned by a compile-time proof; see
+// `session::execute::assume_send_future_proofs`.
+//
+// `F::Output: Send` is not part of that obligation, but is required here so the
+// wrapper can never launder a non-`Send` *result* onto another thread.
+unsafe impl<F> Send for AssumeSendFuture<F>
+where
+    F: Future,
+    F::Output: Send,
+{
+}
 
 impl<F> Future for AssumeSendFuture<F>
 where
