@@ -153,7 +153,7 @@ mod tests {
         );
 
         let session = lix
-            .open_session_with_account(
+            .open_session_at_with_account(
                 lix.active_branch_id().await.expect("active branch"),
                 AUTHOR_ID,
             )
@@ -185,7 +185,7 @@ mod tests {
         );
 
         let system = lix
-            .open_session_with_account(
+            .open_session_at_with_account(
                 lix.active_branch_id().await.expect("active branch"),
                 crate::SYSTEM_ACCOUNT_ID,
             )
