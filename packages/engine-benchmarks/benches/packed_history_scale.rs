@@ -2,6 +2,10 @@ use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use lix::registered_spaces::{
+    JSON_SPACE, TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+    TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+};
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::tracked_state::bench::{
@@ -310,10 +314,10 @@ async fn run_case<S, Flush, FlushFuture>(
     );
     let lifecycle_write_amplification = ratio(lifecycle_io.write_bytes, logical_written_bytes);
     let storage_amplification = ratio(backend_bytes, logical_written_bytes);
-    let manifest = find_layout(&layout, "tracked_state.commit_state_manifest.v7");
-    let segments = find_layout(&layout, "tracked_state.commit_delta_segment.v6");
-    let locators = find_layout(&layout, "tracked_state.change_locator.v2");
-    let json_payloads = find_layout(&layout, "json_store.json");
+    let manifest = find_layout(&layout, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.name);
+    let segments = find_layout(&layout, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE.name);
+    let locators = find_layout(&layout, TRACKED_STATE_CHANGE_LOCATOR_SPACE.name);
+    let json_payloads = find_layout(&layout, JSON_SPACE.name);
 
     println!(
         "packed_history_scale,backend={backend},id_shape={id_shape},history_shape={},payload_shape={},\

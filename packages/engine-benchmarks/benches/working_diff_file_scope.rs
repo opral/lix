@@ -210,7 +210,7 @@ async fn run<StorageImpl>(
     // Live-state read of the same file. HOT_ROW is keyed
     // `schema_key ++ file_id ++ entity_pk` and `hot_scan_entries` owns a
     // file-first prefix route; the entity surface pushes `lixcol_file_id` into
-    // `LiveStateFilter::file_ids`, so this reaches that prefix seek and costs
+    // `HotStateFilter::file_ids`, so this reaches that prefix seek and costs
     // O(rows in the file). `entity_scan_rows` is fixed at `rows_per_file`, so
     // a flat latency across dirty-set sizes is the pass condition and a rising
     // one means the pushdown stopped reaching the seek.

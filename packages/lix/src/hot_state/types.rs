@@ -1,16 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[cfg(test)]
 use std::mem::size_of;
 use std::num::NonZeroU32;
+#[cfg(test)]
 use std::ops::Range;
 use std::sync::Arc;
 
-use ahash::RandomState;
 use bytes::Bytes;
 
 use super::tracked_head::{CertifiedCurrentStatePredecessor, ColumnarBaseCoordinate};
 use crate::changelog::{ChangeId, CommitId};
-use crate::common::{LixTimestamp, SharedStr};
+use crate::common::{
+    FastHashBuilder, LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder,
+    fast_hash_builder,
+};
 use crate::entity_pk::EntityPk;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
@@ -18,9 +21,9 @@ use crate::{NullableKeyFilter, Value};
 /// Terminal owned DTO for consumers that cannot yet borrow a live-state batch.
 ///
 /// HOT materialization and visibility never use this as an intermediate. They
-/// exchange [`MaterializedLiveStateBatch`] owners and borrowed row views.
+/// exchange [`MaterializedHotStateBatch`] owners and borrowed row views.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MaterializedLiveStateRow {
+pub(crate) struct MaterializedHotStateRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -62,45 +65,20 @@ impl FileIdId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BranchIdId(u32);
 
-/// Dictionary storage shared by every identity column in one live-state batch.
-///
-/// Schema keys, file ids, and branch ids occupy one contiguous UTF-8 arena.
-/// Their typed ordinal columns make repeated batch-wide metadata a four-byte
-/// reference instead of another owned allocation on every row.
-#[derive(Debug, Clone, Default)]
-struct LiveStateStringDictionary {
-    bytes: Bytes,
-    ranges: Vec<Range<u32>>,
-    #[cfg(test)]
-    arena_allocation_count: usize,
-    #[cfg(test)]
-    arena_large_allocation_count: usize,
-}
-
-impl LiveStateStringDictionary {
-    fn get(&self, ordinal: u32) -> &str {
-        let range = self
-            .ranges
-            .get(ordinal as usize)
-            .expect("live-state string ordinal belongs to this batch");
-        let range = range.start as usize..range.end as usize;
-        // SAFETY: the builder appends complete `str` values and records their
-        // exact boundaries. `Bytes` preserves that immutable allocation.
-        unsafe { std::str::from_utf8_unchecked(&self.bytes[range]) }
-    }
-}
-
 /// Columnar owner for materialized live-state rows.
 ///
 /// This is the read-side handoff between HOT materialization, visibility, and
 /// provider adaptation. Identity strings are dictionary encoded once per
 /// batch; payloads retain their existing shared storage buffers. Consumers
-/// operate on [`MaterializedLiveStateRowRef`] views and only construct the
+/// operate on [`MaterializedHotStateRowRef`] views and only construct the
 /// legacy owned DTO at an API boundary that still requires it.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct MaterializedLiveStateBatch {
-    singleton: Option<Box<MaterializedLiveStateSingleton>>,
-    strings: LiveStateStringDictionary,
+pub(crate) struct MaterializedHotStateBatch {
+    singleton: Option<Box<MaterializedHotStateSingleton>>,
+    /// Schema keys, file ids, and branch ids share one contiguous UTF-8 arena,
+    /// so repeated batch-wide metadata costs a four-byte ordinal per row rather
+    /// than another owned allocation.
+    strings: StringDictionary,
     schema_keys: Vec<SchemaKeyId>,
     file_ids: Vec<Option<FileIdId>>,
     branch_ids: Vec<BranchIdId>,
@@ -130,16 +108,16 @@ pub(crate) struct MaterializedLiveStateBatch {
 /// handoff. Keeping this behind one box avoids allocating every column vector
 /// and dictionary index while leaving the bulk columnar owner compact.
 #[derive(Debug, Clone)]
-struct MaterializedLiveStateSingleton {
-    row: MaterializedLiveStateRow,
+struct MaterializedHotStateSingleton {
+    row: MaterializedHotStateRow,
     durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
 
-impl MaterializedLiveStateBatch {
-    pub(crate) fn from_rows(rows: Vec<MaterializedLiveStateRow>) -> Self {
+impl MaterializedHotStateBatch {
+    pub(crate) fn from_rows(rows: Vec<MaterializedHotStateRow>) -> Self {
         let (dictionary_entries, dictionary_bytes) = owned_row_dictionary_capacity(&rows);
-        let mut builder = MaterializedLiveStateBatchBuilder::with_dictionary_capacity(
+        let mut builder = MaterializedHotStateBatchBuilder::with_dictionary_capacity(
             rows.len(),
             dictionary_entries,
             dictionary_bytes,
@@ -160,23 +138,23 @@ impl MaterializedLiveStateBatch {
         self.singleton.is_none() && self.entity_pks.is_empty()
     }
 
-    pub(crate) fn row(&self, index: usize) -> MaterializedLiveStateRowRef<'_> {
+    pub(crate) fn row(&self, index: usize) -> MaterializedHotStateRowRef<'_> {
         assert!(index < self.len(), "live-state row ordinal out of bounds");
-        MaterializedLiveStateRowRef { batch: self, index }
+        MaterializedHotStateRowRef { batch: self, index }
     }
 
-    pub(crate) fn get(&self, index: usize) -> Option<MaterializedLiveStateRowRef<'_>> {
+    pub(crate) fn get(&self, index: usize) -> Option<MaterializedHotStateRowRef<'_>> {
         (index < self.len()).then(|| self.row(index))
     }
 
-    pub(crate) fn iter(&self) -> MaterializedLiveStateBatchIter<'_> {
-        MaterializedLiveStateBatchIter {
+    pub(crate) fn iter(&self) -> MaterializedHotStateBatchIter<'_> {
+        MaterializedHotStateBatchIter {
             batch: self,
             next: 0,
         }
     }
 
-    pub(crate) fn into_rows(mut self) -> Vec<MaterializedLiveStateRow> {
+    pub(crate) fn into_rows(mut self) -> Vec<MaterializedHotStateRow> {
         if let Some(singleton) = self.singleton.take() {
             return vec![singleton.row];
         }
@@ -264,7 +242,7 @@ impl MaterializedLiveStateBatch {
         if let Some(singleton) = &self.singleton {
             return vec![Some(Arc::clone(&singleton.row.branch_id))];
         }
-        let mut owners = vec![None; self.strings.ranges.len()];
+        let mut owners = vec![None; self.strings.len()];
         for branch_id in &self.branch_ids {
             let ordinal = branch_id.0 as usize;
             if owners[ordinal].is_none() {
@@ -282,11 +260,11 @@ impl MaterializedLiveStateBatch {
 
     pub(crate) fn filter(
         &self,
-        mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
+        mut keep: impl FnMut(MaterializedHotStateRowRef<'_>) -> bool,
         limit: Option<usize>,
     ) -> Self {
         let capacity = limit.map_or_else(|| self.len(), |limit| limit.min(self.len()));
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(capacity);
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(capacity);
         if capacity == 0 && limit.is_some() {
             return builder.finish();
         }
@@ -311,7 +289,7 @@ impl MaterializedLiveStateBatch {
                     file_id == row.schema_key || file_id == row.branch_id.as_ref()
                 }));
         }
-        self.strings.ranges.len()
+        self.strings.len()
     }
 
     #[cfg(test)]
@@ -330,7 +308,7 @@ impl MaterializedLiveStateBatch {
             }
             return bytes;
         }
-        self.strings.bytes.len()
+        self.strings.byte_len()
     }
 
     #[cfg(test)]
@@ -338,7 +316,7 @@ impl MaterializedLiveStateBatch {
         if self.singleton.is_some() {
             return 0;
         }
-        usize::from(!self.strings.bytes.is_empty())
+        usize::from(!self.strings.is_arena_empty())
     }
 
     #[cfg(test)]
@@ -346,7 +324,7 @@ impl MaterializedLiveStateBatch {
         if self.singleton.is_some() {
             return 0;
         }
-        self.strings.arena_allocation_count
+        self.strings.arena_allocation_count()
     }
 
     #[cfg(test)]
@@ -354,7 +332,7 @@ impl MaterializedLiveStateBatch {
         if self.singleton.is_some() {
             return 0;
         }
-        self.strings.arena_large_allocation_count
+        self.strings.arena_large_allocation_count()
     }
 
     #[cfg(test)]
@@ -368,7 +346,7 @@ impl MaterializedLiveStateBatch {
     #[cfg(test)]
     fn large_column_allocation_count(&self, threshold: usize) -> usize {
         if self.singleton.is_some() {
-            return usize::from(size_of::<MaterializedLiveStateSingleton>() >= threshold);
+            return usize::from(size_of::<MaterializedHotStateSingleton>() >= threshold);
         }
         [
             self.schema_keys.capacity() * size_of::<SchemaKeyId>(),
@@ -389,8 +367,8 @@ impl MaterializedLiveStateBatch {
                 .map_or(0, |coordinates| {
                     coordinates.capacity() * size_of::<ColumnarBaseCoordinate>()
                 }),
-            self.strings.bytes.len(),
-            self.strings.ranges.capacity() * size_of::<Range<u32>>(),
+            self.strings.byte_len(),
+            self.strings.ranges_capacity() * size_of::<Range<u32>>(),
         ]
         .into_iter()
         .filter(|bytes| *bytes >= threshold)
@@ -398,21 +376,21 @@ impl MaterializedLiveStateBatch {
     }
 }
 
-impl From<Vec<MaterializedLiveStateRow>> for MaterializedLiveStateBatch {
-    fn from(rows: Vec<MaterializedLiveStateRow>) -> Self {
+impl From<Vec<MaterializedHotStateRow>> for MaterializedHotStateBatch {
+    fn from(rows: Vec<MaterializedHotStateRow>) -> Self {
         Self::from_rows(rows)
     }
 }
 
-/// One borrowed row view over a [`MaterializedLiveStateBatch`].
+/// One borrowed row view over a [`MaterializedHotStateBatch`].
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct MaterializedLiveStateRowRef<'a> {
-    batch: &'a MaterializedLiveStateBatch,
+pub(crate) struct MaterializedHotStateRowRef<'a> {
+    batch: &'a MaterializedHotStateBatch,
     index: usize,
 }
 
-impl<'a> MaterializedLiveStateRowRef<'a> {
-    fn singleton(self) -> Option<&'a MaterializedLiveStateSingleton> {
+impl<'a> MaterializedHotStateRowRef<'a> {
+    fn singleton(self) -> Option<&'a MaterializedHotStateSingleton> {
         self.batch.singleton.as_deref()
     }
 
@@ -544,12 +522,12 @@ impl<'a> MaterializedLiveStateRowRef<'a> {
     /// Batch pipeline stages should retain the batch owner and borrow this
     /// view instead. This conversion deliberately remains explicit so an
     /// accidental row-owned intermediate is visible at its call site.
-    pub(crate) fn to_owned(self) -> MaterializedLiveStateRow {
+    pub(crate) fn to_owned(self) -> MaterializedHotStateRow {
         self.to_owned_with_branch(Arc::from(self.branch_id()))
     }
 
-    fn to_owned_with_branch(self, branch_id: Arc<str>) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    fn to_owned_with_branch(self, branch_id: Arc<str>) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             entity_pk: self.entity_pk().clone(),
             schema_key: self.schema_key().to_owned(),
             file_id: self.file_id().map(str::to_owned),
@@ -567,13 +545,13 @@ impl<'a> MaterializedLiveStateRowRef<'a> {
     }
 }
 
-pub(crate) struct MaterializedLiveStateBatchIter<'a> {
-    batch: &'a MaterializedLiveStateBatch,
+pub(crate) struct MaterializedHotStateBatchIter<'a> {
+    batch: &'a MaterializedHotStateBatch,
     next: usize,
 }
 
-impl<'a> Iterator for MaterializedLiveStateBatchIter<'a> {
-    type Item = MaterializedLiveStateRowRef<'a>;
+impl<'a> Iterator for MaterializedHotStateBatchIter<'a> {
+    type Item = MaterializedHotStateRowRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let index = self.next;
@@ -590,19 +568,19 @@ impl<'a> Iterator for MaterializedLiveStateBatchIter<'a> {
     }
 }
 
-impl ExactSizeIterator for MaterializedLiveStateBatchIter<'_> {}
+impl ExactSizeIterator for MaterializedHotStateBatchIter<'_> {}
 
 /// Aligned exact-read result. Missing slots are represented by `None`; present
 /// slots point into one compact materialized batch.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct MaterializedLiveStateExactBatch {
-    batch: MaterializedLiveStateBatch,
+pub(crate) struct MaterializedHotStateExactBatch {
+    batch: MaterializedHotStateBatch,
     slots: Vec<Option<u32>>,
 }
 
-impl MaterializedLiveStateExactBatch {
+impl MaterializedHotStateExactBatch {
     pub(crate) fn new(
-        batch: MaterializedLiveStateBatch,
+        batch: MaterializedHotStateBatch,
         slots: Vec<Option<u32>>,
     ) -> Result<Self, crate::LixError> {
         if u32::try_from(batch.len()).is_err()
@@ -620,8 +598,8 @@ impl MaterializedLiveStateExactBatch {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_rows(rows: Vec<Option<MaterializedLiveStateRow>>) -> Self {
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(rows.len());
+    pub(crate) fn from_rows(rows: Vec<Option<MaterializedHotStateRow>>) -> Self {
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(rows.len());
         let mut slots = Vec::with_capacity(rows.len());
         for row in rows {
             slots.push(row.map(|row| {
@@ -641,7 +619,7 @@ impl MaterializedLiveStateExactBatch {
         self.slots.len()
     }
 
-    pub(crate) fn row(&self, slot: usize) -> Option<MaterializedLiveStateRowRef<'_>> {
+    pub(crate) fn row(&self, slot: usize) -> Option<MaterializedHotStateRowRef<'_>> {
         self.slots
             .get(slot)
             .copied()
@@ -651,9 +629,9 @@ impl MaterializedLiveStateExactBatch {
 
     pub(crate) fn filter(
         &self,
-        mut keep: impl FnMut(MaterializedLiveStateRowRef<'_>) -> bool,
+        mut keep: impl FnMut(MaterializedHotStateRowRef<'_>) -> bool,
     ) -> Result<Self, crate::LixError> {
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(self.len());
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(self.len());
         let mut slots = Vec::with_capacity(self.len());
         for index in 0..self.len() {
             let Some(row) = self.row(index).filter(|row| keep(*row)) else {
@@ -677,8 +655,8 @@ impl MaterializedLiveStateExactBatch {
     /// Durable readers normally already produce identity-ordered slots, in
     /// which case this is a zero-copy move of the underlying batch. Sparse or
     /// deduplicated results are compacted with one batch builder rather than a
-    /// `Vec<Option<MaterializedLiveStateRow>>` intermediate.
-    pub(crate) fn into_present_batch(self) -> MaterializedLiveStateBatch {
+    /// `Vec<Option<MaterializedHotStateRow>>` intermediate.
+    pub(crate) fn into_present_batch(self) -> MaterializedHotStateBatch {
         let Self { batch, slots } = self;
         if slots.len() == batch.len()
             && slots
@@ -689,7 +667,7 @@ impl MaterializedLiveStateExactBatch {
             return batch;
         }
 
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(
             slots.iter().filter(|slot| slot.is_some()).count(),
         );
         for ordinal in slots.into_iter().flatten() {
@@ -698,7 +676,7 @@ impl MaterializedLiveStateExactBatch {
         builder.finish()
     }
 
-    pub(crate) fn into_rows(self) -> Vec<Option<MaterializedLiveStateRow>> {
+    pub(crate) fn into_rows(self) -> Vec<Option<MaterializedHotStateRow>> {
         let branch_ids = self.batch.terminal_branch_owners();
         self.slots
             .iter()
@@ -717,10 +695,10 @@ impl MaterializedLiveStateExactBatch {
     }
 }
 
-fn owned_row_dictionary_capacity(rows: &[MaterializedLiveStateRow]) -> (usize, usize) {
+fn owned_row_dictionary_capacity(rows: &[MaterializedHotStateRow]) -> (usize, usize) {
     let mut seen = HashSet::<&str, FastHashBuilder>::with_capacity_and_hasher(
         rows.len().saturating_mul(3),
-        live_state_hash_builder(),
+        fast_hash_builder(),
     );
     let mut bytes = 0_usize;
     for row in rows {
@@ -745,263 +723,16 @@ fn account_dictionary_value<'a>(
     }
 }
 
-const SMALL_DICTIONARY_LOOKUP_LIMIT: usize = 32;
-const SMALL_DICTIONARY_ARENA_BYTES: usize = 1024;
-const NO_DICTIONARY_ORDINAL: u32 = u32::MAX;
-#[cfg(test)]
-const LARGE_DICTIONARY_ALLOCATION_BYTES: usize = 32 * 1024;
-
-type FastHashBuilder = RandomState;
-
-enum LiveStateStringLookup {
-    Small,
-    Hashed(HashMap<u64, u32, FastHashBuilder>),
-}
-
-/// Arena-first interner for the live-state identity dictionaries.
-///
-/// Hash buckets point to an ordinal in `ranges`; `collision_next` links the
-/// remaining entries with the same 64-bit hash. Keys therefore remain stable
-/// across arena growth without retaining one heap allocation per distinct
-/// string.
-struct LiveStateStringDictionaryBuilder {
-    bytes: Vec<u8>,
-    ranges: Vec<Range<u32>>,
-    collision_next: Vec<u32>,
-    lookup: LiveStateStringLookup,
-    hash_builder: FastHashBuilder,
-    expected_entry_capacity: usize,
-    maximum_entry_capacity: usize,
-    max_string_len: usize,
-    exact_byte_capacity: bool,
-    #[cfg(test)]
-    arena_allocation_count: usize,
-    #[cfg(test)]
-    arena_large_allocation_count: usize,
-}
-
-impl LiveStateStringDictionaryBuilder {
-    fn with_capacity(
-        row_capacity: usize,
-        dictionary_entry_capacity: usize,
-        dictionary_byte_capacity: usize,
-        exact_byte_capacity: bool,
-    ) -> Self {
-        let expected_entry_capacity = dictionary_entry_capacity.max(1);
-        Self {
-            bytes: Vec::with_capacity(dictionary_byte_capacity),
-            ranges: Vec::with_capacity(dictionary_entry_capacity),
-            collision_next: Vec::with_capacity(dictionary_entry_capacity),
-            lookup: LiveStateStringLookup::Small,
-            hash_builder: live_state_hash_builder(),
-            expected_entry_capacity,
-            maximum_entry_capacity: row_capacity
-                .saturating_mul(3)
-                .max(dictionary_entry_capacity)
-                .max(1),
-            max_string_len: 0,
-            exact_byte_capacity,
-            #[cfg(test)]
-            arena_allocation_count: usize::from(dictionary_byte_capacity != 0),
-            #[cfg(test)]
-            arena_large_allocation_count: usize::from(
-                dictionary_byte_capacity >= LARGE_DICTIONARY_ALLOCATION_BYTES,
-            ),
-        }
-    }
-
-    fn intern_owned(&mut self, value: String) -> u32 {
-        self.intern(value.as_str())
-    }
-
-    fn intern_ref(&mut self, value: &str) -> u32 {
-        self.intern(value)
-    }
-
-    fn intern(&mut self, value: &str) -> u32 {
-        if !matches!(&self.lookup, LiveStateStringLookup::Small) {
-            return self.intern_hashed(value);
-        }
-        if let Some(ordinal) = self.find_linear(value) {
-            return ordinal;
-        }
-        if self.ranges.len() == SMALL_DICTIONARY_LOOKUP_LIMIT {
-            self.promote_to_hashed(value.len());
-            self.intern_hashed(value)
-        } else {
-            self.append_small(value)
-        }
-    }
-
-    fn find_linear(&self, value: &str) -> Option<u32> {
-        self.ranges
-            .iter()
-            .position(|range| {
-                &self.bytes[range.start as usize..range.end as usize] == value.as_bytes()
-            })
-            .map(|ordinal| {
-                u32::try_from(ordinal).expect("live-state dictionary ordinal exceeds u32")
-            })
-    }
-
-    fn intern_hashed(&mut self, value: &str) -> u32 {
-        let hash = live_state_dictionary_hash(&self.hash_builder, value.as_bytes());
-        let mut candidate = match &self.lookup {
-            LiveStateStringLookup::Small => {
-                unreachable!("hashed dictionary lookup must be promoted first")
-            }
-            LiveStateStringLookup::Hashed(lookup) => lookup.get(&hash).copied(),
-        };
-        while let Some(ordinal) = candidate {
-            if self.value(ordinal) == value {
-                return ordinal;
-            }
-            let next = self.collision_next[ordinal as usize];
-            candidate = (next != NO_DICTIONARY_ORDINAL).then_some(next);
-        }
-        self.append_hashed(value, hash)
-    }
-
-    fn value(&self, ordinal: u32) -> &str {
-        let range = &self.ranges[ordinal as usize];
-        // SAFETY: `append_bytes` receives a `str` and records that complete
-        // value's exact boundaries.
-        unsafe {
-            std::str::from_utf8_unchecked(&self.bytes[range.start as usize..range.end as usize])
-        }
-    }
-
-    fn append_small(&mut self, value: &str) -> u32 {
-        let ordinal = self.append_bytes(value);
-        self.collision_next.push(NO_DICTIONARY_ORDINAL);
-        ordinal
-    }
-
-    fn append_hashed(&mut self, value: &str, hash: u64) -> u32 {
-        let previous_head = match &self.lookup {
-            LiveStateStringLookup::Small => {
-                unreachable!("hashed dictionary insertion must be promoted first")
-            }
-            LiveStateStringLookup::Hashed(lookup) => {
-                lookup.get(&hash).copied().unwrap_or(NO_DICTIONARY_ORDINAL)
-            }
-        };
-        let ordinal = self.append_bytes(value);
-        self.collision_next.push(previous_head);
-        let LiveStateStringLookup::Hashed(lookup) = &mut self.lookup else {
-            unreachable!("hashed dictionary insertion must retain its lookup")
-        };
-        lookup.insert(hash, ordinal);
-        ordinal
-    }
-
-    fn append_bytes(&mut self, value: &str) -> u32 {
-        self.max_string_len = self.max_string_len.max(value.len());
-        let end = self
-            .bytes
-            .len()
-            .checked_add(value.len())
-            .expect("live-state string dictionary byte count overflow");
-        let end_u32 = u32::try_from(end).expect("live-state string dictionary exceeds u32 bytes");
-        self.ensure_arena_capacity(end);
-        let start = u32::try_from(self.bytes.len())
-            .expect("live-state string dictionary start exceeds u32 bytes");
-        self.bytes.extend_from_slice(value.as_bytes());
-        let ordinal =
-            u32::try_from(self.ranges.len()).expect("live-state dictionary exceeds u32 rows");
-        assert_ne!(
-            ordinal, NO_DICTIONARY_ORDINAL,
-            "live-state dictionary reserves the terminal u32 ordinal"
-        );
-        self.ranges.push(start..end_u32);
-        ordinal
-    }
-
-    fn ensure_arena_capacity(&mut self, required: usize) {
-        if required <= self.bytes.capacity() {
-            return;
-        }
-        let projected = match &self.lookup {
-            LiveStateStringLookup::Small => SMALL_DICTIONARY_ARENA_BYTES,
-            LiveStateStringLookup::Hashed(_) => self
-                .maximum_entry_capacity
-                .saturating_mul(self.max_string_len),
-        };
-        let target = required.max(projected);
-        self.bytes.reserve_exact(target - self.bytes.len());
-        #[cfg(test)]
-        {
-            self.arena_allocation_count += 1;
-            self.arena_large_allocation_count +=
-                usize::from(target >= LARGE_DICTIONARY_ALLOCATION_BYTES);
-        }
-    }
-
-    fn promote_to_hashed(&mut self, incoming_len: usize) {
-        self.max_string_len = self.max_string_len.max(incoming_len);
-        let projected_entries = self
-            .expected_entry_capacity
-            .max(self.ranges.len().saturating_add(1));
-        let projected_bytes = projected_entries.saturating_mul(self.max_string_len);
-        if !self.exact_byte_capacity && projected_bytes > self.bytes.capacity() {
-            self.bytes.reserve_exact(projected_bytes - self.bytes.len());
-            #[cfg(test)]
-            {
-                self.arena_allocation_count += 1;
-                self.arena_large_allocation_count +=
-                    usize::from(projected_bytes >= LARGE_DICTIONARY_ALLOCATION_BYTES);
-            }
-        }
-
-        let mut lookup =
-            HashMap::with_capacity_and_hasher(projected_entries, live_state_hash_builder());
-        for ordinal in 0..self.ranges.len() {
-            let ordinal =
-                u32::try_from(ordinal).expect("live-state dictionary ordinal exceeds u32");
-            let hash =
-                live_state_dictionary_hash(&self.hash_builder, self.value(ordinal).as_bytes());
-            self.collision_next[ordinal as usize] = lookup
-                .insert(hash, ordinal)
-                .unwrap_or(NO_DICTIONARY_ORDINAL);
-        }
-        self.lookup = LiveStateStringLookup::Hashed(lookup);
-    }
-
-    fn finish(self) -> LiveStateStringDictionary {
-        debug_assert!(
-            self.ranges
-                .iter()
-                .all(|range| range.start <= range.end && range.end as usize <= self.bytes.len())
-        );
-        LiveStateStringDictionary {
-            bytes: Bytes::from(self.bytes),
-            ranges: self.ranges,
-            #[cfg(test)]
-            arena_allocation_count: self.arena_allocation_count,
-            #[cfg(test)]
-            arena_large_allocation_count: self.arena_large_allocation_count,
-        }
-    }
-}
-
-fn live_state_hash_builder() -> FastHashBuilder {
-    FastHashBuilder::with_seeds(0, 0, 0, 0)
-}
-
-fn live_state_dictionary_hash(hash_builder: &FastHashBuilder, value: &[u8]) -> u64 {
-    hash_builder.hash_one(value)
-}
-
 /// Temporary builder for a columnar materialized batch.
 ///
 /// Distinct identity values are appended directly to one UTF-8 arena. Small
 /// dictionaries use a linear range lookup; larger dictionaries promote to one
 /// hash table whose entries are compact arena ordinals. Finish transfers the
 /// arena into the immutable batch without copying it.
-pub(crate) struct MaterializedLiveStateBatchBuilder {
+pub(crate) struct MaterializedHotStateBatchBuilder {
     singleton_capacity: bool,
-    singleton: Option<Box<MaterializedLiveStateSingleton>>,
-    strings: LiveStateStringDictionaryBuilder,
+    singleton: Option<Box<MaterializedHotStateSingleton>>,
+    strings: StringDictionaryBuilder,
     schema_keys: Vec<SchemaKeyId>,
     file_ids: Vec<Option<FileIdId>>,
     branch_ids: Vec<BranchIdId>,
@@ -1019,7 +750,7 @@ pub(crate) struct MaterializedLiveStateBatchBuilder {
     columnar_base_coordinate: Option<Vec<ColumnarBaseCoordinate>>,
 }
 
-impl MaterializedLiveStateBatchBuilder {
+impl MaterializedHotStateBatchBuilder {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         let dictionary_entry_capacity = if capacity == 0 {
             0
@@ -1053,8 +784,10 @@ impl MaterializedLiveStateBatchBuilder {
         Self {
             singleton_capacity,
             singleton: None,
-            strings: LiveStateStringDictionaryBuilder::with_capacity(
-                column_capacity,
+            strings: StringDictionaryBuilder::with_capacity(
+                // Every row contributes at most a schema key, a file id and a
+                // branch id.
+                column_capacity.saturating_mul(3),
                 if singleton_capacity {
                     0
                 } else {
@@ -1096,12 +829,12 @@ impl MaterializedLiveStateBatchBuilder {
     }
 
     fn intern_ref(&mut self, value: &str) -> u32 {
-        self.strings.intern_ref(value)
+        self.strings.intern(value)
     }
 
-    pub(crate) fn push_owned(&mut self, row: MaterializedLiveStateRow) {
+    pub(crate) fn push_owned(&mut self, row: MaterializedHotStateRow) {
         if self.singleton_capacity && self.singleton.is_none() && self.entity_pks.is_empty() {
-            self.singleton = Some(Box::new(MaterializedLiveStateSingleton {
+            self.singleton = Some(Box::new(MaterializedHotStateSingleton {
                 row,
                 durable_predecessor: None,
                 columnar_base_coordinate: None,
@@ -1127,11 +860,11 @@ impl MaterializedLiveStateBatchBuilder {
 
     fn push_owned_columnar(
         &mut self,
-        row: MaterializedLiveStateRow,
+        row: MaterializedHotStateRow,
         durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
         columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     ) {
-        let MaterializedLiveStateRow {
+        let MaterializedHotStateRow {
             entity_pk,
             schema_key,
             file_id,
@@ -1192,7 +925,7 @@ impl MaterializedLiveStateBatchBuilder {
     ) -> usize {
         let ordinal = self.len();
         if self.singleton_capacity {
-            self.push_owned(MaterializedLiveStateRow {
+            self.push_owned(MaterializedHotStateRow {
                 entity_pk,
                 schema_key,
                 file_id,
@@ -1249,7 +982,7 @@ impl MaterializedLiveStateBatchBuilder {
     ) -> usize {
         let ordinal = self.len();
         if self.singleton_capacity {
-            self.push_owned(MaterializedLiveStateRow {
+            self.push_owned(MaterializedHotStateRow {
                 entity_pk: entity_pk.clone(),
                 schema_key: schema_key.to_owned(),
                 file_id: file_id.map(str::to_owned),
@@ -1289,7 +1022,7 @@ impl MaterializedLiveStateBatchBuilder {
 
     pub(crate) fn push_ref(
         &mut self,
-        row: MaterializedLiveStateRowRef<'_>,
+        row: MaterializedHotStateRowRef<'_>,
         branch_override: Option<&str>,
     ) -> usize {
         let ordinal = self.len();
@@ -1420,8 +1153,8 @@ impl MaterializedLiveStateBatchBuilder {
         })[row] = value;
     }
 
-    pub(crate) fn finish(self) -> MaterializedLiveStateBatch {
-        MaterializedLiveStateBatch {
+    pub(crate) fn finish(self) -> MaterializedHotStateBatch {
+        MaterializedHotStateBatch {
             singleton: self.singleton,
             strings: self.strings.finish(),
             schema_keys: self.schema_keys,
@@ -1443,10 +1176,10 @@ impl MaterializedLiveStateBatchBuilder {
     }
 }
 
-impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
+impl TryFrom<&MaterializedHotStateRow> for MaterializedTrackedStateRow {
     type Error = crate::LixError;
 
-    fn try_from(row: &MaterializedLiveStateRow) -> Result<Self, Self::Error> {
+    fn try_from(row: &MaterializedHotStateRow) -> Result<Self, Self::Error> {
         if row.untracked {
             return Err(crate::LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1513,11 +1246,20 @@ pub(crate) enum ScanOperator {
     },
 }
 
+/// An equality predicate on a column the schema declares as unique or as a
+/// foreign key, addressed by its stable ordinal in the schema's index.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DeclaredColumnEq {
+    pub(crate) schema_key: String,
+    pub(crate) ordinal: u16,
+    pub(crate) value: crate::hot_state::HotIndexValue,
+}
+
 /// Identity-centered filter for visible live entities.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-pub(crate) struct LiveStateFilter {
+pub(crate) struct HotStateFilter {
     #[serde(default)]
-    pub(crate) rows: LiveStateRowFilter,
+    pub(crate) rows: HotStateRowFilter,
     #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
@@ -1530,12 +1272,20 @@ pub(crate) struct LiveStateFilter {
     pub(crate) untracked: Option<bool>,
     #[serde(default)]
     pub(crate) constraints: Vec<ScanConstraint>,
+    /// Equality on a declared column, to be served by the hot index plane.
+    ///
+    /// Resolved into [`Self::entity_pks`] before any scan route is chosen, so
+    /// no route below this ever sees it. The predicate is *not* removed from
+    /// the caller's own filtering when this is set: index entries are
+    /// candidates, so the caller's predicate is what rejects stale ones.
+    #[serde(default)]
+    pub(crate) declared_column_eq: Option<DeclaredColumnEq>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub(crate) enum LiveStateRowFilter {
+pub(crate) enum HotStateRowFilter {
     #[default]
     All,
     None,
@@ -1543,25 +1293,25 @@ pub(crate) enum LiveStateRowFilter {
 
 /// Requested property set for a live-state scan.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-pub(crate) struct LiveStateProjection {
+pub(crate) struct HotStateProjection {
     #[serde(default)]
     pub(crate) columns: Vec<String>,
 }
 
 /// First-principles scan request for engine-owned reads.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-pub(crate) struct LiveStateScanRequest {
+pub(crate) struct HotStateScanRequest {
     #[serde(default)]
-    pub(crate) filter: LiveStateFilter,
+    pub(crate) filter: HotStateFilter,
     #[serde(default)]
-    pub(crate) projection: LiveStateProjection,
+    pub(crate) projection: HotStateProjection,
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
 
 /// Point lookup request for one visible live-state row.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LiveStateRowRequest {
+pub(crate) struct HotStateRowRequest {
     pub(crate) schema_key: String,
     pub(crate) branch_id: String,
     pub(crate) entity_pk: EntityPk,
@@ -1570,11 +1320,11 @@ pub(crate) struct LiveStateRowRequest {
 
 /// One concrete visible-row identity in an exact batch read.
 ///
-/// Unlike [`LiveStateFilter`], the identity fields in this request are
+/// Unlike [`HotStateFilter`], the identity fields in this request are
 /// correlated. Implementations must never expand multiple requests into the
 /// Cartesian product of their schema, entity, and file dimensions.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LiveStateExactRowRequest {
+pub(crate) struct HotStateExactRowRequest {
     pub(crate) schema_key: String,
     pub(crate) branch_id: String,
     pub(crate) entity_pk: EntityPk,
@@ -1587,17 +1337,17 @@ pub(crate) struct LiveStateExactRowRequest {
 /// duplicate result slots and missing or tombstoned identities produce `None`
 /// unless tombstones are explicitly requested.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct LiveStateExactBatchRequest {
-    pub(crate) rows: Vec<LiveStateExactRowRequest>,
-    pub(crate) projection: LiveStateProjection,
+pub(crate) struct HotStateExactBatchRequest {
+    pub(crate) rows: Vec<HotStateExactRowRequest>,
+    pub(crate) projection: HotStateProjection,
     pub(crate) untracked: Option<bool>,
     pub(crate) include_tombstones: bool,
 }
 
-impl LiveStateExactBatchRequest {
-    pub(crate) fn row_scan_request(&self, row: &LiveStateExactRowRequest) -> LiveStateScanRequest {
-        LiveStateScanRequest {
-            filter: LiveStateFilter {
+impl HotStateExactBatchRequest {
+    pub(crate) fn row_scan_request(&self, row: &HotStateExactRowRequest) -> HotStateScanRequest {
+        HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec![row.schema_key.clone()],
                 entity_pks: vec![row.entity_pk.clone()],
                 branch_ids: vec![row.branch_id.clone()],
@@ -1610,7 +1360,7 @@ impl LiveStateExactBatchRequest {
                 ],
                 untracked: self.untracked,
                 include_tombstones: self.include_tombstones,
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
             projection: self.projection.clone(),
             limit: Some(1),
@@ -1623,7 +1373,7 @@ impl LiveStateExactBatchRequest {
 /// Overlay maps own only these references and row ordinals. They never clone
 /// schema, file, branch, or entity-key storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LiveStateRowIdentityRef<'a> {
+pub(crate) struct HotStateRowIdentityRef<'a> {
     pub(crate) branch_id: &'a str,
     pub(crate) schema_key: &'a str,
     pub(crate) entity_pk: &'a EntityPk,
@@ -1634,9 +1384,9 @@ pub(crate) struct LiveStateRowIdentityRef<'a> {
 mod batch_tests {
     use super::*;
 
-    fn row(entity_pk: EntityPk) -> MaterializedLiveStateRow {
+    fn row(entity_pk: EntityPk) -> MaterializedHotStateRow {
         let timestamp = LixTimestamp::expect_parse("batch test timestamp", "2026-01-01T00:00:00Z");
-        MaterializedLiveStateRow {
+        MaterializedHotStateRow {
             entity_pk,
             schema_key: "shared_schema".to_owned(),
             file_id: Some("shared_file".to_owned()),
@@ -1656,7 +1406,7 @@ mod batch_tests {
     #[test]
     fn materialized_batch_stores_repeated_identity_metadata_once() {
         let entity_pk = EntityPk::single("shared_entity");
-        let batch = MaterializedLiveStateBatch::from_rows(
+        let batch = MaterializedHotStateBatch::from_rows(
             (0..10_000).map(|_| row(entity_pk.clone())).collect(),
         );
 
@@ -1682,7 +1432,7 @@ mod batch_tests {
 
     #[test]
     fn one_row_builder_uses_boxed_singleton_storage() {
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(1);
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(1);
         builder.push_owned(row(EntityPk::single("only")));
         builder.set_snapshot_content(0, SharedStr::from_static(r#"{"path":"only"}"#));
         builder.set_metadata(0, SharedStr::from_static(r#"{"source":"test"}"#));
@@ -1707,7 +1457,7 @@ mod batch_tests {
 
     #[test]
     fn singleton_builder_promotes_when_capacity_hint_is_exceeded() {
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(1);
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(1);
         let coordinate = ColumnarBaseCoordinate {
             base_commit_id: CommitId::for_test_label("batch-coordinate-base"),
             group_index: 3,
@@ -1735,7 +1485,7 @@ mod batch_tests {
 
     #[test]
     fn coordinate_free_multi_row_batch_does_not_allocate_coordinate_column() {
-        let batch = MaterializedLiveStateBatch::from_rows(vec![
+        let batch = MaterializedHotStateBatch::from_rows(vec![
             row(EntityPk::single("first")),
             row(EntityPk::single("second")),
             row(EntityPk::single("third")),
@@ -1752,7 +1502,7 @@ mod batch_tests {
 
     #[test]
     fn late_coordinate_allocation_backfills_existing_rows_and_extends_with_none() {
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(4);
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(4);
         builder.push_owned(row(EntityPk::single("first")));
         builder.push_owned(row(EntityPk::single("second")));
         builder.push_owned(row(EntityPk::single("third")));
@@ -1786,7 +1536,7 @@ mod batch_tests {
             SharedStr::from_utf8(payload).expect("snapshot fixture should contain valid UTF-8"),
         );
         let snapshots =
-            MaterializedLiveStateBatch::from_rows(vec![source]).into_identity_ordered_snapshots();
+            MaterializedHotStateBatch::from_rows(vec![source]).into_identity_ordered_snapshots();
 
         let snapshot = snapshots[0].as_ref().expect("snapshot should be present");
         assert_eq!(snapshot.as_ptr(), payload_ptr);
@@ -1800,7 +1550,7 @@ mod batch_tests {
         let mut first = row(EntityPk::single("a"));
         first.snapshot_content = Some(SharedStr::from_static(r#"{"path":"a"}"#));
 
-        let snapshots = MaterializedLiveStateBatch::from_rows(vec![second, first])
+        let snapshots = MaterializedHotStateBatch::from_rows(vec![second, first])
             .into_identity_ordered_snapshots();
 
         assert_eq!(snapshots[0].as_deref(), Some(br#"{"path":"a"}"#.as_slice()));
@@ -1822,7 +1572,7 @@ mod batch_tests {
             .map(|row| row.file_id.as_deref().expect("file id").len())
             .sum::<usize>();
 
-        let batch = MaterializedLiveStateBatch::from_rows(rows);
+        let batch = MaterializedHotStateBatch::from_rows(rows);
 
         assert_eq!(batch.len(), 10_000);
         assert_eq!(batch.dictionary_entry_count(), 10_002);
@@ -1862,7 +1612,7 @@ mod batch_tests {
     fn materialized_builder_promotes_once_for_10k_distinct_file_ids() {
         let timestamp = LixTimestamp::expect_parse("batch test timestamp", "2026-01-01T00:00:00Z");
         let entity_pk = EntityPk::single("shared_entity");
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(10_000);
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(10_000);
         for index in 0..10_000 {
             let file_id = format!("file-{index:08}");
             builder.push_materialized_ref(
@@ -1901,7 +1651,7 @@ mod batch_tests {
     #[test]
     fn rebatching_borrowed_rows_does_not_retain_per_row_identity_strings() {
         let entity_pk = EntityPk::single("shared_entity");
-        let batch = MaterializedLiveStateBatch::from_rows(
+        let batch = MaterializedHotStateBatch::from_rows(
             (0..10_000).map(|_| row(entity_pk.clone())).collect(),
         );
         let filtered = batch.filter(|_| true, None);
@@ -1920,7 +1670,7 @@ mod batch_tests {
 
     #[test]
     fn filtering_with_a_zero_limit_returns_no_rows() {
-        let batch = MaterializedLiveStateBatch::from_rows(vec![
+        let batch = MaterializedHotStateBatch::from_rows(vec![
             row(EntityPk::single("first")),
             row(EntityPk::single("second")),
         ]);
@@ -1934,12 +1684,12 @@ mod batch_tests {
 
     #[test]
     fn exact_present_batch_moves_identity_ordered_owner_without_rebatching() {
-        let batch = MaterializedLiveStateBatch::from_rows(vec![
+        let batch = MaterializedHotStateBatch::from_rows(vec![
             row(EntityPk::single("first")),
             row(EntityPk::single("second")),
         ]);
         let entity_column = batch.entity_column_ptr();
-        let exact = MaterializedLiveStateExactBatch::new(batch, vec![Some(0), Some(1)])
+        let exact = MaterializedHotStateExactBatch::new(batch, vec![Some(0), Some(1)])
             .expect("identity slots should be valid");
 
         let present = exact.into_present_batch();
@@ -1965,12 +1715,12 @@ mod batch_tests {
 
     #[test]
     fn exact_present_batch_compacts_sparse_slots_in_request_order() {
-        let batch = MaterializedLiveStateBatch::from_rows(vec![
+        let batch = MaterializedHotStateBatch::from_rows(vec![
             row(EntityPk::single("first")),
             row(EntityPk::single("second")),
         ]);
         let exact =
-            MaterializedLiveStateExactBatch::new(batch, vec![Some(1), None, Some(0), Some(1)])
+            MaterializedHotStateExactBatch::new(batch, vec![Some(1), None, Some(0), Some(1)])
                 .expect("sparse slots should be valid");
 
         let present = exact.into_present_batch();

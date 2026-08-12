@@ -12,12 +12,12 @@ use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
 };
-use crate::live_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
-use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReadDomain, LiveStateReader, LiveStateRowFilter,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
-    MaterializedLiveStateRowRef, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
+use crate::hot_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
+use crate::hot_state::{
+    HotStateExactBatchRequest, HotStateReadDomain, HotStateReader, HotStateRowFilter,
+    HotStateRowRequest, HotStateScanRequest, MaterializedHotStateBatch,
+    MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch, MaterializedHotStateRow,
+    MaterializedHotStateRowRef, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
     resolve_visible_batch,
 };
 use crate::storage_adapter::StorageAdapterRead;
@@ -90,7 +90,7 @@ struct CachedEntityColumnarLayout {
     id: crate::columnar_row_group::RowGroupSetId,
     manifest: std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
     manifest_digest: [u8; 32],
-    overlay: std::sync::Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
+    overlay: std::sync::Arc<Vec<crate::hot_state::EntityColumnarOverlayRow>>,
     head_commit_id: CommitId,
     live_count: u64,
     bytes: usize,
@@ -125,7 +125,7 @@ impl EntityColumnarLayoutCache {
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
-        overlay: Vec<crate::live_state::EntityColumnarOverlayRow>,
+        overlay: Vec<crate::hot_state::EntityColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
     ) -> std::sync::Arc<CachedEntityColumnarLayout> {
@@ -148,7 +148,7 @@ impl EntityColumnarLayoutCache {
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
-        overlay: Vec<crate::live_state::EntityColumnarOverlayRow>,
+        overlay: Vec<crate::hot_state::EntityColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
         max_bytes: usize,
@@ -199,7 +199,7 @@ impl EntityColumnarLayoutCache {
 fn estimated_entity_columnar_layout_bytes(
     key: &EntityColumnarLayoutCacheKey,
     manifest: &crate::columnar_row_group::RowGroupManifest,
-    overlay: &[crate::live_state::EntityColumnarOverlayRow],
+    overlay: &[crate::hot_state::EntityColumnarOverlayRow],
     overlay_capacity: usize,
 ) -> usize {
     let manifest_bytes = size_of::<crate::columnar_row_group::RowGroupManifest>()
@@ -210,7 +210,7 @@ fn estimated_entity_columnar_layout_bytes(
         .saturating_add(manifest_bytes)
         .saturating_add(
             overlay_capacity
-                .saturating_mul(size_of::<crate::live_state::EntityColumnarOverlayRow>()),
+                .saturating_mul(size_of::<crate::hot_state::EntityColumnarOverlayRow>()),
         )
         .saturating_add(
             overlay
@@ -298,24 +298,24 @@ const fn entity_point_snapshot_cache_disabled_for_profile() -> bool {
 /// Normal rows are resolved from one durable hot-state projection. Each row
 /// carries its own tracked|untracked retention, so readers do not route
 /// through a separate retention index or merge retention candidates.
-pub(crate) struct LiveStateContext {
+pub(crate) struct HotStateContext {
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
     entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
     entity_columnar_layout_cache: std::sync::Arc<EntityColumnarLayoutCache>,
     entity_columnar_scan_cache:
-        std::sync::Arc<std::sync::Mutex<crate::live_state::EntityColumnarShadowMaskCache>>,
-    entity_decoded_column_cache: crate::live_state::EntityDecodedColumnCache,
+        std::sync::Arc<std::sync::Mutex<crate::hot_state::EntityColumnarShadowMaskCache>>,
+    entity_decoded_column_cache: crate::hot_state::EntityDecodedColumnCache,
 }
 
-impl LiveStateContext {
+impl HotStateContext {
     pub(crate) fn new(
         _tracked_state: TrackedStateContext,
         commit_graph: CommitGraphContext,
     ) -> Self {
         let entity_columnar_array_budget =
-            std::sync::Arc::new(crate::live_state::EntityColumnarArrayBudget::default());
+            std::sync::Arc::new(crate::hot_state::EntityColumnarArrayBudget::default());
         Self {
             tracked_head: TrackedHeadContext::new(),
             commit_graph,
@@ -323,12 +323,12 @@ impl LiveStateContext {
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
             entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
             entity_columnar_scan_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::live_state::EntityColumnarShadowMaskCache::with_array_budget(
+                crate::hot_state::EntityColumnarShadowMaskCache::with_array_budget(
                     std::sync::Arc::clone(&entity_columnar_array_budget),
                 ),
             )),
             entity_decoded_column_cache:
-                crate::live_state::EntityDecodedColumnCache::with_array_budget(
+                crate::hot_state::EntityDecodedColumnCache::with_array_budget(
                     entity_columnar_array_budget,
                 ),
         }
@@ -336,22 +336,22 @@ impl LiveStateContext {
 
     pub(crate) fn entity_columnar_scan_cache(
         &self,
-    ) -> std::sync::Arc<std::sync::Mutex<crate::live_state::EntityColumnarShadowMaskCache>> {
+    ) -> std::sync::Arc<std::sync::Mutex<crate::hot_state::EntityColumnarShadowMaskCache>> {
         std::sync::Arc::clone(&self.entity_columnar_scan_cache)
     }
 
     pub(crate) fn entity_decoded_column_cache(
         &self,
-    ) -> crate::live_state::EntityDecodedColumnCache {
+    ) -> crate::hot_state::EntityDecodedColumnCache {
         self.entity_decoded_column_cache.clone()
     }
 
     /// Creates a visible live-state reader over a caller-provided KV store.
-    pub(crate) fn reader<S>(&self, store: S) -> LiveStateStoreReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> HotStateContextReader<S>
     where
         S: StorageAdapterRead,
     {
-        LiveStateStoreReader {
+        HotStateContextReader {
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
@@ -368,11 +368,11 @@ impl LiveStateContext {
         &self,
         store: S,
         branch_head_control_cache: std::sync::Arc<BranchHeadControlCache>,
-    ) -> LiveStateStoreReader<S>
+    ) -> HotStateContextReader<S>
     where
         S: StorageAdapterRead,
     {
-        LiveStateStoreReader {
+        HotStateContextReader {
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
@@ -386,11 +386,11 @@ impl LiveStateContext {
     /// Creates a reader whose derived indexes are private to one retained
     /// storage snapshot. Process-wide caches intentionally advance with live
     /// commits and therefore cannot serve an older explicit transaction.
-    pub(crate) fn snapshot_reader<S>(&self, store: S) -> LiveStateStoreReader<S>
+    pub(crate) fn snapshot_reader<S>(&self, store: S) -> HotStateContextReader<S>
     where
         S: StorageAdapterRead,
     {
-        LiveStateStoreReader {
+        HotStateContextReader {
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
@@ -405,7 +405,7 @@ impl LiveStateContext {
         &self,
         previous_revision: Option<&[u8]>,
         next_revision: Option<&[u8]>,
-        rows: &[MaterializedLiveStateRow],
+        rows: &[MaterializedHotStateRow],
     ) {
         self.filesystem_path_index_cache
             .advance_committed(previous_revision, next_revision, rows);
@@ -413,7 +413,7 @@ impl LiveStateContext {
 }
 
 /// Visible live-state reader backed by a caller-provided KV store.
-pub(crate) struct LiveStateStoreReader<S> {
+pub(crate) struct HotStateContextReader<S> {
     store: S,
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
@@ -423,7 +423,7 @@ pub(crate) struct LiveStateStoreReader<S> {
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
 }
 
-impl<S> LiveStateStoreReader<S>
+impl<S> HotStateContextReader<S>
 where
     S: StorageAdapterRead,
 {
@@ -431,7 +431,7 @@ where
         &self,
         branch_id: &str,
         schema_key: &str,
-    ) -> Result<Option<crate::live_state::PackedIdentityMembership>, LixError> {
+    ) -> Result<Option<crate::hot_state::PackedIdentityMembership>, LixError> {
         let Some(cache) = self.branch_head_control_cache.as_ref() else {
             return Ok(None);
         };
@@ -455,7 +455,7 @@ where
     /// semantics.
     pub(crate) async fn scan_direct_entity_snapshots(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
         let Some((requested_branch_id, requested_control, schema_key)) =
             self.direct_entity_snapshot_scope(request).await?
@@ -506,7 +506,7 @@ where
     /// decoding only when their projected SQL fields are exact key components.
     pub(crate) async fn scan_direct_entity_primary_keys(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
         let Some((branch_id, control, schema_key)) =
             self.direct_entity_snapshot_scope(request).await?
@@ -528,13 +528,13 @@ where
 
     pub(crate) async fn plan_direct_entity_columnar_scan(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
     ) -> Result<
         Option<(
             crate::columnar_row_group::RowGroupSetId,
             std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
             [u8; 32],
-            std::sync::Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
+            std::sync::Arc<Vec<crate::hot_state::EntityColumnarOverlayRow>>,
             String,
             CommitId,
             u64,
@@ -544,7 +544,7 @@ where
     > {
         if !request.filter.entity_pks.is_empty()
             || request.limit.is_some()
-            || !matches!(request.filter.rows, LiveStateRowFilter::All)
+            || !matches!(request.filter.rows, HotStateRowFilter::All)
             || request.filter.include_tombstones
             || request.filter.untracked.is_some()
             || !request.filter.file_ids.is_empty()
@@ -628,7 +628,7 @@ where
 
     async fn direct_entity_snapshot_scope(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
     ) -> Result<Option<(String, BranchHeadControl, String)>, LixError> {
         // The hot index carries tracked and untracked rows in one serving
         // plane, so this route never probes a separate retention index.
@@ -676,16 +676,16 @@ where
 
     pub(crate) async fn scan_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         self.scan_batch_with_schema_presence(request, false).await
     }
 
     async fn scan_batch_with_schema_presence(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
         skip_proven_empty_schema: bool,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         let store = &self.store;
         let reads_tracked = !is_derived_only_request(request);
         let scope = scan_scope(
@@ -696,12 +696,24 @@ where
         )
         .await?;
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
-            return Ok(MaterializedLiveStateBatch::default());
+            return Ok(MaterializedHotStateBatch::default());
         }
+        // Resolve a declared-column equality through the index plane before any
+        // route is chosen, so every route below sees an ordinary entity-pk
+        // request. Candidates are not answers: the caller keeps its own
+        // predicate and rejects stale ones.
+        let resolved;
+        let request = match self.resolve_declared_column_eq(request, &scope).await? {
+            Some(rewritten) => {
+                resolved = rewritten;
+                &resolved
+            }
+            None => request,
+        };
         if let Some(rows) = self.scan_direct_entity_pk_batch(request, &scope).await? {
             return Ok(rows);
         }
-        let derived_rows = MaterializedLiveStateBatch::from_rows(
+        let derived_rows = MaterializedHotStateBatch::from_rows(
             scan_derived_rows(
                 store,
                 &self.commit_graph,
@@ -739,7 +751,7 @@ where
                 request.limit,
             ));
         }
-        let rows = concat_live_state_batches(
+        let rows = concat_hot_state_batches(
             std::iter::once(derived_rows).chain(
                 hot_branch_rows
                     .into_iter()
@@ -748,7 +760,7 @@ where
         );
         Ok(resolve_visible_batch(
             rows,
-            MaterializedLiveStateBatch::default(),
+            MaterializedHotStateBatch::default(),
             &VisibilityRequest {
                 branch_scope: VisibilityBranchScope::BranchIds {
                     branch_ids: scope.projection_branch_ids.clone(),
@@ -759,27 +771,94 @@ where
         ))
     }
 
+    /// Rewrites a declared-column equality into an entity-pk request.
+    ///
+    /// Returns `None` when the predicate cannot be served — no predicate, more
+    /// than one branch in scope, or no completeness witness for the collection
+    /// — in which case the caller's ordinary scan runs unchanged and still
+    /// produces correct rows, only slower.
+    ///
+    /// An empty candidate set becomes `HotStateRowFilter::None`, never an
+    /// empty `entity_pks` list: an empty list means "no identity filter" and
+    /// would silently widen the scan to the whole collection.
+    async fn resolve_declared_column_eq(
+        &self,
+        request: &HotStateScanRequest,
+        scope: &HotStateScanScope,
+    ) -> Result<Option<HotStateScanRequest>, LixError> {
+        let Some(predicate) = request.filter.declared_column_eq.as_ref() else {
+            return Ok(None);
+        };
+        if !request.filter.entity_pks.is_empty() {
+            let mut rewritten = request.clone();
+            rewritten.filter.declared_column_eq = None;
+            return Ok(Some(rewritten));
+        }
+        let mut rewritten = request.clone();
+        rewritten.filter.declared_column_eq = None;
+        // Every branch in scope must be witnessed. A branch whose index is
+        // incomplete would contribute no candidates and silently drop its
+        // rows, which is the false negative this design cannot have — so one
+        // unwitnessed branch sends the whole read back to the scan.
+        let mut unique = std::collections::BTreeSet::new();
+        for branch_id in &scope.storage_branch_ids {
+            let Some(control) = scope.branch_heads.get(branch_id).copied() else {
+                return Ok(Some(rewritten));
+            };
+            // A branch the control proves holds no row of this schema
+            // contributes no candidates, so it needs no witness. The bloom has
+            // no false negatives, so this skip cannot hide a row. Without it a
+            // branch that never stores the schema — the global branch, for
+            // every ordinary user collection — would be permanently
+            // unwitnessed and would veto the index for everyone.
+            if !control.may_have_schema(&predicate.schema_key) {
+                continue;
+            }
+            let Some(candidates) = self
+                .tracked_head
+                .reader(&self.store)
+                .scan_hot_index_candidates(
+                    branch_id,
+                    control.tracked_generation,
+                    &predicate.schema_key,
+                    predicate.ordinal,
+                    &predicate.value,
+                )
+                .await?
+            else {
+                return Ok(Some(rewritten));
+            };
+            unique.extend(candidates);
+        }
+        if unique.is_empty() {
+            rewritten.filter.rows = HotStateRowFilter::None;
+        } else {
+            rewritten.filter.entity_pks = unique.into_iter().collect();
+        }
+        Ok(Some(rewritten))
+    }
+
     /// Serves finite entity-PK scans from the hot current-state index. Every
     /// row already has its retention tag, so an unrelated untracked row
     /// cannot route selected tracked identities through a separate scan.
     #[cfg(test)]
     async fn scan_direct_entity_pk_rows(
         &self,
-        request: &LiveStateScanRequest,
-        scope: &LiveStateScanScope,
-    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        request: &HotStateScanRequest,
+        scope: &HotStateScanScope,
+    ) -> Result<Option<Vec<MaterializedHotStateRow>>, LixError> {
         Ok(self
             .scan_direct_entity_pk_batch(request, scope)
             .await?
-            .map(MaterializedLiveStateBatch::into_rows))
+            .map(MaterializedHotStateBatch::into_rows))
     }
 
     async fn scan_direct_entity_pk_batch(
         &self,
-        request: &LiveStateScanRequest,
-        scope: &LiveStateScanScope,
-    ) -> Result<Option<MaterializedLiveStateBatch>, LixError> {
-        if !matches!(request.filter.rows, LiveStateRowFilter::All)
+        request: &HotStateScanRequest,
+        scope: &HotStateScanScope,
+    ) -> Result<Option<MaterializedHotStateBatch>, LixError> {
+        if !matches!(request.filter.rows, HotStateRowFilter::All)
             || request.filter.branch_ids.is_empty()
             || request.filter.schema_keys.is_empty()
             || request.filter.entity_pks.is_empty()
@@ -821,7 +900,7 @@ where
             });
         }
         if controls.is_empty() {
-            return Ok(Some(MaterializedLiveStateBatch::default()));
+            return Ok(Some(MaterializedHotStateBatch::default()));
         }
         let tracked_request = tracked_scan_request_from_live(request);
         let tracked_head = self.branch_head_control_cache.as_ref().map_or_else(
@@ -834,14 +913,14 @@ where
         let rows_by_branch = tracked_head
             .scan_live_batches_for_controls(&controls, &tracked_request, request.filter.untracked)
             .await?;
-        let rows = concat_live_state_batches(
+        let rows = concat_hot_state_batches(
             rows_by_branch
                 .into_iter()
                 .map(|(_, rows)| filter_current_row_retention(rows, request.filter.untracked)),
         );
         Ok(Some(resolve_visible_batch(
             rows,
-            MaterializedLiveStateBatch::default(),
+            MaterializedHotStateBatch::default(),
             &VisibilityRequest {
                 branch_scope: VisibilityBranchScope::BranchIds {
                     branch_ids: scope.projection_branch_ids.clone(),
@@ -854,11 +933,11 @@ where
 
     pub(crate) async fn load_row(
         &self,
-        request: &LiveStateRowRequest,
-    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+        request: &HotStateRowRequest,
+    ) -> Result<Option<MaterializedHotStateRow>, LixError> {
         let rows = self
-            .scan_batch(&LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
+            .scan_batch(&HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
                     entity_pks: vec![request.entity_pk.clone()],
                     branch_ids: vec![request.branch_id.clone()],
@@ -870,15 +949,15 @@ where
                 ..Default::default()
             })
             .await?;
-        Ok(rows.get(0).map(MaterializedLiveStateRowRef::to_owned))
+        Ok(rows.get(0).map(MaterializedHotStateRowRef::to_owned))
     }
 
     pub(crate) async fn load_exact_batch(
         &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         if request.rows.is_empty() {
-            return Ok(MaterializedLiveStateExactBatch::default());
+            return Ok(MaterializedHotStateExactBatch::default());
         }
         // Derived rows are synthesized rather than stored under the
         // requested identity. Preserve their exact scan semantics without
@@ -888,7 +967,7 @@ where
             .iter()
             .any(|row| is_derived_schema(&row.schema_key))
         {
-            let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+            let mut builder = MaterializedHotStateBatchBuilder::with_capacity(request.rows.len());
             let mut slots = Vec::with_capacity(request.rows.len());
             for row in &request.rows {
                 let rows = self.scan_batch(&request.row_scan_request(row)).await?;
@@ -904,7 +983,7 @@ where
                     None
                 });
             }
-            return MaterializedLiveStateExactBatch::new(builder.finish(), slots);
+            return MaterializedHotStateExactBatch::new(builder.finish(), slots);
         }
 
         let branch_ids = request
@@ -914,8 +993,8 @@ where
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let scope_request = LiveStateScanRequest {
-            filter: crate::live_state::LiveStateFilter {
+        let scope_request = HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
                 branch_ids,
                 untracked: request.untracked,
                 ..Default::default()
@@ -945,14 +1024,14 @@ where
             if !visible_branch_ids.contains(&row.branch_id) {
                 continue;
             }
-            storage_identities.push(crate::live_state::LiveStateRowIdentityRef {
+            storage_identities.push(crate::hot_state::HotStateRowIdentityRef {
                 branch_id: row.branch_id.as_str(),
                 schema_key: row.schema_key.as_str(),
                 entity_pk: &row.entity_pk,
                 file_id: row.file_id.as_deref(),
             });
             if row.branch_id != GLOBAL_BRANCH_ID {
-                storage_identities.push(crate::live_state::LiveStateRowIdentityRef {
+                storage_identities.push(crate::hot_state::HotStateRowIdentityRef {
                     branch_id: GLOBAL_BRANCH_ID,
                     schema_key: row.schema_key.as_str(),
                     entity_pk: &row.entity_pk,
@@ -996,11 +1075,11 @@ where
                     let domain =
                         request
                             .untracked
-                            .map_or(LiveStateReadDomain::Combined, |untracked| {
+                            .map_or(HotStateReadDomain::Combined, |untracked| {
                                 if untracked {
-                                    LiveStateReadDomain::Untracked
+                                    HotStateReadDomain::Untracked
                                 } else {
-                                    LiveStateReadDomain::Tracked
+                                    HotStateReadDomain::Tracked
                                 }
                             });
                     let rows = self
@@ -1034,20 +1113,20 @@ where
         // ordered. Keep the assertion close to the binary-search contract.
         debug_assert!(candidate_slots.windows(2).all(|pair| pair[0].0 < pair[1].0));
 
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(request.rows.len());
         let mut slots = Vec::with_capacity(request.rows.len());
         for requested in &request.rows {
             if !visible_branch_ids.contains(&requested.branch_id) {
                 slots.push(None);
                 continue;
             }
-            let branch_identity = crate::live_state::LiveStateRowIdentityRef {
+            let branch_identity = crate::hot_state::HotStateRowIdentityRef {
                 branch_id: requested.branch_id.as_str(),
                 schema_key: requested.schema_key.as_str(),
                 entity_pk: &requested.entity_pk,
                 file_id: requested.file_id.as_deref(),
             };
-            let global_identity = crate::live_state::LiveStateRowIdentityRef {
+            let global_identity = crate::hot_state::HotStateRowIdentityRef {
                 branch_id: GLOBAL_BRANCH_ID,
                 ..branch_identity
             };
@@ -1089,22 +1168,22 @@ where
                 })?,
             ));
         }
-        MaterializedLiveStateExactBatch::new(builder.finish(), slots)
+        MaterializedHotStateExactBatch::new(builder.finish(), slots)
     }
 
     pub(crate) async fn scan_tracked_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         self.scan_tracked_batch_with_schema_presence(request, false)
             .await
     }
 
     async fn scan_tracked_batch_with_schema_presence(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
         skip_proven_empty_schema: bool,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         let store = &self.store;
         let reads_tracked = !is_derived_only_request(request);
         let scope = scan_scope(
@@ -1115,9 +1194,23 @@ where
         )
         .await?;
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
-            return Ok(MaterializedLiveStateBatch::default());
+            return Ok(MaterializedHotStateBatch::default());
         }
-        let derived_rows = MaterializedLiveStateBatch::from_rows(
+        // The tracked domain is the constraint validator's route, and
+        // `validate_committed_unique_constraints` reaches it with an equality
+        // on a declared column. Resolving it here is the same access-path
+        // choice the combined route already makes, and it is what stops an
+        // insert into an `x-lix-unique` collection from scanning that
+        // collection.
+        let resolved;
+        let request = match self.resolve_declared_column_eq(request, &scope).await? {
+            Some(rewritten) => {
+                resolved = rewritten;
+                &resolved
+            }
+            None => request,
+        };
+        let derived_rows = MaterializedHotStateBatch::from_rows(
             scan_derived_rows(
                 store,
                 &self.commit_graph,
@@ -1147,7 +1240,7 @@ where
                 request.limit,
             ));
         }
-        let rows = concat_live_state_batches(
+        let rows = concat_hot_state_batches(
             std::iter::once(derived_rows).chain(
                 hot_branch_rows
                     .into_iter()
@@ -1156,7 +1249,7 @@ where
         );
         Ok(resolve_visible_batch(
             rows,
-            MaterializedLiveStateBatch::default(),
+            MaterializedHotStateBatch::default(),
             &VisibilityRequest {
                 branch_scope: VisibilityBranchScope::BranchIds {
                     branch_ids: scope.projection_branch_ids,
@@ -1169,9 +1262,17 @@ where
 
     async fn scan_hot_branch_rows(
         &self,
-        request: &LiveStateScanRequest,
-        scope: &LiveStateScanScope,
+        request: &HotStateScanRequest,
+        scope: &HotStateScanScope,
     ) -> Result<Vec<HotBranchRows>, LixError> {
+        // `HotStateRowFilter::None` means "no identity can match", which is
+        // exactly what an index probe with no candidates produces. The tracked
+        // request below carries only `entity_pks`, where an empty list means
+        // "no identity filter" — the opposite — so the empty case has to be
+        // answered before the request is lowered.
+        if matches!(request.filter.rows, HotStateRowFilter::None) {
+            return Ok(Vec::new());
+        }
         let store = &self.store;
         let tracked_request = tracked_scan_request_from_live(request);
         let branches = scope
@@ -1213,15 +1314,15 @@ where
 }
 
 #[async_trait]
-impl<S> LiveStateReader for LiveStateStoreReader<S>
+impl<S> HotStateReader for HotStateContextReader<S>
 where
     S: StorageAdapterRead,
 {
     async fn scan_constraint_batch(
         &self,
-        request: &LiveStateScanRequest,
+        request: &HotStateScanRequest,
         tracked_only: bool,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         if tracked_only {
             self.scan_tracked_batch_with_schema_presence(request, true)
                 .await
@@ -1236,15 +1337,15 @@ where
 
     async fn scan_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         Self::scan_batch(self, request).await
     }
 
     async fn load_exact_batch(
         &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         Self::load_exact_batch(self, request).await
     }
 
@@ -1271,14 +1372,14 @@ where
 
     async fn scan_tracked_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         Self::scan_tracked_batch(self, request).await
     }
 }
 
 #[async_trait]
-impl<S> FilesystemPathIndexReader for LiveStateStoreReader<S>
+impl<S> FilesystemPathIndexReader for HotStateContextReader<S>
 where
     S: StorageAdapterRead + Send + Sync,
 {
@@ -1308,7 +1409,7 @@ where
     }
 }
 
-fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStateScanRequest {
+fn tracked_scan_request_from_live(request: &HotStateScanRequest) -> TrackedStateScanRequest {
     TrackedStateScanRequest {
         filter: TrackedStateFilter {
             schema_keys: request.filter.schema_keys.clone(),
@@ -1326,7 +1427,7 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveStateScanScope {
+struct HotStateScanScope {
     storage_branch_ids: Vec<String>,
     projection_branch_ids: Vec<String>,
     branch_heads: BranchHeads,
@@ -1338,7 +1439,7 @@ struct LiveStateScanScope {
 /// and has one row per identity.
 struct HotBranchRows {
     branch_id: String,
-    rows: MaterializedLiveStateBatch,
+    rows: MaterializedHotStateBatch,
     ordered_unique: bool,
 }
 
@@ -1371,10 +1472,10 @@ fn ordered_unique_branch_row_index(
 /// sole requested branch. This intentionally does no identity sort or
 /// deduplication; the tracked-head key codec proves both properties.
 fn finalize_ordered_unique_batch(
-    rows: MaterializedLiveStateBatch,
+    rows: MaterializedHotStateBatch,
     include_tombstones: bool,
     limit: Option<usize>,
-) -> MaterializedLiveStateBatch {
+) -> MaterializedHotStateBatch {
     if limit.is_none_or(|limit| limit >= rows.len())
         && (include_tombstones || !rows.iter().any(|row| row.deleted()))
     {
@@ -1384,16 +1485,16 @@ fn finalize_ordered_unique_batch(
 }
 
 fn current_row_matches_retention(
-    row: MaterializedLiveStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     requested_untracked: Option<bool>,
 ) -> bool {
     requested_untracked.is_none_or(|untracked| row.untracked() == untracked)
 }
 
 fn filter_current_row_retention(
-    rows: MaterializedLiveStateBatch,
+    rows: MaterializedHotStateBatch,
     requested_untracked: Option<bool>,
-) -> MaterializedLiveStateBatch {
+) -> MaterializedHotStateBatch {
     if requested_untracked.is_none()
         || rows
             .iter()
@@ -1407,20 +1508,20 @@ fn filter_current_row_retention(
     )
 }
 
-fn concat_live_state_batches(
-    batches: impl IntoIterator<Item = MaterializedLiveStateBatch>,
-) -> MaterializedLiveStateBatch {
+fn concat_hot_state_batches(
+    batches: impl IntoIterator<Item = MaterializedHotStateBatch>,
+) -> MaterializedHotStateBatch {
     let mut incoming = batches.into_iter().filter(|batch| !batch.is_empty());
     let Some(first) = incoming.next() else {
-        return MaterializedLiveStateBatch::default();
+        return MaterializedHotStateBatch::default();
     };
     let Some(second) = incoming.next() else {
         return first;
     };
     let mut batches = vec![first, second];
     batches.extend(incoming);
-    let capacity = batches.iter().map(MaterializedLiveStateBatch::len).sum();
-    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(capacity);
+    let capacity = batches.iter().map(MaterializedHotStateBatch::len).sum();
+    let mut builder = MaterializedHotStateBatchBuilder::with_capacity(capacity);
     for batch in &batches {
         for row in batch.iter() {
             builder.push_ref(row, None);
@@ -1438,7 +1539,7 @@ fn concat_live_state_batches(
 /// untracked rows as well: every untracked publication notes its schema keys
 /// on the same control. An explicit retention filter therefore needs no
 /// escape hatch here.
-fn scope_may_have_schema_rows(request: &LiveStateScanRequest, scope: &LiveStateScanScope) -> bool {
+fn scope_may_have_schema_rows(request: &HotStateScanRequest, scope: &HotStateScanScope) -> bool {
     let [schema_key] = request.filter.schema_keys.as_slice() else {
         return true;
     };
@@ -1455,20 +1556,20 @@ fn scope_may_have_schema_rows(request: &LiveStateScanRequest, scope: &LiveStateS
 
 async fn scan_scope(
     store: &(impl StorageAdapterRead + ?Sized),
-    request: &LiveStateScanRequest,
+    request: &HotStateScanRequest,
     resolve_branch_heads: bool,
     branch_head_control_cache: Option<&BranchHeadControlCache>,
-) -> Result<LiveStateScanScope, LixError> {
+) -> Result<HotStateScanScope, LixError> {
     if request.filter.branch_ids.is_empty() {
         if resolve_branch_heads {
             let branch_heads = load_branch_head_controls(store, &[], None).await?;
-            return Ok(LiveStateScanScope {
+            return Ok(HotStateScanScope {
                 storage_branch_ids: branch_heads.keys().cloned().collect(),
                 projection_branch_ids: Vec::new(),
                 branch_heads,
             });
         }
-        return Ok(LiveStateScanScope {
+        return Ok(HotStateScanScope {
             storage_branch_ids: all_branch_head_control_ids(store).await?,
             projection_branch_ids: Vec::new(),
             branch_heads: BranchHeads::new(),
@@ -1488,7 +1589,7 @@ async fn scan_scope(
             .cloned()
             .collect::<Vec<_>>();
         let storage_branch_ids = expanded_branch_ids(&projection_branch_ids);
-        return Ok(LiveStateScanScope {
+        return Ok(HotStateScanScope {
             storage_branch_ids,
             projection_branch_ids,
             branch_heads,
@@ -1508,7 +1609,7 @@ async fn scan_scope(
         .collect::<Vec<_>>();
 
     let storage_branch_ids = expanded_branch_ids(&projection_branch_ids);
-    Ok(LiveStateScanScope {
+    Ok(HotStateScanScope {
         storage_branch_ids,
         projection_branch_ids,
         branch_heads: BranchHeads::new(),
@@ -1625,9 +1726,9 @@ mod tests {
     };
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-    use crate::live_state::{
-        CurrentStateDeltaRef, LiveStateExactBatchRequest, LiveStateExactRowRequest,
-        LiveStateFilter, LiveStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
+    use crate::hot_state::{
+        CurrentStateDeltaRef, HotStateExactBatchRequest, HotStateExactRowRequest,
+        HotStateFilter, HotStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
@@ -1744,8 +1845,8 @@ mod tests {
         ChangeId::for_test_label(label)
     }
 
-    fn live_state_context() -> LiveStateContext {
-        LiveStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
+    fn hot_state_context() -> HotStateContext {
+        HotStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
     }
 
     async fn stage_direct_entity_head(
@@ -1855,29 +1956,29 @@ mod tests {
         branch_id: &str,
         schema_key: &str,
         entity_pks: Vec<EntityPk>,
-    ) -> LiveStateScanRequest {
-        LiveStateScanRequest {
-            filter: LiveStateFilter {
+    ) -> HotStateScanRequest {
+        HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec![schema_key.to_string()],
                 entity_pks,
                 branch_ids: vec![branch_id.to_string()],
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
-            ..LiveStateScanRequest::default()
+            ..HotStateScanRequest::default()
         }
     }
 
     async fn scan_direct_entity_pk_rows_for_test(
-        live_state: &LiveStateContext,
+        hot_state: &HotStateContext,
         storage: &StorageAdapter,
-        request: &LiveStateScanRequest,
-    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        request: &HotStateScanRequest,
+    ) -> Result<Option<Vec<MaterializedHotStateRow>>, LixError> {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open direct hot-state scan read");
         let scope = scan_scope(&read, request, true, None).await?;
-        live_state
+        hot_state
             .reader(read)
             .scan_direct_entity_pk_rows(request, &scope)
             .await
@@ -1970,11 +2071,11 @@ mod tests {
     }
 
     async fn scan_rows_for_test(
-        live_state: &LiveStateContext,
+        hot_state: &HotStateContext,
         storage: &StorageAdapter,
-        request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        live_state
+        request: &HotStateScanRequest,
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
+        hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
@@ -1983,31 +2084,31 @@ mod tests {
             )
             .scan_batch(request)
             .await
-            .map(MaterializedLiveStateBatch::into_rows)
+            .map(MaterializedHotStateBatch::into_rows)
     }
 
     async fn scan_direct_entity_snapshots_for_test(
-        live_state: &LiveStateContext,
+        hot_state: &HotStateContext,
         storage: &StorageAdapter,
         branch_id: &str,
         schema_key: &str,
         entity_pks: &[EntityPk],
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        live_state
+        hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("open direct entity read"),
             )
-            .scan_direct_entity_snapshots(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+            .scan_direct_entity_snapshots(&HotStateScanRequest {
+                filter: HotStateFilter {
                     schema_keys: vec![schema_key.to_string()],
                     entity_pks: entity_pks.to_vec(),
                     branch_ids: vec![branch_id.to_string()],
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                ..LiveStateScanRequest::default()
+                ..HotStateScanRequest::default()
             })
             .await
     }
@@ -2017,7 +2118,7 @@ mod tests {
         let requested_branch_ids = vec!["branch".to_string()];
         let branch = HotBranchRows {
             branch_id: "branch".to_string(),
-            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
+            rows: MaterializedHotStateBatch::from_rows(vec![tracked_row_at_with_commit(
                 "branch", "branch", None, "branch",
             )]),
             ordered_unique: true,
@@ -2029,14 +2130,14 @@ mod tests {
 
         let branch = HotBranchRows {
             branch_id: "branch".to_string(),
-            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
+            rows: MaterializedHotStateBatch::from_rows(vec![tracked_row_at_with_commit(
                 "branch", "branch", None, "branch",
             )]),
             ordered_unique: true,
         };
         let global = HotBranchRows {
             branch_id: GLOBAL_BRANCH_ID.to_string(),
-            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
+            rows: MaterializedHotStateBatch::from_rows(vec![tracked_row_at_with_commit(
                 GLOBAL_BRANCH_ID,
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 None,
@@ -2052,7 +2153,7 @@ mod tests {
 
         let unordered_candidate = HotBranchRows {
             branch_id: "branch".to_string(),
-            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
+            rows: MaterializedHotStateBatch::from_rows(vec![tracked_row_at_with_commit(
                 "branch", "branch", None, "branch",
             )]),
             ordered_unique: false,
@@ -2066,7 +2167,7 @@ mod tests {
 
     #[test]
     fn ordered_and_single_batch_fast_paths_preserve_the_existing_columns() {
-        let batch = MaterializedLiveStateBatch::from_rows(vec![
+        let batch = MaterializedHotStateBatch::from_rows(vec![
             tracked_row_at_with_commit("branch", "first", None, "first"),
             tracked_row_at_with_commit("branch", "second", None, "second"),
         ]);
@@ -2079,10 +2180,10 @@ mod tests {
         assert_eq!(batch.entity_column_ptr(), entity_column);
 
         let entity_column = batch.entity_column_ptr();
-        let batch = concat_live_state_batches([
-            MaterializedLiveStateBatch::default(),
+        let batch = concat_hot_state_batches([
+            MaterializedHotStateBatch::default(),
             batch,
-            MaterializedLiveStateBatch::default(),
+            MaterializedHotStateBatch::default(),
         ]);
         assert_eq!(batch.entity_column_ptr(), entity_column);
         assert_eq!(batch.len(), 2);
@@ -2091,7 +2192,7 @@ mod tests {
     #[tokio::test]
     async fn direct_entity_snapshots_fall_back_when_global_tracks_the_schema() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         let branch_id = "branch";
         let schema_key = "schema";
         let local_pk = EntityPk::single("local-row");
@@ -2116,7 +2217,7 @@ mod tests {
 
         assert!(
             scan_direct_entity_snapshots_for_test(
-                &live_state,
+                &hot_state,
                 &storage,
                 branch_id,
                 schema_key,
@@ -2132,24 +2233,24 @@ mod tests {
     #[tokio::test]
     async fn direct_entity_snapshots_fall_back_for_retention_scoped_reads() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         for untracked in [false, true] {
-            let snapshots = live_state
+            let snapshots = hot_state
                 .reader(
                     storage
                         .begin_read(StorageReadOptions::default())
                         .await
                         .expect("open retention-scoped entity read"),
                 )
-                .scan_direct_entity_snapshots(&LiveStateScanRequest {
-                    filter: LiveStateFilter {
+                .scan_direct_entity_snapshots(&HotStateScanRequest {
+                    filter: HotStateFilter {
                         schema_keys: vec!["schema".to_string()],
                         entity_pks: vec![EntityPk::single("row")],
                         branch_ids: vec!["branch".to_string()],
                         untracked: Some(untracked),
-                        ..LiveStateFilter::default()
+                        ..HotStateFilter::default()
                     },
-                    ..LiveStateScanRequest::default()
+                    ..HotStateScanRequest::default()
                 })
                 .await
                 .expect("retention-scoped entity read should execute");
@@ -2163,7 +2264,7 @@ mod tests {
     #[tokio::test]
     async fn direct_entity_snapshots_read_sorted_exact_primary_keys() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         let branch_id = "branch";
         let schema_key = "schema";
         let first = EntityPk::single("first");
@@ -2193,7 +2294,7 @@ mod tests {
         .await;
 
         let snapshots = scan_direct_entity_snapshots_for_test(
-            &live_state,
+            &hot_state,
             &storage,
             branch_id,
             schema_key,
@@ -2224,7 +2325,7 @@ mod tests {
     #[tokio::test]
     async fn finite_pk_hot_scan_returns_all_file_id_siblings() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         let entity_pk = EntityPk::single("shared-entity");
         let rows = [
             DirectTrackedHeadRow {
@@ -2251,7 +2352,7 @@ mod tests {
         .await;
 
         let request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
-        let direct = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
+        let direct = scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("direct hot-state scan should execute")
             .expect("finite tracked primary-key scan should use the hot route");
@@ -2273,7 +2374,7 @@ mod tests {
             ])
         );
 
-        let normal = scan_rows_for_test(&live_state, &storage, &request)
+        let normal = scan_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("normal finite primary-key scan should execute");
         assert_eq!(normal, direct);
@@ -2282,7 +2383,7 @@ mod tests {
     #[tokio::test]
     async fn finite_pk_hot_scan_resolves_branch_override_and_tombstone_against_global() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         let entity_pk = EntityPk::single("shared-entity");
         stage_direct_tracked_head_rows(
             &storage,
@@ -2316,7 +2417,7 @@ mod tests {
             "schema",
             vec![entity_pk.clone()],
         );
-        let direct = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
+        let direct = scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("direct hot-state scan should execute")
             .expect("current branch and global controls should use the hot route");
@@ -2331,7 +2432,7 @@ mod tests {
             Some(r#"{"value":"branch"}"#)
         );
         assert_eq!(
-            scan_rows_for_test(&live_state, &storage, &request)
+            scan_rows_for_test(&hot_state, &storage, &request)
                 .await
                 .expect("normal branch override scan should execute"),
             direct
@@ -2351,13 +2452,13 @@ mod tests {
         )
         .await;
 
-        let hidden = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
+        let hidden = scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("direct hot-state tombstone scan should execute")
             .expect("current controls should retain the hot route");
         assert!(hidden.is_empty(), "local tombstone must hide global row");
         assert!(
-            scan_rows_for_test(&live_state, &storage, &request)
+            scan_rows_for_test(&hot_state, &storage, &request)
                 .await
                 .expect("normal branch tombstone scan should execute")
                 .is_empty()
@@ -2366,7 +2467,7 @@ mod tests {
         let mut including_tombstones = request.clone();
         including_tombstones.filter.include_tombstones = true;
         let tombstones =
-            scan_direct_entity_pk_rows_for_test(&live_state, &storage, &including_tombstones)
+            scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &including_tombstones)
                 .await
                 .expect("direct hot-state tombstone scan should execute")
                 .expect("current controls should retain the hot route");
@@ -2382,7 +2483,7 @@ mod tests {
     #[tokio::test]
     async fn finite_pk_hot_scan_serves_mixed_current_state() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         let tracked_pk = EntityPk::single("tracked-entity");
         let untracked_pk = EntityPk::single("untracked-entity");
         stage_direct_tracked_head_rows(
@@ -2405,7 +2506,7 @@ mod tests {
             vec![tracked_pk.clone(), untracked_pk.clone()],
         );
         assert!(
-            scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
+            scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
                 .await
                 .expect("initial direct hot-state scan should execute")
                 .is_some(),
@@ -2433,12 +2534,12 @@ mod tests {
         )
         .await;
 
-        let direct = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
+        let direct = scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("mixed hot-state scan should execute")
             .expect("one hot index serves both retention modes");
         assert_eq!(direct.len(), 2);
-        let rows = scan_rows_for_test(&live_state, &storage, &request)
+        let rows = scan_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("mixed normal scan should execute");
         assert_eq!(rows, direct);
@@ -2466,7 +2567,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_file_id_predicate_retains_member_read_path() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         let entity_pk = EntityPk::single("shared-entity");
         stage_direct_tracked_head_rows(
             &storage,
@@ -2496,13 +2597,13 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a2".to_string(),
         )];
         assert!(
-            scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
+            scan_direct_entity_pk_rows_for_test(&hot_state, &storage, &request)
                 .await
                 .expect("file-filtered direct hot-state scan should execute")
                 .is_none(),
             "an explicit file-id predicate must retain the member projection route"
         );
-        let rows = scan_rows_for_test(&live_state, &storage, &request)
+        let rows = scan_rows_for_test(&hot_state, &storage, &request)
             .await
             .expect("file-filtered normal scan should execute");
         assert_eq!(rows.len(), 1);
@@ -2649,7 +2750,7 @@ mod tests {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
                     entity_pk: &row.entity_pk,
-                    change_id: None,
+                    change_id: Some(ChangeId::for_test_label("live-state-untracked-store")),
                     commit_id: None,
                     untracked: true,
                     deleted: row.deleted,
@@ -2732,7 +2833,7 @@ mod tests {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
                     entity_pk: &row.entity_pk,
-                    change_id: None,
+                    change_id: Some(ChangeId::for_test_label("live-state-untracked-store-alt")),
                     commit_id: None,
                     untracked: true,
                     deleted: row.deleted,
@@ -2855,7 +2956,7 @@ mod tests {
         write_empty_commits_to_store(&storage, &setup_read, &[&existing.to_string()]).await;
         drop(setup_read);
 
-        let scope = LiveStateScanScope {
+        let scope = HotStateScanScope {
             storage_branch_ids: Vec::new(),
             projection_branch_ids: vec!["test-branch".to_string()],
             branch_heads: BranchHeads::default(),
@@ -2919,19 +3020,19 @@ mod tests {
         write_empty_commits_to_store(&storage, &setup_read, &[&existing.to_string()]).await;
         drop(setup_read);
 
-        let scope = LiveStateScanScope {
+        let scope = HotStateScanScope {
             storage_branch_ids: Vec::new(),
             projection_branch_ids: vec!["test-branch".to_string()],
             branch_heads: BranchHeads::default(),
         };
-        let request = LiveStateScanRequest {
-            filter: LiveStateFilter {
-                rows: LiveStateRowFilter::None,
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
+                rows: HotStateRowFilter::None,
                 schema_keys: vec![COMMIT_SCHEMA_KEY.to_string()],
                 branch_ids: vec!["test-branch".to_string()],
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
-            ..LiveStateScanRequest::default()
+            ..HotStateScanRequest::default()
         };
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -2961,7 +3062,7 @@ mod tests {
             &[],
         )
         .await;
-        let scope = LiveStateScanScope {
+        let scope = HotStateScanScope {
             storage_branch_ids: vec![GLOBAL_BRANCH_ID.to_string(), branch_id.to_string()],
             projection_branch_ids: vec![branch_id.to_string()],
             branch_heads: BranchHeads::default(),
@@ -3070,7 +3171,7 @@ mod tests {
         drop(read);
 
         let branch_id = "test-branch";
-        let scope = LiveStateScanScope {
+        let scope = HotStateScanScope {
             storage_branch_ids: Vec::new(),
             projection_branch_ids: vec![branch_id.to_string()],
             branch_heads: BranchHeads::default(),
@@ -3080,17 +3181,17 @@ mod tests {
             crate::entity_pk::EntityPkComponent::Integer(0),
         ])
         .expect("valid edge identity");
-        let request = LiveStateScanRequest {
-            filter: LiveStateFilter {
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec!["lix_commit".to_string(), "lix_commit_edge".to_string()],
                 entity_pks: vec![
                     EntityPk::uuid_from_bytes(*child.as_uuid().as_bytes()),
                     edge_pk.clone(),
                 ],
                 branch_ids: vec![branch_id.to_string()],
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
-            ..LiveStateScanRequest::default()
+            ..HotStateScanRequest::default()
         };
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3118,7 +3219,7 @@ mod tests {
         store: &impl StorageAdapterRead,
         writes: &mut StorageWriteSet,
         json_writer: &mut crate::json_store::JsonStoreWriter,
-        rows: &[MaterializedLiveStateRow],
+        rows: &[MaterializedHotStateRow],
     ) -> Result<(), LixError> {
         let mut tracked_rows_by_commit = std::collections::BTreeMap::<
             String,
@@ -3308,7 +3409,7 @@ mod tests {
     }
 
     fn parent_commit_id_from_test_commit_row(
-        row: &MaterializedLiveStateRow,
+        row: &MaterializedHotStateRow,
     ) -> Result<Option<String>, LixError> {
         let Some(metadata) = row.metadata.as_deref() else {
             return Ok(None);
@@ -3328,9 +3429,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_state_serves_untracked_member_from_current_state() {
+    async fn hot_state_serves_untracked_member_from_current_state() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3361,7 +3462,7 @@ mod tests {
         .await;
 
         let rows = scan_selected_tab_at(
-            &live_state,
+            &hot_state,
             &storage,
             "ffffffff-ffff-7fff-bfff-ffffffffffff",
             false,
@@ -3374,16 +3475,19 @@ mod tests {
             Some("{\"value\":\"untracked-value\"}")
         );
         assert!(rows[0].untracked);
-        assert_eq!(rows[0].change_id, None);
+        assert!(
+            rows[0].change_id.is_some_and(|id| !id.as_uuid().is_nil()),
+            "untracked rows carry a real change id"
+        );
 
-        let loaded = live_state
+        let loaded = hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
@@ -3393,7 +3497,10 @@ mod tests {
             .expect("load should succeed")
             .expect("current row should be visible");
         assert!(loaded.untracked);
-        assert_eq!(loaded.change_id, None);
+        assert!(
+            loaded.change_id.is_some_and(|id| !id.as_uuid().is_nil()),
+            "untracked rows carry a real change id"
+        );
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked-value\"}")
@@ -3403,7 +3510,7 @@ mod tests {
     #[tokio::test]
     async fn exact_batch_preserves_duplicate_and_missing_slots_for_current_rows() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3432,31 +3539,31 @@ mod tests {
         )
         .await;
 
-        let selected = LiveStateExactRowRequest {
+        let selected = HotStateExactRowRequest {
             schema_key: "lix_key_value".to_string(),
             branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             entity_pk: identity("selected-tab"),
             file_id: None,
         };
-        let rows = live_state
+        let rows = hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should reopen"),
             )
-            .load_exact_batch(&LiveStateExactBatchRequest {
+            .load_exact_batch(&HotStateExactBatchRequest {
                 rows: vec![
                     selected.clone(),
                     selected,
-                    LiveStateExactRowRequest {
+                    HotStateExactRowRequest {
                         schema_key: "lix_key_value".to_string(),
                         branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
                         entity_pk: identity("missing"),
                         file_id: None,
                     },
                 ],
-                projection: LiveStateProjection {
+                projection: HotStateProjection {
                     columns: vec!["snapshot_content".to_string()],
                 },
                 ..Default::default()
@@ -3480,7 +3587,7 @@ mod tests {
     #[tokio::test]
     async fn tracked_row_is_visible_from_commit_root() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3518,7 +3625,7 @@ mod tests {
         )
         .await;
 
-        let loaded = load_selected_tab(&live_state, &storage)
+        let loaded = load_selected_tab(&hot_state, &storage)
             .await
             .expect("load should succeed")
             .expect("tracked row should be visible");
@@ -3533,7 +3640,7 @@ mod tests {
     #[tokio::test]
     async fn load_row_falls_back_to_global_tracked_row_for_requested_branch() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3577,7 +3684,7 @@ mod tests {
         .await;
 
         let loaded = load_selected_tab_at(
-            &live_state,
+            &hot_state,
             &storage,
             "01920000-0000-7000-8000-0000000000a1",
         )
@@ -3601,7 +3708,7 @@ mod tests {
     async fn main_sees_global_row_by_reading_global_root_separately() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let live_state = LiveStateContext::new(tracked_state.clone(), CommitGraphContext::new());
+        let hot_state = HotStateContext::new(tracked_state.clone(), CommitGraphContext::new());
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3636,7 +3743,7 @@ mod tests {
         .await;
         write_empty_commits_to_store(&storage, &read, &["commit-main"]).await;
 
-        let loaded = load_selected_tab_at(&live_state, &storage, "main")
+        let loaded = load_selected_tab_at(&hot_state, &storage, "main")
             .await
             .expect("load should succeed")
             .expect("global row should be projected into main");
@@ -3657,7 +3764,7 @@ mod tests {
     #[tokio::test]
     async fn load_row_prefers_requested_branch_over_global() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3696,7 +3803,7 @@ mod tests {
         .await;
 
         let loaded = load_selected_tab_at(
-            &live_state,
+            &hot_state,
             &storage,
             "01920000-0000-7000-8000-0000000000a1",
         )
@@ -3718,7 +3825,7 @@ mod tests {
     #[tokio::test]
     async fn main_override_hides_global_row() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3756,7 +3863,7 @@ mod tests {
         )
         .await;
 
-        let loaded = load_selected_tab_at(&live_state, &storage, "main")
+        let loaded = load_selected_tab_at(&hot_state, &storage, "main")
             .await
             .expect("load should succeed")
             .expect("main row should be visible");
@@ -3772,7 +3879,7 @@ mod tests {
     #[tokio::test]
     async fn scan_rows_resolves_requested_branch_over_global() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3811,7 +3918,7 @@ mod tests {
         .await;
 
         let rows = scan_selected_tab_at(
-            &live_state,
+            &hot_state,
             &storage,
             "01920000-0000-7000-8000-0000000000a1",
             false,
@@ -3833,7 +3940,7 @@ mod tests {
     #[tokio::test]
     async fn scan_rows_projects_global_row_into_requested_branch() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3877,7 +3984,7 @@ mod tests {
         .await;
 
         let rows = scan_selected_tab_at(
-            &live_state,
+            &hot_state,
             &storage,
             "01920000-0000-7000-8000-0000000000a1",
             false,
@@ -3900,7 +4007,7 @@ mod tests {
     #[tokio::test]
     async fn scan_rows_does_not_project_global_rows_into_missing_branch() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3934,7 +4041,7 @@ mod tests {
         )
         .await;
 
-        let rows = scan_selected_tab_at(&live_state, &storage, "missing-branch", false)
+        let rows = scan_selected_tab_at(&hot_state, &storage, "missing-branch", false)
             .await
             .expect("scan should succeed");
 
@@ -3948,7 +4055,7 @@ mod tests {
     #[tokio::test]
     async fn winning_tombstone_hides_row_unless_tombstones_are_included() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3986,7 +4093,7 @@ mod tests {
         .await;
 
         let hidden = scan_selected_tab_at(
-            &live_state,
+            &hot_state,
             &storage,
             "01920000-0000-7000-8000-0000000000a1",
             false,
@@ -3996,7 +4103,7 @@ mod tests {
         assert_eq!(hidden.len(), 0);
 
         let with_tombstone = scan_selected_tab_at(
-            &live_state,
+            &hot_state,
             &storage,
             "01920000-0000-7000-8000-0000000000a1",
             true,
@@ -4014,7 +4121,7 @@ mod tests {
     #[tokio::test]
     async fn main_tombstone_hides_global_row() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4051,12 +4158,12 @@ mod tests {
         )
         .await;
 
-        let hidden = scan_selected_tab_at(&live_state, &storage, "main", false)
+        let hidden = scan_selected_tab_at(&hot_state, &storage, "main", false)
             .await
             .expect("scan should succeed");
         assert_eq!(hidden.len(), 0);
 
-        let tombstones = scan_selected_tab_at(&live_state, &storage, "main", true)
+        let tombstones = scan_selected_tab_at(&hot_state, &storage, "main", true)
             .await
             .expect("scan should succeed");
         assert_eq!(tombstones.len(), 1);
@@ -4068,7 +4175,7 @@ mod tests {
     #[tokio::test]
     async fn exact_batch_resolves_branch_global_tombstone_projection_and_correlated_keys() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -4134,20 +4241,20 @@ mod tests {
         )
         .await;
 
-        let exact = |entity: &str, file_id: &str| LiveStateExactRowRequest {
+        let exact = |entity: &str, file_id: &str| HotStateExactRowRequest {
             schema_key: "lix_key_value".to_string(),
             branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             entity_pk: identity(entity),
             file_id: Some(file_id.to_string()),
         };
-        let reader = live_state.reader(
+        let reader = hot_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("read should reopen"),
         );
         let loaded = reader
-            .load_exact_batch(&LiveStateExactBatchRequest {
+            .load_exact_batch(&HotStateExactBatchRequest {
                 rows: vec![
                     exact("fallback", "fallback"),
                     exact("overridden", "overridden"),
@@ -4157,7 +4264,7 @@ mod tests {
                     exact("entity-a", "01920000-0000-7000-8000-0000000000b2"),
                     exact("missing", "missing"),
                 ],
-                projection: LiveStateProjection {
+                projection: HotStateProjection {
                     columns: vec!["snapshot_content".to_string()],
                 },
                 ..Default::default()
@@ -4195,7 +4302,7 @@ mod tests {
         assert_eq!(loaded[6], None);
 
         let tombstone = reader
-            .load_exact_batch(&LiveStateExactBatchRequest {
+            .load_exact_batch(&HotStateExactBatchRequest {
                 rows: vec![exact("hidden", "hidden")],
                 include_tombstones: true,
                 ..Default::default()
@@ -4213,7 +4320,7 @@ mod tests {
     #[tokio::test]
     async fn writer_allows_commit_fact_to_share_the_touched_branch_commit_id() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -4227,7 +4334,7 @@ mod tests {
                     Some("change-branch"),
                     "commit-branch",
                 ),
-                commit_live_state_row("commit-branch"),
+                commit_hot_state_row("commit-branch"),
             ];
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
@@ -4252,7 +4359,7 @@ mod tests {
         .await;
 
         let loaded = load_selected_tab_at(
-            &live_state,
+            &hot_state,
             &storage,
             "01920000-0000-7000-8000-0000000000a1",
         )
@@ -4297,7 +4404,7 @@ mod tests {
                     Some("change-branch"),
                     "commit-merge",
                 ),
-                commit_live_state_row_with_parents(
+                commit_hot_state_row_with_parents(
                     "commit-merge",
                     &["parent-left", "parent-right"],
                 ),
@@ -4376,17 +4483,17 @@ mod tests {
     }
 
     async fn load_selected_tab(
-        live_state: &LiveStateContext,
+        hot_state: &HotStateContext,
         storage: &StorageAdapter,
-    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        live_state
+    ) -> Result<Option<MaterializedHotStateRow>, LixError> {
+        hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
@@ -4396,18 +4503,18 @@ mod tests {
     }
 
     async fn load_selected_tab_at(
-        live_state: &LiveStateContext,
+        hot_state: &HotStateContext,
         storage: &StorageAdapter,
         branch_id: &str,
-    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        live_state
+    ) -> Result<Option<MaterializedHotStateRow>, LixError> {
+        hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: branch_id.to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
@@ -4417,31 +4524,31 @@ mod tests {
     }
 
     async fn scan_selected_tab_at(
-        live_state: &LiveStateContext,
+        hot_state: &HotStateContext,
         storage: &StorageAdapter,
         branch_id: &str,
         include_tombstones: bool,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        live_state
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
+        hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .scan_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+            .scan_batch(&HotStateScanRequest {
+                filter: HotStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
                     entity_pks: vec![crate::entity_pk::EntityPk::single("selected-tab")],
                     branch_ids: vec![branch_id.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones,
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                ..LiveStateScanRequest::default()
+                ..HotStateScanRequest::default()
             })
             .await
-            .map(MaterializedLiveStateBatch::into_rows)
+            .map(MaterializedHotStateBatch::into_rows)
     }
 
     async fn scan_tracked_root(
@@ -4475,7 +4582,7 @@ mod tests {
         value: &str,
         change_id: Option<&str>,
         commit_id: &str,
-    ) -> MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
         tracked_row_at_with_commit(
             "ffffffff-ffff-7fff-bfff-ffffffffffff",
             value,
@@ -4489,9 +4596,9 @@ mod tests {
         value: &str,
         change_id: Option<&str>,
         commit_id: &str,
-    ) -> MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
         let commit_id = CommitId::for_test_label(commit_id);
-        MaterializedLiveStateRow {
+        MaterializedHotStateRow {
             entity_pk: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -4512,8 +4619,8 @@ mod tests {
         branch_id: &str,
         change_id: Option<&str>,
         commit_id: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             snapshot_content: None,
             deleted: true,
             ..tracked_row_at_with_commit(branch_id, "ignored", change_id, commit_id)
@@ -4559,20 +4666,20 @@ mod tests {
         }
     }
 
-    fn commit_live_state_row(commit_id: &str) -> MaterializedLiveStateRow {
-        commit_live_state_row_with_parents(commit_id, &[])
+    fn commit_hot_state_row(commit_id: &str) -> MaterializedHotStateRow {
+        commit_hot_state_row_with_parents(commit_id, &[])
     }
 
-    fn commit_live_state_row_with_parents(
+    fn commit_hot_state_row_with_parents(
         commit_id: &str,
         parent_ids: &[&str],
-    ) -> MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
         let commit_id_text = CommitId::for_test_label(commit_id).to_string();
         let parent_id_texts = parent_ids
             .iter()
             .map(|parent| CommitId::for_test_label(parent).to_string())
             .collect::<Vec<_>>();
-        let mut row = commit_live_state_row_with_snapshot(
+        let mut row = commit_hot_state_row_with_snapshot(
             &commit_id_text,
             json!({
                 "id": commit_id_text,
@@ -4586,13 +4693,13 @@ mod tests {
         row
     }
 
-    fn commit_live_state_row_with_snapshot(
+    fn commit_hot_state_row_with_snapshot(
         commit_id: &str,
         snapshot: serde_json::Value,
-    ) -> MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
         let commit_id = CommitId::for_test_label(commit_id);
         let commit_id_text = commit_id.to_string();
-        MaterializedLiveStateRow {
+        MaterializedHotStateRow {
             entity_pk: identity(&commit_id_text),
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
             file_id: None,

@@ -16,9 +16,9 @@ use crate::common::{
     ExecuteStatementMetadata, RequestBlobSpliceProvenance, SharedStr, validate_row_metadata,
 };
 use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateScanRequest,
-    MaterializedLiveStateBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+use crate::hot_state::{
+    HotStateFilter, HotStateProjection, HotStateRowFilter, HotStateScanRequest,
+    MaterializedHotStateBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
@@ -34,7 +34,7 @@ use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
-use crate::transaction::types::{
+use crate::transaction_types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
     CertifiedRawWriteBatchPreparation, CompleteCollectionReplacementProof, PreparedRowFacts,
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
@@ -1156,7 +1156,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         });
     }
     let candidates = if certified_generation_identity {
-        MaterializedLiveStateBatch::default()
+        MaterializedHotStateBatch::default()
     } else {
         let candidates =
             scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.to_vec(), true)
@@ -1466,8 +1466,8 @@ fn direct_replacement_text_columns<'a>(
 
 #[derive(Clone, Copy)]
 enum EntityLiveRowRef<'a> {
-    Owned(&'a MaterializedLiveStateRow),
-    Batch(MaterializedLiveStateRowRef<'a>),
+    Owned(&'a MaterializedHotStateRow),
+    Batch(MaterializedHotStateRowRef<'a>),
 }
 
 impl<'a> EntityLiveRowRef<'a> {
@@ -1550,7 +1550,7 @@ impl<'a> EntityLiveRowRef<'a> {
 
     fn durable_predecessor(
         self,
-    ) -> Option<&'a crate::live_state::CertifiedCurrentStatePredecessor> {
+    ) -> Option<&'a crate::hot_state::CertifiedCurrentStatePredecessor> {
         match self {
             Self::Owned(_) => None,
             Self::Batch(row) => row.durable_predecessor(),
@@ -1565,14 +1565,14 @@ impl<'a> EntityLiveRowRef<'a> {
     }
 }
 
-impl<'a> From<&'a MaterializedLiveStateRow> for EntityLiveRowRef<'a> {
-    fn from(row: &'a MaterializedLiveStateRow) -> Self {
+impl<'a> From<&'a MaterializedHotStateRow> for EntityLiveRowRef<'a> {
+    fn from(row: &'a MaterializedHotStateRow) -> Self {
         Self::Owned(row)
     }
 }
 
-impl<'a> From<MaterializedLiveStateRowRef<'a>> for EntityLiveRowRef<'a> {
-    fn from(row: MaterializedLiveStateRowRef<'a>) -> Self {
+impl<'a> From<MaterializedHotStateRowRef<'a>> for EntityLiveRowRef<'a> {
+    fn from(row: MaterializedHotStateRowRef<'a>) -> Self {
         Self::Batch(row)
     }
 }
@@ -3239,15 +3239,15 @@ pub(crate) async fn prepare_path_value_replacement_row(
     let primary_key = program.primary_key(params)?;
     let entity_pk = EntityPk::single(primary_key.to_owned());
     let candidates = ctx
-        .scan_live_state_batch(&LiveStateScanRequest {
-            filter: LiveStateFilter {
+        .scan_hot_state_batch(&HotStateScanRequest {
+            filter: HotStateFilter {
                 schema_keys: vec![program.schema_key.clone()],
                 entity_pks: vec![entity_pk.clone()],
                 branch_ids: vec![ctx.active_branch_id().to_owned()],
                 include_tombstones: false,
-                ..LiveStateFilter::default()
+                ..HotStateFilter::default()
             },
-            ..LiveStateScanRequest::default()
+            ..HotStateScanRequest::default()
         })
         .await?;
     if candidates.is_empty() {
@@ -3533,7 +3533,7 @@ fn entity_staged_returning_identity(
     ))
 }
 
-fn entity_live_returning_identity(row: MaterializedLiveStateRowRef<'_>) -> EntityReturningIdentity {
+fn entity_live_returning_identity(row: MaterializedHotStateRowRef<'_>) -> EntityReturningIdentity {
     (
         row.entity_pk().clone(),
         row.file_id().map(ToOwned::to_owned),
@@ -4022,8 +4022,8 @@ fn insert_row_entity_pk(
 fn find_conflict_candidate<'a>(
     insert_row: RawWriteRowRef<'_>,
     inserted_entity_pk: &EntityPk,
-    candidates: &'a MaterializedLiveStateBatch,
-) -> Option<MaterializedLiveStateRowRef<'a>> {
+    candidates: &'a MaterializedHotStateBatch,
+) -> Option<MaterializedHotStateRowRef<'a>> {
     candidates.iter().find(|candidate| {
         candidate_matches_insert_identity(*candidate, insert_row, inserted_entity_pk)
     })
@@ -4045,7 +4045,7 @@ async fn scan_entity_conflict_candidates(
     ctx: &mut dyn SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
     insert_rows: &RawWriteBatch,
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     let mut branch_ids = std::collections::BTreeSet::new();
     let mut entity_pks = std::collections::BTreeSet::new();
     let mut file_ids = std::collections::BTreeSet::new();
@@ -4067,16 +4067,16 @@ async fn scan_entity_conflict_candidates(
     // of SQL conflict identity. A tracked INSERT therefore conflicts with an
     // existing untracked row (and vice versa); `DO UPDATE` then preserves the
     // existing row's retention through `append_entity_replace_row_from_live`.
-    ctx.scan_live_state_batch(&LiveStateScanRequest {
-        filter: LiveStateFilter {
+    ctx.scan_hot_state_batch(&HotStateScanRequest {
+        filter: HotStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             entity_pks: entity_pks.into_iter().collect(),
             branch_ids: branch_ids.into_iter().map(Into::into).collect(),
             file_ids,
             include_tombstones: false,
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         },
-        ..LiveStateScanRequest::default()
+        ..HotStateScanRequest::default()
     })
     .await
 }
@@ -4086,26 +4086,26 @@ async fn scan_entity_candidates(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-) -> Result<MaterializedLiveStateBatch, LixError> {
+) -> Result<MaterializedHotStateBatch, LixError> {
     let branch_ids = scan_branch_ids(&plan.bound.branch_scope)?;
-    let mut request = LiveStateScanRequest {
-        filter: LiveStateFilter {
+    let mut request = HotStateScanRequest {
+        filter: HotStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             branch_ids,
             include_tombstones: false,
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         },
-        ..LiveStateScanRequest::default()
+        ..HotStateScanRequest::default()
     };
     if let Some(entity_pks) =
         bound_entity_pks_from_primary_key_predicate(spec, &plan.bound.predicate, params)
     {
         if entity_pks.is_empty() {
-            request.filter.rows = LiveStateRowFilter::None;
+            request.filter.rows = HotStateRowFilter::None;
         }
         request.filter.entity_pks = entity_pks;
     }
-    ctx.scan_live_state_batch(&request).await
+    ctx.scan_hot_state_batch(&request).await
 }
 
 async fn scan_entity_candidates_for_pks(
@@ -4114,23 +4114,23 @@ async fn scan_entity_candidates_for_pks(
     spec: &EntitySurfaceSpec,
     entity_pks: Vec<EntityPk>,
     metadata_only: bool,
-) -> Result<MaterializedLiveStateBatch, LixError> {
-    ctx.scan_live_state_batch(&LiveStateScanRequest {
-        filter: LiveStateFilter {
+) -> Result<MaterializedHotStateBatch, LixError> {
+    ctx.scan_hot_state_batch(&HotStateScanRequest {
+        filter: HotStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             entity_pks,
             branch_ids: scan_branch_ids(&plan.bound.branch_scope)?,
             include_tombstones: false,
-            ..LiveStateFilter::default()
+            ..HotStateFilter::default()
         },
         projection: if metadata_only {
-            LiveStateProjection {
+            HotStateProjection {
                 columns: vec!["metadata".to_string()],
             }
         } else {
-            LiveStateProjection::default()
+            HotStateProjection::default()
         },
-        ..LiveStateScanRequest::default()
+        ..HotStateScanRequest::default()
     })
     .await
 }
@@ -4522,11 +4522,25 @@ fn certified_entity_insert_parameter_batch(
     {
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_certified_entity_insert_parameter_batch_certification();
-        return Ok(Some(if use_typed_certified_insert(rows.len()) {
-            CertifiedEntityInsertParameterBatch::Typed(rows)
-        } else {
-            CertifiedEntityInsertParameterBatch::Raw(rows.into_raw()?)
-        }));
+        // The dense lane has no per-row change column: it derives every UUID
+        // from the commit-delta address space, which untracked rows are not
+        // members of. Rather than reintroduce the million-row column that the
+        // dense layout exists to avoid, untracked batches fall back to the
+        // *raw* certified lane, whose per-row slot already carries a change id.
+        //
+        // Raw, not generic: the ordinary untracked insert (1k/10k rows) is far
+        // below this threshold and already takes the raw lane, so nothing that
+        // #1329 optimized changes route. Only untracked batches at or above
+        // 32,768 rows move, and they move to raw rather than to the generic
+        // path they would otherwise fall to.
+        let dense_lane_supports_batch = !rows.untracked();
+        return Ok(Some(
+            if dense_lane_supports_batch && use_typed_certified_insert(rows.len()) {
+                CertifiedEntityInsertParameterBatch::Typed(rows)
+            } else {
+                CertifiedEntityInsertParameterBatch::Raw(rows.into_raw()?)
+            },
+        ));
     }
     if !allow_generic_fallback {
         return Ok(None);
@@ -7923,6 +7937,100 @@ mod splice_provenance_tests {
                 &metadata,
             ),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod constraints_unchanged_tests {
+    use std::collections::{BTreeMap, HashSet};
+
+    use serde_json::{Value as JsonValue, json};
+
+    use super::assigned_columns_preserve_constraints;
+    use crate::catalog::{SchemaCatalogKey, SchemaPlan};
+    use crate::sql2::derive_entity_surface_spec_from_schema;
+
+    fn schema() -> JsonValue {
+        json!({
+            "x-lix-key": "constraint_probe",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/slug"]],
+            "x-lix-foreign-keys": [{
+                "properties": ["/parentId"],
+                "references": { "schemaKey": "constraint_probe_parent", "properties": ["/id"] }
+            }],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "slug": { "type": "string" },
+                "parentId": { "type": "string" },
+                "payload": { "type": "string" }
+            },
+            "required": ["id", "slug", "parentId", "payload"],
+            "additionalProperties": false
+        })
+    }
+
+    /// `constraints_unchanged` is the one way a row of an indexed schema can
+    /// reach commit with `requires_transaction_validation == false`, so the
+    /// index's completeness rests on it never being granted to an UPDATE that
+    /// touches an indexed column.
+    ///
+    /// It is granted through `assigned_columns_preserve_constraints`, which
+    /// refuses whenever the assignment set touches the primary key, a unique
+    /// group, or a foreign key's local properties — a strict superset of
+    /// `indexed_columns`. This test states that superset relation directly:
+    /// every indexed column, individually, revokes the certificate.
+    #[test]
+    fn every_indexed_column_revokes_the_constraints_unchanged_certificate() {
+        let schema = schema();
+        let spec = derive_entity_surface_spec_from_schema(&schema).expect("spec");
+        assert_eq!(
+            spec.indexed_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parentId", "slug"],
+            "the probe schema must actually declare indexed columns"
+        );
+        let parent = json!({
+            "x-lix-key": "constraint_probe_parent",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        let parent_key = SchemaCatalogKey {
+            schema_key: "constraint_probe_parent".to_owned(),
+        };
+        let schema_index = BTreeMap::from([(parent_key.clone(), &parent)]);
+        let key_index = BTreeMap::from([(parent_key, crate::catalog::SchemaPlanId::for_test(0))]);
+        let plan = SchemaPlan::compile_standalone_for_test(
+            SchemaCatalogKey {
+                schema_key: "constraint_probe".to_owned(),
+            },
+            schema,
+            &key_index,
+            &schema_index,
+        )
+        .expect("schema should compile");
+
+        for column in &spec.indexed_columns {
+            let assigned = HashSet::from([column.name.as_str()]);
+            assert!(
+                !assigned_columns_preserve_constraints(&plan, &assigned),
+                "assigning indexed column '{}' must revoke constraints_unchanged",
+                column.name
+            );
+        }
+
+        let untouched = HashSet::from(["payload"]);
+        assert!(
+            assigned_columns_preserve_constraints(&plan, &untouched),
+            "an assignment touching no declared column keeps the certificate, \
+             which is what makes skipping extraction for it sound"
         );
     }
 }

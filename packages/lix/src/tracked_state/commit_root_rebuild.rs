@@ -72,8 +72,15 @@ async fn rebuild_commit_root_at_inner<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let plans =
-        load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
+    // Explicit repair is the caller whose job is to distrust the chunk plane,
+    // so it — and only it — pays for the total closure proof.
+    let plans = load_rebuild_plans_to_nearest_available_root_with_proof(
+        rebuilder.store,
+        commit_id,
+        true,
+        RootAvailabilityProof::Complete,
+    )
+    .await?;
     let mut report = None;
     let context = TrackedStateContext::new();
     let mut state = TrackedStateTransientRebuildState::default();
@@ -154,10 +161,48 @@ where
     Ok(report)
 }
 
+/// How much of a candidate resume point's chunk closure a caller demands to be
+/// proved readable before it may resume from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootAvailabilityProof {
+    /// Prove the root is *addressable*: the root chunk and one root-to-leaf
+    /// path load and decode. `O(tree depth)`.
+    ///
+    /// Closure completeness is not re-derived. Chunks are staged in the same
+    /// atomic write set that publishes the root and the manifest, and GC
+    /// reaches them from refs, so the write path and GC are already its single
+    /// authority. This is what the commit path uses.
+    Addressable,
+    /// Prove the whole addressed closure loads and decodes. `O(tree rows)`.
+    ///
+    /// Used only by explicit repair (`rebuild_commit_root_at`), whose contract
+    /// is to distrust the chunk plane: rejecting a damaged resume point is what
+    /// makes it walk back and re-stage every chunk, so repair stays total.
+    Complete,
+}
+
 pub(crate) async fn load_rebuild_plans_to_nearest_available_root<S>(
     store: &S,
     commit_id: &str,
     force_head: bool,
+) -> Result<Vec<CommitRootRebuildPlan>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    load_rebuild_plans_to_nearest_available_root_with_proof(
+        store,
+        commit_id,
+        force_head,
+        RootAvailabilityProof::Addressable,
+    )
+    .await
+}
+
+pub(crate) async fn load_rebuild_plans_to_nearest_available_root_with_proof<S>(
+    store: &S,
+    commit_id: &str,
+    force_head: bool,
+    proof: RootAvailabilityProof,
 ) -> Result<Vec<CommitRootRebuildPlan>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
@@ -176,7 +221,11 @@ where
             ));
         }
         if !force_current {
-            let available = load_available_root(store, &current_commit_id).await?;
+            #[cfg(feature = "storage-benches")]
+            let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+                crate::storage_bench::PlanLoadPhase::AvailProbe,
+            );
+            let available = load_available_root(store, &current_commit_id, proof).await?;
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_root_replay_available_root_probe(available.is_some());
             if available.is_some() {
@@ -207,17 +256,24 @@ where
 /// 1. the root pointer is live (`load_snapshot_commit_root` also proves the
 ///    commit itself exists in the changelog, so an orphaned manifest cannot
 ///    authorize a resume), and
-/// 2. the content-addressed chunk closure it names is physically readable, so
-///    a damaged root is never resumed from and explicit repair stays total.
+/// 2. the content-addressed chunk closure it names is physically addressable,
+///    so a damaged root is never resumed from and explicit repair stays total.
 ///
-/// This proof is bounded by the size of the addressed tree. It deliberately
-/// does **not** recurse through the ancestry: ordinary commits are rootless
-/// bounded-replay layouts by design, so an ancestry-wide proof can only ever
-/// succeed by reaching genesis, which makes every interval closure replay the
-/// entire history.
+/// It deliberately does **not** recurse through the ancestry: ordinary commits
+/// are rootless bounded-replay layouts by design, so an ancestry-wide proof can
+/// only ever succeed by reaching genesis, which makes every interval closure
+/// replay the entire history.
+///
+/// How much of obligation (2) is proved is the caller's choice — see
+/// [`RootAvailabilityProof`]. The commit path proves addressability only:
+/// re-deriving closure completeness there cost `O(total state)` per boundary
+/// and, at one boundary per `COMMIT_STATE_MAX_REPLAY_DEPTH` commits, put an
+/// `O(N^2)` term back into commit for a fact atomic publication and GC already
+/// own. Explicit repair still proves the whole closure.
 async fn load_available_root<S>(
     store: &S,
     commit_id: &str,
+    proof: RootAvailabilityProof,
 ) -> Result<Option<TrackedStateRootId>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
@@ -225,7 +281,14 @@ where
     let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
         return Ok(None);
     };
-    if !commit_root_tree_is_readable(store, &metadata).await? {
+    let readable = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::AvailTreeScan,
+        );
+        commit_root_tree_is_readable(store, &metadata, proof).await?
+    };
+    if !readable {
         return Ok(None);
     }
     Ok(Some(metadata.root_id))
@@ -234,16 +297,23 @@ where
 async fn commit_root_tree_is_readable<S>(
     store: &S,
     metadata: &TrackedStateCommitRoot,
+    proof: RootAvailabilityProof,
 ) -> Result<bool, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    // One row is enough for addressability: the scan walks root -> leftmost
+    // overlapping child -> leaf and stops, so a missing or corrupt root chunk
+    // still fails while the probe stays `O(tree depth)`.
+    let request = TrackedStateTreeScanRequest {
+        limit: match proof {
+            RootAvailabilityProof::Addressable => Some(1),
+            RootAvailabilityProof::Complete => None,
+        },
+        ..TrackedStateTreeScanRequest::default()
+    };
     match TrackedStateTree::new()
-        .scan(
-            store,
-            &metadata.root_id,
-            &TrackedStateTreeScanRequest::default(),
-        )
+        .scan(store, &metadata.root_id, &request)
         .await
     {
         Ok(_) => Ok(true),
@@ -265,34 +335,54 @@ async fn load_commit_root_rebuild_plan<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let mut reader = ChangelogContext::new().reader(store);
-    let commit_ids = [CommitId::parse_lix(
-        commit_id,
-        "commit-root rebuild commit_id",
-    )?];
-    let batch = reader
-        .load_commits(CommitLoadRequest {
-            commit_ids: &commit_ids,
-        })
-        .await?;
-    let entry = batch
-        .into_iter()
-        .next()
-        .and_then(|(_, value)| value)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"
-                ),
-            )
-        })?;
-    let commit = entry;
+    let commit = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::CommitRecord,
+        );
+        let mut reader = ChangelogContext::new().reader(store);
+        let commit_ids = [CommitId::parse_lix(
+            commit_id,
+            "commit-root rebuild commit_id",
+        )?];
+        let batch = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &commit_ids,
+            })
+            .await?;
+        batch
+            .into_iter()
+            .next()
+            .and_then(|(_, value)| value)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"
+                    ),
+                )
+            })?
+    };
     // Commit roots contain only identity/index facts. Avoid hydrating JSON
     // sidecars while rebuilding them; the packed delta index already carries
     // deletion, owner ids, and original timestamps.
-    let deltas = storage::scan_commit_delta_members(store, commit.commit_id)
-        .await?
+    let members = storage::scan_commit_delta_members(store, commit.commit_id).await?;
+    #[cfg(feature = "root-replay-trace")]
+    let member_bytes = members
+        .iter()
+        .map(|(key, _)| {
+            (key.schema_key.len()
+                + key.file_id.as_ref().map(String::len).unwrap_or(0)
+                + key.entity_pk.estimated_heap_bytes()) as u64
+        })
+        .sum::<u64>();
+    #[cfg(feature = "root-replay-trace")]
+    crate::storage_bench::record_plan_load_plan(
+        members.len() as u64,
+        members.len() as u64,
+        member_bytes,
+    );
+    let deltas = members
         .into_iter()
         .map(|(key, value)| CommitRootRebuildDelta {
             schema_key: key.schema_key,

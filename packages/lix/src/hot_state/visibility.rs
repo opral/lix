@@ -1,11 +1,11 @@
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 #[cfg(test)]
-use crate::live_state::MaterializedLiveStateRow;
-use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateReader, LiveStateRowIdentityRef,
-    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
-    MaterializedLiveStateExactBatch, MaterializedLiveStateRowRef,
+use crate::hot_state::MaterializedHotStateRow;
+use crate::hot_state::{
+    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateReader, HotStateRowIdentityRef,
+    HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateBatchBuilder,
+    MaterializedHotStateExactBatch, MaterializedHotStateRowRef,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,12 +20,12 @@ pub(crate) enum VisibilityBranchScope {
     BranchIds { branch_ids: Vec<String> },
 }
 
-pub(crate) trait StagedLiveStateRows {
+pub(crate) trait StagedHotStateRows {
     /// Returns staged candidates in one shared columnar owner.
     fn staged_batch(
         &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError>;
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError>;
 
     /// Loads exact staged storage identities in request order.
     ///
@@ -33,8 +33,8 @@ pub(crate) trait StagedLiveStateRows {
     /// branch and global candidates separately to preserve their precedence.
     fn load_exact_batch(
         &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError>;
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError>;
 
     /// Whether this transaction has replaced the requested collection with a
     /// generation marker. Collection replacement suppresses committed members
@@ -79,10 +79,10 @@ pub(crate) fn expanded_branch_ids(branch_ids: &[String]) -> Vec<String> {
 }
 
 pub(crate) fn resolve_visible_batch(
-    base_rows: MaterializedLiveStateBatch,
-    staged_rows: MaterializedLiveStateBatch,
+    base_rows: MaterializedHotStateBatch,
+    staged_rows: MaterializedHotStateBatch,
     request: &VisibilityRequest,
-) -> MaterializedLiveStateBatch {
+) -> MaterializedHotStateBatch {
     let requested_branch_ids = requested_branch_ids(&request.branch_scope);
     if staged_rows.is_empty()
         && request.limit.is_none_or(|limit| base_rows.len() <= limit)
@@ -101,7 +101,7 @@ pub(crate) fn resolve_visible_batch(
     {
         return base_rows;
     }
-    resolve_live_state_batch(
+    resolve_hot_state_batch(
         &base_rows,
         &staged_rows,
         &requested_branch_ids,
@@ -110,8 +110,8 @@ pub(crate) fn resolve_visible_batch(
     )
 }
 
-fn materialized_row_identity(row: MaterializedLiveStateRowRef<'_>) -> LiveStateRowIdentityRef<'_> {
-    LiveStateRowIdentityRef {
+fn materialized_row_identity(row: MaterializedHotStateRowRef<'_>) -> HotStateRowIdentityRef<'_> {
+    HotStateRowIdentityRef {
         branch_id: row.branch_id(),
         schema_key: row.schema_key(),
         entity_pk: row.entity_pk(),
@@ -120,12 +120,12 @@ fn materialized_row_identity(row: MaterializedLiveStateRowRef<'_>) -> LiveStateR
 }
 
 pub(crate) async fn overlay_scan_batch<S>(
-    base: &dyn LiveStateReader,
+    base: &dyn HotStateReader,
     staged: &S,
-    request: &LiveStateScanRequest,
-) -> Result<MaterializedLiveStateBatch, LixError>
+    request: &HotStateScanRequest,
+) -> Result<MaterializedHotStateBatch, LixError>
 where
-    S: StagedLiveStateRows + ?Sized,
+    S: StagedHotStateRows + ?Sized,
 {
     let mut visible_branch_ids = request.filter.branch_ids.clone();
     if let [schema_key] = request.filter.schema_keys.as_slice() {
@@ -140,7 +140,7 @@ where
         visible_branch_ids = retained;
     }
     if !request.filter.branch_ids.is_empty() && visible_branch_ids.is_empty() {
-        return Ok(MaterializedLiveStateBatch::default());
+        return Ok(MaterializedHotStateBatch::default());
     }
     let mut candidate_request = request.clone();
     candidate_request.limit = None;
@@ -162,12 +162,12 @@ where
 }
 
 pub(crate) async fn overlay_scan_tracked_batch<S>(
-    base: &dyn LiveStateReader,
+    base: &dyn HotStateReader,
     staged: &S,
-    request: &LiveStateScanRequest,
-) -> Result<MaterializedLiveStateBatch, LixError>
+    request: &HotStateScanRequest,
+) -> Result<MaterializedHotStateBatch, LixError>
 where
-    S: StagedLiveStateRows + ?Sized,
+    S: StagedHotStateRows + ?Sized,
 {
     let mut candidate_request = request.clone();
     candidate_request.limit = None;
@@ -192,15 +192,15 @@ where
 /// Overlays staged exact identities without converting correlated row keys to
 /// independent scan filters.
 pub(crate) async fn overlay_load_exact_batch<S>(
-    base: &dyn LiveStateReader,
+    base: &dyn HotStateReader,
     staged: &S,
-    request: &LiveStateExactBatchRequest,
-) -> Result<MaterializedLiveStateExactBatch, LixError>
+    request: &HotStateExactBatchRequest,
+) -> Result<MaterializedHotStateExactBatch, LixError>
 where
-    S: StagedLiveStateRows + ?Sized,
+    S: StagedHotStateRows + ?Sized,
 {
     if request.rows.is_empty() {
-        return Ok(MaterializedLiveStateExactBatch::default());
+        return Ok(MaterializedHotStateExactBatch::default());
     }
 
     let mut base_request = request.clone();
@@ -221,7 +221,7 @@ where
     let mut staged_indices = Vec::with_capacity(request.rows.len());
     for row in &request.rows {
         let global_index = staged_requests.len();
-        staged_requests.push(LiveStateExactRowRequest {
+        staged_requests.push(HotStateExactRowRequest {
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
@@ -236,7 +236,7 @@ where
         };
         staged_indices.push((global_index, branch_index));
     }
-    let staged_request = LiveStateExactBatchRequest {
+    let staged_request = HotStateExactBatchRequest {
         rows: staged_requests,
         projection: request.projection.clone(),
         untracked: request.untracked,
@@ -254,7 +254,7 @@ where
         ));
     }
 
-    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+    let mut builder = MaterializedHotStateBatchBuilder::with_capacity(request.rows.len());
     let mut slots = Vec::with_capacity(request.rows.len());
     for (slot, (requested, (global_index, branch_index))) in
         request.rows.iter().zip(staged_indices).enumerate()
@@ -308,17 +308,17 @@ where
             slots.push(Some(ordinal));
         }
     }
-    MaterializedLiveStateExactBatch::new(builder.finish(), slots)
+    MaterializedHotStateExactBatch::new(builder.finish(), slots)
 }
 
 fn insert_exact_overlay_candidate<'a>(
     winner: &mut Option<(
         OverlayTier,
-        MaterializedLiveStateRowRef<'a>,
+        MaterializedHotStateRowRef<'a>,
         Option<&'a str>,
     )>,
     tier: OverlayTier,
-    row: MaterializedLiveStateRowRef<'a>,
+    row: MaterializedHotStateRowRef<'a>,
     branch_override: Option<&'a str>,
 ) {
     if winner
@@ -331,15 +331,15 @@ fn insert_exact_overlay_candidate<'a>(
 
 #[derive(Clone, Copy)]
 struct OverlayCandidate<'a> {
-    row: MaterializedLiveStateRowRef<'a>,
+    row: MaterializedHotStateRowRef<'a>,
     branch_id: &'a str,
     tier: OverlayTier,
     sequence: usize,
 }
 
 impl<'a> OverlayCandidate<'a> {
-    fn identity(self) -> LiveStateRowIdentityRef<'a> {
-        LiveStateRowIdentityRef {
+    fn identity(self) -> HotStateRowIdentityRef<'a> {
+        HotStateRowIdentityRef {
             branch_id: self.branch_id,
             ..materialized_row_identity(self.row)
         }
@@ -351,13 +351,13 @@ impl<'a> OverlayCandidate<'a> {
 /// The temporary vector carries one row view, effective branch view, and tier
 /// per candidate. No identity field is cloned into a map. The winning rows are
 /// then lowered directly into one dictionary-backed result batch.
-fn resolve_live_state_batch<'a>(
-    base_rows: &'a MaterializedLiveStateBatch,
-    staged_rows: &'a MaterializedLiveStateBatch,
+fn resolve_hot_state_batch<'a>(
+    base_rows: &'a MaterializedHotStateBatch,
+    staged_rows: &'a MaterializedHotStateBatch,
     requested_branch_ids: &'a [String],
     include_tombstones: bool,
     limit: Option<usize>,
-) -> MaterializedLiveStateBatch {
+) -> MaterializedHotStateBatch {
     let capacity = projected_candidate_count(base_rows, requested_branch_ids)
         .checked_add(projected_candidate_count(staged_rows, requested_branch_ids))
         .expect("live-state candidate count overflow");
@@ -385,7 +385,7 @@ fn resolve_live_state_batch<'a>(
     });
 
     let output_capacity = limit.map_or(capacity, |limit| limit.min(capacity));
-    let mut output = MaterializedLiveStateBatchBuilder::with_capacity(output_capacity);
+    let mut output = MaterializedHotStateBatchBuilder::with_capacity(output_capacity);
     let mut offset = 0;
     while offset < candidates.len() && output.len() < output_capacity {
         let mut end = offset + 1;
@@ -409,7 +409,7 @@ fn resolve_live_state_batch<'a>(
 }
 
 fn projected_candidate_count(
-    rows: &MaterializedLiveStateBatch,
+    rows: &MaterializedHotStateBatch,
     requested_branch_ids: &[String],
 ) -> usize {
     if requested_branch_ids.is_empty() {
@@ -430,7 +430,7 @@ fn projected_candidate_count(
 
 fn append_projected_candidates<'a>(
     candidates: &mut Vec<OverlayCandidate<'a>>,
-    rows: &'a MaterializedLiveStateBatch,
+    rows: &'a MaterializedHotStateBatch,
     requested_branch_ids: &'a [String],
     global_tier: OverlayTier,
     branch_tier: OverlayTier,
@@ -517,7 +517,7 @@ mod tests {
     fn ten_thousand_row_visibility_keeps_identity_metadata_dictionary_encoded() {
         let branch_id = "01920000-0000-7000-8000-0000000000a1";
         let rows = (0..10_000)
-            .map(|index| MaterializedLiveStateRow {
+            .map(|index| MaterializedHotStateRow {
                 entity_pk: EntityPk::uuid_from_canonical(&format!(
                     "01920000-0000-7000-8000-{index:012x}"
                 ))
@@ -536,11 +536,11 @@ mod tests {
                 branch_id: branch_id.into(),
             })
             .collect();
-        let source = MaterializedLiveStateBatch::from_rows(rows);
+        let source = MaterializedHotStateBatch::from_rows(rows);
         let source_entity_column = source.entity_column_ptr();
         let batch = resolve_visible_batch(
             source,
-            MaterializedLiveStateBatch::default(),
+            MaterializedHotStateBatch::default(),
             &VisibilityRequest {
                 branch_scope: VisibilityBranchScope::BranchIds {
                     branch_ids: vec![branch_id.to_owned()],
@@ -562,15 +562,15 @@ mod tests {
 
     #[test]
     fn committed_scan_projects_global_row_into_requested_branch() {
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![row_at(
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![row_at(
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 "entity",
                 "global-value",
                 true,
                 Some("change-global"),
             )]),
-            &MaterializedLiveStateBatch::default(),
+            &MaterializedHotStateBatch::default(),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -591,8 +591,8 @@ mod tests {
 
     #[test]
     fn committed_scan_prefers_requested_branch_row_over_projected_global_row() {
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![
                 row_at(
                     "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "entity",
@@ -608,7 +608,7 @@ mod tests {
                     Some("change-branch"),
                 ),
             ]),
-            &MaterializedLiveStateBatch::default(),
+            &MaterializedHotStateBatch::default(),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -647,9 +647,9 @@ mod tests {
         untracked.untracked = true;
         untracked.commit_id = None;
 
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![tracked, untracked]),
-            &MaterializedLiveStateBatch::default(),
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![tracked, untracked]),
+            &MaterializedHotStateBatch::default(),
             &[],
             false,
             None,
@@ -681,9 +681,9 @@ mod tests {
             Some("change-staged"),
         );
 
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![base]),
-            &MaterializedLiveStateBatch::from_rows(vec![staged]),
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![base]),
+            &MaterializedHotStateBatch::from_rows(vec![staged]),
             &[],
             false,
             None,
@@ -699,8 +699,8 @@ mod tests {
 
     #[test]
     fn branch_tombstone_hides_global_row_after_visibility_resolution() {
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![
                 row_at(
                     "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "entity",
@@ -715,7 +715,7 @@ mod tests {
                     Some("change-tombstone"),
                 ),
             ]),
-            &MaterializedLiveStateBatch::default(),
+            &MaterializedHotStateBatch::default(),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -745,9 +745,9 @@ mod tests {
         untracked.untracked = true;
         untracked.commit_id = None;
 
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::default(),
-            &MaterializedLiveStateBatch::from_rows(vec![untracked.clone(), tracked.clone()]),
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::default(),
+            &MaterializedHotStateBatch::from_rows(vec![untracked.clone(), tracked.clone()]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -761,9 +761,9 @@ mod tests {
             Some("{\"value\":\"tracked\"}")
         );
 
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::default(),
-            &MaterializedLiveStateBatch::from_rows(vec![tracked, untracked]),
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::default(),
+            &MaterializedHotStateBatch::from_rows(vec![tracked, untracked]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -798,9 +798,9 @@ mod tests {
         );
         staged.untracked = false;
 
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![base]),
-            &MaterializedLiveStateBatch::from_rows(vec![staged]),
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![base]),
+            &MaterializedHotStateBatch::from_rows(vec![staged]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -826,9 +826,9 @@ mod tests {
         );
         base.global = true;
 
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![base]),
-            &MaterializedLiveStateBatch::from_rows(vec![tombstone_at(
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![base]),
+            &MaterializedHotStateBatch::from_rows(vec![tombstone_at(
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 "entity",
                 true,
@@ -859,9 +859,9 @@ mod tests {
             Some("change-staged"),
         );
 
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![base]),
-            &MaterializedLiveStateBatch::from_rows(vec![staged]),
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![base]),
+            &MaterializedHotStateBatch::from_rows(vec![staged]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -889,9 +889,9 @@ mod tests {
         staged.untracked = true;
         staged.commit_id = None;
 
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![base]),
-            &MaterializedLiveStateBatch::from_rows(vec![staged]),
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![base]),
+            &MaterializedHotStateBatch::from_rows(vec![staged]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -917,9 +917,9 @@ mod tests {
             Some("change-staged"),
         );
 
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![base]),
-            &MaterializedLiveStateBatch::from_rows(vec![staged]),
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![base]),
+            &MaterializedHotStateBatch::from_rows(vec![staged]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
@@ -932,8 +932,8 @@ mod tests {
 
     #[test]
     fn tombstone_can_be_returned_when_requested() {
-        let rows = resolve_live_state_batch(
-            &MaterializedLiveStateBatch::from_rows(vec![
+        let rows = resolve_hot_state_batch(
+            &MaterializedHotStateBatch::from_rows(vec![
                 row_at(
                     "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "entity",
@@ -948,7 +948,7 @@ mod tests {
                     Some("change-tombstone"),
                 ),
             ]),
-            &MaterializedLiveStateBatch::default(),
+            &MaterializedHotStateBatch::default(),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             true,
             None,
@@ -973,7 +973,7 @@ mod tests {
             limit: Some(1),
         };
         let rows = resolve_visible_batch(
-            MaterializedLiveStateBatch::from_rows(vec![
+            MaterializedHotStateBatch::from_rows(vec![
                 row_at(
                     "01920000-0000-7000-8000-0000000000a1",
                     "a",
@@ -989,7 +989,7 @@ mod tests {
                     Some("change-b"),
                 ),
             ]),
-            MaterializedLiveStateBatch::default(),
+            MaterializedHotStateBatch::default(),
             &request,
         )
         .into_rows();
@@ -1013,8 +1013,8 @@ mod tests {
         let rows = overlay_scan_batch(
             &base,
             &staged,
-            &LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
+            &HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
                     branch_ids: vec!["staged-branch".to_string()],
                     ..Default::default()
                 },
@@ -1064,8 +1064,8 @@ mod tests {
         let rows = overlay_scan_batch(
             &base,
             &staged,
-            &LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
+            &HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
                     branch_ids: vec![replaced_branch.to_string(), unaffected_branch.to_string()],
                     schema_keys: vec!["schema".to_string()],
                     ..Default::default()
@@ -1180,13 +1180,13 @@ mod tests {
                 ),
             ],
         };
-        let exact = |entity: &str| LiveStateExactRowRequest {
+        let exact = |entity: &str| HotStateExactRowRequest {
             schema_key: "schema".to_string(),
             branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             entity_pk: EntityPk::single(entity),
             file_id: None,
         };
-        let request = LiveStateExactBatchRequest {
+        let request = HotStateExactBatchRequest {
             rows: [
                 "base-branch",
                 "base-global",
@@ -1222,7 +1222,7 @@ mod tests {
         let tombstone = overlay_load_exact_batch(
             &base,
             &staged,
-            &LiveStateExactBatchRequest {
+            &HotStateExactBatchRequest {
                 rows: vec![exact("stage-delete")],
                 include_tombstones: true,
                 ..Default::default()
@@ -1244,8 +1244,8 @@ mod tests {
         value: &str,
         global: bool,
         change_id: Option<&str>,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: "schema".to_string(),
             file_id: None,
@@ -1267,8 +1267,8 @@ mod tests {
         entity_pk: &str,
         global: bool,
         change_id: Option<&str>,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
             snapshot_content: None,
             deleted: true,
             ..row_at(branch_id, entity_pk, "ignored", global, change_id)
@@ -1276,8 +1276,8 @@ mod tests {
     }
 
     fn matches_scan_request(
-        row: &MaterializedLiveStateRow,
-        request: &LiveStateScanRequest,
+        row: &MaterializedHotStateRow,
+        request: &HotStateScanRequest,
     ) -> bool {
         let filter = &request.filter;
         let branch_matches = filter.branch_ids.is_empty()
@@ -1301,20 +1301,20 @@ mod tests {
 
     struct EmptyStagedRows;
 
-    impl StagedLiveStateRows for EmptyStagedRows {
+    impl StagedHotStateRows for EmptyStagedRows {
         fn staged_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
-            Ok(MaterializedLiveStateBatch::default())
+            _request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            Ok(MaterializedHotStateBatch::default())
         }
 
         fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-            MaterializedLiveStateExactBatch::new(
-                MaterializedLiveStateBatch::default(),
+            request: &HotStateExactBatchRequest,
+        ) -> Result<MaterializedHotStateExactBatch, LixError> {
+            MaterializedHotStateExactBatch::new(
+                MaterializedHotStateBatch::default(),
                 vec![None; request.rows.len()],
             )
         }
@@ -1325,20 +1325,20 @@ mod tests {
         schema_key: &'a str,
     }
 
-    impl StagedLiveStateRows for ReplacedBranchStagedRows<'_> {
+    impl StagedHotStateRows for ReplacedBranchStagedRows<'_> {
         fn staged_batch(
             &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
-            Ok(MaterializedLiveStateBatch::default())
+            _request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            Ok(MaterializedHotStateBatch::default())
         }
 
         fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-            MaterializedLiveStateExactBatch::new(
-                MaterializedLiveStateBatch::default(),
+            request: &HotStateExactBatchRequest,
+        ) -> Result<MaterializedHotStateExactBatch, LixError> {
+            MaterializedHotStateExactBatch::new(
+                MaterializedHotStateBatch::default(),
                 vec![None; request.rows.len()],
             )
         }
@@ -1356,15 +1356,15 @@ mod tests {
     }
 
     struct FilteringStagedRows {
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<MaterializedHotStateRow>,
     }
 
-    impl StagedLiveStateRows for FilteringStagedRows {
+    impl StagedHotStateRows for FilteringStagedRows {
         fn staged_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
-            Ok(MaterializedLiveStateBatch::from_rows(
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            Ok(MaterializedHotStateBatch::from_rows(
                 self.rows
                     .iter()
                     .filter(|row| matches_scan_request(row, request))
@@ -1375,9 +1375,9 @@ mod tests {
 
         fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-            Ok(MaterializedLiveStateExactBatch::from_rows(
+            request: &HotStateExactBatchRequest,
+        ) -> Result<MaterializedHotStateExactBatch, LixError> {
+            Ok(MaterializedHotStateExactBatch::from_rows(
                 request
                     .rows
                     .iter()
@@ -1395,22 +1395,22 @@ mod tests {
     }
 
     struct ExistingGlobalOnlyReader {
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for ExistingGlobalOnlyReader {
+    impl HotStateReader for ExistingGlobalOnlyReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
             if request
                 .filter
                 .branch_ids
@@ -1425,23 +1425,23 @@ mod tests {
     }
 
     struct FilteringReader {
-        rows: Vec<MaterializedLiveStateRow>,
+        rows: Vec<MaterializedHotStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateReader for FilteringReader {
+    impl HotStateReader for FilteringReader {
         async fn load_exact_batch(
             &self,
-            request: &LiveStateExactBatchRequest,
-        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
+            request: &HotStateExactBatchRequest,
+        ) -> Result<MaterializedHotStateExactBatch, LixError> {
+            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
         async fn scan_batch(
             &self,
-            request: &LiveStateScanRequest,
-        ) -> Result<MaterializedLiveStateBatch, LixError> {
-            Ok(MaterializedLiveStateBatch::from_rows(
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            Ok(MaterializedHotStateBatch::from_rows(
                 self.rows
                     .iter()
                     .filter(|row| matches_scan_request(row, request))

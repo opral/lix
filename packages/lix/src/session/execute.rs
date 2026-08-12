@@ -875,7 +875,7 @@ where
                         active_branch_id: &active_branch_id,
                         active_account_id: self.active_account_id(),
                         read_store,
-                        live_state: Arc::clone(&self.live_state),
+                        hot_state: Arc::clone(&self.hot_state),
                         binary_cas: Arc::clone(&self.binary_cas),
                         branch_ctx: Arc::clone(&self.branch_ctx),
                         catalog_context: Arc::clone(&self.catalog_context),
@@ -1156,10 +1156,10 @@ where
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                 let plugin_cache_snapshot = read_store.snapshot_cache_key();
-                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
+                let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+                    Arc::new(self.hot_state.reader(read_store.clone()));
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-                    Arc::new(self.live_state.reader(read_store.clone()));
+                    Arc::new(self.hot_state.reader(read_store.clone()));
                 let branch_ref: Arc<dyn BranchRefReader> =
                     Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                 let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
@@ -1170,7 +1170,7 @@ where
                 let file_view_collector = sql2::SessionFileViews::default();
                 let result = sql2::execute_exact_lix_file_batch_read(
                     &active_branch_id,
-                    live_state,
+                    hot_state,
                     filesystem_path_index,
                     branch_ref,
                     blob_reader,
@@ -1977,7 +1977,7 @@ where
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
                     read_store,
-                    live_state: Arc::clone(&self.live_state),
+                    hot_state: Arc::clone(&self.hot_state),
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
@@ -2128,7 +2128,7 @@ where
                     active_branch_id: &active_branch_id,
                     active_account_id: self.active_account_id(),
                     read_store,
-                    live_state: Arc::clone(&self.live_state),
+                    hot_state: Arc::clone(&self.hot_state),
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
@@ -2302,7 +2302,7 @@ where
                 ExactFilesystemRead::RootFileListing => {
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    > = Arc::new(self.hot_state.reader(read_store.clone()));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store));
                     sql2::execute_exact_lix_file_root_listing(
@@ -2315,7 +2315,7 @@ where
                 ExactFilesystemRead::RootDirectoryListing => {
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    > = Arc::new(self.hot_state.reader(read_store.clone()));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store));
                     sql2::execute_exact_lix_directory_root_listing(
@@ -2326,11 +2326,11 @@ where
                     .await?
                 }
                 exact_filesystem_read => {
-                    let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                        Arc::new(self.live_state.reader(read_store.clone()));
+                    let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+                        Arc::new(self.hot_state.reader(read_store.clone()));
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    > = Arc::new(self.hot_state.reader(read_store.clone()));
                     let branch_ref: Arc<dyn BranchRefReader> =
                         Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                     let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
@@ -2339,7 +2339,7 @@ where
                         ExactFilesystemRead::Point(selector, column) => {
                             sql2::execute_exact_lix_file_read(
                                 &active_branch_id,
-                                live_state,
+                                hot_state,
                                 filesystem_path_index,
                                 branch_ref,
                                 blob_reader,
@@ -2353,7 +2353,7 @@ where
                         ExactFilesystemRead::PathContentBatch(paths) => {
                             sql2::execute_exact_lix_file_batch_read(
                                 &active_branch_id,
-                                live_state,
+                                hot_state,
                                 filesystem_path_index,
                                 branch_ref,
                                 blob_reader,
@@ -2368,7 +2368,7 @@ where
                         ExactFilesystemRead::IdManifestBatch(file_ids) => {
                             sql2::execute_exact_lix_file_id_manifest_batch_read(
                                 &active_branch_id,
-                                live_state,
+                                hot_state,
                                 filesystem_path_index,
                                 branch_ref,
                                 blob_reader,
@@ -2396,8 +2396,8 @@ where
                 file_view_mutations,
             ));
         }
-        let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-            Arc::new(self.live_state.reader(read_store.clone()));
+        let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+            Arc::new(self.hot_state.reader(read_store.clone()));
         let runtime_functions = if has_durable_runtime_function {
             Some(FunctionContext::prepare(&read_store).await?)
         } else {
@@ -2417,7 +2417,7 @@ where
             active_branch_id: &active_branch_id,
             active_account_id: self.active_account_id(),
             read_store: read_store.clone(),
-            live_state: Arc::clone(&self.live_state),
+            hot_state: Arc::clone(&self.hot_state),
             binary_cas: Arc::clone(&self.binary_cas),
             branch_ctx: Arc::clone(&self.branch_ctx),
             catalog_context: Arc::clone(&self.catalog_context),
@@ -2440,7 +2440,7 @@ where
         drop(ctx);
         if let Some(data_column_index) = late_file_content_column {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-                Arc::new(self.live_state.reader(read_store.clone()));
+                Arc::new(self.hot_state.reader(read_store.clone()));
             let branch_ref: Arc<dyn BranchRefReader> =
                 Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
             let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
@@ -2448,7 +2448,7 @@ where
             let mut materialized = query.query.into_sql_query_result()?;
             hydrate_lix_file_content_result(
                 &active_branch_id,
-                Arc::clone(&live_state),
+                Arc::clone(&hot_state),
                 filesystem_path_index,
                 branch_ref,
                 blob_reader,
@@ -2460,7 +2460,7 @@ where
             .await?;
             query.query = sql2::SessionReadResult::Rows(materialized);
         }
-        drop(live_state);
+        drop(hot_state);
         let file_view_mutations = file_view_collector
             .map(|collector| collector.plugin_file_mutations())
             .unwrap_or_default();
@@ -2680,7 +2680,7 @@ fn validate_execute_statement_metadata(
 #[allow(clippy::too_many_arguments)]
 async fn hydrate_lix_file_content_result(
     active_branch_id: &str,
-    live_state: Arc<dyn crate::live_state::LiveStateReader>,
+    hot_state: Arc<dyn crate::hot_state::HotStateReader>,
     filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
@@ -2705,7 +2705,7 @@ async fn hydrate_lix_file_content_result(
 
     let hydrated = sql2::execute_exact_lix_file_batch_read(
         active_branch_id,
-        live_state,
+        hot_state,
         filesystem_path_index,
         branch_ref,
         blob_reader,
@@ -3212,14 +3212,14 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) async fn scan_live_state_for_test(
+    pub(crate) async fn scan_hot_state_for_test(
         &mut self,
-        request: &crate::live_state::LiveStateScanRequest,
-    ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+        request: &crate::hot_state::HotStateScanRequest,
+    ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
         let _operation_guard = self.begin_session_operation()?;
         let transaction = self.transaction_mut()?;
         transaction.flush_prepared_mutations_for_read().await?;
-        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_live_state_batch(
+        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_hot_state_batch(
             transaction,
             request,
         )
@@ -4474,7 +4474,7 @@ mod tests {
     use crate::telemetry::{
         CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TelemetryValue,
     };
-    use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
+    use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
     use crate::{
         Memory,
         engine::{Engine, EngineOptions},
@@ -4529,7 +4529,7 @@ mod tests {
             .await
             .expect("columnar route read should open");
         let overlay_rows = session
-            .live_state
+            .hot_state
             .reader(&read)
             .entity_columnar_overlay_len_for_test(&branch_id, schema_key)
             .await
@@ -4570,7 +4570,7 @@ mod tests {
                 .expect("replacement metadata should load")
                 .expect("current head must publish replacement metadata");
         assert_eq!(u64::from(replay.member_count), expected_rows);
-        let id = crate::live_state::entity_row_group_set_id(head.commit_id, schema_key);
+        let id = crate::hot_state::entity_row_group_set_id(head.commit_id, schema_key);
         let manifest = crate::columnar_row_group::load_row_group_manifest(&state_read, id)
             .await
             .expect("columnar manifest lookup should succeed");
@@ -6061,7 +6061,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("sidecar read scope should open");
-        let row_group_id = crate::live_state::entity_row_group_set_id(
+        let row_group_id = crate::hot_state::entity_row_group_set_id(
             crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle insert head")
                 .expect("insert head should be canonical"),
             "columnar_lifecycle_probe",
@@ -6672,6 +6672,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(before.rows(), after.rows());
+    }
+
+    /// A file and its rows share one durability lane. An untracked
+    /// parameter batch large enough to reach the dense certified transport
+    /// must still land untracked — the lane is not a function of batch size.
+    #[tokio::test]
+    async fn expdl_dense_scale_untracked_parameter_batch_stays_untracked() {
+        // The dense certified transport engages at this row count, so this is
+        // the smallest batch that can exercise the dense projection.
+        const ROW_COUNT: usize = 32 * 1024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "expdl_dense_untracked_lane_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "anyOf": [
+                        { "type": "object" },
+                        { "type": "array" },
+                        { "type": "string" },
+                        { "type": "number" },
+                        { "type": "boolean" },
+                        { "type": "null" }
+                    ]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema \
+                 (value, lixcol_global, lixcol_untracked) \
+                 VALUES (lix_json($1), false, true)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("untracked schema registration should succeed");
+
+        let sql = "INSERT INTO expdl_dense_untracked_lane_probe \
+                   (path, value, lixcol_untracked) VALUES ($1, lix_json($2), TRUE)";
+        let statements = (0..ROW_COUNT)
+            .map(|index| ExecuteBatchStatement {
+                label: None,
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text(format!("/p-{index:05}")),
+                    Value::Text(format!("\"v-{index:05}\"")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&statements)
+            .await
+            .expect("dense-scale untracked parameter batch should commit");
+
+        let totals = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM expdl_dense_untracked_lane_probe",
+                &[],
+            )
+            .await
+            .expect("probe rows should read");
+        assert_eq!(
+            totals.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64
+        );
+
+        let lanes = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM expdl_dense_untracked_lane_probe \
+                 WHERE lixcol_untracked",
+                &[],
+            )
+            .await
+            .expect("probe lanes should read");
+        assert_eq!(
+            lanes.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64,
+            "every row of an untracked batch must stay in the untracked lane"
+        );
+
+        let commits = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM expdl_dense_untracked_lane_probe \
+                 WHERE lixcol_commit_id IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("probe commit ids should read");
+        assert_eq!(
+            commits.rows()[0].get::<i64>("entries").unwrap(),
+            0,
+            "untracked rows carry no commit id"
+        );
     }
 
     #[tokio::test]

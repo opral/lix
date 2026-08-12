@@ -13,9 +13,9 @@ use crate::changelog::{
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    CurrentStateDeltaRef, LiveStateContext, LiveStateFilter, LiveStateProjection,
-    LiveStateRowRequest, LiveStateScanRequest, TrackedHeadContext, WorkingDiffIndexCoverage,
+use crate::hot_state::{
+    CurrentStateDeltaRef, HotStateContext, HotStateFilter, HotStateProjection,
+    HotStateRowRequest, HotStateScanRequest, TrackedHeadContext, WorkingDiffIndexCoverage,
 };
 use crate::session::SessionMode;
 use crate::storage_adapter::Storage;
@@ -24,7 +24,7 @@ use crate::storage_adapter::{
     StorageWriteSetStats,
 };
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-00000000b001";
@@ -43,7 +43,7 @@ pub struct BenchTransactionRow {
 #[expect(missing_debug_implementations)]
 pub struct BenchTransactionFixture<StorageImpl: Storage> {
     storage: StorageAdapter<StorageImpl>,
-    live_state: Arc<LiveStateContext>,
+    hot_state: Arc<HotStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     branch_ctx: Arc<BranchContext>,
@@ -91,7 +91,7 @@ where
 
     pub async fn new(storage: StorageAdapter<StorageImpl>, rows: Vec<BenchTransactionRow>) -> Self {
         let tracked_state = Arc::new(TrackedStateContext::new());
-        let live_state = Arc::new(LiveStateContext::new(
+        let hot_state = Arc::new(HotStateContext::new(
             tracked_state.as_ref().clone(),
             crate::commit_graph::CommitGraphContext::new(),
         ));
@@ -99,7 +99,7 @@ where
         seed_visible_schema_rows(storage.clone(), tracked_state.as_ref()).await;
         Self {
             storage,
-            live_state,
+            hot_state,
             tracked_state,
             binary_cas: Arc::new(BinaryCasContext::new()),
             branch_ctx,
@@ -187,17 +187,17 @@ where
                 .expect("begin transaction bench read"),
         );
         let rows = self
-            .live_state
+            .hot_state
             .reader(read)
-            .scan_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+            .scan_batch(&HotStateScanRequest {
+                filter: HotStateFilter {
                     schema_keys: vec!["json_pointer".to_string()],
                     branch_ids: vec![BENCH_BRANCH_ID.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones: false,
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                projection: LiveStateProjection::default(),
+                projection: HotStateProjection::default(),
                 limit: None,
             })
             .await
@@ -237,17 +237,17 @@ where
                 .expect("begin transaction bench read"),
         );
         let rows = self
-            .live_state
+            .hot_state
             .reader(read)
-            .scan_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+            .scan_batch(&HotStateScanRequest {
+                filter: HotStateFilter {
                     schema_keys: vec!["json_pointer".to_string()],
                     branch_ids: vec![BENCH_BRANCH_ID.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones: false,
-                    ..LiveStateFilter::default()
+                    ..HotStateFilter::default()
                 },
-                projection: LiveStateProjection::default(),
+                projection: HotStateProjection::default(),
                 limit: None,
             })
             .await
@@ -279,9 +279,9 @@ where
                 .expect("begin transaction bench read"),
         );
         let row = self
-            .live_state
+            .hot_state
             .reader(read)
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: "json_pointer".to_string(),
                 branch_id: BENCH_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(row.entity_pk.clone()),
@@ -302,7 +302,7 @@ where
             },
             crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             self.storage.clone(),
-            Arc::clone(&self.live_state),
+            Arc::clone(&self.hot_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             crate::plugin::PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),

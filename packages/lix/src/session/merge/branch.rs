@@ -20,7 +20,7 @@ use crate::tracked_state::{
     MaterializedTrackedStateRowRef, TrackedStateDiffIdentity, TrackedStateKey, TrackedStateKeyRef,
     TrackedStateMergeConflict, TrackedStateStoreReader,
 };
-use crate::transaction::types::{
+use crate::transaction_types::{
     RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 
@@ -34,7 +34,7 @@ use super::stats::MergeStats;
 use crate::common::{SharedStr, compose_directory_path, compose_file_path};
 use crate::session::context::SessionContext;
 use crate::tracked_state::TrackedStateMergePick;
-use crate::transaction::types::StagedCommitChangeBatchBuilder;
+use crate::transaction::StagedCommitChangeBatchBuilder;
 use crate::wasm::{
     WasmByteSource, WasmChangeEffect, WasmConflictResolution, WasmConflictTake, WasmEntityConflict,
     WasmEntityKey, WasmFileDescriptor, WasmHostBytes, WasmPluginSelection, WasmSourceRange,
@@ -959,12 +959,12 @@ where
         .filter(|(index, _)| base_rows.row(*index).is_none())
         .map(|(_, key)| key.clone())
         .collect::<Vec<_>>();
-    let certified_base_rows = reader
-        .load_certified_rows_at_commit(
-            &analysis.commits.base_commit_id.to_string(),
-            &missing_base_keys,
-        )
-        .await?;
+    let certified_base_rows = crate::hot_state::load_certified_rows_at_commit(
+        reader.store(),
+        &analysis.commits.base_commit_id.to_string(),
+        &missing_base_keys,
+    )
+    .await?;
 
     let mut groups = BTreeMap::<String, PluginMergeConflictGroup>::new();
     for (index, conflict) in semantic_conflicts.into_iter().enumerate() {
@@ -1032,7 +1032,7 @@ where
 }
 
 fn certified_live_payload(
-    row: &crate::live_state::MaterializedLiveStateRow,
+    row: &crate::hot_state::MaterializedHotStateRow,
 ) -> Option<PluginMergeConflictPayload> {
     if row.deleted {
         return None;

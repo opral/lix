@@ -15,8 +15,8 @@ use crate::binary_cas::BlobId;
 use crate::common::LixTimestamp;
 use crate::common::MutationIdentity;
 use crate::entity_pk::EntityPk;
-use crate::live_state::{MaterializedLiveStateExactBatch, MaterializedLiveStateRow};
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::hot_state::{MaterializedHotStateExactBatch, MaterializedHotStateRow};
+use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::{
     WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityChanges,
     WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,
@@ -246,9 +246,10 @@ pub(crate) fn materialize_keyless_creates(
 pub(crate) fn require_existing_id_authorities(
     plugin: &PluginRegistryEntry,
     keys: &[WasmEntityKey],
-    rows: &MaterializedLiveStateExactBatch,
+    rows: &MaterializedHotStateExactBatch,
     file_id: &str,
     branch_id: &str,
+    untracked: bool,
 ) -> Result<(), LixError> {
     if keys.len() != rows.len() {
         return Err(LixError::new(
@@ -267,7 +268,8 @@ pub(crate) fn require_existing_id_authorities(
                 && row.file_id() == Some(file_id)
                 && row.branch_id() == branch_id
                 && !row.global()
-                && !row.untracked()
+                // The authority row lives in its own file's lane.
+                && row.untracked() == untracked
         });
         if !valid {
             return Err(LixError::new(
@@ -297,7 +299,7 @@ struct ReservationValue {
 /// same-proof replay without another write, and rejects a truncated-context
 /// collision before semantic rows enter the transaction buffer.
 pub(crate) fn reserve_create_row(
-    existing: Option<&MaterializedLiveStateRow>,
+    existing: Option<&MaterializedHotStateRow>,
     bound: BoundCreateContext,
     file_id: &str,
     branch_id: &str,
@@ -334,7 +336,7 @@ pub(crate) fn reserve_create_row(
 /// rejecting it here prevents guest-local allocator errors from obscuring the
 /// public constraint violation.
 pub(crate) fn validate_create_reservation(
-    existing: Option<&MaterializedLiveStateRow>,
+    existing: Option<&MaterializedHotStateRow>,
     bound: BoundCreateContext,
     file_id: &str,
     branch_id: &str,
@@ -446,7 +448,7 @@ fn reservation_row(
 }
 
 fn validate_reservation_identity(
-    row: &MaterializedLiveStateRow,
+    row: &MaterializedHotStateRow,
     key: &str,
     file_id: &str,
     branch_id: &str,
@@ -588,7 +590,7 @@ mod tests {
         }
     }
 
-    fn row_for(bound: BoundCreateContext) -> MaterializedLiveStateRow {
+    fn row_for(bound: BoundCreateContext) -> MaterializedHotStateRow {
         let write = reserve_create_row(
             None,
             bound,
@@ -598,7 +600,7 @@ mod tests {
         )
         .expect("reserve")
         .expect("new row");
-        MaterializedLiveStateRow {
+        MaterializedHotStateRow {
             entity_pk: write.entity_pk.expect("pk"),
             schema_key: write.schema_key.into(),
             file_id: write.file_id.map(Into::into),
@@ -671,7 +673,7 @@ mod tests {
             .component(1)
             .expect("generated UUID");
         let key = WasmEntityKey::from_owned_parts("csv_row", vec![id.clone()]);
-        let row = MaterializedLiveStateRow {
+        let row = MaterializedHotStateRow {
             entity_pk: EntityPk::uuid_from_canonical(&id).expect("typed UUID primary key"),
             schema_key: "csv_row".into(),
             file_id: Some("01920000-0000-7000-8000-0000000000a2".into()),
@@ -689,12 +691,26 @@ mod tests {
 
         require_existing_id_authorities(
             &plugin(),
-            &[key],
-            &MaterializedLiveStateExactBatch::from_rows(vec![Some(row)]),
+            &[key.clone()],
+            &MaterializedHotStateExactBatch::from_rows(vec![Some(row.clone())]),
             "01920000-0000-7000-8000-0000000000a2",
             "main",
+            false,
         )
         .expect("typed UUID authority must compare without string-only accessors");
+
+        // The authority row must be matched in the requesting file's own lane.
+        // A tracked row can never satisfy an untracked file's create authority
+        // and vice versa, or a create would reserve across the lane boundary.
+        require_existing_id_authorities(
+            &plugin(),
+            &[key],
+            &MaterializedHotStateExactBatch::from_rows(vec![Some(row)]),
+            "01920000-0000-7000-8000-0000000000a2",
+            "main",
+            true,
+        )
+        .expect_err("a tracked authority row must not satisfy an untracked create");
     }
 
     #[test]

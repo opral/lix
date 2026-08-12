@@ -288,12 +288,6 @@ pub fn certified_entity_insert_parameter_batch_counters()
     }
 }
 
-/// Returns and resets the number of certified parameter-batch INSERT routes
-/// selected by the planner, before any physical staging occurs.
-pub fn take_certified_entity_insert_parameter_batch_certifications() -> u64 {
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_CERTIFICATIONS.swap(0, Ordering::Relaxed)
-}
-
 pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
 }
@@ -473,7 +467,6 @@ static ROOT_REPLAY_PLANS_LOADED: AtomicU64 = AtomicU64::new(0);
 static ROOT_REPLAY_PLANS_STAGED: AtomicU64 = AtomicU64::new(0);
 static ROOT_REPLAY_AVAILABLE_ROOT_PROBES: AtomicU64 = AtomicU64::new(0);
 static ROOT_REPLAY_AVAILABLE_ROOT_HITS: AtomicU64 = AtomicU64::new(0);
-static ROOT_REPLAY_PROOF_STAGINGS: AtomicU64 = AtomicU64::new(0);
 static ROOT_REPLAY_MAX_PLANS: AtomicU64 = AtomicU64::new(0);
 
 static ROOT_REPLAY_PLAN_LOAD_NANOS: AtomicU64 = AtomicU64::new(0);
@@ -492,8 +485,6 @@ pub struct RootReplayAccounting {
     pub plans_staged: u64,
     pub available_root_probes: u64,
     pub available_root_hits: u64,
-    /// Root stagings performed inside the ancestry proof itself.
-    pub proof_stagings: u64,
     pub max_plans_in_one_boundary: u64,
     pub plan_load_nanos: u64,
     pub stage_nanos: u64,
@@ -521,13 +512,6 @@ pub(crate) fn record_root_replay_available_root_probe(hit: bool) {
     }
 }
 
-/// Retained so the base and candidate arms of an A/B expose the same
-/// accounting surface; the bounded availability proof performs no stagings.
-#[allow(dead_code)]
-pub(crate) fn record_root_replay_proof_staging() {
-    ROOT_REPLAY_PROOF_STAGINGS.fetch_add(1, Ordering::Relaxed);
-}
-
 pub(crate) fn record_root_replay_plan_load_nanos(nanos: u64) {
     ROOT_REPLAY_PLAN_LOAD_NANOS.fetch_add(nanos, Ordering::Relaxed);
 }
@@ -543,7 +527,6 @@ pub fn take_root_replay_accounting() -> RootReplayAccounting {
         plans_staged: ROOT_REPLAY_PLANS_STAGED.swap(0, Ordering::Relaxed),
         available_root_probes: ROOT_REPLAY_AVAILABLE_ROOT_PROBES.swap(0, Ordering::Relaxed),
         available_root_hits: ROOT_REPLAY_AVAILABLE_ROOT_HITS.swap(0, Ordering::Relaxed),
-        proof_stagings: ROOT_REPLAY_PROOF_STAGINGS.swap(0, Ordering::Relaxed),
         max_plans_in_one_boundary: ROOT_REPLAY_MAX_PLANS.swap(0, Ordering::Relaxed),
         plan_load_nanos: ROOT_REPLAY_PLAN_LOAD_NANOS.swap(0, Ordering::Relaxed),
         stage_nanos: ROOT_REPLAY_STAGE_NANOS.swap(0, Ordering::Relaxed),
@@ -763,6 +746,241 @@ pub(crate) fn record_replay_node_encode(nanos: u64, bytes: u64) {
 #[cfg(feature = "root-replay-trace")]
 pub(crate) fn record_replay_node_hash(nanos: u64, bytes: u64) {
     replay_trace::record_node_hash(nanos, bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Plan-load phase attribution (experiment AB).
+//
+// Splits one commit-root rebuild plan load into named phases and, for every
+// phase, separates the time spent inside the storage adapter's `get_many`
+// boundary (I/O) from everything else (decode + allocation + setup). Also
+// counts physical read batches and keys per phase, so "how many physical reads
+// does one plan load issue" is answered by a counter rather than a guess.
+//
+// Gated behind `root-replay-trace` exactly like the AA attribution, so no A/B
+// timing build pays for an `Instant::now()` inside `get_many`.
+// ---------------------------------------------------------------------------
+
+/// Named phases of one commit-root rebuild plan load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanLoadPhase {
+    /// Everything outside a plan load.
+    Other = 0,
+    /// `load_available_root` — the bounded durable-root availability probe.
+    AvailProbe = 1,
+    /// `ChangelogReader::load_commits` for the one replayed commit.
+    CommitRecord = 2,
+    /// `load_point_replay_commit_state` — commit-state header + inventory.
+    ReplayState = 3,
+    /// Mutation-directory routing plus packed commit-delta segment reads and
+    /// leaf decode.
+    DeltaSegments = 4,
+    /// Owned-key materialization of the decoded batch into plan deltas.
+    Collect = 5,
+    /// `commit_root_tree_is_readable` — the full tracked-state tree scan the
+    /// availability probe runs to prove the addressed chunk closure is
+    /// physically readable. Nested inside `AvailProbe`.
+    AvailTreeScan = 6,
+}
+
+pub const PLAN_LOAD_PHASE_COUNT: usize = 7;
+
+pub const PLAN_LOAD_PHASE_NAMES: [&str; PLAN_LOAD_PHASE_COUNT] = [
+    "other",
+    "avail_probe",
+    "commit_record",
+    "replay_state",
+    "delta_segments",
+    "collect",
+    "avail_tree_scan",
+];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanLoadPhaseMetric {
+    /// Wall time inside the phase guard.
+    pub wall_nanos: u64,
+    /// Wall time inside `StorageAdapterRead::get_many` while in this phase.
+    pub io_nanos: u64,
+    /// `StorageAdapterRead::get_many` invocations issued while in this phase.
+    pub read_calls: u64,
+    /// Logical per-space requests inside those invocations.
+    pub read_batches: u64,
+    /// Keys requested across those batches.
+    pub read_keys: u64,
+    /// Keys that returned a value.
+    pub read_hits: u64,
+    /// Bytes returned by those batches.
+    pub read_bytes: u64,
+    /// Times the phase guard was entered.
+    pub entries: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanLoadAttribution {
+    pub phases: [PlanLoadPhaseMetric; PLAN_LOAD_PHASE_COUNT],
+    /// Plan loads completed (one per replayed ancestor).
+    pub plans: u64,
+    /// Commit-delta members decoded across those plan loads.
+    pub members_decoded: u64,
+    /// Members kept in the returned plan.
+    pub members_kept: u64,
+    /// Bytes of packed commit-delta segment payload decoded.
+    pub member_payload_bytes: u64,
+}
+
+/// True when this build carries the plan-load phase attribution.
+pub fn plan_load_trace_enabled() -> bool {
+    cfg!(feature = "root-replay-trace")
+}
+
+#[cfg(feature = "root-replay-trace")]
+mod plan_load_trace {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{PLAN_LOAD_PHASE_COUNT, PlanLoadAttribution, PlanLoadPhase, PlanLoadPhaseMetric};
+
+    const FIELDS: usize = 8;
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    static COUNTERS: [AtomicU64; PLAN_LOAD_PHASE_COUNT * FIELDS] =
+        [ZERO; PLAN_LOAD_PHASE_COUNT * FIELDS];
+    static PLANS: AtomicU64 = AtomicU64::new(0);
+    static MEMBERS_DECODED: AtomicU64 = AtomicU64::new(0);
+    static MEMBERS_KEPT: AtomicU64 = AtomicU64::new(0);
+    static MEMBER_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static PHASE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn add(phase: usize, field: usize, value: u64) {
+        COUNTERS[phase * FIELDS + field].fetch_add(value, Ordering::Relaxed);
+    }
+
+    pub(super) fn current_phase() -> usize {
+        PHASE.with(Cell::get)
+    }
+
+    pub(super) fn set_phase(phase: usize) -> usize {
+        PHASE.with(|slot| slot.replace(phase))
+    }
+
+    pub(super) fn record_phase_wall(phase: usize, nanos: u64) {
+        add(phase, 0, nanos);
+        add(phase, 6, 1);
+    }
+
+    pub(super) fn record_io(nanos: u64, batches: u64, keys: u64, hits: u64, bytes: u64) {
+        let phase = current_phase();
+        add(phase, 1, nanos);
+        add(phase, 2, batches);
+        add(phase, 3, keys);
+        add(phase, 4, hits);
+        add(phase, 5, bytes);
+        add(phase, 7, 1);
+    }
+
+    pub(super) fn record_plan(members_decoded: u64, members_kept: u64, payload_bytes: u64) {
+        PLANS.fetch_add(1, Ordering::Relaxed);
+        MEMBERS_DECODED.fetch_add(members_decoded, Ordering::Relaxed);
+        MEMBERS_KEPT.fetch_add(members_kept, Ordering::Relaxed);
+        MEMBER_PAYLOAD_BYTES.fetch_add(payload_bytes, Ordering::Relaxed);
+    }
+
+    pub(super) fn take() -> PlanLoadAttribution {
+        let mut phases = [PlanLoadPhaseMetric::default(); PLAN_LOAD_PHASE_COUNT];
+        for (index, phase) in phases.iter_mut().enumerate() {
+            let get = |field: usize| COUNTERS[index * FIELDS + field].swap(0, Ordering::Relaxed);
+            *phase = PlanLoadPhaseMetric {
+                wall_nanos: get(0),
+                io_nanos: get(1),
+                read_batches: get(2),
+                read_keys: get(3),
+                read_hits: get(4),
+                read_bytes: get(5),
+                entries: get(6),
+                read_calls: get(7),
+            };
+        }
+        PlanLoadAttribution {
+            phases,
+            plans: PLANS.swap(0, Ordering::Relaxed),
+            members_decoded: MEMBERS_DECODED.swap(0, Ordering::Relaxed),
+            members_kept: MEMBERS_KEPT.swap(0, Ordering::Relaxed),
+            member_payload_bytes: MEMBER_PAYLOAD_BYTES.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn phase_index(phase: PlanLoadPhase) -> usize {
+        phase as usize
+    }
+}
+
+pub fn take_plan_load_attribution() -> PlanLoadAttribution {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        plan_load_trace::take()
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    {
+        PlanLoadAttribution::default()
+    }
+}
+
+/// RAII guard marking the dynamic extent of one plan-load phase.
+///
+/// Phases nest: the guard restores the enclosing phase on drop, and wall time
+/// is charged to the phase named by the guard (so an inner phase's time is
+/// counted in both, exactly like a call-tree self/total split at one level).
+pub(crate) struct PlanLoadPhaseScope {
+    #[cfg(feature = "root-replay-trace")]
+    phase: usize,
+    #[cfg(feature = "root-replay-trace")]
+    previous: usize,
+    #[cfg(feature = "root-replay-trace")]
+    start: std::time::Instant,
+}
+
+impl PlanLoadPhaseScope {
+    #[allow(unused_variables)]
+    pub(crate) fn enter(phase: PlanLoadPhase) -> Self {
+        #[cfg(feature = "root-replay-trace")]
+        {
+            let phase = plan_load_trace::phase_index(phase);
+            let previous = plan_load_trace::set_phase(phase);
+            Self {
+                phase,
+                previous,
+                start: std::time::Instant::now(),
+            }
+        }
+        #[cfg(not(feature = "root-replay-trace"))]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for PlanLoadPhaseScope {
+    fn drop(&mut self) {
+        #[cfg(feature = "root-replay-trace")]
+        {
+            plan_load_trace::record_phase_wall(self.phase, self.start.elapsed().as_nanos() as u64);
+            plan_load_trace::set_phase(self.previous);
+        }
+    }
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_plan_load_io(nanos: u64, batches: u64, keys: u64, hits: u64, bytes: u64) {
+    plan_load_trace::record_io(nanos, batches, keys, hits, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_plan_load_plan(members_decoded: u64, members_kept: u64, payload_bytes: u64) {
+    plan_load_trace::record_plan(members_decoded, members_kept, payload_bytes);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2384,16 +2602,16 @@ pub async fn current_image_cas_oracle_accounting<R>(
 where
     R: StorageAdapterRead,
 {
-    use crate::live_state::LiveStateScanRequest;
+    use crate::hot_state::HotStateScanRequest;
 
-    let live_state = crate::live_state::LiveStateContext::new(
+    let hot_state = crate::hot_state::HotStateContext::new(
         crate::tracked_state::TrackedStateContext::new(),
         crate::commit_graph::CommitGraphContext::new(),
     );
-    let current_rows = live_state
+    let current_rows = hot_state
         .reader(read)
-        .scan_batch(&LiveStateScanRequest {
-            filter: crate::live_state::LiveStateFilter {
+        .scan_batch(&HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
                 schema_keys: vec!["lix_binary_blob_ref".to_owned()],
                 ..Default::default()
             },
@@ -2811,6 +3029,25 @@ pub fn storage_space_by_name(space_name: &str) -> crate::storage_adapter::Storag
         .expect("space name should exist")
 }
 
+/// The registered space for one physical space id, value semantics included.
+///
+/// Benchmarks and qualification harnesses that already hold an id must read
+/// their space here rather than re-declaring it with
+/// `StorageSpace::mutable`/`::immutable`. A space id has exactly one value
+/// semantics, and both adapters place data by that declaration — RocksDB by
+/// column family, SlateDB by LSM value versus object segment — so a harness
+/// that guesses the semantics scans a different physical location than the
+/// engine wrote. That is not hypothetical: `large_blob_updates` guessed
+/// `immutable` for `binary_cas.chunk` and handed a raw payload to the
+/// immutable-locator decoder, which reported it as data corruption.
+#[must_use]
+pub fn storage_space_by_id(space_id: u32) -> crate::storage_adapter::StorageSpace {
+    *native_storage_spaces()
+        .iter()
+        .find(|space| space.id.0 == space_id)
+        .unwrap_or_else(|| panic!("storage space id 0x{space_id:08x} is not registered"))
+}
+
 /// Per-row (key, value bytes) inventory of one space.
 ///
 /// Equivalence tests compare these inventories byte-for-byte, so the scan
@@ -2906,8 +3143,6 @@ pub fn content_address_rule(space_id: u32) -> ContentAddressRule {
         0x0005_0003 => ContentAddressRule::BinaryCasChunkPayload,
         // json_store.json
         0x0002_0001 => ContentAddressRule::JsonStorePayload,
-        // json_store.untracked_reclaim_candidate.v1
-        0x0002_0002 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
         // binary_cas.chunk_presence
         0x0005_0004 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
         _ => ContentAddressRule::NotContentAddressed,

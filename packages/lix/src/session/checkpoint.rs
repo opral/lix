@@ -4,9 +4,8 @@ use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_stage_row};
 use crate::gc::CheckpointGcState;
 use crate::storage_adapter::Storage;
 use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow};
-use crate::transaction::types::{
-    RawWriteBatch, StagedCommitChangeBatchBuilder, TransactionWrite, TransactionWriteMode,
-};
+use crate::transaction::StagedCommitChangeBatchBuilder;
+use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 
 use super::context::SessionContext;
 
@@ -229,7 +228,7 @@ mod tests {
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateDiffKind, TrackedStateDiffRow, TrackedStateKey,
     };
-    use crate::transaction::types::StagedCommitChangeBatchBuilder;
+    use crate::transaction::StagedCommitChangeBatchBuilder;
 
     #[test]
     fn canonicalized_added_timestamp_declines_source_membership_certificate() {

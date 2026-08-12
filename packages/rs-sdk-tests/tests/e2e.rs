@@ -3,8 +3,7 @@ mod benchmark_metrics;
 use bytes::Bytes;
 use lix::storage::{
     BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
-    ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
-    WriteOptions,
+    ReadOptions, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
 };
 use lix::storage_adapter::{
     StorageAdapter, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
@@ -409,6 +408,457 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
     lix.close()
         .await
         .expect("mixed-batch workspace should close");
+}
+
+/// Plugins behave identically irrespective of lane.
+///
+/// The tracked and untracked arms are deliberately kept in one test so that
+/// "identical behaviour" is *asserted* rather than asserted-about: the same
+/// bytes go through the same plugin and the same projection, and only the lane
+/// differs. Before plugin reconciliation was unskipped for untracked writes,
+/// the untracked arm produced no entity rows at all — an untracked JSON file
+/// was a descriptor plus a content blob whose contents were unqueryable.
+///
+/// The untracked arm's row shape is the one #1346 established: a real
+/// `change_id` (identity) with a NULL `commit_id` (no history). The change id
+/// is asserted as a property, never as a literal — its value is a function of
+/// UUID draw order.
+#[tokio::test]
+async fn untracked_json_file_produces_the_same_plugin_entity_rows_as_a_tracked_one() {
+    const TRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008a1";
+    const UNTRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008a2";
+    const TRACKED_PATH: &str = "/lane-parity-tracked.json";
+    const UNTRACKED_PATH: &str = "/lane-parity-untracked.json";
+    const CONTENT: &[u8] = br#"{"alpha":"plugin"}"#;
+
+    let lix = open_lix().await.expect("lane-parity workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+        &[
+            Value::Text(TRACKED_FILE_ID.to_owned()),
+            Value::Text(TRACKED_PATH.to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("tracked json file should write");
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text(UNTRACKED_FILE_ID.to_owned()),
+            Value::Text(UNTRACKED_PATH.to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("untracked json file should write");
+
+    // Both files must round-trip their bytes regardless of lane.
+    assert_eq!(
+        read_file(&lix, TRACKED_PATH).await.unwrap(),
+        Some(CONTENT.to_vec())
+    );
+    assert_eq!(
+        read_file(&lix, UNTRACKED_PATH).await.unwrap(),
+        Some(CONTENT.to_vec())
+    );
+
+    let member_row = async |file_id: &str| {
+        let result = lix
+            .execute(
+                "SELECT scalar_json, lixcol_untracked, lixcol_change_id, lixcol_commit_id \
+                 FROM json_object_member \
+                 WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("plugin-derived rows should query");
+        let [row] = result.rows() else {
+            panic!(
+                "expected exactly one plugin entity row for file '{file_id}', got {}",
+                result.len()
+            );
+        };
+        row.values().to_vec()
+    };
+
+    // Tracked arm: the pre-existing behaviour, kept beside the untracked arm as
+    // the reference the untracked arm has to match.
+    let [tracked_scalar, tracked_untracked, tracked_change_id, tracked_commit_id] =
+        member_row(TRACKED_FILE_ID).await.try_into().unwrap_or_else(|_| {
+            panic!("expected four projected columns for the tracked plugin entity row")
+        });
+    assert_eq!(tracked_scalar, Value::Text(r#""plugin""#.to_owned()));
+    assert_eq!(tracked_untracked, Value::Boolean(false));
+    assert!(
+        matches!(&tracked_change_id, Value::Text(value)
+            if uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil())),
+        "tracked plugin entity rows must carry a real change id, got {tracked_change_id:?}"
+    );
+    assert!(
+        matches!(&tracked_commit_id, Value::Text(value) if !value.is_empty()),
+        "tracked plugin entity rows enter the commit graph, got {tracked_commit_id:?}"
+    );
+
+    // Untracked arm: the same plugin, the same bytes, the same projection.
+    let [untracked_scalar, untracked_untracked, untracked_change_id, untracked_commit_id] =
+        member_row(UNTRACKED_FILE_ID)
+            .await
+            .try_into()
+            .unwrap_or_else(|_| {
+                panic!("expected four projected columns for the untracked plugin entity row")
+            });
+    assert_eq!(
+        untracked_scalar, tracked_scalar,
+        "the same JSON must parse to the same entity value irrespective of lane"
+    );
+    assert_eq!(
+        untracked_untracked,
+        Value::Boolean(true),
+        "entity rows inherit their file's lane"
+    );
+    assert!(
+        matches!(&untracked_change_id, Value::Text(value)
+            if uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil())),
+        "untracked plugin entity rows are identity-bearing, got {untracked_change_id:?}"
+    );
+    assert_eq!(
+        untracked_commit_id,
+        Value::Null,
+        "untracked plugin entity rows must stay outside the commit graph"
+    );
+
+    // Editing an entity row must round-trip back into the file's bytes on both
+    // lanes. This probes the read-path boundary deliberately left tracked-only
+    // in `sql2/providers/file.rs`: if an untracked file's content depended on
+    // being re-rendered from entities through that owner lookup, it would fail
+    // here rather than silently later.
+    for (file_id, path) in [
+        (TRACKED_FILE_ID, TRACKED_PATH),
+        (UNTRACKED_FILE_ID, UNTRACKED_PATH),
+    ] {
+        lix.execute(
+            "UPDATE json_object_member SET scalar_json = '\"edited\"' \
+             WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
+            &[Value::Text(file_id.to_owned())],
+        )
+        .await
+        .unwrap_or_else(|error| panic!("entity edit on '{path}' should commit: {error:?}"));
+        assert_eq!(
+            read_file(&lix, path).await.unwrap(),
+            Some(br#"{"alpha":"edited"}"#.to_vec()),
+            "an entity edit must re-render '{path}' irrespective of lane"
+        );
+    }
+
+    lix.close()
+        .await
+        .expect("lane-parity workspace should close");
+}
+
+/// Foreign-key equivalence across lanes on the ordinary decode path.
+///
+/// A tracked complete parse is retained as a certified packet, whose foreign
+/// keys are checked *within the batch* (`validate_certified_snapshot_packets`).
+/// An untracked complete parse takes the ordinary decode path instead, where
+/// foreign keys are resolved against live state by ordinary transaction
+/// validation. Those are different mechanisms, so equivalence has to be
+/// measured rather than argued.
+///
+/// `markdown_node` is the vehicle: it declares a self-referential foreign key
+/// `/parent_id` -> `markdown_node./id`.
+#[tokio::test]
+async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
+    const TRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008b1";
+    const UNTRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008b2";
+    const CONTENT: &[u8] = b"# Title\n\nA paragraph with *emphasis*.\n\n- one\n- two\n";
+
+    let lix = open_lix().await.expect("fk workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+        &[
+            Value::Text(TRACKED_FILE_ID.to_owned()),
+            Value::Text("/fk-tracked.md".to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("tracked markdown file should write");
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text(UNTRACKED_FILE_ID.to_owned()),
+            Value::Text("/fk-untracked.md".to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("untracked markdown file should write");
+
+    // Same bytes through the same plugin must yield the same graph shape on
+    // both lanes. A decode path that dropped or altered rows shows up here.
+    //
+    // Node ids are per-file UUIDs, so the shape is compared as each node's kind
+    // paired with its parent's *kind* — lane-independent, while still sensitive
+    // to a lost row or a reparented one.
+    let shape = async |file_id: &str| {
+        let result = lix
+            .execute(
+                "SELECT child.kind AS kind, parent.kind AS parent_kind \
+                 FROM markdown_node AS child \
+                 LEFT JOIN markdown_node AS parent \
+                   ON parent.lixcol_file_id = child.lixcol_file_id \
+                  AND parent.id = child.parent_id \
+                 WHERE child.lixcol_file_id = $1 \
+                 ORDER BY child.kind, parent.kind",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("markdown nodes should query");
+        result
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("kind").unwrap(),
+                    row.get::<Value>("parent_kind").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let tracked_shape = shape(TRACKED_FILE_ID).await;
+    let untracked_shape = shape(UNTRACKED_FILE_ID).await;
+    assert!(
+        tracked_shape.len() > 3,
+        "the fixture must produce a non-trivial node graph, got {tracked_shape:?}"
+    );
+    assert_eq!(
+        untracked_shape, tracked_shape,
+        "the ordinary decode path must produce the same node graph as the certified packet"
+    );
+
+    // Every foreign key must resolve inside its own file, on both lanes. A
+    // dangling parent_id is exactly what weaker validation would let through.
+    for file_id in [TRACKED_FILE_ID, UNTRACKED_FILE_ID] {
+        let dangling = lix
+            .execute(
+                "SELECT child.id FROM markdown_node AS child \
+                 WHERE child.lixcol_file_id = $1 AND child.parent_id IS NOT NULL \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM markdown_node AS parent \
+                     WHERE parent.lixcol_file_id = $1 AND parent.id = child.parent_id)",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("foreign-key resolution should query");
+        assert_eq!(
+            dangling.len(),
+            0,
+            "file '{file_id}' has markdown_node rows whose parent_id does not resolve"
+        );
+    }
+
+    // Enforcement must also be live, not merely satisfied by construction:
+    // deleting a referenced parent has to be rejected on both lanes alike.
+    let delete_parent = async |file_id: &str| {
+        let parents = lix
+            .execute(
+                "SELECT DISTINCT parent_id FROM markdown_node \
+                 WHERE lixcol_file_id = $1 AND parent_id IS NOT NULL LIMIT 1",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("parent lookup should query");
+        let parent_id = parents.rows()[0]
+            .get::<String>("parent_id")
+            .expect("a referenced parent id");
+        lix.execute(
+            "DELETE FROM markdown_node WHERE lixcol_file_id = $1 AND id = $2",
+            &[
+                Value::Text(file_id.to_owned()),
+                Value::Text(parent_id.clone()),
+            ],
+        )
+        .await
+        .err()
+        .map(|error| error.code)
+    };
+    let tracked_delete = delete_parent(TRACKED_FILE_ID).await;
+    let untracked_delete = delete_parent(UNTRACKED_FILE_ID).await;
+    assert_eq!(
+        untracked_delete, tracked_delete,
+        "deleting a referenced parent must fail (or succeed) identically on both lanes"
+    );
+
+    lix.close().await.expect("fk workspace should close");
+}
+
+/// Prior rows plus a fresh parse must compose on the ordinary decode path.
+///
+/// The collection-replacement marker a certified packet carries
+/// (`complete_file_state`) is not produced on the decode path. The argument
+/// that this is harmless is that `open_file` only runs when no prior entity
+/// state exists under the selected plugin, because a previous owner's rows are
+/// tombstoned separately. This measures that argument in the case where it
+/// would fail: rows already exist for the file when it is parsed fresh again.
+#[tokio::test]
+async fn a_fresh_reparse_after_ownership_loss_replaces_untracked_rows_like_tracked_ones() {
+    const TRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008c1";
+    const UNTRACKED_FILE_ID: &str = "01900000-0000-7000-8000-0000000008c2";
+    const TRACKED_PATH: &str = "/replace-tracked.json";
+    const UNTRACKED_PATH: &str = "/replace-untracked.json";
+
+    let lix = open_lix().await.expect("replacement workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let write = async |file_id: &str, path: &str, untracked: bool, body: &str| {
+        let sql = if untracked {
+            "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content"
+        } else {
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content"
+        };
+        lix.execute(
+            sql,
+            &[
+                Value::Text(file_id.to_owned()),
+                Value::Text(path.to_owned()),
+                Value::Blob(body.as_bytes().to_vec().into()),
+            ],
+        )
+        .await
+        .expect("json file should write");
+    };
+    let member_keys = async |file_id: &str| {
+        let result = lix
+            .execute(
+                "SELECT key FROM json_object_member \
+                 WHERE lixcol_file_id = $1 ORDER BY key",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("members should query");
+        result
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("key").unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    write(TRACKED_FILE_ID, TRACKED_PATH, false, r#"{"alpha":"one"}"#).await;
+    write(
+        UNTRACKED_FILE_ID,
+        UNTRACKED_PATH,
+        true,
+        r#"{"alpha":"one"}"#,
+    )
+    .await;
+    assert_eq!(member_keys(TRACKED_FILE_ID).await, vec!["alpha".to_owned()]);
+    assert_eq!(
+        member_keys(UNTRACKED_FILE_ID).await,
+        vec!["alpha".to_owned()]
+    );
+
+    // Dropping the archive retires the owner and tombstones the prior rows, so
+    // the next write parses each file fresh again with history behind it.
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = '/.lix/plugins/plugin_json.lixplugin'",
+        &[],
+    )
+    .await
+    .expect("plugin uninstall should commit");
+    install_plugin(&lix, "plugin_json", &build_json_plugin_archive())
+        .await
+        .expect("plugin reinstall should commit");
+
+    write(TRACKED_FILE_ID, TRACKED_PATH, false, r#"{"beta":"two"}"#).await;
+    write(UNTRACKED_FILE_ID, UNTRACKED_PATH, true, r#"{"beta":"two"}"#).await;
+
+    let tracked_after = member_keys(TRACKED_FILE_ID).await;
+    let untracked_after = member_keys(UNTRACKED_FILE_ID).await;
+    assert_eq!(
+        tracked_after,
+        vec!["beta".to_owned()],
+        "the tracked reparse must not leave the superseded member behind"
+    );
+    assert_eq!(
+        untracked_after, tracked_after,
+        "the untracked reparse must replace its rows exactly like the tracked one"
+    );
+
+    lix.close()
+        .await
+        .expect("replacement workspace should close");
+}
+
+/// Scopes the blast radius of unskipping reconciliation for untracked writes.
+///
+/// An untracked file whose path matches no installed plugin must keep working
+/// exactly as before: bytes in, bytes out, no entity rows, no plugin involved.
+/// This separates "untracked plugin-owned files are blocked" from the far worse
+/// "untracked files are blocked".
+#[tokio::test]
+async fn untracked_file_matching_no_plugin_is_unaffected_by_reconciliation() {
+    const FILE_ID: &str = "01900000-0000-7000-8000-0000000008a3";
+    const PATH: &str = "/lane-parity-unmatched.bin";
+    const CONTENT: &[u8] = b"\x00\x01\x02 not json, not csv";
+
+    let lix = open_lix().await.expect("workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text(FILE_ID.to_owned()),
+            Value::Text(PATH.to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("an untracked file matching no plugin must still write");
+
+    assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(CONTENT.to_vec()));
+
+    let untracked = lix
+        .execute(
+            "SELECT lixcol_untracked FROM lix_file WHERE id = $1",
+            &[Value::Text(FILE_ID.to_owned())],
+        )
+        .await
+        .expect("descriptor should query");
+    assert_eq!(untracked.len(), 1);
+    assert_eq!(untracked.rows()[0].values(), &[Value::Boolean(true)]);
+
+    lix.close().await.expect("workspace should close");
 }
 
 #[tokio::test]
@@ -5186,13 +5636,15 @@ async fn qualify_corrupt_current_plugin_checkpoint<B: CurrentPluginCheckpointCor
         "checkpoint payload must include authenticated bytes"
     );
     value[92] ^= 1;
-    let (space_id, canonical_name) = layout_space_catalog()
+    let (space_id, _) = layout_space_catalog()
         .into_iter()
         .find(|(_, name)| *name == CHECKPOINT_SPACE)
         .expect("plugin current-checkpoint space must be catalogued");
     let mut writes = storage.new_write_set();
     writes.put(
-        StorageSpace::mutable(SpaceId(space_id), canonical_name),
+        // A space id has exactly one value semantics; read it from the engine
+        // registry rather than restating it here.
+        lix::storage_bench::storage_space_by_id(space_id),
         StorageKey(Bytes::from(expected_key)),
         StorageValue {
             bytes: Bytes::from(value),
@@ -5224,6 +5676,112 @@ async fn qualify_corrupt_current_plugin_checkpoint<B: CurrentPluginCheckpointCor
         .await
         .expect("close rejected plugin-checkpoint fixture");
     drop(database);
+}
+
+/// Lane parity for the durable actor checkpoint.
+///
+/// #1353 made plugin reconciliation lane-neutral, but the checkpoint was still
+/// withheld from untracked files, so every session re-parsed them from scratch.
+/// `plugin.current_checkpoint.v2` is a dedicated mutable side space keyed by
+/// `branch_id ++ file_id` — no lane column, no commit link, no changelog — and
+/// its validity is content-addressed, so publishing one for an untracked file
+/// creates no cross-lane state and can never serve stale rows: it either
+/// matches the current generation, blob hash and semantic root, or the load
+/// degrades into the cold rebuild it was accelerating.
+///
+/// The second half is the correctness crux. A restored actor that served stale
+/// entity rows would be silent corruption, so the edit after cold reopen has to
+/// re-render exactly the bytes a cold rebuild would have produced.
+#[tokio::test]
+async fn untracked_plugin_file_publishes_and_restores_its_durable_checkpoint() {
+    const FILE_ID: &str = "01920000-0000-7000-8000-0000000000c3";
+    const PATH: &str = "/untracked-durable-checkpoint.json";
+    const CHECKPOINT_SPACE: &str = "plugin.current_checkpoint.v2";
+
+    let root = tempfile::tempdir().expect("create untracked checkpoint fixture");
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text(FILE_ID.to_owned()),
+            Value::Text(PATH.to_owned()),
+            Value::Blob(br#"{"alpha":"before"}"#.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("untracked plugin file should write");
+    let branch_id = lix
+        .active_branch_id()
+        .await
+        .expect("load untracked checkpoint branch owner");
+    lix.close()
+        .await
+        .expect("close untracked checkpoint fixture");
+
+    let mut expected_key = Vec::with_capacity(32);
+    expected_key.extend_from_slice(
+        uuid::Uuid::parse_str(&branch_id)
+            .expect("untracked checkpoint branch owner is a UUID")
+            .as_bytes(),
+    );
+    expected_key.extend_from_slice(
+        uuid::Uuid::parse_str(FILE_ID)
+            .expect("untracked checkpoint file owner is a UUID")
+            .as_bytes(),
+    );
+    let database =
+        RocksDB::open(root.path().join(".lix")).expect("reopen untracked checkpoint inventory");
+    let storage = StorageAdapter::new(database.clone());
+    let read = storage
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("open untracked checkpoint inventory read");
+    let entries = space_inventory(&read, CHECKPOINT_SPACE).await;
+    drop(read);
+    drop(storage);
+    drop(database);
+    assert!(
+        entries.iter().any(|(key, _)| key == &expected_key),
+        "an untracked plugin file must publish its durable checkpoint like a tracked one"
+    );
+
+    let lix = open_rocksdb_lix(root.path()).await;
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = '\"after\"' \
+         WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
+        &[Value::Text(FILE_ID.to_owned())],
+    )
+    .await
+    .expect("a restored untracked actor should accept an entity edit");
+    assert_eq!(
+        read_file(&lix, PATH).await.unwrap(),
+        Some(br#"{"alpha":"after"}"#.to_vec()),
+        "a restored checkpoint must re-render current bytes, never stale ones"
+    );
+    let still_untracked = lix
+        .execute(
+            "SELECT lixcol_untracked FROM lix_file WHERE id = $1",
+            &[Value::Text(FILE_ID.to_owned())],
+        )
+        .await
+        .expect("the untracked file should still be visible")
+        .rows()[0]
+        .get::<bool>("lixcol_untracked")
+        .expect("lane column should project");
+    assert!(
+        still_untracked,
+        "a durable checkpoint must not promote the file out of the untracked lane"
+    );
+    lix.close()
+        .await
+        .expect("close restored untracked checkpoint fixture");
 }
 
 #[tokio::test]
@@ -7344,12 +7902,15 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
     reopened.close().await.unwrap();
 }
 
-const CERTIFIED_ENTITY_BATCH_TEST_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0004_001f), "live_state.certified_entity_batch.v1");
-const CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE: StorageSpace = StorageSpace::mutable(
-    SpaceId(0x0004_0022),
-    "live_state.certified_entity_batch_page.v1",
-);
+// A space id has exactly one value semantics, declared once in the engine
+// registry. These read it back instead of restating id, name and semantics.
+fn certified_entity_batch_space() -> StorageSpace {
+    lix::storage_bench::storage_space_by_name("hot_state.certified_entity_batch.v1")
+}
+
+fn certified_entity_batch_page_space() -> StorageSpace {
+    lix::storage_bench::storage_space_by_name("hot_state.certified_entity_batch_page.v1")
+}
 const CEB2_FIXTURE_PATH: &str = "/ceb2-hard-cut.excalidraw";
 const CEB2_FIXTURE_BYTES: &[u8] = br#"{"type":"excalidraw","version":2,"elements":[{"id":"a","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}]}"#;
 
@@ -7430,7 +7991,7 @@ where
     );
     lix.close().await.expect("close CEB2 fixture workspace");
 
-    let contents = storage_space_entries(storage, CERTIFIED_ENTITY_BATCH_TEST_SPACE).await;
+    let contents = storage_space_entries(storage, certified_entity_batch_space()).await;
     assert!(
         !contents.is_empty(),
         "writer must publish a certified batch"
@@ -7440,7 +8001,7 @@ where
         "current writers must emit only CEB2"
     );
     assert!(
-        !storage_space_entries(storage, CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE)
+        !storage_space_entries(storage, certified_entity_batch_page_space())
             .await
             .is_empty(),
         "CEB2 writer must publish external pages"
@@ -7475,7 +8036,7 @@ async fn corrupt_first_ceb2_page<StorageImpl>(storage: &StorageImpl)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut pages = storage_space_entries(storage, CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE).await;
+    let mut pages = storage_space_entries(storage, certified_entity_batch_page_space()).await;
     let (key, mut bytes) = pages
         .drain(..)
         .next()
@@ -7488,7 +8049,7 @@ where
         .expect("open CEB2 corruption write");
     write
         .put_many(
-            CERTIFIED_ENTITY_BATCH_PAGE_TEST_SPACE,
+            certified_entity_batch_page_space(),
             PutBatch {
                 entries: vec![PutEntry {
                     key,

@@ -24,8 +24,8 @@ use crate::functions::FunctionContext;
 use crate::json_store::{
     JSON_INLINE_MAX_BYTES, JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
 };
-use crate::live_state::{
-    HotTrackedSnapshot, LiveStateContext, LiveStateRowRequest, MaterializedLiveStateRow,
+use crate::hot_state::{
+    HotTrackedSnapshot, HotStateContext, HotStateRowRequest, MaterializedHotStateRow,
     TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
 };
@@ -42,15 +42,15 @@ use crate::tracked_state::{
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
+#[cfg(test)]
+use crate::transaction::staged_commit_changes::StagedCommitChangeBatchBuilder;
+use crate::transaction::staged_commit_changes::{
+    StagedCommitChangeBatch, StagedCommitChangeRef, StagedCommitChangeRefs,
+};
 use crate::transaction::staging::{
     OrderedMutationJournal, PreparedInsertSelection, PreparedWriteSet,
 };
-#[cfg(test)]
-use crate::transaction::types::StagedCommitChangeBatchBuilder;
-use crate::transaction::types::{
-    PreparedStateBatch, PreparedStateRowRef, StagedCommitChangeBatch, StagedCommitChangeRef,
-    StagedCommitChangeRefs,
-};
+use crate::transaction_types::{PreparedStateBatch, PreparedStateRowRef};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
@@ -73,8 +73,8 @@ const PACKED_CURRENT_BASE_MIN_ROWS: usize = 512;
 const ROOTLESS_MAX_REPLAY_BYTES: u64 = crate::tracked_state::COMMIT_STATE_MAX_REPLAY_BYTES;
 
 fn compare_certified_predecessors(
-    left: &crate::live_state::CertifiedCurrentStatePredecessorRef<'_>,
-    right: &crate::live_state::CertifiedCurrentStatePredecessorRef<'_>,
+    left: &crate::hot_state::CertifiedCurrentStatePredecessorRef<'_>,
+    right: &crate::hot_state::CertifiedCurrentStatePredecessorRef<'_>,
 ) -> std::cmp::Ordering {
     left.schema_key
         .cmp(right.schema_key)
@@ -391,7 +391,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     .await?;
     let commit_rows = finalized.commit_rows;
     let tracked_roots = finalized.tracked_roots;
-    let mut certified_packet_root_rows = BTreeMap::<CommitId, Vec<MaterializedLiveStateRow>>::new();
+    let mut certified_packet_root_rows = BTreeMap::<CommitId, Vec<MaterializedHotStateRow>>::new();
     let mut certified_replacement_markers = BTreeMap::<CommitId, BTreeSet<TrackedStateKey>>::new();
     for file in prepared_writes
         .file_content_writes
@@ -428,7 +428,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                 replacement_schemas.extend(batch.schema_keys.iter().cloned());
             }
             expanded_rows.extend(
-                crate::live_state::materialize_certified_root_rows(
+                crate::hot_state::materialize_certified_root_rows(
                     &file.branch_id,
                     &file.file_id,
                     root.commit_id,
@@ -794,13 +794,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let certified_files = prepared_writes
         .file_content_writes
         .iter()
-        .map(|file| crate::live_state::CertifiedEntityBatchFileRef {
+        .map(|file| crate::hot_state::CertifiedEntityBatchFileRef {
             branch_id: &file.branch_id,
             file_id: &file.file_id,
             batches: file.certified_entity_batches(),
         })
         .collect::<Vec<_>>();
-    crate::live_state::stage_certified_entity_batches(
+    crate::hot_state::stage_certified_entity_batches(
         read,
         &mut writes,
         &certified_files,
@@ -845,7 +845,7 @@ fn certified_collection_replacement_marker(
     schema_key: &str,
     commit_id: CommitId,
     timestamp: LixTimestamp,
-) -> Result<MaterializedLiveStateRow, LixError> {
+) -> Result<MaterializedHotStateRow, LixError> {
     use crate::collection_generation::{
         COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
     };
@@ -872,7 +872,7 @@ fn certified_collection_replacement_marker(
     hasher.update(scope_key.as_bytes());
     let mut change_bytes = [0_u8; 16];
     change_bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    Ok(MaterializedLiveStateRow {
+    Ok(MaterializedHotStateRow {
         entity_pk: EntityPk::single(scope_key),
         schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
         file_id: None,
@@ -929,7 +929,7 @@ fn stage_state_json_payloads(
     json_writer: &mut crate::json_store::JsonStoreWriter,
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
-    certified_rows_by_commit: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    certified_rows_by_commit: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
     certified_refs_by_commit: &BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>>,
 ) -> Result<(), LixError> {
     json_writer.stage_batch(
@@ -967,7 +967,7 @@ struct CertifiedRootJsonRefs {
 }
 
 fn certified_root_json_refs(
-    rows_by_commit: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    rows_by_commit: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
 ) -> BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>> {
     let mut refs_by_commit = BTreeMap::new();
     for (&commit_id, rows) in rows_by_commit {
@@ -1136,7 +1136,7 @@ async fn stage_changelog_commits(
     staged_root_rebuild_commits: &mut BTreeSet<CommitId>,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     commit_rows: &[FinalizedCommitRow],
-    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
     mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     external_parent_manifests: &mut BTreeMap<
@@ -1606,11 +1606,11 @@ fn transaction_change_record_from_state_row<'a>(
         file_id: row.file_id.map(crate::common::SharedStr::as_str),
         snapshot: row.snapshot.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         metadata: row.metadata.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         created_at: row.updated_at,
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
@@ -1725,7 +1725,7 @@ fn tracked_delta_from_state_row(
     };
     let created_at = row
         .durable_predecessor
-        .map(crate::live_state::CertifiedCurrentStatePredecessor::created_at)
+        .map(crate::hot_state::CertifiedCurrentStatePredecessor::created_at)
         .transpose()?
         .unwrap_or(row.created_at);
     Ok(TrackedStateDeltaRef {
@@ -1747,11 +1747,11 @@ fn tracked_commit_delta_from_state_row(
         delta: tracked_delta_from_state_row(row)?,
         snapshot: row.snapshot.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         metadata: row.metadata.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
         base_coordinate: None,
@@ -1760,7 +1760,7 @@ fn tracked_commit_delta_from_state_row(
 }
 
 fn tracked_delta_from_certified_root_row(
-    row: &MaterializedLiveStateRow,
+    row: &MaterializedHotStateRow,
 ) -> Result<TrackedStateDeltaRef<'_>, LixError> {
     Ok(TrackedStateDeltaRef {
         schema_key: &row.schema_key,
@@ -1785,7 +1785,7 @@ fn tracked_delta_from_certified_root_row(
 }
 
 fn tracked_commit_delta_from_certified_root_row<'a>(
-    row: &'a MaterializedLiveStateRow,
+    row: &'a MaterializedHotStateRow,
     json_refs: &'a CertifiedRootJsonRefs,
 ) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
     Ok(TrackedStateCommitDeltaRef {
@@ -1870,9 +1870,61 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
     })
 }
 
+/// Builds this commit's index entries, plus witnesses for schemas it registers.
+///
+/// Put-only: rows whose indexed value changed publish a new entry and leave the
+/// superseded one behind, and deleted rows publish nothing. Both cases are
+/// resolved on read by re-checking candidates against the row, which is what
+/// lets this stay one pass over the commit's own rows with no reads.
+///
+/// The values arrive **pre-extracted** on the batch. Transaction validation
+/// already parses every staged snapshot, and `StageJson::value()` panics once
+/// that decoded column is released, so decoding again here would be both a
+/// second full parse of the commit and a deliberate route around that guard.
+/// A batch whose rows never reached extraction carries an empty
+/// [`StagedIndexValues`] and therefore publishes nothing at all — no entries
+/// and, critically, no witnesses, so those collections keep scanning instead of
+/// trusting an incomplete index.
+fn hot_index_writes_for_commit(
+    state_rows: &PreparedStateBatch,
+    branch_id: &str,
+    parent_control: Option<&BranchHeadControl>,
+) -> (Vec<crate::hot_state::HotIndexEntry>, BTreeSet<(String, u16)>) {
+    let staged = state_rows.staged_index_values();
+    let mut entries = Vec::new();
+    let mut witnesses = staged.registered_collections.clone();
+    for row in &staged.rows {
+        if row.branch_id.as_str() != branch_id {
+            continue;
+        }
+        // A schema the parent generation proves absent has an empty
+        // collection in this branch, so indexing it from this commit forward
+        // is complete and the witness is free. The bloom filter has no false
+        // negatives, so "absent" here is a proof, not a guess. A collection
+        // that predates this plane never gets a witness and keeps scanning.
+        let collection_starts_here =
+            parent_control.is_none_or(|control| !control.may_have_schema(row.schema_key.as_str()));
+        for (ordinal, value) in &row.columns {
+            if collection_starts_here {
+                witnesses.insert((row.schema_key.as_str().to_owned(), *ordinal));
+            }
+            let Some(value) = value else {
+                continue;
+            };
+            entries.push(crate::hot_state::HotIndexEntry {
+                schema_key: row.schema_key.as_str().to_owned(),
+                ordinal: *ordinal,
+                value: value.clone(),
+                entity_pk: row.entity_pk.clone(),
+            });
+        }
+    }
+    (entries, witnesses)
+}
+
 fn current_state_delta_from_state_row(
     row: PreparedStateRowRef<'_>,
-) -> Result<crate::live_state::CurrentStateDeltaRef<'_>, LixError> {
+) -> Result<crate::hot_state::CurrentStateDeltaRef<'_>, LixError> {
     let Some(change_id) = row.change_id else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -1889,11 +1941,15 @@ fn current_state_delta_from_state_row(
             )
         })?)
     };
-    Ok(crate::live_state::CurrentStateDeltaRef {
+    Ok(crate::hot_state::CurrentStateDeltaRef {
         schema_key: row.schema_key,
         file_id: row.file_id.map(crate::common::SharedStr::as_str),
         entity_pk: row.entity_pk,
-        change_id: (!row.untracked).then_some(change_id),
+        // Untracked rows are identity-bearing but history-free: the minted
+        // change_id travels with the row, while commit_id stays absent so the
+        // row never joins the commit graph. Changelog exclusion is enforced
+        // separately, by the addressable-change filter, not by dropping this.
+        change_id: Some(change_id),
         commit_id,
         untracked: row.untracked,
         deleted: row.snapshot.is_none(),
@@ -1901,11 +1957,11 @@ fn current_state_delta_from_state_row(
         updated_at: row.updated_at,
         snapshot: row.snapshot.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         metadata: row.metadata.map_or(
             crate::json_store::JsonSlotRef::None,
-            crate::transaction::types::StageJson::slot_ref,
+            crate::transaction_types::StageJson::slot_ref,
         ),
         columnar_base_coordinate: None,
     })
@@ -1931,12 +1987,12 @@ fn host_certified_batch_owns_live_row(
         })
 }
 
-impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
-    fn row(&self, index: usize) -> crate::live_state::DeferredFreshHotRowRef<'_> {
+impl crate::hot_state::DeferredFreshHotRows for PreparedStateBatch {
+    fn row(&self, index: usize) -> crate::hot_state::DeferredFreshHotRowRef<'_> {
         let row = PreparedStateBatch::row(self, index);
-        crate::live_state::DeferredFreshHotRowRef {
+        crate::hot_state::DeferredFreshHotRowRef {
             branch_id: row.branch_id.as_str(),
-            delta: crate::live_state::CurrentStateDeltaRef {
+            delta: crate::hot_state::CurrentStateDeltaRef {
                 schema_key: row.schema_key,
                 file_id: row.file_id.map(crate::common::SharedStr::as_str),
                 entity_pk: row.entity_pk,
@@ -1948,11 +2004,11 @@ impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
                 updated_at: row.updated_at,
                 snapshot: row.snapshot.map_or(
                     crate::json_store::JsonSlotRef::None,
-                    crate::transaction::types::StageJson::slot_ref,
+                    crate::transaction_types::StageJson::slot_ref,
                 ),
                 metadata: row.metadata.map_or(
                     crate::json_store::JsonSlotRef::None,
-                    crate::transaction::types::StageJson::slot_ref,
+                    crate::transaction_types::StageJson::slot_ref,
                 ),
                 columnar_base_coordinate: None,
             },
@@ -1962,12 +2018,15 @@ impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
 
 fn current_state_delta_from_engine_row(
     row: &EngineCurrentRow,
-) -> crate::live_state::CurrentStateDeltaRef<'_> {
-    crate::live_state::CurrentStateDeltaRef {
+) -> crate::hot_state::CurrentStateDeltaRef<'_> {
+    crate::hot_state::CurrentStateDeltaRef {
         schema_key: &row.change.schema_key,
         file_id: row.change.file_id.as_deref(),
         entity_pk: &row.change.entity_pk,
-        change_id: None,
+        // Engine rows arrive with their change record already built, so the id
+        // is authoritative here. This lane runs beside — not through — the
+        // prepared-row funnel, so the id has to be carried across explicitly.
+        change_id: Some(row.change.change_id),
         commit_id: None,
         untracked: true,
         deleted: row.change.snapshot == crate::json_store::JsonSlot::None,
@@ -2094,12 +2153,12 @@ async fn stage_tracked_commit_delta_index(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &mut PreparedStateBatch,
-    entity_columnar_write_sets: &mut crate::live_state::EntityColumnarWriteSets,
+    entity_columnar_write_sets: &mut crate::hot_state::EntityColumnarWriteSets,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     commit_rows: &[FinalizedCommitRow],
     selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
-    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
     certified_packet_json_refs: &BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>>,
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
@@ -2522,7 +2581,7 @@ fn try_stage_lossless_columnar_mutations(
     commit_id: CommitId,
     state_rows: &PreparedStateBatch,
     state_row_indices: &[RowIndex],
-    entity_columnar_write_sets: &mut crate::live_state::EntityColumnarWriteSets,
+    entity_columnar_write_sets: &mut crate::hot_state::EntityColumnarWriteSets,
 ) -> Result<Option<crate::tracked_state::OrderedAddressableCommitDeltaStage>, LixError> {
     if state_row_indices.is_empty()
         || entity_columnar_write_sets.dense_state_row_count() != Some(state_row_indices.len())
@@ -2586,7 +2645,7 @@ fn try_stage_lossless_columnar_mutations(
     }
     let parts = crate::tracked_state::ColumnarMutationPartSet {
         owner_commit_id: *commit_id.as_uuid().as_bytes(),
-        row_group_set_id: crate::live_state::entity_row_group_set_id(
+        row_group_set_id: crate::hot_state::entity_row_group_set_id(
             commit_id,
             first.schema_key.as_str(),
         )
@@ -2960,7 +3019,7 @@ fn select_new_rootless_ordered_commits(
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     ordered_addressable_commits: &BTreeSet<CommitId>,
-    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
 ) -> BTreeSet<CommitId> {
     let can_start_rootless_interval = tracked_roots.len() == 1;
@@ -2991,7 +3050,7 @@ fn select_new_rootless_ordered_commits(
 
 struct StagedHotHeads {
     controls: BTreeMap<String, BranchHeadControl>,
-    deferred_fresh_hot_plans: Vec<crate::live_state::DeferredFreshHotPlan>,
+    deferred_fresh_hot_plans: Vec<crate::hot_state::DeferredFreshHotPlan>,
 }
 
 /// Returns the commit snapshots that must be materialized before publication.
@@ -3121,7 +3180,7 @@ async fn build_lifecycle_tracked_snapshots(
                 "tracked lifecycle snapshot row is missing change_id",
             )
         })?;
-        let live = MaterializedLiveStateRow::from(row);
+        let live = MaterializedHotStateRow::from(row);
         let tracked = MaterializedTrackedStateRow::try_from(&live)?;
         let identity = TrackedStateKey {
             schema_key: tracked.schema_key.clone(),
@@ -3169,7 +3228,7 @@ async fn build_lifecycle_tracked_snapshots(
             .unwrap_or_default();
         for &row_index in row_indices {
             let row = state_rows.row(row_index);
-            let live = MaterializedLiveStateRow::from(row);
+            let live = MaterializedHotStateRow::from(row);
             let tracked = MaterializedTrackedStateRow::try_from(&live)?;
             apply_lifecycle_tracked_snapshot_row(
                 &mut rows,
@@ -3396,6 +3455,10 @@ fn lifecycle_generation(
     ref_change_id: ChangeId,
 ) -> CommitId {
     let mut hasher = blake3::Hasher::new();
+    // Domain-separation tag. These bytes are load-bearing: they feed a
+    // blake3 hash whose output is a persisted `CommitId`, so the string is
+    // an input to stored data, not a label. It deliberately keeps the old
+    // `live_state` spelling and must NOT be renamed with the module.
     hasher.update(b"lix.live_state.lifecycle_generation.v1");
     hasher.update(&(branch_id.len() as u64).to_be_bytes());
     hasher.update(branch_id.as_bytes());
@@ -3422,7 +3485,7 @@ async fn stage_tracked_head(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
-    entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
+    entity_columnar_write_sets: &crate::hot_state::EntityColumnarWriteSets,
     engine_rows: &[EngineCurrentRow],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
@@ -3954,7 +4017,7 @@ async fn stage_tracked_head(
         if can_defer_fresh_hot {
             let certified_file_id = certified_fresh_plugin_file_id
                 .expect("deferred fresh hot publication requires its certificate");
-            deferred_fresh_hot_plans.push(crate::live_state::DeferredFreshHotPlan::new(
+            deferred_fresh_hot_plans.push(crate::hot_state::DeferredFreshHotPlan::new(
                 &root.branch_id,
                 parent_generation,
                 state_rows,
@@ -4017,7 +4080,7 @@ async fn stage_tracked_head(
                     .zip(selected_rows)
                     .zip(selected_snapshots.iter().zip(selected_metadata))
                     .map(|((change_ref, row), (snapshot, metadata))| {
-                        crate::live_state::CurrentStateDeltaRef {
+                        crate::hot_state::CurrentStateDeltaRef {
                             schema_key: &row.schema_key,
                             file_id: row.file_id.as_deref(),
                             entity_pk: &row.entity_pk,
@@ -4048,7 +4111,7 @@ async fn stage_tracked_head(
             })
             .filter_map(|row| {
                 row.durable_predecessor.map(|value| {
-                    crate::live_state::CertifiedCurrentStatePredecessorRef {
+                    crate::hot_state::CertifiedCurrentStatePredecessorRef {
                         schema_key: row.schema_key.as_str(),
                         file_id: row.file_id.map(crate::common::SharedStr::as_str),
                         entity_pk: row.entity_pk,
@@ -4304,6 +4367,20 @@ async fn stage_tracked_head(
             ))
             .await?
         };
+        // The index plane is staged from this commit's own rows, so it is
+        // correct whichever physical route above published them, and it lands
+        // in the same write set as the rows themselves.
+        let (index_entries, index_witnesses) =
+            hot_index_writes_for_commit(state_rows, &root.branch_id, parent_control.as_ref());
+        if !index_entries.is_empty() || !index_witnesses.is_empty() {
+            crate::hot_state::stage_hot_index_entries(
+                writes,
+                &root.branch_id,
+                generation,
+                &index_entries,
+                &index_witnesses,
+            )?;
+        }
         if let Some(epoch) = working_diff_epoch {
             let next_epoch = TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: epoch.checkpoint_commit_id,
@@ -4502,7 +4579,7 @@ fn owned_absence_guards(guards: &[TrackedStateKeyRef<'_>]) -> BTreeSet<TrackedSt
 /// when the selectors diverge, validate the correlated INSERT identities
 /// against the untracked generation before publishing the tracked root.
 fn packed_current_base_guards_match(
-    deltas: &[crate::live_state::CurrentStateDeltaRef<'_>],
+    deltas: &[crate::hot_state::CurrentStateDeltaRef<'_>],
     guards: &[TrackedStateKeyRef<'_>],
 ) -> bool {
     if deltas.len() != guards.len() {
@@ -5108,7 +5185,7 @@ async fn stage_branch_head_control_publications(
         if let Some(old_control) = observation.control.as_ref() {
             let generation = old_control.tracked_generation;
             if !desired.is_some_and(|new_control| new_control.tracked_generation == generation) {
-                crate::live_state::stage_retire_hot_generation(read, writes, branch_id, generation)
+                crate::hot_state::stage_retire_hot_generation(read, writes, branch_id, generation)
                     .await?;
             }
             if desired.is_none_or(|new_control| new_control.ref_change_id != old_control.ref_change_id)
@@ -5183,14 +5260,14 @@ fn prepare_entity_columnar_write_sets(
     state_rows: &mut PreparedStateBatch,
     insert_selection: &PreparedInsertSelection,
     entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
-) -> Result<crate::live_state::EntityColumnarWriteSets, LixError> {
+) -> Result<crate::hot_state::EntityColumnarWriteSets, LixError> {
     if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS {
-        return Ok(crate::live_state::EntityColumnarWriteSets::new());
+        return Ok(crate::hot_state::EntityColumnarWriteSets::new());
     }
     let publishes_ordered_insert =
         insert_selection.len() == state_rows.len() && insert_selection.covers_all(state_rows.len());
     if !publishes_ordered_insert {
-        return Ok(crate::live_state::EntityColumnarWriteSets::new());
+        return Ok(crate::hot_state::EntityColumnarWriteSets::new());
     }
     if let Some((commit_id, schema_key, row_groups)) = state_rows.take_dense_entity_columnar() {
         let layout_is_current = entity_schema_catalog
@@ -5211,11 +5288,11 @@ fn prepare_entity_columnar_write_sets(
             let (row_group_set, input_locations) = row_groups.into_parts();
             let mut encoded = match input_locations {
                 crate::sql2::EntityRowGroupLocations::Dense { row_count } => {
-                    crate::live_state::EntityColumnarWriteSets::with_dense_state_rows(row_count)
+                    crate::hot_state::EntityColumnarWriteSets::with_dense_state_rows(row_count)
                 }
                 crate::sql2::EntityRowGroupLocations::Explicit(locations) => {
                     let mut encoded =
-                        crate::live_state::EntityColumnarWriteSets::with_state_row_count(
+                        crate::hot_state::EntityColumnarWriteSets::with_state_row_count(
                             state_rows.len(),
                         );
                     for (state_row_index, location) in locations.into_iter().enumerate() {
@@ -5231,10 +5308,10 @@ fn prepare_entity_columnar_write_sets(
     if let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input() {
         let Some(schema) = entity_schema_catalog.and_then(|catalog| catalog.schema(schema_key))
         else {
-            return Ok(crate::live_state::EntityColumnarWriteSets::new());
+            return Ok(crate::hot_state::EntityColumnarWriteSets::new());
         };
         let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
-            return Ok(crate::live_state::EntityColumnarWriteSets::new());
+            return Ok(crate::hot_state::EntityColumnarWriteSets::new());
         };
         let rows = state_rows.iter().zip(snapshots).map(|(row, snapshot)| {
             crate::sql2::EntityColumnarRowRef {
@@ -5244,7 +5321,7 @@ fn prepare_entity_columnar_write_sets(
             }
         });
         let mut encoded =
-            crate::live_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
+            crate::hot_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
         if let Some(row_groups) = crate::sql2::encode_registered_entity_row_groups(&spec, rows)? {
             let (row_group_set, input_locations) = row_groups.into_parts();
             for (state_row_index, location) in input_locations.iter().enumerate() {
@@ -5257,7 +5334,7 @@ fn prepare_entity_columnar_write_sets(
     let mut indices = BTreeMap::<(CommitId, String), Vec<usize>>::new();
     for (index, row) in state_rows.iter().enumerate() {
         if !insert_selection.contains(index) {
-            return Ok(crate::live_state::EntityColumnarWriteSets::new());
+            return Ok(crate::hot_state::EntityColumnarWriteSets::new());
         }
         let (Some(commit_id), Some(_snapshot)) = (row.commit_id, row.snapshot) else {
             continue;
@@ -5271,7 +5348,7 @@ fn prepare_entity_columnar_write_sets(
             .push(index);
     }
     let mut encoded =
-        crate::live_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
+        crate::hot_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
     for ((commit_id, schema_key), row_indices) in indices {
         if row_indices.len() < PACKED_CURRENT_BASE_MIN_ROWS {
             continue;
@@ -5522,7 +5599,7 @@ async fn stage_tracked_roots(
     staged_root_rebuild_commits: &BTreeSet<CommitId>,
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     insert_selection: &PreparedInsertSelection,
-    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
     certified_replacement_markers_by_commit: &BTreeMap<CommitId, BTreeSet<TrackedStateKey>>,
 ) -> Result<BTreeMap<CommitId, TrackedStateCommitRoot>, LixError> {
     let root_fence_ids = tracked_root_fence_ids(tracked_roots);
@@ -6303,12 +6380,12 @@ async fn validate_active_account_and_account_rows(
             format!("active account id '{active_account_id}' is not a canonical UUID"),
         )
     })?;
-    let account = LiveStateContext::new(
+    let account = HotStateContext::new(
         TrackedStateContext::new(),
         crate::commit_graph::CommitGraphContext::new(),
     )
     .reader(&*read)
-    .load_row(&LiveStateRowRequest {
+    .load_row(&HotStateRowRequest {
         schema_key: "lix_account".to_string(),
         branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
         entity_pk: account_pk,
@@ -6486,9 +6563,9 @@ mod tests {
     use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
-    use crate::live_state::{
-        HOT_ROW_SPACE, LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest,
-        LiveStateProjection, LiveStateRowRequest, PACKED_CURRENT_BASE_SPACE,
+    use crate::hot_state::{
+        ROW_SPACE, HotStateContext, HotStateExactBatchRequest, HotStateExactRowRequest,
+        HotStateProjection, HotStateRowRequest, PACKED_CURRENT_BASE_SPACE,
     };
     use crate::storage::{
         BeginScanOptions, CommitResult, GetManyResult, KeyRange, PutBatch, ScanCursor, SpaceId,
@@ -6498,7 +6575,7 @@ mod tests {
         Memory, MemoryRead, MemoryWrite, StorageAdapter, StorageAdapterReadScope, StorageKey,
         StorageReadOptions, StorageSpace, StorageWriteOptions,
     };
-    use crate::transaction::types::{
+    use crate::transaction_types::{
         PreparedRowFacts, TestPreparedStateRow, TransactionFileContent,
     };
     use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
@@ -6899,7 +6976,11 @@ mod tests {
         TRACKED_STATE_TREE_CHUNK_SPACE_ID,
         "tracked_state.tree_chunk",
     );
-    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
+    // Immutable, matching the canonical declaration in `tracked_state`. Only
+    // the id is load-bearing here (`has_mutations_in_space` keys on it), but a
+    // space id has exactly one value semantics, so restating it wrongly would
+    // be the drift `storage_spaces` exists to prevent.
+    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID,
         "tracked_state.commit_state_manifest.v7",
     );
@@ -7005,7 +7086,7 @@ mod tests {
         let tracked_pk = EntityPk::single("tracked-update");
         let untracked_pk = EntityPk::single("untracked-insert");
         let timestamp = ts("2026-01-01T00:00:00Z");
-        let delta = crate::live_state::CurrentStateDeltaRef {
+        let delta = crate::hot_state::CurrentStateDeltaRef {
             schema_key: "tracked_schema",
             file_id: None,
             entity_pk: &tracked_pk,
@@ -7031,8 +7112,8 @@ mod tests {
         );
     }
 
-    fn live_state_context() -> LiveStateContext {
-        LiveStateContext::new(
+    fn hot_state_context() -> HotStateContext {
+        HotStateContext::new(
             TrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
@@ -7072,7 +7153,7 @@ mod tests {
                         .v10_marker_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space == HOT_ROW_SPACE || space == crate::live_state::HOT_FILE_SPACE {
+                if space == ROW_SPACE || space == crate::hot_state::FILE_SPACE {
                     self.counts
                         .row_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -7097,7 +7178,7 @@ mod tests {
             range: KeyRange,
             opts: BeginScanOptions,
         ) -> Result<ScanCursor<'_>, StorageError> {
-            if space == HOT_ROW_SPACE || space == crate::live_state::HOT_FILE_SPACE {
+            if space == ROW_SPACE || space == crate::hot_state::FILE_SPACE {
                 self.counts.row_scan_calls.fetch_add(1, Ordering::Relaxed);
             }
             if space.id == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
@@ -7162,8 +7243,8 @@ mod tests {
             "ordinary_schema".into(),
             None,
             Some(
-                crate::transaction::types::stage_json_from_value(
-                    crate::transaction::types::TransactionJson::from_value_for_test(
+                crate::transaction_types::stage_json_from_value(
+                    crate::transaction_types::TransactionJson::from_value_for_test(
                         serde_json::from_str(large_snapshot.as_str())
                             .expect("large ordinary snapshot should parse"),
                     ),
@@ -7186,7 +7267,7 @@ mod tests {
         let certified_change_id = change_id("mixed-certified-change");
         let certified_rows = BTreeMap::from([(
             commit_id,
-            vec![MaterializedLiveStateRow {
+            vec![MaterializedHotStateRow {
                 entity_pk: EntityPk::single("certified"),
                 schema_key: "certified_schema".to_owned(),
                 file_id: Some("certified.csv".to_owned()),
@@ -7234,7 +7315,7 @@ mod tests {
         let large_snapshot_ref = certified_json_refs[&commit_id][0]
             .snapshot
             .expect("large certified snapshot should use a JSON ref");
-        let mut entity_columnar_write_sets = crate::live_state::EntityColumnarWriteSets::new();
+        let mut entity_columnar_write_sets = crate::hot_state::EntityColumnarWriteSets::new();
         let staged_index = stage_tracked_commit_delta_index(
             &read,
             &mut writes,
@@ -7363,7 +7444,7 @@ mod tests {
             "an unaddressed tracked commit still requires commit-state authority"
         );
         assert!(
-            writes.has_mutations_in_space(HOT_ROW_SPACE),
+            writes.has_mutations_in_space(ROW_SPACE),
             "a small ordinary tracked commit must retain point-addressable HOT state"
         );
         assert!(
@@ -7459,15 +7540,15 @@ mod tests {
             commit_rows.is_empty(),
             "commit rows are derived from changelog.commit, not stored in tracked roots"
         );
-        let derived_commit_rows = live_state_context()
+        let derived_commit_rows = hot_state_context()
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .scan_batch(&crate::live_state::LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
+            .scan_batch(&crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
                     schema_keys: vec!["lix_commit".to_string()],
                     branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
                     ..Default::default()
@@ -8394,8 +8475,8 @@ mod tests {
         second.created_at = ts("2026-01-02T00:00:00Z");
         second.updated_at = second.created_at;
         second.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "value": 2 }),
                 ),
                 "second rootless tracked row snapshot",
@@ -8447,8 +8528,8 @@ mod tests {
         third.created_at = ts("2026-01-03T00:00:00Z");
         third.updated_at = third.created_at;
         third.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "value": 3 }),
                 ),
                 "third rootless tracked row snapshot",
@@ -8811,7 +8892,7 @@ mod tests {
             .expect("normal tracked commit should persist");
 
         let counts = Arc::new(TrackedHeadReadCounts::default());
-        let scanned = live_state_context()
+        let scanned = hot_state_context()
             .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
@@ -8819,8 +8900,8 @@ mod tests {
                     .expect("counted scan read should open"),
                 counts: Arc::clone(&counts),
             }))
-            .scan_batch(&crate::live_state::LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
+            .scan_batch(&crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
                     branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
                     schema_keys: vec!["test_schema".to_string()],
                     untracked: Some(false),
@@ -8867,7 +8948,7 @@ mod tests {
             "a current head projection must not scan commit-state authority"
         );
 
-        let loaded = live_state_context()
+        let loaded = hot_state_context()
             .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
@@ -8875,7 +8956,7 @@ mod tests {
                     .expect("counted point read should open"),
                 counts: Arc::clone(&counts),
             }))
-            .load_row(&live_state_request())
+            .load_row(&hot_state_request())
             .await
             .expect("tracked point read should succeed")
             .expect("tracked row should be visible");
@@ -8885,7 +8966,7 @@ mod tests {
             "the exact tracked lookup must point-read the head projection"
         );
 
-        let exact_rows = live_state_context()
+        let exact_rows = hot_state_context()
             .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
@@ -8893,14 +8974,14 @@ mod tests {
                     .expect("counted exact batch read should open"),
                 counts: Arc::clone(&counts),
             }))
-            .load_exact_batch(&LiveStateExactBatchRequest {
-                rows: vec![LiveStateExactRowRequest {
+            .load_exact_batch(&HotStateExactBatchRequest {
+                rows: vec![HotStateExactRowRequest {
                     schema_key: "test_schema".to_string(),
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
                     entity_pk: EntityPk::single("entity-1"),
                     file_id: None,
                 }],
-                projection: LiveStateProjection::default(),
+                projection: HotStateProjection::default(),
                 untracked: Some(false),
                 include_tombstones: false,
             })
@@ -9269,7 +9350,7 @@ mod tests {
         assert_eq!(branch_control.working_diff_checkpoint_commit_id, None);
 
         let counts = Arc::new(TrackedHeadReadCounts::default());
-        let scanned = live_state_context()
+        let scanned = hot_state_context()
             .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
@@ -9277,8 +9358,8 @@ mod tests {
                     .expect("counted branch scan read should open"),
                 counts: Arc::clone(&counts),
             }))
-            .scan_batch(&crate::live_state::LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
+            .scan_batch(&crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     schema_keys: vec!["test_schema".to_string()],
                     untracked: Some(false),
@@ -9363,7 +9444,7 @@ mod tests {
             .await
             .expect("branch tombstone commit should persist");
 
-        let scanned = live_state_context()
+        let scanned = hot_state_context()
             .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
                 inner: memory
                     .begin_read(StorageReadOptions::default())
@@ -9371,8 +9452,8 @@ mod tests {
                     .expect("counted tombstone scan read should open"),
                 counts: Arc::clone(&counts),
             }))
-            .scan_batch(&crate::live_state::LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
+            .scan_batch(&crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     schema_keys: vec!["test_schema".to_string()],
                     untracked: Some(false),
@@ -9641,7 +9722,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -9672,14 +9753,14 @@ mod tests {
             .await
             .expect("writes should commit");
 
-        let loaded = live_state
+        let loaded = hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .load_row(&live_state_request())
+            .load_row(&hot_state_request())
             .await
             .expect("current row load should succeed")
             .expect("untracked row should be persisted in live state");
@@ -9687,7 +9768,10 @@ mod tests {
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
         );
-        assert_eq!(loaded.change_id, None);
+        // Identity without history, asserted in one place: the row keeps the
+        // exact change id it was staged with, and the changelog lookup for that
+        // same id immediately below finds nothing.
+        assert_eq!(loaded.change_id, Some(change_id("change-untracked")));
 
         let mut changelog_reader = ChangelogContext::new().reader(
             storage
@@ -9782,7 +9866,7 @@ mod tests {
         let write_batches = counting_storage.write_batches();
         let storage = StorageAdapter::new(counting_storage);
         let binary_cas = BinaryCasContext::new();
-        let live_state = Arc::new(live_state_context());
+        let hot_state = Arc::new(hot_state_context());
         let branch_ctx = BranchContext::new();
         {
             let mut read = storage
@@ -9953,14 +10037,14 @@ mod tests {
         let expected_commit_id = commit_id("test-uuid-1");
         assert_eq!(loaded_head, Some(expected_commit_id));
 
-        let untracked = live_state
+        let untracked = hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: "test_schema".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single("entity-2"),
@@ -9973,16 +10057,18 @@ mod tests {
             untracked.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
         );
-        assert_eq!(untracked.change_id, None);
+        // The untracked row in this mixed batch keeps its own staged id while
+        // the tracked row alongside it takes a commit-delta address.
+        assert_eq!(untracked.change_id, Some(change_id("change-untracked")));
 
-        let sequence_row = live_state
+        let sequence_row = hot_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .expect("read should open"),
             )
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
@@ -10351,14 +10437,12 @@ mod tests {
         row.schema_key = "lix_binary_blob_ref".into();
         row.file_id = Some(file_id.into());
         row.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
-                    serde_json::json!({
-                        "id": file_id,
-                        "blob_hash": blob_id.to_hex(),
-                        "size_bytes": payload.len(),
-                    }),
-                ),
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(serde_json::json!({
+                    "id": file_id,
+                    "blob_hash": blob_id.to_hex(),
+                    "size_bytes": payload.len(),
+                })),
                 "ordinary CAS epoch test blob reference",
             )
             .expect("ordinary file blob reference should stage"),
@@ -10505,8 +10589,8 @@ mod tests {
             schema_key: "test_schema".into(),
             file_id: None,
             snapshot: Some(
-                crate::transaction::types::stage_json_from_value(
-                    crate::transaction::types::TransactionJson::from_value_for_test(
+                crate::transaction_types::stage_json_from_value(
+                    crate::transaction_types::TransactionJson::from_value_for_test(
                         serde_json::json!({ "value": 1 }),
                     ),
                     "test tracked row snapshot",
@@ -10541,8 +10625,8 @@ mod tests {
     fn untracked_global_row(change_id: &str) -> TestPreparedStateRow {
         let mut row = tracked_global_row(change_id);
         row.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "value": "untracked" }),
                 ),
                 "test untracked row snapshot",
@@ -10566,13 +10650,11 @@ mod tests {
         row.entity_pk = EntityPk::single(branch_id);
         row.schema_key = BRANCH_REF_SCHEMA_KEY.into();
         row.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
-                    serde_json::json!({
-                        "id": branch_id,
-                        "commit_id": commit_id(target_commit_label).to_string(),
-                    }),
-                ),
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(serde_json::json!({
+                    "id": branch_id,
+                    "commit_id": commit_id(target_commit_label).to_string(),
+                })),
                 "test direct branch-ref snapshot",
             )
             .expect("branch-ref snapshot should stage"),
@@ -10589,8 +10671,8 @@ mod tests {
         row.entity_pk = EntityPk::single(key);
         row.schema_key = "lix_key_value".into();
         row.snapshot = Some(
-            crate::transaction::types::stage_json_from_value(
-                crate::transaction::types::TransactionJson::from_value_for_test(
+            crate::transaction_types::stage_json_from_value(
+                crate::transaction_types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "key": key, "value": value }),
                 ),
                 "test untracked key-value snapshot",
@@ -10600,8 +10682,8 @@ mod tests {
         row
     }
 
-    fn live_state_request() -> LiveStateRowRequest {
-        LiveStateRowRequest {
+    fn hot_state_request() -> HotStateRowRequest {
+        HotStateRowRequest {
             schema_key: "test_schema".to_string(),
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             entity_pk: EntityPk::single("entity-1"),

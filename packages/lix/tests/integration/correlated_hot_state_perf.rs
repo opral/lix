@@ -15,17 +15,17 @@ use lix::storage::{
 use lix::{ExecuteResult, Value};
 use serde::Serialize;
 
-const FILES_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_FILES";
-const BATCH_SIZES_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_BATCH_SIZES";
-const OPERATIONS_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_OPERATIONS";
-const WARMUPS_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_WARMUPS";
-const SAMPLES_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_SAMPLES";
-const SETUP_CHUNK_SIZE_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_SETUP_CHUNK_SIZE";
-const SEED_INPUT_PATH_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_SEED_INPUT_PATH";
-const SEED_OUTPUT_PATH_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_SEED_OUTPUT_PATH";
-const PROFILE_READY_PATH_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_PROFILE_READY_PATH";
-const PROFILE_GO_PATH_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_PROFILE_GO_PATH";
-const PROFILE_ITERATIONS_ENV: &str = "LIX_CORRELATED_LIVE_STATE_PERF_PROFILE_ITERATIONS";
+const FILES_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_FILES";
+const BATCH_SIZES_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_BATCH_SIZES";
+const OPERATIONS_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_OPERATIONS";
+const WARMUPS_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_WARMUPS";
+const SAMPLES_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_SAMPLES";
+const SETUP_CHUNK_SIZE_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_SETUP_CHUNK_SIZE";
+const SEED_INPUT_PATH_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_SEED_INPUT_PATH";
+const SEED_OUTPUT_PATH_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_SEED_OUTPUT_PATH";
+const PROFILE_READY_PATH_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_PROFILE_READY_PATH";
+const PROFILE_GO_PATH_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_PROFILE_GO_PATH";
+const PROFILE_ITERATIONS_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_PROFILE_ITERATIONS";
 
 // Seed input bypasses setup; seed output persists the exact bytes used by the run.
 // Setting any profile variable enables SELECT-only profile mode and requires all three.
@@ -39,7 +39,7 @@ const DEFAULT_SETUP_CHUNK_SIZE: usize = 500;
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "manual release-mode performance harness"]
-async fn correlated_live_state_sql_perf() {
+async fn correlated_hot_state_sql_perf() {
     let config = Config::from_env();
     let ids = file_ids(config.files);
     let seed_snapshot = prepare_seed_snapshot(&config, &ids).await;
@@ -93,7 +93,7 @@ async fn correlated_live_state_sql_perf() {
     };
 
     let report = Report {
-        benchmark: "correlated_live_state_sql",
+        benchmark: "correlated_hot_state_sql",
         config,
         measurements,
         profile_measurement,

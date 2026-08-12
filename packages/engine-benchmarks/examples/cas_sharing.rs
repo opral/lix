@@ -38,7 +38,6 @@ use lix::storage::{
     BeginScanOptions, CoreProjection, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, ReadOptions,
     SpaceId, Storage, StorageRead,
 };
-use lix::storage_adapter::StorageSpace;
 use lix::{CreateBranchOptions, Value};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{
@@ -551,11 +550,10 @@ async fn space_accounting<S>(storage: &S, space: SpaceId) -> (u64, u64)
 where
     S: Storage,
 {
-    let space = if space == PAYLOAD_SPACE {
-        StorageSpace::immutable(space, "benchmark.binary_cas_payload")
-    } else {
-        StorageSpace::mutable(space, "benchmark.binary_cas_metadata")
-    };
+    // A space id has exactly one value semantics and the engine registry is
+    // where it is declared; guessing it here scans a different physical
+    // location than the engine wrote.
+    let space = lix::storage_bench::storage_space_by_id(space.0);
     let read = storage
         .begin_read(ReadOptions::default())
         .await

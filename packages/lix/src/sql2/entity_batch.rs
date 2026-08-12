@@ -17,9 +17,9 @@ use datafusion::physical_plan::Statistics;
 
 use crate::LixError;
 use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey, LiveStateContext,
-    LiveStateRowFilter, LiveStateScanRequest,
+use crate::hot_state::{
+    EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey, HotStateContext,
+    HotStateRowFilter, HotStateScanRequest,
 };
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -29,7 +29,7 @@ pub(crate) struct EntityColumnarScanLayout {
     pub(crate) id: crate::columnar_row_group::RowGroupSetId,
     pub(crate) manifest: Arc<crate::columnar_row_group::RowGroupManifest>,
     pub(crate) manifest_digest: [u8; 32],
-    pub(crate) overlay: Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
+    pub(crate) overlay: Arc<Vec<crate::hot_state::EntityColumnarOverlayRow>>,
     pub(crate) branch_id: Arc<str>,
     pub(crate) head_commit_id: crate::changelog::CommitId,
     pub(crate) current_state_revision: u64,
@@ -49,7 +49,7 @@ pub(crate) struct EntityColumnarScanLayout {
 pub(crate) trait EntitySnapshotReader: Send + Sync {
     async fn scan_entity_snapshots(
         &self,
-        request: LiveStateScanRequest,
+        request: HotStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError>;
 
     /// Returns primary keys from the same committed direct-scan proof as raw
@@ -58,14 +58,14 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
     /// leaving all relational operators to DataFusion.
     async fn scan_entity_primary_keys(
         &self,
-        _request: LiveStateScanRequest,
+        _request: HotStateScanRequest,
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
         Ok(None)
     }
 
     async fn plan_entity_columnar_scan(
         &self,
-        _request: LiveStateScanRequest,
+        _request: HotStateScanRequest,
     ) -> Result<Option<Arc<EntityColumnarScanLayout>>, LixError> {
         Ok(None)
     }
@@ -151,18 +151,18 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
 }
 
 pub(crate) struct CurrentEntitySnapshotReader<S> {
-    live_state: Arc<LiveStateContext>,
+    hot_state: Arc<HotStateContext>,
     store: S,
     entity_columnar_shadow_masks: Arc<Mutex<EntityColumnarShadowMaskCache>>,
-    entity_decoded_columns: crate::live_state::EntityDecodedColumnCache,
+    entity_decoded_columns: crate::hot_state::EntityDecodedColumnCache,
 }
 
 impl<S> CurrentEntitySnapshotReader<S> {
-    pub(crate) fn new(live_state: Arc<LiveStateContext>, store: S) -> Self {
-        let entity_columnar_shadow_masks = live_state.entity_columnar_scan_cache();
-        let entity_decoded_columns = live_state.entity_decoded_column_cache();
+    pub(crate) fn new(hot_state: Arc<HotStateContext>, store: S) -> Self {
+        let entity_columnar_shadow_masks = hot_state.entity_columnar_scan_cache();
+        let entity_decoded_columns = hot_state.entity_decoded_column_cache();
         Self {
-            live_state,
+            hot_state,
             store,
             entity_columnar_shadow_masks,
             entity_decoded_columns,
@@ -177,12 +177,12 @@ where
 {
     async fn scan_entity_snapshots(
         &self,
-        request: LiveStateScanRequest,
+        request: HotStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
         if !direct_entity_snapshot_request(&request) {
             return Ok(None);
         }
-        self.live_state
+        self.hot_state
             .reader(self.store.clone())
             .scan_direct_entity_snapshots(&request)
             .await
@@ -190,12 +190,12 @@ where
 
     async fn scan_entity_primary_keys(
         &self,
-        request: LiveStateScanRequest,
+        request: HotStateScanRequest,
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
         if !direct_entity_snapshot_request(&request) {
             return Ok(None);
         }
-        self.live_state
+        self.hot_state
             .reader(self.store.clone())
             .scan_direct_entity_primary_keys(&request)
             .await
@@ -203,13 +203,13 @@ where
 
     async fn plan_entity_columnar_scan(
         &self,
-        request: LiveStateScanRequest,
+        request: HotStateScanRequest,
     ) -> Result<Option<Arc<EntityColumnarScanLayout>>, LixError> {
         if !direct_entity_columnar_request(&request) {
             return Ok(None);
         }
         Ok(self
-            .live_state
+            .hot_state
             .reader(self.store.clone())
             .plan_direct_entity_columnar_scan(&request)
             .await?
@@ -430,15 +430,15 @@ fn entity_columnar_mask_error(message: &str) -> LixError {
 /// PKs, so only a no-tombstone request without file or residual constraints
 /// can use it. Both Arrow and public-result consumers add their own
 /// output-shape checks above this shared serving boundary.
-fn direct_entity_snapshot_request(request: &LiveStateScanRequest) -> bool {
-    matches!(request.filter.rows, LiveStateRowFilter::All)
+fn direct_entity_snapshot_request(request: &HotStateScanRequest) -> bool {
+    matches!(request.filter.rows, HotStateRowFilter::All)
         && !request.filter.include_tombstones
         && request.filter.untracked.is_none()
         && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()
 }
 
-fn direct_entity_columnar_request(request: &LiveStateScanRequest) -> bool {
+fn direct_entity_columnar_request(request: &HotStateScanRequest) -> bool {
     direct_entity_snapshot_request(request)
         && request.filter.entity_pks.is_empty()
         && request.limit.is_none()
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn exact_primary_key_and_limit_bypass_columnar_scan() {
-        let mut request = LiveStateScanRequest::default();
+        let mut request = HotStateScanRequest::default();
         assert!(direct_entity_columnar_request(&request));
 
         request

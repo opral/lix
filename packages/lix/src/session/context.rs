@@ -19,9 +19,9 @@ use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
-use crate::live_state::{
-    LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateProjection,
-    LiveStateReader,
+use crate::hot_state::{
+    HotStateContext, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateProjection,
+    HotStateReader,
 };
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
@@ -45,20 +45,20 @@ pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 /// Loads the workspace selector from its canonical untracked current-state
 /// member when opening a workspace session.
 pub(crate) async fn load_workspace_branch_id_from_index(
-    live_state: &LiveStateContext,
+    hot_state: &HotStateContext,
     branch_ctx: &BranchContext,
     reader: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
-    let rows = live_state
+    let rows = hot_state
         .reader(reader)
-        .load_exact_batch(&LiveStateExactBatchRequest {
-            rows: vec![LiveStateExactRowRequest {
+        .load_exact_batch(&HotStateExactBatchRequest {
+            rows: vec![HotStateExactRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(WORKSPACE_BRANCH_KEY),
                 file_id: None,
             }],
-            projection: LiveStateProjection {
+            projection: HotStateProjection {
                 columns: vec!["snapshot_content".to_string()],
             },
             untracked: Some(true),
@@ -134,7 +134,7 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) mode: SessionMode,
     pub(super) active_account_id: Arc<str>,
     pub(super) storage: StorageAdapter<StorageImpl>,
-    pub(super) live_state: Arc<LiveStateContext>,
+    pub(super) hot_state: Arc<HotStateContext>,
     pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
@@ -158,7 +158,7 @@ where
     pub(crate) async fn open_workspace(
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        live_state: Arc<LiveStateContext>,
+        hot_state: Arc<HotStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
@@ -175,7 +175,7 @@ where
         let read =
             SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
         let branch_id =
-            load_workspace_branch_id_from_index(live_state.as_ref(), branch_ctx.as_ref(), &read)
+            load_workspace_branch_id_from_index(hot_state.as_ref(), branch_ctx.as_ref(), &read)
                 .await?;
         drop(read);
         Ok(Self::new(
@@ -184,7 +184,7 @@ where
             },
             active_account_id,
             storage,
-            live_state,
+            hot_state,
             tracked_state,
             binary_cas,
             branch_ctx,
@@ -204,7 +204,7 @@ where
         active_branch_id: String,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        live_state: Arc<LiveStateContext>,
+        hot_state: Arc<HotStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
@@ -224,7 +224,7 @@ where
             },
             active_account_id,
             storage,
-            live_state,
+            hot_state,
             tracked_state,
             binary_cas,
             branch_ctx,
@@ -244,7 +244,7 @@ where
         mode: SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        live_state: Arc<LiveStateContext>,
+        hot_state: Arc<HotStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
@@ -262,7 +262,7 @@ where
             mode,
             active_account_id,
             storage,
-            live_state,
+            hot_state,
             tracked_state,
             binary_cas,
             branch_ctx,
@@ -284,7 +284,7 @@ where
         mode: SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        live_state: Arc<LiveStateContext>,
+        hot_state: Arc<HotStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
@@ -304,7 +304,7 @@ where
             mode,
             active_account_id: Arc::from(active_account_id),
             storage,
-            live_state,
+            hot_state,
             tracked_state,
             binary_cas,
             branch_ctx,
@@ -533,7 +533,7 @@ where
             &self.mode,
             self.active_account_id.to_string(),
             self.storage.clone(),
-            Arc::clone(&self.live_state),
+            Arc::clone(&self.hot_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             self.plugin_host.clone(),
@@ -635,7 +635,7 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) active_branch_id: &'a str,
     pub(super) active_account_id: &'a str,
     pub(super) read_store: SharedStorageAdapterRead<R>,
-    pub(super) live_state: Arc<LiveStateContext>,
+    pub(super) hot_state: Arc<HotStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
@@ -656,10 +656,10 @@ where
                 "lix.perf.public_read.catalog_revision"
             ))
             .await?;
-        let live_state = self.live_state();
+        let hot_state = self.hot_state();
         self.catalog_context
             .compiled_catalog_for_transaction_open(
-                live_state.as_ref(),
+                hot_state.as_ref(),
                 &Domain::schema_catalog(self.active_branch_id.to_string(), true),
                 revision.as_ref(),
             )
@@ -707,20 +707,20 @@ where
     }
 
     #[expect(trivial_casts)]
-    fn live_state(&self) -> Arc<dyn LiveStateReader> {
-        Arc::new(self.live_state.reader(self.read_store.clone())) as Arc<dyn LiveStateReader>
+    fn hot_state(&self) -> Arc<dyn HotStateReader> {
+        Arc::new(self.hot_state.reader(self.read_store.clone())) as Arc<dyn HotStateReader>
     }
 
     fn entity_snapshot_reader(&self) -> Option<Arc<dyn crate::sql2::EntitySnapshotReader>> {
         Some(Arc::new(crate::sql2::CurrentEntitySnapshotReader::new(
-            Arc::clone(&self.live_state),
+            Arc::clone(&self.hot_state),
             self.read_store.clone(),
         )))
     }
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         let reader: Arc<dyn FilesystemPathIndexReader> =
-            Arc::new(self.live_state.reader(self.read_store.clone()));
+            Arc::new(self.hot_state.reader(self.read_store.clone()));
         reader
     }
 

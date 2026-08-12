@@ -1,7 +1,7 @@
-//! Anatomy of a `live_state.hot_row.v21` row, and what two branches share.
+//! Anatomy of a `hot_state.row.v21` row, and what two branches share.
 //!
 //! Experiment T attributed 95.4% of the two-branch storage delta to
-//! `live_state.hot_row.v21` and showed that two branches making *identical*
+//! `hot_state.row.v21` and showed that two branches making *identical*
 //! edits pay the same as two branches making *disjoint* edits. This tool
 //! answers the follow-up questions directly on the bytes:
 //!
@@ -27,13 +27,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use lix::integration::{Engine, SessionContext};
+use lix::registered_spaces::HOT_ROW_SPACE;
 use lix::storage::ReadOptions;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{layout_accounting, space_inventory};
 use lix::{CreateBranchOptions, Value};
 use lix_storage_slatedb::SlateDB;
 
-const HOT_ROW_SPACE: &str = "live_state.hot_row.v21";
 const SEED_BATCH_ROWS: usize = 5_000;
 const PAD_UNIT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -49,7 +49,7 @@ fn pad() -> String {
     PAD_UNIT.repeat(bytes.div_ceil(PAD_UNIT.len()))[..bytes].to_owned()
 }
 
-// Mirrors `live_state::tracked_head` value codec v8. Asserted against the
+// Mirrors `hot_state::tracked_head` value codec v8. Asserted against the
 // version byte of every scanned row, so a codec change fails loudly here.
 const HEAD_VALUE_VERSION: u8 = 8;
 const HEAD_VALUE_HEADER_BYTES: usize = 59;
@@ -626,7 +626,7 @@ async fn hot_inventory(storage: &SlateDB) -> Vec<(Vec<u8>, Vec<u8>)> {
         .begin_read(ReadOptions::default())
         .await
         .expect("open anatomy inventory read");
-    let inventory = space_inventory(&read, HOT_ROW_SPACE).await;
+    let inventory = space_inventory(&read, HOT_ROW_SPACE.name).await;
     drop(read);
     inventory
 }

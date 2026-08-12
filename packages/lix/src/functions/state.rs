@@ -13,8 +13,8 @@ use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
 };
-use crate::live_state::{
-    CurrentStateDeltaRef, LiveStateReadDomain, MaterializedLiveStateRow, TrackedHeadContext,
+use crate::hot_state::{
+    CurrentStateDeltaRef, HotStateReadDomain, MaterializedHotStateRow, TrackedHeadContext,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};
@@ -63,7 +63,7 @@ pub(crate) async fn stage_sequence(
     writes: &mut StorageWriteSet,
     sequence: DeterministicSequence,
     timestamp: LixTimestamp,
-    _change_id: ChangeId,
+    change_id: ChangeId,
 ) -> Result<StoragePrecondition, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
@@ -106,7 +106,10 @@ pub(crate) async fn stage_sequence(
                 schema_key: KEY_VALUE_SCHEMA_KEY,
                 file_id: None,
                 entity_pk: &entity_pk,
-                change_id: None,
+                // The caller already minted this id for the sequence row; this
+                // lane stages the head directly, so it must carry it rather
+                // than relying on the prepared-row path to supply one.
+                change_id: Some(change_id),
                 commit_id: None,
                 untracked: true,
                 deleted: false,
@@ -132,7 +135,7 @@ pub(crate) async fn stage_sequence(
 async fn load_key_value_row(
     read: &(impl StorageAdapterRead + ?Sized),
     key: &str,
-) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+) -> Result<Option<MaterializedHotStateRow>, LixError> {
     let Some(control) = BranchHeadControlContext::new()
         .reader(read)
         .load(GLOBAL_BRANCH_ID)
@@ -164,7 +167,7 @@ async fn load_key_value_row(
             control,
             &key_refs,
             &projection,
-            LiveStateReadDomain::Untracked,
+            HotStateReadDomain::Untracked,
         )
         .await?;
     let Some(row) = rows.row(0) else {
@@ -177,7 +180,7 @@ async fn load_key_value_row(
                     file_id: None,
                 },
                 key_refs[0],
-                LiveStateReadDomain::Untracked,
+                HotStateReadDomain::Untracked,
                 control.current_state_revision == 0,
             )
             .await?;
@@ -192,7 +195,7 @@ async fn load_key_value_row(
     Ok(Some(row.to_owned()))
 }
 
-fn key_value_payload(row: &MaterializedLiveStateRow, key: &str) -> Result<JsonValue, LixError> {
+fn key_value_payload(row: &MaterializedHotStateRow, key: &str) -> Result<JsonValue, LixError> {
     let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -258,7 +261,7 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 #[cfg(test)]
 mod tests {
     use crate::NullableKeyFilter;
-    use crate::live_state::{LiveStateContext, LiveStateRowRequest};
+    use crate::hot_state::{HotStateContext, HotStateRowRequest};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{
         Memory, StorageBeginScanOptions, StorageKey, StorageProjectedValue, StorageReadOptions,
@@ -267,8 +270,8 @@ mod tests {
 
     use super::*;
 
-    fn live_state_context() -> LiveStateContext {
-        LiveStateContext::new(
+    fn hot_state_context() -> HotStateContext {
+        HotStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
@@ -378,7 +381,7 @@ mod tests {
         .expect("valid empty prefix");
         let mut cursor = read
             .begin_scan(
-                crate::live_state::HOT_ROW_SPACE,
+                crate::hot_state::ROW_SPACE,
                 range,
                 StorageBeginScanOptions::default(),
             )
@@ -414,9 +417,9 @@ mod tests {
         drop(read);
 
         let mut corrupt = storage.new_write_set();
-        corrupt.delete(crate::live_state::HOT_ROW_SPACE, sequence_member.key);
+        corrupt.delete(crate::hot_state::ROW_SPACE, sequence_member.key);
         corrupt.put(
-            crate::live_state::HOT_ROW_SPACE,
+            crate::hot_state::ROW_SPACE,
             StorageKey(bytes::Bytes::from(unrelated_key)),
             StorageValue {
                 bytes: sequence_value,
@@ -468,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn write_sequence_persists_untracked_global_key_value() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
+        let hot_state = hot_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
 
         let mut writes = storage.new_write_set();
@@ -490,14 +493,14 @@ mod tests {
             .await
             .expect("sequence should commit");
 
-        let reader = live_state.reader(
+        let reader = hot_state.reader(
             storage
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("read should open"),
         );
         let row = reader
-            .load_row(&LiveStateRowRequest {
+            .load_row(&HotStateRowRequest {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
@@ -508,7 +511,14 @@ mod tests {
             .expect("sequence row should exist");
         assert!(row.untracked);
         assert!(row.global);
-        assert_eq!(row.change_id, None);
+        // The id the caller handed `stage_sequence` must survive to the head.
+        // Asserting the exact supplied label — rather than merely `is_some()` —
+        // is what proves this lane carries the caller's id instead of inventing
+        // one of its own.
+        assert_eq!(
+            row.change_id,
+            Some(ChangeId::for_test_label("sequence-change-7"))
+        );
         assert_eq!(row.commit_id, None);
         assert_eq!(
             row.snapshot_content.as_deref(),
@@ -547,7 +557,7 @@ mod tests {
                     schema_key: KEY_VALUE_SCHEMA_KEY,
                     file_id: None,
                     entity_pk: &entity_pk,
-                    change_id: None,
+                    change_id: Some(ChangeId::for_test_label("functions-state-sequence")),
                     commit_id: None,
                     untracked: true,
                     deleted: false,

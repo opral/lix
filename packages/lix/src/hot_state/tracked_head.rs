@@ -9,7 +9,7 @@
 
 mod hot;
 
-pub(crate) use crate::live_state::LiveStateReadDomain;
+pub(crate) use crate::hot_state::HotStateReadDomain;
 #[cfg(test)]
 pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
@@ -18,11 +18,13 @@ pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
     DeferredFreshHotRowRef, DeferredFreshHotRows, EntityColumnarOverlayRow,
-    HOT_COLLECTION_CONTROL_SPACE, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE,
-    HotStateTransactionCache, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
+    COLLECTION_CONTROL_SPACE, DIFF_SPACE, FILE_SPACE, INDEX_SPACE,
+    ROW_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, materialize_certified_root_rows,
-    scan_certified_history_rows, stage_certified_entity_batches, stage_retire_hot_generation,
+    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, load_certified_rows_at_commit,
+    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
+    stage_hot_index_entries,
+    stage_retire_hot_generation,
 };
 
 /// Stable physical address of a row in an immutable columnar base.
@@ -54,16 +56,15 @@ use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
-    JsonStoreWriter,
 };
-use crate::live_state::{
-    MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
-    MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+use crate::hot_state::{
+    MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
+    MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
     StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageSpace,
-    StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageSpaceId, StorageValue, StorageWriteSet, ValueSemantics,
 };
 use crate::storage_codec;
 use crate::tracked_state::{
@@ -72,10 +73,11 @@ use crate::tracked_state::{
     TrackedStateKey, TrackedStateKeyRef, TrackedStateScanRequest,
 };
 
-pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "live_state.hot_diff_marker.v16";
-pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "hot_state.diff_marker.v16";
+pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_001e),
     TRACKED_WORKING_DIFF_MARKER_NAMESPACE,
+    ValueSemantics::Mutable,
 );
 
 /// The active checkpoint epoch for the sparse working-diff indexes.
@@ -437,14 +439,40 @@ impl<'a> CurrentStateDeltaRef<'a> {
         }
     }
 
+    /// Enforces the untracked-row identity invariant at head staging.
+    ///
+    /// Untracked rows carry identity but no history: a real, non-nil
+    /// `change_id` so every row is addressable, and an absent `commit_id`
+    /// because they are not members of the commit graph.
+    ///
+    /// This check lives here, at head staging, rather than upstream at the
+    /// prepared-row funnel, and that placement is load-bearing. An experiment
+    /// on this branch hard-errored inside
+    /// `transaction::commit::current_state_delta_from_state_row` — the
+    /// prepared-row funnel — to test whether every untracked row reaches the
+    /// head through it. It does not. The probe never fired, while 169 staging
+    /// failures showed **four production lanes that build untracked deltas
+    /// outside that funnel entirely**: repository init (`init::plan`'s seed
+    /// rows), `current_state_delta_from_engine_row`,
+    /// `functions::state::stage_sequence`, and `hot::stage_hot_bootstrap`.
+    /// Each already had a real id in hand and was discarding it.
+    ///
+    /// So the id cannot be guaranteed by any single upstream site. Head
+    /// staging is the one place every lane converges, which makes this the
+    /// only sound place to enforce it. Do not "simplify" this by moving the
+    /// check upstream to the funnel — that model was tested and is false.
     fn validate(self) -> Result<(), LixError> {
-        match (self.untracked, self.change_id, self.commit_id, self.deleted) {
-            (false, Some(_), Some(_), _) | (true, None, None, false | true) => Ok(()),
-            (false, _, _, _) => Err(head_value_error(
+        let untracked_id_is_usable = self
+            .change_id
+            .is_some_and(|change_id| !change_id.as_uuid().is_nil());
+        match (self.untracked, self.change_id, self.commit_id) {
+            (false, Some(_), Some(_)) => Ok(()),
+            (true, _, None) if untracked_id_is_usable => Ok(()),
+            (false, _, _) => Err(head_value_error(
                 "tracked current-state mutation must carry change_id and commit_id",
             )),
-            (true, _, _, _) => Err(head_value_error(
-                "untracked current-state mutation must not carry change_id or commit_id",
+            (true, _, _) => Err(head_value_error(
+                "untracked current-state mutation must carry a non-nil change_id and no commit_id",
             )),
         }
     }
@@ -557,29 +585,6 @@ fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixE
             delta.schema_key, delta.entity_pk, delta.file_id
         ),
     )
-}
-
-fn collect_retired_untracked_json_refs(
-    existing: HeadValueView<'_>,
-    delta: &CurrentStateDeltaRef<'_>,
-    retired: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) {
-    debug_assert!(existing.untracked);
-    if !delta.untracked {
-        return;
-    }
-    for old_slot in [existing.snapshot, existing.metadata] {
-        let HeadSlotView::Ref(old_ref) = old_slot else {
-            continue;
-        };
-        let retained_by_successor = !delta.physically_deletes()
-            && [delta.snapshot, delta.metadata].into_iter().any(
-                |new_slot| matches!(new_slot, JsonSlotRef::Ref(new_ref) if new_ref == &old_ref),
-            );
-        if !retained_by_successor {
-            retired.insert(*old_ref.as_hash_array());
-        }
-    }
 }
 
 fn reject_guarded_live_member(
@@ -1372,7 +1377,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// every row before it was copied into a live-state row.
 ///
 /// ```text
-///  0      format version (8)
+///  0      format version (9)
 ///  1      deleted + untracked + snapshot/metadata kinds + diff baseline kind
 ///  2..18  change UUID
 /// 18..34  commit UUID
@@ -1390,7 +1395,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// Persisting fingerprints only while a row is dirty keeps repeated diff
 /// classification independent of payload size without taxing checkpointed
 /// current state.
-const HEAD_VALUE_VERSION: u8 = 8;
+const HEAD_VALUE_VERSION: u8 = 9;
 const HEAD_VALUE_HEADER_BYTES: usize = 59;
 const COLUMNAR_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
@@ -1741,13 +1746,23 @@ fn append_head_value_parts(
             "deleted current-state rows must not carry JSON payloads",
         ));
     }
+    // Encode-side half of the untracked identity invariant documented on
+    // `CurrentStateDeltaRef::validate`. Rejecting a *nil* id and not merely an
+    // absent one is the point: the certified lanes default the per-row slot to
+    // `ChangeId::default()`, which is `Some` but all zeroes, so an `is_some()`
+    // check would let a row of 16 zero bytes reach the head and only fail
+    // later, on read, in `decode_head_value`.
+    let untracked_id_is_usable = value
+        .change_id
+        .is_some_and(|change_id| !change_id.as_uuid().is_nil());
     match (
         value.untracked,
         value.change_id,
         value.commit_id,
         value.deleted,
     ) {
-        (false, Some(_), Some(_), _) | (true, None, None, false) => {}
+        (false, Some(_), Some(_), _) => {}
+        (true, _, None, false) if untracked_id_is_usable => {}
         (true, _, _, true) => {
             return Err(head_value_error(
                 "untracked current-state rows must be deleted physically",
@@ -1760,7 +1775,7 @@ fn append_head_value_parts(
         }
         (true, _, _, false) => {
             return Err(head_value_error(
-                "untracked current-state rows must not carry change_id or commit_id",
+                "untracked current-state rows must carry a non-nil change_id and no commit_id",
             ));
         }
     }
@@ -2013,9 +2028,9 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
                 "untracked current-state rows must be deleted physically",
             ));
         }
-        if change_uuid != uuid::Uuid::nil() || commit_uuid != uuid::Uuid::nil() {
+        if change_uuid == uuid::Uuid::nil() || commit_uuid != uuid::Uuid::nil() {
             return Err(head_value_error(
-                "untracked current-state rows must use nil change and commit ids",
+                "untracked current-state rows must use a non-nil change id and a nil commit id",
             ));
         }
         if working_diff_baseline != WorkingDiffBaseline::Disabled {
@@ -2028,7 +2043,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
                 "untracked current-state rows must not carry an columnar base coordinate",
             ));
         }
-        (None, None)
+        (Some(ChangeId::new(change_uuid)), None)
     } else {
         if change_uuid == uuid::Uuid::nil() || commit_uuid == uuid::Uuid::nil() {
             return Err(head_value_error(
@@ -2164,7 +2179,7 @@ trait LiveMaterializationIdentity {
     #[allow(clippy::too_many_arguments)]
     fn push_materialized(
         self,
-        rows: &mut MaterializedLiveStateBatchBuilder,
+        rows: &mut MaterializedHotStateBatchBuilder,
         snapshot_content: Option<SharedStr>,
         metadata: Option<SharedStr>,
         deleted: bool,
@@ -2181,7 +2196,7 @@ trait LiveMaterializationIdentity {
 impl LiveMaterializationIdentity for HeadRowIdentity {
     fn push_materialized(
         self,
-        rows: &mut MaterializedLiveStateBatchBuilder,
+        rows: &mut MaterializedHotStateBatchBuilder,
         snapshot_content: Option<SharedStr>,
         metadata: Option<SharedStr>,
         deleted: bool,
@@ -2214,7 +2229,7 @@ impl LiveMaterializationIdentity for HeadRowIdentity {
 impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
     fn push_materialized(
         self,
-        rows: &mut MaterializedLiveStateBatchBuilder,
+        rows: &mut MaterializedHotStateBatchBuilder,
         snapshot_content: Option<SharedStr>,
         metadata: Option<SharedStr>,
         deleted: bool,
@@ -2254,14 +2269,14 @@ async fn materialize_live_entries<I>(
     projection: ChangeRecordProjection,
     branch_id: &str,
     active_checkpoint_commit_id: Option<CommitId>,
-) -> Result<MaterializedLiveStateBatch, LixError>
+) -> Result<MaterializedHotStateBatch, LixError>
 where
     I: LiveMaterializationIdentity,
 {
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
     let mut json_refs = Vec::new();
     let mut deferred = Vec::new();
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(entries.len());
+    let mut rows = MaterializedHotStateBatchBuilder::with_capacity(entries.len());
     for (identity, bytes) in entries {
         let value = decode_head_value(&bytes)?;
         let row_index = rows.len();
@@ -3412,7 +3427,7 @@ mod tests {
         assert_eq!(no_op_coverage, WorkingDiffIndexCoverage::default());
         assert!(
             writes.contains_put(
-                HOT_ROW_SPACE,
+                ROW_SPACE,
                 &hot::encode_hot_row_key(&HeadIdentity {
                     branch_id: branch_id.to_owned(),
                     generation: checkpoint,
@@ -3456,7 +3471,7 @@ mod tests {
             entity_pk: entity_pk.clone(),
             file_id: None,
         });
-        let value = PointReadPlan::new(HOT_ROW_SPACE, &[StorageKey(Bytes::from(hot_key))])
+        let value = PointReadPlan::new(ROW_SPACE, &[StorageKey(Bytes::from(hot_key))])
             .materialize(&read, StorageGetOptions::default())
             .await
             .expect("read cleaned checkpoint HOT row")
@@ -4024,7 +4039,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file schema marker verification read");
-        let projection_rows = scan_test_space(&projection_read, HOT_FILE_SPACE)
+        let projection_rows = scan_test_space(&projection_read, FILE_SPACE)
             .await
             .entries;
         assert_eq!(
@@ -4609,7 +4624,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file-schema marker verification read");
-        let projections = scan_test_space(&read, HOT_FILE_SPACE).await.entries;
+        let projections = scan_test_space(&read, FILE_SPACE).await.entries;
         assert_eq!(projections.len(), 1);
         assert!(
             projections.into_iter().all(|projection| {
@@ -4664,7 +4679,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open corruption fixture read");
-        let unrelated_key = scan_test_space(&read, HOT_ROW_SPACE)
+        let unrelated_key = scan_test_space(&read, ROW_SPACE)
             .await
             .entries
             .into_iter()
@@ -4678,7 +4693,7 @@ mod tests {
         drop(read);
         let mut corrupt_writes = StorageWriteSet::new();
         corrupt_writes.put(
-            HOT_ROW_SPACE,
+            ROW_SPACE,
             unrelated_key,
             StorageValue {
                 bytes: Bytes::from_static(b"corrupt unrelated hot row"),
@@ -5176,7 +5191,7 @@ mod tests {
             },
         );
         writes.put(
-            HOT_DIFF_SPACE,
+            DIFF_SPACE,
             malformed_index_key.clone(),
             StorageValue {
                 bytes: Bytes::from_static(b"not-a-hot-diff-before-image"),
@@ -5209,7 +5224,7 @@ mod tests {
             .expect("open cleanup verification read");
         for (space, key) in [
             (TRACKED_WORKING_DIFF_MARKER_SPACE, malformed_epoch_key),
-            (HOT_DIFF_SPACE, malformed_index_key),
+            (DIFF_SPACE, malformed_index_key),
         ] {
             let value = PointReadPlan::new(space, &[key])
                 .materialize(&read, StorageGetOptions::default())

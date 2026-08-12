@@ -1245,73 +1245,14 @@ where
         MaterializedTrackedStateExactBatch::new(batch, slots)
     }
 
-    /// Loads certified packet rows for exact identities that are intentionally
-    /// absent from the ordinary tracked root. This is a narrow historical
-    /// fallback for consumers, such as semantic merge, that need the complete
-    /// base snapshot of a host-certified fresh import.
-    pub(crate) async fn load_certified_rows_at_commit(
-        &mut self,
-        commit_id: &str,
-        keys: &[TrackedStateKey],
-    ) -> Result<BTreeMap<TrackedStateKey, crate::live_state::MaterializedLiveStateRow>, LixError>
-    {
-        if keys.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let exact = keys.iter().cloned().collect::<BTreeSet<_>>();
-        let schema_keys = keys
-            .iter()
-            .map(|key| key.schema_key.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let entity_pks = keys
-            .iter()
-            .map(|key| key.entity_pk.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let mut file_ids = Vec::new();
-        for key in keys {
-            let filter = match &key.file_id {
-                Some(file_id) => NullableKeyFilter::Value(file_id.clone()),
-                None => NullableKeyFilter::Null,
-            };
-            if !file_ids.contains(&filter) {
-                file_ids.push(filter);
-            }
-        }
-        let rows = crate::live_state::scan_certified_history_rows(
-            &self.store,
-            &BTreeSet::from([CommitId::parse_lix(
-                commit_id,
-                "certified historical fallback commit_id",
-            )?]),
-            &TrackedStateScanRequest {
-                filter: crate::tracked_state::TrackedStateFilter {
-                    schema_keys,
-                    entity_pks,
-                    file_ids,
-                    include_tombstones: true,
-                },
-                read_columns: crate::tracked_state::TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
-                },
-                limit: None,
-            },
-        )
-        .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let key = TrackedStateKey {
-                    schema_key: row.schema_key.clone(),
-                    file_id: row.file_id.clone(),
-                    entity_pk: row.entity_pk.clone(),
-                };
-                exact.contains(&key).then_some((key, row))
-            })
-            .collect())
+    /// Borrows the storage snapshot this reader was opened over.
+    ///
+    /// Callers use it to run a read that belongs to a *different* plane against
+    /// the same snapshot — notably the live-state certified-history fallback in
+    /// semantic merge. Keeping that call on the caller's side is what lets this
+    /// module stay free of references into the derived hot plane.
+    pub(crate) fn store(&self) -> &S {
+        &self.store
     }
 
     #[cfg(any(test, feature = "storage-benches"))]
@@ -2584,7 +2525,7 @@ where
             return Ok(entries);
         }
         if self
-            .exact_current_state_scope_has_equal_live_state(
+            .exact_current_state_scope_has_equal_hot_state(
                 left_commit_id,
                 right_commit_id,
                 request,
@@ -2665,7 +2606,7 @@ where
     /// This proof belongs to semantic diff, which normalizes tombstones to
     /// absence. Raw tree-entry diff must retain tombstone rows for merge and
     /// history consumers and therefore never calls this helper.
-    pub(crate) async fn exact_current_state_scope_has_equal_live_state(
+    pub(crate) async fn exact_current_state_scope_has_equal_hot_state(
         &self,
         left_commit_id: &str,
         right_commit_id: &str,
@@ -4921,7 +4862,7 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::branch::BranchHeadControl;
     use crate::changelog::CommitRecord;
-    use crate::live_state::CertifiedEntityBatchFileRef;
+    use crate::hot_state::CertifiedEntityBatchFileRef;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::wasm::{WasmCertifiedEntityBatch, WasmCreateContext};
@@ -8648,6 +8589,110 @@ mod tests {
         );
     }
 
+    /// The commit-path availability probe proves the resume point is
+    /// *addressable*, not that its whole chunk closure is intact; explicit
+    /// repair still proves the whole closure. Pins both halves, because the
+    /// difference between them is the entire cost argument: the commit path
+    /// walks one root-to-leaf path, repair walks every row.
+    #[tokio::test]
+    async fn availability_proof_is_bounded_on_commit_and_total_on_repair() {
+        use crate::tracked_state::commit_root_rebuild::RootAvailabilityProof;
+
+        let tracked_state = TrackedStateContext::new();
+        let storage = StorageAdapter::new(Memory::new());
+        // Wide enough that the tree is more than one chunk, so "the root chunk"
+        // and "the closure" are actually different sets.
+        let rows = (0..4000)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:06}"),
+                    &format!("gen-change-{index}"),
+                    "gen",
+                    "gen",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_root_for_test(&storage, &tracked_state, "gen", None, &rows)
+            .await
+            .expect("wide genesis root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "a1",
+            "gen",
+            &[row_with_value("entity-a1", "a1-change", "a1", "a1")],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("root read should open");
+        let root_id = storage::load_root(&read, "gen")
+            .await
+            .expect("genesis root should load")
+            .expect("genesis root should exist");
+        drop(read);
+        let chunks = stored_tree_chunk_hashes_for_test(&storage).await;
+        assert!(
+            chunks.len() > 2,
+            "fixture must build a multi-chunk tree, got {} chunks",
+            chunks.len()
+        );
+
+        // Damage a chunk that is not the root and not on the leftmost path, so
+        // only a total traversal can notice it.
+        let mut damaged_chunk = None;
+        for chunk in chunks.iter() {
+            if chunk != root_id.as_bytes() {
+                damaged_chunk = Some(*chunk);
+            }
+        }
+        let damaged_chunk = damaged_chunk.expect("a non-root chunk exists");
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&damaged_chunk)),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("chunk delete should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("probe read should open");
+        let bounded = crate::tracked_state::commit_root_rebuild::
+            load_rebuild_plans_to_nearest_available_root_with_proof(
+                &read,
+                "a1",
+                true,
+                RootAvailabilityProof::Addressable,
+            )
+            .await
+            .expect("bounded probe should load plans");
+        assert_eq!(
+            bounded.len(),
+            1,
+            "the commit path resumes from an addressable root and does not re-derive closure completeness"
+        );
+
+        let total = crate::tracked_state::commit_root_rebuild::
+            load_rebuild_plans_to_nearest_available_root_with_proof(
+                &read,
+                "a1",
+                true,
+                RootAvailabilityProof::Complete,
+            )
+            .await
+            .expect("total probe should load plans");
+        assert_eq!(
+            total.len(),
+            2,
+            "explicit repair must reject a resume point with a damaged closure and replay past it"
+        );
+    }
+
     async fn stored_tree_chunk_hashes_for_test(
         storage: &StorageAdapter,
     ) -> HashSet<[u8; crate::tracked_state::types::TRACKED_STATE_HASH_BYTES]> {
@@ -8995,7 +9040,7 @@ mod tests {
             .await
             .expect("certified batch read should open");
         let mut writes = storage.new_write_set();
-        crate::live_state::stage_certified_entity_batches(
+        crate::hot_state::stage_certified_entity_batches(
             &read,
             &mut writes,
             &files,
@@ -9024,7 +9069,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("certified authority read should open");
-        let certified = crate::live_state::scan_certified_history_rows(
+        let certified = crate::hot_state::scan_certified_history_rows(
             &read,
             &BTreeSet::from([commit_id]),
             &TrackedStateScanRequest {

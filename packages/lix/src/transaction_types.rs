@@ -14,9 +14,10 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
+use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonRef;
-use crate::live_state::{CertifiedCurrentStatePredecessor, MaterializedLiveStateRow};
-use crate::tracked_state::{OrderedAddressableCommitDeltaStage, TrackedStateDiffIdentity};
+use crate::hot_state::{CertifiedCurrentStatePredecessor, MaterializedHotStateRow};
+use crate::tracked_state::OrderedAddressableCommitDeltaStage;
 use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -698,6 +699,26 @@ impl CertifiedParameterBatch {
         origin_key: Option<&SharedStr>,
         timestamp: LixTimestamp,
     ) -> Result<PreparedStateBatch, LixError> {
+        // The dense certified representation is tracked-only *by construction*,
+        // and this assertion is where that invariant is stated. Fixing the two
+        // projections below to agree on the lane does not make the dense lane
+        // correct for untracked rows: it derives every change id from the
+        // commit-delta address space and reports `addressable_change_id: true`
+        // unconditionally, neither of which holds for untracked state. The
+        // routing guard lives at `sql2::exec::bound_public_write`
+        // (`dense_lane_supports_batch`), which sends untracked certified
+        // batches to the raw lane before they can reach this constructor.
+        //
+        // That guard is a call-site predicate one edit away from deletion, so
+        // restate it here at the construction boundary — where a future caller
+        // would actually violate it — rather than leaving it to a comment.
+        // Verified to hold today: this assertion was run as a hard `assert!`
+        // over the full CI-scope suite with zero hits.
+        debug_assert!(
+            !self.untracked,
+            "the dense certified lane is tracked-only; untracked certified \
+             batches take the raw lane"
+        );
         self.into_dense_prepared_timestamps(origin_key, DenseParameterTimestamps::Scalar(timestamp))
     }
 
@@ -794,6 +815,7 @@ impl CertifiedParameterBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: certificate.tracked_keys_strictly_ordered,
             complete_collection_replacement: certificate.complete_collection_replacement,
+            staged_index_values: StagedIndexValues::default(),
         };
         if predecessor_count != 0 && predecessor_count != row_count {
             for (index, predecessor) in durable_predecessors.into_iter().enumerate() {
@@ -1197,6 +1219,7 @@ impl RawWriteBatch {
         certificate: CertifiedRawWriteBatchPreparation,
         origin_key: Option<&SharedStr>,
         timestamp: LixTimestamp,
+        functions: &FunctionProviderHandle,
     ) -> Result<PreparedStateBatch, LixError> {
         if self.certified_preparation != Some(certificate) {
             return Err(LixError::new(
@@ -1304,6 +1327,18 @@ impl RawWriteBatch {
                 stage_json_from_value(snapshot, "certified prepared row snapshot_content")?;
             prepared_entity_pks.push(entity_pk);
             json.push(snapshot);
+            let untracked = slot.flags & RAW_WRITE_UNTRACKED != 0;
+            // Tracked rows keep the nil placeholder: `addressable_change_id`
+            // means commit planning replaces it with the row's commit-delta
+            // address, so minting here would be a wasted UUID draw per row on
+            // the flagship tracked path. Untracked rows are outside that
+            // address space, so nothing would ever replace the placeholder —
+            // they are the only rows that must be minted here.
+            let change_id = if untracked {
+                ChangeId::from(functions.call_uuid_v7())
+            } else {
+                ChangeId::default()
+            };
             prepared_slots.push(PreparedStateSlot {
                 schema_plan_id: certificate.schema_plan_id,
                 facts: certificate.facts,
@@ -1321,10 +1356,10 @@ impl RawWriteBatch {
                 created_at: timestamp,
                 updated_at: timestamp,
                 global: false,
-                change_id: Some(ChangeId::default()),
+                change_id: Some(change_id),
                 addressable_change_id: true,
                 commit_id: None,
-                untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
+                untracked,
                 branch_id: slot.branch_id,
                 durable_predecessor: None,
             });
@@ -1343,6 +1378,7 @@ impl RawWriteBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: certificate.tracked_keys_strictly_ordered,
             complete_collection_replacement: certificate.complete_collection_replacement,
+            staged_index_values: StagedIndexValues::default(),
         })
     }
 
@@ -2805,6 +2841,54 @@ impl TestPreparedStateRow {
     }
 }
 
+/// One staged row's indexed-column values, lifted out of the snapshot while
+/// transaction validation still held it parsed.
+///
+/// This exists so the commit-time index hook never decodes a snapshot again.
+/// `StageJson::value()` panics once validation releases the decoded column,
+/// and reaching around it with a second `serde_json::from_str` is exactly the
+/// cost this carrier removes.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedIndexRow {
+    pub(crate) branch_id: SharedStr,
+    pub(crate) schema_key: SharedStr,
+    pub(crate) entity_pk: EntityPk,
+    /// **Every** indexed ordinal the row's schema declares, carrying `None`
+    /// where this row has no indexable value for it.
+    ///
+    /// Commit earns a completeness witness per `(schema, ordinal)` whether or
+    /// not extraction found a value, so dropping the `None` entries would
+    /// silently narrow witness coverage and leave a column permanently
+    /// unwitnessed — a slow read, not a wrong one, but an invisible one.
+    pub(crate) columns: Vec<(u16, Option<crate::hot_state::HotIndexValue>)>,
+}
+
+/// Everything the commit-time hot index hook needs, produced by validation.
+///
+/// Empty is the safe value: no rows means no entries, and no registered
+/// collections means no witnesses, so a batch that never reached extraction
+/// publishes nothing and every read of that collection keeps scanning.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StagedIndexValues {
+    pub(crate) rows: Vec<StagedIndexRow>,
+    /// `(schema_key, ordinal)` pairs whose collection provably begins at this
+    /// commit because the commit registers the schema itself.
+    pub(crate) registered_collections: std::collections::BTreeSet<(String, u16)>,
+}
+
+impl StagedIndexValues {
+    /// Folds one schema scope's extraction into the transaction-wide result.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.rows.extend(other.rows);
+        self.registered_collections
+            .extend(other.registered_collections);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.registered_collections.is_empty()
+    }
+}
+
 /// Compact, typed owner for prepared transaction state.
 ///
 /// Rows are represented by ordinals into typed owner columns. Repeated
@@ -2834,6 +2918,10 @@ pub(crate) struct PreparedStateBatch {
     /// Proof material consumed when publishing the immutable replacement
     /// manifest. Row-topology changes clear the proof as one atomic value.
     complete_collection_replacement: Option<CompleteCollectionReplacementProof>,
+    /// Indexed-column values extracted during transaction validation, which is
+    /// the last place the snapshots are already parsed. Derived data, not row
+    /// content: [`PartialEq`] deliberately ignores it.
+    staged_index_values: StagedIndexValues,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3000,7 +3088,18 @@ impl PreparedStateBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: false,
             complete_collection_replacement: None,
+            staged_index_values: StagedIndexValues::default(),
         }
+    }
+
+    /// Publishes validation's indexed-column extraction onto the batch that
+    /// commit will materialize.
+    pub(crate) fn set_staged_index_values(&mut self, values: StagedIndexValues) {
+        self.staged_index_values = values;
+    }
+
+    pub(crate) fn staged_index_values(&self) -> &StagedIndexValues {
+        &self.staged_index_values
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -3373,7 +3472,11 @@ impl PreparedStateBatch {
                 )),
                 addressable_change_id: true,
                 commit_id: dense.commit_id,
-                untracked: false,
+                // The durability lane is a batch-common fact carried by the
+                // dense header, exactly like `commit_id` and `branch_id` above.
+                // Reading it from anywhere else would let the same batch report
+                // one lane through `get()` and another through its row slots.
+                untracked: dense.untracked,
                 branch_id: dense.branch_id,
                 durable_predecessor,
             });
@@ -3420,6 +3523,11 @@ impl PreparedStateBatch {
                         == other.strings[right.branch_id as usize]
                     && same_origin_key
                     && left.commit_id == right.commit_id
+                    // The merged cohort keeps one dense header, so every
+                    // batch-common fact must already agree. The durability
+                    // lane is one of them: without this, a cohort silently
+                    // adopts the leader's lane.
+                    && left.untracked == right.untracked
                     && left.direct_change_ids.is_none()
                     && right.direct_change_ids.is_none()
                     && left.entity_columnar.is_none()
@@ -4042,7 +4150,7 @@ impl PartialEq for PreparedStateRowRef<'_> {
 
 impl Eq for PreparedStateRowRef<'_> {}
 
-impl From<PreparedStateRowRef<'_>> for MaterializedLiveStateRow {
+impl From<PreparedStateRowRef<'_>> for MaterializedHotStateRow {
     fn from(row: PreparedStateRowRef<'_>) -> Self {
         Self {
             entity_pk: row.entity_pk.clone(),
@@ -4063,7 +4171,7 @@ impl From<PreparedStateRowRef<'_>> for MaterializedLiveStateRow {
 }
 
 #[cfg(test)]
-impl From<TestPreparedStateRow> for MaterializedLiveStateRow {
+impl From<TestPreparedStateRow> for MaterializedHotStateRow {
     fn from(row: TestPreparedStateRow) -> Self {
         let deleted = row.snapshot.is_none();
         Self {
@@ -4085,7 +4193,7 @@ impl From<TestPreparedStateRow> for MaterializedLiveStateRow {
 }
 
 #[cfg(test)]
-impl From<&TestPreparedStateRow> for MaterializedLiveStateRow {
+impl From<&TestPreparedStateRow> for MaterializedHotStateRow {
     fn from(row: &TestPreparedStateRow) -> Self {
         Self {
             entity_pk: row.entity_pk.clone(),
@@ -4105,407 +4213,95 @@ impl From<&TestPreparedStateRow> for MaterializedLiveStateRow {
     }
 }
 
-/// Transaction-local commit change refs accumulated while rows are staged.
-///
-/// Final commit row materialization owns commit ids, parent heads, and commit
-/// row timestamps. Staging only tracks which hydrated tracked changes the
-/// future commit introduces for a branch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StagedCommitChangeRefs {
-    pub(crate) commit_id: CommitId,
-    pub(crate) commit_change_id: ChangeId,
-    /// Every normal branch-head publication has a distinct public
-    /// `lixcol_change_id`, even though v6 stores the moving ref directly
-    /// rather than as a flat current row.
-    pub(crate) branch_ref_change_id: ChangeId,
-    pub(crate) created_at: LixTimestamp,
-    /// Normal prepared rows are already the authoritative commit-membership
-    /// sequence. Keeping every fresh row change id in another BTreeSet only
-    /// duplicates 10k+ UUIDs on bulk commits, so staging tracks their count.
-    pub(crate) tracked_change_count: usize,
-    /// Selected historical refs retain their immutable identity and metadata
-    /// columns through merge/checkpoint staging and commit materialization.
-    ///
-    /// A branch normally owns exactly one batch. Multiple batches remain
-    /// separate so staging/finalization clones only `Arc` owners rather than
-    /// copying schema/file/entity or metadata columns.
-    selected_change_batches: Vec<StagedCommitChangeBatch>,
-    /// Certified immutable mutation columns for this commit. This owner is
-    /// attached only at drain, after complete-replacement certification, and
-    /// is cloned through commit finalization in O(1).
-    ordered_mutation_journal: Option<Arc<crate::transaction::staging::OrderedMutationJournal>>,
-    pub(crate) allow_empty: bool,
-}
-
-impl Default for StagedCommitChangeRefs {
-    fn default() -> Self {
-        Self {
-            commit_id: CommitId::default(),
-            commit_change_id: ChangeId::default(),
-            branch_ref_change_id: ChangeId::default(),
-            created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
-            tracked_change_count: 0,
-            selected_change_batches: Vec::new(),
-            ordered_mutation_journal: None,
-            allow_empty: false,
-        }
-    }
-}
-
-impl StagedCommitChangeRefs {
-    pub(crate) fn absorb_cohort_membership(&mut self, mut other: Self) {
-        debug_assert!(
-            self.ordered_mutation_journal.is_none() && other.ordered_mutation_journal.is_none(),
-            "immutable replacement journals cannot join commit cohorts"
-        );
-        self.tracked_change_count = self
-            .tracked_change_count
-            .saturating_add(other.tracked_change_count);
-        self.selected_change_batches
-            .append(&mut other.selected_change_batches);
-        self.allow_empty |= other.allow_empty;
-    }
-}
-
-/// Immutable typed columns for historical changes selected into a new commit.
-///
-/// Identities retain the diff batch owner, so schema keys, file ids, and
-/// entity primary keys are never lowered into row-owned transaction strings.
-/// All remaining metadata is stored in fixed typed columns allocated once per
-/// batch. Cloning this batch through transaction staging is O(1).
-#[derive(Debug, Default, PartialEq, Eq)]
-struct StagedCommitChangeColumns {
-    identities: Vec<TrackedStateDiffIdentity>,
-    source_commit_ids: Vec<CommitId>,
-    change_ids: Vec<ChangeId>,
-    deleted: Vec<bool>,
-    created_at: Vec<LixTimestamp>,
-    updated_at: Vec<LixTimestamp>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct StagedCommitChangeBatch {
-    columns: Arc<StagedCommitChangeColumns>,
-    /// Every `(source_commit_id, change_id, identity)` tuple was produced by
-    /// the tracked diff reader from immutable commit authority.
-    source_membership_certified: bool,
-    /// Present only when duplicate identities were filtered while combining
-    /// independently supplied batches. The normal merge/checkpoint path views
-    /// every row directly and allocates no selection column.
-    selection: Option<Arc<[u32]>>,
-}
-
-#[derive(Debug)]
-pub(crate) struct StagedCommitChangeBatchBuilder {
-    columns: StagedCommitChangeColumns,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StagedCommitChangeRef<'a> {
-    identity: &'a TrackedStateDiffIdentity,
-    pub(crate) source_commit_id: CommitId,
-    pub(crate) change_id: ChangeId,
-    pub(crate) deleted: bool,
-    pub(crate) created_at: LixTimestamp,
-    pub(crate) updated_at: LixTimestamp,
-}
-
-impl StagedCommitChangeBatchBuilder {
-    pub(crate) fn with_capacity(row_count: usize) -> Self {
-        Self {
-            columns: StagedCommitChangeColumns {
-                identities: Vec::with_capacity(row_count),
-                source_commit_ids: Vec::with_capacity(row_count),
-                change_ids: Vec::with_capacity(row_count),
-                deleted: Vec::with_capacity(row_count),
-                created_at: Vec::with_capacity(row_count),
-                updated_at: Vec::with_capacity(row_count),
-            },
-        }
-    }
-
-    pub(crate) fn push(
-        &mut self,
-        identity: TrackedStateDiffIdentity,
-        source_commit_id: CommitId,
-        change_id: ChangeId,
-        deleted: bool,
-        created_at: LixTimestamp,
-        updated_at: LixTimestamp,
-    ) {
-        self.columns.identities.push(identity);
-        self.columns.source_commit_ids.push(source_commit_id);
-        self.columns.change_ids.push(change_id);
-        self.columns.deleted.push(deleted);
-        self.columns.created_at.push(created_at);
-        self.columns.updated_at.push(updated_at);
-    }
-
-    pub(crate) fn finish(self) -> StagedCommitChangeBatch {
-        StagedCommitChangeBatch {
-            columns: Arc::new(self.columns),
-            source_membership_certified: false,
-            selection: None,
-        }
-    }
-
-    /// Finishes rows materialized directly from a tracked-state diff.
-    ///
-    /// The diff reader binds every direct change address to the decoded source
-    /// identity before exposing the row. Checkpoint lowering may therefore
-    /// prove a complete dense source selection from coordinates alone instead
-    /// of hashing all identity bytes again.
-    pub(crate) fn finish_source_certified(self) -> StagedCommitChangeBatch {
-        StagedCommitChangeBatch {
-            columns: Arc::new(self.columns),
-            source_membership_certified: true,
-            selection: None,
-        }
-    }
-}
-
-impl Default for StagedCommitChangeBatch {
-    fn default() -> Self {
-        StagedCommitChangeBatchBuilder::with_capacity(0).finish()
-    }
-}
-
-impl PartialEq for StagedCommitChangeBatch {
-    fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
-    }
-}
-
-impl Eq for StagedCommitChangeBatch {}
-
-impl StagedCommitChangeBatch {
-    pub(crate) fn len(&self) -> usize {
-        self.selection
-            .as_ref()
-            .map_or(self.columns.identities.len(), |selection| selection.len())
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = StagedCommitChangeRef<'_>> + '_ {
-        (0..self.len()).map(|row_index| self.row(row_index))
-    }
-
-    fn row(&self, row_index: usize) -> StagedCommitChangeRef<'_> {
-        let column_index = self
-            .selection
-            .as_ref()
-            .map_or(row_index, |selection| selection[row_index] as usize);
-        StagedCommitChangeRef {
-            identity: &self.columns.identities[column_index],
-            source_commit_id: self.columns.source_commit_ids[column_index],
-            change_id: self.columns.change_ids[column_index],
-            deleted: self.columns.deleted[column_index],
-            created_at: self.columns.created_at[column_index],
-            updated_at: self.columns.updated_at[column_index],
-        }
-    }
-
-    fn select(self, selection: Vec<u32>) -> Self {
-        if selection.len() == self.columns.identities.len() {
-            self
-        } else {
-            Self {
-                columns: self.columns,
-                source_membership_certified: self.source_membership_certified,
-                selection: Some(selection.into()),
-            }
-        }
-    }
-
-    pub(crate) fn source_membership_certified(&self) -> bool {
-        self.source_membership_certified
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.columns, &other.columns)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn large_buffer_count(&self) -> usize {
-        usize::from(!self.columns.identities.is_empty())
-            + usize::from(!self.columns.source_commit_ids.is_empty())
-            + usize::from(!self.columns.change_ids.is_empty())
-            + usize::from(!self.columns.deleted.is_empty())
-            + usize::from(!self.columns.created_at.is_empty())
-            + usize::from(!self.columns.updated_at.is_empty())
-            + usize::from(self.selection.is_some())
-    }
-}
-
-impl<'a> StagedCommitChangeRef<'a> {
-    #[cfg(test)]
-    pub(crate) fn identity(&self) -> &'a TrackedStateDiffIdentity {
-        self.identity
-    }
-
-    pub(crate) fn schema_key(&self) -> &'a str {
-        self.identity.schema_key()
-    }
-
-    pub(crate) fn file_id(&self) -> Option<&'a str> {
-        self.identity.file_id()
-    }
-
-    pub(crate) fn entity_pk(&self) -> &'a EntityPk {
-        self.identity.entity_pk()
-    }
-}
-
-impl StagedCommitChangeRefs {
-    pub(crate) fn attach_ordered_mutation_journal(
-        &mut self,
-        journal: Arc<crate::transaction::staging::OrderedMutationJournal>,
-    ) -> Result<(), LixError> {
-        if self.ordered_mutation_journal.replace(journal).is_some() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "commit received more than one immutable mutation journal",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn ordered_mutation_journal(
-        &self,
-    ) -> Option<&Arc<crate::transaction::staging::OrderedMutationJournal>> {
-        self.ordered_mutation_journal.as_ref()
-    }
-
-    pub(crate) fn take_ordered_mutation_journal(
-        &mut self,
-    ) -> Option<Arc<crate::transaction::staging::OrderedMutationJournal>> {
-        self.ordered_mutation_journal.take()
-    }
-
-    pub(crate) fn new(
-        commit_id: CommitId,
-        commit_change_id: ChangeId,
-        branch_ref_change_id: ChangeId,
-        created_at: LixTimestamp,
-    ) -> Self {
-        Self {
-            commit_id,
-            commit_change_id,
-            branch_ref_change_id,
-            created_at,
-            tracked_change_count: 0,
-            selected_change_batches: Vec::new(),
-            ordered_mutation_journal: None,
-            allow_empty: false,
-        }
-    }
-
-    pub(crate) fn add_change_id(&mut self, _change_id: ChangeId) {
-        self.tracked_change_count += 1;
-    }
-
-    pub(crate) fn add_change_count(&mut self, count: usize) {
-        self.tracked_change_count += count;
-    }
-
-    pub(crate) fn add_selected_change_batch(&mut self, batch: StagedCommitChangeBatch) {
-        if batch.is_empty() {
-            return;
-        }
-        if self.selected_change_batches.is_empty() {
-            // Merge and checkpoint each stage one already validated diff
-            // batch. Preserve that overwhelmingly common handoff as a pure
-            // move with no deduplication index or selection allocation.
-            self.selected_change_batches.push(batch);
-            return;
-        }
-
-        // Deduplicate logical identities only while batches are combined,
-        // then drop the index. Eager plugin rows may legitimately share one
-        // source change id.
-        // Unlike the former BTreeSet retained for the transaction lifetime,
-        // this is one temporary contiguous table rather than one allocation
-        // per selected mutation.
-        let mut identities =
-            HashSet::with_capacity(self.selected_change_count().saturating_add(batch.len()));
-        identities.extend(
-            self.selected_changes()
-                .map(|change| (change.schema_key(), change.file_id(), change.entity_pk())),
-        );
-        let mut selected: Option<Vec<u32>> = None;
-        for (row_index, change) in batch.iter().enumerate() {
-            if identities.insert((change.schema_key(), change.file_id(), change.entity_pk())) {
-                if let Some(selected) = selected.as_mut() {
-                    selected.push(
-                        u32::try_from(row_index)
-                            .expect("selected commit change batch exceeds the ordinal range"),
-                    );
-                }
-            } else if selected.is_none() {
-                let mut retained = Vec::with_capacity(batch.len().saturating_sub(1));
-                retained.extend((0..row_index).map(|index| {
-                    u32::try_from(index)
-                        .expect("selected commit change batch exceeds the ordinal range")
-                }));
-                selected = Some(retained);
-            }
-        }
-        match selected {
-            None => self.selected_change_batches.push(batch),
-            Some(selected) if !selected.is_empty() => {
-                self.selected_change_batches.push(batch.select(selected));
-            }
-            Some(_) => {}
-        }
-    }
-
-    pub(crate) fn selected_changes(&self) -> impl Iterator<Item = StagedCommitChangeRef<'_>> + '_ {
-        self.selected_change_batches
-            .iter()
-            .flat_map(StagedCommitChangeBatch::iter)
-    }
-
-    pub(crate) fn selected_change_count(&self) -> usize {
-        self.selected_change_batches
-            .iter()
-            .map(StagedCommitChangeBatch::len)
-            .sum()
-    }
-
-    pub(crate) fn has_selected_changes(&self) -> bool {
-        self.selected_change_batches
-            .iter()
-            .any(|batch| !batch.is_empty())
-    }
-
-    pub(crate) fn into_selected_change_batches(self) -> Vec<StagedCommitChangeBatch> {
-        self.selected_change_batches
-    }
-
-    pub(crate) fn remove_change_id(&mut self, _change_id: &ChangeId) {
-        self.tracked_change_count = self
-            .tracked_change_count
-            .checked_sub(1)
-            .expect("staged tracked change count must not underflow");
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.tracked_change_count == 0 && !self.has_selected_changes()
-    }
-
-    pub(crate) fn allow_empty(&mut self) {
-        self.allow_empty = true;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKey};
+
+    fn expdl_probe_certificate(plan: u32) -> CertifiedRawWriteBatchPreparation {
+        CertifiedRawWriteBatchPreparation {
+            schema_plan_id: SchemaPlanId::for_test(plan),
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: None,
+        }
+    }
+
+    fn expdl_probe_batch(keys: &[&str], untracked: bool) -> PreparedStateBatch {
+        let entity_pks = keys.iter().map(|key| EntityPk::single(*key)).collect();
+        let snapshots = keys
+            .iter()
+            .map(|key| {
+                TransactionJson::from_certified_shared_normalized_row_content(
+                    format!(r#"{{"id":"{key}"}}"#).into(),
+                )
+            })
+            .collect::<Vec<_>>();
+        CertifiedParameterInsertBatch::new_with_lane(
+            entity_pks,
+            snapshots,
+            "expdl_probe".into(),
+            "main".into(),
+            untracked,
+            expdl_probe_certificate(7),
+        )
+        .expect("certified rows should construct")
+        // Deliberately the inner constructor. `into_dense_prepared` asserts
+        // that no untracked batch reaches the dense lane, which is the
+        // invariant these probes are the backstop for: they prove that if the
+        // routing guard ever goes, the projections still agree on the lane
+        // instead of silently flipping it.
+        .into_dense_prepared_timestamps(
+            None,
+            DenseParameterTimestamps::Scalar(LixTimestamp::expect_parse(
+                "timestamp",
+                "2026-08-02T00:00:00.000Z",
+            )),
+        )
+        .expect("certified rows should prepare")
+    }
+
+    /// A dense certified batch must report the same durability lane through
+    /// both of its projections. The borrowed accessor reads
+    /// `dense.untracked`; expansion into row slots must not invent one.
+    #[test]
+    fn expdl_dense_certified_expansion_preserves_untracked_lane() {
+        let mut prepared = expdl_probe_batch(&["a", "b"], true);
+
+        assert!(prepared.is_dense_certified_parameter());
+        assert!(
+            prepared.iter().all(|row| row.untracked),
+            "dense projection must report the untracked lane"
+        );
+
+        prepared.set_durable_predecessor(0, None);
+
+        assert!(!prepared.is_dense_certified_parameter());
+        assert!(
+            prepared.iter().all(|row| row.untracked),
+            "expansion must not move untracked rows into the tracked lane"
+        );
+    }
+
+    /// Two dense cohorts only merge when every batch-common fact matches.
+    /// The durability lane is batch-common, so a tracked cohort must never
+    /// absorb an untracked one.
+    #[test]
+    fn expdl_dense_certified_cohort_merge_keeps_lanes_apart() {
+        let mut tracked = expdl_probe_batch(&["a", "b"], false);
+        let untracked = expdl_probe_batch(&["c", "d"], true);
+
+        tracked.append(untracked);
+
+        assert_eq!(tracked.len(), 4);
+        assert_eq!(
+            tracked.iter().map(|row| row.untracked).collect::<Vec<_>>(),
+            vec![false, false, true, true],
+            "merging cohorts must preserve each row's durability lane"
+        );
+    }
 
     #[test]
     fn certified_parameter_rows_keep_batch_common_prepared_facts_dense() {
@@ -4815,116 +4611,6 @@ mod tests {
         assert_eq!(prepared.row(0).updated_at, first_timestamp);
         assert_eq!(prepared.row(1).updated_at, second_timestamp);
         assert!(prepared.complete_collection_replacement_proof().is_none());
-    }
-
-    #[test]
-    fn ten_thousand_selected_changes_retain_one_shared_typed_batch() {
-        const ROW_COUNT: usize = 10_000;
-        let identities = TrackedStateDiffIdentity::from_key_batch(
-            (0..ROW_COUNT)
-                .map(|index| TrackedStateKey {
-                    schema_key: "shared_schema".to_string(),
-                    file_id: Some("shared_file".to_string()),
-                    entity_pk: EntityPk::single(format!("entity-{index:05}")),
-                })
-                .collect(),
-        )
-        .expect("identity batch should fit");
-        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
-        let mut builder = StagedCommitChangeBatchBuilder::with_capacity(ROW_COUNT);
-        for (index, identity) in identities.iter().enumerate() {
-            builder.push(
-                identity.clone(),
-                CommitId::for_test_label(&format!("selected-owner-{index}")),
-                ChangeId::for_test_label(&format!("selected-change-{index}")),
-                false,
-                timestamp,
-                timestamp,
-            );
-        }
-        let batch = builder.finish();
-        let source = batch.clone();
-
-        assert_eq!(batch.large_buffer_count(), 6);
-        assert!(
-            batch
-                .iter()
-                .zip(&identities)
-                .all(|(change, identity)| change.identity().shares_batch_with(identity)),
-            "selected changes must retain the diff identity batch"
-        );
-
-        let mut staged = StagedCommitChangeRefs::default();
-        staged.add_selected_change_batch(batch);
-        assert_eq!(staged.selected_change_count(), ROW_COUNT);
-        assert_eq!(staged.selected_change_batches.len(), 1);
-        assert!(
-            staged.selected_change_batches[0].shares_storage_with(&source),
-            "transaction staging must retain the same metadata columns"
-        );
-        let finalized_clone = staged.clone();
-        assert!(
-            finalized_clone.selected_change_batches[0]
-                .shares_storage_with(&staged.selected_change_batches[0]),
-            "commit finalization clones must be O(1) batch-owner clones"
-        );
-    }
-
-    #[test]
-    fn selected_batches_dedupe_identity_not_source_change_id() {
-        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
-        let source_commit = CommitId::for_test_label("shared-source");
-        let shared_change = ChangeId::for_test_label("shared-change");
-        let identities = TrackedStateDiffIdentity::from_key_batch(
-            ["entity-a", "entity-b"]
-                .into_iter()
-                .map(|entity| TrackedStateKey {
-                    schema_key: "schema".to_string(),
-                    file_id: Some("file".to_string()),
-                    entity_pk: EntityPk::single(entity),
-                })
-                .collect(),
-        )
-        .expect("identity batch should fit");
-
-        let mut first = StagedCommitChangeBatchBuilder::with_capacity(1);
-        first.push(
-            identities[0].clone(),
-            source_commit,
-            shared_change,
-            false,
-            timestamp,
-            timestamp,
-        );
-        let mut second = StagedCommitChangeBatchBuilder::with_capacity(2);
-        second.push(
-            identities[1].clone(),
-            source_commit,
-            shared_change,
-            false,
-            timestamp,
-            timestamp,
-        );
-        second.push(
-            identities[0].clone(),
-            source_commit,
-            ChangeId::for_test_label("duplicate-identity"),
-            false,
-            timestamp,
-            timestamp,
-        );
-
-        let mut staged = StagedCommitChangeRefs::default();
-        staged.add_selected_change_batch(first.finish());
-        staged.add_selected_change_batch(second.finish());
-        assert_eq!(staged.selected_change_count(), 2);
-        assert_eq!(
-            staged
-                .selected_changes()
-                .map(|change| change.change_id)
-                .collect::<Vec<_>>(),
-            vec![shared_change, shared_change]
-        );
     }
 
     fn prepared_fixture_row(

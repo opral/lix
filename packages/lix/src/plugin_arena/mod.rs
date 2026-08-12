@@ -1061,10 +1061,6 @@ impl Transaction {
         self.entity_changes.insert(key, Some(value));
     }
 
-    pub fn delete_entity(&mut self, key: Vec<u8>) {
-        self.entity_changes.insert(key, None);
-    }
-
     pub fn put_state(&mut self, key: Vec<u8>, value: Vec<u8>) {
         self.state_changes.insert(key, Some(value));
     }

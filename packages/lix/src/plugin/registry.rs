@@ -19,12 +19,12 @@ use crate::binary_cas::BlobId;
 use crate::branch::BranchHeadControl;
 use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::entity_pk::EntityPk;
-use crate::live_state::MaterializedLiveStateRow;
+use crate::hot_state::MaterializedHotStateRow;
 use crate::tracked_state::{
     MaterializedTrackedStateRowRef, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest, TrackedStateStoreReader,
 };
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
 use super::InstalledPlugin;
@@ -357,14 +357,16 @@ impl PluginRegistry {
         Self::from_optional_value(Some(value))
     }
 
-    pub(crate) fn from_optional_live_state_row(
-        row: Option<&MaterializedLiveStateRow>,
+    pub(crate) fn from_optional_hot_state_row(
+        row: Option<&MaterializedHotStateRow>,
         branch_id: &str,
     ) -> Result<Self, LixError> {
         let Some(row) = row else {
             return Ok(Self::empty());
         };
-        validate_live_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id)?;
+        // The branch registry is branch-global with no file, so it is always
+        // tracked regardless of any file's lane.
+        validate_hot_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id, false)?;
         if row.deleted || row.snapshot_content.is_none() {
             return Ok(Self::empty());
         }
@@ -518,14 +520,14 @@ where
         },
         limit: None,
     };
-    let current = crate::live_state::TrackedHeadContext::new()
+    let current = crate::hot_state::TrackedHeadContext::new()
         .reader(store)
         .scan_live_batches_for_controls(controls, &request, None)
         .await?;
     let mut roots = BTreeSet::new();
     for (branch_id, rows) in current {
         for row in rows.into_rows() {
-            let registry = PluginRegistry::from_optional_live_state_row(Some(&row), &branch_id)?;
+            let registry = PluginRegistry::from_optional_hot_state_row(Some(&row), &branch_id)?;
             extend_registry_wasm_roots(&registry, &mut roots)?;
         }
     }
@@ -638,14 +640,15 @@ impl PluginFileOwner {
         }))
     }
 
-    pub(crate) fn from_live_state_row(
-        row: &MaterializedLiveStateRow,
+    pub(crate) fn from_hot_state_row(
+        row: &MaterializedHotStateRow,
         branch_id: &str,
+        untracked: bool,
     ) -> Result<Option<Self>, LixError> {
         let file_id = row.file_id.as_deref().ok_or_else(|| {
             invalid_registry("plugin owner row is missing its file_id storage identity")
         })?;
-        validate_live_state_identity(row, PLUGIN_OWNER_KEY, Some(file_id), branch_id)?;
+        validate_hot_state_identity(row, PLUGIN_OWNER_KEY, Some(file_id), branch_id, untracked)?;
         if row.deleted || row.snapshot_content.is_none() {
             return Ok(None);
         }
@@ -1204,22 +1207,27 @@ fn plugin_key_value_write_row(
     })
 }
 
-fn validate_live_state_identity(
-    row: &MaterializedLiveStateRow,
+fn validate_hot_state_identity(
+    row: &MaterializedHotStateRow,
     key: &str,
     expected_file_id: Option<&str>,
     branch_id: &str,
+    expected_untracked: bool,
 ) -> Result<(), LixError> {
     validate_branch_local_scope(branch_id)?;
     if row.schema_key != KEY_VALUE_SCHEMA_KEY
         || row.entity_pk.as_single_string().ok() != Some(key)
         || row.file_id.as_deref() != expected_file_id
         || row.global
-        || row.untracked
+        // A file-scoped reserved row lives in its own file's lane. The branch
+        // registry stays tracked (it is branch-global with no file), but an
+        // owner row for an untracked file is untracked, and reading it back
+        // must accept exactly the lane it was written in.
+        || row.untracked != expected_untracked
         || row.branch_id.as_ref() != branch_id
     {
         return Err(invalid_registry(format!(
-            "reserved plugin row '{key}' has invalid tracked branch-local storage identity"
+            "reserved plugin row '{key}' has invalid branch-local storage identity"
         )));
     }
     Ok(())
@@ -1235,7 +1243,7 @@ fn validate_branch_local_scope(branch_id: &str) -> Result<(), LixError> {
 }
 
 fn parse_snapshot_content(
-    row: &MaterializedLiveStateRow,
+    row: &MaterializedHotStateRow,
     kind: &str,
 ) -> Result<JsonValue, LixError> {
     let raw = row.snapshot_content.as_deref().ok_or_else(|| {
