@@ -18,7 +18,7 @@
 //! ```text
 //! LIX_BRANCH_SHARING_ROWS=1000,10000,100000 \
 //! LIX_BRANCH_SHARING_BACKENDS=rocksdb,slatedb \
-//! cargo bench -p lix_benchmarks --features storage-benches,slatedb --bench branch_storage_sharing
+//! cargo bench -p lix_e2e --features storage-benches,slatedb --bench branch_storage_sharing
 //! ```
 
 #![allow(clippy::large_futures)]

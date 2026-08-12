@@ -1,7 +1,7 @@
 //! Manual benchmark for warmed exact `lix_file` reads through the public session API.
 //!
 //! Run with:
-//! `cargo test -p lix_benchmarks --release --test exact_file_read_benchmark -- --ignored --nocapture`
+//! `cargo test -p lix_e2e --release --test exact_file_read_benchmark -- --ignored --nocapture`
 //!
 //! Set `LIX_EXACT_FILE_READ_BENCH_FILE_COUNT=10000` to verify that a
 //! `WHERE id = $1` read remains a point lookup as the file corpus grows.

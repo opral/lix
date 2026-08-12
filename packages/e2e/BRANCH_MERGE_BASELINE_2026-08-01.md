@@ -95,7 +95,7 @@ still needs the full repeated run before being declared stable.
 ## Reproduction
 
 ```sh
-cargo build --release -p lix_tests --example branch_merge_benchmark
+cargo build --release -p lix_e2e --example branch_merge_benchmark
 LIX_BRANCH_MERGE_BENCH_SAMPLES=11 \
   target/release/examples/branch_merge_benchmark qualification > qualification.jsonl
 LIX_BRANCH_MERGE_BENCH_SAMPLES=11 \

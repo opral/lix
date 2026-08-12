@@ -17,7 +17,7 @@
 //! Ignored by default; it is a measurement driver, not an assertion.
 //!
 //! ```text
-//! EXPCK_MEMBERS=64,512,4096 cargo test --release -p lix_tests \
+//! EXPCK_MEMBERS=64,512,4096 cargo test --release -p lix_e2e \
 //!   --test untracked_plugin_cold_open_bench -- --ignored --nocapture
 //! ```
 

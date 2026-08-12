@@ -21,7 +21,7 @@
 //! plane empty and cannot see the inheritance path at all.
 //!
 //! ```text
-//! cargo run --release -p lix_tests --example e10_branch_file_cost -- 100 1000 10000
+//! cargo run --release -p lix_e2e --example e10_branch_file_cost -- 100 1000 10000
 //! ```
 
 use std::collections::BTreeMap;

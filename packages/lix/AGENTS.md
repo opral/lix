@@ -9,5 +9,5 @@
   when its implementation or the engine storage contract changes:
   `cargo test -p lix_storage_rocksdb` or
   `cargo test -p lix_storage_slatedb`.
-- Engine benchmarks live in `lix_benchmarks`, whose default backend is
+- Engine benchmarks live in `lix_e2e`, whose default backend is
   RocksDB. Use `--all-features` for the complete backend benchmark build.

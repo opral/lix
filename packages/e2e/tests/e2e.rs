@@ -4083,7 +4083,7 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
                     row.get::<serde_json::Value>("value").unwrap(),
                 )
             })
-            .collect::<std::collections::BTreeMap<_, _>>();
+            .collect::<BTreeMap<_, _>>();
         assert_eq!(
             values.get(&target_key),
             Some(&serde_json::json!(target_value))

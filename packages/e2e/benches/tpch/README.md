@@ -9,7 +9,7 @@ not be compared with published native-type TPC-H results.
 Run the full common-type suite with:
 
 ```sh
-cargo bench -p lix_benchmarks --bench tpch \
+cargo bench -p lix_e2e --bench tpch \
   --features storage-benches,tpch
 ```
 

@@ -92,14 +92,14 @@ The CRDT workloads are ignored profiling tests so normal CI remains fast. The
 ordinary-execute correctness assertion is part of the normal test run.
 
 ```bash
-cargo test -p lix_tests --test crdt_benchmarks_baseline \
+cargo test -p lix_e2e --test crdt_benchmarks_baseline \
   ordinary_concurrent_execute_serializes_without_plugin_resolution -- --exact
 
-cargo test -p lix_tests --test crdt_benchmarks_baseline --release \
+cargo test -p lix_e2e --test crdt_benchmarks_baseline --release \
   crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts \
   -- --ignored --exact --nocapture
 
-LIX_CRDT_SAMPLES=1 cargo test -p lix_tests \
+LIX_CRDT_SAMPLES=1 cargo test -p lix_e2e \
   --test crdt_benchmarks_baseline --release \
   crdt_benchmarks_b3_1_json_concurrent_map_sets \
   -- --ignored --exact --nocapture

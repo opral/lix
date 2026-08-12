@@ -12,7 +12,7 @@ compilation are outside the measurement:
 
 ```sh
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
-  cargo test --release -p lix_tests \
+  cargo test --release -p lix_e2e \
   --test plugin_document_scale --no-run
 
 PLUGIN_DOCUMENT_SCALE_BIN="$(find target/release/deps -maxdepth 1 \

@@ -24,7 +24,7 @@
 //!                     which does not push `lixcol_file_id` down at all.
 //!
 //! ```text
-//! cargo bench -p lix_benchmarks --features storage-benches,slatedb \
+//! cargo bench -p lix_e2e --features storage-benches,slatedb \
 //!   --bench working_diff_file_scope -- rocksdb 8 40 100 9 1000 20000 100000
 //! ```
 //! Positionals: `<rocksdb|slatedb> <min-files> <rows-per-file> <changes-per-commit> <reps>`

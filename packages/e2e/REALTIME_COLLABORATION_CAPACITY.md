@@ -136,7 +136,7 @@ for format in json csv markdown text; do
   LIX_COLLAB_OPERATIONS=100 \
   LIX_COLLAB_ARRIVAL_MS=50 \
   LIX_COLLAB_FORMAT="$format" \
-  cargo test -p lix_tests \
+  cargo test -p lix_e2e \
     --test realtime_collaboration_capacity --release \
     realtime_collaboration_commit_to_convergence_capacity \
     -- --ignored --exact --nocapture
@@ -144,7 +144,7 @@ done
 
 LIX_COLLAB_CLIENTS=100 \
 LIX_COLLAB_SOAK_ROUNDS=10 \
-cargo test -p lix_tests \
+cargo test -p lix_e2e \
   --test realtime_collaboration_capacity --release \
   abandoned_transactions_and_sessions_release_resources \
   -- --ignored --exact --nocapture
