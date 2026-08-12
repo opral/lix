@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 
 use lix::{LixError, Value};
 
-const SEQUENTIAL_SEEDS: u64 = 2;
-const BOUNDARY_SEEDS: [u64; 3] = [0x51ce_deed, u64::MAX - 1, u64::MAX];
+/// `0x7dc` is a regression seed: at step 36 it drove the tracked-state rebuild
+/// path to stage one content-addressed tree chunk twice in one write set, which
+/// failed every later read with `LIX_STORAGE_ERROR`.
+const DEFAULT_SEEDS: [u64; 6] = [0, 1, 0x7dc, 0x51ce_deed, u64::MAX - 1, u64::MAX];
 const STEPS_PER_SEED: usize = 40;
 
 simulation_test!(
@@ -18,7 +20,7 @@ simulation_test!(
             &engine,
         );
 
-        for seed in (0..SEQUENTIAL_SEEDS).chain(BOUNDARY_SEEDS) {
+        for seed in crate::support::fuzz_seeds(&DEFAULT_SEEDS) {
             let root = format!("/corruption-fuzz-{seed:016x}");
             let paths = (0..3)
                 .flat_map(|directory| {
