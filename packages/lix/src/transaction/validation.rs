@@ -6612,7 +6612,7 @@ mod tests {
 
     async fn committed_delete_restriction_outcome(
         staged_rows: Vec<TestPreparedStateRow>,
-        committed_rows: Vec<MaterializedLiveStateRow>,
+        committed_rows: Vec<MaterializedHotStateRow>,
     ) -> Result<(), LixError> {
         let staged_writes = PreparedWriteSet {
             state_rows: PreparedStateBatch::from_test_rows(staged_rows),
@@ -6624,7 +6624,7 @@ mod tests {
             directory_descriptor_schema(),
         ])
         .expect("descriptor schemas should compile");
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: committed_rows,
         };
         let mut pending_constraints = PendingConstraintIndexes::default();
@@ -6633,7 +6633,7 @@ mod tests {
                 pending_constraints.remember_tombstone(row);
             }
         }
-        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &hot_state);
         validate_committed_delete_restrictions(&input, &catalog, &pending_constraints).await
     }
 
@@ -6659,8 +6659,8 @@ mod tests {
         committed_delete_restriction_outcome(
             vec![directory_delete],
             vec![
-                MaterializedLiveStateRow::from(committed_directory),
-                MaterializedLiveStateRow::from(committed_file),
+                MaterializedHotStateRow::from(committed_directory),
+                MaterializedHotStateRow::from(committed_file),
             ],
         )
         .await
@@ -6685,8 +6685,8 @@ mod tests {
         let error = committed_delete_restriction_outcome(
             vec![directory_delete],
             vec![
-                MaterializedLiveStateRow::from(committed_directory),
-                MaterializedLiveStateRow::from(committed_child),
+                MaterializedHotStateRow::from(committed_directory),
+                MaterializedHotStateRow::from(committed_child),
             ],
         )
         .await
@@ -6729,21 +6729,21 @@ mod tests {
         let outcome = committed_delete_restriction_outcome(
             vec![directory_delete],
             vec![
-                MaterializedLiveStateRow::from(directory_descriptor_row(
+                MaterializedHotStateRow::from(directory_descriptor_row(
                     FK_SCOPE_DIRECTORY_ID,
                     None,
                     "docs",
                     FK_SCOPE_BRANCH_ID,
                 )),
                 // same branch, different parent directory
-                MaterializedLiveStateRow::from(file_descriptor_row_in_directory(
+                MaterializedHotStateRow::from(file_descriptor_row_in_directory(
                     FK_SCOPE_FILE_ID,
                     Some(other_directory),
                     "readme.md",
                     FK_SCOPE_BRANCH_ID,
                 )),
                 // same directory id, different branch
-                MaterializedLiveStateRow::from(file_descriptor_row_in_directory(
+                MaterializedHotStateRow::from(file_descriptor_row_in_directory(
                     "01920000-0000-7000-8000-0000000000f2",
                     Some(FK_SCOPE_DIRECTORY_ID),
                     "readme.md",
@@ -6778,13 +6778,13 @@ mod tests {
         let outcome = committed_delete_restriction_outcome(
             vec![directory_delete, file_delete],
             vec![
-                MaterializedLiveStateRow::from(directory_descriptor_row(
+                MaterializedHotStateRow::from(directory_descriptor_row(
                     FK_SCOPE_DIRECTORY_ID,
                     None,
                     "docs",
                     FK_SCOPE_BRANCH_ID,
                 )),
-                MaterializedLiveStateRow::from(file_descriptor_row_in_directory(
+                MaterializedHotStateRow::from(file_descriptor_row_in_directory(
                     FK_SCOPE_FILE_ID,
                     Some(FK_SCOPE_DIRECTORY_ID),
                     "readme.md",
@@ -6800,9 +6800,9 @@ mod tests {
         );
     }
 
-    fn fk_row_in_file(mut row: TestPreparedStateRow, file_id: &str) -> MaterializedLiveStateRow {
+    fn fk_row_in_file(mut row: TestPreparedStateRow, file_id: &str) -> MaterializedHotStateRow {
         row.file_id = Some(file_id.into());
-        MaterializedLiveStateRow::from(row)
+        MaterializedHotStateRow::from(row)
     }
 
     /// Simulates the "just widen the delete-side source domain" fix by running
@@ -6813,7 +6813,7 @@ mod tests {
         let file_f = "01920000-0000-7000-8000-0000000000f0";
         let file_g = "01920000-0000-7000-8000-0000000000f9";
 
-        let live_state = StrictStaticLiveStateReader {
+        let hot_state = StrictStaticHotStateReader {
             rows: vec![
                 fk_row_in_file(fk_parent_row("parent-1", branch_id), file_f),
                 fk_row_in_file(fk_parent_row("parent-1", branch_id), file_g),
@@ -6854,7 +6854,7 @@ mod tests {
         )]);
 
         validate_committed_normal_delete_restriction_batches(
-            &live_state,
+            &hot_state,
             &PendingConstraintIndexes::default(),
             batches,
         )
