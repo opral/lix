@@ -5677,6 +5677,112 @@ async fn qualify_corrupt_current_plugin_checkpoint<B: CurrentPluginCheckpointCor
     drop(database);
 }
 
+/// Lane parity for the durable actor checkpoint.
+///
+/// #1353 made plugin reconciliation lane-neutral, but the checkpoint was still
+/// withheld from untracked files, so every session re-parsed them from scratch.
+/// `plugin.current_checkpoint.v2` is a dedicated mutable side space keyed by
+/// `branch_id ++ file_id` — no lane column, no commit link, no changelog — and
+/// its validity is content-addressed, so publishing one for an untracked file
+/// creates no cross-lane state and can never serve stale rows: it either
+/// matches the current generation, blob hash and semantic root, or the load
+/// degrades into the cold rebuild it was accelerating.
+///
+/// The second half is the correctness crux. A restored actor that served stale
+/// entity rows would be silent corruption, so the edit after cold reopen has to
+/// re-render exactly the bytes a cold rebuild would have produced.
+#[tokio::test]
+async fn untracked_plugin_file_publishes_and_restores_its_durable_checkpoint() {
+    const FILE_ID: &str = "01920000-0000-7000-8000-0000000000c3";
+    const PATH: &str = "/untracked-durable-checkpoint.json";
+    const CHECKPOINT_SPACE: &str = "plugin.current_checkpoint.v2";
+
+    let root = tempfile::tempdir().expect("create untracked checkpoint fixture");
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        &[
+            Value::Text(FILE_ID.to_owned()),
+            Value::Text(PATH.to_owned()),
+            Value::Blob(br#"{"alpha":"before"}"#.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("untracked plugin file should write");
+    let branch_id = lix
+        .active_branch_id()
+        .await
+        .expect("load untracked checkpoint branch owner");
+    lix.close()
+        .await
+        .expect("close untracked checkpoint fixture");
+
+    let mut expected_key = Vec::with_capacity(32);
+    expected_key.extend_from_slice(
+        uuid::Uuid::parse_str(&branch_id)
+            .expect("untracked checkpoint branch owner is a UUID")
+            .as_bytes(),
+    );
+    expected_key.extend_from_slice(
+        uuid::Uuid::parse_str(FILE_ID)
+            .expect("untracked checkpoint file owner is a UUID")
+            .as_bytes(),
+    );
+    let database =
+        RocksDB::open(root.path().join(".lix")).expect("reopen untracked checkpoint inventory");
+    let storage = StorageAdapter::new(database.clone());
+    let read = storage
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("open untracked checkpoint inventory read");
+    let entries = space_inventory(&read, CHECKPOINT_SPACE).await;
+    drop(read);
+    drop(storage);
+    drop(database);
+    assert!(
+        entries.iter().any(|(key, _)| key == &expected_key),
+        "an untracked plugin file must publish its durable checkpoint like a tracked one"
+    );
+
+    let lix = open_rocksdb_lix(root.path()).await;
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = '\"after\"' \
+         WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
+        &[Value::Text(FILE_ID.to_owned())],
+    )
+    .await
+    .expect("a restored untracked actor should accept an entity edit");
+    assert_eq!(
+        read_file(&lix, PATH).await.unwrap(),
+        Some(br#"{"alpha":"after"}"#.to_vec()),
+        "a restored checkpoint must re-render current bytes, never stale ones"
+    );
+    let still_untracked = lix
+        .execute(
+            "SELECT lixcol_untracked FROM lix_file WHERE id = $1",
+            &[Value::Text(FILE_ID.to_owned())],
+        )
+        .await
+        .expect("the untracked file should still be visible")
+        .rows()[0]
+        .get::<bool>("lixcol_untracked")
+        .expect("lane column should project");
+    assert!(
+        still_untracked,
+        "a durable checkpoint must not promote the file out of the untracked lane"
+    );
+    lix.close()
+        .await
+        .expect("close restored untracked checkpoint fixture");
+}
+
 #[tokio::test]
 async fn universal_entity_page_streams_oversized_output_snapshot() {
     const PATH: &str = "/universal-oversized-output.json";

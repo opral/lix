@@ -10484,16 +10484,16 @@ impl PluginWriteReconciliation {
                         ),
                     )
                 })?;
-            // An untracked file gets no durable actor checkpoint. A checkpoint
-            // is a persisted artifact keyed to the file, so writing one for an
-            // untracked file would hand untracked state a durability guarantee
-            // it is defined not to have. Reconciliation still runs and still
-            // produces entity rows; only the checkpoint is withheld, so the
-            // actor rebuilds cold on the next open through the existing
-            // checkpoint-miss path.
-            if write.untracked {
-                continue;
-            }
+            // Lane does not gate the checkpoint. `PLUGIN_CHECKPOINT_SPACE` is a
+            // dedicated mutable side space keyed by `branch_id ++ file_id` with
+            // no lane column, no commit link and no changelog entry, and its
+            // validity is content-addressed: a load only returns a checkpoint
+            // whose generation, blob hash and semantic root all still match, so
+            // a stale one degrades into the cold rebuild it was accelerating.
+            // Its lifetime already matches untracked state — the branch's
+            // prefix range is reclaimed when the branch is deleted, and the
+            // file's key is dropped with the file. Withholding it for untracked
+            // files bought no invariant and cost every session a full re-parse.
             write.set_plugin_checkpoint(generation, semantic_root, checkpoint.bytes(), authority);
         }
         Ok(())
