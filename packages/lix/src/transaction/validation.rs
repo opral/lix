@@ -6206,6 +6206,93 @@ mod tests {
         );
     }
 
+    fn fk_row_in_file(
+        mut row: TestPreparedStateRow,
+        file_id: &str,
+    ) -> MaterializedLiveStateRow {
+        row.file_id = Some(file_id.into());
+        MaterializedLiveStateRow::from(row)
+    }
+
+    /// Simulates the "just widen the delete-side source domain" fix by running
+    /// the committed batch with an `Any` file scope, against a corpus where the
+    /// same target primary key legitimately exists in two file scopes.
+    async fn widened_source_domain_probe(source_domain: Domain) -> Result<(), LixError> {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let file_f = "01920000-0000-7000-8000-0000000000f0";
+        let file_g = "01920000-0000-7000-8000-0000000000f9";
+
+        let live_state = StrictStaticLiveStateReader {
+            rows: vec![
+                fk_row_in_file(fk_parent_row("parent-1", branch_id), file_f),
+                fk_row_in_file(fk_parent_row("parent-1", branch_id), file_g),
+                fk_row_in_file(fk_child_row("child-1", "parent-1", branch_id), file_g),
+            ],
+        };
+        let catalog = CatalogSnapshot::from_visible_schemas(&[fk_parent_schema(), fk_child_schema()])
+            .expect("fk schemas should compile");
+        let reference = catalog
+            .delete_plan_for_key("fk_parent_schema")
+            .foreign_key_references
+            .first()
+            .expect("fk_parent_schema is referenced by fk_child_schema")
+            .clone();
+
+        // Delete `parent-1` in file F only. `child-1` lives in file G and is
+        // satisfied by the `parent-1` row that remains in file G.
+        let deleted_identity = DomainRowIdentity::in_domain(
+            Domain::exact_file(branch_id.to_string(), false, Some(file_f.to_string())),
+            "fk_parent_schema",
+            EntityPk::single("parent-1"),
+        );
+        let batches = BTreeMap::from([(
+            NormalDeleteRestrictionBatchKey {
+                source_key: reference.source_key.clone(),
+                source_domain,
+                local_properties: reference.foreign_key.local_properties.clone(),
+            },
+            BTreeMap::from([(
+                UniqueConstraintValue::from_snapshot(
+                    &json!({ "id": "parent-1" }),
+                    &reference.foreign_key.referenced_properties,
+                )
+                .expect("referenced value should encode"),
+                vec![deleted_identity],
+            )]),
+        )]);
+
+        validate_committed_normal_delete_restriction_batches(
+            &live_state,
+            &PendingConstraintIndexes::default(),
+            batches,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn widening_delete_source_domain_to_any_file_falsely_rejects() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let file_f = "01920000-0000-7000-8000-0000000000f0";
+
+        let narrow = widened_source_domain_probe(Domain::exact_file(
+            branch_id.to_string(),
+            false,
+            Some(file_f.to_string()),
+        ))
+        .await;
+        assert!(
+            narrow.is_ok(),
+            "today's exact file scope correctly allows this delete, got {narrow:?}"
+        );
+
+        let widened =
+            widened_source_domain_probe(Domain::any_file(branch_id.to_string(), false)).await;
+        let error = widened.expect_err(
+            "Domain::any_file conflates same-valued keys across file scopes and must reject",
+        );
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
     fn pending_delete_restriction_probe(
         visible_schemas: &[JsonValue],
         staged_rows: Vec<TestPreparedStateRow>,
