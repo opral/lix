@@ -1,7 +1,7 @@
 # Lix Server Protocol
 
 The Lix Server Protocol is the canonical HTTP contract for hosting a Lix
-workspace. Its methods, `/lix/v1` paths, wire formats, session behavior, and
+repository. Its methods, `/lix/v1` paths, wire formats, session behavior, and
 reference implementation live in the `lix` crate. HTTP frameworks and
 deployment policy do not.
 
@@ -15,10 +15,10 @@ lix = { version = "0.11", features = ["server-protocol"] }
 The feature is off by default. Embedded users do not compile the HTTP protocol
 surface or its optional dependencies.
 
-## Host one workspace
+## Host one repository
 
-Open a Lix workspace and retain one `LixServerProtocol` for the entire time the
-workspace is hosted:
+Open a Lix repository and retain one `LixServerProtocol` for the entire time the
+repository is hosted:
 
 ```rust,no_run
 use std::sync::Arc;
@@ -28,8 +28,8 @@ use lix::server_protocol::{
 
 # async fn example(request: lix::server_protocol::ServerProtocolRequest)
 #     -> Result<lix::server_protocol::ServerProtocolResponse, lix::LixError> {
-let workspace = Arc::new(lix::open_lix().await?);
-let protocol = LixServerProtocol::new(workspace);
+let repository = Arc::new(lix::open_lix().await?);
+let protocol = LixServerProtocol::new(repository);
 
 // Authentication happens in the host, before protocol dispatch.
 let context = ServerProtocolContext {
@@ -50,8 +50,8 @@ types and `ServerProtocolBody`. An Axum, Hyper, Actix, or custom host only needs
 to convert its body into `ServerProtocolBody`, invoke `handle`, and forward the
 returned status, headers, extensions, and body.
 
-The host owns the outer URL. For example, it may mount a workspace at
-`/workspaces/{workspace_id}` and strip that prefix before dispatch. Everything
+The host owns the outer URL. For example, it may mount a repository at
+`/repositories/{repository_id}` and strip that prefix before dispatch. Everything
 beginning at `/lix/v1` is owned by the protocol and must not be renamed.
 
 ## Authentication
@@ -83,7 +83,7 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix({
   server: {
     mode: "remote",
-    url: "https://example.com/workspaces/acme",
+    url: "https://example.com/repositories/acme",
     headers: async () => ({
       Authorization: `Bearer ${await getAccessToken()}`,
     }),
@@ -100,21 +100,21 @@ streams. The handshake response reports the account chosen by the host.
 Before dispatch, the host must:
 
 - authenticate and select a trusted principal;
-- resolve the outer workspace identifier and retain its runtime;
+- resolve the outer repository identifier and retain its runtime;
 - strip the outer route prefix;
 - decompress request content and enforce a compressed-body safety limit;
 - convert the decoded body to `ServerProtocolBody`.
 
 After dispatch, the host may apply response compression, CORS, deadlines,
 rate limits, and telemetry. It must preserve protocol status codes, headers,
-body bytes, and streaming behavior. SSE responses must retain the workspace
+body bytes, and streaming behavior. SSE responses must retain the repository
 runtime until their body closes.
 
 `DurableTerminalStorageNotifier`, `is_terminal_storage_response`, and
 `terminal_storage_stream_signal` let a production host replace a terminal
 storage runtime without parsing wire error bodies or SSE frames.
 
-Call `LixServerProtocol::close()` during workspace shutdown. Dropping a live
+Call `LixServerProtocol::close()` during repository shutdown. Dropping a live
 server invalidates its in-memory session capabilities.
 
 ## Contract

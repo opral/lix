@@ -4,10 +4,10 @@ info:
   version: "2"
   description: Canonical HTTP surface implemented by lix::server_protocol.
 servers:
-  - url: https://host.example/{workspacePrefix}
+  - url: https://host.example/{repositoryPrefix}
     variables:
-      workspacePrefix:
-        default: workspaces/example
+      repositoryPrefix:
+        default: repositories/example
 security:
   - bearerAuth: []
   - cookieAuth: []

@@ -15,7 +15,7 @@ Lix has pluggable storage. A storage adapter decides where the bytes live. The L
 | `LocalFilesystem`  | JavaScript, Rust | a local directory synchronized with Lix        |
 | `RocksDB`          | Rust             | native embedded persistence                    |
 | `SlateDB`          | Rust             | object storage, for example S3                 |
-| Remote server      | any client       | shared workspaces; the server owns persistence |
+| Remote server      | any client       | shared repositories; the server owns persistence |
 
 In JavaScript, `LocalFilesystem` requires Node.js. The default `Memory` storage and `IndexedDbStorage` work in browsers.
 
@@ -33,24 +33,24 @@ await lix.close();
 
 ## Local filesystem
 
-Persist a directory as a Lix workspace with `LocalFilesystem`:
+Persist a directory as a Lix repository with `LocalFilesystem`:
 
 ```ts
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
   storage: new LocalFilesystem({
-    path: "/var/data/workspace",
+    path: "/var/data/repository",
     syncAllFiles: true,
   }),
 });
 ```
 
-Lix stores its repository state in `<workspace>/.lix/.internal` and synchronizes workspace files. Reopen the same path to resume the existing state.
+Lix stores its repository state in `<repository>/.lix/.internal` and synchronizes repository files. Reopen the same path to resume the existing state.
 
 Two options change this behavior:
 
-- `lixDir` stores the repository state outside the workspace. The workspace does not receive a `.lix` directory.
+- `lixDir` stores the repository state outside the repository. The repository does not receive a `.lix` directory.
 - `syncAllFiles: false` starts without importing files. Import exact file paths with `storage.importPaths(["notes/today.md"])`.
 
 ## IndexedDB
@@ -76,7 +76,7 @@ Filesystem sync handles regular files only. Symbolic links and other special ent
 
 ## Remote server
 
-Connect to a hosted workspace with `server`:
+Connect to a hosted repository with `server`:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -84,14 +84,14 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix({
   server: {
     mode: "remote",
-    url: "https://example.com/workspaces/acme",
+    url: "https://example.com/repositories/acme",
   },
 });
 ```
 
 The client needs no local storage option. Files, SQL rows, and branches live on the server.
 
-For S3, the server runs Lix with the Rust SlateDB storage backed by an S3-compatible object store and exposes the workspace through the [Lix Server Protocol](./server-protocol.md). Clients do not pass S3 to `openLix()`.
+For S3, the server runs Lix with the Rust SlateDB storage backed by an S3-compatible object store and exposes the repository through the [Lix Server Protocol](./server-protocol.md). Clients do not pass S3 to `openLix()`.
 
 ```text
 JS client ── HTTP ──▶ Lix server ──▶ SlateDB ──▶ S3

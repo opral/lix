@@ -304,7 +304,7 @@ pub const TRANSACTION_ID_HEADER: &str = "lix-transaction-id";
 pub const FILE_FOUND_HEADER: &str = "lix-file-found";
 /// Client-generated identity for sequential resumable file parts.
 pub const FILE_UPLOAD_ID_HEADER: &str = "lix-upload-id";
-/// Default maximum number of live remote sessions for one workspace.
+/// Default maximum number of live remote sessions for one repository.
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 /// Default idle lifetime for a remote session.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
@@ -329,7 +329,7 @@ const MIN_REQUEST_BLOB_CACHE_BYTES: usize = 32 * 1024;
 /// while inserting its similarly sized successor evicts the predecessor.
 const MAX_REQUEST_BLOB_CACHE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum request-base bytes retained across every remote session for one
-/// workspace. Once full, additional bases simply use the existing complete-
+/// repository. Once full, additional bases simply use the existing complete-
 /// blob retry path; request correctness never depends on cache admission.
 pub const DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
@@ -401,7 +401,7 @@ impl ServerProtocolContext {
     }
 }
 
-/// Resource limits for one workspace's remote protocol sessions.
+/// Resource limits for one repository's remote protocol sessions.
 #[derive(Clone, Copy, Debug)]
 pub struct ServerProtocolOptions {
     /// Maximum number of retained remote sessions and their per-session caches.
@@ -428,7 +428,7 @@ impl Default for ServerProtocolOptions {
     }
 }
 
-/// Persistent canonical protocol server for one Lix workspace.
+/// Persistent canonical protocol server for one Lix repository.
 ///
 /// A server owns one root [`Lix`] and opens every remote client as an
 /// independent branch-pinned session on that root's existing engine. Clones
@@ -1407,7 +1407,7 @@ where
             .expect("default protocol server options must be valid")
     }
 
-    /// Creates a protocol server with explicit per-workspace session limits.
+    /// Creates a protocol server with explicit per-repository session limits.
     pub fn with_options(
         root: Arc<Lix<S>>,
         options: ServerProtocolOptions,
@@ -1458,7 +1458,7 @@ where
     /// Handles one canonical protocol request.
     ///
     /// Hosts authenticate before calling this method, strip their outer
-    /// workspace prefix, decompress the request body, and pass the resulting
+    /// repository prefix, decompress the request body, and pass the resulting
     /// trusted principal through `context`. The protocol owns every method and
     /// path beginning at [`PROTOCOL_PATH`].
     pub fn handle(
@@ -1650,7 +1650,7 @@ where
             .all(|record| record.is_idle_expired(now, self.inner.options.session_idle_timeout))
     }
 
-    /// Closes every child session and finally the root workspace session.
+    /// Closes every child session and finally the root repository session.
     /// Repeated calls are safe.
     pub async fn close(&self) -> Result<(), LixError> {
         let mut close_result = self.inner.close_result.subscribe();
@@ -8808,7 +8808,7 @@ mod tests {
         assert!(second.get(&second_sha256).is_some());
         assert!(
             third.get(&third_sha256).is_none(),
-            "a full workspace budget must decline another session cache admission"
+            "a full repository budget must decline another session cache admission"
         );
         assert_eq!(
             budget.total_bytes.load(Ordering::Acquire),
@@ -8832,7 +8832,7 @@ mod tests {
         third.insert(CachedRequestBlob { blob: third_blob });
         assert!(
             third.get(&third_sha256).is_some(),
-            "dropping a session cache must release its workspace budget"
+            "dropping a session cache must release its repository budget"
         );
         assert_eq!(
             budget.total_bytes.load(Ordering::Acquire),
