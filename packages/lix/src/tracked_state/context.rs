@@ -6968,7 +6968,6 @@ mod tests {
                     parent_commit_ids: vec![commit_b],
                     first_parent_jump_commit_id: commit_a,
                     first_parent_jump_span: 0,
-                    change_id: ChangeId::for_test_label("commit-a:commit"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at: crate::common::LixTimestamp::expect_parse(
                         "created_at",
@@ -8639,15 +8638,20 @@ mod tests {
             chunks.len()
         );
 
-        // Damage a chunk that is not the root and not on the leftmost path, so
+        // Damage a chunk that is not the root and not on the bounded path, so
         // only a total traversal can notice it.
-        let mut damaged_chunk = None;
-        for chunk in chunks.iter() {
-            if chunk != root_id.as_bytes() {
-                damaged_chunk = Some(*chunk);
-            }
-        }
-        let damaged_chunk = damaged_chunk.expect("a non-root chunk exists");
+        //
+        // `chunks` is a HashSet, so picking "the last non-root chunk" made the
+        // choice depend on hash iteration order — the fixture silently relied
+        // on that pick landing off the bounded path. Sort first so the chunk
+        // this test damages is a property of the tree, not of the allocator.
+        let mut candidates = chunks
+            .iter()
+            .copied()
+            .filter(|chunk| chunk != root_id.as_bytes())
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        let damaged_chunk = *candidates.last().expect("a non-root chunk exists");
         let mut writes = storage.new_write_set();
         writes.delete(
             storage::TRACKED_STATE_TREE_CHUNK_SPACE,

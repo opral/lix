@@ -62,7 +62,6 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
     crate::changelog::COMMIT_SPACE,
     crate::changelog::CHANGE_SPACE,
-    crate::changelog::COMMIT_CHANGE_ID_SPACE,
     crate::storage_adapter::REVISION_SPACE,
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
     crate::session::UPLOAD_STATE_SPACE,
@@ -86,17 +85,27 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
 
 /// Space ids the constructor check cannot reject yet.
 ///
-/// `gc.rs` re-declares `0x0004_002b` (`tracked_state.commit_state_manifest.v7`)
-/// as mutable so a retention test can delete and overwrite an authority the
-/// engine publishes write-once. Every other engine test states that need
+/// Empty, and it should stay that way. Every engine site that needs to place
+/// chosen bytes under a key the engine publishes write-once states that need
 /// through `StorageSpace::mutable_view_for_corruption_test`, which does not go
-/// through the checked constructors at all. `gc.rs` is owned by the in-flight
-/// GC ledger redesign and is not edited this cycle, so this one id keeps the
-/// weaker, test-enforced treatment: it is reported by
-/// [`tests::no_registered_space_id_is_declared_with_two_value_semantics`], and
-/// [`tests::the_unchecked_ids_are_exactly_the_known_disagreements`] fails the
-/// moment the site goes away and this list becomes stale.
-const UNCHECKED_SPACE_IDS: &[u32] = &[0x0004_002b];
+/// through the checked constructors at all.
+///
+/// This list held `0x0004_002b` (`tracked_state.commit_state_manifest.v7`) for
+/// one raw re-declaration in a `gc.rs` retention test, justified by `gc.rs`
+/// being owned by an in-flight redesign and not editable that cycle. The
+/// ownership claim was round-4 residue; the site has now been converted to
+/// `mutable_view_for_corruption_test` and the hole is closed.
+///
+/// Note what the guard could and could not do. `tests::the_unchecked_ids_are_
+/// exactly_the_known_disagreements` compares this list to
+/// `tests::KNOWN_DISAGREEMENTS` -- two hand-maintained lists, checked against
+/// each other and never against the code -- so it would not have noticed the
+/// call site disappearing, only a disagreement between the two lists. What
+/// actually enforces this is the `const` assertion in
+/// `StorageSpace::mutable`: with the list empty, a re-declaration is a compile
+/// error naming the exact site. Widening a safety check for one call site needs
+/// a guard that watches the call site, not a second list describing it.
+const UNCHECKED_SPACE_IDS: &[u32] = &[];
 
 /// Whether a space id may be declared with `semantics`.
 ///
@@ -343,7 +352,7 @@ mod tests {
     /// owned by the in-flight GC ledger redesign and is left alone this cycle.
     /// The list is exact, so this also fails once the redesign removes the
     /// site and the entry goes stale.
-    const KNOWN_DISAGREEMENTS: &[(&str, u32)] = &[("lix/src/gc.rs", 0x0004_002b)];
+    const KNOWN_DISAGREEMENTS: &[(&str, u32)] = &[];
 
     #[test]
     fn no_registered_space_id_is_declared_with_two_value_semantics() {
@@ -629,9 +638,9 @@ mod tests {
                 };
                 let name = name.trim();
                 if name.is_empty()
-                    || !name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
                 {
                     continue;
                 }
@@ -639,9 +648,9 @@ mod tests {
                     continue;
                 };
                 let id = match declared_type.trim() {
-                    "SpaceId" | "StorageSpaceId" => literal_space_id(
-                        &expression.split_whitespace().collect::<String>(),
-                    ),
+                    "SpaceId" | "StorageSpaceId" => {
+                        literal_space_id(&expression.split_whitespace().collect::<String>())
+                    }
                     "StorageSpace" => construction_sites(expression)
                         .first()
                         .and_then(|site| literal_space_id(&site.id_expression)),

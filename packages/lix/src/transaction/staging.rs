@@ -1823,7 +1823,6 @@ impl TransactionWriteBuffer {
             StagedCommitChangeRefs::new(
                 CommitId::with_change_address_space(self.functions.call_uuid_v7()),
                 ChangeId::from(self.functions.call_uuid_v7()),
-                ChangeId::from(self.functions.call_uuid_v7()),
                 timestamp,
             )
         });
@@ -2425,7 +2424,6 @@ impl TransactionWriteBuffer {
                     StagedCommitChangeRefs::new(
                         CommitId::with_change_address_space(self.functions.call_uuid_v7()),
                         ChangeId::from(self.functions.call_uuid_v7()),
-                        ChangeId::from(self.functions.call_uuid_v7()),
                         timestamp,
                     )
                 });
@@ -2549,7 +2547,6 @@ impl TransactionWriteBuffer {
                 let timestamp = self.functions.call_timestamp();
                 StagedCommitChangeRefs::new(
                     CommitId::with_change_address_space(self.functions.call_uuid_v7()),
-                    ChangeId::from(self.functions.call_uuid_v7()),
                     ChangeId::from(self.functions.call_uuid_v7()),
                     timestamp,
                 )
@@ -2787,7 +2784,6 @@ impl TransactionWriteBuffer {
             StagedCommitChangeRefs::new(
                 CommitId::with_change_address_space(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
-                ChangeId::from(functions.call_uuid_v7()),
                 timestamp,
             )
         });
@@ -2805,7 +2801,6 @@ impl TransactionWriteBuffer {
         let timestamp = self.functions.call_timestamp();
         let mut change_refs = StagedCommitChangeRefs::new(
             CommitId::with_change_address_space(self.functions.call_uuid_v7()),
-            ChangeId::from(self.functions.call_uuid_v7()),
             ChangeId::from(self.functions.call_uuid_v7()),
             timestamp,
         );
@@ -4245,7 +4240,6 @@ fn add_row_to_commit_change_refs(
             let timestamp = functions.call_timestamp();
             StagedCommitChangeRefs::new(
                 CommitId::with_change_address_space(functions.call_uuid_v7()),
-                ChangeId::from(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
                 timestamp,
             )
@@ -6352,7 +6346,6 @@ mod tests {
             .get("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .expect("global commit change_refs should exist");
         assert_eq!(change_refs.commit_id, test_commit_id(1));
-        assert_eq!(change_refs.commit_change_id, test_change_id(2));
         assert_eq!(
             change_refs.created_at.to_string(),
             "2026-01-01T00:00:00.001Z"
@@ -6411,20 +6404,12 @@ mod tests {
         }
     }
 
-    fn test_uuid(index: usize) -> String {
-        test_uuid_value(index).to_string()
-    }
-
     fn test_uuid_value(index: usize) -> uuid::Uuid {
         uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128)
     }
 
     fn test_commit_id(index: usize) -> CommitId {
         CommitId::with_change_address_space(test_uuid_value(index))
-    }
-
-    fn test_change_id(index: usize) -> ChangeId {
-        ChangeId::parse(&test_uuid(index)).expect("test uuid should parse as change id")
     }
 
     fn state_row(key: &str, value: &str) -> TestPreparedStateRow {
