@@ -4507,6 +4507,56 @@ mod tests {
     use super::*;
     use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKey};
 
+    /// Probe: a dense certified-parameter batch reports its durability lane
+    /// through the borrowed accessor, but `expand_dense_certified_parameter`
+    /// hard-codes `untracked: false`, so the same batch changes lane the first
+    /// time anything forces it into row slots.
+    #[test]
+    fn dense_certified_parameter_lane_probe() {
+        let entity_pks = vec![EntityPk::single("a"), EntityPk::single("b")];
+        let snapshots = [r#"{"id":"a"}"#, r#"{"id":"b"}"#]
+            .into_iter()
+            .map(|value| {
+                TransactionJson::from_certified_shared_normalized_row_content(value.into())
+            })
+            .collect::<Vec<_>>();
+        let certificate = CertifiedRawWriteBatchPreparation {
+            schema_plan_id: SchemaPlanId::for_test(7),
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: None,
+        };
+        let timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z");
+        let mut prepared = CertifiedParameterInsertBatch::new_with_lane(
+            entity_pks,
+            snapshots,
+            "dense_probe".into(),
+            "main".into(),
+            true,
+            certificate,
+        )
+        .expect("certified rows should construct")
+        .into_dense_prepared(None, timestamp)
+        .expect("certified rows should prepare");
+
+        assert!(prepared.is_dense_certified_parameter());
+        assert!(
+            prepared.iter().all(|row| row.untracked),
+            "dense projection preserves the untracked lane"
+        );
+
+        prepared.set_durable_predecessor(0, None);
+
+        assert!(!prepared.is_dense_certified_parameter());
+        assert!(
+            prepared.iter().all(|row| !row.untracked),
+            "expansion silently moved every row into the tracked lane"
+        );
+    }
+
     #[test]
     fn certified_parameter_rows_keep_batch_common_prepared_facts_dense() {
         let entity_pks = vec![EntityPk::single("a"), EntityPk::single("b")];
