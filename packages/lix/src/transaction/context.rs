@@ -1805,30 +1805,20 @@ where
                 .await;
             return Err(error);
         }
-        let filesystem_delta_rows =
-            if prepared_writes_require_filesystem_index_rebuild(&prepared_writes) {
-                Vec::new()
-            } else {
-                prepared_writes
-                    .state_rows
-                    .iter()
-                    .filter(|row| {
-                        matches!(
-                            row.schema_key.as_str(),
-                            "lix_file_descriptor"
-                                | "lix_directory_descriptor"
-                                | BLOB_REF_SCHEMA_KEY
-                        )
-                    })
-                    .map(MaterializedHotStateRow::from)
-                    .collect::<Vec<_>>()
-            };
-        let previous_filesystem_revision = if filesystem_delta_rows.is_empty() {
-            None
-        } else {
+        // The delta itself is projected out of the commit below, once
+        // addressable rows hold their final commit-delta change ids. Only its
+        // *projectability* is decided here, because the revision the cached
+        // views are keyed on has to be read before the commit publishes its
+        // successor.
+        let filesystem_delta_projectable =
+            prepared_writes_stage_filesystem_rows(&prepared_writes)
+                && !prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
+        let previous_filesystem_revision = if filesystem_delta_projectable {
             load_path_index_revision(&read).await.ok().flatten()
+        } else {
+            None
         };
-        let (mut writes, materialization_preconditions) =
+        let (mut writes, materialization_preconditions, filesystem_delta_rows) =
             match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
                 &transaction.tracked_state,
@@ -1846,7 +1836,15 @@ where
             ))
             .await
             {
-                Ok(writes) => writes,
+                Ok(commit) => (
+                    commit.writes,
+                    commit.preconditions,
+                    if filesystem_delta_projectable {
+                        commit.filesystem_delta_rows
+                    } else {
+                        Vec::new()
+                    },
+                ),
                 Err(error) => {
                     transaction
                         .discard_pending_plugin_actor_publications()
@@ -8912,26 +8910,50 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
         .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
 }
 
+/// Whether this commit's staged filesystem rows are an incomplete description
+/// of how the visible filesystem changed, so cached path indexes must be
+/// rebuilt from hot state rather than advanced by a delta.
+///
+/// Two shapes are incomplete, and both are about *which rows exist*, not about
+/// when their identities are assigned:
+///
+/// * a **branch ref move** republishes the branch's entire visible filesystem;
+///   the difference is between two commits, not between staged rows;
+/// * a **change selected into this commit from another commit** (merge,
+///   checkpoint, cherry-pick) enters the branch's visible filesystem without
+///   appearing in `state_rows` at all.
+///
+/// An ordinary create, rename, delete, or content write is fully described by
+/// its staged rows and is therefore projectable. Those rows are read back out
+/// of the commit once materialization has assigned their final change ids —
+/// see [`commit::MaterializedCommit::filesystem_delta_rows`].
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
-    prepared_writes.state_rows.iter().any(|row| {
-        row.schema_key == BRANCH_REF_SCHEMA_KEY
-            || (row.addressable_change_id
-                && matches!(
-                    row.schema_key.as_str(),
-                    "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
-                ))
-    }) || prepared_writes
-        .commit_change_refs_by_branch
-        .values()
-        .flat_map(
-            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
-        )
-        .any(|change_ref| {
-            matches!(
-                change_ref.schema_key(),
-                "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+    prepared_writes
+        .state_rows
+        .iter()
+        .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
+        || prepared_writes
+            .commit_change_refs_by_branch
+            .values()
+            .flat_map(
+                crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
             )
-        })
+            .any(|change_ref| {
+                matches!(
+                    change_ref.schema_key(),
+                    "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+                )
+            })
+}
+
+/// Whether this commit stages any row that the cached path index projects.
+fn prepared_writes_stage_filesystem_rows(prepared_writes: &PreparedWriteSet) -> bool {
+    prepared_writes.state_rows.iter().any(|row| {
+        matches!(
+            row.schema_key.as_str(),
+            "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+        )
+    })
 }
 
 pub(crate) struct OpenTransaction<StorageImpl: Storage + 'static = Memory> {
@@ -12015,8 +12037,14 @@ mod tests {
         ));
     }
 
+    /// An addressable filesystem row carries a provisional change id into
+    /// materialization, which is why the delta is projected out of the commit
+    /// rather than out of the caller's `PreparedWriteSet`. Addressability alone
+    /// says nothing about whether the staged rows describe the whole change,
+    /// so it must not force a rebuild — that is what made every file *create*
+    /// discard the cached path index.
     #[test]
-    fn addressable_filesystem_row_requires_index_rebuild() {
+    fn addressable_filesystem_row_does_not_require_index_rebuild() {
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let mut state_rows = PreparedStateBatch::with_capacity(1);
         state_rows.push_parts_with_change_addressability(
@@ -12034,6 +12062,48 @@ mod tests {
             false,
             Some(ChangeId::for_test_label("provisional")),
             true,
+            Some(CommitId::for_test_label("commit")),
+            false,
+            "main".into(),
+        );
+        let prepared_writes = PreparedWriteSet {
+            state_rows,
+            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+        };
+
+        assert!(prepared_writes_stage_filesystem_rows(&prepared_writes));
+        assert!(!prepared_writes_require_filesystem_index_rebuild(
+            &prepared_writes
+        ));
+    }
+
+    /// A branch ref move republishes the branch's whole visible filesystem, so
+    /// the staged rows cannot describe the difference.
+    #[test]
+    fn branch_ref_write_requires_filesystem_index_rebuild() {
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+        let mut state_rows = PreparedStateBatch::with_capacity(1);
+        state_rows.push_parts_with_change_addressability(
+            SchemaPlanId::for_test(0),
+            PreparedRowFacts::default(),
+            EntityPk::single("main"),
+            BRANCH_REF_SCHEMA_KEY.into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            timestamp,
+            timestamp,
+            true,
+            Some(ChangeId::for_test_label("branch-ref")),
+            false,
             Some(CommitId::for_test_label("commit")),
             false,
             "main".into(),
