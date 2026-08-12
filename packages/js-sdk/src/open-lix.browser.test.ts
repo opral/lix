@@ -146,7 +146,7 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 	}
 });
 
-test("remote client state survives reopen while the server selects the session branch", async () => {
+test("remote client state survives reopen without selecting protocol identity", async () => {
 	const { IndexedDbStorage, openLix } = await import("@lix-js/sdk");
 	const storage = new IndexedDbStorage({
 		name: `lix-client-state-test:${crypto.randomUUID()}`,
@@ -217,10 +217,7 @@ test("remote client state survives reopen while the server selects the session b
 		await second.close();
 	}
 	expect(initialBranchRequests).toEqual([null, null]);
-	expect(initialAccountRequests).toEqual([
-		null,
-		"00000000-0000-7000-8000-000000000002",
-	]);
+	expect(initialAccountRequests).toEqual([null, null]);
 });
 
 test("IndexedDbStorage persists a complete local Lix", async () => {
