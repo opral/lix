@@ -10014,7 +10014,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("read should open");
-            FunctionContext::prepare(&read)
+            FunctionContext::prepare(&read, None)
                 .await
                 .expect("runtime context should prepare")
         };

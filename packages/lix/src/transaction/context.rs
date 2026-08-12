@@ -1536,7 +1536,8 @@ where
         let read = opening_read.clone();
         let setup_result = async {
             let active_branch_id = session_branch.get()?;
-            let runtime_functions = FunctionContext::prepare(&read).await?;
+            let runtime_functions =
+                FunctionContext::prepare(&read, Some(hot_state.global_key_value_rows())).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
             // Transaction open needs the catalog revision and the tracked

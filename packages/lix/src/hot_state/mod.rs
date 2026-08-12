@@ -10,7 +10,9 @@ mod types;
 pub(crate) mod visibility;
 
 #[allow(unused_imports)]
-pub(crate) use context::{BranchHeadControlCache, HotStateContext, HotStateContextReader};
+pub(crate) use context::{
+    BranchHeadControlCache, GlobalKeyValueRowCache, HotStateContext, HotStateContextReader,
+};
 /// Re-exported for the consumers that already spell these `crate::hot_state::…`.
 /// The definitions live in the top-level `entity_columnar` module, which sits
 /// below both state planes; this facade only exists so the move did not have to

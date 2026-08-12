@@ -14,7 +14,8 @@ use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
 };
 use crate::hot_state::{
-    CurrentStateDeltaRef, HotStateReadDomain, MaterializedHotStateRow, TrackedHeadContext,
+    CurrentStateDeltaRef, GlobalKeyValueRowCache, HotStateReadDomain, MaterializedHotStateRow,
+    TrackedHeadContext,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};
@@ -32,8 +33,9 @@ const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 /// is engine-owned global state and has no changelog or commit history.
 pub(crate) async fn load_mode(
     read: &(impl StorageAdapterRead + ?Sized),
+    cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicMode, LixError> {
-    let Some(row) = load_key_value_row(read, DETERMINISTIC_MODE_KEY).await? else {
+    let Some(row) = load_key_value_row(read, cache, DETERMINISTIC_MODE_KEY).await? else {
         return Ok(DeterministicMode::disabled());
     };
     let value = key_value_payload(&row, DETERMINISTIC_MODE_KEY)?;
@@ -46,8 +48,9 @@ pub(crate) async fn load_mode(
 /// execution starts at sequence zero.
 pub(crate) async fn load_sequence(
     read: &(impl StorageAdapterRead + ?Sized),
+    cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicSequence, LixError> {
-    let Some(row) = load_key_value_row(read, DETERMINISTIC_SEQUENCE_KEY).await? else {
+    let Some(row) = load_key_value_row(read, cache, DETERMINISTIC_SEQUENCE_KEY).await? else {
         return Ok(DeterministicSequence::uninitialized());
     };
     let value = key_value_payload(&row, DETERMINISTIC_SEQUENCE_KEY)?;
@@ -142,6 +145,7 @@ pub(crate) async fn stage_sequence(
 
 async fn load_key_value_row(
     read: &(impl StorageAdapterRead + ?Sized),
+    cache: Option<&GlobalKeyValueRowCache>,
     key: &str,
 ) -> Result<Option<MaterializedHotStateRow>, LixError> {
     let Some(control) = BranchHeadControlContext::new()
@@ -151,6 +155,27 @@ async fn load_key_value_row(
     else {
         return Ok(None);
     };
+    // The control is the fence, not just the read's input: it is republished
+    // under a CAS by every write to this plane, so an unchanged control means
+    // the row below — and the collection closure validated with it — cannot
+    // have moved.
+    if let Some(cache) = cache
+        && let Some(row) = cache.get(control, key)
+    {
+        return Ok(row);
+    }
+    let row = load_key_value_row_under_control(read, control, key).await?;
+    if let Some(cache) = cache {
+        cache.insert(control, key, row.clone());
+    }
+    Ok(row)
+}
+
+async fn load_key_value_row_under_control(
+    read: &(impl StorageAdapterRead + ?Sized),
+    control: crate::branch::BranchHeadControl,
+    key: &str,
+) -> Result<Option<MaterializedHotStateRow>, LixError> {
     let keys = [TrackedStateKey {
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         entity_pk: EntityPk::single(key),
@@ -293,7 +318,7 @@ mod tests {
             .await
             .expect("read should open");
 
-        let mode = load_mode(&read).await.expect("missing mode should decode");
+        let mode = load_mode(&read, None).await.expect("missing mode should decode");
 
         assert_eq!(mode, DeterministicMode::disabled());
     }
@@ -316,7 +341,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let mode = load_mode(&read).await.expect("valid mode should decode");
+        let mode = load_mode(&read, None).await.expect("valid mode should decode");
 
         assert_eq!(
             mode,
@@ -336,7 +361,7 @@ mod tests {
             .await
             .expect("read should open");
 
-        let sequence = load_sequence(&read)
+        let sequence = load_sequence(&read, None)
             .await
             .expect("missing sequence should decode");
 
@@ -441,7 +466,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("corrupt sequence storage should read");
-        let error = load_sequence(&read)
+        let error = load_sequence(&read, None)
             .await
             .expect_err("missing selected sequence member must fail closed");
         assert!(
@@ -467,7 +492,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let sequence = load_sequence(&read)
+        let sequence = load_sequence(&read, None)
             .await
             .expect("valid sequence should decode");
 
