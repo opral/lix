@@ -2645,7 +2645,10 @@ async fn validate_committed_delete_restrictions(
             else {
                 continue;
             };
-            for source_domain in tombstone.identity.domain().fk_source_domains_for_target() {
+            for source_domain in delete_restriction_source_domains(
+                &tombstone.identity,
+                reference.source_key.schema_key.as_str(),
+            ) {
                 normal_batches
                     .entry(NormalDeleteRestrictionBatchKey {
                         source_key: reference.source_key.clone(),
@@ -2666,6 +2669,43 @@ async fn validate_committed_delete_restrictions(
     )
     .await?;
     Ok(())
+}
+
+/// Delete-side mirror of [`foreign_key_target_domain`].
+///
+/// The insert side rewrites the *target* domain of a
+/// `lix_file_descriptor -> lix_directory_descriptor` reference to
+/// `Exact(None)`, because a file-descriptor row carries `file_id = own id`
+/// while the directory row it points at carries `file_id = NULL`. The delete
+/// side has to invert that rewrite: given the deleted directory, which file
+/// scopes can hold a file descriptor that still references it?
+///
+/// Because `canonicalize_descriptor_file_id` forces
+/// `lix_file_descriptor.file_id` to equal the row's own entity id, the answer
+/// is "every file scope, and at most one row per scope". `DomainFileScope::Any`
+/// is therefore *exact* for this one pair rather than a widening: no two
+/// file-descriptor rows can share a file scope, so nothing can be conflated
+/// across scopes.
+///
+/// This stays a targeted rewrite instead of widening
+/// `fk_source_domains_for_target` for every schema. For an ordinary
+/// file-scoped schema the same referenced key may legitimately exist in two
+/// different files, and a source row in file G is satisfied by the target in
+/// file G; scanning every file scope would let the copy in G block a delete of
+/// the copy in F and turn a legal delete into a foreign-key error. See
+/// `widening_delete_source_domain_to_any_file_falsely_rejects`.
+fn delete_restriction_source_domains(
+    deleted_identity: &DomainRowIdentity,
+    source_schema_key: &str,
+) -> Vec<Domain> {
+    let domain = deleted_identity.domain();
+    if deleted_identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+        && source_schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+    {
+        return Domain::any_file(domain.branch_id().to_string(), domain.untracked())
+            .fk_source_domains_for_target();
+    }
+    domain.fk_source_domains_for_target()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -6537,6 +6577,404 @@ mod tests {
             live_state.scan_count.load(Ordering::Relaxed),
             3,
             "two target point loads should share the committed source-schema scan"
+        );
+    }
+
+    fn file_descriptor_row_in_directory(
+        file_id: &str,
+        directory_id: Option<&str>,
+        name: &str,
+        branch_id: &str,
+    ) -> TestPreparedStateRow {
+        let mut row = staged_row(
+            FILE_DESCRIPTOR_SCHEMA_KEY,
+            Some(
+                json!({
+                    "id": file_id,
+                    "directory_id": directory_id,
+                    "name": name,
+                })
+                .to_string(),
+            ),
+        );
+        row.entity_pk =
+            EntityPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
+        row.file_id = Some(file_id.into());
+        row.branch_id = branch_id.into();
+        row.global = branch_id == crate::GLOBAL_BRANCH_ID;
+        row
+    }
+
+    const FK_SCOPE_BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000a1";
+    const FK_SCOPE_DIRECTORY_ID: &str = "01920000-0000-7000-8000-0000000000d1";
+    const FK_SCOPE_CHILD_DIRECTORY_ID: &str = "01920000-0000-7000-8000-0000000000d2";
+    const FK_SCOPE_FILE_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    async fn committed_delete_restriction_outcome(
+        staged_rows: Vec<TestPreparedStateRow>,
+        committed_rows: Vec<MaterializedLiveStateRow>,
+    ) -> Result<(), LixError> {
+        let staged_writes = PreparedWriteSet {
+            state_rows: PreparedStateBatch::from_test_rows(staged_rows),
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            file_descriptor_schema(),
+            directory_descriptor_schema(),
+        ])
+        .expect("descriptor schemas should compile");
+        let live_state = StrictStaticLiveStateReader {
+            rows: committed_rows,
+        };
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            if row.snapshot_json().is_none() {
+                pending_constraints.remember_tombstone(row);
+            }
+        }
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        validate_committed_delete_restrictions(&input, &catalog, &pending_constraints).await
+    }
+
+    async fn directory_delete_with_committed_file_child_outcome(
+        untracked: bool,
+    ) -> Result<(), LixError> {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let mut committed_directory =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        let mut committed_file = file_descriptor_row_in_directory(
+            FK_SCOPE_FILE_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "readme.md",
+            FK_SCOPE_BRANCH_ID,
+        );
+        if untracked {
+            mark_prepared_row_untracked(&mut directory_delete);
+            mark_prepared_row_untracked(&mut committed_directory);
+            mark_prepared_row_untracked(&mut committed_file);
+        }
+        committed_delete_restriction_outcome(
+            vec![directory_delete],
+            vec![
+                MaterializedLiveStateRow::from(committed_directory),
+                MaterializedLiveStateRow::from(committed_file),
+            ],
+        )
+        .await
+    }
+
+    /// Control: the same declared restriction on a same-file-scope pair does
+    /// fire, so the batch machinery itself is alive.
+    #[tokio::test]
+    async fn committed_delete_restriction_rejects_child_directory_of_deleted_directory() {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let committed_directory =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        let committed_child = directory_descriptor_row(
+            FK_SCOPE_CHILD_DIRECTORY_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "guides",
+            FK_SCOPE_BRANCH_ID,
+        );
+
+        let error = committed_delete_restriction_outcome(
+            vec![directory_delete],
+            vec![
+                MaterializedLiveStateRow::from(committed_directory),
+                MaterializedLiveStateRow::from(committed_child),
+            ],
+        )
+        .await
+        .expect_err("committed child directory must block its parent's delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    /// A file descriptor row lives in file scope `Exact(Some(own id))` while
+    /// the directory it references lives in `Exact(None)`. Before
+    /// `delete_restriction_source_domains`, the committed delete side scanned
+    /// only `file_id IS NULL` and this declared foreign key could never fire.
+    #[tokio::test]
+    async fn committed_delete_restriction_rejects_tracked_file_child_of_deleted_directory() {
+        let error = directory_delete_with_committed_file_child_outcome(false)
+            .await
+            .expect_err("tracked lane: committed file child must block the directory delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    #[tokio::test]
+    async fn committed_delete_restriction_rejects_untracked_file_child_of_deleted_directory() {
+        let error = directory_delete_with_committed_file_child_outcome(true)
+            .await
+            .expect_err("untracked lane: committed file child must block the directory delete");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    /// The mirror must not reach across branches, and must not fire for a
+    /// file descriptor that sits in a different directory.
+    #[tokio::test]
+    async fn committed_delete_restriction_allows_directory_delete_without_file_children() {
+        let other_directory = "01920000-0000-7000-8000-0000000000d8";
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+
+        let outcome = committed_delete_restriction_outcome(
+            vec![directory_delete],
+            vec![
+                MaterializedLiveStateRow::from(directory_descriptor_row(
+                    FK_SCOPE_DIRECTORY_ID,
+                    None,
+                    "docs",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+                // same branch, different parent directory
+                MaterializedLiveStateRow::from(file_descriptor_row_in_directory(
+                    FK_SCOPE_FILE_ID,
+                    Some(other_directory),
+                    "readme.md",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+                // same directory id, different branch
+                MaterializedLiveStateRow::from(file_descriptor_row_in_directory(
+                    "01920000-0000-7000-8000-0000000000f2",
+                    Some(FK_SCOPE_DIRECTORY_ID),
+                    "readme.md",
+                    "01920000-0000-7000-8000-0000000000b1",
+                )),
+            ],
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "unrelated file descriptors must not block the delete, got {outcome:?}"
+        );
+    }
+
+    /// A file descriptor staged as a tombstone in the same transaction is not
+    /// a live reference, so deleting its directory alongside it is legal --
+    /// this is the shape the recursive directory-delete planner produces.
+    #[tokio::test]
+    async fn committed_delete_restriction_allows_directory_delete_with_staged_file_tombstone() {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let mut file_delete = file_descriptor_row_in_directory(
+            FK_SCOPE_FILE_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "readme.md",
+            FK_SCOPE_BRANCH_ID,
+        );
+        file_delete.snapshot = None;
+
+        let outcome = committed_delete_restriction_outcome(
+            vec![directory_delete, file_delete],
+            vec![
+                MaterializedLiveStateRow::from(directory_descriptor_row(
+                    FK_SCOPE_DIRECTORY_ID,
+                    None,
+                    "docs",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+                MaterializedLiveStateRow::from(file_descriptor_row_in_directory(
+                    FK_SCOPE_FILE_ID,
+                    Some(FK_SCOPE_DIRECTORY_ID),
+                    "readme.md",
+                    FK_SCOPE_BRANCH_ID,
+                )),
+            ],
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a cascading recursive delete must stay legal, got {outcome:?}"
+        );
+    }
+
+    fn fk_row_in_file(mut row: TestPreparedStateRow, file_id: &str) -> MaterializedLiveStateRow {
+        row.file_id = Some(file_id.into());
+        MaterializedLiveStateRow::from(row)
+    }
+
+    /// Simulates the "just widen the delete-side source domain" fix by running
+    /// the committed batch with an `Any` file scope, against a corpus where the
+    /// same target primary key legitimately exists in two file scopes.
+    async fn widened_source_domain_probe(source_domain: Domain) -> Result<(), LixError> {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let file_f = "01920000-0000-7000-8000-0000000000f0";
+        let file_g = "01920000-0000-7000-8000-0000000000f9";
+
+        let live_state = StrictStaticLiveStateReader {
+            rows: vec![
+                fk_row_in_file(fk_parent_row("parent-1", branch_id), file_f),
+                fk_row_in_file(fk_parent_row("parent-1", branch_id), file_g),
+                fk_row_in_file(fk_child_row("child-1", "parent-1", branch_id), file_g),
+            ],
+        };
+        let catalog =
+            CatalogSnapshot::from_visible_schemas(&[fk_parent_schema(), fk_child_schema()])
+                .expect("fk schemas should compile");
+        let reference = catalog
+            .delete_plan_for_key("fk_parent_schema")
+            .foreign_key_references
+            .first()
+            .expect("fk_parent_schema is referenced by fk_child_schema")
+            .clone();
+
+        // Delete `parent-1` in file F only. `child-1` lives in file G and is
+        // satisfied by the `parent-1` row that remains in file G.
+        let deleted_identity = DomainRowIdentity::in_domain(
+            Domain::exact_file(branch_id.to_string(), false, Some(file_f.to_string())),
+            "fk_parent_schema",
+            EntityPk::single("parent-1"),
+        );
+        let batches = BTreeMap::from([(
+            NormalDeleteRestrictionBatchKey {
+                source_key: reference.source_key.clone(),
+                source_domain,
+                local_properties: reference.foreign_key.local_properties.clone(),
+            },
+            BTreeMap::from([(
+                UniqueConstraintValue::from_snapshot(
+                    &json!({ "id": "parent-1" }),
+                    &reference.foreign_key.referenced_properties,
+                )
+                .expect("referenced value should encode"),
+                vec![deleted_identity],
+            )]),
+        )]);
+
+        validate_committed_normal_delete_restriction_batches(
+            &live_state,
+            &PendingConstraintIndexes::default(),
+            batches,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn widening_delete_source_domain_to_any_file_falsely_rejects() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let file_f = "01920000-0000-7000-8000-0000000000f0";
+
+        let narrow = widened_source_domain_probe(Domain::exact_file(
+            branch_id.to_string(),
+            false,
+            Some(file_f.to_string()),
+        ))
+        .await;
+        assert!(
+            narrow.is_ok(),
+            "today's exact file scope correctly allows this delete, got {narrow:?}"
+        );
+
+        let widened =
+            widened_source_domain_probe(Domain::any_file(branch_id.to_string(), false)).await;
+        let error = widened.expect_err(
+            "Domain::any_file conflates same-valued keys across file scopes and must reject",
+        );
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    fn pending_delete_restriction_probe(
+        visible_schemas: &[JsonValue],
+        staged_rows: Vec<TestPreparedStateRow>,
+    ) -> Result<(), LixError> {
+        let staged_writes = PreparedWriteSet {
+            state_rows: PreparedStateBatch::from_test_rows(staged_rows),
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let catalog = CatalogSnapshot::from_visible_schemas(visible_schemas)
+            .expect("probe schemas should compile");
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            match row.snapshot_json() {
+                Some(snapshot) => {
+                    let (_, schema_plan) = catalog
+                        .plan_for_key(row.schema_key())
+                        .expect("probe schema plan should resolve");
+                    pending_constraints
+                        .remember_foreign_key_references(row, schema_plan, snapshot)
+                        .expect("probe foreign-key references should index");
+                }
+                None => pending_constraints.remember_tombstone(row),
+            }
+        }
+        validate_pending_delete_restrictions(&catalog, &pending_constraints)
+    }
+
+    /// `UniqueConstraintValue::from_entity_pk` renders a component with
+    /// `format!("{:?}", JsonValue)` while `from_snapshot*` renders the inner
+    /// value. The two encodings can never compare equal for a string or UUID
+    /// primary key, and `validate_pending_delete_restrictions` is the only
+    /// caller of `from_entity_pk`.
+    #[test]
+    fn pending_delete_restriction_value_encodings_do_not_agree() {
+        let entity_pk = EntityPk::single("parent-1");
+        let snapshot = json!({ "id": "parent-1" });
+        let pointer_group = vec![vec!["id".to_string()]];
+
+        let from_identity = UniqueConstraintValue::from_entity_pk(&entity_pk);
+        let from_snapshot = UniqueConstraintValue::from_snapshot(&snapshot, &pointer_group)
+            .expect("snapshot value should encode");
+
+        assert_eq!(from_identity.0, vec!["String(\"parent-1\")".to_string()]);
+        assert_eq!(from_snapshot.0, vec!["\"parent-1\"".to_string()]);
+        assert_ne!(from_identity, from_snapshot);
+    }
+
+    /// Consequence of the encoding mismatch: the pending lane never fires,
+    /// for a plain user schema pair with no file-scope subtlety at all.
+    #[test]
+    fn pending_delete_restriction_scope_probe_generic_schema_pair() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let mut parent_delete = fk_parent_row("parent-1", branch_id);
+        parent_delete.snapshot = None;
+
+        let outcome = pending_delete_restriction_probe(
+            &[fk_parent_schema(), fk_child_schema()],
+            vec![
+                parent_delete,
+                fk_child_row("child-1", "parent-1", branch_id),
+            ],
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "generic pair: expected the pending restriction to be unreachable, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn pending_delete_restriction_scope_probe_staged_file_child() {
+        let mut directory_delete =
+            directory_descriptor_row(FK_SCOPE_DIRECTORY_ID, None, "docs", FK_SCOPE_BRANCH_ID);
+        directory_delete.snapshot = None;
+        let staged_file = file_descriptor_row_in_directory(
+            FK_SCOPE_FILE_ID,
+            Some(FK_SCOPE_DIRECTORY_ID),
+            "readme.md",
+            FK_SCOPE_BRANCH_ID,
+        );
+
+        let outcome = pending_delete_restriction_probe(
+            &[file_descriptor_schema(), directory_descriptor_schema()],
+            vec![directory_delete, staged_file],
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "descriptor pair: expected the pending restriction to be unreachable, got {outcome:?}"
         );
     }
 
