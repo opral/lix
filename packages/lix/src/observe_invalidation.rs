@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
+#[cfg(not(target_family = "wasm"))]
 use crate::LixError;
 #[cfg(not(target_family = "wasm"))]
 use crate::storage_adapter::Storage;
