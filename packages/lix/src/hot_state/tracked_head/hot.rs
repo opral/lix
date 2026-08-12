@@ -14248,6 +14248,235 @@ mod tests {
         );
     }
 
+    const PAGING_SCHEMA_KEY: &str = "paged_certified_row";
+    const PAGING_FILE_COUNT: usize = crate::storage_adapter::MAX_SCAN_PAGE_ROWS + 3;
+
+    fn paging_certified_batch(index: usize) -> WasmCertifiedEntityBatch {
+        let mut page = Vec::new();
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u64.to_le_bytes());
+        page.push(0);
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u16.to_le_bytes());
+        page.extend_from_slice(&5_u32.to_le_bytes());
+        page.extend_from_slice(b"value");
+        let page = crate::plugin_wire::encode_single_section(
+            crate::plugin_wire::Representation::SchemaRows,
+            crate::plugin_wire::Operation::Create,
+            PAGING_SCHEMA_KEY,
+            br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
+            1,
+            page,
+        )
+        .expect("paged certified schema-row page");
+        WasmCertifiedEntityBatch {
+            format: 1,
+            schema_keys: vec![PAGING_SCHEMA_KEY.to_owned()],
+            row_count: 1,
+            creates: WasmCreateContext {
+                high: 0x0192_0000_0000_7000,
+                low: 0x8000_0000 + index as u32,
+            },
+            create_ranges: Vec::new(),
+            complete_file_state: true,
+            pages: vec![Bytes::from(page)],
+        }
+    }
+
+    /// Publishes `PAGING_FILE_COUNT` single-row certified files on one branch
+    /// generation, so every certified manifest scan for that generation has to
+    /// cross the storage scan page boundary.
+    async fn seed_paged_certified_generation(
+        branch_id: &str,
+        generation_label: &str,
+    ) -> (StorageAdapter, BranchHeadControl) {
+        let storage = StorageAdapter::new(Memory::new());
+        let head_commit_id = CommitId::for_test_label("paged-certified-head");
+        let created_at = timestamp();
+        let control = BranchHeadControl {
+            head_commit_id,
+            tracked_generation: CommitId::for_test_label(generation_label),
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at,
+            updated_at: created_at,
+            ref_change_id: ChangeId::for_test_label("paged-certified-ref"),
+        };
+
+        let file_ids = (0..PAGING_FILE_COUNT)
+            .map(|index| format!("paged-{index:05}.csv"))
+            .collect::<Vec<_>>();
+        let batches = (0..PAGING_FILE_COUNT)
+            .map(|index| [paging_certified_batch(index)])
+            .collect::<Vec<_>>();
+        let files = file_ids
+            .iter()
+            .zip(batches.iter())
+            .map(|(file_id, batches)| CertifiedEntityBatchFileRef {
+                branch_id,
+                file_id,
+                batches,
+            })
+            .collect::<Vec<_>>();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged certified seed read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, branch_id, control)
+            .expect("paged certified control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &files,
+            &BTreeMap::from([(branch_id.to_owned(), control)]),
+            &BTreeMap::from([(
+                branch_id.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: Some(control),
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::from([(head_commit_id, created_at)]),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("paged certified batches should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("paged certified batches should commit");
+        (storage, control)
+    }
+
+    async fn count_certified_manifests(
+        read: &impl StorageAdapterRead,
+        generation: CommitId,
+    ) -> usize {
+        let range = StoragePrefix {
+            bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
+        }
+        .to_range()
+        .expect("manifest prefix range");
+        let mut cursor = read
+            .begin_scan(
+                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                range,
+                StorageBeginScanOptions::default(),
+            )
+            .await
+            .expect("manifest scan should open");
+        let mut total = 0;
+        loop {
+            let page = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await
+                .expect("manifest page should read");
+            let has_more = page.has_more;
+            total += page.entries.len();
+            if !has_more {
+                return total;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn certified_scan_returns_every_file_past_one_scan_page() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000001a0";
+        let (storage, control) =
+            seed_paged_certified_generation(BRANCH_ID, "paged-certified-generation").await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged certified verification read should open");
+        assert_eq!(
+            count_certified_manifests(&read, control.tracked_generation).await,
+            PAGING_FILE_COUNT,
+            "every published file must have a durable certified manifest"
+        );
+
+        let rows = scan_certified_entity_batch_rows(
+            &read,
+            BRANCH_ID,
+            control.tracked_generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![PAGING_SCHEMA_KEY.to_owned()],
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("paged certified rows should scan");
+
+        assert_eq!(
+            rows.len(),
+            PAGING_FILE_COUNT,
+            "an unfiltered certified scan must not stop at the first storage scan page"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_creation_inherits_every_certified_manifest_past_one_scan_page() {
+        const DONOR_BRANCH: &str = "01920000-0000-7000-8000-0000000001a1";
+        const CREATED_BRANCH: &str = "01920000-0000-7000-8000-0000000001a2";
+        let (storage, donor_control) =
+            seed_paged_certified_generation(DONOR_BRANCH, "paged-inherit-donor").await;
+        let created_control = BranchHeadControl {
+            tracked_generation: CommitId::for_test_label("paged-inherit-created"),
+            ref_change_id: ChangeId::for_test_label("paged-inherit-created-ref"),
+            ..donor_control
+        };
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged inherit read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &[],
+            &BTreeMap::from([(CREATED_BRANCH.to_owned(), created_control)]),
+            &BTreeMap::from([(
+                CREATED_BRANCH.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: None,
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("created branch should inherit certified manifests");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("inherited certified manifests should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged inherit verification read should open");
+        assert_eq!(
+            count_certified_manifests(&read, created_control.tracked_generation).await,
+            PAGING_FILE_COUNT,
+            "branch creation must inherit every certified manifest, not one scan page of them"
+        );
+    }
+
     fn diff_identity(branch_id: &str, generation: CommitId, entity: &str) -> HeadIdentity {
         HeadIdentity {
             branch_id: branch_id.to_string(),
