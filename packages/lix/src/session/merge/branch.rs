@@ -20,7 +20,7 @@ use crate::tracked_state::{
     MaterializedTrackedStateRowRef, TrackedStateDiffIdentity, TrackedStateKey, TrackedStateKeyRef,
     TrackedStateMergeConflict, TrackedStateStoreReader,
 };
-use crate::transaction::types::{
+use crate::transaction_types::{
     RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 
@@ -34,7 +34,7 @@ use super::stats::MergeStats;
 use crate::common::{SharedStr, compose_directory_path, compose_file_path};
 use crate::session::context::SessionContext;
 use crate::tracked_state::TrackedStateMergePick;
-use crate::transaction::types::StagedCommitChangeBatchBuilder;
+use crate::transaction::StagedCommitChangeBatchBuilder;
 use crate::wasm::{
     WasmByteSource, WasmChangeEffect, WasmConflictResolution, WasmConflictTake, WasmEntityConflict,
     WasmEntityKey, WasmFileDescriptor, WasmHostBytes, WasmPluginSelection, WasmSourceRange,

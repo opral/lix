@@ -31,7 +31,7 @@ use crate::sql2::write_normalization::{
     defaultable_text_insert_value, insert_column_is_omitted,
 };
 use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
-use crate::transaction::types::{
+use crate::transaction_types::{
     LogicalPrimaryKey, RawWriteBatch, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteRow,
 };
@@ -1141,7 +1141,7 @@ fn with_origin(
 
 fn lix_branch_origin(action: TransactionWriteOperation, branch_id: &str) -> TransactionWriteOrigin {
     TransactionWriteOrigin {
-        surface: crate::transaction::types::shared_origin_surface("lix_branch"),
+        surface: crate::transaction_types::shared_origin_surface("lix_branch"),
         operation: action,
         primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(branch_id))),
     }

@@ -16,7 +16,7 @@ use crate::common::LixTimestamp;
 use crate::common::MutationIdentity;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{MaterializedLiveStateExactBatch, MaterializedLiveStateRow};
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::{
     WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityChanges,
     WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,

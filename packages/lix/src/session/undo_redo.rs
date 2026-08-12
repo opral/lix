@@ -8,7 +8,7 @@ use crate::tracked_state::{
     TrackedStateIndexValue, TrackedStateKey, descriptor_dependency_cascade_file_ids,
 };
 use crate::transaction::Transaction;
-use crate::transaction::types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
+use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 use crate::undo_redo::{
     UNDO_REDO_MARKER_SCHEMA_KEY, UndoRedoKind, UndoRedoMarker, marker_stage_row,
 };
