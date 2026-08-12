@@ -3464,7 +3464,12 @@ fn lifecycle_generation(
     hasher.update(ref_change_id.as_uuid().as_bytes());
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    CommitId::new(uuid::Uuid::from_bytes(bytes))
+    // Every commit id must reserve its change address space, including the
+    // synthetic ones: the commit's own change id is that address at ordinal
+    // zero. `with_change_address_space` folds the low bits back into the
+    // random field rather than discarding them, so the hash keeps its
+    // distinguishing power.
+    CommitId::with_change_address_space(uuid::Uuid::from_bytes(bytes))
 }
 
 fn next_current_state_revision(current: u64) -> Result<u64, LixError> {

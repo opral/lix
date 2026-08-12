@@ -82,11 +82,13 @@ impl CommitId {
         ChangeId::new(self.uuid)
     }
 
+    /// Test-only commit ids must satisfy the same invariant as real ones: the
+    /// low 32 bits are reserved, because the commit's own change id is that
+    /// address at ordinal zero.
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) fn for_test_label(value: &str) -> Self {
-        Uuid::parse_str(value)
-            .map(Self::new)
-            .unwrap_or_else(|_| Self::new(test_uuid_from_label(0x43, value)))
+        let uuid = Uuid::parse_str(value).unwrap_or_else(|_| test_uuid_from_label(0x43, value));
+        Self::with_change_address_space(uuid)
     }
 }
 

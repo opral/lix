@@ -123,7 +123,8 @@ mod tests {
 
     #[test]
     fn commit_change_id_is_the_commit_id_at_ordinal_zero() {
-        let commit_id = CommitId::for_test_label("commit-1");
+        let commit_id =
+            CommitId::with_change_address_space(*CommitId::for_test_label("commit-1").as_uuid());
         let change_id = commit_id.commit_change_id();
         assert_eq!(change_key(change_id), commit_key(commit_id));
         assert_eq!(change_id.as_commit_change(), Some(commit_id));

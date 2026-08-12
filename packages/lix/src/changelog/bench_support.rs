@@ -195,7 +195,7 @@ pub fn append_ordered_commits(
         let commit_index = first_commit_index
             .checked_add(offset)
             .ok_or_else(|| LixError::unknown("ordered benchmark commit index overflow"))?;
-        let commit_id = CommitId::new(ordered_bench_uuid(commit_index, 0));
+        let commit_id = CommitId::with_change_address_space(ordered_bench_uuid(commit_index, 0));
         append.commits.push(CommitRecord {
             format_version: 4,
             commit_id,
@@ -219,7 +219,7 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
     append.commits.reserve(commit_count);
     let mut parent_commit_id = None;
     for commit_index in 0..commit_count {
-        let commit_id = CommitId::new(ordered_bench_uuid(commit_index, 0));
+        let commit_id = CommitId::with_change_address_space(ordered_bench_uuid(commit_index, 0));
         let parent_commit_ids = parent_commit_id.into_iter().collect::<Vec<_>>();
         let parent = append.commits.last();
         let parent_jump = parent.map(|parent| {

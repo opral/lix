@@ -171,7 +171,7 @@ pub struct InitReceipt {
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
     let main_branch_id = functions.call_uuid_v7().to_string();
     let lix_id = functions.call_uuid_v7().to_string();
-    let initial_commit_id = CommitId::from(functions.call_uuid_v7());
+    let initial_commit_id = CommitId::with_change_address_space(functions.call_uuid_v7());
     let timestamp = functions.call_timestamp();
 
     let mut registered_schema_changes = Vec::new();
