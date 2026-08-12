@@ -1,24 +1,14 @@
-//! Canonical HTTP transport for independent pinned sessions on a workspace-mode
-//! root [`lix::Lix`] handle.
+//! Canonical Lix Server Protocol implementation for independent pinned sessions.
 
-#![recursion_limit = "256"]
 #![cfg_attr(test, allow(clippy::large_futures))]
 
-use axum::{
-    Extension, Json, Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, Query, Request, State},
-    http::{
-        HeaderMap, HeaderName, StatusCode,
-        header::{ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
-    },
-    middleware::{self, Next},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
-    },
-    routing::{delete, get, post},
+use bytes::Bytes;
+use futures_core::Stream;
+use http::{
+    HeaderMap, HeaderName, Method, Request, Response as HttpResponse, StatusCode,
+    header::{ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
 };
+use http_body::{Body, Frame, SizeHint};
 #[cfg(test)]
 use lix::FILE_UPLOAD_PART_BYTES;
 use lix::storage::Storage;
@@ -35,32 +25,274 @@ use std::{
     future::Future,
     io,
     mem::size_of,
+    pin::Pin,
     sync::{
         Arc, Mutex, Once,
         atomic::{AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::{
     sync::{Mutex as AsyncMutex, Notify, mpsc, watch},
     task::JoinHandle,
 };
-use tower_http::{
-    compression::{
-        CompressionLayer, CompressionLevel,
-        predicate::{DefaultPredicate, Predicate as _, SizeAbove},
-    },
-    decompression::RequestDecompressionLayer,
-};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
-#[cfg(test)]
-mod remote_read_bench;
+/// Request accepted by the canonical protocol handler.
+pub type ServerProtocolRequest = Request<ServerProtocolBody>;
+/// Response returned by the canonical protocol handler.
+pub type ServerProtocolResponse = HttpResponse<ServerProtocolBody>;
+type Response = ServerProtocolResponse;
+
+/// Framework-neutral response body used for JSON, binary, and SSE responses.
+pub struct ServerProtocolBody {
+    inner: ServerProtocolBodyInner,
+}
+
+impl std::fmt::Debug for ServerProtocolBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerProtocolBody")
+            .field(
+                "streaming",
+                &matches!(self.inner, ServerProtocolBodyInner::Stream(_)),
+            )
+            .finish()
+    }
+}
+
+enum ServerProtocolBodyInner {
+    Full(Option<Bytes>),
+    Stream(Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>),
+}
+
+impl ServerProtocolBody {
+    pub fn empty() -> Self {
+        Self::full(Bytes::new())
+    }
+
+    pub fn full(bytes: impl Into<Bytes>) -> Self {
+        Self {
+            inner: ServerProtocolBodyInner::Full(Some(bytes.into())),
+        }
+    }
+
+    pub fn stream(stream: impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static) -> Self {
+        Self {
+            inner: ServerProtocolBodyInner::Stream(Box::pin(stream)),
+        }
+    }
+
+    async fn into_bytes(mut self, limit: usize) -> Result<Bytes, ApiError> {
+        let mut collected = Vec::new();
+        while let Some(frame) =
+            std::future::poll_fn(|context| Pin::new(&mut self).poll_frame(context)).await
+        {
+            let frame = frame
+                .map_err(|error| ApiError::bad_request(format!("read request body: {error}")))?;
+            if let Ok(data) = frame.into_data() {
+                let next_len = collected.len().saturating_add(data.len());
+                if next_len > limit {
+                    return Err(ApiError::payload_too_large(limit));
+                }
+                collected.extend_from_slice(&data);
+            }
+        }
+        Ok(Bytes::from(collected))
+    }
+}
+
+impl From<Bytes> for ServerProtocolBody {
+    fn from(value: Bytes) -> Self {
+        Self::full(value)
+    }
+}
+
+impl From<Vec<u8>> for ServerProtocolBody {
+    fn from(value: Vec<u8>) -> Self {
+        Self::full(value)
+    }
+}
+
+impl From<String> for ServerProtocolBody {
+    fn from(value: String) -> Self {
+        Self::full(value)
+    }
+}
+
+impl From<&'static str> for ServerProtocolBody {
+    fn from(value: &'static str) -> Self {
+        Self::full(value)
+    }
+}
+
+impl Body for ServerProtocolBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match &mut self.inner {
+            ServerProtocolBodyInner::Full(bytes) => {
+                Poll::Ready(bytes.take().map(|bytes| Ok(Frame::data(bytes))))
+            }
+            ServerProtocolBodyInner::Stream(stream) => stream
+                .as_mut()
+                .poll_next(context)
+                .map(|item| item.map(|result| result.map(Frame::data))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        matches!(&self.inner, ServerProtocolBodyInner::Full(None))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.inner {
+            ServerProtocolBodyInner::Full(Some(bytes)) => SizeHint::with_exact(bytes.len() as u64),
+            ServerProtocolBodyInner::Full(None) => SizeHint::with_exact(0),
+            ServerProtocolBodyInner::Stream(_) => SizeHint::default(),
+        }
+    }
+}
+
+struct Json<T>(T);
+
+trait IntoResponse {
+    fn into_response(self) -> Response;
+}
+
+impl<T> IntoResponse for Json<T>
+where
+    T: Serialize,
+{
+    fn into_response(self) -> Response {
+        match serde_json::to_vec(&self.0) {
+            Ok(bytes) => {
+                let mut response = HttpResponse::new(ServerProtocolBody::full(bytes));
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+                response
+            }
+            Err(error) => HttpResponse::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(CONTENT_TYPE, "application/json")
+                .body(ServerProtocolBody::full(format!(
+                    "{{\"error\":{{\"code\":\"LIX_ERROR_INTERNAL\",\"message\":\"serialize protocol response: {error}\"}}}}"
+                )))
+                .expect("static protocol response is valid"),
+        }
+    }
+}
+
+impl IntoResponse for StatusCode {
+    fn into_response(self) -> Response {
+        HttpResponse::builder()
+            .status(self)
+            .body(ServerProtocolBody::empty())
+            .expect("status-only protocol response is valid")
+    }
+}
+
+impl<T> IntoResponse for (StatusCode, Json<T>)
+where
+    T: Serialize,
+{
+    fn into_response(self) -> Response {
+        let (status, body) = self;
+        let mut response = body.into_response();
+        *response.status_mut() = status;
+        response
+    }
+}
+
+impl IntoResponse for Response {
+    fn into_response(self) -> Response {
+        self
+    }
+}
+
+impl<T> IntoResponse for ([(HeaderName, T); 1], Json<HandshakeResponse>)
+where
+    T: TryInto<http::HeaderValue>,
+    T::Error: std::fmt::Debug,
+{
+    fn into_response(self) -> Response {
+        let (headers, body) = self;
+        let mut response = body.into_response();
+        for (name, value) in headers {
+            response.headers_mut().insert(
+                name,
+                value.try_into().expect("static protocol header is valid"),
+            );
+        }
+        response
+    }
+}
+
+#[derive(Default)]
+struct Event {
+    event: Option<&'static str>,
+    data: String,
+}
+
+impl Event {
+    fn event(mut self, event: &'static str) -> Self {
+        self.event = Some(event);
+        self
+    }
+
+    fn data(mut self, data: String) -> Self {
+        self.data = data;
+        self
+    }
+
+    fn encode(self) -> Bytes {
+        let mut encoded = String::new();
+        if let Some(event) = self.event {
+            encoded.push_str("event: ");
+            encoded.push_str(event);
+            encoded.push('\n');
+        }
+        for line in self.data.lines() {
+            encoded.push_str("data: ");
+            encoded.push_str(line);
+            encoded.push('\n');
+        }
+        encoded.push('\n');
+        Bytes::from(encoded)
+    }
+}
 
 /// Stable URL prefix owned by the Lix server protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Current wire protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
+/// Canonical method and path registry for protocol hosts and conformance tools.
+pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
+    ("GET", "/lix/v1"),
+    ("DELETE", "/lix/v1/session"),
+    ("POST", "/lix/v1/execute"),
+    ("POST", "/lix/v1/execute-batch"),
+    ("POST", "/lix/v1/transaction/begin"),
+    ("POST", "/lix/v1/transaction/execute"),
+    ("POST", "/lix/v1/transaction/commit"),
+    ("POST", "/lix/v1/transaction/rollback"),
+    ("GET", "/lix/v1/file"),
+    ("POST", "/lix/v1/file/upsert"),
+    ("POST", "/lix/v1/file/upsert-batch"),
+    ("POST", "/lix/v1/branch/create"),
+    ("POST", "/lix/v1/checkpoint/create"),
+    ("POST", "/lix/v1/undo"),
+    ("POST", "/lix/v1/redo"),
+    ("POST", "/lix/v1/branch/switch"),
+    ("POST", "/lix/v1/observe"),
+    ("POST", "/lix/v1/observe/multiplex"),
+];
 /// Header carrying the opaque server-issued session capability.
 pub const SESSION_ID_HEADER: &str = "lix-session-id";
 /// Standard request identity for replay-safe SQL mutations.
@@ -72,7 +304,7 @@ pub const TRANSACTION_ID_HEADER: &str = "lix-transaction-id";
 pub const FILE_FOUND_HEADER: &str = "lix-file-found";
 /// Client-generated identity for sequential resumable file parts.
 pub const FILE_UPLOAD_ID_HEADER: &str = "lix-upload-id";
-/// Default maximum number of live remote sessions for one workspace.
+/// Default maximum number of live remote sessions for one repository.
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 /// Default idle lifetime for a remote session.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
@@ -85,7 +317,6 @@ pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Keeping this bounded makes the fast path predictable for the normal bulk
 /// upload shape while keeping one request from monopolizing a session.
 const MAX_BINARY_FILE_UPSERT_BATCH_ENTRIES: usize = 1024;
-const MIN_COMPRESSION_BODY_BYTES: u16 = 32 * 1024;
 /// Maximum number of queries multiplexed onto one observation stream.
 pub const MAX_MULTIPLEX_SUBSCRIPTIONS: usize = 32;
 
@@ -98,7 +329,7 @@ const MIN_REQUEST_BLOB_CACHE_BYTES: usize = 32 * 1024;
 /// while inserting its similarly sized successor evicts the predecessor.
 const MAX_REQUEST_BLOB_CACHE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum request-base bytes retained across every remote session for one
-/// workspace. Once full, additional bases simply use the existing complete-
+/// repository. Once full, additional bases simply use the existing complete-
 /// blob retry path; request correctness never depends on cache admission.
 pub const DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
@@ -115,43 +346,64 @@ const SESSION_ACTIVITY_TRANSACTION: usize = 1 << (usize::BITS - 1);
 const SESSION_ACTIVITY_LEASE_COUNT_MASK: usize = !SESSION_ACTIVITY_TRANSACTION;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// A stable principal namespace injected by an authenticated protocol host.
+/// Principal selected by the host after authenticating the outer request.
 ///
-/// This is deliberately a request extension rather than an HTTP header: an
-/// untrusted caller must never choose another principal's replay namespace.
-/// Lixray strips its reserved inbound header after authentication and inserts
-/// this extension before dispatching to the canonical protocol router.
-#[derive(Clone, Debug)]
-pub struct TrustedIdempotencyScope(String);
+/// This value is deliberately separate from HTTP request data. A protocol
+/// client can therefore never claim another account or replay namespace by
+/// supplying a header, query parameter, or request extension.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServerProtocolPrincipal {
+    /// Explicit anonymous access selected by the host.
+    Anonymous,
+    /// A host-authenticated Lix account and stable idempotency namespace.
+    Authenticated {
+        account_id: String,
+        idempotency_scope: String,
+    },
+}
 
-impl TrustedIdempotencyScope {
-    /// Creates a scope after the host has authenticated and validated it.
-    pub fn new(value: String) -> Self {
-        Self(value)
+impl ServerProtocolPrincipal {
+    fn account_id(&self) -> &str {
+        match self {
+            Self::Anonymous => lix::ANONYMOUS_ACCOUNT_ID,
+            Self::Authenticated { account_id, .. } => account_id,
+        }
     }
 
-    fn into_inner(self) -> String {
-        self.0
+    fn idempotency_scope(&self) -> Option<String> {
+        match self {
+            Self::Anonymous => None,
+            Self::Authenticated {
+                account_id,
+                idempotency_scope,
+            } => Some(format!(
+                "account:{}:{account_id}{idempotency_scope}",
+                account_id.len()
+            )),
+        }
     }
 }
 
-/// Host-authenticated account expected to own the remote session.
-///
-/// Like [`TrustedIdempotencyScope`], this is in-process metadata rather than
-/// an HTTP header so a caller cannot bind a stolen session to itself.
+/// Trusted, host-owned metadata for one protocol request.
 #[derive(Clone, Debug)]
-pub struct TrustedActiveAccountId(String);
+pub struct ServerProtocolContext {
+    pub principal: ServerProtocolPrincipal,
+    pub durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
+}
 
-impl TrustedActiveAccountId {
-    /// Creates an account binding after the host has authenticated the caller.
-    pub fn new(value: String) -> Self {
-        Self(value)
+impl ServerProtocolContext {
+    /// Creates context for explicitly anonymous access.
+    pub fn anonymous() -> Self {
+        Self {
+            principal: ServerProtocolPrincipal::Anonymous,
+            durable_terminal_storage_notifier: None,
+        }
     }
 }
 
-/// Resource limits for one workspace's remote protocol sessions.
+/// Resource limits for one repository's remote protocol sessions.
 #[derive(Clone, Copy, Debug)]
-pub struct ProtocolServerOptions {
+pub struct ServerProtocolOptions {
     /// Maximum number of retained remote sessions and their per-session caches.
     ///
     /// Handshakes may briefly validate up to this many lightweight candidate
@@ -165,7 +417,7 @@ pub struct ProtocolServerOptions {
     pub max_request_blob_cache_bytes: usize,
 }
 
-impl Default for ProtocolServerOptions {
+impl Default for ServerProtocolOptions {
     fn default() -> Self {
         Self {
             max_sessions: DEFAULT_MAX_SESSIONS,
@@ -176,20 +428,20 @@ impl Default for ProtocolServerOptions {
     }
 }
 
-/// Persistent canonical protocol server for one Lix workspace.
+/// Persistent canonical protocol server for one Lix repository.
 ///
 /// A server owns one root [`Lix`] and opens every remote client as an
 /// independent branch-pinned session on that root's existing engine. Clones
 /// share the same bounded in-memory session registry.
 #[expect(missing_debug_implementations)]
-pub struct LixProtocolServer<S>
+pub struct LixServerProtocol<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     inner: Arc<ServerInner<S>>,
 }
 
-impl<S> Clone for LixProtocolServer<S>
+impl<S> Clone for LixServerProtocol<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -205,7 +457,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     root: Arc<Lix<S>>,
-    options: ProtocolServerOptions,
+    options: ServerProtocolOptions,
     registry: AsyncMutex<SessionRegistry<S>>,
     request_blob_budget: Arc<RequestBlobCacheBudget>,
     session_open_gate: Arc<SessionOpenGate>,
@@ -306,6 +558,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     lix: Arc<Lix<S>>,
+    principal: ServerProtocolPrincipal,
     transactions: AsyncMutex<RemoteTransactionRegistry<S>>,
     last_used: Mutex<Instant>,
     activity: Arc<SessionActivity>,
@@ -583,12 +836,14 @@ where
 {
     fn new(
         lix: Lix<S>,
+        principal: ServerProtocolPrincipal,
         now: Instant,
         max_reconstructed_request_blob_bytes: usize,
         request_blob_budget: Arc<RequestBlobCacheBudget>,
     ) -> Self {
         Self {
             lix: Arc::new(lix),
+            principal,
             transactions: AsyncMutex::new(RemoteTransactionRegistry::default()),
             last_used: Mutex::new(now),
             activity: Arc::new(SessionActivity::default()),
@@ -734,8 +989,8 @@ where
     /// second executor is involved.
     async fn run_cancellable_read<T, F, Fut>(&self, operation: F) -> Result<T, LixError>
     where
-        F: FnOnce(Arc<Lix<S>>) -> Fut,
-        Fut: Future<Output = Result<T, LixError>>,
+        F: FnOnce(Arc<Lix<S>>) -> Fut + Send,
+        Fut: Future<Output = Result<T, LixError>> + Send,
     {
         let result = operation(Arc::clone(&self.record.lix)).await;
         if let (Some(notifier), Err(error)) = (&self.durable_terminal_storage_notifier, &result) {
@@ -1059,7 +1314,7 @@ struct HandlerState<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    server: LixProtocolServer<S>,
+    server: LixServerProtocol<S>,
 }
 
 impl<S> HandlerState<S>
@@ -1098,20 +1353,64 @@ where
     }
 }
 
-impl<S> LixProtocolServer<S>
+fn result_response<T>(result: Result<T, ApiError>) -> Response
+where
+    T: IntoResponse,
+{
+    result.map_or_else(IntoResponse::into_response, IntoResponse::into_response)
+}
+
+fn decode_query<T>(query: Option<&str>) -> Result<T, ApiError>
+where
+    T: for<'de> Deserialize<'de> + Default,
+{
+    query.map_or_else(
+        || Ok(T::default()),
+        |query| {
+            serde_urlencoded::from_str(query)
+                .map_err(|error| ApiError::bad_request(format!("invalid query string: {error}")))
+        },
+    )
+}
+
+fn method_not_allowed() -> Response {
+    ApiError::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "LIX_ERROR_METHOD_NOT_ALLOWED",
+        "the HTTP method is not defined for this Lix Server Protocol path",
+    )
+    .into_response()
+}
+
+fn not_found() -> Response {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "LIX_ERROR_PROTOCOL_PATH_NOT_FOUND",
+        "the path is not part of the Lix Server Protocol",
+    )
+    .into_response()
+}
+
+fn is_known_protocol_path(path: &str) -> bool {
+    SERVER_PROTOCOL_ENDPOINTS
+        .iter()
+        .any(|(_, endpoint_path)| *endpoint_path == path)
+}
+
+impl<S> LixServerProtocol<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     /// Creates a protocol server with the default session limits.
     pub fn new(root: Arc<Lix<S>>) -> Self {
-        Self::with_options(root, ProtocolServerOptions::default())
+        Self::with_options(root, ServerProtocolOptions::default())
             .expect("default protocol server options must be valid")
     }
 
-    /// Creates a protocol server with explicit per-workspace session limits.
+    /// Creates a protocol server with explicit per-repository session limits.
     pub fn with_options(
         root: Arc<Lix<S>>,
-        options: ProtocolServerOptions,
+        options: ServerProtocolOptions,
     ) -> Result<Self, LixError> {
         if options.max_sessions == 0 {
             return Err(LixError::new(
@@ -1156,62 +1455,179 @@ where
         })
     }
 
-    /// Builds the Axum router backed by this persistent server registry.
-    pub fn router(&self) -> Router {
+    /// Handles one canonical protocol request.
+    ///
+    /// Hosts authenticate before calling this method, strip their outer
+    /// repository prefix, decompress the request body, and pass the resulting
+    /// trusted principal through `context`. The protocol owns every method and
+    /// path beginning at [`PROTOCOL_PATH`].
+    pub fn handle(
+        &self,
+        request: ServerProtocolRequest,
+        context: ServerProtocolContext,
+    ) -> impl Future<Output = ServerProtocolResponse> + 'static {
+        let server = self.clone();
+        async move { Box::pin(server.dispatch(request, context)).await }
+    }
+
+    async fn dispatch(
+        self,
+        request: ServerProtocolRequest,
+        context: ServerProtocolContext,
+    ) -> ServerProtocolResponse {
         let state = HandlerState {
             server: self.clone(),
         };
-        let protected = Router::new()
-            .route("/lix/v1/execute", post(execute::<S>))
-            .route("/lix/v1/execute-batch", post(execute_batch::<S>))
-            .route("/lix/v1/transaction/begin", post(begin_transaction::<S>))
-            .route(
-                "/lix/v1/transaction/execute",
-                post(transaction_execute::<S>),
+        let (parts, body) = request.into_parts();
+        if parts.headers.contains_key(http::header::CONTENT_ENCODING) {
+            return ApiError::unsupported_media_type(
+                "hosts must decode Content-Encoding before protocol dispatch",
             )
-            .route("/lix/v1/transaction/commit", post(commit_transaction::<S>))
-            .route(
-                "/lix/v1/transaction/rollback",
-                post(rollback_transaction::<S>),
+            .into_response();
+        }
+        let path = parts.uri.path().to_owned();
+        let method = parts.method.clone();
+        if matches!(path.as_str(), "/lix/v1" | "/lix/v1/") {
+            if method != Method::GET {
+                return method_not_allowed();
+            }
+            let query = match decode_query::<HandshakeRequest>(parts.uri.query()) {
+                Ok(query) => query,
+                Err(error) => return error.into_response(),
+            };
+            return result_response(handshake(state, query, parts.headers, context).await);
+        }
+
+        if path == "/lix/v1/session" {
+            if method != Method::DELETE {
+                return method_not_allowed();
+            }
+            return result_response(delete_session(state, parts.headers, context).await);
+        }
+
+        let session_id = match required_session_id(&parts.headers) {
+            Ok(session_id) => session_id,
+            Err(error) => return error.into_response(),
+        };
+        let lease = match state
+            .lease(
+                &session_id,
+                context.durable_terminal_storage_notifier.clone(),
             )
-            .route("/lix/v1/file", get(read_file_content::<S>))
-            .route("/lix/v1/file/upsert", post(upsert_file_content::<S>))
-            .route(
-                "/lix/v1/file/upsert-batch",
-                post(upsert_file_content_batch::<S>),
-            )
-            .route("/lix/v1/branch/create", post(create_branch::<S>))
-            .route("/lix/v1/checkpoint/create", post(create_checkpoint::<S>))
-            .route("/lix/v1/undo", post(undo::<S>))
-            .route("/lix/v1/redo", post(redo::<S>))
-            .route("/lix/v1/branch/switch", post(switch_branch::<S>))
-            .route("/lix/v1/observe", post(observe::<S>))
-            .route("/lix/v1/observe/multiplex", post(observe_multiplex::<S>))
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_session::<S>,
-            ));
-        Router::new()
-            .route("/lix/v1", get(handshake::<S>))
-            .route("/lix/v1/", get(handshake::<S>))
-            .route("/lix/v1/session", delete(delete_session::<S>))
-            .merge(protected)
-            .layer(
-                CompressionLayer::new()
-                    .gzip(true)
-                    .zstd(true)
-                    .quality(CompressionLevel::Precise(2))
-                    .compress_when(
-                        DefaultPredicate::new().and(SizeAbove::new(MIN_COMPRESSION_BODY_BYTES)),
-                    ),
-            )
-            .layer(DefaultBodyLimit::max(
-                self.inner.options.max_request_body_bytes,
-            ))
-            // This must be outside DefaultBodyLimit so the configured limit
-            // applies to expanded JSON rather than attacker-controlled gzip.
-            .layer(RequestDecompressionLayer::new().gzip(true))
-            .with_state(state)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => return error.into_response(),
+        };
+        if let Err(error) = validate_principal(&lease, &context.principal) {
+            return error.into_response();
+        }
+        let scope = context.principal.idempotency_scope();
+        let consumes_json = matches!(
+            (&method, path.as_str()),
+            (&Method::POST, "/lix/v1/execute")
+                | (&Method::POST, "/lix/v1/execute-batch")
+                | (&Method::POST, "/lix/v1/transaction/execute")
+                | (&Method::POST, "/lix/v1/branch/create")
+                | (&Method::POST, "/lix/v1/branch/switch")
+                | (&Method::POST, "/lix/v1/observe")
+                | (&Method::POST, "/lix/v1/observe/multiplex")
+        );
+        if consumes_json && let Err(error) = require_json_content_type(&parts.headers) {
+            return error.into_response();
+        }
+        let consumes_body = consumes_json
+            || matches!(
+                (&method, path.as_str()),
+                (&Method::POST, "/lix/v1/file/upsert")
+                    | (&Method::POST, "/lix/v1/file/upsert-batch")
+            );
+        let body = if consumes_body {
+            match body
+                .into_bytes(self.inner.options.max_request_body_bytes)
+                .await
+            {
+                Ok(body) => body,
+                Err(error) => return error.into_response(),
+            }
+        } else {
+            Bytes::new()
+        };
+
+        macro_rules! json_request {
+            ($ty:ty) => {
+                match serde_json::from_slice::<$ty>(&body) {
+                    Ok(value) => Json(value),
+                    Err(error) => {
+                        return ApiError::bad_request(format!("invalid JSON request: {error}"))
+                            .into_response();
+                    }
+                }
+            };
+        }
+
+        match (&method, path.as_str()) {
+            (&Method::POST, "/lix/v1/execute") => result_response(
+                execute(lease, scope, parts.headers, json_request!(ExecuteRequest)).await,
+            ),
+            (&Method::POST, "/lix/v1/execute-batch") => result_response(
+                execute_batch(
+                    lease,
+                    scope,
+                    parts.headers,
+                    json_request!(ExecuteBatchRequest),
+                )
+                .await,
+            ),
+            (&Method::POST, "/lix/v1/transaction/begin") => {
+                result_response(begin_transaction(lease).await)
+            }
+            (&Method::POST, "/lix/v1/transaction/execute") => result_response(
+                transaction_execute(lease, parts.headers, json_request!(ExecuteRequest)).await,
+            ),
+            (&Method::POST, "/lix/v1/transaction/commit") => {
+                result_response(commit_transaction(lease, parts.headers).await)
+            }
+            (&Method::POST, "/lix/v1/transaction/rollback") => {
+                result_response(rollback_transaction(lease, parts.headers).await)
+            }
+            (&Method::GET, "/lix/v1/file") => {
+                let query = match decode_query::<BinaryFileReadRequest>(parts.uri.query()) {
+                    Ok(query) => query,
+                    Err(error) => return error.into_response(),
+                };
+                result_response(read_file_content(lease, query, parts.headers).await)
+            }
+            (&Method::POST, "/lix/v1/file/upsert") => {
+                let query = match decode_query::<BinaryFileUpdateRequest>(parts.uri.query()) {
+                    Ok(query) => query,
+                    Err(error) => return error.into_response(),
+                };
+                result_response(upsert_file_content(lease, query, parts.headers, body).await)
+            }
+            (&Method::POST, "/lix/v1/file/upsert-batch") => {
+                result_response(upsert_file_content_batch(lease, body).await)
+            }
+            (&Method::POST, "/lix/v1/branch/create") => {
+                result_response(create_branch(lease, json_request!(CreateBranchRequest)).await)
+            }
+            (&Method::POST, "/lix/v1/checkpoint/create") => {
+                result_response(create_checkpoint(lease).await)
+            }
+            (&Method::POST, "/lix/v1/undo") => result_response(undo(lease).await),
+            (&Method::POST, "/lix/v1/redo") => result_response(redo(lease).await),
+            (&Method::POST, "/lix/v1/branch/switch") => {
+                result_response(switch_branch(lease, json_request!(SwitchBranchRequest)).await)
+            }
+            (&Method::POST, "/lix/v1/observe") => {
+                result_response(observe(lease, json_request!(ObserveRequest)).await)
+            }
+            (&Method::POST, "/lix/v1/observe/multiplex") => result_response(
+                observe_multiplex(lease, json_request!(MultiplexObserveRequest)).await,
+            ),
+            (_, known) if is_known_protocol_path(known) => method_not_allowed(),
+            _ => not_found(),
+        }
     }
 
     /// Returns whether this server can be dropped without invalidating a live
@@ -1234,7 +1650,7 @@ where
             .all(|record| record.is_idle_expired(now, self.inner.options.session_idle_timeout))
     }
 
-    /// Closes every child session and finally the root workspace session.
+    /// Closes every child session and finally the root repository session.
     /// Repeated calls are safe.
     pub async fn close(&self) -> Result<(), LixError> {
         let mut close_result = self.inner.close_result.subscribe();
@@ -1304,6 +1720,7 @@ where
         &self,
         initial_active_branch_id: Option<String>,
         initial_active_account_id: Option<String>,
+        principal: Option<ServerProtocolPrincipal>,
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Result<SessionLease<S>, ApiError> {
         let pending_open = self.reserve_session_open()?;
@@ -1395,6 +1812,7 @@ where
         }
         let record = Arc::new(SessionRecord::new(
             child,
+            principal.unwrap_or(ServerProtocolPrincipal::Anonymous),
             now,
             self.inner.options.max_request_body_bytes,
             Arc::clone(&self.inner.request_blob_budget),
@@ -1578,65 +1996,27 @@ fn required_transaction_id(headers: &HeaderMap) -> Result<String, ApiError> {
     Ok(value.to_owned())
 }
 
-async fn require_session<S>(
-    State(state): State<HandlerState<S>>,
-    mut request: Request,
-    next: Next,
-) -> Result<Response, ApiError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    let session_id = required_session_id(request.headers())?;
-    let durable_terminal_storage_notifier = request
-        .extensions()
-        .get::<DurableTerminalStorageNotifier>()
-        .cloned();
-    let lease = state
-        .lease(&session_id, durable_terminal_storage_notifier)
-        .await?;
-    validate_trusted_active_account(&lease, request.extensions().get()).await?;
-    request.extensions_mut().insert(lease);
-    Ok(next.run(request).await)
-}
-
-/// Returns an Axum handler for an existing persistent protocol server.
-///
-/// The returned router is already mounted at [`PROTOCOL_PATH`]. Hosts should
-/// merge it into their application and keep auth, workspace resolution, and
-/// storage lifecycle outside this package.
-pub fn handler<S>(server: LixProtocolServer<S>) -> Router
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    server.router()
-}
-
 async fn handshake<S>(
-    State(state): State<HandlerState<S>>,
-    Query(request): Query<HandshakeRequest>,
+    state: HandlerState<S>,
+    request: HandshakeRequest,
     headers: HeaderMap,
-    notifier: Option<Extension<DurableTerminalStorageNotifier>>,
-    trusted_account: Option<Extension<TrustedActiveAccountId>>,
+    context: ServerProtocolContext,
 ) -> Result<impl IntoResponse, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let durable_terminal_storage_notifier = notifier.map(|Extension(notifier)| notifier);
+    let durable_terminal_storage_notifier = context.durable_terminal_storage_notifier.clone();
     let lease = match optional_session_id(&headers)? {
         Some(session_id) => {
-            if request.active_branch_id.is_some() || request.active_account_id.is_some() {
+            if request.active_branch_id.is_some() {
                 return Err(ApiError::bad_request(
-                    "activeBranchId and activeAccountId are only allowed when creating a session",
+                    "activeBranchId is only allowed when creating a session",
                 ));
             }
             let lease = state
                 .lease(&session_id, durable_terminal_storage_notifier.clone())
                 .await?;
-            validate_trusted_active_account(
-                &lease,
-                trusted_account.as_ref().map(|Extension(account)| account),
-            )
-            .await?;
+            validate_principal(&lease, &context.principal)?;
             lease
         }
         None => {
@@ -1651,25 +2031,24 @@ where
                 }
                 None => None,
             };
-            let active_account_id = match trusted_account {
-                Some(Extension(account)) => Some(account.0),
-                None => match request.active_account_id {
-                    Some(active_account_id) if !active_account_id.trim().is_empty() => {
-                        Some(active_account_id)
-                    }
-                    Some(_) => {
-                        return Err(ApiError::bad_request(
-                            "activeAccountId must be a non-empty string",
-                        ));
-                    }
-                    None => None,
-                },
-            };
+            let active_account_id = context.principal.account_id().to_owned();
+            if matches!(
+                context.principal,
+                ServerProtocolPrincipal::Authenticated { .. }
+            ) {
+                state
+                    .server
+                    .inner
+                    .root
+                    .ensure_account(&active_account_id, &active_account_id, "human")
+                    .await?;
+            }
             state
                 .server
                 .create_session(
                     active_branch_id,
-                    active_account_id,
+                    Some(active_account_id),
+                    Some(context.principal),
                     durable_terminal_storage_notifier,
                 )
                 .await?
@@ -1698,37 +2077,34 @@ where
 }
 
 async fn delete_session<S>(
-    State(state): State<HandlerState<S>>,
+    state: HandlerState<S>,
     headers: HeaderMap,
-    trusted_account: Option<Extension<TrustedActiveAccountId>>,
+    context: ServerProtocolContext,
 ) -> Result<StatusCode, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session_id = required_session_id(&headers)?;
-    if let Some(Extension(account)) = trusted_account {
-        let lease = state.server.lease(&session_id, None).await?;
-        validate_trusted_active_account(&lease, Some(&account)).await?;
-        drop(lease);
+    match state.server.lease(&session_id, None).await {
+        Ok(lease) => {
+            validate_principal(&lease, &context.principal)?;
+            drop(lease);
+        }
+        Err(error) if error.status == StatusCode::GONE => return Ok(StatusCode::NO_CONTENT),
+        Err(error) => return Err(error),
     }
     state.server.delete_session(&session_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn validate_trusted_active_account<S>(
+fn validate_principal<S>(
     lease: &SessionLease<S>,
-    trusted_account: Option<&TrustedActiveAccountId>,
+    principal: &ServerProtocolPrincipal,
 ) -> Result<(), ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let Some(trusted_account) = trusted_account else {
-        return Ok(());
-    };
-    let active_account_id = lease
-        .run_cancellable_read(|lix| async move { Ok(lix.active_account_id().to_string()) })
-        .await?;
-    if active_account_id == trusted_account.0 {
+    if lease.record.principal == *principal {
         Ok(())
     } else {
         Err(ApiError::account_mismatch())
@@ -1736,8 +2112,8 @@ where
 }
 
 async fn execute<S>(
-    Extension(lease): Extension<SessionLease<S>>,
-    scope: Option<Extension<TrustedIdempotencyScope>>,
+    lease: SessionLease<S>,
+    scope: Option<String>,
     headers: HeaderMap,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<ExecuteResponse>, ApiError>
@@ -1764,7 +2140,7 @@ where
     let metadata = decoded.metadata;
     let idempotency = execute_idempotency(
         &headers,
-        scope.map(|Extension(scope)| scope.into_inner()),
+        scope,
         &sql,
         &params,
         options.origin_key.as_deref(),
@@ -1777,8 +2153,8 @@ where
 }
 
 async fn execute_batch<S>(
-    Extension(lease): Extension<SessionLease<S>>,
-    scope: Option<Extension<TrustedIdempotencyScope>>,
+    lease: SessionLease<S>,
+    scope: Option<String>,
     headers: HeaderMap,
     Json(request): Json<ExecuteBatchRequest>,
 ) -> Result<Json<Vec<ExecuteResponse>>, ApiError>
@@ -1819,12 +2195,8 @@ where
         .collect::<Result<Vec<_>, ApiError>>()?;
     let (statements, statement_metadata): (Vec<_>, Vec<_>) = decoded_statements.into_iter().unzip();
     let options: ExecuteOptions = request.options.into();
-    let idempotency = execute_batch_idempotency(
-        &headers,
-        scope.map(|Extension(scope)| scope.into_inner()),
-        &statements,
-        options.origin_key.as_deref(),
-    )?;
+    let idempotency =
+        execute_batch_idempotency(&headers, scope, &statements, options.origin_key.as_deref())?;
     let results = lease
         .execute_batch(statements, options, statement_metadata, idempotency)
         .await?;
@@ -1838,7 +2210,7 @@ where
 }
 
 async fn begin_transaction<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
 ) -> Result<Json<BeginTransactionResponse>, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1849,7 +2221,7 @@ where
 }
 
 async fn transaction_execute<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
     headers: HeaderMap,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<ExecuteResponse>, ApiError>
@@ -1883,7 +2255,7 @@ where
 }
 
 async fn commit_transaction<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError>
 where
@@ -1896,7 +2268,7 @@ where
 }
 
 async fn rollback_transaction<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError>
 where
@@ -1914,8 +2286,8 @@ where
 /// the normal execute response envelope, but avoids JSON base64 expansion and
 /// decoding for the file payload itself.
 async fn upsert_file_content<S>(
-    Extension(lease): Extension<SessionLease<S>>,
-    Query(request): Query<BinaryFileUpdateRequest>,
+    lease: SessionLease<S>,
+    request: BinaryFileUpdateRequest,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError>
@@ -1951,11 +2323,8 @@ where
             if progress.next_offset > 0 {
                 response.headers_mut().insert(
                     RANGE,
-                    axum::http::HeaderValue::from_str(&format!(
-                        "bytes=0-{}",
-                        progress.next_offset - 1
-                    ))
-                    .map_err(|_| ApiError::bad_request("upload offset cannot be encoded"))?,
+                    http::HeaderValue::from_str(&format!("bytes=0-{}", progress.next_offset - 1))
+                        .map_err(|_| ApiError::bad_request("upload offset cannot be encoded"))?,
                 );
             }
         }
@@ -2023,7 +2392,7 @@ fn parse_file_upload_content_range(
 /// payloads remain `Bytes` slices through the SDK boundary; only paths need a
 /// `String` allocation.
 async fn upsert_file_content_batch<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
     body: Bytes,
 ) -> Result<Json<ExecuteResponse>, ApiError>
 where
@@ -2173,8 +2542,8 @@ fn take_binary_file_upsert_batch_range(
 /// non-cacheable because the session's rendered plugin view is part of the
 /// collaboration protocol.
 async fn read_file_content<S>(
-    Extension(lease): Extension<SessionLease<S>>,
-    Query(request): Query<BinaryFileReadRequest>,
+    lease: SessionLease<S>,
+    request: BinaryFileReadRequest,
     headers: HeaderMap,
 ) -> Result<Response, ApiError>
 where
@@ -2200,7 +2569,7 @@ where
         })
         .await?;
     let (found, body, file_range) = match data {
-        None => ("false", axum::body::Body::empty(), None),
+        None => ("false", ServerProtocolBody::empty(), None),
         Some(read) => {
             let first_range = read.range();
             let total_size = read.total_size();
@@ -2254,7 +2623,7 @@ where
                     yield Ok(read.into_content().into_bytes());
                 }
             };
-            let body = axum::body::Body::from_stream(body_stream);
+            let body = ServerProtocolBody::stream(body_stream);
             ("true", body, Some((response_range, total_size)))
         }
     };
@@ -2263,24 +2632,21 @@ where
         *response.status_mut() = StatusCode::PARTIAL_CONTENT;
     }
     let headers = response.headers_mut();
+    headers.insert(CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
     headers.insert(
-        CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/octet-stream"),
+        CONTENT_TYPE,
+        http::HeaderValue::from_static("application/octet-stream"),
     );
     headers.insert(
         HeaderName::from_static(FILE_FOUND_HEADER),
-        axum::http::HeaderValue::from_static(found),
+        http::HeaderValue::from_static(found),
     );
-    headers.insert(ACCEPT_RANGES, axum::http::HeaderValue::from_static("bytes"));
+    headers.insert(ACCEPT_RANGES, http::HeaderValue::from_static("bytes"));
     if let Some((range, total_size)) = file_range {
         let body_length = range.end - range.start;
         headers.insert(
             CONTENT_LENGTH,
-            axum::http::HeaderValue::from_str(&body_length.to_string())
+            http::HeaderValue::from_str(&body_length.to_string())
                 .map_err(|_| ApiError::bad_request("file range length is invalid"))?,
         );
         if partial {
@@ -2292,7 +2658,7 @@ where
             );
             headers.insert(
                 CONTENT_RANGE,
-                axum::http::HeaderValue::from_str(&value)
+                http::HeaderValue::from_str(&value)
                     .map_err(|_| ApiError::bad_request("file content range is invalid"))?,
             );
         }
@@ -2348,7 +2714,7 @@ fn parse_single_file_range(headers: &HeaderMap) -> Result<Option<std::ops::Range
 }
 
 async fn create_branch<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
     Json(request): Json<CreateBranchRequest>,
 ) -> Result<Json<CreateBranchResponse>, ApiError>
 where
@@ -2371,7 +2737,7 @@ where
 }
 
 async fn create_checkpoint<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
 ) -> Result<Json<CreateCheckpointResponse>, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -2384,9 +2750,7 @@ where
     }))
 }
 
-async fn undo<S>(
-    Extension(lease): Extension<SessionLease<S>>,
-) -> Result<Json<UndoResponse>, ApiError>
+async fn undo<S>(lease: SessionLease<S>) -> Result<Json<UndoResponse>, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -2400,9 +2764,7 @@ where
     }))
 }
 
-async fn redo<S>(
-    Extension(lease): Extension<SessionLease<S>>,
-) -> Result<Json<RedoResponse>, ApiError>
+async fn redo<S>(lease: SessionLease<S>) -> Result<Json<RedoResponse>, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -2417,7 +2779,7 @@ where
 }
 
 async fn switch_branch<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
     Json(request): Json<SwitchBranchRequest>,
 ) -> Result<Json<SwitchBranchResponse>, ApiError>
 where
@@ -2433,7 +2795,7 @@ where
 }
 
 async fn observe<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
     Json(request): Json<ObserveRequest>,
 ) -> Result<Response, ApiError>
 where
@@ -2467,19 +2829,13 @@ where
             }
         }
     };
-    let mut response = Sse::new(stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keep-alive"),
-        )
-        .into_response();
+    let mut response = sse_response(stream);
     response.extensions_mut().insert(terminal_signal);
     Ok(response)
 }
 
 async fn observe_multiplex<S>(
-    Extension(lease): Extension<SessionLease<S>>,
+    lease: SessionLease<S>,
     Json(request): Json<MultiplexObserveRequest>,
 ) -> Result<Response, ApiError>
 where
@@ -2609,13 +2965,7 @@ where
             }
         }
     };
-    let mut response = Sse::new(stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keep-alive"),
-        )
-        .into_response();
+    let mut response = sse_response(stream);
     response.extensions_mut().insert(terminal_signal);
     Ok(response)
 }
@@ -2634,6 +2984,33 @@ fn sse_json_event<T: Serialize>(event: &'static str, payload: &T) -> Event {
             }),
         ),
     }
+}
+
+fn sse_response(
+    stream: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
+) -> Response {
+    let stream = async_stream::stream! {
+        futures_util::pin_mut!(stream);
+        let mut keep_alive = tokio::time::interval(Duration::from_secs(15));
+        keep_alive.tick().await;
+        loop {
+            tokio::select! {
+                event = futures_util::StreamExt::next(&mut stream) => match event {
+                    Some(Ok(event)) => yield Ok::<Bytes, io::Error>(event.encode()),
+                    Some(Err(never)) => match never {},
+                    None => break,
+                },
+                _ = keep_alive.tick() => {
+                    yield Ok(Bytes::from_static(b": keep-alive\n\n"));
+                }
+            }
+        }
+    };
+    HttpResponse::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .header(CACHE_CONTROL, "no-cache")
+        .body(ServerProtocolBody::stream(stream))
+        .expect("static SSE response is valid")
 }
 
 fn decode_params(params: Vec<WireValue>) -> Result<Vec<Value>, ApiError> {
@@ -2910,11 +3287,34 @@ struct ApiError {
 }
 
 impl ApiError {
+    fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: ErrorEnvelope::from_parts(code, message, None, None),
+        }
+    }
+
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             body: ErrorEnvelope::from_parts("LIX_INVALID_ARGUMENT", message, None, None),
         }
+    }
+
+    fn payload_too_large(limit: usize) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "LIX_ERROR_REQUEST_BODY_TOO_LARGE",
+            format!("request body exceeds the {limit}-byte protocol limit"),
+        )
+    }
+
+    fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "LIX_ERROR_UNSUPPORTED_CONTENT_ENCODING",
+            message,
+        )
     }
 
     fn account_mismatch() -> Self {
@@ -3218,10 +3618,9 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HandshakeRequest {
     active_branch_id: Option<String>,
-    active_account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3263,12 +3662,12 @@ struct ExecuteRequest {
     cache_blobs: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct BinaryFileUpdateRequest {
     path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct BinaryFileReadRequest {
     path: Option<String>,
 }
@@ -3392,6 +3791,26 @@ fn optional_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiEr
         )));
     }
     Ok(Some(value.to_string()))
+}
+
+fn require_json_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
+    let media_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default();
+    if media_type.eq_ignore_ascii_case("application/json")
+        || media_type.to_ascii_lowercase().ends_with("+json")
+    {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "LIX_ERROR_UNSUPPORTED_CONTENT_TYPE",
+            "JSON protocol requests require Content-Type application/json",
+        ))
+    }
 }
 
 fn idempotency_fingerprint(
@@ -3958,9 +4377,9 @@ impl Drop for ObserveTaskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-    use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+    use flate2::{Compression, write::GzEncoder};
+    use http::Request;
     use http_body_util::BodyExt as _;
     use lix::storage::{
         BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, MemoryRead,
@@ -3972,17 +4391,13 @@ mod tests {
     use lix_collaboration_test_support::{
         CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
     };
-    use lix_storage_rocksdb::RocksDB;
-    use lix_storage_slatedb::{SlateDB, SlateDBObjectStoreOptions, SlateDBRead, SlateDBWrite};
-    use object_store::memory::InMemory as ObjectStoreMemory;
     use serde_json::{Value as JsonValue, json};
     use std::{
         collections::BTreeMap,
-        io::{Cursor, Read as _, Write as _},
+        io::{Cursor, Write as _},
         path::Path,
         sync::{Arc, Mutex, atomic::AtomicBool},
     };
-    use tower::ServiceExt as _;
     use tracing::Subscriber;
     use tracing_subscriber::{
         layer::{Context as LayerContext, Layer},
@@ -3992,8 +4407,95 @@ mod tests {
 
     static TEST_IDEMPOTENCY_KEY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+    #[test]
+    fn openapi_contains_every_canonical_method_and_path() {
+        let openapi = include_str!("../../server-protocol.openapi.yaml");
+        for (method, path) in SERVER_PROTOCOL_ENDPOINTS {
+            assert!(
+                openapi.contains(&format!("  {path}:")),
+                "OpenAPI is missing {path}"
+            );
+            let operation_id = match (*method, *path) {
+                ("GET", "/lix/v1") => "handshake",
+                ("DELETE", "/lix/v1/session") => "deleteSession",
+                ("POST", "/lix/v1/execute") => "execute",
+                ("POST", "/lix/v1/execute-batch") => "executeBatch",
+                ("POST", "/lix/v1/transaction/begin") => "beginTransaction",
+                ("POST", "/lix/v1/transaction/execute") => "transactionExecute",
+                ("POST", "/lix/v1/transaction/commit") => "commitTransaction",
+                ("POST", "/lix/v1/transaction/rollback") => "rollbackTransaction",
+                ("GET", "/lix/v1/file") => "readFile",
+                ("POST", "/lix/v1/file/upsert") => "upsertFile",
+                ("POST", "/lix/v1/file/upsert-batch") => "upsertFileBatch",
+                ("POST", "/lix/v1/branch/create") => "createBranch",
+                ("POST", "/lix/v1/checkpoint/create") => "createCheckpoint",
+                ("POST", "/lix/v1/undo") => "undo",
+                ("POST", "/lix/v1/redo") => "redo",
+                ("POST", "/lix/v1/branch/switch") => "switchBranch",
+                ("POST", "/lix/v1/observe") => "observe",
+                ("POST", "/lix/v1/observe/multiplex") => "observeMultiplex",
+                _ => panic!("endpoint registry needs an OpenAPI operation mapping"),
+            };
+            assert!(
+                openapi.contains(&format!("operationId: {operation_id}")),
+                "OpenAPI is missing {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_idempotency_namespaces_include_the_account() {
+        let principal = |account_id: &str| ServerProtocolPrincipal::Authenticated {
+            account_id: account_id.to_owned(),
+            idempotency_scope: "shared-provider-scope".to_owned(),
+        };
+        assert_ne!(
+            principal("account-a").idempotency_scope(),
+            principal("account-b").idempotency_scope(),
+        );
+    }
+
+    type Body = ServerProtocolBody;
+
+    trait TestStorage: Storage + Clone + Send + Sync + 'static {}
+
+    impl<S> TestStorage for S where S: Storage + Clone + Send + Sync + 'static {}
+
+    #[derive(Clone)]
+    struct Router<S: TestStorage> {
+        server: LixServerProtocol<S>,
+    }
+
+    impl<S> Router<S>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        async fn oneshot(self, mut request: Request<Body>) -> Result<Response, Infallible> {
+            let durable_terminal_storage_notifier = request
+                .extensions_mut()
+                .remove::<DurableTerminalStorageNotifier>();
+            Ok(self
+                .server
+                .handle(
+                    request,
+                    ServerProtocolContext {
+                        principal: ServerProtocolPrincipal::Anonymous,
+                        durable_terminal_storage_notifier,
+                    },
+                )
+                .await)
+        }
+    }
+
+    fn handler<S>(server: LixServerProtocol<S>) -> Router<S>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        Router { server }
+    }
+
     struct TestSseStream {
-        body: Body,
+        body: ServerProtocolBody,
         buffered: Vec<u8>,
     }
 
@@ -4098,8 +4600,8 @@ mod tests {
     }
 
     struct TestApp {
-        server: LixProtocolServer<Memory>,
-        router: Router,
+        server: LixServerProtocol<Memory>,
+        router: Router<Memory>,
     }
 
     #[derive(Clone, Debug)]
@@ -4555,105 +5057,6 @@ mod tests {
         }
     }
 
-    /// Turns one definite SlateDB commit into the transport-style ambiguity
-    /// that occurs when an acknowledgement is lost after the write returns.
-    /// Unlike the Memory wrapper above, this preserves SlateDB's remote
-    /// durability read tier so the protocol can prove a positive receipt.
-    #[derive(Clone)]
-    struct PostCommitUnknownSlateDB {
-        inner: SlateDB,
-        fail_next_commit: Arc<AtomicBool>,
-    }
-
-    impl PostCommitUnknownSlateDB {
-        fn new() -> Self {
-            let inner = SlateDB::open_object_store_with_options(
-                "server-protocol-idempotency",
-                Arc::new(ObjectStoreMemory::new()),
-                SlateDBObjectStoreOptions::default(),
-            )
-            .expect("open SlateDB test storage");
-            Self {
-                inner,
-                fail_next_commit: Arc::new(AtomicBool::new(false)),
-            }
-        }
-
-        fn fail_next_commit(&self) {
-            self.fail_next_commit.store(true, Ordering::Release);
-        }
-    }
-
-    struct PostCommitUnknownSlateDBWrite {
-        inner: SlateDBWrite,
-        fail_after_commit: bool,
-    }
-
-    impl Storage for PostCommitUnknownSlateDB {
-        type Read<'a>
-            = SlateDBRead
-        where
-            Self: 'a;
-        type Write<'a>
-            = PostCommitUnknownSlateDBWrite
-        where
-            Self: 'a;
-
-        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
-            self.inner.begin_read(options).await
-        }
-
-        async fn begin_write(
-            &self,
-            options: WriteOptions,
-        ) -> Result<Self::Write<'_>, StorageError> {
-            Ok(PostCommitUnknownSlateDBWrite {
-                inner: self.inner.begin_write(options).await?,
-                fail_after_commit: self.fail_next_commit.swap(false, Ordering::AcqRel),
-            })
-        }
-    }
-
-    impl StorageWrite for PostCommitUnknownSlateDBWrite {
-        async fn put_many(
-            &mut self,
-            space: StorageSpace,
-            entries: PutBatch,
-        ) -> Result<(), StorageError> {
-            self.inner.put_many(space, entries).await
-        }
-
-        async fn delete_many(
-            &mut self,
-            space: StorageSpace,
-            keys: &[Key],
-        ) -> Result<(), StorageError> {
-            self.inner.delete_many(space, keys).await
-        }
-
-        async fn delete_range(
-            &mut self,
-            space: StorageSpace,
-            range: KeyRange,
-        ) -> Result<(), StorageError> {
-            self.inner.delete_range(space, range).await
-        }
-
-        async fn commit(self) -> Result<CommitResult, StorageError> {
-            let result = self.inner.commit().await?;
-            if self.fail_after_commit {
-                return Err(StorageError::CommitOutcomeUnknown(
-                    "injected post-commit acknowledgement loss".to_string(),
-                ));
-            }
-            Ok(result)
-        }
-
-        async fn rollback(self) -> Result<(), StorageError> {
-            self.inner.rollback().await
-        }
-    }
-
     #[derive(Clone)]
     struct FencedReadStorage {
         inner: Memory,
@@ -4723,10 +5126,10 @@ mod tests {
                 .await
                 .expect("open Lix"),
         );
-        let server = LixProtocolServer::new(root);
+        let server = LixServerProtocol::new(root);
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None, None)
+            .create_session(None, None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();
@@ -4764,7 +5167,7 @@ mod tests {
                 .await
                 .expect("open Lix"),
         );
-        let router = handler(LixProtocolServer::new(root));
+        let router = handler(LixServerProtocol::new(root));
 
         storage.fence_reads();
         let (notifier, signal) = durable_terminal_storage_signal();
@@ -4801,7 +5204,7 @@ mod tests {
             .active_branch_id()
             .await
             .expect("read initial active branch");
-        let router = handler(LixProtocolServer::new(root));
+        let router = handler(LixServerProtocol::new(root));
 
         storage.fence_reads();
         let (notifier, signal) = durable_terminal_storage_signal();
@@ -4834,9 +5237,9 @@ mod tests {
                 .await
                 .expect("open Lix"),
         );
-        let server = LixProtocolServer::new(root);
+        let server = LixServerProtocol::new(root);
         let lease = server
-            .create_session(None, None, None)
+            .create_session(None, None, None, None)
             .await
             .expect("session lease");
         let (terminal_sender, terminal_signal) = TerminalStorageStreamSignal::new();
@@ -5025,7 +5428,7 @@ mod tests {
                 .await
                 .expect("open Lix"),
         );
-        let server = LixProtocolServer::new(root);
+        let server = LixServerProtocol::new(root);
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
@@ -5078,7 +5481,7 @@ mod tests {
                 .await
                 .expect("open Lix"),
         );
-        let server = LixProtocolServer::new(root);
+        let server = LixServerProtocol::new(root);
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
@@ -5161,7 +5564,7 @@ mod tests {
                 .await
                 .expect("open Lix"),
         );
-        let server = LixProtocolServer::new(root);
+        let server = LixServerProtocol::new(root);
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
@@ -5251,7 +5654,7 @@ mod tests {
                 .await
                 .expect("open Lix"),
         );
-        let server = LixProtocolServer::new(root);
+        let server = LixServerProtocol::new(root);
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
@@ -5300,7 +5703,10 @@ mod tests {
         );
     }
 
-    async fn prime_external_observe_watcher(router: &Router, session_id: &str) -> Body {
+    async fn prime_external_observe_watcher(
+        router: &Router<impl TestStorage>,
+        session_id: &str,
+    ) -> Body {
         let response = request(
             router,
             "POST",
@@ -5320,22 +5726,22 @@ mod tests {
     }
 
     async fn app() -> TestApp {
-        app_with_options(ProtocolServerOptions::default()).await
+        app_with_options(ServerProtocolOptions::default()).await
     }
 
-    async fn app_with_options(options: ProtocolServerOptions) -> TestApp {
+    async fn app_with_options(options: ServerProtocolOptions) -> TestApp {
         let lix = Arc::new(open_lix().await.expect("open lix"));
-        let server = LixProtocolServer::with_options(lix, options).expect("protocol server");
+        let server = LixServerProtocol::with_options(lix, options).expect("protocol server");
         let router = handler(server.clone());
         TestApp { server, router }
     }
 
-    async fn router_with_storage<S>(storage: S) -> Router
+    async fn router_with_storage<S>(storage: S) -> Router<S>
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
         let lix = Arc::new(open_lix().with_storage(storage).await.expect("open Lix"));
-        handler(LixProtocolServer::new(lix))
+        handler(LixServerProtocol::new(lix))
     }
 
     #[tokio::test]
@@ -5373,61 +5779,6 @@ mod tests {
         assert_eq!(
             response_json(persisted).await["rows"][0][0],
             json!({ "kind": "int", "value": 0 })
-        );
-    }
-
-    #[tokio::test]
-    async fn idempotency_key_replays_a_post_commit_acknowledgement_loss_once() {
-        let storage = PostCommitUnknownSlateDB::new();
-        let router = router_with_storage(storage.clone()).await;
-        let (session_id, _) = new_session(&router).await;
-        let headers = [(IDEMPOTENCY_KEY_HEADER, "post-commit-ack-loss")];
-        let body = json!({
-            "sql": "INSERT INTO lix_key_value (key, value) VALUES ('once', 'persisted')"
-        });
-
-        storage.fail_next_commit();
-        let first = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            &headers,
-            Some(body.clone()),
-        )
-        .await;
-        assert_eq!(
-            first.status(),
-            StatusCode::OK,
-            "{:?}",
-            response_json(first).await
-        );
-
-        let replay = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            &headers,
-            Some(body),
-        )
-        .await;
-        assert_eq!(replay.status(), StatusCode::OK);
-
-        let persisted = request(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            Some(json!({
-                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'once'"
-            })),
-        )
-        .await;
-        assert_eq!(persisted.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(persisted).await["rows"][0][0],
-            json!({ "kind": "int", "value": 1 })
         );
     }
 
@@ -5534,67 +5885,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotent_batch_replays_all_results_after_acknowledgement_loss() {
-        let storage = PostCommitUnknownSlateDB::new();
-        let router = router_with_storage(storage.clone()).await;
-        let (session_id, _) = new_session(&router).await;
-        let headers = [(IDEMPOTENCY_KEY_HEADER, "batch-ack-loss")];
-        let body = json!({
-            "statements": [
-                { "sql": "INSERT INTO lix_key_value (key, value) VALUES ('batch-first', 'one')" },
-                { "sql": "INSERT INTO lix_key_value (key, value) VALUES ('batch-second', 'two')" }
-            ]
-        });
-
-        storage.fail_next_commit();
-        let first = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute-batch",
-            Some(&session_id),
-            &headers,
-            Some(body.clone()),
-        )
-        .await;
-        assert_eq!(
-            first.status(),
-            StatusCode::OK,
-            "{:?}",
-            response_json(first).await
-        );
-        let replay = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute-batch",
-            Some(&session_id),
-            &headers,
-            Some(body),
-        )
-        .await;
-        assert_eq!(replay.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(replay).await.as_array().map(Vec::len),
-            Some(2)
-        );
-
-        let persisted = request(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            Some(json!({
-                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key IN ('batch-first', 'batch-second')"
-            })),
-        )
-        .await;
-        assert_eq!(persisted.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(persisted).await["rows"][0][0],
-            json!({ "kind": "int", "value": 2 })
-        );
-    }
-
-    #[tokio::test]
     async fn keyed_write_without_durable_receipt_proof_is_not_acknowledged() {
         let storage = PostCommitUnknownStorage::new();
         let lix = Arc::new(
@@ -5603,7 +5893,7 @@ mod tests {
                 .await
                 .expect("open Lix"),
         );
-        let server = LixProtocolServer::new(lix);
+        let server = LixServerProtocol::new(lix);
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
         let headers = [(IDEMPOTENCY_KEY_HEADER, "memory-has-no-durable-proof")];
@@ -5657,13 +5947,13 @@ mod tests {
                 .await
                 .expect("open lix"),
         );
-        let server = LixProtocolServer::new(lix);
+        let server = LixServerProtocol::new(lix);
         let router = handler(server.clone());
         TestApp { server, router }
     }
 
     async fn request(
-        app: &Router,
+        app: &Router<impl TestStorage>,
         method: &str,
         uri: &str,
         session_id: Option<&str>,
@@ -5685,7 +5975,7 @@ mod tests {
         request_with_headers(app, method, uri, session_id, &idempotency_headers, body).await
     }
 
-    async fn begin_remote_transaction(app: &Router, session_id: &str) -> String {
+    async fn begin_remote_transaction(app: &Router<impl TestStorage>, session_id: &str) -> String {
         let response = request(
             app,
             "POST",
@@ -5702,7 +5992,7 @@ mod tests {
     }
 
     async fn remote_transaction_request(
-        app: &Router,
+        app: &Router<impl TestStorage>,
         method: &str,
         uri: &str,
         session_id: &str,
@@ -5729,19 +6019,19 @@ mod tests {
         for (path, bytes) in [
             (
                 "manifest.json",
-                include_str!("../../../plugins/json/manifest.json").as_bytes(),
+                include_str!("../../../../plugins/json/manifest.json").as_bytes(),
             ),
             (
                 "schema/json_root.json",
-                include_str!("../../../plugins/json/schema/json_root.json").as_bytes(),
+                include_str!("../../../../plugins/json/schema/json_root.json").as_bytes(),
             ),
             (
                 "schema/json_object_member.json",
-                include_str!("../../../plugins/json/schema/json_object_member.json").as_bytes(),
+                include_str!("../../../../plugins/json/schema/json_object_member.json").as_bytes(),
             ),
             (
                 "schema/json_array_item.json",
-                include_str!("../../../plugins/json/schema/json_array_item.json").as_bytes(),
+                include_str!("../../../../plugins/json/schema/json_array_item.json").as_bytes(),
             ),
             ("plugin.wasm", wasm.as_slice()),
         ] {
@@ -5752,7 +6042,7 @@ mod tests {
     }
 
     async fn request_with_headers(
-        app: &Router,
+        app: &Router<impl TestStorage>,
         method: &str,
         uri: &str,
         session_id: Option<&str>,
@@ -5771,8 +6061,8 @@ mod tests {
                 .headers_mut()
                 .expect("request builder headers")
                 .insert(
-                    axum::http::header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("application/json"),
+                    CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/json"),
                 );
             Body::from(body.to_string())
         });
@@ -5782,11 +6072,14 @@ mod tests {
             .expect("response")
     }
 
-    async fn new_session(app: &Router) -> (String, JsonValue) {
+    async fn new_session(app: &Router<impl TestStorage>) -> (String, JsonValue) {
         new_session_at(app, None).await
     }
 
-    async fn new_session_at(app: &Router, active_branch_id: Option<&str>) -> (String, JsonValue) {
+    async fn new_session_at(
+        app: &Router<impl TestStorage>,
+        active_branch_id: Option<&str>,
+    ) -> (String, JsonValue) {
         let uri = active_branch_id.map_or_else(
             || "/lix/v1".to_string(),
             |active_branch_id| format!("/lix/v1?activeBranchId={active_branch_id}"),
@@ -5795,7 +6088,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CACHE_CONTROL),
-            Some(&axum::http::HeaderValue::from_static("no-store"))
+            Some(&http::HeaderValue::from_static("no-store"))
         );
         let body = response_json(response).await;
         let session_id = body["sessionId"].as_str().expect("session id").to_string();
@@ -6053,38 +6346,6 @@ mod tests {
         encoder.finish().expect("finish gzip")
     }
 
-    async fn gzip_response_json(response: Response) -> JsonValue {
-        assert_eq!(
-            response.headers().get(axum::http::header::CONTENT_ENCODING),
-            Some(&axum::http::HeaderValue::from_static("gzip"))
-        );
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("compressed body")
-            .to_bytes();
-        let mut decoder = GzDecoder::new(bytes.as_ref());
-        let mut decoded = Vec::new();
-        decoder.read_to_end(&mut decoded).expect("decode gzip");
-        serde_json::from_slice(&decoded).expect("compressed json")
-    }
-
-    async fn zstd_response_json(response: Response) -> JsonValue {
-        assert_eq!(
-            response.headers().get(axum::http::header::CONTENT_ENCODING),
-            Some(&axum::http::HeaderValue::from_static("zstd"))
-        );
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("compressed body")
-            .to_bytes();
-        let decoded = zstd::stream::decode_all(bytes.as_ref()).expect("decode zstd");
-        serde_json::from_slice(&decoded).expect("compressed json")
-    }
-
     async fn error_code(response: Response) -> String {
         response_json(response).await["error"]["code"]
             .as_str()
@@ -6117,14 +6378,14 @@ mod tests {
     }
 
     async fn binary_file_upsert_batch_request(
-        app: &Router,
+        app: &Router<impl TestStorage>,
         session_id: Option<&str>,
         body: Vec<u8>,
     ) -> Response {
         let mut builder = Request::builder()
             .method("POST")
             .uri("/lix/v1/file/upsert-batch")
-            .header(axum::http::header::CONTENT_TYPE, "application/octet-stream");
+            .header(CONTENT_TYPE, "application/octet-stream");
         if let Some(session_id) = session_id {
             builder = builder.header(SESSION_ID_HEADER, session_id);
         }
@@ -6163,48 +6424,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handshake_rejects_client_controlled_account_identity() {
+        let app = app().await;
+        let response = request(
+            &app.router,
+            "GET",
+            "/lix/v1?activeAccountId=00000000-0000-7000-8000-000000000001",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn trusted_account_binding_overrides_creation_and_rejects_cross_account_resume() {
         let app = app().await;
-        let mut create = Request::builder()
-            .uri(format!(
-                "/lix/v1?activeAccountId={}",
-                lix::ANONYMOUS_ACCOUNT_ID
-            ))
+        let create = Request::builder()
+            .uri("/lix/v1")
             .body(Body::empty())
             .expect("trusted handshake request");
-        create.extensions_mut().insert(TrustedActiveAccountId::new(
-            lix::SYSTEM_ACCOUNT_ID.to_string(),
-        ));
         let response = app
-            .router
-            .clone()
-            .oneshot(create)
-            .await
-            .expect("trusted handshake response");
+            .server
+            .handle(
+                create,
+                ServerProtocolContext {
+                    principal: ServerProtocolPrincipal::Authenticated {
+                        account_id: lix::SYSTEM_ACCOUNT_ID.to_string(),
+                        idempotency_scope: "system-test".to_string(),
+                    },
+                    durable_terminal_storage_notifier: None,
+                },
+            )
+            .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["activeAccountId"], lix::SYSTEM_ACCOUNT_ID);
         let session_id = body["sessionId"].as_str().expect("session id");
 
-        let mut resume = Request::builder()
+        let resume = Request::builder()
             .uri("/lix/v1")
             .header(SESSION_ID_HEADER, session_id)
             .body(Body::empty())
             .expect("cross-account resume request");
-        resume.extensions_mut().insert(TrustedActiveAccountId::new(
-            lix::ANONYMOUS_ACCOUNT_ID.to_string(),
-        ));
         let response = app
-            .router
-            .clone()
-            .oneshot(resume)
-            .await
-            .expect("cross-account resume response");
+            .server
+            .handle(resume, ServerProtocolContext::anonymous())
+            .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             error_code(response).await,
             "LIX_ERROR_PROTOCOL_ACCOUNT_MISMATCH"
         );
+
+        let changed_scope = Request::builder()
+            .uri("/lix/v1")
+            .header(SESSION_ID_HEADER, session_id)
+            .body(Body::empty())
+            .expect("changed-scope resume request");
+        let response = app
+            .server
+            .handle(
+                changed_scope,
+                ServerProtocolContext {
+                    principal: ServerProtocolPrincipal::Authenticated {
+                        account_id: lix::SYSTEM_ACCOUNT_ID.to_string(),
+                        idempotency_scope: "different-system-scope".to_string(),
+                    },
+                    durable_terminal_storage_notifier: None,
+                },
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -6280,7 +6571,7 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
                     .header(SESSION_ID_HEADER, &session_id)
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_TYPE, "application/octet-stream")
                     .body(Body::from(payload.clone()))
                     .expect("binary file upsert request"),
             )
@@ -6320,7 +6611,7 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
                     .header(SESSION_ID_HEADER, &session_id)
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_TYPE, "application/octet-stream")
                     .body(Body::empty())
                     .expect("empty binary file upsert request"),
             )
@@ -6355,7 +6646,7 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/file/upsert?path=%2Fcreated.bin")
                     .header(SESSION_ID_HEADER, &session_id)
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_TYPE, "application/octet-stream")
                     .body(Body::from(created_payload.clone()))
                     .expect("binary file create request"),
             )
@@ -6485,7 +6776,7 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
                     .header(SESSION_ID_HEADER, &session_id)
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_TYPE, "application/octet-stream")
                     .body(Body::from(payload.clone()))
                     .expect("binary file seed request"),
             )
@@ -6509,17 +6800,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CACHE_CONTROL),
-            Some(&axum::http::HeaderValue::from_static("no-store"))
+            Some(&http::HeaderValue::from_static("no-store"))
         );
         assert_eq!(
-            response.headers().get(axum::http::header::CONTENT_TYPE),
-            Some(&axum::http::HeaderValue::from_static(
-                "application/octet-stream"
-            ))
+            response.headers().get(CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("application/octet-stream"))
         );
         assert_eq!(
             response.headers().get(FILE_FOUND_HEADER),
-            Some(&axum::http::HeaderValue::from_static("true"))
+            Some(&http::HeaderValue::from_static("true"))
         );
         assert_eq!(
             response
@@ -6549,12 +6838,12 @@ mod tests {
         assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
             ranged.headers().get(ACCEPT_RANGES),
-            Some(&axum::http::HeaderValue::from_static("bytes"))
+            Some(&http::HeaderValue::from_static("bytes"))
         );
         assert_eq!(
             ranged.headers().get(CONTENT_RANGE),
             Some(
-                &axum::http::HeaderValue::from_str(&format!("bytes 1-3/{}", payload.len()))
+                &http::HeaderValue::from_str(&format!("bytes 1-3/{}", payload.len()))
                     .expect("content range header")
             )
         );
@@ -6622,7 +6911,7 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
                     .header(SESSION_ID_HEADER, &session_id)
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_TYPE, "application/octet-stream")
                     .body(Body::empty())
                     .expect("empty binary file update request"),
             )
@@ -6646,7 +6935,7 @@ mod tests {
         assert_eq!(empty.status(), StatusCode::OK);
         assert_eq!(
             empty.headers().get(FILE_FOUND_HEADER),
-            Some(&axum::http::HeaderValue::from_static("true"))
+            Some(&http::HeaderValue::from_static("true"))
         );
         assert!(
             empty
@@ -6689,7 +6978,7 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::OK);
         assert_eq!(
             missing.headers().get(FILE_FOUND_HEADER),
-            Some(&axum::http::HeaderValue::from_static("false"))
+            Some(&http::HeaderValue::from_static("false"))
         );
         assert!(
             missing
@@ -6745,7 +7034,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_TYPE, "application/octet-stream")
                     .body(Body::from(vec![1_u8]))
                     .expect("missing session request"),
             )
@@ -6766,7 +7055,7 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/file/upsert?path=relative.bin")
                     .header(SESSION_ID_HEADER, &session_id)
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_TYPE, "application/octet-stream")
                     .body(Body::from(vec![1_u8]))
                     .expect("invalid path request"),
             )
@@ -7236,9 +7525,9 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_initial_branch_does_not_evict_an_idle_session_at_capacity() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_sessions: 1,
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (existing_session, _) = new_session(&app.router).await;
@@ -7281,16 +7570,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_metadata_and_returning_work_on_all_storage_adapters() {
+    async fn execute_batch_metadata_and_returning_work_in_memory() {
         assert_execute_batch_metadata(Memory::default()).await;
-
-        let rocks_root = tempfile::tempdir().expect("create RocksDB test directory");
-        assert_execute_batch_metadata(
-            RocksDB::open(rocks_root.path().join(".lix")).expect("open RocksDB test storage"),
-        )
-        .await;
-
-        assert_execute_batch_metadata(PostCommitUnknownSlateDB::new()).await;
     }
 
     async fn assert_execute_batch_metadata<S>(storage: S)
@@ -7664,9 +7945,9 @@ mod tests {
 
     impl RemoteCapacityBackend {
         async fn open(clients: usize, operations: usize) -> Self {
-            let app = app_with_options(ProtocolServerOptions {
+            let app = app_with_options(ServerProtocolOptions {
                 max_sessions: 128,
-                ..ProtocolServerOptions::default()
+                ..ServerProtocolOptions::default()
             })
             .await;
             let root = &app.server.inner.root;
@@ -8239,9 +8520,9 @@ mod tests {
     #[tokio::test]
     async fn execute_batch_bounds_aggregate_blob_reconstruction_before_mutation() {
         const TEST_RECONSTRUCTION_LIMIT: usize = 128 * 1024;
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_request_body_bytes: TEST_RECONSTRUCTION_LIMIT,
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (session_id, _) = new_session(&app.router).await;
@@ -8527,7 +8808,7 @@ mod tests {
         assert!(second.get(&second_sha256).is_some());
         assert!(
             third.get(&third_sha256).is_none(),
-            "a full workspace budget must decline another session cache admission"
+            "a full repository budget must decline another session cache admission"
         );
         assert_eq!(
             budget.total_bytes.load(Ordering::Acquire),
@@ -8551,7 +8832,7 @@ mod tests {
         third.insert(CachedRequestBlob { blob: third_blob });
         assert!(
             third.get(&third_sha256).is_some(),
-            "dropping a session cache must release its workspace budget"
+            "dropping a session cache must release its repository budget"
         );
         assert_eq!(
             budget.total_bytes.load(Ordering::Acquire),
@@ -8581,7 +8862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_body_limit_accepts_blobs_larger_than_axums_two_megabyte_default() {
+    async fn configured_body_limit_accepts_blobs_larger_than_two_megabytes() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
         let blob = WireValue::try_from_engine(&Value::Blob(vec![0x41; 2 * 1024 * 1024].into()))
@@ -8606,9 +8887,9 @@ mod tests {
 
     #[tokio::test]
     async fn configured_body_limit_rejects_oversized_json() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_request_body_bytes: 1_024,
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (session_id, _) = new_session(&app.router).await;
@@ -8629,9 +8910,9 @@ mod tests {
 
     #[tokio::test]
     async fn configured_body_limit_rejects_oversized_binary_file_upsert() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_request_body_bytes: 1_024,
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (session_id, _) = new_session(&app.router).await;
@@ -8643,7 +8924,7 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/file/upsert?path=%2Foversized.bin")
                     .header(SESSION_ID_HEADER, session_id)
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_TYPE, "application/octet-stream")
                     .body(Body::from(vec![0_u8; 2_048]))
                     .expect("oversized binary file upsert request"),
             )
@@ -8655,9 +8936,9 @@ mod tests {
 
     #[tokio::test]
     async fn configured_body_limit_rejects_oversized_binary_file_upsert_batch() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_request_body_bytes: 1_024,
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (session_id, _) = new_session(&app.router).await;
@@ -8673,7 +8954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compressed_execute_requests_are_expanded_before_json_extraction() {
+    async fn encoded_requests_must_be_decompressed_by_the_host() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
         let request_body = json!({
@@ -8689,34 +8970,21 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/execute")
                     .header(SESSION_ID_HEADER, session_id)
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .header(axum::http::header::CONTENT_ENCODING, "gzip")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(http::header::CONTENT_ENCODING, "gzip")
                     .body(Body::from(gzip(request_body.as_bytes())))
                     .expect("compressed request"),
             )
             .await
             .expect("compressed response");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(response).await["rows"][0][0]["value"],
-            "x".repeat(64 * 1024)
-        );
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]
-    async fn configured_body_limit_applies_to_expanded_json() {
-        let app = app_with_options(ProtocolServerOptions {
-            max_request_body_bytes: 1_024,
-            ..ProtocolServerOptions::default()
-        })
-        .await;
+    async fn json_routes_require_a_json_content_type() {
+        let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
-        let request_body = json!({
-            "sql": "SELECT $1",
-            "params": [{ "kind": "text", "value": "x".repeat(2_048) }]
-        })
-        .to_string();
         let response = app
             .router
             .oneshot(
@@ -8724,19 +8992,48 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/execute")
                     .header(SESSION_ID_HEADER, session_id)
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .header(axum::http::header::CONTENT_ENCODING, "gzip")
-                    .body(Body::from(gzip(request_body.as_bytes())))
+                    .header(IDEMPOTENCY_KEY_HEADER, "content-type-test")
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(Body::from(r#"{"sql":"SELECT 1"}"#))
+                    .expect("plain-text JSON request"),
+            )
+            .await
+            .expect("plain-text JSON response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            error_code(response).await,
+            "LIX_ERROR_UNSUPPORTED_CONTENT_TYPE"
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_requests_are_rejected_before_body_dispatch() {
+        let app = app_with_options(ServerProtocolOptions {
+            max_request_body_bytes: 1_024,
+            ..ServerProtocolOptions::default()
+        })
+        .await;
+        let (session_id, _) = new_session(&app.router).await;
+        let response = app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/execute")
+                    .header(SESSION_ID_HEADER, session_id)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(http::header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from(vec![0_u8; 2_048]))
                     .expect("compressed request"),
             )
             .await
             .expect("compressed response");
 
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]
-    async fn large_finite_responses_negotiate_compression_but_sse_does_not() {
+    async fn protocol_returns_uncompressed_responses_for_host_adaptation() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
         let request_body = json!({
@@ -8747,8 +9044,8 @@ mod tests {
             .method("POST")
             .uri("/lix/v1/execute")
             .header(SESSION_ID_HEADER, &session_id)
-            .header(axum::http::header::ACCEPT_ENCODING, "gzip")
-            .header(axum::http::header::CONTENT_TYPE, "application/json");
+            .header(http::header::ACCEPT_ENCODING, "gzip")
+            .header(CONTENT_TYPE, "application/json");
         let response = app
             .router
             .clone()
@@ -8760,8 +9057,14 @@ mod tests {
             .await
             .expect("gzip response");
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .is_none()
+        );
         assert_eq!(
-            gzip_response_json(response).await["rows"][0][0]["value"],
+            response_json(response).await["rows"][0][0]["value"],
             "x".repeat(64 * 1024)
         );
 
@@ -8773,16 +9076,22 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/execute")
                     .header(SESSION_ID_HEADER, &session_id)
-                    .header(axum::http::header::ACCEPT_ENCODING, "zstd")
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(http::header::ACCEPT_ENCODING, "zstd")
+                    .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(request_body.to_string()))
                     .expect("zstd response request"),
             )
             .await
             .expect("zstd response");
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .is_none()
+        );
         assert_eq!(
-            zstd_response_json(response).await["rows"][0][0]["value"],
+            response_json(response).await["rows"][0][0]["value"],
             "x".repeat(64 * 1024)
         );
 
@@ -8797,8 +9106,8 @@ mod tests {
             .method("POST")
             .uri("/lix/v1/observe/multiplex")
             .header(SESSION_ID_HEADER, session_id)
-            .header(axum::http::header::ACCEPT_ENCODING, "gzip")
-            .header(axum::http::header::CONTENT_TYPE, "application/json");
+            .header(http::header::ACCEPT_ENCODING, "gzip")
+            .header(CONTENT_TYPE, "application/json");
         let response = app
             .router
             .oneshot(
@@ -8810,13 +9119,13 @@ mod tests {
             .expect("SSE response");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get(axum::http::header::CONTENT_TYPE),
-            Some(&axum::http::HeaderValue::from_static("text/event-stream"))
+            response.headers().get(CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("text/event-stream"))
         );
         assert!(
             response
                 .headers()
-                .get(axum::http::header::CONTENT_ENCODING)
+                .get(http::header::CONTENT_ENCODING)
                 .is_none()
         );
     }
@@ -9353,10 +9662,10 @@ mod tests {
 
     #[tokio::test]
     async fn idle_timeout_expires_a_session_with_gone() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_sessions: 4,
             session_idle_timeout: Duration::ZERO,
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (session_id, _) = new_session(&app.router).await;
@@ -9388,9 +9697,9 @@ mod tests {
         assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
         assert!(app.server.is_idle());
 
-        let expired = app_with_options(ProtocolServerOptions {
+        let expired = app_with_options(ServerProtocolOptions {
             session_idle_timeout: Duration::ZERO,
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (_session_id, _) = new_session(&expired.router).await;
@@ -9399,9 +9708,9 @@ mod tests {
 
     #[tokio::test]
     async fn pending_session_open_reservations_are_bounded_and_cancel_safe() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_sessions: 1,
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let pending = app
@@ -9460,14 +9769,14 @@ mod tests {
 
     #[tokio::test]
     async fn close_waits_for_eviction_cleanup_in_a_pending_session_open() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_sessions: 1,
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let first = app
             .server
-            .create_session(None, None, None)
+            .create_session(None, None, None, None)
             .await
             .expect("open first session");
         let first_session_id = first.session_id.clone();
@@ -9486,8 +9795,11 @@ mod tests {
             .await
             .expect("active branch");
         let server = app.server.clone();
-        let replacement =
-            tokio::spawn(async move { server.create_session(Some(branch_id), None, None).await });
+        let replacement = tokio::spawn(async move {
+            server
+                .create_session(Some(branch_id), None, None, None)
+                .await
+        });
 
         loop {
             let replaced = {
@@ -9574,11 +9886,11 @@ mod tests {
                 .expect("open Lix"),
         );
         let branch_id = root.active_branch_id().await.expect("active branch");
-        let server = LixProtocolServer::with_options(
+        let server = LixServerProtocol::with_options(
             root,
-            ProtocolServerOptions {
+            ServerProtocolOptions {
                 max_sessions: SESSION_COUNT,
-                ..ProtocolServerOptions::default()
+                ..ServerProtocolOptions::default()
             },
         )
         .expect("protocol server");
@@ -9590,7 +9902,7 @@ mod tests {
             let branch_id = branch_id.clone();
             tasks.spawn(async move {
                 server
-                    .create_session(Some(branch_id), None, None)
+                    .create_session(Some(branch_id), None, None, None)
                     .await
                     .expect("open protocol session")
             });
@@ -9614,9 +9926,9 @@ mod tests {
         const OPERATIONS: usize = 512;
         const OPERATIONS_AS_F64: f64 = 512.0;
         for concurrency in [1_usize, 8, 32, 64] {
-            let app = app_with_options(ProtocolServerOptions {
+            let app = app_with_options(ServerProtocolOptions {
                 max_sessions: OPERATIONS + 16,
-                ..ProtocolServerOptions::default()
+                ..ServerProtocolOptions::default()
             })
             .await;
             let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
@@ -9654,10 +9966,10 @@ mod tests {
 
     #[tokio::test]
     async fn capacity_evicts_the_least_recently_used_idle_session() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_sessions: 1,
             session_idle_timeout: Duration::from_mins(1),
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (first, _) = new_session(&app.router).await;
@@ -9671,10 +9983,10 @@ mod tests {
 
     #[tokio::test]
     async fn active_sse_lease_cannot_be_evicted_for_capacity() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_sessions: 1,
             session_idle_timeout: Duration::from_mins(1),
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (session_id, _) = new_session(&app.router).await;
@@ -9702,10 +10014,10 @@ mod tests {
 
     #[tokio::test]
     async fn active_remote_transaction_pins_session_until_terminal_request() {
-        let app = app_with_options(ProtocolServerOptions {
+        let app = app_with_options(ServerProtocolOptions {
             max_sessions: 1,
             session_idle_timeout: Duration::from_mins(1),
-            ..ProtocolServerOptions::default()
+            ..ServerProtocolOptions::default()
         })
         .await;
         let (session_id, _) = new_session(&app.router).await;
@@ -9825,18 +10137,18 @@ mod tests {
                 .await
                 .expect("open lix"),
         );
-        let server = LixProtocolServer::with_options(
+        let server = LixServerProtocol::with_options(
             root,
-            ProtocolServerOptions {
+            ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
-                ..ProtocolServerOptions::default()
+                ..ServerProtocolOptions::default()
             },
         )
         .expect("protocol server");
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None, None)
+            .create_session(None, None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();
@@ -9895,10 +10207,10 @@ mod tests {
                 .await
                 .expect("open lix"),
         );
-        let server = LixProtocolServer::new(root);
+        let server = LixServerProtocol::new(root);
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None, None)
+            .create_session(None, None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();
@@ -9939,10 +10251,10 @@ mod tests {
                 .await
                 .expect("open lix"),
         );
-        let server = LixProtocolServer::new(root);
+        let server = LixServerProtocol::new(root);
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None, None)
+            .create_session(None, None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();
@@ -9990,18 +10302,18 @@ mod tests {
                 .await
                 .expect("open lix"),
         );
-        let server = LixProtocolServer::with_options(
+        let server = LixServerProtocol::with_options(
             root,
-            ProtocolServerOptions {
+            ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
-                ..ProtocolServerOptions::default()
+                ..ServerProtocolOptions::default()
             },
         )
         .expect("protocol server");
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None, None)
+            .create_session(None, None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();
@@ -10019,7 +10331,7 @@ mod tests {
                         .uri("/lix/v1/execute")
                         .header(SESSION_ID_HEADER, operation_session_id)
                         .header(IDEMPOTENCY_KEY_HEADER, "detached-write")
-                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .header(CONTENT_TYPE, "application/json")
                         .extension(notifier)
                         .body(Body::from(
                             json!({
@@ -10069,12 +10381,12 @@ mod tests {
                 .await
                 .expect("open lix"),
         );
-        let server = LixProtocolServer::with_options(
+        let server = LixServerProtocol::with_options(
             root,
-            ProtocolServerOptions {
+            ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
-                ..ProtocolServerOptions::default()
+                ..ServerProtocolOptions::default()
             },
         )
         .expect("protocol server");
@@ -10254,7 +10566,7 @@ mod tests {
                 .await
                 .expect("open lix"),
         );
-        let server = LixProtocolServer::new(root);
+        let server = LixServerProtocol::new(root);
         let router = handler(server.clone());
         let (session_id, _) = new_session(&router).await;
         let created = request(
@@ -10355,12 +10667,12 @@ mod tests {
     #[tokio::test]
     async fn zero_capacity_is_rejected() {
         let lix = open_lix().await.expect("open lix");
-        let result = LixProtocolServer::with_options(
+        let result = LixServerProtocol::with_options(
             Arc::new(lix),
-            ProtocolServerOptions {
+            ServerProtocolOptions {
                 max_sessions: 0,
                 session_idle_timeout: Duration::from_secs(1),
-                ..ProtocolServerOptions::default()
+                ..ServerProtocolOptions::default()
             },
         );
         let Err(error) = result else {
@@ -10368,11 +10680,11 @@ mod tests {
         };
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
-        let result = LixProtocolServer::with_options(
+        let result = LixServerProtocol::with_options(
             Arc::new(open_lix().await.expect("open second lix")),
-            ProtocolServerOptions {
+            ServerProtocolOptions {
                 max_request_blob_cache_bytes: 0,
-                ..ProtocolServerOptions::default()
+                ..ServerProtocolOptions::default()
             },
         );
         let Err(error) = result else {

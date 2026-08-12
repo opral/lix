@@ -117,6 +117,10 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("prepared_dml", "leaf utility, no layer semantics"),
     ("registered_spaces", "cfg-gated harness"),
     ("schema", "not yet analysed"),
+    (
+        "server_protocol",
+        "optional public HTTP facade; orchestrates sessions and engine APIs",
+    ),
     ("session", "cyclic with `transaction` and with `gc`"),
     (
         "sql2",

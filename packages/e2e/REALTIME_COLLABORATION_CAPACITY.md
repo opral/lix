@@ -149,7 +149,7 @@ cargo test -p lix_e2e \
   abandoned_transactions_and_sessions_release_resources \
   -- --ignored --exact --nocapture
 
-cargo test -p lix_server_protocol --release \
+cargo test -p lix --features "server-protocol storage-benches" --release \
   tests::remote_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95 \
   -- --ignored --exact --nocapture
 ```

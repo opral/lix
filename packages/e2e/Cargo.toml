@@ -25,6 +25,7 @@ rocksdb = ["dep:lix_storage_rocksdb"]
 slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
 storage-benches = ["lix/storage-benches", "rocksdb"]
 root-replay-trace = ["lix/root-replay-trace", "storage-benches"]
+server-protocol = ["lix/server-protocol"]
 tpch = ["dep:duckdb", "dep:tpchgen"]
 # Turns on `lix/default_wasm_runtime` for the SDK tests folded in from the
 # former `lix_tests` crate, which ran with it enabled. It is deliberately not
@@ -88,6 +89,8 @@ plugin_excalidraw = { path = "../../plugins/excalidraw", lib = true, artifact = 
 plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_markdown = { path = "../../plugins/markdown", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_text = { path = "../../plugins/text", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+http = "1"
+http-body-util = "0.1"
 
 [[example]]
 name = "expaa_replay_scope"
@@ -142,6 +145,16 @@ required-features = ["storage-benches"]
 [[example]]
 name = "chunking_oracle"
 path = "examples/chunking_oracle.rs"
+
+[[bench]]
+name = "request_blob_transport"
+path = "benches/request_blob_transport.rs"
+harness = false
+
+[[test]]
+name = "server_protocol_durable_idempotency"
+path = "tests/server_protocol_durable_idempotency.rs"
+required-features = ["server-protocol", "slatedb"]
 
 [[example]]
 name = "cas_sharing"

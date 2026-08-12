@@ -148,7 +148,6 @@ test("remote client state and active branch survive reopen without reaching the 
 	const sessions = new Map<string, string>();
 	const availableBranches = new Set(["main", "draft"]);
 	const initialBranchRequests: Array<string | null> = [];
-	const initialAccountRequests: Array<string | null> = [];
 	const requestBodies: string[] = [];
 	let nextSession = 0;
 	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -159,7 +158,7 @@ test("remote client state and active branch survive reopen without reaching the 
 			const requestedBranch = url.searchParams.get("activeBranchId");
 			if (!suppliedSession) {
 				initialBranchRequests.push(requestedBranch);
-				initialAccountRequests.push(url.searchParams.get("activeAccountId"));
+				expect(url.searchParams.has("activeAccountId")).toBe(false);
 				if (requestedBranch && !availableBranches.has(requestedBranch)) {
 					return Response.json(
 						{
@@ -238,13 +237,6 @@ test("remote client state and active branch survive reopen without reaching the 
 			"draft",
 			null,
 			"main",
-		]);
-		expect(initialAccountRequests).toEqual([
-			null,
-			"00000000-0000-7000-8000-000000000002",
-			"00000000-0000-7000-8000-000000000002",
-			"00000000-0000-7000-8000-000000000002",
-			"00000000-0000-7000-8000-000000000002",
 		]);
 	} finally {
 		await reopenedFallback.close();

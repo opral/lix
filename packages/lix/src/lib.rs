@@ -14,6 +14,7 @@
 //! [`open_lix`] opens an in-memory workspace. Add a storage adapter with
 //! [`OpenLixBuilder::with_storage`] when persistence is needed.
 
+#![recursion_limit = "256"]
 #![cfg_attr(
     test,
     allow(
@@ -83,6 +84,8 @@ mod prepared_dml;
 #[cfg(any(test, feature = "storage-benches"))]
 pub mod registered_spaces;
 mod schema;
+#[cfg(feature = "server-protocol")]
+pub mod server_protocol;
 mod session;
 pub(crate) mod sql2;
 #[cfg(feature = "storage-benches")]
