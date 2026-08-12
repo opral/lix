@@ -144,6 +144,7 @@ async fn load_key_value_row(
     read: &(impl StorageAdapterRead + ?Sized),
     key: &str,
 ) -> Result<Option<MaterializedHotStateRow>, LixError> {
+    let mut probe = crate::e46_probe::mark();
     let Some(control) = BranchHeadControlContext::new()
         .reader(read)
         .load(GLOBAL_BRANCH_ID)
@@ -151,6 +152,7 @@ async fn load_key_value_row(
     else {
         return Ok(None);
     };
+    probe.lap(9);
     let keys = [TrackedStateKey {
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         entity_pk: EntityPk::single(key),
@@ -178,6 +180,7 @@ async fn load_key_value_row(
             HotStateReadDomain::Untracked,
         )
         .await?;
+    probe.lap(10);
     let Some(row) = rows.row(0) else {
         reader
             .validate_exact_collection_closure(
@@ -192,6 +195,7 @@ async fn load_key_value_row(
                 control.current_state_revision == 0,
             )
             .await?;
+        probe.lap(11);
         return Ok(None);
     };
     if !row.untracked() || row.deleted() {
