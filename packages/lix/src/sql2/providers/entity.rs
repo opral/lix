@@ -690,7 +690,7 @@ impl TableSpec for EntitySpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     {
-                        crate::sql_profile::record_provider_rows_examined(entity_pks.len());
+                        record_rows_examined(entity_pks.len());
                         return entity_primary_key_record_batch(&spec, schema, entity_pks);
                     }
                     if let Some(direct_entity_snapshot) = direct_entity_snapshot
@@ -699,7 +699,7 @@ impl TableSpec for EntitySpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     {
-                        crate::sql_profile::record_provider_rows_examined(rows.len());
+                        record_rows_examined(rows.len());
                         let decoder = EntityProjectionDecoder::new(
                             &spec,
                             schema.fields().iter().map(|field| field.name().as_str()),
@@ -717,7 +717,7 @@ impl TableSpec for EntitySpec {
                         .map_err(lix_error_to_datafusion_error)?;
                     // Before `row_filters` run: this is the row count a
                     // predicate without an indexed access path pays for.
-                    crate::sql_profile::record_provider_rows_examined(rows.len());
+                    record_rows_examined(rows.len());
                     let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                     entity_record_batch_with_parsed(
                         &spec,
@@ -1074,7 +1074,7 @@ async fn entity_columnar_scan_source(
             debug_assert!(partition < partition_count);
             if partition >= base_partition_count {
                 if partition == base_partition_count {
-                    crate::sql_profile::record_provider_rows_examined(overlay_rows_examined);
+                    record_rows_examined(overlay_rows_examined);
                 }
                 let schema = Arc::clone(&stream_schema);
                 let batch = entity_columnar_overlay_partition(
@@ -1180,7 +1180,7 @@ async fn entity_columnar_scan_source(
             // enough to overflow them. Keep additions off this future.
             let batches = futures_util::StreamExt::map(batches, |batch| {
                 if let Ok(batch) = &batch {
-                    crate::sql_profile::record_provider_rows_examined(batch.num_rows());
+                    record_rows_examined(batch.num_rows());
                 }
                 batch
             });
@@ -1351,6 +1351,22 @@ fn entity_columnar_overlay_batches(
         })
         .collect()
 }
+
+/// Records rows a scan route looked at, before its own filtering.
+///
+/// `sql_profile` is gated behind `storage-benches`, so the call sites must not
+/// name it directly: `--all-features` builds would compile and the default and
+/// `wasm32` builds would not. Routing every site through this pair keeps the
+/// diagnostic out of builds that do not have the module at all.
+#[cfg(feature = "storage-benches")]
+#[inline]
+fn record_rows_examined(rows: usize) {
+    crate::sql_profile::record_provider_rows_examined(rows);
+}
+
+#[cfg(not(feature = "storage-benches"))]
+#[inline]
+fn record_rows_examined(_rows: usize) {}
 
 fn entity_columnar_group_indices(
     manifest: &crate::columnar_row_group::RowGroupManifest,
