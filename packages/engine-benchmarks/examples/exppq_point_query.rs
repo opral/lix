@@ -95,6 +95,29 @@ const SCENARIOS: &[Scenario] = &[
         expected_rows: 2,
         params: ParamSet::BundleAndMessages,
     },
+    // Non-primary-key, non-foreign-key equality. Shows whether the access-path
+    // gap is about foreign keys specifically or about every non-PK column.
+    Scenario {
+        name: "message_nonfk_count",
+        sql: "SELECT count(*) AS matches FROM message WHERE locale = 'en'",
+        expected_rows: 1,
+        params: ParamSet::None,
+    },
+    // Unfiltered full scan of the same table: the floor a filtered scan is
+    // compared against.
+    Scenario {
+        name: "message_count_all",
+        sql: "SELECT count(*) AS matches FROM message",
+        expected_rows: 1,
+        params: ParamSet::None,
+    },
+    // Primary-key equality on the same table as `message_fk_only`.
+    Scenario {
+        name: "message_pk_only",
+        sql: "SELECT id, locale FROM message WHERE id = $1",
+        expected_rows: 1,
+        params: ParamSet::Message,
+    },
 ];
 
 #[tokio::main(flavor = "current_thread")]
@@ -110,16 +133,21 @@ async fn main() {
         .next()
         .and_then(|value| value.parse().ok())
         .unwrap_or(200);
+    // `row` writes one row per commit (the OLTP shape the reproduction uses).
+    // `bulk` writes each table in one ordered multi-row INSERT, which is the
+    // only shape that currently produces an entity columnar row-group layout.
+    let bulk = args.next().is_some_and(|value| value == "bulk");
 
     println!(
-        "# exppq point-query attribution | rounds={rounds} | sizes={sizes:?} | storage=Memory"
+        "# exppq point-query attribution | rounds={rounds} | sizes={sizes:?} | storage=Memory | fixture={}",
+        if bulk { "bulk" } else { "row" }
     );
     for bundles in sizes {
-        run_fixture(bundles, rounds).await;
+        run_fixture(bundles, rounds, bulk).await;
     }
 }
 
-async fn run_fixture(bundles: usize, rounds: u32) {
+async fn run_fixture(bundles: usize, rounds: u32, bulk: bool) {
     let storage = Memory::default();
     Engine::initialize(storage.clone())
         .await
@@ -139,39 +167,10 @@ async fn run_fixture(bundles: usize, rounds: u32) {
             .await
             .expect("register schema");
     }
-    for index in 0..bundles {
-        let bundle = format!("bundle-{index}");
-        session
-            .execute(
-                "INSERT INTO bundle (id, declarations) VALUES ($1, lix_json('[]'))",
-                &[Value::Text(bundle.clone())],
-            )
-            .await
-            .expect("insert bundle");
-        for locale in ["en", "de"] {
-            let message = format!("message-{index}-{locale}");
-            session
-                .execute(
-                    r#"INSERT INTO message (id, "bundleId", locale, selectors) VALUES ($1, $2, $3, lix_json('[]'))"#,
-                    &[
-                        Value::Text(message.clone()),
-                        Value::Text(bundle.clone()),
-                        Value::Text(locale.into()),
-                    ],
-                )
-                .await
-                .expect("insert message");
-            session
-                .execute(
-                    r#"INSERT INTO variant (id, "messageId", matches, pattern) VALUES ($1, $2, lix_json('[]'), lix_json('[{"type":"text","value":"fixture"}]'))"#,
-                    &[
-                        Value::Text(format!("variant-{index}-{locale}")),
-                        Value::Text(message),
-                    ],
-                )
-                .await
-                .expect("insert variant");
-        }
+    if bulk {
+        seed_bulk(&session, bundles).await;
+    } else {
+        seed_row_by_row(&session, bundles).await;
     }
 
     let target = bundles / 2;
@@ -213,6 +212,95 @@ async fn run_fixture(bundles: usize, rounds: u32) {
         }
         report(bundles, scenario.name, total, rounds);
     }
+}
+
+async fn seed_row_by_row(session: &lix::integration::SessionContext<Memory>, bundles: usize) {
+    for index in 0..bundles {
+        let bundle = format!("bundle-{index}");
+        session
+            .execute(
+                "INSERT INTO bundle (id, declarations) VALUES ($1, lix_json('[]'))",
+                &[Value::Text(bundle.clone())],
+            )
+            .await
+            .expect("insert bundle");
+        for locale in ["en", "de"] {
+            let message = format!("message-{index}-{locale}");
+            session
+                .execute(
+                    r#"INSERT INTO message (id, "bundleId", locale, selectors) VALUES ($1, $2, $3, lix_json('[]'))"#,
+                    &[
+                        Value::Text(message.clone()),
+                        Value::Text(bundle.clone()),
+                        Value::Text(locale.into()),
+                    ],
+                )
+                .await
+                .expect("insert message");
+            session
+                .execute(
+                    r#"INSERT INTO variant (id, "messageId", matches, pattern) VALUES ($1, $2, lix_json('[]'), lix_json('[{"type":"text","value":"fixture"}]'))"#,
+                    &[
+                        Value::Text(format!("variant-{index}-{locale}")),
+                        Value::Text(message),
+                    ],
+                )
+                .await
+                .expect("insert variant");
+        }
+    }
+}
+
+async fn seed_bulk(session: &lix::integration::SessionContext<Memory>, bundles: usize) {
+    let bundle_values = (0..bundles)
+        .map(|index| format!("('bundle-{index}', lix_json('[]'))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    session
+        .execute(
+            &format!("INSERT INTO bundle (id, declarations) VALUES {bundle_values}"),
+            &[],
+        )
+        .await
+        .expect("bulk insert bundles");
+
+    let message_values = (0..bundles)
+        .flat_map(|index| {
+            ["de", "en"].into_iter().map(move |locale| {
+                format!("('message-{index}-{locale}', 'bundle-{index}', '{locale}', lix_json('[]'))")
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    session
+        .execute(
+            &format!(
+                r#"INSERT INTO message (id, "bundleId", locale, selectors) VALUES {message_values}"#
+            ),
+            &[],
+        )
+        .await
+        .expect("bulk insert messages");
+
+    let variant_values = (0..bundles)
+        .flat_map(|index| {
+            ["de", "en"].into_iter().map(move |locale| {
+                format!(
+                    r#"('variant-{index}-{locale}', 'message-{index}-{locale}', lix_json('[]'), lix_json('[{{"type":"text","value":"fixture"}}]'))"#
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    session
+        .execute(
+            &format!(
+                r#"INSERT INTO variant (id, "messageId", matches, pattern) VALUES {variant_values}"#
+            ),
+            &[],
+        )
+        .await
+        .expect("bulk insert variants");
 }
 
 fn accumulate(out: &mut SqlReadProfile, value: SqlReadProfile) {
