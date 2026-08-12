@@ -857,10 +857,10 @@ where
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let key: BranchRefKey = match storage_codec::decode(
                 "tracked working-diff marker key",
                 entry.key.0.as_ref(),
@@ -901,7 +901,7 @@ where
                 },
             );
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -2393,7 +2393,7 @@ mod tests {
     async fn scan_test_space(
         read: &(impl StorageAdapterRead + ?Sized),
         space: StorageSpace,
-    ) -> crate::storage_adapter::StorageScanChunk {
+    ) -> Vec<crate::storage_adapter::StorageReadEntry> {
         let range = StoragePrefix {
             bytes: Bytes::new(),
         }
@@ -2404,7 +2404,7 @@ mod tests {
             .await
             .expect("begin test scan");
         cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .collect_all()
             .await
             .expect("read test scan page")
     }
@@ -4040,8 +4040,7 @@ mod tests {
             .await
             .expect("open file schema marker verification read");
         let projection_rows = scan_test_space(&projection_read, FILE_SPACE)
-            .await
-            .entries;
+            .await;
         assert_eq!(
             projection_rows.len(),
             1,
@@ -4624,7 +4623,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file-schema marker verification read");
-        let projections = scan_test_space(&read, FILE_SPACE).await.entries;
+        let projections = scan_test_space(&read, FILE_SPACE).await;
         assert_eq!(projections.len(), 1);
         assert!(
             projections.into_iter().all(|projection| {
@@ -4681,7 +4680,6 @@ mod tests {
             .expect("open corruption fixture read");
         let unrelated_key = scan_test_space(&read, ROW_SPACE)
             .await
-            .entries
             .into_iter()
             .find_map(|entry| {
                 let value = full_value_bytes(entry.value).ok()?;

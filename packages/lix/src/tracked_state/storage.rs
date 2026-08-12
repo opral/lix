@@ -3824,10 +3824,10 @@ pub(crate) async fn scan_commit_state_manifest_commit_ids(
         .await?;
     let mut commit_ids = Vec::new();
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in &page.entries {
+            .await?.into_parts();
+        for entry in &page {
             let bytes: [u8; 16] = entry.key.0.as_ref().try_into().map_err(|_| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -3836,7 +3836,7 @@ pub(crate) async fn scan_commit_state_manifest_commit_ids(
             })?;
             commit_ids.push(CommitId::new(uuid::Uuid::from_bytes(bytes)));
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -9835,10 +9835,10 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry_batch in page.entries.chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS) {
+            .await?.into_parts();
+        for entry_batch in page.chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS) {
             let commit_ids = entry_batch
                 .iter()
                 .map(|entry| commit_id_from_delta_key(&entry.key))
@@ -9925,7 +9925,7 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                 }
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -10003,14 +10003,14 @@ async fn validate_no_orphan_commit_delta_segments(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        if page.entries.is_empty() {
+            .await?.into_parts();
+        if page.is_empty() {
             break;
         }
         let mut commit_ids = Vec::new();
-        for entry in &page.entries {
+        for entry in &page {
             if entry.key.0.len() != 20 && entry.key.0.len() != 52 {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -10027,7 +10027,7 @@ async fn validate_no_orphan_commit_delta_segments(
             .into_iter()
             .zip(manifests)
             .collect::<BTreeMap<_, _>>();
-        for entry in &page.entries {
+        for entry in &page {
             let commit_id = commit_id_from_delta_key(&entry.key)?;
             let segment_index = usize::try_from(u32::from_be_bytes(
                 entry.key.0[16..20]
@@ -10065,7 +10065,7 @@ async fn validate_no_orphan_commit_delta_segments(
                 ));
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -10675,10 +10675,10 @@ pub(crate) async fn stage_sweep_unreachable_content_nodes(
             )
             .await?;
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 let node_id = <[u8; 32]>::try_from(entry.key.0.as_ref()).map_err(|_| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -10692,7 +10692,7 @@ pub(crate) async fn stage_sweep_unreachable_content_nodes(
                     writes.delete(space, entry.key);
                 }
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -10720,16 +10720,16 @@ async fn scan_full_space(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in &page.entries {
+            .await?.into_parts();
+        for entry in &page {
             let StorageProjectedValue::FullValue(bytes) = &entry.value else {
                 unreachable!("full commit-delta scan returned a key-only row");
             };
             rows.push((entry.key.clone(), bytes.clone()));
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }

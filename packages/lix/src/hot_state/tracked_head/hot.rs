@@ -615,10 +615,11 @@ pub(crate) async fn stage_certified_entity_batches(
                     StorageBeginScanOptions::default(),
                 )
                 .await?;
-            let manifests = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in manifests.entries {
+            // The prefix is only the 16-byte generation, so this range covers
+            // every file on the branch. Reading one page dropped every file
+            // past row 1024 out of the new generation permanently.
+            let manifests = cursor.collect_all().await?;
+            for entry in manifests {
                 let suffix = entry
                     .key
                     .0
@@ -685,10 +686,10 @@ pub(crate) async fn stage_certified_entity_batches(
                         StorageBeginScanOptions::default(),
                     )
                     .await?;
-                let prior_manifests = cursor
-                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                    .await?;
-                for entry in prior_manifests.entries {
+                // Every prior manifest for this file must be deleted, or a
+                // superseded batch survives its replacement.
+                let prior_manifests = cursor.collect_all().await?;
+                for entry in prior_manifests {
                     writes.delete(CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, entry.key);
                 }
             }
@@ -1066,12 +1067,7 @@ async fn scan_certified_entity_batch_rows(
                     StorageBeginScanOptions::default(),
                 )
                 .await?;
-            manifest_entries.extend(
-                cursor
-                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                    .await?
-                    .entries,
-            );
+            manifest_entries.extend(cursor.collect_all().await?);
         }
     } else {
         let range = StoragePrefix {
@@ -1085,10 +1081,10 @@ async fn scan_certified_entity_batch_rows(
                 StorageBeginScanOptions::default(),
             )
             .await?;
-        manifest_entries = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?
-            .entries;
+        // Prefixed by the generation alone, so this covers every file on the
+        // branch. One page silently hid every file past row 1024 from the
+        // merged scan result.
+        manifest_entries = cursor.collect_all().await?;
     }
     if exact_file_ids.is_none() && manifest_entries.is_empty() {
         if let Some(cache) = transaction_cache {
@@ -1216,11 +1212,10 @@ pub(crate) async fn scan_certified_history_rows(
             )
             .await?;
         loop {
-            let page = cursor
+            let (page, has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            let has_more = page.has_more;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 let value = full_value_bytes(entry.value)?;
                 if certified_batch_commit_id(&value)? != *commit_id {
                     continue;
@@ -3093,10 +3088,10 @@ async fn packed_exclusive_schema_base_refs(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
                 return Err(head_value_error(
@@ -3111,7 +3106,7 @@ async fn packed_exclusive_schema_base_refs(
                 index_key: entry.key.0,
             });
         }
-        if !page.has_more {
+        if !has_more {
             break;
         }
     }
@@ -3168,10 +3163,10 @@ async fn packed_current_base_refs(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
                 return Err(head_value_error(
@@ -3197,7 +3192,7 @@ async fn packed_current_base_refs(
                 coverage_key: entry.key.0,
             });
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -3239,13 +3234,13 @@ async fn stage_retire_packed_current_bases(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             writes.delete(PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, entry.key);
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -3509,10 +3504,11 @@ async fn scan_root_current_base_rows_for_merge(
                     StorageBeginScanOptions::default(),
                 )
                 .await?;
-            control_entries = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?
-                .entries;
+            // A replacement control anywhere in the generation decides whether
+            // the root scan may keep a pushed-down LIMIT. Missing one past row
+            // 1024 reads as "no replacement" and can select a retired row while
+            // a live row still exists further along.
+            control_entries = cursor.collect_all().await?;
         } else {
             for schema_key in &request.filter.schema_keys {
                 let mut prefix = hot_scope_prefix(branch_id, generation);
@@ -3528,12 +3524,7 @@ async fn scan_root_current_base_rows_for_merge(
                         StorageBeginScanOptions::default(),
                     )
                     .await?;
-                control_entries.extend(
-                    cursor
-                        .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                        .await?
-                        .entries,
-                );
+                control_entries.extend(cursor.collect_all().await?);
             }
         }
         control_entries
@@ -4736,10 +4727,10 @@ where
             .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 let raw_key = entry.key.0;
                 let raw_value = full_value_bytes(entry.value)?;
                 let identity = validate_exact_collection_member(
@@ -4759,7 +4750,7 @@ where
                         .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
                 }
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -4928,8 +4919,8 @@ where
             .await?;
         let mut candidates = Vec::new();
         loop {
-            let page = cursor.next_page(HOT_INDEX_CANDIDATE_PAGE).await?;
-            for entry in &page.entries {
+            let (page, page_has_more) = cursor.next_page(HOT_INDEX_CANDIDATE_PAGE).await?.into_parts();
+            for entry in &page {
                 let StorageProjectedValue::FullValue(value) = &entry.value else {
                     continue;
                 };
@@ -4940,7 +4931,7 @@ where
                     head_value_error(format!("hot index entry has an invalid entity pk: {error}"))
                 })?);
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -4970,8 +4961,8 @@ where
                 },
             )
             .await?;
-        let page = cursor.next_page(1).await?;
-        if !page.entries.is_empty() {
+        let (page, _page_has_more) = cursor.next_page(1).await?.into_parts();
+        if !page.is_empty() {
             return Ok(true);
         }
         if packed_current_base_has_schema(
@@ -6004,15 +5995,15 @@ where
                 .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
                 .await?;
             loop {
-                let page = cursor
+                let (page, page_has_more) = cursor
                     .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                    .await?;
-                for entry in page.entries {
+                    .await?.into_parts();
+                for entry in page {
                     let bytes = full_value_bytes(entry.value)?;
                     let value = decode_head_value(&bytes)?;
                     collect_hot_untracked_refs(value, &mut refs);
                 }
-                if !page.has_more {
+                if !page_has_more {
                     break;
                 }
             }
@@ -9883,10 +9874,10 @@ async fn hot_load_file_scope_identities(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let row = decode_hot_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
             if !row
                 .file_id
@@ -9903,7 +9894,7 @@ async fn hot_load_file_scope_identities(
                 file_id: row.file_id,
             });
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -10082,15 +10073,9 @@ async fn hot_file_backed_schema_keys(
             },
         )
         .await?;
-    loop {
-        let page = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+    while let Some(entries) = cursor.next_chunk().await? {
+        for entry in entries {
             schema_keys.push(decode_hot_file_schema_key_in_scope(entry.key.0, &scope)?);
-        }
-        if !page.has_more {
-            break;
         }
     }
     schema_keys.sort();
@@ -10163,10 +10148,10 @@ async fn hot_working_diff_entries(
         .begin_scan(DIFF_SPACE, range, StorageBeginScanOptions::default())
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let Ok(bytes) = full_value_bytes(entry.value) else {
                 return Ok(None);
             };
@@ -10220,7 +10205,7 @@ async fn hot_working_diff_entries(
                 return Ok(None);
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -10727,10 +10712,12 @@ async fn hot_scan_entries<'a>(
                 };
                 return Ok(Some(HotScanEntries::Decoded(rows)));
             }
-            let page = cursor
+            // Deliberately bounded: this reader stops at the caller's LIMIT.
+            let (page, page_has_more) = cursor
                 .next_page(remaining.unwrap_or(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
-                .await?;
-            for entry in page.entries {
+                .await?
+                .into_parts();
+            for entry in page {
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
@@ -10755,7 +10742,7 @@ async fn hot_scan_entries<'a>(
                     }
                 }
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -10919,11 +10906,14 @@ async fn hot_scan_dense_encoded_key_range<'a>(
         if remaining_budget == 0 {
             return Ok(None);
         }
-        let page = cursor
+        // Deliberately bounded: this reader gives up once it has burned its
+        // scan budget rather than reading an unbounded range.
+        let (page, page_has_more) = cursor
             .next_page(remaining_budget.min(crate::storage_adapter::MAX_SCAN_PAGE_ROWS))
-            .await?;
-        scanned += page.entries.len();
-        for entry in page.entries {
+            .await?
+            .into_parts();
+        scanned += page.len();
+        for entry in page {
             while requested_index < key_count && key_at(requested_index) < entry.key.0.as_ref() {
                 requested_index += 1;
             }
@@ -10932,7 +10922,7 @@ async fn hot_scan_dense_encoded_key_range<'a>(
                 requested_index += 1;
             }
         }
-        if requested_index == key_count || !page.has_more {
+        if requested_index == key_count || !page_has_more {
             return Ok(Some(values));
         }
     }
@@ -11004,16 +10994,16 @@ async fn scan_hot_file_entries(
             .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
                     rows.push((identity, full_value_bytes(entry.value)?));
                 }
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -11967,17 +11957,17 @@ where
             )
             .await?;
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 if declared.contains(entry.key.0.as_ref()) {
                     continue;
                 }
                 writes.delete(*space, entry.key);
                 deleted = deleted.saturating_add(1);
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }
@@ -12002,10 +11992,10 @@ where
         .begin_scan(DIFF_SPACE, range, StorageBeginScanOptions::default())
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let keep = match full_value_bytes(entry.value) {
                 Ok(bytes) if bytes.is_empty() => decode_hot_diff_key(entry.key.0.as_ref())
                     .is_ok_and(|(checkpoint_commit_id, identity)| {
@@ -12038,7 +12028,7 @@ where
                 writes.delete(DIFF_SPACE, entry.key);
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -12078,14 +12068,14 @@ where
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
+            .await?.into_parts();
         writes.delete_batch(
             DIFF_SPACE,
-            page.entries.into_iter().map(|entry| entry.key),
+            page.into_iter().map(|entry| entry.key),
         );
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -14248,6 +14238,235 @@ mod tests {
         );
     }
 
+    const PAGING_SCHEMA_KEY: &str = "paged_certified_row";
+    const PAGING_FILE_COUNT: usize = crate::storage_adapter::MAX_SCAN_PAGE_ROWS + 3;
+
+    fn paging_certified_batch(index: usize) -> WasmCertifiedEntityBatch {
+        let mut page = Vec::new();
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u64.to_le_bytes());
+        page.push(0);
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u16.to_le_bytes());
+        page.extend_from_slice(&5_u32.to_le_bytes());
+        page.extend_from_slice(b"value");
+        let page = crate::plugin_wire::encode_single_section(
+            crate::plugin_wire::Representation::SchemaRows,
+            crate::plugin_wire::Operation::Create,
+            PAGING_SCHEMA_KEY,
+            br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
+            1,
+            page,
+        )
+        .expect("paged certified schema-row page");
+        WasmCertifiedEntityBatch {
+            format: 1,
+            schema_keys: vec![PAGING_SCHEMA_KEY.to_owned()],
+            row_count: 1,
+            creates: WasmCreateContext {
+                high: 0x0192_0000_0000_7000,
+                low: 0x8000_0000 + index as u32,
+            },
+            create_ranges: Vec::new(),
+            complete_file_state: true,
+            pages: vec![Bytes::from(page)],
+        }
+    }
+
+    /// Publishes `PAGING_FILE_COUNT` single-row certified files on one branch
+    /// generation, so every certified manifest scan for that generation has to
+    /// cross the storage scan page boundary.
+    async fn seed_paged_certified_generation(
+        branch_id: &str,
+        generation_label: &str,
+    ) -> (StorageAdapter, BranchHeadControl) {
+        let storage = StorageAdapter::new(Memory::new());
+        let head_commit_id = CommitId::for_test_label("paged-certified-head");
+        let created_at = timestamp();
+        let control = BranchHeadControl {
+            head_commit_id,
+            tracked_generation: CommitId::for_test_label(generation_label),
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at,
+            updated_at: created_at,
+            ref_change_id: ChangeId::for_test_label("paged-certified-ref"),
+        };
+
+        let file_ids = (0..PAGING_FILE_COUNT)
+            .map(|index| format!("paged-{index:05}.csv"))
+            .collect::<Vec<_>>();
+        let batches = (0..PAGING_FILE_COUNT)
+            .map(|index| [paging_certified_batch(index)])
+            .collect::<Vec<_>>();
+        let files = file_ids
+            .iter()
+            .zip(batches.iter())
+            .map(|(file_id, batches)| CertifiedEntityBatchFileRef {
+                branch_id,
+                file_id,
+                batches,
+            })
+            .collect::<Vec<_>>();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged certified seed read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, branch_id, control)
+            .expect("paged certified control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &files,
+            &BTreeMap::from([(branch_id.to_owned(), control)]),
+            &BTreeMap::from([(
+                branch_id.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: Some(control),
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::from([(head_commit_id, created_at)]),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("paged certified batches should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("paged certified batches should commit");
+        (storage, control)
+    }
+
+    async fn count_certified_manifests(
+        read: &impl StorageAdapterRead,
+        generation: CommitId,
+    ) -> usize {
+        let range = StoragePrefix {
+            bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
+        }
+        .to_range()
+        .expect("manifest prefix range");
+        let mut cursor = read
+            .begin_scan(
+                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                range,
+                StorageBeginScanOptions::default(),
+            )
+            .await
+            .expect("manifest scan should open");
+        let mut total = 0;
+        loop {
+            let (page, has_more) = cursor
+                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .await
+                .expect("manifest page should read")
+                .into_parts();
+            total += page.len();
+            if !has_more {
+                return total;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn certified_scan_returns_every_file_past_one_scan_page() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000001a0";
+        let (storage, control) =
+            seed_paged_certified_generation(BRANCH_ID, "paged-certified-generation").await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged certified verification read should open");
+        assert_eq!(
+            count_certified_manifests(&read, control.tracked_generation).await,
+            PAGING_FILE_COUNT,
+            "every published file must have a durable certified manifest"
+        );
+
+        let rows = scan_certified_entity_batch_rows(
+            &read,
+            BRANCH_ID,
+            control.tracked_generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![PAGING_SCHEMA_KEY.to_owned()],
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("paged certified rows should scan");
+
+        assert_eq!(
+            rows.len(),
+            PAGING_FILE_COUNT,
+            "an unfiltered certified scan must not stop at the first storage scan page"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_creation_inherits_every_certified_manifest_past_one_scan_page() {
+        const DONOR_BRANCH: &str = "01920000-0000-7000-8000-0000000001a1";
+        const CREATED_BRANCH: &str = "01920000-0000-7000-8000-0000000001a2";
+        let (storage, donor_control) =
+            seed_paged_certified_generation(DONOR_BRANCH, "paged-inherit-donor").await;
+        let created_control = BranchHeadControl {
+            tracked_generation: CommitId::for_test_label("paged-inherit-created"),
+            ref_change_id: ChangeId::for_test_label("paged-inherit-created-ref"),
+            ..donor_control
+        };
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged inherit read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &[],
+            &BTreeMap::from([(CREATED_BRANCH.to_owned(), created_control)]),
+            &BTreeMap::from([(
+                CREATED_BRANCH.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: None,
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("created branch should inherit certified manifests");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("inherited certified manifests should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("paged inherit verification read should open");
+        assert_eq!(
+            count_certified_manifests(&read, created_control.tracked_generation).await,
+            PAGING_FILE_COUNT,
+            "branch creation must inherit every certified manifest, not one scan page of them"
+        );
+    }
+
     fn diff_identity(branch_id: &str, generation: CommitId, entity: &str) -> HeadIdentity {
         HeadIdentity {
             branch_id: branch_id.to_string(),
@@ -14869,15 +15088,15 @@ mod tests {
             .begin_scan(DIFF_SPACE, range, StorageBeginScanOptions::default())
             .await
             .expect("begin segmented hot diff scan");
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan segmented hot diff");
-        assert!(!page.has_more);
+            .expect("scan segmented hot diff").into_parts();
+        assert!(!page_has_more);
 
         let mut actual_coverage = WorkingDiffIndexCoverage::default();
         let mut decoded = 0_usize;
-        for entry in page.entries {
+        for entry in page {
             let bytes = full_value_bytes(entry.value).expect("full segment value");
             let segment_scope =
                 decode_hot_diff_segment_key(entry.key.0.as_ref()).expect("segment key");

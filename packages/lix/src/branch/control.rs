@@ -259,10 +259,10 @@ where
             )
             .await?;
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?;
-            for entry in page.entries {
+                .await?.into_parts();
+            for entry in page {
                 let key = storage_codec::decode::<BranchHeadControlKey>(
                     "branch-head control key",
                     entry.key.0.as_ref(),
@@ -270,7 +270,7 @@ where
                 let control = decode_projected_value(&key.branch_id, entry.value)?;
                 rows.push((key.branch_id, control));
             }
-            if !page.has_more {
+            if !page_has_more {
                 break;
             }
         }

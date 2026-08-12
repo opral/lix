@@ -300,19 +300,18 @@ async fn slatedb_streams_unbounded_scan_limits() {
         )
         .await
         .expect("begin scan slatedb rows");
-    let result = cursor
+    let (result, result_has_more) = cursor
         .next_page(usize::MAX)
         .await
-        .expect("scan slatedb rows");
+        .expect("scan slatedb rows").into_parts();
 
-    assert_eq!(result.entries.len(), 10);
+    assert_eq!(result.len(), 10);
     assert!(
         result
-            .entries
             .iter()
             .all(|entry| entry.value == ProjectedValue::KeyOnly)
     );
-    assert!(!result.has_more);
+    assert!(!result_has_more);
 }
 
 #[tokio::test]
@@ -524,14 +523,13 @@ async fn assert_cached_rows(
         )
         .await
         .expect("begin cached scan");
-    let result = cursor
+    let (result, _result_has_more) = cursor
         .next_page(usize::MAX)
         .await
-        .expect("scan cached rows");
+        .expect("scan cached rows").into_parts();
 
-    assert_eq!(result.entries.len(), 3);
+    assert_eq!(result.len(), 3);
     let rows = result
-        .entries
         .into_iter()
         .map(|entry| {
             let ProjectedValue::FullValue(value) = entry.value else {

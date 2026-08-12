@@ -92,10 +92,7 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>>
         {
             Box::pin(async {
-                Ok(ScanChunk {
-                    entries: Vec::new(),
-                    has_more: false,
-                })
+                Ok(ScanChunk::new(Vec::new(), false))
             })
         }
     }
@@ -305,7 +302,7 @@ mod tests {
                 .begin_scan(space(), range, BeginScanOptions::default())
                 .await
                 .expect("begin prefix scan");
-            cursor.next_page(1).await.expect("prefix scan");
+            let _ = cursor.next_page(1).await.expect("prefix scan");
         }
 
         assert_eq!(
@@ -348,10 +345,10 @@ mod tests {
             )
             .await
             .expect("begin zero-limit prefix scan");
-        let result = cursor.next_page(0).await.expect("zero-limit prefix scan");
+        let (result, result_has_more) = cursor.next_page(0).await.expect("zero-limit prefix scan").into_parts();
 
-        assert!(result.entries.is_empty());
-        assert!(!result.has_more);
+        assert!(result.is_empty());
+        assert!(!result_has_more);
         assert_eq!(scan_calls.load(Ordering::Relaxed), 1);
     }
 
@@ -381,16 +378,16 @@ mod tests {
             )
             .await
             .expect("begin cursor");
-        let page = cursor.next_page(1).await.expect("first page");
-        assert_eq!(page.entries[0].key, key("a"));
-        assert!(page.has_more);
+        let (page, page_has_more) = cursor.next_page(1).await.expect("first page").into_parts();
+        assert_eq!(page[0].key, key("a"));
+        assert!(page_has_more);
 
-        let next = cursor
+        let (next, _next_has_more) = cursor
             .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("second page");
+            .expect("second page").into_parts();
         assert_eq!(
-            next.entries
+            next
                 .into_iter()
                 .map(|entry| entry.key)
                 .collect::<Vec<_>>(),

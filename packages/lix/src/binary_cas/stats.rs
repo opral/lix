@@ -102,12 +102,12 @@ where
         .await?;
 
     loop {
-        let result = cursor.next_page(4096).await?;
-        row_count += result.entries.len() as u64;
-        for entry in result.entries {
+        let (result, result_has_more) = cursor.next_page(4096).await?.into_parts();
+        row_count += result.len() as u64;
+        for entry in result {
             visit(entry.value)?;
         }
-        if !result.has_more {
+        if !result_has_more {
             break;
         }
     }

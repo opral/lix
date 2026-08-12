@@ -797,20 +797,19 @@ async fn space_stats<S: Storage>(storage: &S, space_id: lix::storage::SpaceId) -
         .await
         .expect("begin CAS stats scan");
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan CAS stats");
-        stats.rows += page.entries.len() as u64;
+            .expect("scan CAS stats").into_parts();
+        stats.rows += page.len() as u64;
         stats.value_bytes += page
-            .entries
             .iter()
             .map(|entry| match &entry.value {
                 lix::storage::ProjectedValue::FullValue(bytes) => bytes.len() as u64,
                 lix::storage::ProjectedValue::KeyOnly => 0,
             })
             .sum::<u64>();
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }

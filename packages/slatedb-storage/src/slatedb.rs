@@ -3070,7 +3070,7 @@ impl StorageScanSource for SlateDBScanSource {
             let space_id = self.space.id;
             #[cfg(test)]
             let worker_gate = self.worker_gate.clone();
-            let (state, mut chunk) = self
+            let (state, chunk) = self
                 .worker
                 .call_read(move |_db| async move {
                     #[cfg(test)]
@@ -3089,14 +3089,15 @@ impl StorageScanSource for SlateDBScanSource {
                 gate.entered_notify.notify_waiters();
                 gate.release.notified().await;
             }
+            let (mut entries, has_more) = chunk.into_parts();
             hydrate_immutable_value_scan(
                 &self.immutable_value_store,
                 self.space,
                 self.projection,
-                &mut chunk,
+                &mut entries,
             )
             .await?;
-            Ok(chunk)
+            Ok(ScanChunk::new(entries, has_more))
         })
     }
 }
@@ -3284,7 +3285,7 @@ async fn streaming_scan_page(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((state, ScanChunk { entries, has_more }))
+    Ok((state, ScanChunk::new(entries, has_more)))
 }
 
 async fn next_streaming_visible_row(
@@ -3364,7 +3365,7 @@ async fn hydrate_immutable_value_scan(
     immutable_value_store: &ImmutableValueStore,
     space: StorageSpace,
     projection: CoreProjection,
-    chunk: &mut ScanChunk,
+    entries: &mut [ReadEntry],
 ) -> Result<(), StorageError> {
     if space.value_semantics != ValueSemantics::Immutable || projection != CoreProjection::FullValue
     {
@@ -3372,8 +3373,7 @@ async fn hydrate_immutable_value_scan(
     }
     let values = immutable_value_store
         .get_many(
-            chunk
-                .entries
+            entries
                 .iter()
                 .map(|entry| match &entry.value {
                     ProjectedValue::FullValue(marker) => Ok(marker.clone()),
@@ -3384,7 +3384,7 @@ async fn hydrate_immutable_value_scan(
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .await?;
-    for (entry, value) in chunk.entries.iter_mut().zip(values) {
+    for (entry, value) in entries.iter_mut().zip(values) {
         entry.value = ProjectedValue::FullValue(value);
     }
     Ok(())
@@ -5788,10 +5788,12 @@ mod tests {
             },
         ))
         .expect("begin immutable chunk scan");
-        let scan = block_on(cursor.next_page(16)).expect("scan immutable chunk");
-        assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.entries[0].key, key);
-        assert_eq!(scan.entries[0].value, ProjectedValue::FullValue(value));
+        let (scan, _scan_has_more) = block_on(cursor.next_page(16))
+            .expect("scan immutable chunk")
+            .into_parts();
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].key, key);
+        assert_eq!(scan[0].value, ProjectedValue::FullValue(value));
 
         let matching = block_on(storage.begin_write(WriteOptions {
             preconditions: vec![Precondition::KeyValueHashEquals {
@@ -5915,13 +5917,12 @@ mod tests {
             )
             .await
             .expect("begin fresh worker-cancellation cursor");
-        let restarted = restart
+        let (restarted, _restarted_has_more) = restart
             .next_page(2)
             .await
-            .expect("drain fresh worker-cancellation cursor");
+            .expect("drain fresh worker-cancellation cursor").into_parts();
         assert_eq!(
             restarted
-                .entries
                 .iter()
                 .map(|entry| entry.key.0.as_ref())
                 .collect::<Vec<_>>(),
@@ -6008,14 +6009,14 @@ mod tests {
             )
             .await
             .expect("begin explicit exclusive restart");
-        let restarted = restart
+        let (restarted, _restarted_has_more) = restart
             .next_page(1)
             .await
-            .expect("read explicit exclusive restart page");
-        assert_eq!(restarted.entries.len(), 1);
-        assert_eq!(restarted.entries[0].key, second_key);
+            .expect("read explicit exclusive restart page").into_parts();
+        assert_eq!(restarted.len(), 1);
+        assert_eq!(restarted[0].key, second_key);
         assert_eq!(
-            restarted.entries[0].value,
+            restarted[0].value,
             ProjectedValue::FullValue(Bytes::from_static(b"second-value"))
         );
     }
@@ -6552,12 +6553,16 @@ mod tests {
             },
         ))
         .expect("begin cursor-test scan");
-        let first = block_on(cursor.next_page(1)).expect("scan first cursor-test page");
-        assert_eq!(first.entries[0].key, keys[0]);
-        assert!(first.has_more);
-        let second = block_on(cursor.next_page(1)).expect("scan second cursor-test page");
-        assert_eq!(second.entries[0].key, keys[1]);
-        assert!(second.has_more);
+        let (first, first_has_more) = block_on(cursor.next_page(1))
+            .expect("scan first cursor-test page")
+            .into_parts();
+        assert_eq!(first[0].key, keys[0]);
+        assert!(first_has_more);
+        let (second, second_has_more) = block_on(cursor.next_page(1))
+            .expect("scan second cursor-test page")
+            .into_parts();
+        assert_eq!(second[0].key, keys[1]);
+        assert!(second_has_more);
 
         // A changed projection requires a new cursor with an explicit exclusive
         // authenticated restart boundary.
@@ -6573,10 +6578,12 @@ mod tests {
             },
         ))
         .expect("begin projected restart scan");
-        let third = block_on(key_cursor.next_page(1)).expect("scan projected restart page");
-        assert_eq!(third.entries[0].key, keys[2]);
-        assert_eq!(third.entries[0].value, ProjectedValue::KeyOnly);
-        assert!(!third.has_more);
+        let (third, third_has_more) = block_on(key_cursor.next_page(1))
+            .expect("scan projected restart page")
+            .into_parts();
+        assert_eq!(third[0].key, keys[2]);
+        assert_eq!(third[0].value, ProjectedValue::KeyOnly);
+        assert!(!third_has_more);
 
         let mut restarted_cursor = block_on(read.begin_scan(
             space,
@@ -6587,11 +6594,15 @@ mod tests {
             },
         ))
         .expect("begin restarted cursor-test scan");
-        let restarted = block_on(restarted_cursor.next_page(1)).expect("scan restarted first page");
-        assert_eq!(restarted.entries[0].key, keys[0]);
-        let restarted_second =
-            block_on(restarted_cursor.next_page(1)).expect("scan restarted second page");
-        assert_eq!(restarted_second.entries[0].key, keys[1]);
+        let (restarted, _restarted_has_more) = block_on(restarted_cursor.next_page(1))
+            .expect("scan restarted first page")
+            .into_parts();
+        assert_eq!(restarted[0].key, keys[0]);
+        let (restarted_second, __restarted_second_has_more) =
+            block_on(restarted_cursor.next_page(1))
+                .expect("scan restarted second page")
+                .into_parts();
+        assert_eq!(restarted_second[0].key, keys[1]);
     }
 
     #[test]
@@ -6759,7 +6770,8 @@ mod tests {
         assert_eq!(
             block_on(cursor.next_page(usize::MAX))
                 .expect("scan pending point")
-                .entries,
+                .into_parts()
+                .0,
             vec![ReadEntry {
                 key: key.clone(),
                 value: ProjectedValue::FullValue(value.clone()),
@@ -7194,7 +7206,8 @@ mod tests {
         assert_eq!(
             block_on(cursor.next_page(usize::MAX))
                 .expect("read publication through older scan view")
-                .entries,
+                .into_parts()
+                .0,
             vec![ReadEntry {
                 key,
                 value: ProjectedValue::FullValue(value),

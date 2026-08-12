@@ -3218,12 +3218,11 @@ where
         .await
         .expect("begin storage bench layout scan");
     loop {
-        let result = cursor
+        let (result, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan complete storage bench layout space");
-        let has_more = result.has_more;
-        for entry in result.entries {
+            .expect("scan complete storage bench layout space").into_parts();
+        for entry in result {
             accounting.rows = accounting
                 .rows
                 .checked_add(1)
@@ -3271,12 +3270,11 @@ where
         .await
         .expect("begin storage bench layout scan");
     loop {
-        let result = cursor
+        let (result, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan complete storage bench layout space");
-        let has_more = result.has_more;
-        entries.extend(result.entries);
+            .expect("scan complete storage bench layout space").into_parts();
+        entries.extend(result);
         if !has_more {
             return entries;
         }

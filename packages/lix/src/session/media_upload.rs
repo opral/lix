@@ -55,8 +55,8 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
         )
         .await?;
     loop {
-        let page = state_cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        for entry in page.entries {
+        let (page, page_has_more) = state_cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
+        for entry in page {
             let upload_id = std::str::from_utf8(&entry.key.0)
                 .map_err(|_| invalid_upload_storage("upload state key is not UTF-8"))?
                 .to_owned();
@@ -70,7 +70,7 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
                 .map_err(|_| invalid_upload_storage("upload state value is invalid JSON"))?;
             states.push((upload_id, state));
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -104,8 +104,8 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
         )
         .await?;
     loop {
-        let page = leaf_cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        for entry in page.entries {
+        let (page, page_has_more) = leaf_cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
+        for entry in page {
             let upload_id = decode_upload_manifest_leaf_upload_id(&entry.key)?;
             if !open_ids.contains(&upload_id) {
                 // Finalized or state-less receipts are not active roots; the
@@ -138,7 +138,7 @@ pub(crate) async fn stage_reclaimable_upload_receipts(
                 }
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -745,8 +745,8 @@ async fn load_upload_progress(
         )
         .await?;
     'pages: loop {
-        let page = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        for entry in &page.entries {
+        let (page, page_has_more) = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
+        for entry in &page {
             let part_number = decode_upload_manifest_leaf_part_number(upload_id, &entry.key)?;
             if part_number != expected_part {
                 break 'pages;
@@ -755,7 +755,7 @@ async fn load_upload_progress(
                 .checked_add(1)
                 .ok_or_else(|| invalid_upload("upload part count exceeds u32"))?;
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -790,8 +790,8 @@ async fn load_upload_manifest_leaves(
         )
         .await?;
     loop {
-        let page = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        for entry in &page.entries {
+        let (page, page_has_more) = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
+        for entry in &page {
             let part_number = decode_upload_manifest_leaf_part_number(upload_id, &entry.key)?;
             if part_number != next_part {
                 return Err(LixError::new(
@@ -819,7 +819,7 @@ async fn load_upload_manifest_leaves(
                 .checked_add(1)
                 .ok_or_else(|| invalid_upload("upload part count exceeds u32"))?;
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -1070,11 +1070,11 @@ mod tests {
             )
             .await
             .expect("chunk verification scan should succeed");
-        let page = cursor
+        let (page, _page_has_more) = cursor
             .next_page(1)
             .await
-            .expect("chunk verification page should succeed");
-        !page.entries.is_empty()
+            .expect("chunk verification page should succeed").into_parts();
+        !page.is_empty()
     }
 
     #[tokio::test]
@@ -1470,12 +1470,12 @@ mod tests {
             )
             .await
             .expect("begin temporary upload receipt scan");
-        let temporary_receipts = cursor
+        let (temporary_receipts, _temporary_receipts_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan temporary upload receipts");
+            .expect("scan temporary upload receipts").into_parts();
         assert!(
-            temporary_receipts.entries.is_empty(),
+            temporary_receipts.is_empty(),
             "publication must atomically remove temporary chunk receipts",
         );
         drop(cursor);
@@ -1563,13 +1563,13 @@ mod tests {
             )
             .await
             .expect("begin CAS chunk scan");
-        let chunks = cursor
+        let (chunks, chunks_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan CAS chunks");
-        assert!(!chunks.has_more);
+            .expect("scan CAS chunks").into_parts();
+        assert!(!chunks_has_more);
         assert_eq!(
-            chunks.entries.len(),
+            chunks.len(),
             2,
             "identical media must reuse payloads"
         );
@@ -1629,12 +1629,12 @@ mod tests {
             )
             .await
             .expect("begin upload leaf scan");
-        let leaves = cursor
+        let (leaves, _leaves_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan upload leaves");
-        assert_eq!(leaves.entries.len(), 3);
-        for entry in leaves.entries {
+            .expect("scan upload leaves").into_parts();
+        assert_eq!(leaves.len(), 3);
+        for entry in leaves {
             let StorageProjectedValue::FullValue(value) = entry.value else {
                 panic!("manifest leaf scan must return values");
             };

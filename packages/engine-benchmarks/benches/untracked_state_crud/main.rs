@@ -364,21 +364,19 @@ impl StorageScanSource for CountingScanSource<'_> {
         limit_rows: usize,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
         Box::pin(async move {
-            let chunk = self.inner.next_page(limit_rows).await?;
+            let (chunk, chunk_has_more) = self.inner.next_page(limit_rows).await?.into_parts();
             let mut stats = self.stats.lock().expect("io stats mutex");
-            stats.scan_entries += chunk.entries.len();
+            stats.scan_entries += chunk.len();
             stats.scan_entry_key_bytes += chunk
-                .entries
                 .iter()
                 .map(|entry| entry.key.0.len())
                 .sum::<usize>();
             stats.scan_entry_value_bytes += chunk
-                .entries
                 .iter()
                 .map(|entry| projected_value_len(&entry.value))
                 .sum::<usize>();
             drop(stats);
-            Ok(chunk)
+            Ok(ScanChunk::new(chunk, chunk_has_more))
         })
     }
 }
@@ -1001,11 +999,11 @@ where
         )
         .await
         .expect("begin row scan");
-    let page = cursor
+    let (page, _page_has_more) = cursor
         .next_page(expected_rows + 1)
         .await
-        .expect("scan rows");
-    assert_eq!(page.entries.len(), expected_rows);
+        .expect("scan rows").into_parts();
+    assert_eq!(page.len(), expected_rows);
     expected_rows
 }
 

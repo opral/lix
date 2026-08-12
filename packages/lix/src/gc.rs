@@ -440,10 +440,10 @@ pub(crate) async fn load_recovery_refs(
         )
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let StorageProjectedValue::FullValue(bytes) = entry.value else {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -481,7 +481,7 @@ pub(crate) async fn load_recovery_refs(
                 },
             );
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -5467,12 +5467,12 @@ mod tests {
         .await
         .expect("generation census scan should open");
         loop {
-            let page = cursor
+            let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await
-                .expect("generation census page should load");
-            rows += page.entries.len();
-            if !page.has_more {
+                .expect("generation census page should load").into_parts();
+            rows += page.len();
+            if !page_has_more {
                 break;
             }
         }

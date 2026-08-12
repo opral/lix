@@ -480,7 +480,7 @@ async fn repository_has_changelog_commit(
             },
         )
         .await?;
-    Ok(!cursor.next_page(1).await?.entries.is_empty())
+    Ok(!cursor.next_page(1).await?.is_empty())
 }
 
 fn not_initialized_error() -> LixError {
@@ -504,7 +504,7 @@ mod tests {
     async fn scan_test_space(
         read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
         space: StorageSpace,
-    ) -> crate::storage_adapter::StorageScanChunk {
+    ) -> Vec<crate::storage_adapter::StorageReadEntry> {
         let range = StoragePrefix {
             bytes: Bytes::new(),
         }
@@ -515,7 +515,7 @@ mod tests {
             .await
             .expect("begin test scan");
         cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .collect_all()
             .await
             .expect("read test scan page")
     }
@@ -2152,7 +2152,7 @@ mod tests {
         let before_packed =
             scan_test_space(&read, crate::hot_state::PACKED_CURRENT_BASE_SPACE).await;
         assert!(
-            !before_sparse.entries.is_empty() || !before_packed.entries.is_empty(),
+            !before_sparse.is_empty() || !before_packed.is_empty(),
             "tracked mutation must persist a sparse or packed physical dirty epoch"
         );
         drop(read);
@@ -2168,7 +2168,7 @@ mod tests {
             .expect("post-checkpoint inventory read should open");
         let after = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
-            after.entries.len(),
+            after.len(),
             1,
             "the superseded branch epoch must be reclaimed; only the repository-global checkpoint entity may remain dirty"
         );
@@ -2183,7 +2183,7 @@ mod tests {
             .expect("second checkpoint inventory read should open");
         let after_second = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
-            after_second.entries.len(),
+            after_second.len(),
             2,
             "the second immutable checkpoint entity remains while the superseded branch epoch is reclaimed"
         );
@@ -2283,8 +2283,7 @@ mod tests {
             .await
             .expect("read initialized hot rows");
         let hot_rows = scan_test_space(&read, crate::hot_state::ROW_SPACE)
-            .await
-            .entries;
+            .await;
         assert!(
             !hot_rows.is_empty(),
             "initialized repository must have hot rows"
@@ -2484,8 +2483,7 @@ mod tests {
             .await
             .expect("read the index plane");
         let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE)
-            .await
-            .entries;
+            .await;
         let witnesses = entries
             .iter()
             .filter(|entry| match &entry.value {

@@ -8714,13 +8714,12 @@ mod tests {
             )
             .await
             .expect("chunk inventory scan should begin");
-        let chunk = cursor
+        let (chunk, chunk_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("chunk inventory should scan");
-        assert!(!chunk.has_more, "test chunk inventory must fit one page");
+            .expect("chunk inventory should scan").into_parts();
+        assert!(!chunk_has_more, "test chunk inventory must fit one page");
         chunk
-            .entries
             .into_iter()
             .map(|entry| {
                 entry

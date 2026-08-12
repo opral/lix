@@ -116,10 +116,10 @@ impl StorageScanSource for CountingScanSource<'_> {
         limit_rows: usize,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
         Box::pin(async move {
-            let chunk = self.inner.next_page(limit_rows).await?;
+            let (chunk, chunk_has_more) = self.inner.next_page(limit_rows).await?.into_parts();
             self.scanned_rows
-                .fetch_add(chunk.entries.len() as u64, Ordering::Relaxed);
-            Ok(chunk)
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            Ok(ScanChunk::new(chunk, chunk_has_more))
         })
     }
 }

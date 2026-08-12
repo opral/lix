@@ -1499,10 +1499,11 @@ where
                         1_001,
                     ))
                     .expect("direct materialized scan");
-                    assert_eq!(chunk.entries.len(), 1_000);
-                    assert!(!chunk.has_more);
+                    let (chunk_entries, chunk_has_more) = chunk.into_parts();
+                    assert_eq!(chunk_entries.len(), 1_000);
+                    assert!(!chunk_has_more);
                     drop(read);
-                    black_box(chunk);
+                    black_box(chunk_entries);
                 });
             });
         }
@@ -1530,10 +1531,11 @@ where
                         rows as usize + 1,
                     ))
                     .expect("direct full-value scan");
-                    assert_eq!(chunk.entries.len(), rows as usize);
-                    assert!(!chunk.has_more);
+                    let (chunk_entries, chunk_has_more) = chunk.into_parts();
+                    assert_eq!(chunk_entries.len(), rows as usize);
+                    assert!(!chunk_has_more);
                     drop(read);
-                    black_box(chunk);
+                    black_box(chunk_entries);
                 });
             });
         }
@@ -1554,10 +1556,11 @@ where
                     let chunk =
                         block_on(materialize_complete_storage_scan(&read, scan_range.clone()))
                             .expect("direct small-value full scan");
-                    assert_eq!(chunk.entries.len(), rows as usize);
-                    assert!(!chunk.has_more);
+                    let (chunk_entries, chunk_has_more) = chunk.into_parts();
+                    assert_eq!(chunk_entries.len(), rows as usize);
+                    assert!(!chunk_has_more);
                     drop(read);
-                    black_box(chunk);
+                    black_box(chunk_entries);
                 });
             });
         }
@@ -1810,16 +1813,16 @@ where
         .map_err(|error| error.to_string())?;
 
     loop {
-        let result = cursor
+        let (result, result_has_more) = cursor
             .next_page(chunk_size)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?.into_parts();
 
-        scanned += result.entries.len();
-        chunks += usize::from(!result.entries.is_empty() || result.has_more);
-        keys.extend(result.entries.into_iter().map(|entry| entry.key));
+        scanned += result.len();
+        chunks += usize::from(!result.is_empty() || result_has_more);
+        keys.extend(result.into_iter().map(|entry| entry.key));
 
-        if !result.has_more {
+        if !result_has_more {
             break;
         }
     }
@@ -1882,15 +1885,15 @@ where
     }
 
     loop {
-        let chunk = cursor.next_page(chunk_size).await?;
+        let (chunk, chunk_has_more) = cursor.next_page(chunk_size).await?.into_parts();
 
-        let entries = &chunk.entries;
+        let entries = &chunk;
         stats.scanned += entries.len();
         stats.storage_calls += 1;
-        stats.chunks += usize::from(!entries.is_empty() || chunk.has_more);
+        stats.chunks += usize::from(!entries.is_empty() || chunk_has_more);
         stats.read_stats.storage_calls += 1;
         stats.read_stats.scan_rows += entries.len() as u64;
-        stats.read_stats.scan_has_more += u64::from(chunk.has_more);
+        stats.read_stats.scan_has_more += u64::from(chunk_has_more);
         stats.read_stats.scan_limit_rows_total += effective_chunk as u64;
         stats.read_stats.scan_limit_rows_max = stats
             .read_stats
@@ -1903,7 +1906,7 @@ where
             stats.read_stats.range_scan_chunks += 1;
         }
 
-        if !chunk.has_more {
+        if !chunk_has_more {
             break;
         }
     }
@@ -2008,15 +2011,11 @@ where
         .await?;
 
     loop {
-        let chunk = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?;
-        let has_more = chunk.has_more;
-        entries.extend(chunk.entries);
+        let (page, has_more) = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
+        entries.extend(page);
 
         if !has_more {
-            return Ok(ScanChunk {
-                entries,
-                has_more: false,
-            });
+            return Ok(ScanChunk::new(entries, false));
         }
     }
 }

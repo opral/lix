@@ -2,7 +2,7 @@ use std::future::Future;
 use std::ops::Bound;
 use std::pin::Pin;
 
-use crate::storage::{Key, KeyRange, ScanChunk, ScanOrder, StorageError};
+use crate::storage::{Key, KeyRange, ReadEntry, ScanChunk, ScanOrder, StorageError};
 
 /// Ephemeral iterator state owned by a coherent storage read view.
 ///
@@ -60,6 +60,17 @@ impl<'a> ScanCursor<'a> {
 
     /// Advances the live native iterator by at most `limit_rows` entries.
     ///
+    /// **This is the deliberately bounded read.** It stops at the page boundary
+    /// even when the range holds more rows, and the returned [`ScanChunk`] only
+    /// yields its entries through
+    /// [`into_parts`](ScanChunk::into_parts) so that the `has_more` flag is
+    /// bound at the call site. Reach for it only when a bound is the intent —
+    /// an existence probe, a `LIMIT` pushed down from SQL, or a byte budget.
+    ///
+    /// **To read every row in the range, use [`Self::collect_all`] or
+    /// [`Self::next_chunk`] instead.** Those cannot truncate, and they are
+    /// shorter to write than a hand-rolled page loop.
+    ///
     /// The requested limit is capped by [`crate::storage::MAX_SCAN_PAGE_ROWS`].
     /// A zero limit ends the cursor without touching the backend.
     ///
@@ -74,29 +85,65 @@ impl<'a> ScanCursor<'a> {
         }
         if self.finished || limit_rows == 0 {
             self.finished = true;
-            return Ok(ScanChunk {
-                entries: Vec::new(),
-                has_more: false,
-            });
+            return Ok(ScanChunk::new(Vec::new(), false));
         }
         let page_size = limit_rows.min(crate::storage::MAX_SCAN_PAGE_ROWS);
         self.poisoned = true;
-        let chunk = self.source.next_page(page_size).await?;
-        if chunk.entries.len() > page_size
-            || (chunk.has_more && chunk.entries.is_empty())
-            || !self.valid_entries(&chunk)
+        let (entries, has_more) = self.source.next_page(page_size).await?.into_parts();
+        if entries.len() > page_size
+            || (has_more && entries.is_empty())
+            || !self.valid_entries(&entries)
         {
             return Err(StorageError::InvalidCursor);
         }
-        self.last_key = chunk.entries.last().map(|entry| entry.key.clone());
-        self.finished = !chunk.has_more;
+        self.last_key = entries.last().map(|entry| entry.key.clone());
+        self.finished = !has_more;
         self.poisoned = false;
-        Ok(chunk)
+        Ok(ScanChunk::new(entries, has_more))
     }
 
-    fn valid_entries(&self, chunk: &ScanChunk) -> bool {
+    /// Yields the next chunk of rows, or `None` once the range is drained.
+    ///
+    /// This is the streaming drain:
+    /// `while let Some(entries) = cursor.next_chunk().await? { … }` visits
+    /// every row in the range without materializing all of them at once, and
+    /// there is no continuation flag for a caller to forget. Prefer it over a
+    /// hand-written `next_page` loop — a hand-written loop is exactly the shape
+    /// that truncated certified-manifest scans at one page.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<ReadEntry>>, StorageError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let (entries, has_more) = self
+            .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
+            .await?
+            .into_parts();
+        if entries.is_empty() && !has_more {
+            return Ok(None);
+        }
+        Ok(Some(entries))
+    }
+
+    /// Reads every remaining row in the range into one vector.
+    ///
+    /// This is the ordinary read. It cannot truncate, and it is shorter than
+    /// the bounded form, which is the intended asymmetry: a call site that
+    /// wants everything says so in one call, and a call site that wants a bound
+    /// has to reach for [`Self::next_page`] and bind `has_more` explicitly.
+    ///
+    /// The cost is O(rows in range) memory. A caller scanning an unbounded
+    /// range over a large space should stream with [`Self::next_chunk`].
+    pub async fn collect_all(&mut self) -> Result<Vec<ReadEntry>, StorageError> {
+        let mut all = Vec::new();
+        while let Some(entries) = self.next_chunk().await? {
+            all.extend(entries);
+        }
+        Ok(all)
+    }
+
+    fn valid_entries(&self, entries: &[ReadEntry]) -> bool {
         let mut previous = self.last_key.as_ref();
-        for entry in &chunk.entries {
+        for entry in entries {
             if !range_contains(&self.range, &entry.key) {
                 return false;
             }
@@ -141,7 +188,7 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{ProjectedValue, ReadEntry};
+    use crate::storage::ProjectedValue;
     use bytes::Bytes;
     use std::task::{Context, Poll};
 
@@ -153,13 +200,13 @@ mod tests {
             _limit_rows: usize,
         ) -> Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
             Box::pin(async {
-                Ok(ScanChunk {
-                    entries: vec![ReadEntry {
+                Ok(ScanChunk::new(
+                    vec![ReadEntry {
                         key: Key(Bytes::from_static(b"a")),
                         value: ProjectedValue::KeyOnly,
                     }],
-                    has_more: false,
-                })
+                    false,
+                ))
             })
         }
     }
@@ -198,10 +245,7 @@ mod tests {
                     key: Key(Bytes::from_static(b"a")),
                     value: ProjectedValue::KeyOnly,
                 };
-                Ok(ScanChunk {
-                    entries: vec![entry.clone(), entry],
-                    has_more: false,
-                })
+                Ok(ScanChunk::new(vec![entry.clone(), entry], false))
             })
         }
     }
@@ -220,8 +264,12 @@ mod tests {
         let future = cursor.next_page(1);
         drop(future);
 
-        let page = cursor.next_page(1).await.expect("cursor remains usable");
-        assert_eq!(page.entries[0].key.0.as_ref(), b"a");
+        let (entries, _has_more) = cursor
+            .next_page(1)
+            .await
+            .expect("cursor remains usable")
+            .into_parts();
+        assert_eq!(entries[0].key.0.as_ref(), b"a");
     }
 
     #[tokio::test]

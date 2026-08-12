@@ -225,10 +225,10 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
         )
         .await?;
     loop {
-        let page = manifest_cursor
+        let (page, page_has_more) = manifest_cursor
             .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let blob_id = BlobId::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
                 LixError::new(
                     LixError::CODE_STORAGE_ERROR,
@@ -252,7 +252,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                 validate_live_manifest_identity(blob_id, &manifest)?;
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -271,10 +271,10 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
         )
         .await?;
     loop {
-        let page = manifest_chunk_cursor
+        let (page, page_has_more) = manifest_chunk_cursor
             .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let (blob_id, offset) = decode_manifest_chunk_key(&entry.key)?;
             let keep = live_manifest_sizes
                 .get(&blob_id)
@@ -284,7 +284,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                 result.reclaimed_manifest_chunk_rows += 1;
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -303,8 +303,8 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
         )
         .await?;
     loop {
-        let page = chunk_cursor.next_page(CAS_RECLAIM_CHUNK_PAGE_ROWS).await?;
-        for entry in page.entries {
+        let (page, page_has_more) = chunk_cursor.next_page(CAS_RECLAIM_CHUNK_PAGE_ROWS).await?.into_parts();
+        for entry in page {
             let chunk_hash =
                 ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
                     LixError::new(
@@ -339,7 +339,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                     )
                 })?;
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -358,10 +358,10 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
         )
         .await?;
     loop {
-        let page = presence_cursor
+        let (page, page_has_more) = presence_cursor
             .next_page(CAS_RECLAIM_MANIFEST_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
+            .await?.into_parts();
+        for entry in page {
             let chunk_hash =
                 ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
                     LixError::new(
@@ -373,7 +373,7 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
                 writes.delete(BINARY_CAS_CHUNK_PRESENCE_SPACE, entry.key);
             }
         }
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
@@ -1037,16 +1037,16 @@ async fn scan_all_values_for_range(
         .begin_scan(space, range, StorageBeginScanOptions::default())
         .await?;
     loop {
-        let page = cursor
+        let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
+            .await?.into_parts();
         values.extend(
-            page.entries
+            page
                 .into_iter()
                 .filter_map(|entry| full_value(entry.value))
                 .map(|bytes| bytes.to_vec()),
         );
-        if !page.has_more {
+        if !page_has_more {
             break;
         }
     }
