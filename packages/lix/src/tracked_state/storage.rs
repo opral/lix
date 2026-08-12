@@ -8072,17 +8072,16 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
         if segment_count > max_segment_count {
             return Ok(None);
         }
-        return Ok(Some((
-            load_commit_delta_members_from_manifest(
-                store,
-                state.commit_id,
-                &manifest,
-                schema_keys,
-                hydrate_selected_payloads,
-            )
-            .await?,
-            segment_count,
-        )));
+        let mut members = load_commit_delta_members_from_manifest(
+            store,
+            state.commit_id,
+            &manifest,
+            schema_keys,
+            hydrate_selected_payloads,
+        )
+        .await?;
+        retain_requested_files(&mut members, file_ids);
+        return Ok(Some((members, segment_count)));
     };
     if root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
         || root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
@@ -8099,17 +8098,16 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     }
     if root.layout == super::mutation_directory::LAYOUT_DIRECT_ROWS_ONLY {
         let manifest = commit_delta_manifest_from_commit_state(state);
-        return Ok(Some((
-            load_commit_delta_members_from_manifest(
-                store,
-                state.commit_id,
-                &manifest,
-                schema_keys,
-                hydrate_selected_payloads,
-            )
-            .await?,
-            0,
-        )));
+        let mut members = load_commit_delta_members_from_manifest(
+            store,
+            state.commit_id,
+            &manifest,
+            schema_keys,
+            hydrate_selected_payloads,
+        )
+        .await?;
+        retain_requested_files(&mut members, file_ids);
+        return Ok(Some((members, 0)));
     }
     if root.layout != super::mutation_directory::LAYOUT_COMPACT_REPLACEMENT {
         return Err(replacement_payload_error(
@@ -8151,17 +8149,39 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     }
     let manifest = expanded_commit_delta_manifest_from_commit_state(store, &expanded_state).await?;
     validate_commit_delta_manifest(&manifest)?;
+    let mut members = load_commit_delta_members_from_manifest(
+        store,
+        state.commit_id,
+        &manifest,
+        schema_keys,
+        hydrate_selected_payloads,
+    )
+    .await?;
+    retain_requested_files(&mut members, file_ids);
     Ok(Some((
-        load_commit_delta_members_from_manifest(
-            store,
-            state.commit_id,
-            &manifest,
-            schema_keys,
-            hydrate_selected_payloads,
-        )
-        .await?,
+        members,
         segment_count,
     )))
+}
+
+/// Restricts loaded members to the requested file ids.
+///
+/// A selected segment can straddle the requested range, and the non-bounded
+/// layouts cannot express a key range at all, so the file bound is applied to
+/// the produced members in every layout. This keeps the returned set
+/// independent of which physical layout a commit happens to use.
+fn retain_requested_files(members: &mut Vec<CommitDeltaMember>, file_ids: &[String]) {
+    if file_ids.is_empty() {
+        return;
+    }
+    let requested_files = file_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    members.retain(|member| {
+        member
+            .key
+            .file_id
+            .as_deref()
+            .is_some_and(|file_id| requested_files.contains(file_id))
+    });
 }
 
 /// Builds the commit-delta key ranges a member scan should read.
@@ -8296,9 +8316,16 @@ async fn load_bounded_commit_delta_members_for_schemas(
         )?;
         validate_bounded_direct_row_count(root.layout, direct_row_count, members.len() - before)?;
     }
+    // A selected segment can straddle the requested range, so the members it
+    // yields are still filtered on both bounded key components.
+    let requested_schemas = schema_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     if !requested_schemas.is_empty() {
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
     }
+    retain_requested_files(&mut members, file_ids);
     if hydrate_selected_payloads {
         hydrate_selected_members(store, &mut members).await?;
     }

@@ -255,7 +255,6 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     // or other unrelated file rows a second time.
     const MAX_REQUESTED_KEYS: u64 = 416;
     const MAX_SCAN_CALLS: u64 = 128;
-    const MAX_SCANNED_ROWS: u64 = 512;
 
     let storage = CountingStorage::default();
     Engine::initialize(storage.clone())
@@ -362,9 +361,18 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
          {UNRELATED_ADDITIONAL_FILE_COUNT} additional files; expected at most {MAX_REQUESTED_KEYS}"
     );
     assert!(
-        scan_calls <= MAX_SCAN_CALLS && scanned_rows <= MAX_SCANNED_ROWS,
-        "point-routed history performed {scan_calls} scans returning {scanned_rows} rows; \
-         expected at most {MAX_SCAN_CALLS} scans and {MAX_SCANNED_ROWS} rows"
+        scan_calls <= MAX_SCAN_CALLS,
+        "point-routed history performed {scan_calls} scans; \
+         expected at most {MAX_SCAN_CALLS}"
+    );
+    // Point-routed file history resolves entirely through `get_many`. It opens
+    // scan cursors but never draws a row from one, so an upper bound here is
+    // vacuous — it cannot fail. Asserting the exact zero makes it a real guard:
+    // it fails the moment this path starts serving rows from a scan.
+    assert_eq!(
+        scanned_rows, 0,
+        "point-routed history drew {scanned_rows} rows from scan cursors; \
+         this path is expected to read exclusively through get_many"
     );
 
     session.close().await.expect("session should close");
@@ -380,7 +388,6 @@ async fn lix_file_history_path_lookup_does_not_rescan_unrelated_observed_state()
     // blobs must not be reconstructed once per observed commit.
     const MAX_REQUESTED_KEYS: u64 = 416;
     const MAX_SCAN_CALLS: u64 = 128;
-    const MAX_SCANNED_ROWS: u64 = 512;
 
     let storage = CountingStorage::default();
     Engine::initialize(storage.clone())
@@ -487,9 +494,16 @@ async fn lix_file_history_path_lookup_does_not_rescan_unrelated_observed_state()
          {UNRELATED_ADDITIONAL_FILE_COUNT} additional files; expected at most {MAX_REQUESTED_KEYS}"
     );
     assert!(
-        scan_calls <= MAX_SCAN_CALLS && scanned_rows <= MAX_SCANNED_ROWS,
-        "path-routed history performed {scan_calls} scans returning {scanned_rows} rows; \
-         expected at most {MAX_SCAN_CALLS} scans and {MAX_SCANNED_ROWS} rows"
+        scan_calls <= MAX_SCAN_CALLS,
+        "path-routed history performed {scan_calls} scans; \
+         expected at most {MAX_SCAN_CALLS}"
+    );
+    // See the point-routed guard: an upper bound on rows drawn from scan
+    // cursors cannot fail on this path, so assert the exact zero instead.
+    assert_eq!(
+        scanned_rows, 0,
+        "path-routed history drew {scanned_rows} rows from scan cursors; \
+         this path is expected to read exclusively through get_many"
     );
 
     session.close().await.expect("session should close");
@@ -646,7 +660,6 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     const UNRELATED_DIRECTORY_COUNT: usize = 256;
     const MAX_REQUESTED_KEYS: u64 = 400;
     const MAX_SCAN_CALLS: u64 = 48;
-    const MAX_SCANNED_ROWS: u64 = 48;
 
     let storage = CountingStorage::default();
     Engine::initialize(storage.clone())
@@ -743,9 +756,16 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
          {UNRELATED_DIRECTORY_COUNT} unrelated directories; expected at most {MAX_REQUESTED_KEYS}"
     );
     assert!(
-        scan_calls <= MAX_SCAN_CALLS && scanned_rows <= MAX_SCANNED_ROWS,
-        "ancestor point history performed {scan_calls} scans returning {scanned_rows} rows; \
-         expected at most {MAX_SCAN_CALLS} scans and {MAX_SCANNED_ROWS} rows"
+        scan_calls <= MAX_SCAN_CALLS,
+        "ancestor point history performed {scan_calls} scans; \
+         expected at most {MAX_SCAN_CALLS}"
+    );
+    // See the point-routed guard: an upper bound on rows drawn from scan
+    // cursors cannot fail on this path, so assert the exact zero instead.
+    assert_eq!(
+        scanned_rows, 0,
+        "ancestor point history drew {scanned_rows} rows from scan cursors; \
+         this path is expected to read exclusively through get_many"
     );
 
     session.close().await.expect("session should close");
