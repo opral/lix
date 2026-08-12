@@ -157,11 +157,20 @@ where
             })
             .await?;
     }
-    // No writeback here. An absent preference already means "follow the
-    // repository's default branch", which is exactly what this function
-    // computes when the key is missing, so materializing it bought nothing and
-    // made the first open of any repository perform a commit before returning
-    // a usable handle. `switch_branch` persists the key on every actual change.
+    // The writeback stays on the open path. It only runs when the stored key
+    // does not already name the active branch, so it costs nothing after the
+    // first open -- and `ClientState::entries`/`get` are public API, so making
+    // the key appear only after an explicit switch would change observable
+    // output for a repository that has never switched.
+    let active_branch_id = lix.active_branch_id().await?;
+    if stored_branch_id.as_deref() != Some(active_branch_id.as_str()) {
+        lix.client_state()
+            .set(
+                crate::client_state::PRIMARY_SESSION_BRANCH_KEY,
+                serde_json::Value::String(active_branch_id),
+            )
+            .await?;
+    }
     Ok(lix)
 }
 
