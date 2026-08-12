@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
+#[cfg(not(target_family = "wasm"))]
 use crate::LixError;
 #[cfg(not(target_family = "wasm"))]
 use crate::storage_adapter::Storage;
@@ -21,6 +22,9 @@ const EXTERNAL_MUTATION_REVISION_POLL_INTERVAL: Duration = Duration::from_millis
 #[derive(Clone, Debug)]
 pub(crate) enum ObserveInvalidationEvent {
     Generation(u64),
+    /// Only the native external-mutation watcher can observe a fenced or
+    /// closed store, so this variant cannot be constructed on wasm.
+    #[cfg(not(target_family = "wasm"))]
     TerminalStorageError(LixError),
 }
 
@@ -46,13 +50,16 @@ impl ObserveInvalidation {
     pub(crate) fn bump(&self) -> u64 {
         let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.sender.send_modify(|event| {
-            if !matches!(event, ObserveInvalidationEvent::TerminalStorageError(_)) {
-                *event = ObserveInvalidationEvent::Generation(next);
+            #[cfg(not(target_family = "wasm"))]
+            if matches!(event, ObserveInvalidationEvent::TerminalStorageError(_)) {
+                return;
             }
+            *event = ObserveInvalidationEvent::Generation(next);
         });
         next
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn fail_terminal_storage(&self, error: LixError) {
         self.sender.send_modify(|event| {
             if !matches!(event, ObserveInvalidationEvent::TerminalStorageError(_)) {

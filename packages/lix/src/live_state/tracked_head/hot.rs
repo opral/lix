@@ -1218,6 +1218,74 @@ pub(crate) async fn scan_certified_history_rows(
     Ok(builder.finish().into_rows())
 }
 
+/// Loads certified packet rows for exact identities that are intentionally
+/// absent from the ordinary tracked root. This is a narrow historical
+/// fallback for consumers, such as semantic merge, that need the complete
+/// base snapshot of a host-certified fresh import.
+pub(crate) async fn load_certified_rows_at_commit(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: &str,
+    keys: &[TrackedStateKey],
+) -> Result<BTreeMap<TrackedStateKey, MaterializedLiveStateRow>, LixError> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let exact = keys.iter().cloned().collect::<BTreeSet<_>>();
+    let schema_keys = keys
+        .iter()
+        .map(|key| key.schema_key.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let entity_pks = keys
+        .iter()
+        .map(|key| key.entity_pk.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut file_ids = Vec::new();
+    for key in keys {
+        let filter = match &key.file_id {
+            Some(file_id) => NullableKeyFilter::Value(file_id.clone()),
+            None => NullableKeyFilter::Null,
+        };
+        if !file_ids.contains(&filter) {
+            file_ids.push(filter);
+        }
+    }
+    let rows = scan_certified_history_rows(
+        store,
+        &BTreeSet::from([CommitId::parse_lix(
+            commit_id,
+            "certified historical fallback commit_id",
+        )?]),
+        &TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys,
+                entity_pks,
+                file_ids,
+                include_tombstones: true,
+            },
+            read_columns: TrackedStateReadColumns {
+                columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
+            },
+            limit: None,
+        },
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let key = TrackedStateKey {
+                schema_key: row.schema_key.clone(),
+                file_id: row.file_id.clone(),
+                entity_pk: row.entity_pk.clone(),
+            };
+            exact.contains(&key).then_some((key, row))
+        })
+        .collect())
+}
+
 /// Expands the authoritative rows needed to publish a host-produced packet.
 /// Commit deltas are self-contained, so the packet is decoded once here and
 /// never becomes a second durable payload authority.
