@@ -12396,6 +12396,17 @@ impl TrackedStateChunkOverlay {
         self.chunks.keys().copied()
     }
 
+    /// Promotes overlay chunks a previous rootless interval staged only
+    /// transiently into the durable write set.
+    ///
+    /// This stages through the same content-addressed entry point as
+    /// [`Self::stage_chunks`]. Both producers write the one chunk space in one
+    /// rebuild write set, and a rooted plan routinely re-derives a node an
+    /// earlier rootless plan already produced — content-addressed, so the same
+    /// digest. Staging that digest through a plain put made the second producer
+    /// a duplicate mutation and failed the whole rebuild; the shared
+    /// content-addressed path coalesces the identical entry while still
+    /// rejecting a same-digest/different-bytes conflict.
     pub(crate) async fn stage_selected_chunks(
         &mut self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -12410,6 +12421,7 @@ impl TrackedStateChunkOverlay {
         // run against the digests themselves rather than the staged-chunk map.
         self.probe_durable_digests(store, hashes.iter().copied())
             .await?;
+        let mut entries = Vec::with_capacity(hashes.len());
         for hash in hashes {
             if self.known_durable.contains(&hash) {
                 continue;
@@ -12420,14 +12432,14 @@ impl TrackedStateChunkOverlay {
                     "tracked-state transient chunk promotion lost its overlay bytes",
                 )
             })?;
-            writes.put(
-                TRACKED_STATE_TREE_CHUNK_SPACE,
+            entries.push((
                 StorageKey(Bytes::copy_from_slice(&hash)),
                 StorageValue {
                     bytes: bytes.clone(),
                 },
-            );
+            ));
         }
+        writes.put_content_addressed_batch(TRACKED_STATE_TREE_CHUNK_SPACE, entries);
         Ok(())
     }
 
@@ -15821,6 +15833,53 @@ mod tests {
             );
             assert_eq!(staged, chunks.chunk_bytes(*chunk));
         }
+    }
+
+    /// Regression: a rebuild write set carries both chunk producers.
+    ///
+    /// `rebuild_commit_root_at` stages a rooted plan's chunks with
+    /// `stage_chunks` and then promotes the transient chunks an earlier
+    /// rootless plan produced with `stage_selected_chunks`. The tree is
+    /// content-addressed, so a re-derived node is the same digest in both
+    /// producers; promotion used to stage it as a plain put, which the
+    /// write-set validator rejected as a duplicate mutation and which made the
+    /// whole rebuild fail with `LIX_STORAGE_ERROR`.
+    #[tokio::test]
+    async fn promoting_a_chunk_the_write_set_already_staged_is_not_a_duplicate_mutation() {
+        let store = StorageAdapter::new(Memory::new())
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open empty snapshot");
+        let data = vec![7u8; 96];
+        let chunks = PendingChunkBatch::from_parts(
+            Bytes::from(data.clone()),
+            vec![PendingChunk {
+                hash: hash_bytes(&data),
+                data_start: 0,
+                data_len: data.len(),
+            }],
+        );
+        let hash = chunks.chunks()[0].hash;
+
+        let mut writes = StorageWriteSet::new();
+        let mut overlay = TrackedStateChunkOverlay::repairing();
+        overlay
+            .stage_chunks(&store, &mut writes, &chunks)
+            .await
+            .expect("rooted plan stages its derived chunks");
+        overlay
+            .stage_selected_chunks(&store, &mut writes, [hash])
+            .await
+            .expect("promotion of an already staged digest stages");
+
+        writes
+            .validate()
+            .expect("a re-derived content-addressed chunk is not a duplicate mutation");
+        assert_eq!(
+            writes.arena_stats().put_descriptors,
+            1,
+            "the identical content-addressed entry must be coalesced, not restated"
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use lix::{LixError, Value};
 
-const SEEDS: [u64; 4] = [0, 1, 0x51ce_deed, u64::MAX];
+const DEFAULT_SEEDS: [u64; 4] = [0, 1, 0x51ce_deed, u64::MAX];
 const STEPS_PER_SEED: usize = 48;
 const IDS: usize = 8;
 
@@ -20,7 +20,7 @@ simulation_test!(
         register_constraint_schemas(&session).await;
         let mut operations_seen = [false; 8];
 
-        for seed in SEEDS {
+        for seed in crate::support::fuzz_seeds(&DEFAULT_SEEDS) {
             let prefix = format!("constraint-fuzz-{seed:016x}-");
             let mut parents = BTreeMap::<String, String>::new();
             let mut children = BTreeMap::<String, String>::new();
@@ -103,9 +103,14 @@ simulation_test!(
                         }
                     }
                     3 => {
+                        // A child insert can violate both constraints at once
+                        // (the id already exists *and* the referenced parent
+                        // does not). The engine validates referential integrity
+                        // first and reports the foreign-key violation, so the
+                        // model must not claim UNIQUE whenever the id exists.
                         let expected_error =
                             children.contains_key(&child_id) || !parents.contains_key(&parent_id);
-                        let expected_code = if children.contains_key(&child_id) {
+                        let expected_code = if parents.contains_key(&parent_id) {
                             LixError::CODE_UNIQUE
                         } else {
                             LixError::CODE_FOREIGN_KEY
