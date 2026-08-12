@@ -175,7 +175,7 @@ pub(crate) const FIRST_LIVE_ROW_SPACE_ID: StorageSpaceId = StorageSpaceId(0x0004
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_adapter::ValueSemantics;
+    use crate::storage_adapter::{ValueIntegrity, ValueSemantics};
     use std::collections::BTreeMap;
 
     /// The registry must list spaces in ascending id order, because that order
