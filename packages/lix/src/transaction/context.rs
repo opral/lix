@@ -517,6 +517,26 @@ fn record_transaction_path_index_build(descriptor_rows: usize) {
 /// that may write. Write-relevant reads must be exposed from this transaction,
 /// after the storage write transaction has begun, rather than from session-level
 /// helpers.
+/// EXPSND probe: the use-after-free precondition for the forged `'static`.
+impl<StorageImpl: Storage + 'static> Drop for Transaction<StorageImpl> {
+    fn drop(&mut self) {
+        let addr = std::ptr::from_ref(self) as *const () as usize;
+        let live = crate::sql2::EXPSND_LIVE_PTRS
+            .lock()
+            .unwrap()
+            .get(&addr)
+            .copied()
+            .unwrap_or(0);
+        if live > 0 {
+            panic!(
+                "EXPSND_USE_AFTER_FREE: Transaction at {addr:x} destroyed while {live} \
+                 SqlWriteContextPtr(s) still point at it\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }
+}
+
 pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_branch_id: String,
     active_account_id: String,

@@ -345,6 +345,24 @@ struct SqlWriteContextShared {
     session_file_views: Option<SessionFileViews>,
 }
 
+/// EXPSND probe: live `SqlWriteContextPtr`s keyed by pointee address.
+pub(crate) static EXPSND_LIVE_PTRS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+impl Drop for SqlWriteContextPtr {
+    fn drop(&mut self) {
+        let addr = self.0.as_ptr() as *const () as usize;
+        let mut live = EXPSND_LIVE_PTRS.lock().unwrap();
+        if let Some(count) = live.get_mut(&addr) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                live.remove(&addr);
+            }
+        }
+    }
+}
+
 // DataFusion stores providers as owned Send + Sync trait objects. This context
 // is only constructed for one write execution and never outlives the borrowed
 // transaction context that owns it.
@@ -369,6 +387,10 @@ impl SqlWriteContext {
             session_file_views: ctx.session_file_views(),
         });
         let ptr = NonNull::from(ctx);
+        {
+            let addr = ptr.as_ptr() as *const () as usize;
+            *EXPSND_LIVE_PTRS.lock().unwrap().entry(addr).or_insert(0usize) += 1;
+        }
         let ptr = unsafe {
             std::mem::transmute::<
                 NonNull<dyn SqlWriteExecutionContext + '_>,
