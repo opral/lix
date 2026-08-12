@@ -30,6 +30,7 @@
 // consumers now that the former engine and SDK share one crate.
 extern crate self as lix;
 
+pub(crate) mod account;
 mod binary_cas;
 pub(crate) mod branch;
 pub(crate) mod catalog;
