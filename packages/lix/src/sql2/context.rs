@@ -24,7 +24,7 @@ use crate::live_state::{
 use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::TrackedStateScanRequest;
-use crate::transaction::types::{
+use crate::transaction_types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, RawWriteBatch,
     TransactionWrite, TransactionWriteMode, TransactionWriteOutcome, TypedMutationJournalBatch,
 };

@@ -101,6 +101,7 @@ pub(crate) mod tracked_state;
 pub mod transaction;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod transaction;
+pub(crate) mod transaction_types;
 pub(crate) mod undo_redo;
 pub mod wasm;
 

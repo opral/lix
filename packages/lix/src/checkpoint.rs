@@ -11,7 +11,7 @@ use crate::changelog::{ChangelogContext, ChangelogReader, CommitScanRequest};
 use crate::commit_graph::CommitGraphNode;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError};
 
 pub(crate) const CHECKPOINT_SCHEMA_KEY: &str = "lix_checkpoint";

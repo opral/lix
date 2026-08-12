@@ -6,9 +6,9 @@ mod context;
 mod normalization;
 pub(crate) mod plugin_checkpoint;
 mod schema_resolver;
+mod staged_commit_changes;
 mod staging;
 mod stale_commit;
-pub(crate) mod types;
 mod validation;
 
 #[cfg(feature = "storage-benches")]
@@ -47,4 +47,5 @@ pub(crate) use context::open_transaction_with_runtime_boundary;
 pub(crate) use context::transaction_is_file_cohort_eligible;
 pub(crate) use context::transactions_can_share_cohort;
 pub(crate) use plugin_checkpoint::stage_delete_branch_plugin_checkpoints;
+pub(crate) use staged_commit_changes::StagedCommitChangeBatchBuilder;
 pub(crate) use staging::duplicate_insert_identity_message;
