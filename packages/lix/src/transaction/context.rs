@@ -8914,36 +8914,48 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
 /// of how the visible filesystem changed, so cached path indexes must be
 /// rebuilt from hot state rather than advanced by a delta.
 ///
-/// Two shapes are incomplete, and both are about *which rows exist*, not about
+/// Three shapes are incomplete, and all are about *which rows exist*, not about
 /// when their identities are assigned:
 ///
 /// * a **branch ref move** republishes the branch's entire visible filesystem;
 ///   the difference is between two commits, not between staged rows;
 /// * a **change selected into this commit from another commit** (merge,
 ///   checkpoint, cherry-pick) enters the branch's visible filesystem without
-///   appearing in `state_rows` at all.
+///   appearing in `state_rows` at all;
+/// * a **global or untracked filesystem row** changes visibility in every
+///   branch at once, so a single-branch delta cannot describe it.
+///
+/// The last one is also the only shape whose staged rows can be *dropped*
+/// between here and the capture point: `retain_untracked_rows_not_superseded_by_engine`
+/// removes untracked rows that an engine row supersedes. Deciding it here, off
+/// the complete pre-materialization row set, is what keeps the capture point
+/// from silently projecting a delta that lost a row. `advance_committed`
+/// evicts on the same condition, but it can only see the rows it is handed.
 ///
 /// An ordinary create, rename, delete, or content write is fully described by
 /// its staged rows and is therefore projectable. Those rows are read back out
 /// of the commit once materialization has assigned their final change ids —
 /// see [`commit::MaterializedCommit::filesystem_delta_rows`].
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
-    prepared_writes
-        .state_rows
-        .iter()
-        .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
-        || prepared_writes
-            .commit_change_refs_by_branch
-            .values()
-            .flat_map(
-                crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
-            )
-            .any(|change_ref| {
-                matches!(
-                    change_ref.schema_key(),
+    prepared_writes.state_rows.iter().any(|row| {
+        row.schema_key == BRANCH_REF_SCHEMA_KEY
+            || ((row.global || row.untracked)
+                && matches!(
+                    row.schema_key.as_str(),
                     "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
-                )
-            })
+                ))
+    }) || prepared_writes
+        .commit_change_refs_by_branch
+        .values()
+        .flat_map(
+            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
+        )
+        .any(|change_ref| {
+            matches!(
+                change_ref.schema_key(),
+                "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+            )
+        })
 }
 
 /// Whether this commit stages any row that the cached path index projects.
@@ -12122,6 +12134,54 @@ mod tests {
         assert!(prepared_writes_require_filesystem_index_rebuild(
             &prepared_writes
         ));
+    }
+
+    /// A global or untracked filesystem row changes visibility in every branch,
+    /// which a single-branch delta cannot describe. It is also the only staged
+    /// filesystem row that can be dropped before the delta is captured, by
+    /// `retain_untracked_rows_not_superseded_by_engine`, so the rebuild has to
+    /// be decided here rather than left to `advance_committed`'s own eviction —
+    /// that only sees the rows it is handed.
+    #[test]
+    fn global_or_untracked_filesystem_row_requires_index_rebuild() {
+        for (global, untracked) in [(true, false), (false, true), (true, true)] {
+            let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+            let mut state_rows = PreparedStateBatch::with_capacity(1);
+            state_rows.push_parts_with_change_addressability(
+                SchemaPlanId::for_test(0),
+                PreparedRowFacts::default(),
+                EntityPk::single("file-a"),
+                "lix_file_descriptor".into(),
+                Some("file-a".into()),
+                None,
+                None,
+                None,
+                None,
+                timestamp,
+                timestamp,
+                global,
+                Some(ChangeId::for_test_label("provisional")),
+                true,
+                Some(CommitId::for_test_label("commit")),
+                untracked,
+                "main".into(),
+            );
+            let prepared_writes = PreparedWriteSet {
+                state_rows,
+                insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
+                commit_change_refs_by_branch: BTreeMap::new(),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
+                file_content_writes: Vec::new(),
+            };
+
+            assert!(
+                prepared_writes_require_filesystem_index_rebuild(&prepared_writes),
+                "global={global} untracked={untracked} must force a rebuild"
+            );
+        }
     }
 
     #[test]
