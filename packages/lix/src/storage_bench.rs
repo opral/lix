@@ -794,9 +794,13 @@ pub enum PlanLoadPhase {
     DeltaSegments = 4,
     /// Owned-key materialization of the decoded batch into plan deltas.
     Collect = 5,
+    /// `commit_root_tree_is_readable` — the full tracked-state tree scan the
+    /// availability probe runs to prove the addressed chunk closure is
+    /// physically readable. Nested inside `AvailProbe`.
+    AvailTreeScan = 6,
 }
 
-pub const PLAN_LOAD_PHASE_COUNT: usize = 6;
+pub const PLAN_LOAD_PHASE_COUNT: usize = 7;
 
 pub const PLAN_LOAD_PHASE_NAMES: [&str; PLAN_LOAD_PHASE_COUNT] = [
     "other",
@@ -805,6 +809,7 @@ pub const PLAN_LOAD_PHASE_NAMES: [&str; PLAN_LOAD_PHASE_COUNT] = [
     "replay_state",
     "delta_segments",
     "collect",
+    "avail_tree_scan",
 ];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -813,7 +818,9 @@ pub struct PlanLoadPhaseMetric {
     pub wall_nanos: u64,
     /// Wall time inside `StorageAdapterRead::get_many` while in this phase.
     pub io_nanos: u64,
-    /// `get_many` batches issued while in this phase.
+    /// `StorageAdapterRead::get_many` invocations issued while in this phase.
+    pub read_calls: u64,
+    /// Logical per-space requests inside those invocations.
     pub read_batches: u64,
     /// Keys requested across those batches.
     pub read_keys: u64,
@@ -850,7 +857,7 @@ mod plan_load_trace {
 
     use super::{PLAN_LOAD_PHASE_COUNT, PlanLoadAttribution, PlanLoadPhase, PlanLoadPhaseMetric};
 
-    const FIELDS: usize = 7;
+    const FIELDS: usize = 8;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -889,6 +896,7 @@ mod plan_load_trace {
         add(phase, 3, keys);
         add(phase, 4, hits);
         add(phase, 5, bytes);
+        add(phase, 7, 1);
     }
 
     pub(super) fn record_plan(members_decoded: u64, members_kept: u64, payload_bytes: u64) {
@@ -910,6 +918,7 @@ mod plan_load_trace {
                 read_hits: get(4),
                 read_bytes: get(5),
                 entries: get(6),
+                read_calls: get(7),
             };
         }
         PlanLoadAttribution {

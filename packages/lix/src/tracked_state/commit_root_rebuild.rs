@@ -229,7 +229,14 @@ where
     let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
         return Ok(None);
     };
-    if !commit_root_tree_is_readable(store, &metadata).await? {
+    let readable = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::AvailTreeScan,
+        );
+        commit_root_tree_is_readable(store, &metadata).await?
+    };
+    if !readable {
         return Ok(None);
     }
     Ok(Some(metadata.root_id))

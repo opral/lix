@@ -110,23 +110,27 @@ async fn main() {
     println!("op checkpoint wall_ms {:.1}", checkpoint_wall.as_secs_f64() * 1000.0);
     report("checkpoint", &checkpoint);
 
-    let history_start = Instant::now();
-    let history = session
-        .execute(
-            "SELECT lixcol_commit_id FROM replay_scope_history LIMIT 100",
-            &[],
-        )
-        .await;
-    let history_wall = history_start.elapsed();
-    match history {
-        Ok(result) => println!(
-            "op history wall_ms {:.1} rows {}",
-            history_wall.as_secs_f64() * 1000.0,
-            result.len()
-        ),
-        Err(error) => println!("op history unavailable: {error}"),
+    for (label, sql) in [
+        ("history_key_value", "SELECT * FROM lix_key_value_history"),
+        ("history_checkpoint", "SELECT * FROM lix_checkpoint_history"),
+        ("commit_graph", "SELECT * FROM lix_commit"),
+        ("change_scan", "SELECT * FROM lix_change"),
+        ("read_all", "SELECT * FROM replay_scope"),
+    ] {
+        let _ = take_plan_load_attribution();
+        let start = Instant::now();
+        let outcome = session.execute(sql, &[]).await;
+        let elapsed = start.elapsed();
+        match outcome {
+            Ok(result) => println!(
+                "op {label} wall_ms {:.1} rows {}",
+                elapsed.as_secs_f64() * 1000.0,
+                result.len()
+            ),
+            Err(error) => println!("op {label} unavailable: {error}"),
+        }
+        report(label, &take_plan_load_attribution());
     }
-    report("history", &take_plan_load_attribution());
 
     let undo_start = Instant::now();
     let undo = session.undo().await;
@@ -187,11 +191,27 @@ fn report(label: &str, attribution: &PlanLoadAttribution) {
         attribution.members_kept,
         attribution.member_payload_bytes
     );
-    // `delta_segments` encloses `replay_state`; report the exclusive wall too.
-    let replay_state_wall = attribution.phases[3].wall_nanos;
+    // `delta_segments` encloses `replay_state` and `avail_probe` encloses
+    // `avail_tree_scan`; report the exclusive wall alongside the guard wall.
+    let exclusive_of = |index: usize| -> u64 {
+        let wall = attribution.phases[index].wall_nanos;
+        match index {
+            1 => wall.saturating_sub(attribution.phases[6].wall_nanos),
+            4 => wall.saturating_sub(attribution.phases[3].wall_nanos),
+            _ => wall,
+        }
+    };
     println!(
-        "{label}: {:<15} {:>8} {:>12} {:>12} {:>12} {:>10} {:>8} {:>8} {:>12}",
-        "phase", "entries", "wall_ms", "excl_wall_ms", "io_ms", "non_io_ms", "batches", "keys",
+        "{label}: {:<16} {:>8} {:>10} {:>12} {:>10} {:>10} {:>7} {:>8} {:>8} {:>12}",
+        "phase",
+        "entries",
+        "wall_ms",
+        "excl_wall_ms",
+        "io_ms",
+        "non_io_ms",
+        "calls",
+        "reqs",
+        "keys",
         "bytes"
     );
     for (index, name) in PLAN_LOAD_PHASE_NAMES.iter().enumerate() {
@@ -199,18 +219,15 @@ fn report(label: &str, attribution: &PlanLoadAttribution) {
         if phase.entries == 0 && phase.read_batches == 0 {
             continue;
         }
-        let exclusive = if index == 4 {
-            phase.wall_nanos.saturating_sub(replay_state_wall)
-        } else {
-            phase.wall_nanos
-        };
+        let exclusive = exclusive_of(index);
         println!(
-            "{label}: {name:<15} {:>8} {:>12.2} {:>12.2} {:>12.2} {:>10.2} {:>8} {:>8} {:>12}",
+            "{label}: {name:<16} {:>8} {:>10.2} {:>12.2} {:>10.2} {:>10.2} {:>7} {:>8} {:>8} {:>12}",
             phase.entries,
             phase.wall_nanos as f64 / 1e6,
             exclusive as f64 / 1e6,
             phase.io_nanos as f64 / 1e6,
             exclusive.saturating_sub(phase.io_nanos) as f64 / 1e6,
+            phase.read_calls,
             phase.read_batches,
             phase.read_keys,
             phase.read_bytes
@@ -218,45 +235,41 @@ fn report(label: &str, attribution: &PlanLoadAttribution) {
     }
     if attribution.plans > 0 {
         let plans = attribution.plans as f64;
-        let plan_phases = [1usize, 2, 3, 4, 5];
-        let wall: u64 = plan_phases
-            .iter()
-            .map(|index| {
-                if *index == 4 {
-                    attribution.phases[4]
-                        .wall_nanos
-                        .saturating_sub(replay_state_wall)
-                } else {
-                    attribution.phases[*index].wall_nanos
-                }
-            })
-            .sum();
-        let io: u64 = plan_phases
-            .iter()
-            .map(|index| attribution.phases[*index].io_nanos)
-            .sum();
-        let batches: u64 = plan_phases
-            .iter()
-            .map(|index| attribution.phases[*index].read_batches)
-            .sum();
-        let keys: u64 = plan_phases
-            .iter()
-            .map(|index| attribution.phases[*index].read_keys)
-            .sum();
-        let bytes: u64 = plan_phases
-            .iter()
-            .map(|index| attribution.phases[*index].read_bytes)
-            .sum();
+        let plan_phases = [1usize, 2, 3, 4, 5, 6];
+        let sum = |field: fn(&lix::storage_bench::PlanLoadPhaseMetric) -> u64| -> u64 {
+            plan_phases
+                .iter()
+                .map(|index| field(&attribution.phases[*index]))
+                .sum()
+        };
+        let wall: u64 = plan_phases.iter().map(|index| exclusive_of(*index)).sum();
+        let io = sum(|phase| phase.io_nanos);
+        let calls = sum(|phase| phase.read_calls);
+        let keys = sum(|phase| phase.read_keys);
+        let bytes = sum(|phase| phase.read_bytes);
         println!(
-            "{label}: per_plan wall_us {:.2} io_us {:.2} non_io_us {:.2} batches {:.2} keys {:.2} bytes {:.1} members {:.2}",
+            "{label}: per_plan wall_us {:.2} io_us {:.2} non_io_us {:.2} calls {:.2} keys {:.2} bytes {:.1} members {:.2}",
             wall as f64 / plans / 1e3,
             io as f64 / plans / 1e3,
             wall.saturating_sub(io) as f64 / plans / 1e3,
-            batches as f64 / plans,
+            calls as f64 / plans,
             keys as f64 / plans,
             bytes as f64 / plans,
             attribution.members_decoded as f64 / plans
         );
+        let tree = attribution.phases[6];
+        if tree.entries > 0 {
+            println!(
+                "{label}: per_tree_scan entries {} wall_us {:.2} io_us {:.2} non_io_us {:.2} calls {:.2} keys {:.2} bytes {:.1}",
+                tree.entries,
+                tree.wall_nanos as f64 / tree.entries as f64 / 1e3,
+                tree.io_nanos as f64 / tree.entries as f64 / 1e3,
+                tree.wall_nanos.saturating_sub(tree.io_nanos) as f64 / tree.entries as f64 / 1e3,
+                tree.read_calls as f64 / tree.entries as f64,
+                tree.read_keys as f64 / tree.entries as f64,
+                tree.read_bytes as f64 / tree.entries as f64
+            );
+        }
     }
 }
 
