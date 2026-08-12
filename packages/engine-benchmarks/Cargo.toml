@@ -107,6 +107,11 @@ path = "examples/revision_pack_oracle.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
+name = "e5_media_probe"
+path = "examples/e5_media_probe.rs"
+required-features = ["storage-benches"]
+
+[[example]]
 name = "chunking_oracle"
 path = "examples/chunking_oracle.rs"
 
