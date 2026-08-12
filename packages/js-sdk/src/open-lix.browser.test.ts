@@ -217,10 +217,7 @@ test("remote client state survives reopen while the server selects the session b
 		await second.close();
 	}
 	expect(initialBranchRequests).toEqual([null, null]);
-	expect(initialAccountRequests).toEqual([
-		null,
-		"00000000-0000-7000-8000-000000000002",
-	]);
+	expect(initialAccountRequests).toEqual([null, null]);
 });
 
 test("IndexedDbStorage persists a complete local Lix", async () => {

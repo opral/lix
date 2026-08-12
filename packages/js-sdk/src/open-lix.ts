@@ -140,9 +140,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			const restoredAccountId = await clientState.get<string>(
 				ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
 			);
-			remoteBinding = await openRemoteLixBinding(options.server, {
-				initialActiveAccountId: restoredAccountId,
-			});
+			remoteBinding = await openRemoteLixBinding(options.server);
 			const activeAccountId = await remoteBinding.activeAccountId();
 			if (activeAccountId !== restoredAccountId) {
 				await clientState.set(ACTIVE_ACCOUNT_CLIENT_STATE_KEY, activeAccountId);
