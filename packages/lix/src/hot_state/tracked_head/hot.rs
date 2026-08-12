@@ -14242,6 +14242,10 @@ mod tests {
     const PAGING_FILE_COUNT: usize = crate::storage_adapter::MAX_SCAN_PAGE_ROWS + 3;
 
     fn paging_certified_batch(index: usize) -> WasmCertifiedEntityBatch {
+        certified_batch_for_schema(PAGING_SCHEMA_KEY, index)
+    }
+
+    fn certified_batch_for_schema(schema_key: &str, index: usize) -> WasmCertifiedEntityBatch {
         let mut page = Vec::new();
         page.extend_from_slice(&0_u32.to_le_bytes());
         page.extend_from_slice(&1_u64.to_le_bytes());
@@ -14253,7 +14257,7 @@ mod tests {
         let page = crate::plugin_wire::encode_single_section(
             crate::plugin_wire::Representation::SchemaRows,
             crate::plugin_wire::Operation::Create,
-            PAGING_SCHEMA_KEY,
+            schema_key,
             br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
             1,
             page,
@@ -14261,7 +14265,7 @@ mod tests {
         .expect("paged certified schema-row page");
         WasmCertifiedEntityBatch {
             format: 1,
-            schema_keys: vec![PAGING_SCHEMA_KEY.to_owned()],
+            schema_keys: vec![schema_key.to_owned()],
             row_count: 1,
             creates: WasmCreateContext {
                 high: 0x0192_0000_0000_7000,
@@ -14371,6 +14375,121 @@ mod tests {
                 return total;
             }
         }
+    }
+
+    /// Pins why a `LIMIT` cannot be pushed into the certified manifest scan.
+    ///
+    /// Manifest keys are `generation || file_id || format || commit_id`, so the
+    /// scan visits files in `file_id` order. Rows are returned in canonical
+    /// identity order, which is `(schema_key, entity_pk, file_id)` — `file_id`
+    /// is the *last* tiebreaker (`compare_materialized_live_identity_refs`).
+    /// The two orders are orthogonal, so the canonically first row can live in
+    /// the last file the scan reaches, and no prefix of the manifest scan is
+    /// enough to answer `LIMIT 1`.
+    ///
+    /// This fixture makes that concrete: the winning row sits in the
+    /// lexicographically *last* file. A limit pushed into the manifest scan
+    /// would stop at `early.csv` and return the wrong row, so this test fails
+    /// for any such pushdown that is not preceded by a physical layout change.
+    #[tokio::test]
+    async fn certified_limit_cannot_stop_at_the_first_manifest() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000001a3";
+        const EARLY_FILE: &str = "early.csv";
+        const LATE_FILE: &str = "late.csv";
+        // Canonical order is schema-major, so the row in the later file wins.
+        const LATE_FILE_SCHEMA: &str = "aaa_winning_schema";
+        const EARLY_FILE_SCHEMA: &str = "zzz_losing_schema";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let head_commit_id = CommitId::for_test_label("limit-pushdown-head");
+        let generation = CommitId::for_test_label("limit-pushdown-generation");
+        let created_at = timestamp();
+        let control = BranchHeadControl {
+            head_commit_id,
+            tracked_generation: generation,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at,
+            updated_at: created_at,
+            ref_change_id: ChangeId::for_test_label("limit-pushdown-ref"),
+        };
+
+        let early = [certified_batch_for_schema(EARLY_FILE_SCHEMA, 0)];
+        let late = [certified_batch_for_schema(LATE_FILE_SCHEMA, 1)];
+        let files = [
+            CertifiedEntityBatchFileRef {
+                branch_id: BRANCH_ID,
+                file_id: EARLY_FILE,
+                batches: &early,
+            },
+            CertifiedEntityBatchFileRef {
+                branch_id: BRANCH_ID,
+                file_id: LATE_FILE,
+                batches: &late,
+            },
+        ];
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("limit pushdown seed read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, BRANCH_ID, control)
+            .expect("limit pushdown control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &files,
+            &BTreeMap::from([(BRANCH_ID.to_owned(), control)]),
+            &BTreeMap::from([(
+                BRANCH_ID.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: Some(control),
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::from([(head_commit_id, created_at)]),
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("limit pushdown batches should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("limit pushdown batches should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("limit pushdown verification read should open");
+        let rows = scan_certified_entity_batch_rows(
+            &read,
+            BRANCH_ID,
+            generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter::default(),
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: Some(1),
+            },
+            Some(1),
+            None,
+        )
+        .await
+        .expect("limited certified scan should succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.row(0).file_id(),
+            Some(LATE_FILE),
+            "LIMIT 1 must return the canonically first row, which lives in the \
+             last file the manifest scan reaches; a limit pushed into that scan \
+             would return {EARLY_FILE} instead"
+        );
+        assert_eq!(rows.row(0).schema_key(), LATE_FILE_SCHEMA);
     }
 
     #[tokio::test]
