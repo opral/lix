@@ -690,6 +690,7 @@ impl TableSpec for EntitySpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     {
+                        record_rows_examined(entity_pks.len());
                         return entity_primary_key_record_batch(&spec, schema, entity_pks);
                     }
                     if let Some(direct_entity_snapshot) = direct_entity_snapshot
@@ -698,6 +699,7 @@ impl TableSpec for EntitySpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     {
+                        record_rows_examined(rows.len());
                         let decoder = EntityProjectionDecoder::new(
                             &spec,
                             schema.fields().iter().map(|field| field.name().as_str()),
@@ -713,6 +715,9 @@ impl TableSpec for EntitySpec {
                         .scan_batch(&request)
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
+                    // Before `row_filters` run: this is the row count a
+                    // predicate without an indexed access path pays for.
+                    record_rows_examined(rows.len());
                     let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                     entity_record_batch_with_parsed(
                         &spec,
@@ -1056,6 +1061,10 @@ async fn entity_columnar_scan_source(
     }
     let partition_count = statistics.len();
     let base_partition_count = group_indices.len();
+    // Overlay batches reach the partition closure already filtered, so the
+    // examined count comes from the unfiltered overlay the layout carries.
+    // One overlay partition records it; the rest record nothing.
+    let overlay_rows_examined = layout.overlay.len();
     let stream_schema = Arc::clone(&schema);
     Ok(batch_stream_source_with_statistics_and_source(
         Arc::clone(&schema),
@@ -1064,6 +1073,9 @@ async fn entity_columnar_scan_source(
         move |partition, _context| {
             debug_assert!(partition < partition_count);
             if partition >= base_partition_count {
+                if partition == base_partition_count {
+                    record_rows_examined(overlay_rows_examined);
+                }
                 let schema = Arc::clone(&stream_schema);
                 let batch = entity_columnar_overlay_partition(
                     overlay_batches.as_ref(),
@@ -1156,6 +1168,21 @@ async fn entity_columnar_scan_source(
                 }
                 RecordBatch::try_new(batch_schema, batch.columns().to_vec())
                     .map_err(DataFusionError::from)
+            });
+            // Rows of one row group that survived manifest pruning: group
+            // pruning is the columnar route's access path, so a pruned group
+            // never reaches here and never counts.
+            //
+            // Mapped over the stream rather than recorded inside the future
+            // above, so nothing is added to that future's state machine. These
+            // OLAP plans have very little stack headroom: before #1334 sized
+            // these test threads, adding one `u64` to `SqlReadProfile` was
+            // enough to overflow them. Keep additions off this future.
+            let batches = futures_util::StreamExt::map(batches, |batch| {
+                if let Ok(batch) = &batch {
+                    record_rows_examined(batch.num_rows());
+                }
+                batch
             });
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
         },
@@ -1324,6 +1351,22 @@ fn entity_columnar_overlay_batches(
         })
         .collect()
 }
+
+/// Records rows a scan route looked at, before its own filtering.
+///
+/// `sql_profile` is gated behind `storage-benches`, so the call sites must not
+/// name it directly: `--all-features` builds would compile and the default and
+/// `wasm32` builds would not. Routing every site through this pair keeps the
+/// diagnostic out of builds that do not have the module at all.
+#[cfg(feature = "storage-benches")]
+#[inline]
+fn record_rows_examined(rows: usize) {
+    crate::sql_profile::record_provider_rows_examined(rows);
+}
+
+#[cfg(not(feature = "storage-benches"))]
+#[inline]
+fn record_rows_examined(_rows: usize) {}
 
 fn entity_columnar_group_indices(
     manifest: &crate::columnar_row_group::RowGroupManifest,
