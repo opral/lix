@@ -161,6 +161,7 @@ where
             .clone();
         match event {
             ObserveInvalidationEvent::Generation(generation) => Ok(generation),
+            #[cfg(not(target_family = "wasm"))]
             ObserveInvalidationEvent::TerminalStorageError(error) => Err(error),
         }
     }

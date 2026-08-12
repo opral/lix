@@ -461,7 +461,11 @@ where
                     schema_key: &row.schema_key,
                     file_id: None,
                     entity_pk: &row.entity_pk,
-                    change_id: None,
+                    // The seed already minted this id (`untracked_row`, via the
+                    // functions provider). Init stages straight into the head
+                    // without passing the transaction prepared-row path, so
+                    // carrying it here is what gives the seed row an identity.
+                    change_id: Some(row.id),
                     commit_id: None,
                     untracked: true,
                     deleted: false,

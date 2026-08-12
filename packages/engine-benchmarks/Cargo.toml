@@ -67,6 +67,11 @@ path = "examples/expaa_replay_scope.rs"
 required-features = ["storage-benches"]
 
 [[example]]
+name = "expab_plan_load"
+path = "examples/expab_plan_load.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
 name = "space_growth"
 path = "examples/space_growth.rs"
 required-features = ["storage-benches"]
@@ -238,7 +243,7 @@ required-features = ["storage-benches", "slatedb"]
 name = "slatedb_file_api"
 path = "benches/slatedb_file_api.rs"
 harness = false
-required-features = ["slatedb"]
+required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
 name = "native_file_upsert_component"

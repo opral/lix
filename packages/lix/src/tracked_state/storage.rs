@@ -1013,7 +1013,7 @@ async fn load_current_state_values_from_descriptors(
         }
     }
     for (&source_id, manifest) in &columnar_manifests {
-        let identity_column_index = crate::live_state::entity_identity_column_index(manifest)
+        let identity_column_index = crate::entity_columnar::entity_identity_column_index(manifest)
             .ok_or_else(|| {
                 replacement_payload_error("current-state columnar identity contract drifted")
             })?;
@@ -1068,7 +1068,7 @@ fn apply_columnar_identity_page(
     let first_key = decode_key(&descriptor.first_key)?;
     if manifest.content_digest()? != descriptor.content_digest
         || manifest.namespace != first_key.schema_key
-        || crate::live_state::entity_row_group_set_id(
+        || crate::entity_columnar::entity_row_group_set_id(
             CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id)),
             &manifest.namespace,
         )
@@ -3265,7 +3265,7 @@ async fn load_scoped_current_state_descriptor_rows(
             let schema_key = decode_key(&descriptor.first_key)?.schema_key;
             if manifest.content_digest()? != descriptor.content_digest
                 || manifest.namespace != schema_key
-                || crate::live_state::entity_row_group_set_id(
+                || crate::entity_columnar::entity_row_group_set_id(
                     CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id)),
                     &manifest.namespace,
                 )
@@ -6849,11 +6849,11 @@ pub(crate) fn validate_columnar_mutation_manifest(
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
 ) -> Result<(), LixError> {
     let owner = CommitId::new(uuid::Uuid::from_bytes(parts.owner_commit_id));
-    if crate::live_state::entity_row_group_set_id(owner, &parts.schema_key).as_bytes()
+    if crate::entity_columnar::entity_row_group_set_id(owner, &parts.schema_key).as_bytes()
         != parts.row_group_set_id
         || manifest.content_digest()? != parts.manifest_digest
         || manifest.namespace != parts.schema_key
-        || crate::live_state::entity_identity_column_index(manifest).is_none()
+        || crate::entity_columnar::entity_identity_column_index(manifest).is_none()
         || manifest
             .groups
             .iter()
@@ -8481,7 +8481,17 @@ pub(crate) async fn scan_commit_delta_members(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
-    let batch = scan_commit_delta_values(store, commit_id, &[]).await?;
+    let batch = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::DeltaSegments,
+        );
+        scan_commit_delta_values(store, commit_id, &[]).await?
+    };
+    #[cfg(feature = "storage-benches")]
+    let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+        crate::storage_bench::PlanLoadPhase::Collect,
+    );
     let mut members = Vec::with_capacity(batch.len());
     for row in batch.iter() {
         let key = row.key_ref();
@@ -9258,7 +9268,14 @@ pub(crate) async fn scan_commit_delta_values(
     commit_id: CommitId,
     schema_keys: &[String],
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
-    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
+    let state = {
+        #[cfg(feature = "storage-benches")]
+        let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
+            crate::storage_bench::PlanLoadPhase::ReplayState,
+        );
+        load_point_replay_commit_state(store, commit_id).await?
+    };
+    let Some(state) = state else {
         return Ok(DecodedCommitDeltaBatch::default());
     };
     let source = match state.mutations.selected_source_commit_id() {
@@ -10466,7 +10483,7 @@ pub(crate) async fn stage_delete_commit_state_manifest_for_gc(
                 format!("retired columnar mutation authority '{commit_id}' names owner '{owner}'"),
             ));
         }
-        let row_group_id = crate::live_state::entity_row_group_set_id(commit_id, &parts.schema_key);
+        let row_group_id = crate::entity_columnar::entity_row_group_set_id(commit_id, &parts.schema_key);
         if row_group_id.as_bytes() != parts.row_group_set_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -13210,7 +13227,7 @@ fn validate_commit_state_mutation_inventory(
             })
             || columnar.owner_commit_id != *commit_id.as_uuid().as_bytes()
             || columnar.row_group_set_id
-                != crate::live_state::entity_row_group_set_id(commit_id, &columnar.schema_key)
+                != crate::entity_columnar::entity_row_group_set_id(commit_id, &columnar.schema_key)
                     .as_bytes()
             || columnar.manifest_digest == [0; 32]
             || columnar.schema_key.is_empty()

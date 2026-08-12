@@ -49,6 +49,7 @@ pub(crate) mod compression;
 mod default_wasm_runtime;
 pub(crate) mod domain;
 mod engine;
+pub(crate) mod entity_columnar;
 pub(crate) mod entity_pk;
 pub(crate) mod filesystem;
 pub(crate) mod functions;
@@ -57,6 +58,10 @@ mod handle;
 pub(crate) mod init;
 pub(crate) mod json_store;
 pub(crate) mod live_state;
+/// The declared module layer order and the test that enforces it. Test-only:
+/// it contains no engine code, just the layering artifact and its guard.
+#[cfg(test)]
+mod module_layers;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
 pub(crate) mod plugin;
@@ -64,6 +69,11 @@ mod plugin_arena;
 mod plugin_layout;
 mod plugin_wire;
 mod prepared_dml;
+// Gated exactly like `storage_spaces`, whose rows it re-exports: a build with
+// neither `cfg(test)` nor `storage-benches` has no consumer for the handles and
+// does not compile them.
+#[cfg(any(test, feature = "storage-benches"))]
+pub mod registered_spaces;
 mod schema;
 mod session;
 pub(crate) mod sql2;
