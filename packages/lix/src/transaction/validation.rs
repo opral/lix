@@ -2993,31 +2993,25 @@ async fn validate_committed_unique_constraints(
     }
 
     for (scope, pending_values) in pending_by_scope {
-        // One scan per scope becomes one probe per distinct value when the
-        // scope's pointer group is a single column the hot index plane serves.
-        // That trades an O(collection) scan with a parse per row for O(pending
-        // values) point lookups — a win for the ordinary one-row insert and
-        // for any bulk insert whose collection is larger than its batch.
-        // Everything else, including composite groups and values with no
-        // order-preserving key encoding, keeps the single whole-scope scan.
-        let probes = declared_column_probes(input.schema_catalog, &scope, &pending_values);
-        match probes {
-            Some(probes) => {
-                for probe in probes {
-                    let committed_rows = scan_committed_constraint_rows_by_declared_column(
-                        input.live_state,
-                        &scope.domain,
-                        &scope.schema_key,
-                        probe,
-                    )
-                    .await?;
-                    reject_committed_unique_conflicts(
-                        &committed_rows,
-                        &scope,
-                        &pending_values,
-                        pending_constraints,
-                    )?;
-                }
+        // A scope with exactly one pending value becomes a point probe instead
+        // of a whole-collection scan with a parse per row. Everything else —
+        // composite groups, columns the plane cannot key, and scopes holding
+        // several pending values — keeps the single scan it always had.
+        match declared_column_probe(input.schema_catalog, &scope, &pending_values) {
+            Some(probe) => {
+                let committed_rows = scan_committed_constraint_rows_by_declared_column(
+                    input.live_state,
+                    &scope.domain,
+                    &scope.schema_key,
+                    probe,
+                )
+                .await?;
+                reject_committed_unique_conflicts(
+                    &committed_rows,
+                    &scope,
+                    &pending_values,
+                    pending_constraints,
+                )?;
             }
             None => {
                 let committed_rows = scan_committed_constraint_rows(
@@ -3040,24 +3034,35 @@ async fn validate_committed_unique_constraints(
     Ok(())
 }
 
-/// One `declared_column_eq` predicate per distinct pending value, or `None`
-/// when this scope must keep its whole-collection scan.
+/// The one `declared_column_eq` predicate that can replace this scope's scan,
+/// or `None` when the scope must keep scanning.
 ///
-/// Declines unless the scope is a single-column group that the schema's
-/// `indexed_columns` cover **and** every pending value round-trips exactly
-/// through the index's key encoding. A probe built from a value that does not
-/// round-trip could miss a committed conflict, which would turn a unique
-/// violation into a silently accepted duplicate — so an inexact value sends
-/// the whole scope back to the scan rather than probing approximately.
-fn declared_column_probes(
+/// **Deliberately one value only.** Probing per distinct value would turn one
+/// scan-per-scope into N probes, and a collection with no completeness witness
+/// silently falls back to its ordinary scan — so each of those N probes would
+/// become a *full scan*. That is exactly the population this change must not
+/// hurt: repositories whose collections predate the index plane. Capping at
+/// one value makes the probe route weakly better than the scan route in every
+/// case, which is what lets it be chosen here without first asking whether the
+/// index can serve. Lifting the cap needs that question answered first.
+///
+/// Declines unless the scope is a single-column group the schema's
+/// `indexed_columns` cover **and** the value round-trips exactly through the
+/// index's key encoding. A probe built from a value that does not round-trip
+/// could miss a committed conflict — a unique violation silently accepted, not
+/// a slow query — so an inexact value goes back to the scan.
+fn declared_column_probe(
     schema_catalog: &CatalogSnapshot,
     scope: &PendingUniqueConstraintScope,
     pending_values: &BTreeMap<UniqueConstraintValue, Vec<&EntityPk>>,
-) -> Option<Vec<crate::live_state::DeclaredColumnEq>> {
+) -> Option<crate::live_state::DeclaredColumnEq> {
     let [pointer] = scope.pointer_group.as_slice() else {
         return None;
     };
     let [property] = pointer.as_slice() else {
+        return None;
+    };
+    let [value] = pending_values.keys().collect::<Vec<_>>()[..] else {
         return None;
     };
     let schema = schema_catalog.schema(&scope.schema_key)?;
@@ -3067,16 +3072,11 @@ fn declared_column_probes(
         .iter()
         .find(|column| column.name == *property)?
         .ordinal;
-    pending_values
-        .keys()
-        .map(|value| {
-            Some(crate::live_state::DeclaredColumnEq {
-                schema_key: scope.schema_key.clone(),
-                ordinal,
-                value: value.exact_hot_index_value()?,
-            })
-        })
-        .collect()
+    Some(crate::live_state::DeclaredColumnEq {
+        schema_key: scope.schema_key.clone(),
+        ordinal,
+        value: value.exact_hot_index_value()?,
+    })
 }
 
 /// The committed-row half of the unique check, shared by the probe and scan
