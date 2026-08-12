@@ -195,11 +195,22 @@ async fn depth_bounded_shapes_at_fixed_files() {
         // short-circuits identically on both arms. NULL CONTROL.
         let id_nodepth = "SELECT lixcol_depth FROM lix_file_history($1) \
                           WHERE id = $2 ORDER BY lixcol_depth LIMIT 20";
+        // The BEST case for the ordering change. `depth = 0` bounds the event
+        // walk to a single node, so skipping it saves almost nothing; a bound
+        // near the height of the history makes the bounded walk cost nearly as
+        // much as the unbounded one, so skipping it saves nearly a full
+        // traversal. `LIX_HISTORY_SCALE_HIGH_DEPTH` sets the bound.
+        let high = env_usize("LIX_HISTORY_SCALE_HIGH_DEPTH", 1000);
+        let id_depth_high = format!(
+            "SELECT lixcol_depth FROM lix_file_history($1) \
+             WHERE id = $2 AND lixcol_depth <= {high}"
+        );
 
         for (label, sql, arg) in [
             ("id_depth0", id_depth0, noise_id.clone()),
             ("path_depth0", path_depth0, noise_path.clone()),
             ("null_control_id_nodepth", id_nodepth, noise_id.clone()),
+            ("id_depth_high", id_depth_high.as_str(), noise_id.clone()),
         ] {
             let (d, rows) = timed(
                 &lix,
