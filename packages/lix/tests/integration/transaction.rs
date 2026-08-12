@@ -688,7 +688,7 @@ async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
         .await
         .expect("initialized storage should create an engine");
 
-    storage.fail_read_namespace("changelog.commit");
+    storage.fail_read_space(CHANGELOG_COMMIT_SPACE_ID);
     let before = storage.stats();
     let error = engine
         .rebuild_tracked_state_for_branch(&receipt.main_branch_id)
@@ -721,7 +721,7 @@ async fn write_changelog_commit_failure_does_not_commit_storage_write() {
         .await
         .expect("workspace session should open");
 
-    storage.fail_write_namespace("changelog.commit");
+    storage.fail_write_space(CHANGELOG_COMMIT_SPACE_ID);
     let before = storage.stats();
     let error = session
         .execute(
@@ -1373,12 +1373,29 @@ impl InterferenceGate {
     }
 }
 
+/// The changelog commit space, identified by space id.
+///
+/// This fault injector used to be armed with a space *name*, resolved through a
+/// hand-written `namespace_space()` match from name to `SpaceId`. That match was
+/// a second authority for the engine registry and it failed **open**: an
+/// unrecognised name returned `None`, the injector never fired, and the test
+/// went green having injected no fault at all. A space name carries its record
+/// encoding version and is expected to churn, so that was a live way to turn a
+/// fault-injection test into a no-op silently.
+///
+/// The id is the durable identity — the first four bytes of every physical key,
+/// which a routine encoding bump does not move. The declaration this pins to is
+/// `lix::registered_spaces::COMMIT_SPACE`, `pub` only under `storage-benches`;
+/// this test target has no `required-features`, so it builds without that
+/// feature and the id is restated here rather than imported.
+const CHANGELOG_COMMIT_SPACE_ID: SpaceId = SpaceId(0x0006_0001);
+
 #[derive(Clone, Default)]
 struct RecordingStorage {
     inner: Memory,
     stats: Arc<TransactionStats>,
-    fail_read_namespace: Arc<Mutex<Option<String>>>,
-    fail_write_namespace: Arc<Mutex<Option<String>>>,
+    fail_read_space: Arc<Mutex<Option<SpaceId>>>,
+    fail_write_space: Arc<Mutex<Option<SpaceId>>>,
 }
 
 #[derive(Clone)]
@@ -1640,18 +1657,18 @@ impl RecordingStorage {
         self.stats.snapshot()
     }
 
-    fn fail_read_namespace(&self, namespace: &str) {
+    fn fail_read_space(&self, space: SpaceId) {
         *self
-            .fail_read_namespace
+            .fail_read_space
             .lock()
-            .expect("fail namespace lock should not poison") = Some(namespace.to_string());
+            .expect("fail space lock should not poison") = Some(space);
     }
 
-    fn fail_write_namespace(&self, namespace: &str) {
+    fn fail_write_space(&self, space: SpaceId) {
         *self
-            .fail_write_namespace
+            .fail_write_space
             .lock()
-            .expect("fail namespace lock should not poison") = Some(namespace.to_string());
+            .expect("fail space lock should not poison") = Some(space);
     }
 }
 
@@ -1669,7 +1686,7 @@ impl Storage for RecordingStorage {
         self.stats.read_opened.fetch_add(1, Ordering::SeqCst);
         Ok(RecordingRead {
             inner: self.inner.begin_read(opts).await?,
-            fail_read_namespace: Arc::clone(&self.fail_read_namespace),
+            fail_read_space: Arc::clone(&self.fail_read_space),
         })
     }
 
@@ -1678,7 +1695,7 @@ impl Storage for RecordingStorage {
         Ok(RecordingWrite {
             inner: self.inner.begin_write(opts).await?,
             stats: Arc::clone(&self.stats),
-            fail_write_namespace: Arc::clone(&self.fail_write_namespace),
+            fail_write_space: Arc::clone(&self.fail_write_space),
         })
     }
 }
@@ -1686,13 +1703,13 @@ impl Storage for RecordingStorage {
 #[derive(Clone)]
 struct RecordingRead {
     inner: MemoryRead,
-    fail_read_namespace: Arc<Mutex<Option<String>>>,
+    fail_read_space: Arc<Mutex<Option<SpaceId>>>,
 }
 
 struct RecordingWrite {
     inner: MemoryWrite,
     stats: Arc<TransactionStats>,
-    fail_write_namespace: Arc<Mutex<Option<String>>>,
+    fail_write_space: Arc<Mutex<Option<SpaceId>>>,
 }
 
 impl StorageRead for RecordingRead {
@@ -1756,58 +1773,45 @@ impl StorageWrite for RecordingWrite {
 
 impl RecordingWrite {
     fn fail_if_space_matches(&self, space: lix::storage::StorageSpace) -> Result<(), StorageError> {
-        if let Some(namespace) = self.fail_write_namespace() {
-            if let Some(failing) = namespace_space(&namespace) {
-                if space.id == failing {
-                    return Err(forced_write_failure(&namespace));
-                }
-            }
+        if self.fail_write_space() == Some(space.id) {
+            return Err(forced_write_failure(space.name));
         }
         Ok(())
     }
 
-    fn fail_write_namespace(&self) -> Option<String> {
-        self.fail_write_namespace
+    fn fail_write_space(&self) -> Option<SpaceId> {
+        *self
+            .fail_write_space
             .lock()
-            .expect("fail namespace lock should not poison")
-            .clone()
+            .expect("fail space lock should not poison")
     }
 }
 
 impl RecordingRead {
     fn fail_if_space_matches(&self, space: lix::storage::StorageSpace) -> Result<(), StorageError> {
-        if let Some(namespace) = self.fail_read_namespace() {
-            if let Some(failing) = namespace_space(&namespace) {
-                if space.id == failing {
-                    return Err(forced_read_failure(&namespace));
-                }
-            }
+        if self.fail_read_space() == Some(space.id) {
+            return Err(forced_read_failure(space.name));
         }
         Ok(())
     }
 
-    fn fail_read_namespace(&self) -> Option<String> {
-        self.fail_read_namespace
+    fn fail_read_space(&self) -> Option<SpaceId> {
+        *self
+            .fail_read_space
             .lock()
-            .expect("fail namespace lock should not poison")
-            .clone()
+            .expect("fail space lock should not poison")
     }
 }
 
-fn namespace_space(namespace: &str) -> Option<SpaceId> {
-    match namespace {
-        "changelog.commit" => Some(SpaceId(0x0006_0001)),
-        "changelog.change" => Some(SpaceId(0x0006_0002)),
-        _ => None,
-    }
+/// The space name comes from the `StorageSpace` that actually matched, so the
+/// message names whatever the registry currently calls that space instead of
+/// whatever this file last believed it was called.
+fn forced_read_failure(space: &str) -> StorageError {
+    StorageError::Io(format!("forced read failure for namespace {space}"))
 }
 
-fn forced_read_failure(namespace: &str) -> StorageError {
-    StorageError::Io(format!("forced read failure for namespace {namespace}"))
-}
-
-fn forced_write_failure(namespace: &str) -> StorageError {
-    StorageError::Io(format!("forced write failure for namespace {namespace}"))
+fn forced_write_failure(space: &str) -> StorageError {
+    StorageError::Io(format!("forced write failure for namespace {space}"))
 }
 
 #[derive(Default)]
