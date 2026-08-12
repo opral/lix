@@ -10542,7 +10542,7 @@ async fn hot_scan_entries<'a>(
     }
 
     // The authoritative hot index is file-first, so filesystem queries such as
-    // `WHERE file_id = ?` read one contiguous hydrated range without a second
+    // `WHERE file_id = $1` read one contiguous hydrated range without a second
     // value projection or random point-read hydration.
     if let Some(prefixes) = hot_file_scan_prefixes(branch_id, generation, filter) {
         let entries = HotScanEntries::Decoded(
@@ -11092,7 +11092,7 @@ fn encode_hot_diff_key_parts(
 ///
 /// Measured consequence of leaving the proof scope-global (rocksdb,
 /// hetzner-cpx62-II, `working_diff_file_scope`, 9 reps, four dirty rows in the
-/// probed file): `WHERE file_id = ?` costs 0.61 ms at 1k total dirty rows and
+/// probed file): `WHERE file_id = $1` costs 0.61 ms at 1k total dirty rows and
 /// 51.6 ms at 100k — linear in the dirty set, flat in the answer — while the
 /// finite `schema_key + entity_pk + file_id` shape that bypasses this space
 /// stays at ~0.5 ms across the same range.

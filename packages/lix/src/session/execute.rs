@@ -792,13 +792,13 @@ where
         Ok(ExecutionDisposition::CancellableRead)
     }
 
-    /// Executes one DataFusion SQL statement against this Lix session.
+    /// Executes one PostgreSQL-dialect SQL statement against this Lix session.
     ///
-    /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
-    /// placeholders use `?` or `$1`, `$2`, and so on. SQLite-specific catalog tables
-    /// and transaction statements such as `sqlite_master`, `BEGIN`, and
-    /// `COMMIT` are not part of this contract; use `information_schema` for
-    /// catalog inspection. Lix owns transaction boundaries for each statement.
+    /// Lix supports a PostgreSQL-dialect subset executed by DataFusion.
+    /// Positional placeholders use `$1`, `$2`, and so on. Parsing PostgreSQL
+    /// syntax does not imply support for every PostgreSQL statement or runtime
+    /// feature. Use `information_schema` for catalog inspection. Lix owns
+    /// transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
     }
@@ -3479,21 +3479,7 @@ fn is_acknowledgeable_file_content_read(statement: &DataFusionStatement, params:
         .as_ref()
         .expect("simple point read requires a predicate");
     let mut equality_columns = BTreeSet::new();
-    // Anonymous placeholders are bound in textual order. Atelier's point read
-    // projects the active branch as `? AS active_branch_id` before filtering
-    // by `file.id = ?`, so start the WHERE binder after projection params.
-    let mut anonymous_placeholder_index = point_read
-        .select
-        .projection
-        .iter()
-        .map(anonymous_placeholders_in_select_item)
-        .sum();
-    if !collect_literal_equalities(
-        selection,
-        &mut equality_columns,
-        params,
-        &mut anonymous_placeholder_index,
-    ) {
+    if !collect_literal_equalities(selection, &mut equality_columns, params) {
         return false;
     }
     match point_read.table_name.as_str() {
@@ -4097,9 +4083,7 @@ fn exact_point_text_param(expression: &Expr, params: &[Value]) -> Option<String>
         return None;
     };
     match &value.value {
-        SqlValue::Placeholder(placeholder)
-            if params.len() == 1 && (placeholder == "?" || placeholder == "$1") =>
-        {
+        SqlValue::Placeholder(placeholder) if params.len() == 1 && placeholder == "$1" => {
             let Value::Text(value) = &params[0] else {
                 return None;
             };
@@ -4134,38 +4118,6 @@ fn point_read_limit_is_safe(limit_clause: Option<&LimitClause>) -> bool {
     matches!(&value.value, SqlValue::Number(number, _) if number.parse::<u64>().is_ok_and(|number| number > 0))
 }
 
-fn anonymous_placeholders_in_select_item(item: &SelectItem) -> usize {
-    let expression = match item {
-        SelectItem::UnnamedExpr(expression)
-        | SelectItem::ExprWithAlias {
-            expr: expression, ..
-        } => expression,
-        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return 0,
-    };
-    let mut visitor = AnonymousPlaceholderCounter::default();
-    let _ = expression.visit(&mut visitor);
-    visitor.count
-}
-
-#[derive(Default)]
-struct AnonymousPlaceholderCounter {
-    count: usize,
-}
-
-impl Visitor for AnonymousPlaceholderCounter {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
-        if matches!(
-            expression,
-            Expr::Value(value) if matches!(&value.value, SqlValue::Placeholder(placeholder) if placeholder == "?")
-        ) {
-            self.count = self.count.saturating_add(1);
-        }
-        ControlFlow::Continue(())
-    }
-}
-
 fn group_by_is_empty(group_by: &GroupByExpr) -> bool {
     matches!(group_by, GroupByExpr::Expressions(expressions, modifiers)
         if expressions.is_empty() && modifiers.is_empty())
@@ -4185,19 +4137,16 @@ fn collect_literal_equalities(
     expression: &Expr,
     columns: &mut BTreeSet<String>,
     params: &[Value],
-    anonymous_placeholder_index: &mut usize,
 ) -> bool {
     match expression {
-        Expr::Nested(expression) => {
-            collect_literal_equalities(expression, columns, params, anonymous_placeholder_index)
-        }
+        Expr::Nested(expression) => collect_literal_equalities(expression, columns, params),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
         } => {
-            collect_literal_equalities(left, columns, params, anonymous_placeholder_index)
-                && collect_literal_equalities(right, columns, params, anonymous_placeholder_index)
+            collect_literal_equalities(left, columns, params)
+                && collect_literal_equalities(right, columns, params)
         }
         Expr::BinaryOp {
             left,
@@ -4205,16 +4154,8 @@ fn collect_literal_equalities(
             right,
         } => {
             let column = match (direct_column_name(left), direct_column_name(right)) {
-                (Some(column), None)
-                    if point_identity_value_is_text(right, params, anonymous_placeholder_index) =>
-                {
-                    column
-                }
-                (None, Some(column))
-                    if point_identity_value_is_text(left, params, anonymous_placeholder_index) =>
-                {
-                    column
-                }
+                (Some(column), None) if point_identity_value_is_text(right, params) => column,
+                (None, Some(column)) if point_identity_value_is_text(left, params) => column,
                 _ => return false,
             };
             columns.insert(column)
@@ -4223,26 +4164,16 @@ fn collect_literal_equalities(
     }
 }
 
-fn point_identity_value_is_text(
-    expression: &Expr,
-    params: &[Value],
-    anonymous_placeholder_index: &mut usize,
-) -> bool {
+fn point_identity_value_is_text(expression: &Expr, params: &[Value]) -> bool {
     let Expr::Value(value) = expression else {
         return false;
     };
     match &value.value {
         SqlValue::Placeholder(placeholder) => {
-            let index = if placeholder == "?" {
-                let index = *anonymous_placeholder_index;
-                *anonymous_placeholder_index += 1;
-                Some(index)
-            } else {
-                placeholder
-                    .strip_prefix('$')
-                    .and_then(|index| index.parse::<usize>().ok())
-                    .and_then(|index| index.checked_sub(1))
-            };
+            let index = placeholder
+                .strip_prefix('$')
+                .and_then(|index| index.parse::<usize>().ok())
+                .and_then(|index| index.checked_sub(1));
             index
                 .and_then(|index| params.get(index))
                 .is_some_and(|value| matches!(value, Value::Text(_)))
@@ -4716,7 +4647,7 @@ mod tests {
         );
 
         let change_by_path =
-            sql2::parse_statement("SELECT lixcol_change_id FROM lix_file WHERE path = ?").unwrap();
+            sql2::parse_statement("SELECT lixcol_change_id FROM lix_file WHERE path = $1").unwrap();
         assert_eq!(
             exact_filesystem_read_route(&change_by_path, &[Value::Text("/a.txt".to_string())]),
             Some(ExactFilesystemRead::Point(

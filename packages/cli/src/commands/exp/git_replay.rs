@@ -699,7 +699,7 @@ fn is_prepared_replay_shape(sql: &str) -> bool {
 
 fn git_replay_marker_statement(commit: &ReplayCommit) -> SqlStatement {
     SqlStatement {
-        sql: "INSERT INTO lix_key_value (key, value) VALUES (?, ?) \
+        sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
               ON CONFLICT(key) DO UPDATE SET value = excluded.value"
             .to_string(),
         params: vec![
@@ -1895,7 +1895,10 @@ fn build_replay_commit_statements(
             continue;
         }
 
-        let placeholders = vec!["?"; delete_chunk.len()].join(", ");
+        let placeholders = (1..=delete_chunk.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!("DELETE FROM lix_file WHERE id IN ({placeholders})");
         let params = delete_chunk
             .iter()
@@ -1907,8 +1910,9 @@ fn build_replay_commit_statements(
 
     for row in &batch.inserts {
         statements.push(SqlStatement {
-            sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
-                .to_string(),
+            sql:
+                "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES ($1, $2, $3, $4)"
+                    .to_string(),
             params: vec![
                 Value::Text(row.id.clone()),
                 Value::Text(row.path.clone()),
@@ -1920,10 +1924,11 @@ fn build_replay_commit_statements(
 
     for row in &batch.updates {
         statements.push(SqlStatement {
-            sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?) \
+            sql:
+                "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES ($1, $2, $3, $4) \
                  ON CONFLICT(id) DO UPDATE SET content = excluded.content, \
                  lixcol_metadata = excluded.lixcol_metadata"
-                .to_string(),
+                    .to_string(),
             params: vec![
                 Value::Text(row.id.clone()),
                 Value::Text(row.path.clone()),
@@ -2030,7 +2035,10 @@ where
             end += 1;
         }
         let batch = &expected[offset..end];
-        let placeholders = vec!["?"; batch.len()].join(", ");
+        let placeholders = (1..=batch.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
             "SELECT path, content, lixcol_metadata FROM lix_file WHERE path IN ({placeholders})"
         );
@@ -2336,7 +2344,7 @@ where
     ];
     for (key, archive) in plugins {
         db::block_on(lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES (?, ?)",
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
             &[
                 Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
                 Value::Blob(archive.into()),
@@ -2575,7 +2583,7 @@ mod tests {
         let statements =
             vec![
             SqlStatement {
-                sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
+                sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES ($1, $2, $3, $4)"
                     .to_string(),
                 params: vec![
                     Value::Text(stable_file_id(&git_path(b"one"))),
@@ -2585,7 +2593,7 @@ mod tests {
                 ],
             },
             SqlStatement {
-                sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
+                sql: "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES ($1, $2, $3, $4)"
                     .to_string(),
                 params: vec![
                     Value::Text(stable_file_id(&git_path(b"two"))),
@@ -2610,7 +2618,7 @@ mod tests {
             "two contiguous file rows must enter one prepared production page"
         );
         let marker = db::block_on(lix.execute(
-            "SELECT value FROM lix_key_value WHERE key = ?",
+            "SELECT value FROM lix_key_value WHERE key = $1",
             &[Value::Text(GIT_REPLAY_MARKER_KEY.to_string())],
         ))
         .expect("marker should be visible after atomic replay");
@@ -2731,7 +2739,7 @@ mod tests {
         let marker_rows = db::block_on(lix.execute(
             "SELECT value, lixcol_observed_commit_id \
              FROM lix_key_value_history() \
-             WHERE key = ? AND NOT lixcol_is_deleted",
+             WHERE key = $1 AND NOT lixcol_is_deleted",
             &[Value::Text(GIT_REPLAY_MARKER_KEY.to_string())],
         ))
         .expect("replay markers should be queryable without Git");
@@ -2763,7 +2771,7 @@ mod tests {
                 .get(git_sha)
                 .unwrap_or_else(|| panic!("missing Lix commit for Git version {version_index}"));
             let historical = db::block_on(lix.execute(
-                "SELECT content FROM lix_file_history(?) \
+                "SELECT content FROM lix_file_history($1) \
                  WHERE path = '/asset.bin' AND lixcol_depth = 0 AND NOT lixcol_is_deleted",
                 &[Value::Text(lix_commit.clone())],
             ))
@@ -3100,7 +3108,7 @@ mod tests {
 
         assert_eq!(
             statement.sql,
-            "INSERT INTO lix_key_value (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
         );
         assert_eq!(
             statement.params[0],
@@ -3131,7 +3139,7 @@ mod tests {
         assert_eq!(statements.len(), 1);
         assert_eq!(
             statements[0].sql,
-            "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET content = excluded.content, lixcol_metadata = excluded.lixcol_metadata"
+            "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES ($1, $2, $3, $4) ON CONFLICT(id) DO UPDATE SET content = excluded.content, lixcol_metadata = excluded.lixcol_metadata"
         );
         assert_eq!(
             statements[0].params,
@@ -3161,14 +3169,14 @@ mod tests {
         let statements = build_replay_commit_statements(&batch, DEFAULT_INSERT_BATCH_ROWS);
 
         assert_eq!(statements.len(), 2);
-        assert_eq!(statements[0].sql, "DELETE FROM lix_file WHERE id IN (?)");
+        assert_eq!(statements[0].sql, "DELETE FROM lix_file WHERE id IN ($1)");
         assert_eq!(
             statements[0].params,
             vec![Value::Text("/src/old.ts".to_string())]
         );
         assert_eq!(
             statements[1].sql,
-            "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
+            "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES ($1, $2, $3, $4)"
         );
         assert_eq!(
             statements[1].params,
@@ -3424,7 +3432,7 @@ mod tests {
             "initialization plus four replayed commits should publish five checkpoints"
         );
         let text_rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"docs/renamed.txt")))],
         ))
         .expect("Git text rows should be queryable after replay");
@@ -3433,7 +3441,7 @@ mod tests {
             "renamed text file must derive Git-text semantic rows at its new path"
         );
         let csv_rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM csv_row WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM csv_row WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"table.csv")))],
         ))
         .expect("CSV rows should be queryable after replay");
@@ -3443,7 +3451,7 @@ mod tests {
             "CSV replay must eagerly materialize both records"
         );
         let binary_rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"binary.bin")))],
         ))
         .expect("Git text rows should query for binary fixture");
@@ -3532,7 +3540,7 @@ mod tests {
         let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen cleanly");
         let rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM csv_row WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM csv_row WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"table.csv")))],
         ))
         .expect("CSV rows should be queryable after replay");
@@ -3692,7 +3700,7 @@ mod tests {
         for (index, expected) in expected_final.iter().enumerate() {
             let path = format!("/bulk-{index:02}.txt");
             let file_rows = db::block_on(lix.execute(
-                "SELECT content FROM lix_file WHERE path = ?",
+                "SELECT content FROM lix_file WHERE path = $1",
                 &[Value::Text(path.clone())],
             ))
             .expect("reopened rendered text file should query");
@@ -3711,7 +3719,7 @@ mod tests {
             );
 
             let semantic_rows = db::block_on(lix.execute(
-                "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = ?",
+                "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = $1",
                 &[Value::Text(stable_file_id(&git_path(
                     path.trim_start_matches('/').as_bytes(),
                 )))],
@@ -3793,7 +3801,7 @@ mod tests {
         let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen with installed plugin");
         let file_rows = db::block_on(lix.execute(
-            "SELECT content FROM lix_file WHERE path = ?",
+            "SELECT content FROM lix_file WHERE path = $1",
             &[Value::Text("/src/index.ts".to_string())],
         ))
         .expect("replayed text file should query");
@@ -3808,7 +3816,7 @@ mod tests {
         assert_eq!(rendered, Some(b"a\na\n".as_slice()));
 
         let semantic_rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"src/index.ts")))],
         ))
         .expect("replayed Git-text rows should query");

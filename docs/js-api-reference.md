@@ -109,13 +109,13 @@ await storage.syncDiskToLix();
 const result = await lix.execute(sql, params?, options?);
 ```
 
-Executes one DataFusion SQL statement against the active Lix session.
+Executes one PostgreSQL-dialect SQL statement against the active Lix session.
 
 Parameters:
 
 | Parameter | Type                     | Description                                                        |
 | --------- | ------------------------ | ------------------------------------------------------------------ |
-| `sql`     | `string`                 | One SQL statement. Use DataFusion SQL, not SQLite SQL.             |
+| `sql`     | `string`                 | One statement from Lix's PostgreSQL-dialect subset.                |
 | `params`  | `SqlParam[]`             | Optional positional parameters addressed as `$1`, `$2`, and so on. |
 | `options` | `ExecuteOptions`         | Optional execution options. See below.                             |
 
@@ -422,7 +422,12 @@ Closes the Lix handle and its storage resources.
 
 ### clientState
 
-`lix.clientState` stores private client-local JSON state with `get`, `set`, `delete`, and `subscribe`; pass `IndexedDbStorage` in remote mode to persist it locally.
+`lix.clientState` stores private client-local JSON state with asynchronous `get`, `set`, and `delete` methods plus `subscribe`; pass `IndexedDbStorage` in remote mode to persist it locally.
+
+```ts
+const preference = await lix.clientState.get("preference");
+await lix.clientState.set("preference", { sidebar: "history" });
+```
 
 ## Transaction
 

@@ -25,7 +25,7 @@ simulation_test!(subquery_reads_do_not_leak_storage_read_handles, |sim| async mo
     for (index, key) in ["sq-a", "sq-b", "sq-c"].into_iter().enumerate() {
         session
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES (?, ?)",
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
                 &[
                     Value::Text(key.to_string()),
                     Value::Text(format!("value-{index}")),

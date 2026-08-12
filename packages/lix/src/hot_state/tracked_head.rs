@@ -4137,7 +4137,7 @@ mod tests {
             Some("01920000-0000-7000-8000-0000000000b2")
         );
 
-        // A schema-scoped `file_id = ?` query reads the hydrated file-first
+        // A schema-scoped `file_id = $1` query reads the hydrated file-first
         // primary range directly. This is the access pattern used by
         // filesystem-backed entity scans, where the entity PK is not known
         // before the query.

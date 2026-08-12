@@ -60,7 +60,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_revert (diff_id) \
                  SELECT diff_id \
-                 FROM VALUES ($1) AS selected(diff_id) \
+                 FROM (VALUES ($1)) AS selected(diff_id) \
                  RETURNING commit_id",
                 &[selected_diff_id],
             )

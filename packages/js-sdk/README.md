@@ -68,14 +68,14 @@ const lix = await openLix({
 	storage: new IndexedDbStorage({ name: "lixray-client" }),
 });
 
-const previousUiState = lix.clientState.get("atelier-ui");
+const previousUiState = await lix.clientState.get("atelier-ui");
 await lix.clientState.set("atelier-ui", { sidebar: "history" });
 ```
 
-`lix.clientState` is hydrated before `openLix()` resolves, so reads are
-synchronous. Its JSON values and the client's active branch are stored in a
-the local IndexedDB database; workspace SQL continues to execute only on the
-server. Reopening the same remote URL with the same storage name restores both. Each
+`lix.clientState` reads and writes through the local Lix transaction path. Its
+JSON values and the client's active branch are stored in the local IndexedDB
+database; workspace SQL continues to execute only on the server. Reopening the
+same remote URL with the same storage name restores both. Each
 remote server session is branch-pinned, so switching one client does not switch
 another client.
 

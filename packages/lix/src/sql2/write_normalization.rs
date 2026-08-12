@@ -251,7 +251,7 @@ pub(crate) fn scalar_is_binary_or_null(value: &ScalarValue) -> bool {
 }
 
 pub(crate) const LIX_FILE_CONTENT_CAST_HINT: &str =
-    "Use CAST(? AS BYTEA) with a text parameter for file contents.";
+    "Use CAST($1 AS BYTEA) with a text parameter for file contents.";
 
 pub(crate) fn lix_file_content_type_lix_error() -> LixError {
     LixError::new(

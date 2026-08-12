@@ -2907,7 +2907,7 @@ fn expected_positional_parameter_count(
                 LixError::CODE_PARSE_ERROR,
                 format!("unsupported SQL parameter placeholder '{name}'"),
             )
-            .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...")
+            .with_hint("Use PostgreSQL-style numbered placeholders like $1, $2, ...")
             .with_details(json!({
                 "operation": "execute",
                 "placeholder": name,
@@ -2918,7 +2918,7 @@ fn expected_positional_parameter_count(
                 LixError::CODE_PARSE_ERROR,
                 "SQL parameter placeholders are 1-indexed",
             )
-            .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...")
+            .with_hint("Use PostgreSQL-style numbered placeholders like $1, $2, ...")
             .with_details(json!({
                 "operation": "execute",
                 "placeholder": name,
@@ -4195,7 +4195,7 @@ mod tests {
         let plan = create_write_logical_plan(
             &mut ctx,
             "INSERT INTO lix_revert (diff_id) \
-             SELECT diff_id FROM VALUES ('d1.test') AS selected(diff_id) \
+             SELECT diff_id FROM (VALUES ('d1.test')) AS selected(diff_id) \
              RETURNING commit_id",
         )
         .await

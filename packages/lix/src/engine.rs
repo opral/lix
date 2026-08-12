@@ -1608,7 +1608,7 @@ mod tests {
         }
     }
 
-    /// `WHERE lixcol_file_id = ?` is now an exact provider constraint, so
+    /// `WHERE lixcol_file_id = $1` is now an exact provider constraint, so
     /// DataFusion drops its residual filter and the answer rests entirely on
     /// `HotStateFilter::file_ids`. Rows can live in four authorities — the
     /// branch-local `HOT_ROW` overlay, a packed current base, a certified
