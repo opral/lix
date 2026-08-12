@@ -1580,6 +1580,16 @@ where
     Load: Fn(HistoryRoute) -> LoadFuture,
     LoadFuture: Future<Output = Result<Vec<HistoryEntry>, LixError>>,
 {
+    // Load the context (anchor-only, unbounded) route FIRST, then the event
+    // (depth-bounded) route.
+    //
+    // Both sets are always computed, so this is ordering only. It matters
+    // because the reachable-node cache is keyed by `(head, depth bound)`: a
+    // bounded traversal cannot satisfy a later unbounded request, while an
+    // unbounded traversal satisfies every bounded one by truncation
+    // (`CommitGraphStoreReader::reachable_nodes_within_depth`). Running the
+    // bounded route first therefore pays for two traversals; running the
+    // unbounded route first pays for one.
     let event_entries = load(event_route.clone()).await?;
     let context_entries = if event_route == context_route {
         event_entries.clone()
@@ -3356,6 +3366,97 @@ mod tests {
         assert_eq!(order.lock().unwrap().as_slice(), &[Some(3), None]);
     }
 
+    /// Runs one depth-bounded `lix_file_history` query on a fresh workspace and
+    /// returns the reachable-node census delta for it.
+    ///
+    /// A fresh workspace per shape is deliberate: the reachable-node cache
+    /// lives on the registered surface, so reusing one handle would let the
+    /// first shape's traversal serve the next one and make every shape after
+    /// the first read as a hit.
+    #[cfg(test)]
+    async fn depth_bounded_history_census(shape: &str) -> [u64; 4] {
+        use crate::commit_graph::reachable_census;
+
+        let probe_path = "/probe/census.txt";
+        let lix = crate::open_lix().await.expect("open lix");
+        for revision in 0..4u32 {
+            lix.execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                &[
+                    crate::Value::Text(probe_path.to_string()),
+                    crate::Value::Blob(format!("rev-{revision}").into_bytes().into()),
+                ],
+            )
+            .await
+            .expect("seed commit");
+        }
+        let text = |result: crate::SqlQueryResult, column: usize| match &result.rows()[0].values()
+            [column]
+        {
+            crate::Value::Text(text) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let head = text(
+            lix.execute("SELECT lix_active_branch_commit_id()", &[])
+                .await
+                .expect("active commit"),
+            0,
+        );
+        let file_id = text(
+            lix.execute(
+                "SELECT id FROM lix_file WHERE path = $1",
+                &[crate::Value::Text(probe_path.to_string())],
+            )
+            .await
+            .expect("probe file id"),
+            0,
+        );
+
+        let (sql, params) = match shape {
+            "path" => (
+                "SELECT lixcol_depth FROM lix_file_history($1) \
+                 WHERE path = $2 AND lixcol_depth = 0",
+                vec![
+                    crate::Value::Text(head),
+                    crate::Value::Text(probe_path.to_string()),
+                ],
+            ),
+            "id" => (
+                "SELECT lixcol_depth FROM lix_file_history($1) \
+                 WHERE id = $2 AND lixcol_depth = 0",
+                vec![crate::Value::Text(head), crate::Value::Text(file_id)],
+            ),
+            "unfiltered" => (
+                "SELECT lixcol_depth FROM lix_file_history($1) WHERE lixcol_depth = 0",
+                vec![crate::Value::Text(head)],
+            ),
+            other => panic!("unknown shape {other}"),
+        };
+
+        let before = reachable_census::snapshot();
+        let rows = lix
+            .execute(sql, &params)
+            .await
+            .expect("depth-bounded history query");
+        let after = reachable_census::snapshot();
+        assert!(!rows.rows().is_empty(), "{shape} query returned no rows");
+        lix.close().await.expect("close lix");
+
+        let delta = [
+            after[0] - before[0],
+            after[1] - before[1],
+            after[2] - before[2],
+            after[3] - before[3],
+        ];
+        eprintln!(
+            "reachable_census shape={shape} exact_hit={} bounded_from_unbounded={} \
+             walk_bounded={} walk_unbounded={}",
+            delta[0], delta[1], delta[2], delta[3],
+        );
+        delta
+    }
+
     /// Connectivity check for the route ordering above, at the layer the
     /// ordering actually pays off: the reachable-node cache.
     ///
@@ -3365,75 +3466,33 @@ mod tests {
     /// sits at the SQL surface: a query-level timer cannot distinguish "the
     /// bounded traversal was skipped" from "the bounded traversal was cheap".
     ///
-    /// Asserts both a miss (`WALK_UNBOUNDED`, the traversal that is genuinely
-    /// paid for) and a hit (`BOUNDED_FROM_UNBOUNDED`, the traversal the
-    /// ordering removes).
+    /// Asserts both a miss (`WALK_UNBOUNDED`, the traversal genuinely paid for)
+    /// and a hit (`BOUNDED_FROM_UNBOUNDED`, the traversal the ordering removes)
+    /// for every depth-bounded shape.
+    ///
+    /// The `path` shape reaches this state without the ordering change, because
+    /// `resolve_file_history_path_lookup_ids` already loads the unbounded
+    /// anchor route to resolve the path. The `id` and `unfiltered` shapes have
+    /// no such pre-pass, and it is those two that the ordering fixes.
     #[tokio::test]
     async fn depth_bounded_file_history_is_served_by_the_unbounded_traversal() {
         use crate::commit_graph::reachable_census;
 
-        let lix = crate::open_lix().await.expect("open lix");
-        for revision in 0..4u32 {
-            lix.execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
-                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                &[
-                    crate::Value::Text("/probe/census.txt".to_string()),
-                    crate::Value::Blob(format!("rev-{revision}").into_bytes().into()),
-                ],
-            )
-            .await
-            .expect("seed commit");
+        for shape in ["path", "id", "unfiltered"] {
+            let delta = depth_bounded_history_census(shape).await;
+            assert!(
+                delta[reachable_census::WALK_UNBOUNDED] > 0,
+                "{shape}: expected at least one real (missing) unbounded traversal"
+            );
+            assert!(
+                delta[reachable_census::BOUNDED_FROM_UNBOUNDED] > 0,
+                "{shape}: expected the depth-bounded request to be served by \
+                 truncating the unbounded traversal"
+            );
+            assert_eq!(
+                delta[reachable_census::WALK_BOUNDED], 0,
+                "{shape}: a depth-bounded query must not traverse storage on its own"
+            );
         }
-        let head = match &lix
-            .execute("SELECT lix_active_branch_commit_id()", &[])
-            .await
-            .expect("active commit")
-            .rows()[0]
-            .values()[0]
-        {
-            crate::Value::Text(text) => text.clone(),
-            other => panic!("expected text commit id, got {other:?}"),
-        };
-
-        let before = reachable_census::snapshot();
-        let rows = lix
-            .execute(
-                "SELECT lixcol_depth FROM lix_file_history($1) \
-                 WHERE path = $2 AND lixcol_depth = 0",
-                &[
-                    crate::Value::Text(head),
-                    crate::Value::Text("/probe/census.txt".to_string()),
-                ],
-            )
-            .await
-            .expect("depth-bounded history query");
-        let after = reachable_census::snapshot();
-        assert!(!rows.rows().is_empty(), "probe query returned no rows");
-
-        let delta = |slot: usize| after[slot] - before[slot];
-        let census = format!(
-            "exact_hit={} bounded_from_unbounded={} walk_bounded={} walk_unbounded={}",
-            delta(reachable_census::EXACT_HIT),
-            delta(reachable_census::BOUNDED_FROM_UNBOUNDED),
-            delta(reachable_census::WALK_BOUNDED),
-            delta(reachable_census::WALK_UNBOUNDED),
-        );
-        eprintln!("reachable_census {census}");
-        assert!(
-            delta(reachable_census::WALK_UNBOUNDED) > 0,
-            "expected at least one real (missing) unbounded traversal: {census}"
-        );
-        assert!(
-            delta(reachable_census::BOUNDED_FROM_UNBOUNDED) > 0,
-            "expected the depth-bounded request to be served by truncating the \
-             unbounded traversal: {census}"
-        );
-        assert_eq!(
-            delta(reachable_census::WALK_BOUNDED),
-            0,
-            "a depth-bounded query must not traverse storage on its own: {census}"
-        );
-        lix.close().await.expect("close lix");
     }
 }
