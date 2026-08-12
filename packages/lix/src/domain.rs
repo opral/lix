@@ -165,8 +165,18 @@ impl Domain {
         self.source_domains_that_can_reach()
     }
 
+    /// A row's owning file is looked up in the row's own lane only.
+    ///
+    /// This is the enforcement seam for "a row and the file that owns it live in
+    /// the same lane". Deliberately NOT `reachable_target_domains()`: that
+    /// widening is still correct for `fk_target_domains()` and
+    /// `directory_parent_domains()`, where an untracked row referencing a
+    /// tracked schema, account or parent directory is load-bearing. File
+    /// ownership is the one relationship that must not cross the lane
+    /// boundary, because a tracked file deletion would otherwise silently take
+    /// untracked rows with it.
     pub(crate) fn file_owner_domains(&self) -> Vec<Self> {
-        self.reachable_target_domains()
+        vec![self.clone()]
     }
 
     pub(crate) fn directory_parent_domains(&self) -> Vec<Self> {

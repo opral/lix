@@ -7893,7 +7893,17 @@ async fn stage_incremental_file_delete_cascades(
             ));
         };
         let existing = decode_head_value(&previous)?;
-        if (cascade.untracked && !existing.untracked) || existing.deleted {
+        // A file delete cascades only within its own lane. Since PR D a row and
+        // its owning file are validated into the same lane, so the cross-lane
+        // combination should never arrive here; skipping it is defence in
+        // depth, not live behaviour.
+        //
+        // The `existing.untracked` branch below must NOT be deleted as dead
+        // code. Both lanes share this one path, keyed on the row's own flag,
+        // and it is the only mechanism that removes an untracked file's own
+        // rows when that file is deleted. What the invariant removes is the
+        // cross-lane pairing, which is this condition, not that branch.
+        if cascade.untracked != existing.untracked || existing.deleted {
             continue;
         }
         let row_start = mutations.key_bytes.len();
@@ -8333,7 +8343,10 @@ fn apply_complete_file_delete_cascade(
             continue;
         };
         let existing = decode_head_value(previous.as_ref())?;
-        if (delta.untracked && !existing.untracked) || existing.deleted {
+        // Same-lane cascade only; see the note on the incremental cascade. The
+        // `existing.untracked` branch below is the untracked lane's own removal
+        // mechanism and must not be deleted as dead code.
+        if delta.untracked != existing.untracked || existing.deleted {
             continue;
         }
         if existing.untracked {
