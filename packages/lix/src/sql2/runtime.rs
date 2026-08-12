@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::Arc;
 #[cfg(feature = "storage-benches")]
@@ -8,7 +8,9 @@ use std::time::Instant;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::ScanArgs;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, internal_err};
+use datafusion::datasource::provider_as_source;
 use datafusion::error::Result;
 use datafusion::execution::SessionState;
 use datafusion::execution::TaskContext;
@@ -42,9 +44,83 @@ type PhysicalPlanningCache = (
     PhysicalReadPlanCacheKey<CatalogFingerprint>,
 );
 
+/// One read statement's logical plan as handed to the execution runtime.
+///
+/// A warm physical-template execution never reads the logical plan at all —
+/// the cached leaf-scan requests replan directly against the current session —
+/// so a statement that owns a physical-cache key hands over the planning
+/// cache's *detached* template (table scans holding `EmptyTable` placeholders)
+/// instead of eagerly rebinding every scan to live providers first. The
+/// rebinding then happens here, and only on the paths that actually plan the
+/// logical tree.
+pub(crate) enum RuntimeReadPlan {
+    /// Table scans carry live snapshot-bound providers; plannable as-is.
+    Bound(LogicalPlan),
+    /// Table scans carry detached `EmptyTable` placeholders and must be
+    /// rebound against the session state before DataFusion may plan them.
+    Detached(LogicalPlan),
+}
+
+impl RuntimeReadPlan {
+    pub(crate) fn inner(&self) -> &LogicalPlan {
+        match self {
+            Self::Bound(plan) | Self::Detached(plan) => plan,
+        }
+    }
+
+    async fn into_bound(self, state: &SessionState) -> Result<LogicalPlan> {
+        match self {
+            Self::Bound(plan) => Ok(plan),
+            Self::Detached(plan) => rebind_detached_read_plan(state, plan).await,
+        }
+    }
+}
+
+/// Replaces detached `EmptyTable` scan sources with the current session's
+/// providers. Mirrors the eager rebinding previously done during logical
+/// planning; provider resolution goes through the same shared catalog list.
+async fn rebind_detached_read_plan(
+    state: &SessionState,
+    plan: LogicalPlan,
+) -> Result<LogicalPlan> {
+    let mut tables = BTreeSet::new();
+    plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            tables.insert(scan.table_name.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let mut providers = BTreeMap::new();
+    for table in tables {
+        let provider = state
+            .schema_for_ref(table.clone())?
+            .table(table.table())
+            .await?
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "cached SQL plan provider '{table}' is unavailable"
+                ))
+            })?;
+        providers.insert(table, provider_as_source(provider));
+    }
+    plan.transform_up(|node| {
+        let LogicalPlan::TableScan(mut scan) = node else {
+            return Ok(Transformed::no(node));
+        };
+        scan.source = providers.get(&scan.table_name).cloned().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "cached SQL plan provider '{}' is unavailable",
+                scan.table_name
+            ))
+        })?;
+        Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+    })
+    .map(|transformed| transformed.data)
+}
+
 pub(crate) async fn collect_plan(
     state: &SessionState,
-    logical_plan: LogicalPlan,
+    logical_plan: RuntimeReadPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Vec<RecordBatch>> {
     let task_ctx = execution_task_context(state);
@@ -79,7 +155,7 @@ pub(crate) async fn collect_plan(
 #[cfg(feature = "storage-benches")]
 pub(crate) async fn stream_plan(
     state: &SessionState,
-    logical_plan: LogicalPlan,
+    logical_plan: RuntimeReadPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<SendableRecordBatchStream> {
     let task_ctx = execution_task_context(state);
@@ -118,13 +194,14 @@ fn execution_task_context(state: &SessionState) -> Arc<TaskContext> {
 
 async fn create_or_rebind_physical_plan(
     state: &SessionState,
-    logical_plan: LogicalPlan,
+    logical_plan: RuntimeReadPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let Some((cache, key)) = physical_planning_cache else {
-        return state.create_physical_plan(&logical_plan).await;
+        return state.create_physical_plan(&logical_plan.into_bound(state).await?).await;
     };
     let Some(cached) = cache.physical_read_plan(&key) else {
+        let logical_plan = logical_plan.into_bound(state).await?;
         let optimized = state.optimize(&logical_plan)?;
         let plan = state
             .query_planner()
@@ -145,7 +222,8 @@ async fn create_or_rebind_physical_plan(
     // Warm path. Neither DataFusion's analyzer, logical optimizer nor physical
     // planner runs again for this statement shape: each cached leaf scan is
     // replanned against the current snapshot's provider and grafted into the
-    // template.
+    // template. The logical plan is never consulted, which is why a detached
+    // one may arrive here without ever being rebound.
     if let Some(replacements) = plan_cached_spec_scans(&cached.scans, state).await?
         && let Some(plan) =
             rebind_physical_plan_template(Arc::clone(&cached.template), replacements)
@@ -157,6 +235,7 @@ async fn create_or_rebind_physical_plan(
     // invalidates the detached template before execution. Fall back to the
     // ordinary DataFusion planner for this statement and evict the stale entry.
     cache.forget_physical_read_plan(&key);
+    let logical_plan = logical_plan.into_bound(state).await?;
     let optimized = state.optimize(&logical_plan)?;
     state
         .query_planner()
