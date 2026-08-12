@@ -1153,10 +1153,6 @@ async fn entity_columnar_scan_source(
                     },
                 )
                 .await?;
-                // Rows of one row group that survived manifest pruning. Group
-                // pruning is the columnar route's access path, so a pruned
-                // group never reaches this line and never counts.
-                crate::sql_profile::record_provider_rows_examined(batch.num_rows());
                 if !shadow_identities.is_empty() && !statistics_cached {
                     let statistics = entity_columnar_record_batch_statistics(batch.as_ref())?;
                     reader
@@ -1186,14 +1182,22 @@ async fn cached_or_load_entity_columnar_batch(
     projection: Vec<usize>,
     load: impl Future<Output = Result<Arc<RecordBatch>>>,
 ) -> Result<Arc<RecordBatch>> {
+    // Rows of one row group that survived manifest pruning: group pruning is
+    // the columnar route's access path, so a pruned group never reaches here
+    // and never counts. Recorded in this small helper rather than in the
+    // partition closure that calls it — that closure's future is already at
+    // the edge of the debug-profile stack, and one more live temporary there
+    // overflows it.
     if let Some(batch) = reader
         .cached_entity_columnar_batch(layout, group_index, shadow_identity_digest, &projection)
         .await
         .map_err(lix_error_to_datafusion_error)?
     {
+        crate::sql_profile::record_provider_rows_examined(batch.num_rows());
         return Ok(batch);
     }
     let batch = load.await?;
+    crate::sql_profile::record_provider_rows_examined(batch.num_rows());
     reader
         .cache_entity_columnar_batch(
             layout,
