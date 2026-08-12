@@ -5548,16 +5548,30 @@ async fn stage_tracked_roots(
     }
     let mut tracked_writer = tracked_state.writer(read, writes);
     let mut staged_rebuild_plan_ids = BTreeSet::new();
+    #[cfg(feature = "storage-benches")]
+    let _replay_scope = (!durable_root_rebuild_parents.is_empty())
+        .then(crate::storage_bench::RootReplayScope::enter);
     for parent_commit_id in durable_root_rebuild_parents {
+        #[cfg(feature = "storage-benches")]
+        let plan_load_start = std::time::Instant::now();
         let plans = crate::tracked_state::load_rebuild_plans_to_nearest_available_root(
             read,
             &parent_commit_id.to_string(),
             true,
         )
         .await?;
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_root_replay_plan_load_nanos(
+                plan_load_start.elapsed().as_nanos() as u64,
+            );
+            crate::storage_bench::record_root_replay_boundary(plans.len());
+        }
         let all_new = plans
             .iter()
             .all(|plan| !staged_rebuild_plan_ids.contains(&plan.commit_id));
+        #[cfg(feature = "storage-benches")]
+        let stage_start = std::time::Instant::now();
         if all_new
             && crate::tracked_state::try_stage_collapsed_rebuild_plans_with_writer(
                 &mut tracked_writer,
@@ -5566,6 +5580,13 @@ async fn stage_tracked_roots(
             .await?
             .is_some()
         {
+            #[cfg(feature = "storage-benches")]
+            {
+                crate::storage_bench::record_root_replay_plan_staged();
+                crate::storage_bench::record_root_replay_stage_nanos(
+                    stage_start.elapsed().as_nanos() as u64,
+                );
+            }
             // A collapsed replay stages only its terminal root. Intermediate
             // plan IDs remain unstaged so another rebuild parent sharing this
             // suffix can independently collapse against immutable authority.
@@ -5574,10 +5595,16 @@ async fn stage_tracked_roots(
         }
         for plan in plans.iter().rev() {
             if staged_rebuild_plan_ids.insert(plan.commit_id) {
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_root_replay_plan_staged();
                 crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
                     .await?;
             }
         }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_root_replay_stage_nanos(
+            stage_start.elapsed().as_nanos() as u64
+        );
     }
     let empty_certified_replacement_markers = BTreeSet::new();
     for root in tracked_roots_parent_first(tracked_roots)? {

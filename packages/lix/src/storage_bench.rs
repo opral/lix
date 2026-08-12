@@ -458,6 +458,313 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
     }
 }
 
+// ---------------------------------------------------------------------------
+// Commit-root replay accounting (experiment AA).
+//
+// Answers "how many ancestor commits does one root-materialization boundary
+// replay, and where does the per-replayed-commit cost go". The coarse counters
+// tick once per boundary/plan and are always compiled under `storage-benches`.
+// The per-node cost attribution is behind `root-replay-trace` so no timing A/B
+// ever pays for an `Instant::now()` inside `hash_bytes`.
+// ---------------------------------------------------------------------------
+
+static ROOT_REPLAY_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_PLANS_LOADED: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_PLANS_STAGED: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_AVAILABLE_ROOT_PROBES: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_AVAILABLE_ROOT_HITS: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_PROOF_STAGINGS: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_MAX_PLANS: AtomicU64 = AtomicU64::new(0);
+
+static ROOT_REPLAY_PLAN_LOAD_NANOS: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPLAY_STAGE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-boundary replay-set sizes, in boundary order.
+static ROOT_REPLAY_PLAN_HISTOGRAM: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RootReplayAccounting {
+    /// Distinct durable rootless parents that forced a replay.
+    pub boundaries: u64,
+    /// Total rebuild plans returned by the nearest-available-root walk.
+    pub plans_loaded: u64,
+    /// Plans actually replayed through the tracked-state root writer.
+    pub plans_staged: u64,
+    pub available_root_probes: u64,
+    pub available_root_hits: u64,
+    /// Root stagings performed inside the ancestry proof itself.
+    pub proof_stagings: u64,
+    pub max_plans_in_one_boundary: u64,
+    pub plan_load_nanos: u64,
+    pub stage_nanos: u64,
+    /// Replay-set size per boundary, in boundary order.
+    pub plans_per_boundary: Vec<u64>,
+}
+
+pub(crate) fn record_root_replay_boundary(plans: usize) {
+    ROOT_REPLAY_BOUNDARIES.fetch_add(1, Ordering::Relaxed);
+    ROOT_REPLAY_PLANS_LOADED.fetch_add(plans as u64, Ordering::Relaxed);
+    ROOT_REPLAY_MAX_PLANS.fetch_max(plans as u64, Ordering::Relaxed);
+    if let Ok(mut histogram) = ROOT_REPLAY_PLAN_HISTOGRAM.lock() {
+        histogram.push(plans as u64);
+    }
+}
+
+pub(crate) fn record_root_replay_plan_staged() {
+    ROOT_REPLAY_PLANS_STAGED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_replay_available_root_probe(hit: bool) {
+    ROOT_REPLAY_AVAILABLE_ROOT_PROBES.fetch_add(1, Ordering::Relaxed);
+    if hit {
+        ROOT_REPLAY_AVAILABLE_ROOT_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Retained so the base and candidate arms of an A/B expose the same
+/// accounting surface; the bounded availability proof performs no stagings.
+#[allow(dead_code)]
+pub(crate) fn record_root_replay_proof_staging() {
+    ROOT_REPLAY_PROOF_STAGINGS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_replay_plan_load_nanos(nanos: u64) {
+    ROOT_REPLAY_PLAN_LOAD_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_replay_stage_nanos(nanos: u64) {
+    ROOT_REPLAY_STAGE_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+pub fn take_root_replay_accounting() -> RootReplayAccounting {
+    RootReplayAccounting {
+        boundaries: ROOT_REPLAY_BOUNDARIES.swap(0, Ordering::Relaxed),
+        plans_loaded: ROOT_REPLAY_PLANS_LOADED.swap(0, Ordering::Relaxed),
+        plans_staged: ROOT_REPLAY_PLANS_STAGED.swap(0, Ordering::Relaxed),
+        available_root_probes: ROOT_REPLAY_AVAILABLE_ROOT_PROBES.swap(0, Ordering::Relaxed),
+        available_root_hits: ROOT_REPLAY_AVAILABLE_ROOT_HITS.swap(0, Ordering::Relaxed),
+        proof_stagings: ROOT_REPLAY_PROOF_STAGINGS.swap(0, Ordering::Relaxed),
+        max_plans_in_one_boundary: ROOT_REPLAY_MAX_PLANS.swap(0, Ordering::Relaxed),
+        plan_load_nanos: ROOT_REPLAY_PLAN_LOAD_NANOS.swap(0, Ordering::Relaxed),
+        stage_nanos: ROOT_REPLAY_STAGE_NANOS.swap(0, Ordering::Relaxed),
+        plans_per_boundary: ROOT_REPLAY_PLAN_HISTOGRAM
+            .lock()
+            .map(|mut histogram| std::mem::take(&mut *histogram))
+            .unwrap_or_default(),
+    }
+}
+
+/// Per-node cost attribution for replayed commits.
+///
+/// Every bucket records `(in_replay, total)` so a run can say what fraction of
+/// all tracked-state tree CPU is spent inside commit-root replay rather than on
+/// the commit's own mutations.
+#[cfg(feature = "root-replay-trace")]
+mod replay_trace {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    macro_rules! bucket {
+        ($replay_ns:ident, $total_ns:ident, $replay_bytes:ident, $total_bytes:ident,
+         $replay_count:ident, $total_count:ident, $record:ident) => {
+            static $replay_ns: AtomicU64 = AtomicU64::new(0);
+            static $total_ns: AtomicU64 = AtomicU64::new(0);
+            static $replay_bytes: AtomicU64 = AtomicU64::new(0);
+            static $total_bytes: AtomicU64 = AtomicU64::new(0);
+            static $replay_count: AtomicU64 = AtomicU64::new(0);
+            static $total_count: AtomicU64 = AtomicU64::new(0);
+
+            pub(crate) fn $record(nanos: u64, bytes: u64) {
+                $total_ns.fetch_add(nanos, Ordering::Relaxed);
+                $total_bytes.fetch_add(bytes, Ordering::Relaxed);
+                $total_count.fetch_add(1, Ordering::Relaxed);
+                if in_replay() {
+                    $replay_ns.fetch_add(nanos, Ordering::Relaxed);
+                    $replay_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    $replay_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        };
+    }
+
+    thread_local! {
+        static REPLAY_DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn in_replay() -> bool {
+        REPLAY_DEPTH.with(|depth| depth.get() > 0)
+    }
+
+    pub(crate) fn enter() {
+        REPLAY_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    }
+
+    pub(crate) fn exit() {
+        REPLAY_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+
+    bucket!(
+        READ_NS,
+        READ_TOTAL_NS,
+        READ_BYTES,
+        READ_TOTAL_BYTES,
+        READ_COUNT,
+        READ_TOTAL_COUNT,
+        record_chunk_read
+    );
+    bucket!(
+        DECODE_NS,
+        DECODE_TOTAL_NS,
+        DECODE_BYTES,
+        DECODE_TOTAL_BYTES,
+        DECODE_COUNT,
+        DECODE_TOTAL_COUNT,
+        record_node_decode
+    );
+    bucket!(
+        ENCODE_NS,
+        ENCODE_TOTAL_NS,
+        ENCODE_BYTES,
+        ENCODE_TOTAL_BYTES,
+        ENCODE_COUNT,
+        ENCODE_TOTAL_COUNT,
+        record_node_encode
+    );
+    bucket!(
+        HASH_NS,
+        HASH_TOTAL_NS,
+        HASH_BYTES,
+        HASH_TOTAL_BYTES,
+        HASH_COUNT,
+        HASH_TOTAL_COUNT,
+        record_node_hash
+    );
+
+    pub(crate) fn take() -> super::RootReplayCostAttribution {
+        let bucket = |ns: &AtomicU64,
+                      total_ns: &AtomicU64,
+                      bytes: &AtomicU64,
+                      total_bytes: &AtomicU64,
+                      count: &AtomicU64,
+                      total_count: &AtomicU64| {
+            super::RootReplayCostBucket {
+                replay_nanos: ns.swap(0, Ordering::Relaxed),
+                total_nanos: total_ns.swap(0, Ordering::Relaxed),
+                replay_bytes: bytes.swap(0, Ordering::Relaxed),
+                total_bytes: total_bytes.swap(0, Ordering::Relaxed),
+                replay_count: count.swap(0, Ordering::Relaxed),
+                total_count: total_count.swap(0, Ordering::Relaxed),
+            }
+        };
+        super::RootReplayCostAttribution {
+            storage_read: bucket(
+                &READ_NS,
+                &READ_TOTAL_NS,
+                &READ_BYTES,
+                &READ_TOTAL_BYTES,
+                &READ_COUNT,
+                &READ_TOTAL_COUNT,
+            ),
+            decode: bucket(
+                &DECODE_NS,
+                &DECODE_TOTAL_NS,
+                &DECODE_BYTES,
+                &DECODE_TOTAL_BYTES,
+                &DECODE_COUNT,
+                &DECODE_TOTAL_COUNT,
+            ),
+            encode: bucket(
+                &ENCODE_NS,
+                &ENCODE_TOTAL_NS,
+                &ENCODE_BYTES,
+                &ENCODE_TOTAL_BYTES,
+                &ENCODE_COUNT,
+                &ENCODE_TOTAL_COUNT,
+            ),
+            hash: bucket(
+                &HASH_NS,
+                &HASH_TOTAL_NS,
+                &HASH_BYTES,
+                &HASH_TOTAL_BYTES,
+                &HASH_COUNT,
+                &HASH_TOTAL_COUNT,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootReplayCostBucket {
+    pub replay_nanos: u64,
+    pub total_nanos: u64,
+    pub replay_bytes: u64,
+    pub total_bytes: u64,
+    pub replay_count: u64,
+    pub total_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootReplayCostAttribution {
+    pub storage_read: RootReplayCostBucket,
+    pub decode: RootReplayCostBucket,
+    pub encode: RootReplayCostBucket,
+    pub hash: RootReplayCostBucket,
+}
+
+/// True when this build carries the per-node replay cost attribution.
+pub fn root_replay_trace_enabled() -> bool {
+    cfg!(feature = "root-replay-trace")
+}
+
+pub fn take_root_replay_cost_attribution() -> RootReplayCostAttribution {
+    #[cfg(feature = "root-replay-trace")]
+    {
+        replay_trace::take()
+    }
+    #[cfg(not(feature = "root-replay-trace"))]
+    {
+        RootReplayCostAttribution::default()
+    }
+}
+
+/// Marks the dynamic extent of one commit-root replay for cost attribution.
+pub(crate) struct RootReplayScope;
+
+impl RootReplayScope {
+    pub(crate) fn enter() -> Self {
+        #[cfg(feature = "root-replay-trace")]
+        replay_trace::enter();
+        Self
+    }
+}
+
+impl Drop for RootReplayScope {
+    fn drop(&mut self) {
+        #[cfg(feature = "root-replay-trace")]
+        replay_trace::exit();
+    }
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_chunk_read(nanos: u64, bytes: u64) {
+    replay_trace::record_chunk_read(nanos, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_node_decode(nanos: u64, bytes: u64) {
+    replay_trace::record_node_decode(nanos, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_node_encode(nanos: u64, bytes: u64) {
+    replay_trace::record_node_encode(nanos, bytes);
+}
+
+#[cfg(feature = "root-replay-trace")]
+pub(crate) fn record_replay_node_hash(nanos: u64, bytes: u64) {
+    replay_trace::record_node_hash(nanos, bytes);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BinaryCasWriteAccounting {
     pub chunk_lookup_count: u64,
