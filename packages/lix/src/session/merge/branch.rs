@@ -959,12 +959,12 @@ where
         .filter(|(index, _)| base_rows.row(*index).is_none())
         .map(|(_, key)| key.clone())
         .collect::<Vec<_>>();
-    let certified_base_rows = reader
-        .load_certified_rows_at_commit(
-            &analysis.commits.base_commit_id.to_string(),
-            &missing_base_keys,
-        )
-        .await?;
+    let certified_base_rows = crate::live_state::load_certified_rows_at_commit(
+        reader.store(),
+        &analysis.commits.base_commit_id.to_string(),
+        &missing_base_keys,
+    )
+    .await?;
 
     let mut groups = BTreeMap::<String, PluginMergeConflictGroup>::new();
     for (index, conflict) in semantic_conflicts.into_iter().enumerate() {
