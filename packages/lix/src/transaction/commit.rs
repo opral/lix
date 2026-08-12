@@ -7470,7 +7470,7 @@ mod tests {
         let Some(record) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(record.change_id, change_id("test-uuid-2"));
+        assert_eq!(record.change_id(), change_id("test-uuid-2"));
         let membership_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -7501,7 +7501,7 @@ mod tests {
             .map(|member| &member.change)
             .expect("tracked change should have an authoritative packed payload");
         assert_eq!(change.schema_key, "test_schema");
-        let change_ids = [change_id("change-1"), record.change_id];
+        let change_ids = [change_id("change-1"), record.change_id()];
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &change_ids,
@@ -7559,7 +7559,7 @@ mod tests {
         assert!(
             derived_commit_rows
                 .iter()
-                .any(|row| row.change_id == Some(record.change_id)),
+                .any(|row| row.change_id == Some(record.change_id())),
             "live state should derive the commit row from changelog.commit"
         );
 
@@ -10005,7 +10005,7 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id, change_id("test-uuid-2"));
+        assert_eq!(commit.change_id(), change_id("test-uuid-2"));
         let packed_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -10145,7 +10145,7 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id, change_id("test-uuid-2"));
+        assert_eq!(commit.change_id(), change_id("test-uuid-2"));
         assert_eq!(
             commit.parent_commit_ids,
             vec![CommitId::for_test_label(

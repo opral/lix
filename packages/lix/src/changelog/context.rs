@@ -519,7 +519,19 @@ where
             "change_id",
         )?;
         // A commit's change id is a bijection of its commit id, so the
-        // `commit_id` uniqueness check above already covers it.
+        // `commit_id` uniqueness check above already covers it. That bijection
+        // is only collision-free against the commit's own packed member changes
+        // while the low 32 bits stay reserved, so require it here rather than
+        // trusting every caller to have minted the id through
+        // `CommitId::with_change_address_space`.
+        for commit in &append.commits {
+            if commit.commit_id.as_uuid().as_bytes()[12..] != [0; 4] {
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{}' does not reserve its change address space",
+                    commit.commit_id
+                )));
+            }
+        }
 
         let append_commit_ids = append
             .commits

@@ -456,7 +456,7 @@ where
     _temp_dir: TempDir,
     stats: Arc<Mutex<IoStats>>,
     physical_io: Option<SlateDBIoCounters>,
-    history_commit_change_id: String,
+    history_commit_id: String,
     version: u64,
 }
 
@@ -509,7 +509,7 @@ where
             _temp_dir: temp_dir,
             stats,
             physical_io,
-            history_commit_change_id: format!("{first_batch_name}-commit-0:commit"),
+            history_commit_id: format!("{first_batch_name}-commit-0"),
             version: 0,
         }
     }
@@ -521,11 +521,10 @@ where
             Operation::UniqueAppend => {
                 changelog_bench::append_with_shape(&name, 1, 1).expect("build unique append")
             }
-            Operation::DuplicateRejected => changelog_bench::append_1c_with_commit_change_id(
-                &name,
-                &self.history_commit_change_id,
-            )
-            .expect("build duplicate derived change-id append"),
+            Operation::DuplicateRejected => {
+                changelog_bench::append_1c_with_commit_id(&name, &self.history_commit_id)
+                    .expect("build duplicate derived change-id append")
+            }
         }
     }
 

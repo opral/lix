@@ -246,12 +246,15 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
     Ok(BenchAppend { append })
 }
 
-pub fn append_1c_with_commit_change_id(
-    name: &str,
-    commit_change_id: &str,
-) -> Result<BenchAppend, LixError> {
+/// Builds a one-commit append whose commit — and therefore whose derived
+/// commit change id — is pinned to `commit_label`.
+///
+/// A commit's change id is `commit_id` at ordinal zero of its own change
+/// address space, so pinning the commit id pins both.
+pub fn append_1c_with_commit_id(name: &str, commit_label: &str) -> Result<BenchAppend, LixError> {
     let mut append = direct_append_with_shape(name, 1, 1)?;
-    append.append.commits[0].change_id = ChangeId::for_test_label(commit_change_id);
+    append.append.commits[0].commit_id =
+        CommitId::with_change_address_space(*CommitId::for_test_label(commit_label).as_uuid());
     Ok(append)
 }
 
@@ -489,8 +492,11 @@ fn direct_append_with_shape(
     let mut next_change = 0usize;
     for commit_index in 0..commit_count {
         let commit_id = format!("{name}-commit-{commit_index}");
-        let commit_change_id = format!("{commit_id}:commit");
-        let typed_commit_id = CommitId::for_test_label(&commit_id);
+        // Real commits are minted through `with_change_address_space`; fixtures
+        // must match or their derived commit change id lands inside the packed
+        // change range.
+        let typed_commit_id =
+            CommitId::with_change_address_space(*CommitId::for_test_label(&commit_id).as_uuid());
         let remaining = change_count.saturating_sub(next_change);
         let take = remaining.min(changes_per_commit);
         for _ in 0..take {
@@ -710,12 +716,15 @@ mod tests {
 
         assert_eq!(commits.len(), 3);
         assert!(commits.windows(2).all(|pair| {
-            pair[0].commit_id < pair[1].commit_id && pair[0].change_id < pair[1].change_id
+            pair[0].commit_id < pair[1].commit_id && pair[0].change_id() < pair[1].change_id()
         }));
+        // The commit change id is the commit id at ordinal zero of the commit's
+        // own change address space, so the two ids now agree by construction and
+        // the fixture only has to prove the commit ids are v7 and distinct.
         assert!(commits.iter().all(|commit| {
             commit.commit_id.as_uuid().get_version_num() == 7
-                && commit.change_id.as_uuid().get_version_num() == 7
-                && commit.commit_id.as_uuid() != commit.change_id.as_uuid()
+                && commit.change_id().as_uuid() == commit.commit_id.as_uuid()
+                && commit.commit_id.as_uuid().as_bytes()[12..] == [0; 4]
         }));
     }
 }

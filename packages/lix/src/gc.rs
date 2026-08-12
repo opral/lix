@@ -2048,7 +2048,7 @@ where
                 .extend(commit.parent_commit_ids.into_iter());
             commits.entries.push(GcCommitInventoryEntry {
                 commit_id: commit.commit_id,
-                change_id: commit.change_id,
+                change_id: commit.change_id(),
                 parent_start,
                 parent_len,
             });

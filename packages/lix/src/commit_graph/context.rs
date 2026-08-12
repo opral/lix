@@ -649,7 +649,7 @@ fn commit_graph_node_from_record(
     };
     let node = CommitGraphNode {
         commit_id: record.commit_id,
-        change_id: record.change_id,
+        change_id: record.change_id(),
         account_id: record.account_id,
         generation: record.generation,
         parent_commit_ids: record.parent_commit_ids,

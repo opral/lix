@@ -901,7 +901,7 @@ mod tests {
         };
 
         assert_eq!(record.commit_id, receipt.initial_commit_id);
-        let commit_change_id = record.change_id.clone();
+        let commit_change_id = record.change_id();
         let membership_read = storage
             .begin_read(crate::storage_adapter::StorageReadOptions::default())
             .await
@@ -912,7 +912,7 @@ mod tests {
                 .expect("initial commit membership should load");
         assert_eq!(change_refs.len(), seed_schema_definitions().len() + 6);
         assert!(
-            !change_refs.contains(&record.change_id),
+            !change_refs.contains(&record.change_id()),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"
         );
 
