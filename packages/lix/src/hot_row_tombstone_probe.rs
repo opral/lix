@@ -65,6 +65,8 @@ struct RowCensus {
     tombstones: usize,
     /// Records in the packed current-state base plane.
     packed_bases: usize,
+    /// Records in the sparse-generation root base plane.
+    root_bases: usize,
 }
 
 impl RowCensus {
@@ -117,10 +119,14 @@ async fn row_census(storage: &Memory) -> RowCensus {
     let packed_bases = space_values(&read, crate::hot_state::PACKED_CURRENT_BASE_SPACE)
         .await
         .len();
+    let root_bases = space_values(&read, crate::hot_state::ROOT_CURRENT_BASE_SPACE)
+        .await
+        .len();
     RowCensus {
         entries: rows.len(),
         tombstones,
         packed_bases,
+        root_bases,
     }
 }
 
@@ -251,7 +257,7 @@ async fn hot_row_tombstone_accumulation_and_scan_cost() {
     let sizes = sizes_from_env("LIX_TOMBSTONE_SIZES", &[100, 1_000, 10_000]);
     let reps = reps_from_env(5);
     println!(
-        "phase1 | arm,n,deletes,row_entries,tombstones,live_entries,packed_bases,answer_rows,scan_us"
+        "phase1 | arm,n,deletes,row_entries,tombstones,live_entries,packed_bases,root_bases,answer_rows,scan_us"
     );
     for n in sizes {
         {
@@ -262,12 +268,13 @@ async fn hot_row_tombstone_accumulation_and_scan_cost() {
             let census = row_census(&storage).await;
             let scan = timed_scan(&session, &scan_sql("churnrow"), 1, reps).await;
             println!(
-                "churn,{n},{},{},{},{},{},1,{}",
+                "churn,{n},{},{},{},{},{},{},1,{}",
                 n - 1,
                 census.entries,
                 census.tombstones,
                 census.live(),
                 census.packed_bases,
+                census.root_bases,
                 scan.as_micros()
             );
         }
@@ -278,11 +285,12 @@ async fn hot_row_tombstone_accumulation_and_scan_cost() {
             let census = row_census(&storage).await;
             let scan = timed_scan(&session, &scan_sql("freshrow"), 1, reps).await;
             println!(
-                "fresh,{n},0,{},{},{},{},1,{}",
+                "fresh,{n},0,{},{},{},{},{},1,{}",
                 census.entries,
                 census.tombstones,
                 census.live(),
                 census.packed_bases,
+                census.root_bases,
                 scan.as_micros()
             );
         }
@@ -305,14 +313,15 @@ async fn hot_row_tombstone_reclamation_events() {
     insert_rows(&session, "evtrow", n).await;
     delete_all_but_first(&session, "evtrow", n).await;
 
-    println!("phase2 | event,row_entries,tombstones,live_entries,packed_bases,scan_us");
-    let mut report = |label: &str, census: RowCensus, scan: Duration| {
+    println!("phase2 | event,row_entries,tombstones,live_entries,packed_bases,root_bases,scan_us");
+    let report = |label: &str, census: RowCensus, scan: Duration| {
         println!(
-            "{label},{},{},{},{},{}",
+            "{label},{},{},{},{},{},{}",
             census.entries,
             census.tombstones,
             census.live(),
             census.packed_bases,
+            census.root_bases,
             scan.as_micros()
         );
     };
@@ -367,4 +376,89 @@ async fn hot_row_tombstone_reclamation_events() {
     let census = row_census(&storage).await;
     let scan = timed_scan(&session, &scan_sql("evtrow"), 1, reps).await;
     report("after_ckpt2_gc", census, scan);
+}
+
+/// PHASE 3 — generation rotation.
+///
+/// The claim under test is that a branch lifecycle publication mints a fresh
+/// serving generation and *re-encodes* the retired generation's tombstones into
+/// it, so the retirement sweep reclaims nothing on net. The census is taken on
+/// the whole `ROW_SPACE`, across every branch and generation, so a carry-forward
+/// shows up as a count that does not fall.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn hot_row_tombstone_generation_rotation() {
+    let n = sizes_from_env("LIX_TOMBSTONE_SIZES", &[1_000])[0];
+    let reps = reps_from_env(5);
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("rotrow")).await;
+    insert_rows(&session, "rotrow", n).await;
+    delete_all_but_first(&session, "rotrow", n).await;
+
+    println!("phase3 | event,row_entries,tombstones,live_entries,packed_bases,root_bases,scan_us");
+    let report = |label: &str, census: RowCensus, scan: Duration| {
+        println!(
+            "{label},{},{},{},{},{},{}",
+            census.entries,
+            census.tombstones,
+            census.live(),
+            census.packed_bases,
+            census.root_bases,
+            scan.as_micros()
+        );
+    };
+
+    let main_branch_id = session
+        .active_branch_id()
+        .await
+        .expect("active branch should resolve");
+    let census = row_census(&storage).await;
+    let scan = timed_scan(&session, &scan_sql("rotrow"), 1, reps).await;
+    report("after_churn", census, scan);
+
+    let branch = session
+        .create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "e45-rotation".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("branch should create");
+    let census = row_census(&storage).await;
+    let scan = timed_scan(&session, &scan_sql("rotrow"), 1, reps).await;
+    report("after_create_branch", census, scan);
+
+    session
+        .switch_branch(crate::SwitchBranchOptions {
+            branch_id: branch.id.clone(),
+        })
+        .await
+        .expect("branch should switch");
+    let census = row_census(&storage).await;
+    let scan = timed_scan(&session, &scan_sql("rotrow"), 1, reps).await;
+    report("after_switch_to_branch", census, scan);
+
+    // A commit on the new branch, then back to main: exercises both branches'
+    // serving generations.
+    session
+        .execute(
+            "INSERT INTO rotrow (id, locale) VALUES ('branch-row', 'x')",
+            &[],
+        )
+        .await
+        .expect("branch insert should commit");
+    session
+        .switch_branch(crate::SwitchBranchOptions {
+            branch_id: main_branch_id,
+        })
+        .await
+        .expect("branch should switch back");
+    let census = row_census(&storage).await;
+    let scan = timed_scan(&session, &scan_sql("rotrow"), 1, reps).await;
+    report("after_switch_back_to_main", census, scan);
+
+    run_repository_gc(&storage).await;
+    let census = row_census(&storage).await;
+    let scan = timed_scan(&session, &scan_sql("rotrow"), 1, reps).await;
+    report("after_gc", census, scan);
 }
