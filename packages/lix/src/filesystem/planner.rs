@@ -1589,7 +1589,7 @@ pub(crate) fn directory_path_resolvers_from_path_index(
 pub(crate) fn directory_path_resolvers_for_write_paths<'a>(
     index: &super::path_index::FilesystemPathIndex,
     branch_binding: Option<&str>,
-    paths: impl IntoIterator<Item = &'a crate::common::LixPath>,
+    paths: impl IntoIterator<Item = &'a LixPath>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut resolvers: BTreeMap<String, DirectoryPathResolver> = BTreeMap::new();
     let mut probed = BTreeSet::<String>::new();
