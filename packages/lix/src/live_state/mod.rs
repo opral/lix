@@ -15,7 +15,7 @@ pub(crate) use context::{BranchHeadControlCache, LiveStateContext, LiveStateStor
 /// touch every call site at once and can be dropped as those are migrated.
 pub(crate) use crate::entity_columnar::{
     ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
-    EntityColumnarWriteSets, entity_identity_column_index, entity_row_group_set_id,
+    EntityColumnarWriteSets, entity_row_group_set_id,
 };
 pub(crate) use entity_columnar_cache::{
     EntityColumnarArrayBudget, EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey,
