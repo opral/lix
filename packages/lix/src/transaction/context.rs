@@ -517,6 +517,13 @@ fn record_transaction_path_index_build(descriptor_rows: usize) {
 /// that may write. Write-relevant reads must be exposed from this transaction,
 /// after the storage write transaction has begun, rather than from session-level
 /// helpers.
+/// EXPSND probe: retire this pointee so any later gated deref is caught.
+impl<StorageImpl: Storage + 'static> Drop for Transaction<StorageImpl> {
+    fn drop(&mut self) {
+        crate::sql2::expsnd_retire_pointee(std::ptr::from_ref(self) as *const () as usize);
+    }
+}
+
 pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_branch_id: String,
     active_account_id: String,

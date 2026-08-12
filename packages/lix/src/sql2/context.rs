@@ -319,7 +319,69 @@ pub(crate) struct SqlWriteContext {
     write_targets: Option<Arc<super::providers::WriteTargetRegistry>>,
 }
 
-struct SqlWriteContextPtr(NonNull<dyn SqlWriteExecutionContext>);
+struct SqlWriteContextPtr(NonNull<dyn SqlWriteExecutionContext>, u64);
+
+/// EXPSND probe registry.
+pub(crate) struct ExpsndRegistry {
+    next_gen: u64,
+    /// addr -> generation of the pointee currently alive there
+    alive: std::collections::HashMap<usize, u64>,
+    /// (addr, gen) -> number of live `SqlWriteContextPtr` for that pointee
+    live_ptrs: std::collections::HashMap<(usize, u64), usize>,
+}
+
+pub(crate) static EXPSND: std::sync::LazyLock<std::sync::Mutex<ExpsndRegistry>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(ExpsndRegistry {
+            next_gen: 0,
+            alive: std::collections::HashMap::new(),
+            live_ptrs: std::collections::HashMap::new(),
+        })
+    });
+
+pub(crate) fn expsnd_log(line: &str) {
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/root/claude5/expSND-deref.log")
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Called by `Transaction::drop`. Retires the pointee and reports whether any
+/// pointer to it was still alive.
+pub(crate) fn expsnd_retire_pointee(addr: usize) {
+    let mut registry = EXPSND.lock().unwrap();
+    if let Some(generation) = registry.alive.remove(&addr) {
+        let outlived = registry
+            .live_ptrs
+            .get(&(addr, generation))
+            .copied()
+            .unwrap_or(0);
+        drop(registry);
+        if outlived > 0 {
+            expsnd_log(&format!(
+                "OUTLIVED addr={addr:x} gen={generation} live_ptrs={outlived}"
+            ));
+        }
+    }
+}
+
+impl Drop for SqlWriteContextPtr {
+    fn drop(&mut self) {
+        let addr = self.0.as_ptr() as *const () as usize;
+        let mut registry = EXPSND.lock().unwrap();
+        if let Some(count) = registry.live_ptrs.get_mut(&(addr, self.1)) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                registry.live_ptrs.remove(&(addr, self.1));
+            }
+        }
+    }
+}
+
 
 /// Values captured from the write execution context at construction time.
 ///
@@ -357,6 +419,23 @@ unsafe impl Send for SqlWriteContextPtr {}
 unsafe impl Sync for SqlWriteContextPtr {}
 
 impl SqlWriteContext {
+    /// Panics if a gated site is about to dereference a pointee whose
+    /// `Transaction` has already been destroyed.
+    fn expsnd_check_alive(&self, site: &'static str) {
+        let addr = self.ptr.0.as_ptr() as *const () as usize;
+        let generation = self.ptr.1;
+        let live = EXPSND.lock().unwrap().alive.get(&addr).copied();
+        if live != Some(generation) {
+            panic!(
+                "EXPSND_DEREF_AFTER_DEATH: gated `{site}` dereferenced pointee {addr:x} \
+                 (gen {generation}, live now {live:?}) whose Transaction is gone\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }
+}
+
+impl SqlWriteContext {
     pub(crate) fn new(ctx: &mut dyn SqlWriteExecutionContext) -> Self {
         // Capture the shared surface while the `&mut` borrow is still held
         // legitimately, so no later call has to forge one.
@@ -369,6 +448,21 @@ impl SqlWriteContext {
             session_file_views: ctx.session_file_views(),
         });
         let ptr = NonNull::from(ctx);
+        let expsnd_generation = {
+            let addr = ptr.as_ptr() as *const () as usize;
+            let mut registry = EXPSND.lock().unwrap();
+            let generation = match registry.alive.get(&addr) {
+                Some(generation) => *generation,
+                None => {
+                    registry.next_gen += 1;
+                    let generation = registry.next_gen;
+                    registry.alive.insert(addr, generation);
+                    generation
+                }
+            };
+            *registry.live_ptrs.entry((addr, generation)).or_insert(0usize) += 1;
+            generation
+        };
         let ptr = unsafe {
             std::mem::transmute::<
                 NonNull<dyn SqlWriteExecutionContext + '_>,
@@ -376,7 +470,7 @@ impl SqlWriteContext {
             >(ptr)
         };
         Self {
-            ptr: Arc::new(SqlWriteContextPtr(ptr)),
+            ptr: Arc::new(SqlWriteContextPtr(ptr, expsnd_generation)),
             gate: Arc::new(Mutex::new(())),
             shared,
             explicit_insert_columns: None,
@@ -442,6 +536,7 @@ impl SqlWriteContext {
         request: &HotStateScanRequest,
     ) -> Result<MaterializedHotStateBatch, LixError> {
         let _guard = self.gate.lock().await;
+        self.expsnd_check_alive("scan_hot_state_batch");
         unsafe {
             self.ptr
                 .0
@@ -458,6 +553,7 @@ impl SqlWriteContext {
         request: &HotStateExactBatchRequest,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
         let _guard = self.gate.lock().await;
+        self.expsnd_check_alive("load_exact_hot_state_batch");
         unsafe {
             self.ptr
                 .0
@@ -474,6 +570,7 @@ impl SqlWriteContext {
         hashes: &[BlobId],
     ) -> Result<BlobBytesBatch, LixError> {
         let _guard = self.gate.lock().await;
+        self.expsnd_check_alive("load_bytes_many");
         unsafe {
             self.ptr
                 .0
@@ -490,6 +587,7 @@ impl SqlWriteContext {
         branch_id: &str,
     ) -> Result<Option<CommitId>, LixError> {
         let _guard = self.gate.lock().await;
+        self.expsnd_check_alive("load_branch_head");
         unsafe {
             self.ptr
                 .0
@@ -506,6 +604,7 @@ impl SqlWriteContext {
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         let _guard = self.gate.lock().await;
+        self.expsnd_check_alive("filesystem_path_index");
         unsafe {
             self.ptr
                 .0
@@ -522,6 +621,7 @@ impl SqlWriteContext {
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
         let _guard = self.gate.lock().await;
+        self.expsnd_check_alive("stage_write");
         unsafe {
             self.ptr
                 .0
@@ -539,6 +639,7 @@ impl SqlWriteContext {
         diff_ids: Vec<String>,
     ) -> Result<DiffCommandOutcome, LixError> {
         let _guard = self.gate.lock().await;
+        self.expsnd_check_alive("execute_diff_command");
         unsafe {
             self.ptr
                 .0
