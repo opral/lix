@@ -794,6 +794,12 @@ where
             rewritten.filter.declared_column_eq = None;
             return Ok(Some(rewritten));
         }
+        if std::env::var_os("EXPPQ_IDX").is_some() && scope.storage_branch_ids.len() != 1 {
+            eprintln!(
+                "EXPPQ_IDX multi_branch schema={} branches={:?}",
+                predicate.schema_key, scope.storage_branch_ids
+            );
+        }
         let [branch_id] = scope.storage_branch_ids.as_slice() else {
             let mut rewritten = request.clone();
             rewritten.filter.declared_column_eq = None;
@@ -804,6 +810,14 @@ where
             rewritten.filter.declared_column_eq = None;
             return Ok(Some(rewritten));
         };
+        if std::env::var_os("EXPPQ_IDX").is_some() {
+            eprintln!(
+                "EXPPQ_IDX resolve schema={} branches={:?} generation={}",
+                predicate.schema_key,
+                scope.storage_branch_ids,
+                control.tracked_generation,
+            );
+        }
         let candidates = self
             .tracked_head
             .reader(&self.store)
@@ -817,6 +831,9 @@ where
             .await?;
         let mut rewritten = request.clone();
         rewritten.filter.declared_column_eq = None;
+        if std::env::var_os("EXPPQ_IDX").is_some() {
+            eprintln!("EXPPQ_IDX candidates={:?}", candidates.as_ref().map(Vec::len));
+        }
         match candidates {
             None => Ok(Some(rewritten)),
             Some(candidates) if candidates.is_empty() => {
