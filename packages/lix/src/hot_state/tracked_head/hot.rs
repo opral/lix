@@ -3480,29 +3480,63 @@ async fn scan_root_current_base_rows(
     generation: CommitId,
     active_checkpoint_commit_id: Option<CommitId>,
     request: &TrackedStateScanRequest,
+    root_base_cache: Option<&RootBaseBatchCache>,
 ) -> Result<MaterializedHotStateBatch, LixError> {
     let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
     else {
         return Ok(MaterializedHotStateBatch::default());
     };
-    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
-    let tracked =
-        Box::pin(reader.scan_batch_at_commit(&base_commit_id.to_string(), request)).await?;
-    let scopes = tracked
-        .iter()
-        .filter(|row| {
-            row.schema_key() != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-        })
-        .flat_map(|row| {
-            [
-                Some((row.schema_key().to_owned(), None)),
-                row.file_id()
-                    .map(|file_id| (row.schema_key().to_owned(), Some(file_id.to_owned()))),
-            ]
-            .into_iter()
-            .flatten()
-        })
-        .collect::<BTreeSet<_>>();
+    // Only unbounded requests are memoized. A pushed-down LIMIT varies with the
+    // number of sparse candidates that could shadow a root row, so caching by
+    // it would churn the cache with near-duplicate entries for no reuse.
+    let cache = root_base_cache.filter(|_| request.limit.is_none());
+    let tracked = match cache.and_then(|cache| cache.get(base_commit_id, request)) {
+        Some(cached) => {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_root_base_batch_cache_hit();
+            cached
+        }
+        None => {
+            #[cfg(feature = "storage-benches")]
+            if cache.is_some() {
+                crate::storage_bench::record_root_base_batch_cache_miss();
+            }
+            let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+            let produced = Arc::new(
+                Box::pin(reader.scan_batch_at_commit(&base_commit_id.to_string(), request))
+                    .await?,
+            );
+            if let Some(cache) = cache {
+                cache.insert(base_commit_id, request.clone(), Arc::clone(&produced));
+            }
+            produced
+        }
+    };
+    // Tracked rows arrive ordered by `(schema_key, file_id, entity_pk)`, so a
+    // scope repeats across a contiguous run and the set this builds is the
+    // number of collections in the base — one, for an ordinary collection scan.
+    // Allocating the identity per row to insert a duplicate is O(base) heap
+    // traffic for an O(scopes) answer, so skip a row whose scope equals the one
+    // before it. Comparing borrowed `&str` is allocation-free, and the skip is
+    // sound irrespective of ordering: an equal scope is already in the set.
+    let mut scopes = BTreeSet::<(String, Option<String>)>::new();
+    let mut previous_scope: Option<(String, Option<String>)> = None;
+    for row in tracked.iter() {
+        if row.schema_key() == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
+            continue;
+        }
+        if previous_scope.as_ref().is_some_and(|(schema_key, file_id)| {
+            schema_key == row.schema_key() && file_id.as_deref() == row.file_id()
+        }) {
+            continue;
+        }
+        let scope = (row.schema_key().to_owned(), row.file_id().map(str::to_owned));
+        scopes.insert((scope.0.clone(), None));
+        if scope.1.is_some() {
+            scopes.insert(scope.clone());
+        }
+        previous_scope = Some(scope);
+    }
     let scope_refs = scopes
         .iter()
         .map(
@@ -3524,8 +3558,15 @@ async fn scan_root_current_base_rows(
         .filter_map(|(scope, control)| control.map(|control| (scope, control)))
         .collect::<BTreeMap<_, _>>();
     let mut rows = MaterializedHotStateBatchBuilder::with_capacity(tracked.len());
+    let mut scope_memo = RootScopeMemo::default();
     for row in tracked.iter() {
-        if !root_tracked_row_is_active(row, generation, &active_generations, &stored_controls) {
+        if !root_tracked_row_is_active(
+            row,
+            generation,
+            &active_generations,
+            &stored_controls,
+            &mut scope_memo,
+        ) {
             continue;
         }
         push_root_current_base_row(&mut rows, row, branch_id, active_checkpoint_commit_id);
@@ -3540,6 +3581,7 @@ async fn scan_root_current_base_rows_for_merge(
     active_checkpoint_commit_id: Option<CommitId>,
     request: &TrackedStateScanRequest,
     other_candidate_count: usize,
+    root_base_cache: Option<&RootBaseBatchCache>,
 ) -> Result<MaterializedHotStateBatch, LixError> {
     let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
     else {
@@ -3666,6 +3708,7 @@ async fn scan_root_current_base_rows_for_merge(
         generation,
         active_checkpoint_commit_id,
         &root_request,
+        root_base_cache,
     )
     .await
 }
@@ -3729,6 +3772,7 @@ async fn load_root_current_base_exact(
         .collect::<BTreeMap<_, _>>();
     let mut rows = MaterializedHotStateBatchBuilder::with_capacity(keys.len());
     let mut slots = Vec::with_capacity(keys.len());
+    let mut scope_memo = RootScopeMemo::default();
     for index in 0..tracked.len() {
         slots.push(
             tracked
@@ -3739,6 +3783,7 @@ async fn load_root_current_base_exact(
                         generation,
                         &active_generations,
                         &stored_controls,
+                        &mut scope_memo,
                     )
                 })
                 .map(|row| {
@@ -3825,36 +3870,115 @@ struct RootCollectionGeneration {
     created_at: LixTimestamp,
 }
 
+/// The part of [`root_tracked_row_is_active`] that depends only on the scope.
+///
+/// Neither the stored-control mismatch nor the collection-generation floors
+/// depend on the row, and `all(|scope| row.created_at() >= scope.created_at)`
+/// is one comparison against the largest floor. So the whole per-row decision
+/// reduces to a flag and one timestamp compare once the scope is known.
+#[derive(Clone, Copy, Default)]
+struct RootScopeVerdict {
+    /// A stored collection control disagrees with the root's active
+    /// generation, which retires every row of the scope regardless of age.
+    disqualified: bool,
+    /// `max` over the scope's collection-generation `created_at` values.
+    floor: Option<LixTimestamp>,
+}
+
+/// One-entry memo over [`RootScopeVerdict`].
+///
+/// The verdict used to be recomputed per row, and computing it needed the
+/// scope as an owned `(String, Option<String>)` — two heap allocations per row
+/// to probe a map that holds one entry for an ordinary collection scan. Tracked
+/// rows arrive ordered by `(schema_key, file_id, entity_pk)`, so remembering
+/// the previous scope collapses that to one computation per scope run. The
+/// memo is keyed on the full scope, so a cache hit is an exact scope match and
+/// a miss simply recomputes — it cannot serve another scope's verdict even if
+/// the rows were unordered.
+#[derive(Default)]
+struct RootScopeMemo {
+    schema_key: String,
+    file_id: Option<String>,
+    primed: bool,
+    verdict: RootScopeVerdict,
+}
+
+impl RootScopeMemo {
+    fn verdict(
+        &mut self,
+        schema_key: &str,
+        file_id: Option<&str>,
+        branch_generation: CommitId,
+        active_generations: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
+        stored_controls: &BTreeMap<(String, Option<String>), HotCollectionControl>,
+    ) -> RootScopeVerdict {
+        if self.primed && self.schema_key == schema_key && self.file_id.as_deref() == file_id {
+            return self.verdict;
+        }
+        let mut verdict = RootScopeVerdict::default();
+        for scope in [
+            Some((schema_key.to_owned(), None)),
+            file_id.map(|file_id| (schema_key.to_owned(), Some(file_id.to_owned()))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let root_generation = active_generations
+                .get(&scope)
+                .map_or(branch_generation, |generation| generation.commit_id);
+            if stored_controls
+                .get(&scope)
+                .is_some_and(|control| control.active_generation != root_generation)
+            {
+                verdict.disqualified = true;
+            }
+            if let Some(generation) = active_generations.get(&scope) {
+                verdict.floor = Some(match verdict.floor {
+                    Some(floor) if floor >= generation.created_at => floor,
+                    _ => generation.created_at,
+                });
+            }
+        }
+        // Reuse the buffers rather than reallocating them per scope run.
+        self.schema_key.clear();
+        self.schema_key.push_str(schema_key);
+        match file_id {
+            Some(file_id) => {
+                let buffer = self.file_id.get_or_insert_with(String::new);
+                buffer.clear();
+                buffer.push_str(file_id);
+            }
+            None => self.file_id = None,
+        }
+        self.primed = true;
+        self.verdict = verdict;
+        verdict
+    }
+}
+
 fn root_tracked_row_is_active(
     row: crate::tracked_state::MaterializedTrackedStateRowRef<'_>,
     branch_generation: CommitId,
     active_generations: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
     stored_controls: &BTreeMap<(String, Option<String>), HotCollectionControl>,
+    memo: &mut RootScopeMemo,
 ) -> bool {
     if row.schema_key() == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
         return true;
     }
-    [
-        Some((row.schema_key().to_owned(), None)),
-        row.file_id()
-            .map(|file_id| (row.schema_key().to_owned(), Some(file_id.to_owned()))),
-    ]
-    .into_iter()
-    .flatten()
-    .all(|scope| {
-        let root_generation = active_generations
-            .get(&scope)
-            .map_or(branch_generation, |generation| generation.commit_id);
-        if stored_controls
-            .get(&scope)
-            .is_some_and(|control| control.active_generation != root_generation)
-        {
-            return false;
-        }
-        active_generations
-            .get(&scope)
-            .is_none_or(|generation| row.created_at() >= generation.created_at)
-    })
+    let verdict = memo.verdict(
+        row.schema_key(),
+        row.file_id(),
+        branch_generation,
+        active_generations,
+        stored_controls,
+    );
+    if verdict.disqualified {
+        return false;
+    }
+    verdict
+        .floor
+        .is_none_or(|floor| row.created_at() >= floor)
 }
 
 fn materialize_packed_slot(
@@ -4699,10 +4823,133 @@ fn exclude_ordered_live_batch_identities(
     )
 }
 
+/// Serving cache for the materialized tracked state at a root current base.
+///
+/// A rotated (branch) generation does not serve reads from materialized hot
+/// rows. Branch lifecycle publication writes a 16-byte reference to a commit
+/// and copies nothing, so every collection scan on that branch re-derives the
+/// collection from canonical records: a tracked-state tree walk, a key decode
+/// per row, and a commit-delta payload fetch per owning commit. Measured, that
+/// is 2.733 µs per base row against 0.686 for the same answer served from a
+/// branch's own hot generation, and the branch pays it on **every** read for
+/// the rest of its life because nothing ever discharges the deferral.
+///
+/// What makes it cacheable with no invalidation rule at all is that the
+/// re-derivation is a pure function of an **immutable** commit's tracked state
+/// and the request. A commit's tracked state never changes, so a hit on
+/// `(base_commit_id, request)` is exact by construction — there is no revision
+/// to compare and no staleness window. Everything about a rotated generation
+/// that *can* change is deliberately outside what is cached: the branch's
+/// stored collection controls and its working-diff checkpoint are applied by
+/// [`scan_root_current_base_rows`] to the rows this returns, after the fact.
+///
+/// This is a disposable derived view under layout invariant 3: never an
+/// authority, rebuildable by re-running the scan, and dropping it costs only
+/// time. Branch creation therefore stays O(1) — nothing is materialized when a
+/// branch is created — and the first read of a rotated generation pays the
+/// materialization once instead of every read paying it forever.
+#[derive(Default)]
+pub(crate) struct RootBaseBatchCache {
+    entries: std::sync::Mutex<RootBaseBatchCacheEntries>,
+}
+
+#[derive(Default)]
+struct RootBaseBatchCacheEntries {
+    /// Most recently used first.
+    resident: Vec<RootBaseBatchCacheEntry>,
+    rows: usize,
+}
+
+struct RootBaseBatchCacheEntry {
+    base_commit_id: CommitId,
+    request: TrackedStateScanRequest,
+    batch: Arc<crate::tracked_state::MaterializedTrackedStateBatch>,
+}
+
+/// A rotated generation holds one base commit and a handful of request shapes,
+/// so a small cache covers it. The row budget is the real bound; the entry
+/// count only keeps the linear scan short.
+const ROOT_BASE_BATCH_CACHE_MAX_ENTRIES: usize = 16;
+const ROOT_BASE_BATCH_CACHE_MAX_ROWS: usize = 250_000;
+
+impl RootBaseBatchCache {
+    /// A poisoned cache lock degrades to a miss rather than an error. A serving
+    /// cache must never be able to fail a read that would otherwise succeed.
+    fn entries(&self) -> std::sync::MutexGuard<'_, RootBaseBatchCacheEntries> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn get(
+        &self,
+        base_commit_id: CommitId,
+        request: &TrackedStateScanRequest,
+    ) -> Option<Arc<crate::tracked_state::MaterializedTrackedStateBatch>> {
+        let mut entries = self.entries();
+        let index = entries.resident.iter().position(|entry| {
+            entry.base_commit_id == base_commit_id && &entry.request == request
+        })?;
+        let entry = entries.resident.remove(index);
+        let batch = Arc::clone(&entry.batch);
+        entries.resident.insert(0, entry);
+        Some(batch)
+    }
+
+    fn insert(
+        &self,
+        base_commit_id: CommitId,
+        request: TrackedStateScanRequest,
+        batch: Arc<crate::tracked_state::MaterializedTrackedStateBatch>,
+    ) {
+        let rows = batch.len();
+        if rows > ROOT_BASE_BATCH_CACHE_MAX_ROWS {
+            return;
+        }
+        let mut entries = self.entries();
+        if let Some(index) = entries.resident.iter().position(|entry| {
+            entry.base_commit_id == base_commit_id && entry.request == request
+        }) {
+            let previous = entries.resident.remove(index);
+            entries.rows = entries.rows.saturating_sub(previous.batch.len());
+        }
+        entries.resident.insert(
+            0,
+            RootBaseBatchCacheEntry {
+                base_commit_id,
+                request,
+                batch,
+            },
+        );
+        entries.rows = entries.rows.saturating_add(rows);
+        while entries.resident.len() > ROOT_BASE_BATCH_CACHE_MAX_ENTRIES
+            || entries.rows > ROOT_BASE_BATCH_CACHE_MAX_ROWS
+        {
+            let Some(evicted) = entries.resident.pop() else {
+                break;
+            };
+            entries.rows = entries.rows.saturating_sub(evicted.batch.len());
+        }
+    }
+}
+
 /// Direct reader for one published hot generation.
 pub(crate) struct HotStateStoreReader<S> {
     pub(super) store: S,
     pub(super) transaction_cache: Option<Arc<HotStateTransactionCache>>,
+    pub(super) root_base_cache: Option<Arc<RootBaseBatchCache>>,
+}
+
+impl<S> HotStateStoreReader<S> {
+    /// Attaches the engine-lifetime root-base serving cache.
+    ///
+    /// Readers built for write/GC paths deliberately leave this unset: they
+    /// read a generation once as part of producing a write set, so caching
+    /// buys nothing and only holds memory.
+    pub(crate) fn with_root_base_cache(mut self, cache: Arc<RootBaseBatchCache>) -> Self {
+        self.root_base_cache = Some(cache);
+        self
+    }
 }
 
 impl<S> HotStateStoreReader<S>
@@ -5227,6 +5474,7 @@ where
                         // a retired row while a later live row still exists.
                         limit: None,
                     },
+                    self.root_base_cache.as_deref(),
                 ))
                 .await?
             } else {
@@ -5807,6 +6055,7 @@ where
             rows.len()
                 .saturating_add(packed_rows.len())
                 .saturating_add(certified_rows.len()),
+            self.root_base_cache.as_deref(),
         ))
         .await?;
         // HOT and packed rows carry comparable commit ownership; their
@@ -6625,6 +6874,7 @@ where
             let reader = HotStateStoreReader {
                 store: &*self.store,
                 transaction_cache: None,
+                root_base_cache: None,
             };
             reader
                 .exact_collection_live_count(
@@ -12464,6 +12714,205 @@ mod tests {
         StorageWriteOptions,
     };
 
+    /// The root-base cache has no invalidation rule — it relies entirely on the
+    /// key being exact. So the key must actually discriminate: a different base
+    /// commit, a different filter, or a different projection must all miss.
+    /// A false hit here would serve one collection's rows for another's query.
+    #[test]
+    fn root_base_batch_cache_key_is_exact() {
+        let cache = RootBaseBatchCache::default();
+        let first = CommitId::for_test_label("root-base-cache-first");
+        let second = CommitId::for_test_label("root-base-cache-second");
+        let request = |schema_key: &str, columns: &[&str], limit: Option<usize>| {
+            TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![schema_key.to_owned()],
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+                },
+                limit,
+            }
+        };
+        let batch = Arc::new(crate::tracked_state::MaterializedTrackedStateBatch::default());
+
+        let stored = request("s", &["change_id"], None);
+        cache.insert(first, stored.clone(), Arc::clone(&batch));
+
+        assert!(cache.get(first, &stored).is_some(), "exact key must hit");
+        assert!(
+            cache.get(second, &stored).is_none(),
+            "a different base commit must miss"
+        );
+        assert!(
+            cache.get(first, &request("other", &["change_id"], None)).is_none(),
+            "a different schema filter must miss"
+        );
+        assert!(
+            cache.get(first, &request("s", &["snapshot_content"], None)).is_none(),
+            "a different projection must miss"
+        );
+        assert!(
+            cache.get(first, &request("s", &["change_id"], Some(1))).is_none(),
+            "a different limit must miss"
+        );
+    }
+
+    /// The cache is bounded by entry count, so a rotated generation that is
+    /// scanned under many request shapes cannot grow it without limit.
+    #[test]
+    fn root_base_batch_cache_evicts_least_recently_used() {
+        let cache = RootBaseBatchCache::default();
+        let commit_id = CommitId::for_test_label("root-base-cache-evict");
+        let request = |index: usize| TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec![format!("s{index}")],
+                ..TrackedStateFilter::default()
+            },
+            ..TrackedStateScanRequest::default()
+        };
+        let batch = Arc::new(crate::tracked_state::MaterializedTrackedStateBatch::default());
+        for index in 0..=ROOT_BASE_BATCH_CACHE_MAX_ENTRIES {
+            cache.insert(commit_id, request(index), Arc::clone(&batch));
+        }
+        assert_eq!(
+            cache.entries().resident.len(),
+            ROOT_BASE_BATCH_CACHE_MAX_ENTRIES
+        );
+        assert!(
+            cache.get(commit_id, &request(0)).is_none(),
+            "the oldest entry must have been evicted"
+        );
+        assert!(
+            cache
+                .get(commit_id, &request(ROOT_BASE_BATCH_CACHE_MAX_ENTRIES))
+                .is_some(),
+            "the newest entry must be resident"
+        );
+    }
+
+    /// The memo replaced a per-row recomputation with a per-scope one, and it
+    /// also replaced `all(|scope| created_at >= scope.floor)` with a single
+    /// comparison against the largest floor. Both rewrites are only sound if
+    /// the verdict is a pure function of the scope, so check it directly
+    /// against the rule it encodes, including the cases that used to be
+    /// separate scopes: a filed row is governed by its unfiled scope *and* its
+    /// filed scope, and either can disqualify it or raise its floor.
+    #[test]
+    fn root_scope_memo_reproduces_the_per_scope_rule() {
+        let branch_generation = CommitId::for_test_label("memo-branch-generation");
+        let root_generation = CommitId::for_test_label("memo-root-generation");
+        let unfiled = ("s".to_owned(), None);
+        let filed = ("s".to_owned(), Some("f".to_owned()));
+
+        // Reference implementation: the pre-memo predicate, verbatim.
+        let reference = |created_at: LixTimestamp,
+                         file_id: Option<&str>,
+                         active: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
+                         stored: &BTreeMap<(String, Option<String>), HotCollectionControl>| {
+            [
+                Some(("s".to_owned(), None)),
+                file_id.map(|file_id| ("s".to_owned(), Some(file_id.to_owned()))),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|scope| {
+                let root = active
+                    .get(&scope)
+                    .map_or(branch_generation, |generation| generation.commit_id);
+                if stored
+                    .get(&scope)
+                    .is_some_and(|control| control.active_generation != root)
+                {
+                    return false;
+                }
+                active
+                    .get(&scope)
+                    .is_none_or(|generation| created_at >= generation.created_at)
+            })
+        };
+
+        let stamp = |text: &str| LixTimestamp::expect_parse("memo test timestamp", text);
+        let low = stamp("2026-01-01T00:00:00Z");
+        let high = stamp("2026-03-01T00:00:00Z");
+        let control = |generation: CommitId| HotCollectionControl {
+            active_generation: generation,
+            live_count: 0,
+            ordered_identity_digest: None,
+        };
+
+        let generation = |created_at: LixTimestamp| RootCollectionGeneration {
+            commit_id: root_generation,
+            created_at,
+        };
+        // Floor on the unfiled scope only.
+        let unfiled_floor = BTreeMap::from([(unfiled.clone(), generation(high))]);
+        // Two floors, the larger on the filed scope — the `max` case.
+        let both_floors = BTreeMap::from([
+            (unfiled.clone(), generation(low)),
+            (filed.clone(), generation(high)),
+        ]);
+        let cases: Vec<(
+            BTreeMap<(String, Option<String>), RootCollectionGeneration>,
+            BTreeMap<(String, Option<String>), HotCollectionControl>,
+        )> = vec![
+            (BTreeMap::new(), BTreeMap::new()),
+            (unfiled_floor, BTreeMap::new()),
+            (both_floors, BTreeMap::new()),
+            // Disqualifying control on the filed scope only.
+            (
+                BTreeMap::new(),
+                BTreeMap::from([(filed.clone(), control(root_generation))]),
+            ),
+            // Agreeing control: must not disqualify.
+            (
+                BTreeMap::new(),
+                BTreeMap::from([(unfiled.clone(), control(branch_generation))]),
+            ),
+        ];
+
+        for (index, (active, stored)) in cases.iter().enumerate() {
+            for file_id in [None, Some("f")] {
+                let mut memo = RootScopeMemo::default();
+                for created_at in [
+                    stamp("2025-01-01T00:00:00Z"),
+                    stamp("2026-01-01T00:00:00Z"),
+                    stamp("2026-03-01T00:00:00Z"),
+                    stamp("2027-01-01T00:00:00Z"),
+                ] {
+                    let verdict =
+                        memo.verdict("s", file_id, branch_generation, active, stored);
+                    let actual = !verdict.disqualified
+                        && verdict.floor.is_none_or(|floor| created_at >= floor);
+                    assert_eq!(
+                        actual,
+                        reference(created_at, file_id, active, stored),
+                        "case {index}, file_id {file_id:?}, created_at {created_at:?}"
+                    );
+                }
+            }
+        }
+
+        // A primed memo must not answer for a different scope.
+        let active = BTreeMap::from([(
+            filed.clone(),
+            RootCollectionGeneration {
+                commit_id: root_generation,
+                created_at: high,
+            },
+        )]);
+        let stored = BTreeMap::new();
+        let mut memo = RootScopeMemo::default();
+        let filed_verdict = memo.verdict("s", Some("f"), branch_generation, &active, &stored);
+        let unfiled_verdict = memo.verdict("s", None, branch_generation, &active, &stored);
+        assert_eq!(filed_verdict.floor, Some(high));
+        assert_eq!(
+            unfiled_verdict.floor, None,
+            "the unfiled scope has no collection generation and must not inherit the filed floor"
+        );
+    }
+
     #[test]
     fn certified_batch_reader_rejects_legacy_ceb1_magic() {
         let error = match CertifiedBatchReader::new(b"CEB1legacy-inline-page") {
@@ -12670,6 +13119,7 @@ mod tests {
                 scan_calls: None,
             },
             transaction_cache: Some(Arc::new(HotStateTransactionCache::default())),
+            root_base_cache: None,
         };
         for _ in 0..2 {
             let control = reader
@@ -12986,6 +13436,7 @@ mod tests {
         let reader = HotStateStoreReader {
             store: &read,
             transaction_cache: None,
+            root_base_cache: None,
         };
         let missing_entity_pk = EntityPk::single("missing-member");
         let missing_identity = TrackedStateKeyRef {
@@ -13057,6 +13508,7 @@ mod tests {
         HotStateStoreReader {
             store: &read,
             transaction_cache: None,
+            root_base_cache: None,
         }
         .validate_exact_collection_closure(
             BRANCH_ID,
@@ -13147,6 +13599,7 @@ mod tests {
         let reader = HotStateStoreReader {
             store: &read,
             transaction_cache: None,
+            root_base_cache: None,
         };
         let batch = reader
             .scan_live_batch_for_generation(
@@ -13200,6 +13653,7 @@ mod tests {
         let reader = HotStateStoreReader {
             store: &read,
             transaction_cache: None,
+            root_base_cache: None,
         };
         reader
             .validate_exact_collection_closure(
@@ -13250,6 +13704,7 @@ mod tests {
         let error = HotStateStoreReader {
             store: &read,
             transaction_cache: None,
+            root_base_cache: None,
         }
         .validate_exact_collection_closure(
             BRANCH_ID,
@@ -13368,6 +13823,7 @@ mod tests {
             let error = HotStateStoreReader {
                 store: &read,
                 transaction_cache: None,
+                root_base_cache: None,
             }
             .validate_exact_collection_closure(
                 BRANCH_ID,
@@ -13651,6 +14107,7 @@ mod tests {
         let reader = HotStateStoreReader {
             store: read,
             transaction_cache: Some(transaction_cache),
+            root_base_cache: None,
         };
         let control = BranchHeadControl {
             head_commit_id: generation,
@@ -14373,6 +14830,7 @@ mod tests {
                 .await
                 .expect("open exact HOT read"),
             transaction_cache: None,
+            root_base_cache: None,
         };
         let result = reader
             .load_projected_live_batch_for_generation_refs(

@@ -17,6 +17,7 @@ pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
 pub(crate) use hot::hot_generation_scope_prefix;
 pub(crate) use hot::{
+    RootBaseBatchCache,
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
     DeferredFreshHotRowRef, DeferredFreshHotRows, EntityColumnarOverlayRow,
@@ -501,6 +502,7 @@ impl TrackedHeadContext {
         hot::HotStateStoreReader {
             store,
             transaction_cache: None,
+            root_base_cache: None,
         }
     }
 
@@ -516,6 +518,7 @@ impl TrackedHeadContext {
         hot::HotStateStoreReader {
             store,
             transaction_cache: Some(cache),
+            root_base_cache: None,
         }
     }
 
