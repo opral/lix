@@ -4425,7 +4425,7 @@ async fn stage_tracked_head(
             entity_schema_catalog,
             state_rows,
             &root.branch_id,
-            parent_control,
+            parent_control.as_ref(),
         )?;
         if !index_entries.is_empty() || !index_witnesses.is_empty() {
             crate::live_state::stage_hot_index_entries(
@@ -4448,7 +4448,7 @@ async fn stage_tracked_head(
         }
         let mut control = normal_branch_head_control(
             root,
-            parent_control,
+            parent_control.as_ref(),
             generation,
             working_diff_checkpoint_commit_id,
         )?;
