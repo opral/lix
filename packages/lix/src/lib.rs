@@ -64,6 +64,11 @@ mod plugin_arena;
 mod plugin_layout;
 mod plugin_wire;
 mod prepared_dml;
+// Gated exactly like `storage_spaces`, whose rows it re-exports: a build with
+// neither `cfg(test)` nor `storage-benches` has no consumer for the handles and
+// does not compile them.
+#[cfg(any(test, feature = "storage-benches"))]
+pub mod registered_spaces;
 mod schema;
 mod session;
 pub(crate) mod sql2;
