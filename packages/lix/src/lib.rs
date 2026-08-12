@@ -69,9 +69,11 @@ mod plugin_arena;
 mod plugin_layout;
 mod plugin_wire;
 mod prepared_dml;
-// Gated exactly like `storage_spaces`, whose rows it re-exports: a build with
-// neither `cfg(test)` nor `storage-benches` has no consumer for the handles and
-// does not compile them.
+// A `pub` view of `storage_spaces`, which is itself unconditional. This module
+// stays gated on its own merits rather than mirroring the registry's: a build
+// with neither `cfg(test)` nor `storage-benches` has no consumer for the
+// handles, and publishing them there would widen the public surface for
+// nothing.
 #[cfg(any(test, feature = "storage-benches"))]
 pub mod registered_spaces;
 mod schema;
