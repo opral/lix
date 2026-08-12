@@ -32,7 +32,7 @@ use std::time::Instant;
 use lix::storage::{ReadOptions, Storage};
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::layout_accounting;
-use lix::{CreateBranchOptions, Lix, Value, open_lix};
+use lix::{CreateBranchOptions, Lix, SwitchBranchOptions, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 const INSERT_BATCH: usize = 100;
@@ -78,6 +78,7 @@ async fn run_case(files: usize) {
     let seed_started = Instant::now();
     seed_files(&lix, files).await;
     let seed_ms = seed_started.elapsed().as_secs_f64() * 1_000.0;
+    println!("branch_file_cost_seed,files={files},seed_ms={seed_ms:.3}");
 
     let plugin_rows = lix
         .execute("SELECT COUNT(*) AS n FROM text_line", &[])
@@ -101,23 +102,59 @@ async fn run_case(files: usize) {
     }
 
     let branch_started = Instant::now();
-    lix.create_branch(CreateBranchOptions {
-        id: None,
-        name: "e10-branch".to_owned(),
-        from_commit_id: None,
-    })
-    .await
-    .expect("create branch-file-cost branch");
+    let branch_id = lix
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "e10-branch".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create branch-file-cost branch")
+        .id;
     let branch_ms = branch_started.elapsed().as_secs_f64() * 1_000.0;
 
     let after = snapshot(&storage, &db_path).await;
 
+    report(files, "create_branch", &before, &after, branch_ms);
+
+    // A root-backed branch publication is cheap by construction. The question
+    // that decides whether the cost was removed or merely deferred is what the
+    // *first write on the new branch* costs: if the per-file planes are copied
+    // lazily, they are copied here.
+    let switch_started = Instant::now();
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: branch_id.clone(),
+    })
+    .await
+    .expect("switch to branch-file-cost branch");
+    let switch_ms = switch_started.elapsed().as_secs_f64() * 1_000.0;
+    let after_switch = snapshot(&storage, &db_path).await;
+    report(files, "switch_branch", &after, &after_switch, switch_ms);
+
+    let write_started = Instant::now();
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+        &[
+            Value::Text("/docs/branch-probe.txt".to_owned()),
+            Value::Blob(one_document(usize::MAX).into()),
+        ],
+    )
+    .await
+    .expect("write first file on branch-file-cost branch");
+    let write_ms = write_started.elapsed().as_secs_f64() * 1_000.0;
+    let after_write = snapshot(&storage, &db_path).await;
+    report(files, "first_write_on_branch", &after_switch, &after_write, write_ms);
+
+    lix.close().await.expect("close branch-file-cost Lix");
+}
+
+fn report(files: usize, phase: &str, before: &Snapshot, after: &Snapshot, elapsed_ms: f64) {
     println!(
-        "branch_file_cost,files={files},\
+        "branch_file_cost,files={files},phase={phase},\
 before_rows={},after_rows={},d_rows={},\
 before_bytes={},after_bytes={},d_bytes={},\
 before_physical_bytes={},after_physical_bytes={},d_physical_bytes={},\
-seed_ms={seed_ms:.3},create_branch_ms={branch_ms:.3}",
+elapsed_ms={elapsed_ms:.3}",
         before.rows(),
         after.rows(),
         after.rows() as i64 - before.rows() as i64,
@@ -145,7 +182,7 @@ seed_ms={seed_ms:.3},create_branch_ms={branch_ms:.3}",
             continue;
         }
         println!(
-            "branch_file_cost_space,files={files},space={name},\
+            "branch_file_cost_space,files={files},phase={phase},space={name},\
 before_rows={},after_rows={},d_rows={d_rows},\
 before_bytes={},after_bytes={},d_bytes={d_bytes}",
             a.rows,
@@ -154,8 +191,6 @@ before_bytes={},after_bytes={},d_bytes={d_bytes}",
             b.key_bytes + b.value_bytes,
         );
     }
-
-    lix.close().await.expect("close branch-file-cost Lix");
 }
 
 #[derive(Clone, Default)]
@@ -242,19 +277,23 @@ where
             sql.push_str(&format!("(${}, ${})", parameter + 1, parameter + 2));
             let index = written + offset;
             params.push(Value::Text(format!("/docs/file-{index:07}.txt")));
-            let mut body = String::with_capacity(LINES_PER_FILE * 48);
-            for line in 0..LINES_PER_FILE {
-                body.push_str(&format!(
-                    "document {index} line {line}: content padding text\n"
-                ));
-            }
-            params.push(Value::Blob(body.into_bytes().into()));
+            params.push(Value::Blob(one_document(index).into()));
         }
         lix.execute(&sql, &params)
             .await
             .expect("seed branch-file-cost files");
         written += batch;
     }
+}
+
+fn one_document(index: usize) -> Vec<u8> {
+    let mut body = String::with_capacity(LINES_PER_FILE * 48);
+    for line in 0..LINES_PER_FILE {
+        body.push_str(&format!(
+            "document {index} line {line}: content padding text\n"
+        ));
+    }
+    body.into_bytes()
 }
 
 fn build_text_plugin_archive() -> Vec<u8> {
