@@ -15,6 +15,7 @@
 
 mod context;
 mod point;
+pub(crate) mod point_memo;
 mod read_scope;
 #[cfg(test)]
 mod reader;

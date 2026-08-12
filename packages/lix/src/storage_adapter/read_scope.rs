@@ -4,6 +4,7 @@ use crate::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, ScanCursor, StorageError,
     StorageRead, StorageSpace,
 };
+use crate::storage_adapter::point_memo::PointValueMemo;
 
 /// The async read capability consumed by engine stores.
 ///
@@ -51,6 +52,10 @@ where
     R: StorageRead,
 {
     read: Arc<R>,
+    // One memo per pinned view, consulted in `get_many` below. Clones are
+    // handles to the same view and share it; another transaction opens another
+    // scope and starts cold.
+    memo: Arc<PointValueMemo>,
 }
 
 impl<R> SharedStorageAdapterRead<R>
@@ -60,6 +65,7 @@ where
     pub(crate) fn new(read: StorageAdapterReadScope<R>) -> Self {
         Self {
             read: Arc::new(read.into_inner()),
+            memo: Arc::new(PointValueMemo::default()),
         }
     }
 
@@ -82,6 +88,7 @@ where
     fn clone(&self) -> Self {
         Self {
             read: Arc::clone(&self.read),
+            memo: Arc::clone(&self.memo),
         }
     }
 }
@@ -166,13 +173,33 @@ where
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        #[cfg(feature = "root-replay-trace")]
-        {
-            traced_get_many(requests, self.read.get_many(requests))
-        }
-        #[cfg(not(feature = "root-replay-trace"))]
-        {
-            self.read.get_many(requests)
+        // Serve memoized singleton control keys from this pinned view before
+        // going to storage. The view is immutable, so a memoized value is
+        // exactly what a re-read would return; anything the memo does not
+        // serve plans to `None` and passes through untouched.
+        let plan = self.memo.plan(requests);
+        async move {
+            let Some(plan) = plan else {
+                #[cfg(feature = "root-replay-trace")]
+                return traced_get_many(requests, self.read.get_many(requests)).await;
+                #[cfg(not(feature = "root-replay-trace"))]
+                return self.read.get_many(requests).await;
+            };
+            let fetched = match plan.forwarded() {
+                None => GetManyResult { values: Vec::new() },
+                Some(forwarded) => {
+                    let forwarded = [forwarded];
+                    #[cfg(feature = "root-replay-trace")]
+                    {
+                        traced_get_many(&forwarded, self.read.get_many(&forwarded)).await?
+                    }
+                    #[cfg(not(feature = "root-replay-trace"))]
+                    {
+                        self.read.get_many(&forwarded).await?
+                    }
+                }
+            };
+            Ok(self.memo.finish(plan, fetched))
         }
     }
 

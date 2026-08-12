@@ -410,6 +410,16 @@ fn decode_projected_value(
 
 #[cfg(test)]
 mod tests {
+    /// The point memo names this space by id, because `storage_adapter` sits
+    /// below `branch` in the module layer order. Pin the two together so a
+    /// space renumbering fails loudly instead of silently disabling the memo.
+    #[test]
+    fn branch_head_control_space_is_memoized() {
+        assert!(crate::storage_adapter::point_memo::is_memoized(
+            BRANCH_HEAD_CONTROL_SPACE.id
+        ));
+    }
+
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
