@@ -27,9 +27,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use lix::integration::{Engine, SessionContext};
+use lix::registered_spaces::HOT_ROW_SPACE;
 use lix::storage::ReadOptions;
 use lix::storage_adapter::StorageAdapter;
-use lix::registered_spaces::HOT_ROW_SPACE;
 use lix::storage_bench::{layout_accounting, space_inventory};
 use lix::{CreateBranchOptions, Value};
 use lix_storage_slatedb::SlateDB;

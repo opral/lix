@@ -3,14 +3,14 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use lix::registered_spaces::{
+    BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
+    BINARY_CAS_MANIFEST_SPACE,
+};
 use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, Precondition, ProjectedValue, PutBatch,
     PutEntry, ReadDurability, ReadOptions, SpaceId, Storage, StorageSpace, StorageWrite,
     StoredValue, WriteOptions,
-};
-use lix::registered_spaces::{
-    BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
-    BINARY_CAS_MANIFEST_SPACE,
 };
 use lix::storage_adapter::{StorageAdapter, StorageAdapterRead};
 use lix::storage_bench::{

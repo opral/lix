@@ -38,11 +38,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use lix::integration::{Engine, SessionContext};
+use lix::registered_spaces::JSON_SPACE;
 use lix::storage::Storage;
 use lix::storage_adapter::{
     PointReadPlan, StorageAdapter, StorageGetOptions, StorageKey, StorageReadOptions,
 };
-use lix::registered_spaces::JSON_SPACE;
 use lix::storage_bench::{space_inventory, storage_space_by_name};
 use lix::Value;
 use lix_storage_slatedb::SlateDB;
