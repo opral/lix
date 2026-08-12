@@ -19,7 +19,9 @@ pub(crate) mod replacement_part;
 mod row_materialization;
 mod scoped_current_state;
 pub(crate) mod scoped_range;
-mod storage;
+// E19 probe: crate-visible only so lib.rs can re-export the decode counters.
+// Revert to `mod storage;` when the probe instrumentation is removed.
+pub(crate) mod storage;
 mod tree;
 mod types;
 
