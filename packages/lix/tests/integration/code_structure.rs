@@ -1624,9 +1624,6 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
             if sealed_owner_allows_importer(owner_root, &relative_path) {
                 continue;
             }
-            if sealed_owner_allows_import_path(owner_root, &imported_path) {
-                continue;
-            }
 
             if !violates_sealed_owner_boundary(owner_root, &imported_path, &child_modules) {
                 continue;
@@ -1663,13 +1660,6 @@ fn sealed_owner_root_facade_owners() -> BTreeSet<&'static str> {
 fn sealed_owner_allows_importer(owner_root: &str, importer_file: &str) -> bool {
     (matches!(owner_root, "api") && importer_file == "lib.rs")
         || importer_file == "storage_bench.rs"
-}
-
-fn sealed_owner_allows_import_path(owner_root: &str, imported_path: &[String]) -> bool {
-    owner_root == "transaction"
-        && imported_path
-            .get(1)
-            .is_some_and(|segment| segment == "types")
 }
 
 fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -> String {

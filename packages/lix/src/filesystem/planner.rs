@@ -22,8 +22,8 @@ use super::keys::{
 use super::visibility::VisibleFilesystem;
 use super::{DirectoryPathRecord, derive_directory_paths};
 #[cfg(test)]
-use crate::transaction::types::TransactionWriteRow;
-use crate::transaction::types::{
+use crate::transaction_types::TransactionWriteRow;
+use crate::transaction_types::{
     FileContent, LogicalPrimaryKey, RawWriteBatch, TransactionFileContent, TransactionJson,
     TransactionWriteOperation, TransactionWriteOrigin,
 };
@@ -755,7 +755,7 @@ impl DirectoryPathResolver {
         rows.set_origin(
             row_index,
             Some(TransactionWriteOrigin {
-                surface: crate::transaction::types::shared_origin_surface("filesystem path parent"),
+                surface: crate::transaction_types::shared_origin_surface("filesystem path parent"),
                 operation: TransactionWriteOperation::Update,
                 primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(directory_id))),
             }),
@@ -1748,7 +1748,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey};
-    use crate::transaction::types::{RawWriteBatch, TransactionJson};
+    use crate::transaction_types::{RawWriteBatch, TransactionJson};
 
     use super::{
         BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
@@ -1834,7 +1834,7 @@ mod tests {
         leaf_id: Option<String>,
         context: FilesystemRowContext,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<crate::transaction::types::TransactionWriteRow>, crate::LixError> {
+    ) -> Result<Vec<crate::transaction_types::TransactionWriteRow>, crate::LixError> {
         let parsed = LixPath::try_from_directory_path(directory_path)?;
         let key = super::path_resolver_key(&context);
         with_resolver_map(resolver, key, |resolvers| {

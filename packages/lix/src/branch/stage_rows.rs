@@ -3,7 +3,7 @@ use serde_json::json;
 use crate::GLOBAL_BRANCH_ID;
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 
 pub(crate) const BRANCH_DESCRIPTOR_SCHEMA_KEY: &str = "lix_branch_descriptor";
 pub(crate) const BRANCH_REF_SCHEMA_KEY: &str = "lix_branch_ref";
