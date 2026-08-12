@@ -3887,7 +3887,7 @@ mod tests {
     async fn payload_ref_added_by<F, Fut>(backend: &Memory, publish: F) -> JsonRef
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = ()>,
+        Fut: Future<Output = ()>,
     {
         let before = json_payload_refs(backend).await;
         publish().await;
