@@ -857,4 +857,76 @@ mod tests {
             string_spec.clone().columnar_layout_fingerprint()
         );
     }
+
+    /// The load-bearing bridge under every certificate fast path: a column is
+    /// only indexable because the schema declared it through `x-lix-unique` or
+    /// `x-lix-foreign-keys`, and those are exactly the declarations that set
+    /// `has_inter_row_constraints`.
+    ///
+    /// Four write certificates in `bound_public_write.rs` decline outright on
+    /// `has_inter_row_constraints`. This implication is what turns those four
+    /// bails into a proof that no row carrying an indexed column can reach
+    /// commit without passing through transaction validation, where the hot
+    /// index values are extracted.
+    #[test]
+    fn indexed_columns_imply_inter_row_constraints() {
+        let cases = [
+            json!({
+                "x-lix-key": "bypass_pk_only",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }
+            }),
+            json!({
+                "x-lix-key": "bypass_unique",
+                "x-lix-primary-key": ["/id"],
+                "x-lix-unique": [["/slug"]],
+                "type": "object",
+                "properties": { "id": { "type": "string" }, "slug": { "type": "string" } }
+            }),
+            json!({
+                "x-lix-key": "bypass_fk",
+                "x-lix-primary-key": ["/id"],
+                "x-lix-foreign-keys": [{
+                    "properties": ["/parentId"],
+                    "references": { "schemaKey": "bypass_pk_only", "properties": ["/id"] }
+                }],
+                "type": "object",
+                "properties": { "id": { "type": "string" }, "parentId": { "type": "string" } }
+            }),
+            json!({
+                "x-lix-key": "bypass_composite_unique",
+                "x-lix-primary-key": ["/id"],
+                "x-lix-unique": [["/a", "/b"]],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "a": { "type": "string" },
+                    "b": { "type": "string" }
+                }
+            }),
+        ];
+        for schema in cases {
+            let spec = derive_entity_surface_spec_from_schema(&schema).expect("spec");
+            assert!(
+                spec.indexed_columns.is_empty() || spec.has_inter_row_constraints,
+                "{} declares indexed columns without inter-row constraints",
+                spec.schema_key
+            );
+        }
+
+        let unique = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "bypass_unique",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/slug"]],
+            "type": "object",
+            "properties": { "id": { "type": "string" }, "slug": { "type": "string" } }
+        }))
+        .expect("spec");
+        assert_eq!(
+            unique.indexed_columns.len(),
+            1,
+            "a single-column unique group is the indexable shape this relies on"
+        );
+    }
 }

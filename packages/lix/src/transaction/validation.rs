@@ -7455,6 +7455,72 @@ mod tests {
         ));
     }
 
+    /// A row that carries an indexed column must never reach commit without
+    /// passing through the extraction inside `validate_prepared_writes`.
+    ///
+    /// The hot index plane's one inviolable property is "never a false
+    /// negative". A bypassed row that still earns its collection a witness
+    /// would publish a complete-looking index that is missing that row, and
+    /// every read of it would silently return nothing. Seven certificates can
+    /// skip validation; this pins all seven.
+    ///
+    /// Four live in `bound_public_write.rs` — the insert batch, the two update
+    /// batches, and the path-value replacement program — and each declines
+    /// outright on `spec.has_inter_row_constraints`. That is sufficient
+    /// because a column is only indexable if `x-lix-unique` or
+    /// `x-lix-foreign-keys` declared it, which is the same predicate; see
+    /// `indexed_columns_imply_inter_row_constraints`.
+    ///
+    /// The remaining three are asserted here directly: they all require
+    /// `!requires_transaction_validation` on every row, which
+    /// `normalization.rs` grants to a snapshot row only when its schema plan
+    /// declares no uniques and no foreign keys — hence no indexed columns — or
+    /// when `constraints_unchanged` proves the UPDATE assigned none of them;
+    /// see `every_indexed_column_revokes_the_constraints_unchanged_certificate`.
+    #[test]
+    fn declared_column_rows_never_bypass_extraction() {
+        let mut row = staged_row("indexed_schema", Some(r#"{"id":"row"}"#.to_string()));
+        row.facts.row_content_validated = true;
+        row.facts.requires_transaction_validation = true;
+
+        // Site 5: `prepared_tracked_rows_have_row_local_certificates`, the
+        // early return in `validate_prepared_writes_by_branch`.
+        assert!(
+            !prepared_tracked_rows_have_row_local_certificates(&prepared_rows![row.clone()]),
+            "a row needing transaction validation must not skip the validation index"
+        );
+
+        // Site 6: `row_local_certificates_cover_validation`, the early return
+        // inside `validate_prepared_writes` itself.
+        let borrowed = row.borrowed();
+        assert!(
+            !row_local_certificates_cover_validation(&[PreparedValidationRow::State(borrowed)]),
+            "a row needing transaction validation must not skip per-schema validation"
+        );
+
+        // Site 7: `fresh_plugin_file_import_certificate` under
+        // `trust_filesystem_planner`. Its plugin-owned rows are admitted only
+        // while `requires_transaction_validation` is clear.
+        let mut writes = fresh_plugin_file_import_write_set();
+        assert!(
+            fresh_plugin_file_import_certificate(&writes).is_some(),
+            "the unmodified fixture must certify, or this test proves nothing"
+        );
+        let mut constrained = staged_row("indexed_schema", Some(r#"{"id":"root"}"#.to_string()));
+        constrained.entity_pk = EntityPk::single("root");
+        constrained.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
+        constrained.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
+        constrained.global = false;
+        constrained.facts.row_content_validated = true;
+        constrained.facts.requires_transaction_validation = true;
+        constrained.origin = Some(plugin_reconciliation_update_origin());
+        writes.state_rows.push_test_row(constrained);
+        assert!(
+            fresh_plugin_file_import_certificate(&writes).is_none(),
+            "an indexed-schema row inside a plugin import must revoke the certificate"
+        );
+    }
+
     #[test]
     fn fresh_plugin_file_import_certificate_matches_the_real_blob_materialization_shape() {
         let writes = fresh_plugin_file_import_write_set();
