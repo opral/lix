@@ -1560,8 +1560,12 @@ where
                     BranchReferenceRole::WorkspaceSelector.label(),
                 ));
             }
-            let runtime_functions =
-                FunctionContext::prepare_with_global_control(&read, global_control).await?;
+            let runtime_functions = FunctionContext::prepare_with_global_control(
+                &read,
+                global_control,
+                Some(hot_state.global_key_value_rows()),
+            )
+            .await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
             // Transaction open needs the catalog revision and the tracked
@@ -1596,10 +1600,8 @@ where
                     .await?;
                 (sql_schema_catalog, tracked_schema_catalog)
             };
-            let opening_active_branch_head =
-                active_control.map(|control| control.head_commit_id);
-            let opening_global_branch_head =
-                global_control.map(|control| control.head_commit_id);
+            let opening_active_branch_head = active_control.map(|control| control.head_commit_id);
+            let opening_global_branch_head = global_control.map(|control| control.head_commit_id);
             Ok::<_, LixError>((
                 active_branch_id,
                 runtime_functions,
@@ -11905,10 +11907,7 @@ async fn load_opening_branch_controls(
         return Ok((global, global));
     }
     let mut loaded = controls
-        .load_many(&[
-            active_branch_id.to_string(),
-            GLOBAL_BRANCH_ID.to_string(),
-        ])
+        .load_many(&[active_branch_id.to_string(), GLOBAL_BRANCH_ID.to_string()])
         .await?;
     let global = loaded.pop().flatten();
     let active = loaded.pop().flatten();

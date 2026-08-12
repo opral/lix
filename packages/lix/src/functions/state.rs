@@ -11,11 +11,12 @@ use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
+use crate::hot_state::{
+    CurrentStateDeltaRef, GlobalKeyValueRowCache, HotStateReadDomain, MaterializedHotStateRow,
+    TrackedHeadContext,
+};
 use crate::json_store::{
     JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
-};
-use crate::hot_state::{
-    CurrentStateDeltaRef, HotStateReadDomain, MaterializedHotStateRow, TrackedHeadContext,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};
@@ -38,7 +39,7 @@ pub(crate) async fn load_mode(
     let Some(control) = load_global_control(read).await? else {
         return Ok(DeterministicMode::disabled());
     };
-    load_mode_with_control(read, control).await
+    load_mode_with_control(read, control, None).await
 }
 
 /// Loads the global branch-head control that fences every deterministic-state
@@ -55,8 +56,10 @@ pub(crate) async fn load_global_control(
 pub(crate) async fn load_mode_with_control(
     read: &(impl StorageAdapterRead + ?Sized),
     global_control: BranchHeadControl,
+    cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicMode, LixError> {
-    let Some(row) = load_key_value_row(read, global_control, DETERMINISTIC_MODE_KEY).await? else {
+    let Some(row) = load_key_value_row(read, global_control, cache, DETERMINISTIC_MODE_KEY).await?
+    else {
         return Ok(DeterministicMode::disabled());
     };
     let value = key_value_payload(&row, DETERMINISTIC_MODE_KEY)?;
@@ -74,14 +77,16 @@ pub(crate) async fn load_sequence(
     let Some(control) = load_global_control(read).await? else {
         return Ok(DeterministicSequence::uninitialized());
     };
-    load_sequence_with_control(read, control).await
+    load_sequence_with_control(read, control, None).await
 }
 
 pub(crate) async fn load_sequence_with_control(
     read: &(impl StorageAdapterRead + ?Sized),
     global_control: BranchHeadControl,
+    cache: Option<&GlobalKeyValueRowCache>,
 ) -> Result<DeterministicSequence, LixError> {
-    let Some(row) = load_key_value_row(read, global_control, DETERMINISTIC_SEQUENCE_KEY).await?
+    let Some(row) =
+        load_key_value_row(read, global_control, cache, DETERMINISTIC_SEQUENCE_KEY).await?
     else {
         return Ok(DeterministicSequence::uninitialized());
     };
@@ -176,6 +181,24 @@ pub(crate) async fn stage_sequence(
 }
 
 async fn load_key_value_row(
+    read: &(impl StorageAdapterRead + ?Sized),
+    control: BranchHeadControl,
+    cache: Option<&GlobalKeyValueRowCache>,
+    key: &str,
+) -> Result<Option<MaterializedHotStateRow>, LixError> {
+    if let Some(cache) = cache
+        && let Some(row) = cache.get(control, key)
+    {
+        return Ok(row);
+    }
+    let row = load_key_value_row_uncached(read, control, key).await?;
+    if let Some(cache) = cache {
+        cache.insert(control, key, row.clone());
+    }
+    Ok(row)
+}
+
+async fn load_key_value_row_uncached(
     read: &(impl StorageAdapterRead + ?Sized),
     control: BranchHeadControl,
     key: &str,

@@ -6,6 +6,7 @@ use crate::functions::{
     DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
     SystemFunctionProvider, state,
 };
+use crate::hot_state::GlobalKeyValueRowCache;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 
 /// Execution-scoped runtime function context.
@@ -41,7 +42,7 @@ impl FunctionContext {
         read: &(impl StorageAdapterRead + ?Sized),
     ) -> Result<Self, LixError> {
         let global_control = state::load_global_control(read).await?;
-        Self::prepare_with_global_control(read, global_control).await
+        Self::prepare_with_global_control(read, global_control, None).await
     }
 
     /// Same as [`Self::prepare`] for a caller that already holds the global
@@ -55,16 +56,17 @@ impl FunctionContext {
     pub(crate) async fn prepare_with_global_control(
         read: &(impl StorageAdapterRead + ?Sized),
         global_control: Option<BranchHeadControl>,
+        cache: Option<&GlobalKeyValueRowCache>,
     ) -> Result<Self, LixError> {
         let Some(global_control) = global_control else {
             return Ok(Self::system_for_function_free_read());
         };
-        let mode = state::load_mode_with_control(read, global_control).await?;
+        let mode = state::load_mode_with_control(read, global_control, cache).await?;
         if !mode.enabled {
             return Ok(Self::system_for_function_free_read());
         }
 
-        let sequence = state::load_sequence_with_control(read, global_control).await?;
+        let sequence = state::load_sequence_with_control(read, global_control, cache).await?;
         // Deterministic mode must produce byte-identical state across runs;
         // bookkeeping rows (sequence persistence) take a timestamp derived
         // from the persisted sequence instead of the system clock, without
