@@ -5741,10 +5741,13 @@ mod tests {
 
     #[tokio::test]
     async fn retention_closure_and_audit_reject_missing_and_malformed_required_authority() {
-        const MUTABLE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
-            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id,
-            "tracked_state.commit_state_manifest.v7",
-        );
+        // States the corruption-test need at the call site instead of smuggling
+        // it in as a second `StorageSpace::mutable` declaration that reads like
+        // a canonical one. This was the last raw re-declaration in the engine,
+        // and closing it lets `UNCHECKED_SPACE_IDS` go empty.
+        const MUTABLE_MANIFEST_SPACE: StorageSpace =
+            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+                .mutable_view_for_corruption_test();
 
         let (storage, commit_id, _, _, _) = gc_sweep_fixture().await;
         let mut writes = storage.new_write_set();

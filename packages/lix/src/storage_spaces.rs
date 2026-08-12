@@ -87,20 +87,25 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
 /// Space ids the constructor check cannot reject yet.
 ///
 /// Empty, and it should stay that way. Every engine site that needs to place
-/// chosen bytes under a write-once key states it through
-/// `StorageSpace::mutable_view_for_corruption_test`, which does not go through
-/// the checked constructors at all.
+/// chosen bytes under a key the engine publishes write-once states that need
+/// through `StorageSpace::mutable_view_for_corruption_test`, which does not go
+/// through the checked constructors at all.
 ///
-/// This list previously held `0x0004_002b`
-/// (`tracked_state.commit_state_manifest.v7`) for a raw re-declaration in
-/// `gc.rs`, justified by `gc.rs` being owned by an in-flight redesign and not
-/// editable. Both halves expired: the re-declaration is gone (the site now uses
-/// `mutable_view_for_corruption_test`) and the ownership claim was round-4
-/// residue. The hole outlived its reason by a whole cycle because the guard
-/// meant to catch that compares this list to `tests::KNOWN_DISAGREEMENTS` --
-/// two hand-maintained lists, checked against each other and never against the
-/// code -- so it could not have noticed the site disappearing. Widening a
-/// safety check for one call site needs a guard that watches the call site.
+/// This list held `0x0004_002b` (`tracked_state.commit_state_manifest.v7`) for
+/// one raw re-declaration in a `gc.rs` retention test, justified by `gc.rs`
+/// being owned by an in-flight redesign and not editable that cycle. The
+/// ownership claim was round-4 residue; the site has now been converted to
+/// `mutable_view_for_corruption_test` and the hole is closed.
+///
+/// Note what the guard could and could not do. `tests::the_unchecked_ids_are_
+/// exactly_the_known_disagreements` compares this list to
+/// `tests::KNOWN_DISAGREEMENTS` -- two hand-maintained lists, checked against
+/// each other and never against the code -- so it would not have noticed the
+/// call site disappearing, only a disagreement between the two lists. What
+/// actually enforces this is the `const` assertion in
+/// `StorageSpace::mutable`: with the list empty, a re-declaration is a compile
+/// error naming the exact site. Widening a safety check for one call site needs
+/// a guard that watches the call site, not a second list describing it.
 const UNCHECKED_SPACE_IDS: &[u32] = &[];
 
 /// Whether a space id may be declared with `semantics`.
