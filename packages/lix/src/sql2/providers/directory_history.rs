@@ -30,7 +30,7 @@ use crate::sql2::history_route::{
     serialize_history_source_changes, validate_history_anchor_filter,
 };
 use crate::sql2::providers::filesystem_history_path::{
-    DirectoryPathRecord, HistoryDirectoryTree, load_history_commit_parents,
+    DirectoryPathRecord, HistoryDirectoryTree, load_commit_parents_for,
     resolve_observed_directory_path,
 };
 use crate::sql2::result_metadata::json_field;
@@ -259,12 +259,13 @@ where
     )
     .await?;
     let event_descriptors = parse_directory_history_records(&event_entries)?;
-    let parent_commit_ids_by_commit =
-        load_history_commit_parents(&commit_graph, &event_route.as_of_commit_ids).await?;
     let mut observed_commit_ids = event_descriptors
         .iter()
         .map(|record| record.entry.observed_commit_id.clone())
         .collect::<BTreeSet<_>>();
+    // Parent links only at the commits this query has evidence at.
+    let parent_commit_ids_by_commit =
+        load_commit_parents_for(&commit_graph, &observed_commit_ids).await?;
     let direct_parent_commit_ids = observed_commit_ids
         .iter()
         .flat_map(|observed_commit_id| {

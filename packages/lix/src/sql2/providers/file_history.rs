@@ -43,7 +43,7 @@ use crate::sql2::history_route::{
     serialize_history_source_changes, validate_history_anchor_filter,
 };
 use crate::sql2::providers::filesystem_history_path::{
-    DirectoryPathRecord, HistoryDirectoryTree, load_history_commit_parents,
+    DirectoryPathRecord, HistoryDirectoryTree, load_commit_parents_for,
     resolve_observed_directory_path,
 };
 use crate::sql2::result_metadata::json_field;
@@ -606,7 +606,6 @@ impl FileHistoryDirectoryIndex {
 struct FileHistoryPluginDiscovery {
     schema_keys: Vec<String>,
     registries_by_commit: BTreeMap<String, PluginRegistry>,
-    parent_commit_ids_by_commit: BTreeMap<String, Vec<String>>,
     registry_events: Vec<HistoryEntry>,
 }
 
@@ -666,14 +665,11 @@ where
         metadata_projection,
     )
     .await?;
-    let parent_commit_ids_by_commit =
-        load_history_commit_parents(&commit_graph, &context_route.as_of_commit_ids).await?;
     let plugin_discovery = discover_file_history_plugins(
         Arc::clone(&commit_graph),
         query_source.clone(),
         &event_route,
         &context_route,
-        &parent_commit_ids_by_commit,
         metadata_projection,
     )
     .await?;
@@ -738,6 +734,10 @@ where
                 .map(|entry| entry.observed_commit_id.clone()),
         )
         .collect::<BTreeSet<_>>();
+    // Parent links are needed only where this query has evidence, so read them
+    // for the event commits instead of walking reachability from the anchor.
+    let parent_commit_ids_by_commit =
+        load_commit_parents_for(&commit_graph, &observed_commit_ids).await?;
     let parent_evidence_commit_ids = filesystem_context
         .event_directories
         .iter()
@@ -771,7 +771,7 @@ where
         &event_plugin_state,
         &event_plugin_owners,
         &observed_states,
-        &plugin_discovery.parent_commit_ids_by_commit,
+        &parent_commit_ids_by_commit,
     );
     let plugin_owner_events = event_plugin_owners
         .iter()
@@ -780,7 +780,7 @@ where
         &plugin_discovery.registry_events,
         &observed_states,
         &plugin_discovery.registries_by_commit,
-        &plugin_discovery.parent_commit_ids_by_commit,
+        &parent_commit_ids_by_commit,
     )?;
     let events = sorted_grouped_file_history_events(
         filesystem_events
@@ -1710,7 +1710,6 @@ async fn discover_file_history_plugins<S>(
     query_source: SqlHistoryQuerySource<S>,
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
-    parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<FileHistoryPluginDiscovery, LixError>
 where
@@ -1783,17 +1782,14 @@ where
 
     // A registry is only ever compared at a commit whose registry changed and
     // at that commit's direct parents, so reconstruct exactly those.
-    let mut registry_commit_ids = BTreeSet::new();
-    for entry in &registry_events {
-        registry_commit_ids.insert(entry.observed_commit_id.clone());
-        registry_commit_ids.extend(
-            parent_commit_ids_by_commit
-                .get(&entry.observed_commit_id)
-                .into_iter()
-                .flatten()
-                .cloned(),
-        );
-    }
+    let registry_event_commit_ids = registry_events
+        .iter()
+        .map(|entry| entry.observed_commit_id.clone())
+        .collect::<BTreeSet<_>>();
+    let registry_event_parents =
+        load_commit_parents_for(&commit_graph, &registry_event_commit_ids).await?;
+    let mut registry_commit_ids = registry_event_commit_ids;
+    registry_commit_ids.extend(registry_event_parents.into_values().flatten());
     let mut reader = TrackedStateContext::new().reader(query_source.store.clone());
     let mut registries_by_commit = BTreeMap::new();
     for observed_commit_id in registry_commit_ids {
@@ -1806,7 +1802,6 @@ where
     Ok(FileHistoryPluginDiscovery {
         schema_keys: schema_keys.into_iter().collect(),
         registries_by_commit,
-        parent_commit_ids_by_commit: parent_commit_ids_by_commit.clone(),
         registry_events,
     })
 }

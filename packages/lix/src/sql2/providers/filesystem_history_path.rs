@@ -123,26 +123,35 @@ pub(super) fn resolve_observed_directory_path<R: DirectoryPathRecord>(
 /// descendants may no longer be linked to the changed directory in the
 /// observed root. Direct-parent roots are sufficient and preserve DAG
 /// isolation; no depth-based predecessor is inferred.
-pub(super) async fn load_history_commit_parents(
+/// Loads the direct parent links of exactly `commit_ids`.
+///
+/// Composed history needs parent links only at the commits it actually has
+/// evidence at — a directory rename's commit, a plugin-owner change's commit —
+/// which is bounded by the query's answer, not by the repository.
+///
+/// This deliberately point-reads those nodes rather than walking reachability
+/// from the anchor. That walk was unbounded even for a query that carried a
+/// depth bound: the reachability cache is keyed by `(head, max_depth)`, and a
+/// bounded entry cannot serve an unbounded request, so asking for every
+/// reachable node re-walked the whole graph behind a `WHERE lixcol_depth = 0`.
+pub(super) async fn load_commit_parents_for(
     commit_graph: &Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    as_of_commit_ids: &[String],
+    commit_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, Vec<String>>, LixError> {
     let mut parents_by_commit = BTreeMap::new();
     let mut commit_graph = commit_graph.lock().await;
-    for as_of_commit_id in as_of_commit_ids {
-        let as_of_commit_id =
-            CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
-        for reachable in commit_graph.reachable_nodes(&as_of_commit_id).await?.iter() {
-            parents_by_commit.insert(
-                reachable.commit.commit_id.to_string(),
-                reachable
-                    .commit
-                    .parent_commit_ids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-            );
-        }
+    for commit_id in commit_ids {
+        let parsed = CommitId::parse_lix(commit_id, "history observed commit id")?;
+        let Some(node) = commit_graph.load_node(&parsed).await? else {
+            continue;
+        };
+        parents_by_commit.insert(
+            commit_id.clone(),
+            node.parent_commit_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
     }
     Ok(parents_by_commit)
 }
