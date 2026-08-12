@@ -4391,37 +4391,71 @@ async fn load_packed_current_base_exact_entries(
     if base_refs.is_empty() {
         return Ok((0..keys.len()).map(|_| None).collect());
     }
-    if shadow.len() == keys.len()
-        && let Some(newest_base) = base_refs.iter().map(|base_ref| base_ref.commit_id).max()
-    {
-        let unresolved = keys
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| shadow[*index].is_none_or(|resolved| resolved < newest_base))
-            .map(|(index, key)| (index, *key))
-            .collect::<Vec<_>>();
-        if unresolved.is_empty() {
-            return Ok((0..keys.len()).map(|_| None).collect());
-        }
-        if unresolved.len() != keys.len() {
-            let unresolved_keys = unresolved.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-            let loaded = Box::pin(load_packed_current_base_exact_entries(
-                store,
-                branch_id,
-                generation,
-                &unresolved_keys,
-                &[],
-                transaction_cache,
-            ))
-            .await?;
-            let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
-            for ((index, _), entry) in unresolved.into_iter().zip(loaded) {
-                output[index] = entry;
+    let skipped = packed_current_base_unresolved_indices(keys, shadow, &base_refs);
+    let unresolved_keys;
+    let selected = match skipped.as_deref() {
+        Some(indices) => {
+            if indices.is_empty() {
+                return Ok((0..keys.len()).map(|_| None).collect());
             }
-            return Ok(output);
+            unresolved_keys = indices.iter().map(|&index| keys[index]).collect::<Vec<_>>();
+            unresolved_keys.as_slice()
         }
+        None => keys,
+    };
+    // The base loader is boxed rather than inlined: this wrapper sits deep in an
+    // already-tall async write stack, and holding the loader's state machine in
+    // this frame overflows libtest's 2 MiB worker stack.
+    let loaded = Box::pin(load_packed_current_base_exact_entries_from_refs(
+        store,
+        &base_refs,
+        selected,
+        transaction_cache,
+    ))
+    .await?;
+    let Some(indices) = skipped else {
+        return Ok(loaded);
+    };
+    let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+    for (index, entry) in indices.into_iter().zip(loaded) {
+        output[index] = entry;
     }
-    if let [base_ref] = base_refs.as_slice() {
+    Ok(output)
+}
+
+/// Indices of the keys the packed current base could still win, or `None` when
+/// nothing is known and every key must be read.
+fn packed_current_base_unresolved_indices(
+    keys: &[TrackedStateKeyRef<'_>],
+    shadow: PackedCurrentBaseShadow<'_>,
+    base_refs: &[PackedCurrentBaseRef],
+) -> Option<Vec<usize>> {
+    if shadow.len() != keys.len() {
+        return None;
+    }
+    let newest_base = base_refs.iter().map(|base_ref| base_ref.commit_id).max()?;
+    let unresolved = (0..keys.len())
+        .filter(|&index| shadow[index].is_none_or(|resolved| resolved < newest_base))
+        .collect::<Vec<_>>();
+    (unresolved.len() != keys.len()).then_some(unresolved)
+}
+
+async fn load_packed_current_base_exact_entries_from_refs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    base_refs: &[PackedCurrentBaseRef],
+    keys: &[TrackedStateKeyRef<'_>],
+    transaction_cache: Option<&HotStateTransactionCache>,
+) -> Result<
+    Vec<
+        Option<(
+            crate::tracked_state::TrackedStateIndexValue,
+            crate::changelog::ChangeRecord,
+            Option<crate::tracked_state::TrackedStateBaseCoordinate>,
+        )>,
+    >,
+    LixError,
+> {
+    if let [base_ref] = base_refs {
         return Ok(
             crate::tracked_state::load_owned_commit_delta_entries_one_ordered_ref(
                 store,
