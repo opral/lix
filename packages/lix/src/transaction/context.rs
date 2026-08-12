@@ -1702,6 +1702,9 @@ where
         runtime_functions: &FunctionContext,
         mut prepared_writes: PreparedWriteSet,
     ) -> Result<TransactionCommitOutcome, LixError> {
+        #[cfg(feature = "storage-benches")]
+        let _phase =
+            crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_COMMIT);
         let transaction = &mut self;
         let commit_boundary = transaction.commit_boundary.clone();
         transaction

@@ -8847,6 +8847,8 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     keys: &[TrackedStateKeyRef<'_>],
     point_cache: Option<&CommitDeltaPointReadCache>,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_ordered_load(keys.len());
     let cached_state = point_cache
         .map(|cache| cache.authority(commit_id))
         .transpose()?
@@ -11518,6 +11520,8 @@ fn encode_commit_delta_segment_layout(
     debug_assert_eq!(entries.len(), payloads.len());
     let leaf = encode_leaf_node_refs(entries);
     #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_encode();
+    #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_leaf_layout(
         entries.len(),
         crate::tracked_state::codec::leaf_uses_direct_address_layout(&leaf),
@@ -11771,6 +11775,8 @@ fn decode_commit_delta_leaf(
             "tracked_state commit_delta segment does not match its manifest bounds",
         ));
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_leaf_decode(leaf.len(), bytes.len());
     Ok(leaf)
 }
 
@@ -11889,6 +11895,11 @@ fn decode_commit_delta_with_payloads<'a>(
                     "tracked_state compressed commit_delta sidecar length does not match its header",
                 ));
             }
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_commit_delta_sidecar_zstd(
+                encoded_sidecar.len(),
+                decoded.len(),
+            );
             Cow::Owned(decoded)
         }
         _ => unreachable!("commit-delta sidecar encoding was classified above"),

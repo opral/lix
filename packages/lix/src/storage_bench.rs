@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -3271,6 +3271,121 @@ where
         if !has_more {
             return entries;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E42 probe — commit-delta decode census, attributed by write-path phase.
+//
+// Answers, deterministically and in one rep: does a single-row UPDATE reach
+// through the packed commit-delta indirection to locate the row it is
+// updating, or does it read the hot row? The phase is a process-global
+// marker rather than a thread-local because the profile harness runs exactly
+// one statement at a time under `block_on`; guards nest and restore.
+// ---------------------------------------------------------------------------
+
+pub const CRUD_PHASE_OTHER: usize = 0;
+/// The write-side read: `scan_entity_candidates*` locating the target row.
+pub const CRUD_PHASE_WRITE_READ: usize = 1;
+/// `Transaction::commit_prepared` — publication of the new write set.
+pub const CRUD_PHASE_COMMIT: usize = 2;
+pub const CRUD_PHASE_COUNT: usize = 3;
+
+static CRUD_PHASE: AtomicUsize = AtomicUsize::new(CRUD_PHASE_OTHER);
+static DELTA_LEAF_DECODES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_LEAF_DECODE_ROWS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_LEAF_DECODE_BYTES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ZSTD_CALLS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ZSTD_IN_BYTES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ZSTD_OUT_BYTES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ORDERED_LOADS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static DELTA_ENCODES: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Restores the enclosing phase when dropped.
+#[derive(Debug)]
+pub struct CrudPhaseGuard(usize);
+
+impl Drop for CrudPhaseGuard {
+    fn drop(&mut self) {
+        CRUD_PHASE.store(self.0, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn enter_crud_phase(phase: usize) -> CrudPhaseGuard {
+    CrudPhaseGuard(CRUD_PHASE.swap(phase, Ordering::Relaxed))
+}
+
+fn crud_phase() -> usize {
+    let phase = CRUD_PHASE.load(Ordering::Relaxed);
+    if phase < CRUD_PHASE_COUNT {
+        phase
+    } else {
+        CRUD_PHASE_OTHER
+    }
+}
+
+pub(crate) fn record_commit_delta_leaf_decode(rows: usize, segment_bytes: usize) {
+    let phase = crud_phase();
+    DELTA_LEAF_DECODES[phase].fetch_add(1, Ordering::Relaxed);
+    DELTA_LEAF_DECODE_ROWS[phase].fetch_add(rows as u64, Ordering::Relaxed);
+    DELTA_LEAF_DECODE_BYTES[phase].fetch_add(segment_bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_sidecar_zstd(compressed: usize, uncompressed: usize) {
+    let phase = crud_phase();
+    DELTA_ZSTD_CALLS[phase].fetch_add(1, Ordering::Relaxed);
+    DELTA_ZSTD_IN_BYTES[phase].fetch_add(compressed as u64, Ordering::Relaxed);
+    DELTA_ZSTD_OUT_BYTES[phase].fetch_add(uncompressed as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_ordered_load(keys: usize) {
+    let phase = crud_phase();
+    DELTA_ORDERED_LOADS[phase].fetch_add(keys.max(1) as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_encode() {
+    DELTA_ENCODES[crud_phase()].fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitDeltaPhaseCensus {
+    pub leaf_decodes: u64,
+    pub leaf_decode_rows: u64,
+    pub leaf_decode_bytes: u64,
+    pub zstd_calls: u64,
+    pub zstd_in_bytes: u64,
+    pub zstd_out_bytes: u64,
+    pub ordered_load_keys: u64,
+    pub encodes: u64,
+}
+
+/// Drains the census. Index with `CRUD_PHASE_*`.
+pub fn take_commit_delta_phase_census() -> [CommitDeltaPhaseCensus; CRUD_PHASE_COUNT] {
+    std::array::from_fn(|phase| CommitDeltaPhaseCensus {
+        leaf_decodes: DELTA_LEAF_DECODES[phase].swap(0, Ordering::Relaxed),
+        leaf_decode_rows: DELTA_LEAF_DECODE_ROWS[phase].swap(0, Ordering::Relaxed),
+        leaf_decode_bytes: DELTA_LEAF_DECODE_BYTES[phase].swap(0, Ordering::Relaxed),
+        zstd_calls: DELTA_ZSTD_CALLS[phase].swap(0, Ordering::Relaxed),
+        zstd_in_bytes: DELTA_ZSTD_IN_BYTES[phase].swap(0, Ordering::Relaxed),
+        zstd_out_bytes: DELTA_ZSTD_OUT_BYTES[phase].swap(0, Ordering::Relaxed),
+        ordered_load_keys: DELTA_ORDERED_LOADS[phase].swap(0, Ordering::Relaxed),
+        encodes: DELTA_ENCODES[phase].swap(0, Ordering::Relaxed),
+    })
+}
+
+pub fn crud_phase_name(phase: usize) -> &'static str {
+    match phase {
+        CRUD_PHASE_WRITE_READ => "write_read",
+        CRUD_PHASE_COMMIT => "commit_prepared",
+        _ => "other",
     }
 }
 

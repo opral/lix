@@ -4046,6 +4046,9 @@ async fn scan_entity_conflict_candidates(
     spec: &EntitySurfaceSpec,
     insert_rows: &RawWriteBatch,
 ) -> Result<MaterializedHotStateBatch, LixError> {
+    #[cfg(feature = "storage-benches")]
+    let _phase =
+        crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_WRITE_READ);
     let mut branch_ids = std::collections::BTreeSet::new();
     let mut entity_pks = std::collections::BTreeSet::new();
     let mut file_ids = std::collections::BTreeSet::new();
@@ -4087,6 +4090,9 @@ async fn scan_entity_candidates(
     spec: &EntitySurfaceSpec,
     params: &[Value],
 ) -> Result<MaterializedHotStateBatch, LixError> {
+    #[cfg(feature = "storage-benches")]
+    let _phase =
+        crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_WRITE_READ);
     let branch_ids = scan_branch_ids(&plan.bound.branch_scope)?;
     let mut request = HotStateScanRequest {
         filter: HotStateFilter {
@@ -4115,6 +4121,9 @@ async fn scan_entity_candidates_for_pks(
     entity_pks: Vec<EntityPk>,
     metadata_only: bool,
 ) -> Result<MaterializedHotStateBatch, LixError> {
+    #[cfg(feature = "storage-benches")]
+    let _phase =
+        crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_WRITE_READ);
     ctx.scan_hot_state_batch(&HotStateScanRequest {
         filter: HotStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
