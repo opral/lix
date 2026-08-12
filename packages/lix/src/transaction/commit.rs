@@ -7469,7 +7469,7 @@ mod tests {
         let Some(record) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(record.change_id(), change_id("test-uuid-2"));
+        assert_eq!(record.change_id(), commit_id("test-uuid-1").commit_change_id());
         let membership_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -9981,7 +9981,7 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id(), change_id("test-uuid-2"));
+        assert_eq!(commit.change_id(), commit_id("test-uuid-1").commit_change_id());
         let packed_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -10121,7 +10121,7 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id(), change_id("test-uuid-2"));
+        assert_eq!(commit.change_id(), commit_id("test-uuid-1").commit_change_id());
         assert_eq!(
             commit.parent_commit_ids,
             vec![CommitId::for_test_label(

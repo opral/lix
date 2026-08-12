@@ -951,7 +951,7 @@ mod tests {
 
         assert_eq!(commit.commit_id, commit_id("commit-1"));
         assert_eq!(commit.parent_commit_ids, commit_ids(["parent-1"]));
-        assert_eq!(commit.change_id, change_id("commit-1-change"));
+        assert_eq!(commit.change_id, commit_id("commit-1").commit_change_id());
     }
 
     #[tokio::test]

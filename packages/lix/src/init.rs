@@ -753,7 +753,12 @@ mod tests {
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
         assert_eq!(plan.receipt.lix_id, test_uuid(2));
-        assert_eq!(plan.receipt.initial_commit_id, test_uuid(3));
+        // The initial commit id reserves its low 32 bits for packed change
+        // ordinals like every other commit id, so it is not the raw v7 value.
+        assert_eq!(
+            plan.receipt.initial_commit_id,
+            "01920000-0000-7000-8000-000300000000"
+        );
     }
 
     #[test]
