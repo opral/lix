@@ -7054,8 +7054,18 @@ mod tests {
             .expect_err("first-parent cycle should not rebuild forever");
 
         assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        // Availability is proven from immutable commit-state authority instead
+        // of by walking the ancestry, so a cycle whose members are all rooted
+        // is no longer reported by the walk's cycle detector: the walk resumes
+        // at the first rooted member. It still fails closed, because replaying
+        // the cycle against that root cannot reproduce the root immutable
+        // authority names for this commit. The walk's `seen_commit_ids` guard
+        // remains the termination proof for cycles with no rooted member.
         assert!(
-            error.message.contains("first-parent cycle"),
+            error.message.contains("first-parent cycle")
+                || error
+                    .message
+                    .contains("disagrees with immutable commit authority"),
             "unexpected error message: {}",
             error.message
         );
@@ -8379,6 +8389,262 @@ mod tests {
                 .and_then(|row| row.snapshot_content())
                 .map(AsRef::as_ref),
             Some("{\"value\":\"child\"}")
+        );
+    }
+
+    /// Builds `gen -> a1 -> a2 -> a3 -> b1 -> b2 -> b3` where every commit
+    /// after `gen` is a rootless bounded-replay layout, then optionally seals
+    /// `a3` as a durable interval root so a replay of the `b` interval has a
+    /// resume point.
+    async fn write_two_interval_history_for_test(
+        storage: &StorageAdapter,
+        tracked_state: &TrackedStateContext,
+        seal_midpoint: bool,
+    ) {
+        write_root_for_test(
+            storage,
+            tracked_state,
+            "gen",
+            None,
+            &[row_with_value("entity-gen", "gen-change", "gen", "gen")],
+        )
+        .await
+        .expect("genesis root should write");
+        let mut parent = "gen".to_owned();
+        for commit in ["a1", "a2", "a3"] {
+            write_rootless_commit_for_test(
+                storage,
+                commit,
+                &parent,
+                &[
+                    row_with_value(
+                        &format!("entity-{commit}"),
+                        &format!("{commit}-change"),
+                        commit,
+                        commit,
+                    ),
+                    // Rewrite a shared key in every commit so the interval is
+                    // order sensitive rather than a disjoint insert stream.
+                    row_with_value("entity-shared", &format!("{commit}-shared"), commit, commit),
+                ],
+            )
+            .await;
+            parent = commit.to_owned();
+        }
+        if seal_midpoint {
+            seal_rooted_commit_for_test(storage, tracked_state, "a3").await;
+        }
+        for commit in ["b1", "b2", "b3"] {
+            write_rootless_commit_for_test(
+                storage,
+                commit,
+                &parent,
+                &[
+                    row_with_value(
+                        &format!("entity-{commit}"),
+                        &format!("{commit}-change"),
+                        commit,
+                        commit,
+                    ),
+                    row_with_value("entity-shared", &format!("{commit}-shared"), commit, commit),
+                ],
+            )
+            .await;
+            parent = commit.to_owned();
+        }
+    }
+
+    /// Publishes the canonical root for `commit_id` into its immutable
+    /// commit-state authority, turning a rootless commit into an interval root.
+    async fn seal_rooted_commit_for_test(
+        storage: &StorageAdapter,
+        tracked_state: &TrackedStateContext,
+        commit_id: &str,
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("seal read should open");
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            commit_id,
+            true,
+        )
+        .await
+        .expect("seal plans should load");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        for plan in plans.iter().rev() {
+            crate::tracked_state::commit_root_rebuild::stage_rebuild_plan_with_writer(
+                &mut writer, plan,
+            )
+            .await
+            .expect("seal root should stage");
+        }
+        let typed_commit_id = CommitId::for_test_label(commit_id);
+        let snapshot_root = writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == typed_commit_id)
+            .cloned()
+            .expect("sealed root should be staged");
+        drop(writer);
+        let mut manifest = storage::load_commit_state_manifest(&read, typed_commit_id)
+            .await
+            .expect("sealed manifest should load")
+            .expect("sealed manifest should exist");
+        manifest.replay_debt = crate::tracked_state::CommitStateReplayDebt::default();
+        manifest.snapshot_root = Some(Box::new(snapshot_root));
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
+            .expect("sealed authority should reseal");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("sealed root should commit");
+    }
+
+    /// Replays `commit_id` the way the commit path closes a rootless interval
+    /// and returns `(replay-set size, resulting root)`.
+    async fn replay_root_for_test(
+        storage: &StorageAdapter,
+        tracked_state: &TrackedStateContext,
+        commit_id: &str,
+    ) -> (usize, TrackedStateRootId) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replay read should open");
+        let plans = crate::tracked_state::commit_root_rebuild::load_rebuild_plans_to_nearest_available_root(
+            &read,
+            commit_id,
+            true,
+        )
+        .await
+        .expect("replay plans should load");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        let mut report = None;
+        for plan in plans.iter().rev() {
+            report = Some(
+                crate::tracked_state::commit_root_rebuild::stage_rebuild_plan_with_writer(
+                    &mut writer,
+                    plan,
+                )
+                .await
+                .expect("replay root should stage"),
+            );
+        }
+        (
+            plans.len(),
+            report.expect("replay stages at least one root").root_id,
+        )
+    }
+
+    /// The resume point is the previous interval root named by immutable
+    /// commit-state authority. Resuming from it must produce exactly the root
+    /// a from-genesis replay of the same history produces.
+    #[tokio::test]
+    async fn resumed_interval_root_is_identical_to_from_genesis_root() {
+        let tracked_state = TrackedStateContext::new();
+
+        let from_genesis = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&from_genesis, &tracked_state, false).await;
+        let (genesis_plans, genesis_root) =
+            replay_root_for_test(&from_genesis, &tracked_state, "b3").await;
+
+        let resumed = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&resumed, &tracked_state, true).await;
+        let (resumed_plans, resumed_root) = replay_root_for_test(&resumed, &tracked_state, "b3").await;
+
+        assert_eq!(
+            genesis_plans, 6,
+            "without a sealed interval root the replay set is the whole history"
+        );
+        assert_eq!(
+            resumed_plans, 3,
+            "a sealed interval root bounds the replay set to its own interval"
+        );
+        assert_eq!(
+            resumed_root, genesis_root,
+            "resumed replay must produce a byte-identical state root"
+        );
+    }
+
+    /// Teeth for the assertion above: pointing the resume point at a readable
+    /// but wrong root must change the resulting state root, so a silently bad
+    /// resume point cannot pass the byte-identity check.
+    #[tokio::test]
+    async fn byte_identical_root_check_rejects_a_broken_resume_point() {
+        let tracked_state = TrackedStateContext::new();
+
+        let from_genesis = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&from_genesis, &tracked_state, false).await;
+        let (_, genesis_root) = replay_root_for_test(&from_genesis, &tracked_state, "b3").await;
+
+        let broken = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&broken, &tracked_state, true).await;
+        // Repoint `a3`'s immutable root pointer at `gen`'s root: present,
+        // readable, content-addressed — and wrong.
+        let read = broken
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("broken resume read should open");
+        let genesis_metadata = storage::load_snapshot_commit_root(&read, "gen")
+            .await
+            .expect("genesis root metadata should load")
+            .expect("genesis root metadata should exist");
+        let mut manifest =
+            storage::load_commit_state_manifest(&read, CommitId::for_test_label("a3"))
+                .await
+                .expect("midpoint manifest should load")
+                .expect("midpoint manifest should exist");
+        let mut broken_root = *manifest
+            .snapshot_root
+            .clone()
+            .expect("midpoint is sealed by the fixture");
+        broken_root.root_id = genesis_metadata.root_id.clone();
+        manifest.snapshot_root = Some(Box::new(broken_root));
+        let mut writes = broken.new_write_set();
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
+            .expect("broken authority should reseal");
+        drop(read);
+        broken
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("broken resume point should commit");
+
+        let (broken_plans, broken_root_id) = replay_root_for_test(&broken, &tracked_state, "b3").await;
+        assert_eq!(broken_plans, 3, "the broken pointer is still readable");
+        assert_ne!(
+            broken_root_id, genesis_root,
+            "a wrong resume point must not reproduce the canonical state root"
+        );
+    }
+
+    /// A resume point whose chunk closure is damaged must not be resumed from.
+    /// Repair stays total: the walk continues past it and the replay rebuilds
+    /// the canonical root from the changelog.
+    #[tokio::test]
+    async fn damaged_resume_point_falls_back_to_total_replay() {
+        let tracked_state = TrackedStateContext::new();
+
+        let from_genesis = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&from_genesis, &tracked_state, false).await;
+        let (_, genesis_root) = replay_root_for_test(&from_genesis, &tracked_state, "b3").await;
+
+        let damaged = StorageAdapter::new(Memory::new());
+        write_two_interval_history_for_test(&damaged, &tracked_state, true).await;
+        delete_root_chunk_for_test(&damaged, "a3").await;
+
+        let (damaged_plans, damaged_root) =
+            replay_root_for_test(&damaged, &tracked_state, "b3").await;
+        assert_eq!(
+            damaged_plans, 6,
+            "a damaged interval root must not bound the replay set"
+        );
+        assert_eq!(
+            damaged_root, genesis_root,
+            "total replay must still produce the canonical state root"
         );
     }
 
