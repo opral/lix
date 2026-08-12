@@ -350,11 +350,24 @@ where
         .collect::<Vec<_>>();
 
     stage_init_json_payloads(&mut writes, &plan)?;
+    // The genesis commit's delta members are exactly the authored seed
+    // changes, so its touched-scope digest is derivable here without waiting
+    // for the mutation inventory staged further below. Publishing it matters:
+    // every history traversal reaches the genesis commit, so leaving it
+    // undigested would put one unavoidable replay-state load in every read.
+    let init_touched_scopes = authored_changes
+        .iter()
+        .map(|change| crate::changelog::CommitScopeKey {
+            schema_key: change.schema_key.clone(),
+            file_id: change.file_id.clone(),
+        })
+        .collect::<Vec<_>>();
     stage_init_changelog_commit(
         &mut read,
         &mut writes,
         &plan,
         branch_ref_ledger_changes.clone(),
+        &init_touched_scopes,
     )
     .await?;
 
@@ -584,10 +597,11 @@ async fn stage_init_changelog_commit(
     writes: &mut StorageWriteSet,
     plan: &InitSeedPlan,
     changes: Vec<ChangeRecord>,
+    touched_scopes: &[crate::changelog::CommitScopeKey],
 ) -> Result<(), LixError> {
     let commit = CommitRecord {
-        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
-        format_version: 4,
+        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(touched_scopes),
+        format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
