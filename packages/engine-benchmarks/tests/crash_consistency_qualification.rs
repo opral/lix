@@ -316,8 +316,19 @@ async fn child_main(db: PathBuf, ack: PathBuf, killer: Arc<Killer>, workload: Wo
         .expect("child opens crash-consistency Lix");
 
     // --- setup, deliberately not armed -------------------------------------
+    let setup_started = Instant::now();
     register_schema(&lix).await;
     write_generation(&lix, workload.rows, 0).await;
+    // A fsynced marker so the verifier knows whether a crash landed in setup
+    // (where the row invariant does not hold yet) or in the measured window.
+    let marker = db.parent().expect("trial directory").join("setup.done");
+    fs::write(&marker, b"1").expect("write crash-consistency setup marker");
+    fs::File::open(&marker)
+        .expect("reopen crash-consistency setup marker")
+        .sync_all()
+        .expect("fsync crash-consistency setup marker");
+    println!("E20_SETUP_NANOS {}", setup_started.elapsed().as_nanos());
+    let _ = std::io::stdout().flush();
 
     // --- measured publication window ---------------------------------------
     killer.arm();
@@ -350,7 +361,9 @@ fn append_ack(path: &Path, generation: u64) {
 
 #[derive(Debug)]
 struct Recovered {
-    generation: i64,
+    /// Highest generation visible after the crash, or `None` when the crash
+    /// landed before the seed commit published.
+    generation: Option<i64>,
 }
 
 /// Everything the brief asks of a store that has just survived a crash.
@@ -359,6 +372,7 @@ async fn verify_after_crash(
     acked: Option<i64>,
     attempted: i64,
     rows: usize,
+    setup_complete: bool,
 ) -> Result<Recovered, String> {
     // 1. Does the store open at all?
     let storage = RocksDB::open(&path).map_err(|error| format!("store did not open: {error}"))?;
@@ -401,43 +415,90 @@ async fn verify_after_crash(
     }
 
     // 3./4. Does a plain SELECT return one whole committed write set?
-    let observed = read_generations(&lix, rows)
-        .await
-        .map_err(|error| format!("plain SELECT failed after crash: {error}"))?;
-    let generation = single_generation(&observed)?;
-
-    // Durability: a commit whose `commit()` returned Ok must still be there.
-    if let Some(acked) = acked
-        && generation < acked
-    {
+    //
+    // A kill that landed before the seed commit published leaves the table
+    // absent or empty. Both are legal *pre-publication* states; what would not
+    // be legal is a partially applied seed, so the row count is still pinned to
+    // 0 or `rows` and the generations must still be uniform.
+    let observed = match read_generations(&lix).await {
+        Ok(observed) => observed,
+        Err(ReadFailure::TableAbsent) if !setup_complete => Vec::new(),
+        Err(ReadFailure::TableAbsent) => {
+            return Err(
+                "plain SELECT failed after crash: the table is gone even though setup completed"
+                    .to_owned(),
+            );
+        }
+        Err(ReadFailure::Other(error)) => {
+            return Err(format!("plain SELECT failed after crash: {error}"));
+        }
+    };
+    if !observed.is_empty() && observed.len() != rows {
         return Err(format!(
-            "acknowledged commit lost: ack log reached generation {acked}, store shows {generation}"
+            "TORN WRITE SET: {} rows visible, expected 0 or {rows} — a publication was observed half-applied",
+            observed.len()
         ));
     }
-    if generation > attempted {
+    let generation = if observed.is_empty() {
+        if setup_complete {
+            return Err(
+                "no rows visible even though the seed commit was acknowledged before the crash"
+                    .to_owned(),
+            );
+        }
+        None
+    } else {
+        Some(single_generation(&observed)?)
+    };
+
+    // Durability: a commit whose `commit()` returned Ok must still be there.
+    if let Some(acked) = acked {
+        let visible = generation.ok_or_else(|| {
+            format!("acknowledged commit lost: ack log reached generation {acked}, store is empty")
+        })?;
+        if visible < acked {
+            return Err(format!(
+                "acknowledged commit lost: ack log reached generation {acked}, store shows {visible}"
+            ));
+        }
+    }
+    if let Some(visible) = generation
+        && visible > attempted
+    {
         return Err(format!(
-            "store shows generation {generation}, which the writer never attempted (max {attempted})"
+            "store shows generation {visible}, which the writer never attempted (max {attempted})"
         ));
     }
 
     // Derived views must not be stale-but-authoritative: the history view is
     // rebuilt from canonical records and must agree with the serving read.
-    let history_rows = scalar_i64(
-        &lix,
-        &format!("SELECT COUNT(*) AS n FROM {SCHEMA_KEY}_history() WHERE generation = $1"),
-        &[Value::Integer(generation)],
-    )
-    .await
-    .map_err(|error| format!("history view unreadable after crash: {error}"))?;
-    if history_rows == 0 && generation > 0 {
-        return Err(format!(
-            "serving read reports generation {generation}, but the canonical history view has no such rows"
-        ));
+    if let Some(visible) = generation
+        && visible > 0
+    {
+        let history_rows = scalar_i64(
+            &lix,
+            &format!("SELECT COUNT(*) AS n FROM {SCHEMA_KEY}_history() WHERE generation = $1"),
+            &[Value::Integer(visible)],
+        )
+        .await
+        .map_err(|error| format!("history view unreadable after crash: {error}"))?;
+        if history_rows == 0 {
+            return Err(format!(
+                "serving read reports generation {visible}, but the canonical history view has no such rows"
+            ));
+        }
     }
 
     // 5. Does the next commit after recovery succeed?
-    let recovery_generation = generation + RECOVERY_MARK;
-    write_generation_checked(&lix, rows, recovery_generation)
+    if observed.is_empty() {
+        // The crash landed before the schema or the seed published; recovering
+        // means the store accepts the setup it never finished.
+        if matches!(read_generations(&lix).await, Err(ReadFailure::TableAbsent)) {
+            register_schema(&lix).await;
+        }
+    }
+    let recovery_generation = generation.unwrap_or(0) + RECOVERY_MARK;
+    upsert_generation(&lix, rows, recovery_generation, observed.is_empty())
         .await
         .map_err(|error| format!("first commit after recovery failed: {error}"))?;
     lix.close()
@@ -452,9 +513,15 @@ async fn verify_after_crash(
         .with_storage(storage.clone())
         .await
         .map_err(|error| format!("second engine open failed: {error}"))?;
-    let observed = read_generations(&lix, rows)
+    let observed = read_generations(&lix)
         .await
-        .map_err(|error| format!("SELECT after recovery reopen failed: {error}"))?;
+        .map_err(|error| format!("SELECT after recovery reopen failed: {error:?}"))?;
+    if observed.len() != rows {
+        return Err(format!(
+            "post-recovery commit left {} rows, expected {rows}",
+            observed.len()
+        ));
+    }
     let confirmed = single_generation(&observed)?;
     if confirmed != recovery_generation {
         return Err(format!(
@@ -525,10 +592,19 @@ async fn write_generation_checked<S: Storage + Clone + Send + Sync + 'static>(
     rows: usize,
     generation: i64,
 ) -> Result<(), lix::LixError> {
+    upsert_generation(lix, rows, generation, generation == 0).await
+}
+
+async fn upsert_generation<S: Storage + Clone + Send + Sync + 'static>(
+    lix: &Lix<S>,
+    rows: usize,
+    generation: i64,
+    insert: bool,
+) -> Result<(), lix::LixError> {
     let mut transaction = lix.begin_transaction().await?;
     for index in 0..rows {
         let payload = format!("gen-{generation}-row-{index}");
-        if generation == 0 {
+        if insert {
             transaction
                 .execute(
                     &format!(
@@ -560,29 +636,36 @@ async fn write_generation_checked<S: Storage + Clone + Send + Sync + 'static>(
     Ok(())
 }
 
+/// Why a post-crash read failed. A missing table is a legal pre-publication
+/// state; anything else is a defect.
+#[derive(Debug)]
+enum ReadFailure {
+    TableAbsent,
+    Other(String),
+}
+
 async fn read_generations<S: Storage + Clone + Send + Sync + 'static>(
     lix: &Lix<S>,
-    rows: usize,
-) -> Result<Vec<i64>, String> {
+) -> Result<Vec<i64>, ReadFailure> {
     let result = lix
         .execute(
             &format!("SELECT id, generation FROM {SCHEMA_KEY} ORDER BY id"),
             &[],
         )
         .await
-        .map_err(|error| error.to_string())?;
-    let observed: Vec<i64> = result
+        .map_err(|error| {
+            let text = error.to_string();
+            if text.contains("LIX_TABLE_NOT_FOUND") {
+                ReadFailure::TableAbsent
+            } else {
+                ReadFailure::Other(text)
+            }
+        })?;
+    Ok(result
         .rows()
         .iter()
         .map(|row| row.get::<i64>("generation").expect("generation is an integer"))
-        .collect();
-    if observed.len() != rows {
-        return Err(format!(
-            "row count is {} after recovery, expected {rows} — a publication was observed half-applied",
-            observed.len()
-        ));
-    }
-    Ok(observed)
+        .collect())
 }
 
 async fn scalar_text<S: Storage + Clone + Send + Sync + 'static>(
@@ -640,6 +723,7 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
     let workload = Workload::from_env();
     let root = tempfile::tempdir().expect("create crash-consistency sweep root");
     let mut failures: Vec<String> = Vec::new();
+    let mut recovered_generations: Vec<Option<i64>> = Vec::new();
     let mut trials = 0usize;
     let mut killed_trials = 0usize;
 
@@ -687,14 +771,22 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
             .unwrap_or_else(|| "?".to_owned());
         let database = dir.join("database");
         let acked = child.acked;
+        let setup_complete = child.setup_complete;
         let outcome = block_on(move || {
-            verify_after_crash(database, acked, workload.commits as i64, workload.rows)
+            verify_after_crash(
+                database,
+                acked,
+                workload.commits as i64,
+                workload.rows,
+                setup_complete,
+            )
         });
-        if let Err(error) = &outcome {
-            failures.push(format!(
+        match &outcome {
+            Ok(recovered) => recovered_generations.push(recovered.generation),
+            Err(error) => failures.push(format!(
                 "kill_at={kill_at} ({label}, killed={}): {error}",
                 child.killed_by_signal
-            ));
+            )),
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -709,11 +801,15 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
         },
     );
     let window_nanos = window_duration.as_nanos().max(1) as u64;
+    // Setup is not part of the measured window, so aim the timed kills at what
+    // follows it. A 10% undershoot deliberately keeps a few kills in late setup:
+    // a crash during repository initialization must also leave a usable store.
+    let setup_nanos = calibration.setup_nanos.unwrap_or(0);
+    let aim_from = setup_nanos - setup_nanos / 10;
+    let aim_span = window_nanos.saturating_sub(aim_from).max(1);
     let mut rng = SplitMix64::new(env_u64("LIX_CRASH_CONSISTENCY_SEED", 0x5eed_c0de_1234_5678));
     for trial in 0..timed_trials {
-        // Sweep the whole observed window, biased to the second half where the
-        // measured publications live (setup occupies the first part).
-        let delay = window_nanos / 4 + rng.next() % window_nanos;
+        let delay = aim_from + rng.next() % aim_span;
         let dir = root.path().join(format!("t{trial}"));
         let child = run_child(&dir, workload, KillPlan::AfterNanos(delay), false);
         trials += 1;
@@ -722,23 +818,36 @@ fn rocksdb_publication_window_survives_sigkill_at_every_storage_event() {
         }
         let database = dir.join("database");
         let acked = child.acked;
+        let setup_complete = child.setup_complete;
         let outcome = block_on(move || {
-            verify_after_crash(database, acked, workload.commits as i64, workload.rows)
+            verify_after_crash(
+                database,
+                acked,
+                workload.commits as i64,
+                workload.rows,
+                setup_complete,
+            )
         });
-        if let Err(error) = &outcome {
-            failures.push(format!(
+        match &outcome {
+            Ok(recovered) => recovered_generations.push(recovered.generation),
+            Err(error) => failures.push(format!(
                 "timed delay={delay}ns (killed={}): {error}",
                 child.killed_by_signal
-            ));
+            )),
         }
         let _ = fs::remove_dir_all(&dir);
     }
 
+    let mut distinct: Vec<Option<i64>> = recovered_generations.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
     println!(
         "crash-consistency sweep: {trials} trials ({} storage-event points over a {events}-event \
-         publication window, {timed_trials} seeded wall-clock kills), {killed_trials} confirmed \
-         SIGKILLed, {} inconsistencies",
+         publication window, {timed_trials} seeded wall-clock kills spanning \
+         {aim_from}..{}ns), {killed_trials} confirmed SIGKILLed, {} inconsistencies; \
+         recovered generations observed: {distinct:?}",
         swept.len(),
+        aim_from + aim_span,
         failures.len()
     );
 
@@ -791,6 +900,8 @@ struct ChildRun {
     killed_by_signal: bool,
     acked: Option<i64>,
     events: Option<u64>,
+    setup_nanos: Option<u64>,
+    setup_complete: bool,
     labels: Vec<String>,
     output: String,
 }
@@ -849,11 +960,18 @@ fn run_child(dir: &Path, workload: Workload, plan: KillPlan, trace: bool) -> Chi
         .filter_map(|rest| rest.split_once(' ').map(|(_, label)| label.to_owned()))
         .collect();
 
+    let setup_nanos = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("E20_SETUP_NANOS "))
+        .and_then(|value| value.trim().parse().ok());
+
     ChildRun {
         status_success: output.status.success(),
         killed_by_signal: signal_of(&output.status) == Some(libc::SIGKILL),
         acked: read_ack(&ack),
         events,
+        setup_nanos,
+        setup_complete: dir.join("setup.done").exists(),
         labels,
         output: format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
     }
