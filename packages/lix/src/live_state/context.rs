@@ -658,13 +658,6 @@ where
         let Some(requested_control) = scope.branch_heads.get(requested_branch_id).copied() else {
             return Ok(None);
         };
-        // The direct immutable-base projection covers one serving generation.
-        // A split selector must use the merged tracked/untracked visibility
-        // path so branch-local untracked rows remain visible after a tracked
-        // root swap or an untracked-only generation advance.
-        if requested_control.tracked_generation != requested_control.untracked_generation {
-            return Ok(None);
-        }
         let tracked_head = self.tracked_head.reader(&self.store);
         if requested_branch_id != GLOBAL_BRANCH_ID
             && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
@@ -1271,7 +1264,7 @@ where
         };
         self.tracked_head
             .reader(&self.store)
-            .collection_generation(branch_id, control.untracked_generation, scope)
+            .collection_generation(branch_id, control.tracked_generation, scope)
             .await
             .map(Some)
     }
@@ -1440,10 +1433,12 @@ fn concat_live_state_batches(
 /// publication metadata. Missing controls and Bloom false positives fall back
 /// to the storage scan; only a negative result from every selected generation
 /// can skip it.
+///
+/// The bloom summarizes the branch's one serving generation, so it covers
+/// untracked rows as well: every untracked publication notes its schema keys
+/// on the same control. An explicit retention filter therefore needs no
+/// escape hatch here.
 fn scope_may_have_schema_rows(request: &LiveStateScanRequest, scope: &LiveStateScanScope) -> bool {
-    if request.filter.untracked.is_some() {
-        return true;
-    }
     let [schema_key] = request.filter.schema_keys.as_slice() else {
         return true;
     };
@@ -2689,7 +2684,6 @@ mod tests {
             let mut control = BranchHeadControl {
                 head_commit_id,
                 tracked_generation: generation,
-                untracked_generation: generation,
                 current_state_revision: 0,
                 schema_presence_bloom: [0; 4],
                 working_diff_checkpoint_commit_id: None,

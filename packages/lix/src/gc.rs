@@ -1744,12 +1744,7 @@ where
     // reachability walk instead of needing a second retention ledger.
     let live_generations = controls
         .iter()
-        .flat_map(|(branch_id, control)| {
-            [
-                (branch_id.as_str(), control.tracked_generation),
-                (branch_id.as_str(), control.untracked_generation),
-            ]
-        })
+        .map(|(branch_id, control)| (branch_id.as_str(), control.tracked_generation))
         .collect::<BTreeSet<_>>();
     let mut retired_generations = BTreeSet::new();
     let mut reclaimed_generation_rows = 0_u64;
@@ -1792,13 +1787,9 @@ where
             // generation behind an unrelated pin, exactly like the retired
             // branch-checkpoint prefix immediately above.
             if let Some(old_control) = delta.old_control.as_ref() {
-                for generation in [
-                    old_control.tracked_generation,
-                    old_control.untracked_generation,
-                ] {
+                for generation in [old_control.tracked_generation] {
                     if delta.new_control.is_some_and(|new_control| {
                         new_control.tracked_generation == generation
-                            || new_control.untracked_generation == generation
                     }) || live_generations.contains(&(delta.branch_id.as_str(), generation))
                     {
                         continue;
@@ -1979,12 +1970,6 @@ where
     // maintenance work, but delta rows have no shared ownership and must be
     // reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
-    // Old serving generations are derived data. Removing them in the same
-    // atomic sweep as their untracked payload-root withdrawal prevents stale
-    // branch generations from accumulating indefinitely.
-    let stale_untracked_refs = TrackedHeadContext::new()
-        .stage_collect_stale_current_state_generations(&store, writes, &controls)
-        .await?;
     // The changelog plan contains every payload reachable from tracked
     // history plus the active untracked roots supplied above. A retired
     // untracked JSON ref is only a deletion candidate: content-addressed
@@ -2006,10 +1991,7 @@ where
         .iter()
         .map(|json_ref| *json_ref.as_hash_array())
         .collect::<BTreeSet<_>>();
-    let mut reclaimable_untracked_refs = stale_untracked_refs
-        .into_iter()
-        .map(|json_ref| *json_ref.as_hash_array())
-        .collect::<BTreeSet<_>>();
+    let mut reclaimable_untracked_refs = BTreeSet::new();
     let mut consumed_candidate_keys = Vec::new();
     for candidate in JsonStoreContext::new()
         .scan_untracked_reclaim_candidates(&store)
@@ -2866,7 +2848,6 @@ mod tests {
             *CommitId::for_test_label("control-projection-head").as_uuid(),
         );
         let tracked_generation = CommitId::for_test_label("control-projection-tracked");
-        let untracked_generation = CommitId::for_test_label("control-projection-untracked");
         let working_diff = CommitId::with_change_address_space(
             *CommitId::for_test_label("control-projection-working-diff").as_uuid(),
         );
@@ -2877,7 +2858,6 @@ mod tests {
             BranchHeadControl {
                 head_commit_id: head,
                 tracked_generation,
-                untracked_generation,
                 current_state_revision: 7,
                 working_diff_checkpoint_commit_id: Some(working_diff),
                 created_at: timestamp,
@@ -2929,11 +2909,6 @@ mod tests {
         );
         assert!(reachability.serving_dependencies.is_empty());
         assert!(!reachability.chronology_roots.contains(&tracked_generation));
-        assert!(
-            !reachability
-                .chronology_roots
-                .contains(&untracked_generation)
-        );
     }
 
     #[tokio::test]
@@ -4125,7 +4100,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(commit_id),
             created_at: timestamp,
@@ -4177,7 +4151,6 @@ mod tests {
         let mut advanced = observed.control.expect("fixture control should exist");
         advanced.head_commit_id = CommitId::for_test_label("concurrent-head");
         advanced.tracked_generation = advanced.head_commit_id;
-        advanced.untracked_generation = advanced.head_commit_id;
         advanced.current_state_revision = advanced.current_state_revision.saturating_add(1);
         stage_branch_head_control(&mut concurrent, "main", advanced)
             .expect("concurrent control should stage");
@@ -4453,7 +4426,6 @@ mod tests {
         let old_control = BranchHeadControl {
             head_commit_id: old_root,
             tracked_generation: old_root,
-            untracked_generation: old_root,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -4464,7 +4436,6 @@ mod tests {
         let new_control = BranchHeadControl {
             head_commit_id: new_root,
             tracked_generation: new_root,
-            untracked_generation: new_root,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -4536,7 +4507,6 @@ mod tests {
         let old_control = BranchHeadControl {
             head_commit_id: old_root,
             tracked_generation: old_root,
-            untracked_generation: old_root,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -4547,7 +4517,6 @@ mod tests {
         let new_control = BranchHeadControl {
             head_commit_id: new_root,
             tracked_generation: new_root,
-            untracked_generation: new_root,
             current_state_revision: 1,
             working_diff_checkpoint_commit_id: Some(new_root),
             created_at: timestamp,
@@ -7067,7 +7036,6 @@ mod tests {
         BranchHeadControl {
             head_commit_id: commit_id,
             tracked_generation: commit_id,
-            untracked_generation: commit_id,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(commit_id),
             created_at: timestamp,

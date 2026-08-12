@@ -126,7 +126,7 @@ fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
 mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::branch::{
-        BranchHeadControlContext, stage_branch_head_control, untracked_lifecycle_generation,
+        BranchHeadControlContext, stage_branch_head_control,
     };
     use crate::entity_pk::EntityPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
@@ -366,17 +366,11 @@ mod tests {
         let mut next_control = control
             .next_current_state_revision()
             .expect("global control revision should advance");
-        let next_generation = untracked_lifecycle_generation(
-            GLOBAL_BRANCH_ID,
-            control.untracked_generation,
-            next_control.current_state_revision,
-        );
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_untracked_generation(
+            .stage_untracked_current_state(
                 GLOBAL_BRANCH_ID,
-                control.untracked_generation,
-                next_generation,
+                control.tracked_generation,
                 &[CurrentStateDeltaRef {
                     schema_key: "lix_key_value",
                     file_id: None,
@@ -395,7 +389,6 @@ mod tests {
             )
             .await
             .expect("test key-value current row should stage");
-        next_control.untracked_generation = next_generation;
         next_control.note_schema("lix_key_value");
         stage_branch_head_control(&mut writes, GLOBAL_BRANCH_ID, next_control)
             .expect("global control should publish current state");

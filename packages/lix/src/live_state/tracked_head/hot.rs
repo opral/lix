@@ -87,7 +87,6 @@ const HOT_DIFF_SEGMENT_MAX_IDENTITIES: u32 = 4_096;
 // storage amplification, so retain their allocation-free direct-key path.
 const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
 pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_001f),
@@ -542,21 +541,18 @@ pub(crate) async fn stage_certified_entity_batches(
         let source_generations = observations
             .get(branch_id)
             .and_then(|observation| observation.control)
-            .map(|previous| {
-                BTreeSet::from([previous.tracked_generation, previous.untracked_generation])
-            })
+            .map(|previous| BTreeSet::from([previous.tracked_generation]))
             .unwrap_or_else(|| {
                 durable_controls
                     .iter()
                     .filter(|(_, candidate)| candidate.head_commit_id == control.head_commit_id)
-                    .flat_map(|(_, candidate)| {
-                        [candidate.tracked_generation, candidate.untracked_generation]
-                    })
+                    .map(|(_, candidate)| candidate.tracked_generation)
                     .collect()
             });
-        for source_generation in source_generations.into_iter().filter(|generation| {
-            *generation != control.tracked_generation && *generation != control.untracked_generation
-        }) {
+        for source_generation in source_generations
+            .into_iter()
+            .filter(|generation| *generation != control.tracked_generation)
+        {
             let previous_prefix = source_generation.as_uuid().as_bytes().to_vec();
             let range = StoragePrefix {
                 bytes: Bytes::from(previous_prefix.clone()),
@@ -2473,6 +2469,7 @@ fn stage_incremental_collection_controls(
                         branch_generation,
                         delta.schema_key,
                         delta.file_id,
+                        value.untracked,
                         value.commit_id,
                     )
             });
@@ -2481,6 +2478,7 @@ fn stage_incremental_collection_controls(
             branch_generation,
             delta.schema_key,
             delta.file_id,
+            delta.untracked,
             delta.commit_id,
         );
         let next_live = !delta.deleted && belongs_to_active_generation;
@@ -2538,6 +2536,13 @@ fn stage_incremental_collection_controls(
         if !dirty_scopes.contains(&(schema_key.clone(), file_id.clone())) {
             continue;
         }
+        // An exact-closure scope cannot be published incrementally: the
+        // ordered digest this path drops is exactly what proves absence there.
+        // `restage_exact_closure_collection_control` is its single writer, so
+        // staging here as well would be a duplicate mutation.
+        if scope_requires_exact_closure(branch_id, &schema_key, file_id.as_deref()) {
+            continue;
+        }
         stage_hot_collection_control(
             writes,
             branch_id,
@@ -2582,11 +2587,38 @@ fn apply_incremental_collection_generation_deltas(
     Ok(())
 }
 
+/// A collection-generation fence is a commit-ordered statement about tracked
+/// members: a row survives it only by being newer than the retired generation.
+///
+/// An untracked row has no `commit_id` and is never a member of a collection
+/// generation, so the fence can neither retire it nor resurrect it. Tracked
+/// and untracked rows now share one serving generation, so this exemption is
+/// what keeps a tracked collection replacement from silently deleting the
+/// branch's history-free rows in the same schema scope.
+fn survives_collection_generation_fence(
+    untracked: bool,
+    commit_id: Option<CommitId>,
+    active_generation: CommitId,
+    inclusive: bool,
+) -> bool {
+    if untracked {
+        return true;
+    }
+    commit_id.is_some_and(|commit_id| {
+        if inclusive {
+            commit_id >= active_generation
+        } else {
+            commit_id > active_generation
+        }
+    })
+}
+
 fn row_belongs_to_active_collection_generation(
     controls: &BTreeMap<(String, Option<String>), HotCollectionControl>,
     branch_generation: CommitId,
     schema_key: &str,
     file_id: Option<&str>,
+    untracked: bool,
     commit_id: Option<CommitId>,
 ) -> bool {
     [
@@ -2600,8 +2632,97 @@ fn row_belongs_to_active_collection_generation(
             .get(&scope)
             .expect("row collection scope was loaded above");
         control.active_generation == branch_generation
-            || commit_id.is_some_and(|commit_id| commit_id > control.active_generation)
+            || survives_collection_generation_fence(
+                untracked,
+                commit_id,
+                control.active_generation,
+                false,
+            )
     })
+}
+
+/// Collections whose *absence* is proven by an authenticated identity digest
+/// rather than by a point read returning nothing.
+///
+/// Today there is exactly one: the global branch's `lix_key_value`, which
+/// `functions::state::load_key_value_row` closes over to prove that a
+/// deterministic engine row is genuinely absent instead of silently missing.
+/// The digest is what makes that proof resistant to a same-count,
+/// different-identity substitution; a generation fence or a CAS cannot see
+/// that class of corruption.
+///
+/// The incremental control path deliberately drops the ordered digest, because
+/// it is order-dependent and cannot be maintained without rescanning. A
+/// publication touching one of these scopes therefore recomputes the complete
+/// control, which costs O(scope). That is why this set is kept as narrow as
+/// possible: bulk untracked state lives on ordinary branches under ordinary
+/// schemas and never pays it.
+fn scope_requires_exact_closure(branch_id: &str, schema_key: &str, file_id: Option<&str>) -> bool {
+    branch_id == crate::GLOBAL_BRANCH_ID
+        && schema_key == EXACT_CLOSURE_SCHEMA_KEY
+        && file_id.is_none()
+}
+
+const EXACT_CLOSURE_SCHEMA_KEY: &str = "lix_key_value";
+
+/// Recomputes the complete collection control for an exact-closure scope from
+/// its stored pre-image plus the values this publication is staging.
+///
+/// `staged` maps an identity in the scope to its new encoded value, or `None`
+/// when the publication removes it physically.
+async fn restage_exact_closure_collection_control(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    staged: &BTreeMap<HeadRowIdentity, Option<Bytes>>,
+) -> Result<(), LixError> {
+    let scope = crate::collection_generation::CollectionScopeRef {
+        schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+        file_id: None,
+    };
+    let marker_entity_pk =
+        EntityPk::single(crate::collection_generation::collection_scope_key(scope));
+    let filter = TrackedStateFilter {
+        schema_keys: vec![
+            EXACT_CLOSURE_SCHEMA_KEY.to_owned(),
+            crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+        ],
+        include_tombstones: true,
+        ..TrackedStateFilter::default()
+    };
+    let HotScanEntries::Decoded(entries) =
+        hot_scan_entries(store, branch_id, generation, &filter, None, None)
+            .await?
+            .expect("unbounded HOT scan cannot exhaust a byte budget")
+    else {
+        unreachable!("an unconstrained HOT scan cannot select the finite point-read route");
+    };
+    let mut rows: HotRowMap = BTreeMap::new();
+    for (identity, bytes) in entries {
+        let identity = identity.into_row_identity();
+        // Markers for *other* scopes must not enter this map: they would make
+        // the complete-control pass emit a zero-count control for a scope this
+        // recompute never counted.
+        if identity.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+            && identity.entity_pk != marker_entity_pk
+        {
+            continue;
+        }
+        rows.insert(identity, bytes);
+    }
+    // The publication's own values win over the stored pre-image.
+    for (identity, value) in staged {
+        match value {
+            Some(bytes) => {
+                rows.insert(identity.clone(), bytes.clone());
+            }
+            None => {
+                rows.remove(identity);
+            }
+        }
+    }
+    stage_complete_collection_controls(writes, branch_id, generation, &rows)
 }
 
 fn stage_complete_collection_controls(
@@ -2664,9 +2785,12 @@ fn stage_complete_collection_controls(
             .get(&schema_scope)
             .expect("complete row schema control was initialized above");
         let visible_after_schema_generation = schema_control.active_generation == branch_generation
-            || value
-                .commit_id
-                .is_some_and(|commit_id| commit_id > schema_control.active_generation);
+            || survives_collection_generation_fence(
+                value.untracked,
+                value.commit_id,
+                schema_control.active_generation,
+                false,
+            );
         let file_scope = identity
             .file_id
             .as_ref()
@@ -2676,9 +2800,12 @@ fn stage_complete_collection_controls(
             .and_then(|scope| controls.get(scope))
             .is_none_or(|control| {
                 control.active_generation == branch_generation
-                    || value
-                        .commit_id
-                        .is_some_and(|commit_id| commit_id > control.active_generation)
+                    || survives_collection_generation_fence(
+                        value.untracked,
+                        value.commit_id,
+                        control.active_generation,
+                        false,
+                    )
             });
         if !visible_after_schema_generation || !visible_after_file_generation {
             continue;
@@ -4551,62 +4678,22 @@ where
         request: &TrackedStateScanRequest,
         requested_untracked: Option<bool>,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        match requested_untracked {
-            Some(true) => {
-                self.scan_live_batch_for_generation_with_visibility(
-                    branch_id,
-                    control.untracked_generation,
-                    None,
-                    request,
-                    false,
-                )
-                .await
-            }
-            Some(false) => {
-                self.scan_live_batch_for_generation(
-                    branch_id,
-                    control.tracked_generation,
-                    control.working_diff_checkpoint_commit_id,
-                    request,
-                )
-                .await
-            }
-            None => {
-                let tracked = self
-                    .scan_live_batch_for_generation(
-                        branch_id,
-                        control.tracked_generation,
-                        control.working_diff_checkpoint_commit_id,
-                        request,
-                    )
-                    .await?;
-                if control.tracked_generation == control.untracked_generation {
-                    return Ok(tracked);
-                }
-                // A split branch control has two independent serving roots:
-                // the tracked selector owns only tracked rows and the
-                // untracked selector owns only current-only rows.  Older
-                // generations can contain a complete pre-split snapshot, so
-                // concatenating both roots without applying the domain
-                // boundary would resurrect tracked rows from the untracked
-                // root after checkout/merge.  Filter at the selector
-                // boundary, before visibility resolution, rather than
-                // relying on row-level callers to repair a mixed authority.
-                let tracked = tracked.filter(|row| !row.untracked(), None);
-                let untracked = self
-                    .scan_live_batch_for_generation(
-                        branch_id,
-                        control.untracked_generation,
-                        None,
-                        request,
-                    )
-                    .await?;
-                let untracked = untracked.filter(|row| row.untracked(), None);
-                let mut rows = tracked.into_rows();
-                rows.extend(untracked.into_rows());
-                Ok(MaterializedLiveStateBatch::from_rows(rows))
-            }
-        }
+        // The branch has one serving generation. Tracked and history-free
+        // rows share it and are separated only by their per-row flag, so an
+        // explicit retention filter is a row predicate over a single scan,
+        // never a second authority domain.
+        let rows = self
+            .scan_live_batch_for_generation(
+                branch_id,
+                control.tracked_generation,
+                control.working_diff_checkpoint_commit_id,
+                request,
+            )
+            .await?;
+        Ok(match requested_untracked {
+            None => rows,
+            Some(untracked) => rows.filter(|row| row.untracked() == untracked, None),
+        })
     }
 
     pub(crate) async fn scan_live_batches_for_controls(
@@ -5227,8 +5314,12 @@ where
         let rows = rows.filter(
             |row| {
                 replaced_generation.is_none_or(|control| {
-                    row.commit_id()
-                        .is_some_and(|commit_id| commit_id > control.active_generation)
+                    survives_collection_generation_fence(
+                        row.untracked(),
+                        row.commit_id(),
+                        control.active_generation,
+                        false,
+                    )
                 })
             },
             None,
@@ -5405,7 +5496,10 @@ where
         projection: &ChangeRecordProjection,
         domain: LiveStateReadDomain,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        let tracked = Box::pin(self.load_projected_live_batch_for_generation_refs(
+        // One serving generation holds at most one row per identity, so the
+        // read domain is a predicate on the row that was found rather than a
+        // precedence rule between two roots.
+        let rows = Box::pin(self.load_projected_live_batch_for_generation_refs(
             branch_id,
             control.tracked_generation,
             control.working_diff_checkpoint_commit_id,
@@ -5413,58 +5507,11 @@ where
             projection,
         ))
         .await?;
-        if matches!(domain, LiveStateReadDomain::Tracked) {
-            return tracked.filter(|row| !row.untracked());
+        match domain {
+            LiveStateReadDomain::Combined => Ok(rows),
+            LiveStateReadDomain::Tracked => rows.filter(|row| !row.untracked()),
+            LiveStateReadDomain::Untracked => rows.filter(|row| row.untracked()),
         }
-        if control.tracked_generation == control.untracked_generation
-            && matches!(domain, LiveStateReadDomain::Combined)
-        {
-            return Ok(tracked);
-        }
-        if matches!(domain, LiveStateReadDomain::Untracked) {
-            let untracked = Box::pin(
-                self.load_projected_live_batch_for_generation_refs_with_visibility(
-                    branch_id,
-                    control.untracked_generation,
-                    None,
-                    keys,
-                    projection,
-                    false,
-                ),
-            )
-            .await?;
-            return untracked.filter(|row| row.untracked());
-        }
-        let untracked = Box::pin(self.load_projected_live_batch_for_generation_refs(
-            branch_id,
-            control.untracked_generation,
-            None,
-            keys,
-            projection,
-        ))
-        .await?;
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
-        let mut slots = Vec::with_capacity(keys.len());
-        for index in 0..keys.len() {
-            // The two branch-control selectors are independent authority
-            // domains. Older generations can still contain a complete
-            // snapshot, so an exact lookup must not let an untracked row from
-            // the tracked selector mask the current-only generation (or let a
-            // tracked row from the current-only selector leak into a tracked
-            // read). Enforce the domain boundary at this shared exact-read
-            // primitive before resolving precedence.
-            let row = tracked
-                .row(index)
-                .filter(|row| !row.untracked())
-                .or_else(|| untracked.row(index).filter(|row| row.untracked()));
-            slots.push(row.map(|row| {
-                let ordinal = u32::try_from(builder.len())
-                    .expect("exact live-state row count exceeds u32 ordinals");
-                builder.push_ref(row, None);
-                ordinal
-            }));
-        }
-        MaterializedLiveStateExactBatch::new(builder.finish(), slots)
     }
 
     async fn load_projected_live_batch_for_generation_refs(
@@ -5541,8 +5588,14 @@ where
                     .as_deref()
                     .map(decode_head_value)
                     .transpose()?
-                    .and_then(|value| value.commit_id)
-                    .is_some_and(|commit_id| commit_id > control.active_generation);
+                    .is_some_and(|value| {
+                        survives_collection_generation_fence(
+                            value.untracked,
+                            value.commit_id,
+                            control.active_generation,
+                            false,
+                        )
+                    });
                 if !visible {
                     *value = None;
                 }
@@ -5619,8 +5672,12 @@ where
             }
             resolved.push(row.filter(|row| {
                 replaced_generation.is_none_or(|control| {
-                    row.commit_id()
-                        .is_some_and(|commit_id| commit_id >= control.active_generation)
+                    survives_collection_generation_fence(
+                        row.untracked(),
+                        row.commit_id(),
+                        control.active_generation,
+                        true,
+                    )
                 })
             }));
         }
@@ -5709,8 +5766,12 @@ where
             };
             let row = row.filter(|row| {
                 replaced_generation.is_none_or(|control| {
-                    row.commit_id()
-                        .is_some_and(|commit_id| commit_id >= control.active_generation)
+                    survives_collection_generation_fence(
+                        row.untracked(),
+                        row.commit_id(),
+                        control.active_generation,
+                        true,
+                    )
                 })
             });
             combined_slots.push(
@@ -5742,7 +5803,7 @@ where
     ) -> Result<Vec<JsonRef>, LixError> {
         let mut refs = BTreeSet::new();
         for (branch_id, control) in controls {
-            let scope = hot_scope_prefix(branch_id, control.untracked_generation);
+            let scope = hot_scope_prefix(branch_id, control.tracked_generation);
             let range = StoragePrefix {
                 bytes: Bytes::from(scope),
             }
@@ -6827,68 +6888,6 @@ where
         .await
     }
 
-    /// Publishes a new branch-local untracked snapshot without touching the
-    /// tracked generation. The old untracked rows are copied as encoded
-    /// values, then the sorted untracked deltas are applied once before the
-    /// complete new generation is staged. The branch control swaps this
-    /// generation atomically with the transaction's other publication data.
-    pub(crate) async fn stage_untracked_generation(
-        &mut self,
-        branch_id: &str,
-        previous_generation: CommitId,
-        new_generation: CommitId,
-        deltas: &[CurrentStateDeltaRef<'_>],
-        absence_guards: &BTreeSet<TrackedStateKey>,
-    ) -> Result<CommitId, LixError> {
-        let sorted = sorted_lifecycle_hot_deltas(deltas, true)?;
-        let mut rows =
-            load_hot_untracked_generation(self.store, branch_id, previous_generation).await?;
-        let mut retired_untracked_json_refs = BTreeSet::new();
-        for delta in sorted {
-            apply_complete_hot_snapshot_delta(
-                &mut rows,
-                delta,
-                absence_guards,
-                &mut retired_untracked_json_refs,
-            )?;
-        }
-        let has_key_value_scope = rows
-            .keys()
-            .any(|identity| identity.schema_key == KEY_VALUE_SCHEMA_KEY);
-        stage_complete_collection_controls(self.writes, branch_id, new_generation, &rows)?;
-        // Deterministic runtime state performs required point reads in this
-        // engine-owned collection. A complete untracked generation must
-        // therefore authenticate its empty set as well as its present rows;
-        // absence without a control is reserved for revision-zero bootstrap.
-        if !has_key_value_scope {
-            let scope = crate::collection_generation::CollectionScopeRef {
-                schema_key: KEY_VALUE_SCHEMA_KEY,
-                file_id: None,
-            };
-            stage_hot_collection_control(
-                self.writes,
-                branch_id,
-                new_generation,
-                scope,
-                HotCollectionControl {
-                    active_generation: new_generation,
-                    live_count: 0,
-                    ordered_identity_digest: Some(
-                        CompleteHotCollectionDigest::new(branch_id, new_generation, scope).finish(),
-                    ),
-                },
-            )?;
-        }
-        stage_complete_hot_rows(self.writes, branch_id, new_generation, rows);
-        JsonStoreWriter::stage_untracked_reclaim_candidates(
-            self.writes,
-            retired_untracked_json_refs
-                .into_iter()
-                .map(JsonRef::from_hash_bytes),
-        );
-        Ok(new_generation)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stage_current_state_with_certified_predecessors(
         &mut self,
@@ -7379,6 +7378,7 @@ where
                         generation,
                         delta.schema_key,
                         delta.file_id,
+                        value.untracked,
                         value.commit_id,
                     )
                 });
@@ -7604,6 +7604,40 @@ where
             collection_controls,
             certified_live_increments,
         )?;
+        // The incremental path above drops the ordered identity digest, which
+        // an exact-closure scope needs in order to prove absence. Recompute
+        // the one affected control from its pre-image plus the values staged
+        // here. Bounded by that scope, not by the branch's untracked
+        // population.
+        if sorted.iter().any(|delta| {
+            scope_requires_exact_closure(branch_id, delta.schema_key, delta.file_id)
+        }) {
+            let staged = sorted
+                .iter()
+                .zip(&next_value_ranges)
+                .filter(|(delta, _)| {
+                    scope_requires_exact_closure(branch_id, delta.schema_key, delta.file_id)
+                })
+                .map(|(delta, range)| {
+                    (
+                        HeadRowIdentity {
+                            schema_key: delta.schema_key.to_owned(),
+                            entity_pk: delta.entity_pk.clone(),
+                            file_id: delta.file_id.map(str::to_owned),
+                        },
+                        range.as_ref().map(|range| next_value_bytes.slice(range.clone())),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            Box::pin(restage_exact_closure_collection_control(
+                self.store,
+                self.writes,
+                branch_id,
+                generation,
+                &staged,
+            ))
+            .await?;
+        }
 
         async {
             stage_hot_diff_batch(
@@ -9439,9 +9473,13 @@ fn filter_hot_scan_entries_by_collection_generation(
     control: HotCollectionControl,
 ) -> Result<(), LixError> {
     let visible = |bytes: &Bytes| -> Result<bool, LixError> {
-        Ok(decode_head_value(bytes)?
-            .commit_id
-            .is_some_and(|commit_id| commit_id > control.active_generation))
+        let value = decode_head_value(bytes)?;
+        Ok(survives_collection_generation_fence(
+            value.untracked,
+            value.commit_id,
+            control.active_generation,
+            false,
+        ))
     };
     match entries {
         HotScanEntries::Decoded(rows) => {
@@ -11241,31 +11279,6 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
     })
 }
 
-#[cfg(test)]
-fn decode_hot_row_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
-    let mut offset = 0;
-    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
-    if branch_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot row branch id has an invalid terminator",
-        ));
-    }
-    let generation = read_generation(bytes, &mut offset)?;
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot row schema key has an invalid terminator",
-        ));
-    }
-    let file_id = read_file_id(bytes, &mut offset)?;
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("hot row key has trailing bytes"));
-    }
-    let _ = (schema_key, entity_pk, file_id);
-    Ok((branch_id, generation))
-}
-
 fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(
         scope
@@ -11275,29 +11288,6 @@ fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
     key.extend_from_slice(scope);
     write_key_string(&mut key, schema_key, KEY_PART_FINAL);
     key
-}
-
-#[cfg(test)]
-fn decode_hot_file_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
-    let mut offset = 0;
-    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
-    if branch_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot file schema branch id has an invalid terminator",
-        ));
-    }
-    let generation = read_generation(bytes, &mut offset)?;
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot file schema key has an invalid terminator",
-        ));
-    }
-    if offset != bytes.len() {
-        return Err(key_codec_error("hot file schema key has trailing bytes"));
-    }
-    let _ = schema_key;
-    Ok((branch_id, generation))
 }
 
 #[cfg_attr(not(test), expect(dead_code))]
@@ -11529,172 +11519,6 @@ where
         }
     }
     Ok(deleted)
-}
-
-#[cfg(test)]
-pub(crate) async fn stage_collect_stale_hot_generations<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    controls: &[(String, BranchHeadControl)],
-) -> Result<Vec<JsonRef>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let active = active_current_state_generations(controls);
-    let mut stale_untracked_refs = BTreeSet::new();
-    stage_collect_stale_hot_space(
-        store,
-        writes,
-        HOT_ROW_SPACE,
-        decode_hot_row_scope,
-        &active,
-        &mut stale_untracked_refs,
-    )
-    .await?;
-    // Sweep schema membership markers independently so orphaned generations
-    // cannot retain conservative file-membership hints.
-    stage_collect_stale_hot_space(
-        store,
-        writes,
-        HOT_FILE_SPACE,
-        decode_hot_file_scope,
-        &active,
-        &mut stale_untracked_refs,
-    )
-    .await?;
-    let stale_packed_bases = stage_collect_stale_hot_space(
-        store,
-        writes,
-        PACKED_CURRENT_BASE_SPACE,
-        decode_hot_collection_control_scope,
-        &active,
-        &mut stale_untracked_refs,
-    )
-    .await?;
-    stage_collect_stale_hot_space(
-        store,
-        writes,
-        ROOT_CURRENT_BASE_SPACE,
-        decode_hot_collection_control_scope,
-        &active,
-        &mut stale_untracked_refs,
-    )
-    .await?;
-    let stale_packed_controls = stage_collect_stale_hot_space(
-        store,
-        writes,
-        PACKED_CURRENT_BASE_CONTROL_SPACE,
-        decode_hot_collection_control_scope,
-        &active,
-        &mut stale_untracked_refs,
-    )
-    .await?;
-    if stale_packed_bases || stale_packed_controls {
-        stage_collect_stale_hot_space(
-            store,
-            writes,
-            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-            decode_hot_collection_control_scope,
-            &active,
-            &mut stale_untracked_refs,
-        )
-        .await?;
-    }
-    stage_collect_stale_hot_collection_controls(store, writes, &active).await?;
-    Ok(stale_untracked_refs
-        .into_iter()
-        .map(JsonRef::from_hash_bytes)
-        .collect())
-}
-
-#[cfg(test)]
-fn decode_hot_collection_control_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
-    let mut offset = 0;
-    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
-    if branch_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot collection-control branch id has an invalid terminator",
-        ));
-    }
-    let generation = read_generation(bytes, &mut offset)?;
-    Ok((branch_id, generation))
-}
-
-#[cfg(test)]
-async fn stage_collect_stale_hot_collection_controls(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    active: &BTreeSet<(String, CommitId)>,
-) -> Result<(), LixError> {
-    let range = StoragePrefix {
-        bytes: Bytes::new(),
-    }
-    .to_range()?;
-    let mut cursor = store
-        .begin_scan(
-            HOT_COLLECTION_CONTROL_SPACE,
-            range,
-            StorageBeginScanOptions::default(),
-        )
-        .await?;
-    loop {
-        let page = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
-            let keep = decode_hot_collection_control_scope(entry.key.0.as_ref())
-                .is_ok_and(|scope| active.contains(&scope));
-            if !keep {
-                writes.delete(HOT_COLLECTION_CONTROL_SPACE, entry.key);
-            }
-        }
-        if !page.has_more {
-            break;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-async fn stage_collect_stale_hot_space(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    space: StorageSpace,
-    decode_key: fn(&[u8]) -> Result<(String, CommitId), LixError>,
-    active: &BTreeSet<(String, CommitId)>,
-    stale_untracked_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) -> Result<bool, LixError> {
-    let range = StoragePrefix {
-        bytes: Bytes::new(),
-    }
-    .to_range()?;
-    let mut deleted_any = false;
-    let mut cursor = store
-        .begin_scan(space, range, StorageBeginScanOptions::default())
-        .await?;
-    loop {
-        let page = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?;
-        for entry in page.entries {
-            let active_generation =
-                decode_key(entry.key.0.as_ref()).is_ok_and(|identity| active.contains(&identity));
-            if active_generation {
-                continue;
-            }
-            deleted_any = true;
-            if let StorageProjectedValue::FullValue(bytes) = &entry.value
-                && let Ok(value) = decode_head_value(bytes)
-            {
-                collect_hot_untracked_refs(value, stale_untracked_refs);
-            }
-            writes.delete(space, entry.key);
-        }
-        if !page.has_more {
-            break;
-        }
-    }
-    Ok(deleted_any)
 }
 
 #[cfg(test)]
@@ -12427,6 +12251,108 @@ mod tests {
         .expect("explicit empty control should authenticate an empty scope");
     }
 
+    /// A collection-generation fence retires every tracked member older than
+    /// the marker. Untracked rows carry no `commit_id`, so the commit-ordered
+    /// comparison that implements the fence is false for them; once tracked
+    /// and untracked rows share one serving generation, a tracked collection
+    /// replacement would silently delete the branch's history-free rows in the
+    /// same schema scope unless they are exempt.
+    #[tokio::test]
+    async fn collection_generation_fence_retires_stale_tracked_rows_but_not_untracked_rows() {
+        const BRANCH_ID: &str = "fence-branch";
+        const SCHEMA_KEY: &str = "fence_schema";
+        // The fence is a commit-ordered comparison, so the stale row's commit
+        // must sort strictly below the marker's. Sorting two labels makes that
+        // true regardless of how the labels hash.
+        let mut ordered = [
+            CommitId::for_test_label("fence-commit-a"),
+            CommitId::for_test_label("fence-commit-b"),
+        ];
+        ordered.sort();
+        let [old_generation, fence_commit] = ordered;
+        let generation = CommitId::for_test_label("fence-serving-generation");
+        assert_ne!(
+            generation, fence_commit,
+            "an active fence requires the control to name a different generation"
+        );
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: SCHEMA_KEY,
+            file_id: None,
+        };
+
+        let stale_tracked = HeadRowIdentity {
+            schema_key: SCHEMA_KEY.to_owned(),
+            entity_pk: EntityPk::single("stale-tracked"),
+            file_id: None,
+        };
+        let untracked = HeadRowIdentity {
+            schema_key: SCHEMA_KEY.to_owned(),
+            entity_pk: EntityPk::single("live-untracked"),
+            file_id: None,
+        };
+        let marker = HeadRowIdentity {
+            schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+            entity_pk: EntityPk::single(crate::collection_generation::collection_scope_key(scope)),
+            file_id: None,
+        };
+
+        let rows = HotRowMap::from([
+            // Older than the fence: must be retired.
+            (
+                stale_tracked,
+                encoded_test_hot_value(old_generation, false, false),
+            ),
+            // History-free: the fence cannot speak about it.
+            (untracked.clone(), encoded_test_hot_value(generation, true, false)),
+            (marker, encoded_test_hot_value(fence_commit, false, false)),
+        ]);
+
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = StorageWriteSet::new();
+        stage_complete_collection_controls(&mut writes, BRANCH_ID, generation, &rows)
+            .expect("fence controls should stage");
+        stage_complete_hot_rows(&mut writes, BRANCH_ID, generation, rows);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("fence fixture should publish");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fence fixture should read");
+        let reader = HotStateStoreReader {
+            store: &read,
+            transaction_cache: None,
+        };
+        let batch = reader
+            .scan_live_batch_for_generation(
+                BRANCH_ID,
+                generation,
+                None,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![SCHEMA_KEY.to_owned()],
+                        ..TrackedStateFilter::default()
+                    },
+                    read_columns: TrackedStateReadColumns::default(),
+                    limit: None,
+                },
+            )
+            .await
+            .expect("fenced scope should scan");
+
+        let surviving = batch
+            .iter()
+            .map(|row| (row.entity_pk().clone(), row.untracked()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            surviving,
+            vec![(EntityPk::single("live-untracked"), true)],
+            "the fence must retire the stale tracked row and keep the untracked row"
+        );
+    }
+
     #[tokio::test]
     async fn exact_collection_closure_distinguishes_bootstrap_from_published_missing_digest() {
         const BRANCH_ID: &str = "closure-bootstrap-branch";
@@ -12902,7 +12828,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: generation,
             tracked_generation: generation,
-            untracked_generation: generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -13182,173 +13107,7 @@ mod tests {
         assert_eq!(deletion_writes.stats().staged_deletes, 0);
     }
 
-    #[tokio::test]
-    async fn current_state_gc_sweeps_stale_packed_generations() {
-        let storage = StorageAdapter::new(Memory::new());
-        let active_generation = CommitId::for_test_label("active-packed-generation");
-        let stale_generation = CommitId::for_test_label("stale-packed-generation");
-        let mut active_manifest = hot_scope_prefix("active-packed", active_generation);
-        active_manifest.extend_from_slice(active_generation.as_uuid().as_bytes());
-        let active_control = hot_scope_prefix("active-packed", active_generation);
-        let active_index = packed_exclusive_schema_base_key(
-            "active-packed",
-            active_generation,
-            "schema",
-            active_generation,
-        );
-        let mut stale_manifest = hot_scope_prefix("stale-packed", stale_generation);
-        stale_manifest.extend_from_slice(stale_generation.as_uuid().as_bytes());
-        let stale_control = hot_scope_prefix("stale-packed", stale_generation);
-        let active_root = hot_scope_prefix("active-packed", active_generation);
-        let stale_root = hot_scope_prefix("stale-packed", stale_generation);
-        let stale_index = packed_exclusive_schema_base_key(
-            "stale-packed",
-            stale_generation,
-            "schema",
-            stale_generation,
-        );
-        let mut writes = StorageWriteSet::new();
-        for (space, key, value) in [
-            (
-                PACKED_CURRENT_BASE_SPACE,
-                active_manifest.clone(),
-                Bytes::from_static(&[0; 16]),
-            ),
-            (
-                PACKED_CURRENT_BASE_CONTROL_SPACE,
-                active_control.clone(),
-                Bytes::from_static(&[1]),
-            ),
-            (
-                PACKED_CURRENT_BASE_SPACE,
-                stale_manifest.clone(),
-                Bytes::from_static(&[0; 16]),
-            ),
-            (
-                PACKED_CURRENT_BASE_CONTROL_SPACE,
-                stale_control.clone(),
-                Bytes::from_static(&[1]),
-            ),
-            (
-                ROOT_CURRENT_BASE_SPACE,
-                active_root.clone(),
-                Bytes::copy_from_slice(active_generation.as_uuid().as_bytes()),
-            ),
-            (
-                ROOT_CURRENT_BASE_SPACE,
-                stale_root.clone(),
-                Bytes::copy_from_slice(stale_generation.as_uuid().as_bytes()),
-            ),
-            (
-                PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-                active_index.clone(),
-                Bytes::from_static(&[1]),
-            ),
-            (
-                PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-                stale_index.clone(),
-                Bytes::from_static(&[1]),
-            ),
-        ] {
-            writes.put(
-                space,
-                StorageKey(Bytes::from(key)),
-                StorageValue { bytes: value },
-            );
-        }
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit packed GC fixture");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open packed GC read");
-        let active_branch_control = BranchHeadControl {
-            head_commit_id: active_generation,
-            tracked_generation: active_generation,
-            untracked_generation: active_generation,
-            current_state_revision: 0,
-            schema_presence_bloom: [u64::MAX; 4],
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            ref_change_id: ChangeId::for_test_label("active-packed-ref"),
-        };
-        let mut gc_writes = StorageWriteSet::new();
-        stage_collect_stale_hot_generations(
-            &read,
-            &mut gc_writes,
-            &[("active-packed".to_owned(), active_branch_control)],
-        )
-        .await
-        .expect("collect stale packed generations");
-        drop(read);
-        storage
-            .commit_write_set(gc_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit packed generation GC");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("verify packed generation GC");
-        let manifests = PointReadPlan::new(
-            PACKED_CURRENT_BASE_SPACE,
-            &[
-                StorageKey(Bytes::from(active_manifest)),
-                StorageKey(Bytes::from(stale_manifest)),
-            ],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read packed manifests")
-        .value;
-        let controls = PointReadPlan::new(
-            PACKED_CURRENT_BASE_CONTROL_SPACE,
-            &[
-                StorageKey(Bytes::from(active_control)),
-                StorageKey(Bytes::from(stale_control)),
-            ],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read packed controls")
-        .value;
-        assert!(manifests[0].is_some());
-        assert!(manifests[1].is_none());
-        assert!(controls[0].is_some());
-        assert!(controls[1].is_none());
-        let roots = PointReadPlan::new(
-            ROOT_CURRENT_BASE_SPACE,
-            &[
-                StorageKey(Bytes::from(active_root)),
-                StorageKey(Bytes::from(stale_root)),
-            ],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read tracked root references")
-        .value;
-        assert!(roots[0].is_some());
-        assert!(roots[1].is_none());
-        let indexes = PointReadPlan::new(
-            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-            &[
-                StorageKey(Bytes::from(active_index)),
-                StorageKey(Bytes::from(stale_index)),
-            ],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read packed exclusive-schema indexes")
-        .value;
-        assert!(indexes[0].is_some());
-        assert!(indexes[1].is_none());
-    }
-
-    #[tokio::test]
+        #[tokio::test]
     async fn checkpoint_retires_materialized_packed_bases_in_active_generation() {
         const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000c9";
         const COMMIT_LABEL: &str = "checkpoint-packed-base";
@@ -13820,7 +13579,6 @@ mod tests {
         let donor_control = BranchHeadControl {
             head_commit_id,
             tracked_generation: donor_generation,
-            untracked_generation: donor_generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
@@ -13830,13 +13588,11 @@ mod tests {
         };
         let empty_control = BranchHeadControl {
             tracked_generation: CommitId::for_test_label("certified-inherited-empty"),
-            untracked_generation: CommitId::for_test_label("certified-inherited-empty"),
             ref_change_id: ChangeId::for_test_label("certified-inherited-empty-ref"),
             ..donor_control
         };
         let second_donor_control = BranchHeadControl {
             tracked_generation: CommitId::for_test_label("certified-inherited-donor-two"),
-            untracked_generation: CommitId::for_test_label("certified-inherited-donor-two"),
             ref_change_id: ChangeId::for_test_label("certified-inherited-donor-two-ref"),
             ..donor_control
         };
@@ -13955,7 +13711,6 @@ mod tests {
 
         let created_control = BranchHeadControl {
             tracked_generation: created_generation,
-            untracked_generation: created_generation,
             ref_change_id: ChangeId::for_test_label("certified-inherited-created-ref"),
             ..donor_control
         };
@@ -15344,7 +15099,6 @@ mod tests {
             BranchHeadControl {
                 head_commit_id: active_generation,
                 tracked_generation: active_generation,
-                untracked_generation: active_generation,
                 current_state_revision: 0,
                 schema_presence_bloom: [u64::MAX; 4],
                 working_diff_checkpoint_commit_id: Some(active_checkpoint),
@@ -15371,7 +15125,6 @@ mod tests {
             BranchHeadControl {
                 head_commit_id: stale_generation,
                 tracked_generation: stale_generation,
-                untracked_generation: stale_generation,
                 current_state_revision: 0,
                 schema_presence_bloom: [u64::MAX; 4],
                 working_diff_checkpoint_commit_id: None,

@@ -56,7 +56,6 @@ columns:
 | `lixcol_entity_pk` | JSON array of primary-key values in `x-lix-primary-key` order. |
 | `lixcol_schema_key` | The registered schema key. |
 | `lixcol_file_id` | The owning file, or `NULL`. |
-| `lixcol_snapshot_content` | JSON snapshot at this revision. `NULL` for a tombstone: a deletion produces a change with no snapshot. |
 | `lixcol_metadata` | JSON change metadata. |
 | `lixcol_change_id` | The `lix_change.id` that produced this state. |
 | `lixcol_change_created_at` | When that source change was created. |
