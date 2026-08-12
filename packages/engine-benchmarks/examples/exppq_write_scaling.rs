@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use lix::Value;
 use lix::integration::{Engine, SessionContext};
-use lix::{Memory, storage::Storage};
+use lix::Memory;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Lane {
@@ -39,14 +39,6 @@ impl Lane {
             Self::PkOnly => "pk_only",
             Self::Unique => "unique_declared",
             Self::ForeignKey => "fk_declared",
-        }
-    }
-
-    fn schema_key(self) -> &'static str {
-        match self {
-            Self::PkOnly => "w_pk_only",
-            Self::Unique => "w_unique",
-            Self::ForeignKey => "w_fk_child",
         }
     }
 }

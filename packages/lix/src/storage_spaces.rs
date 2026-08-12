@@ -50,6 +50,7 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
     crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
     crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+    crate::live_state::HOT_INDEX_SPACE,
     crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
     crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
     crate::binary_cas::BINARY_CAS_CHUNK_SPACE,

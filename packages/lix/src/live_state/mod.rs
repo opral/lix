@@ -38,12 +38,13 @@ pub(crate) use tracked_head::{
     CertifiedCurrentStatePredecessorRef, CertifiedEntityBatchFileRef, ColumnarBaseCoordinate,
     CurrentStateDeltaRef, DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows,
     EntityColumnarOverlayRow, HOT_COLLECTION_CONTROL_SPACE, HOT_DIFF_SPACE, HOT_FILE_SPACE,
-    HOT_ROW_SPACE, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
+    HOT_INDEX_SPACE, HOT_ROW_SPACE, HotIndexEntry, HotIndexValue, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
     TrackedHeadContext, TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
-    stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
+    stage_delete_tracked_working_diff_epoch, stage_hot_index_entries,
+    stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{
