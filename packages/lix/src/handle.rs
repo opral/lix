@@ -997,3 +997,54 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     }
 }
+
+
+/// See `session::execute::assume_send_future_proofs`.
+#[cfg(test)]
+mod assume_send_future_proofs {
+    use super::*;
+
+    fn is_send<T: Send>(_: &T) {}
+
+    // handle.rs -- OpenLixBuilder::into_future
+    #[allow(dead_code)]
+    fn open_lix_inner_is_send(
+        storage: Memory,
+        wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+        telemetry: Option<Arc<dyn TelemetrySink>>,
+    ) {
+        is_send(&open_lix_inner(storage, wasm_runtime, telemetry));
+    }
+
+    // handle.rs -- Lix::switch_branch (body mirrored verbatim)
+    #[allow(dead_code)]
+    fn switch_branch_body_is_send(lix: &Lix<Memory>, options: SwitchBranchOptions) {
+        is_send(&async move {
+            let _primary_switch_guard = match &lix.primary_switch_gate {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
+            let receipt = lix.session.switch_branch(options).await?;
+            if lix.primary_switch_gate.is_some() {
+                lix.client_state()
+                    .set(
+                        crate::client_state::PRIMARY_SESSION_BRANCH_KEY,
+                        serde_json::Value::String(receipt.branch_id.clone()),
+                    )
+                    .await?;
+            }
+            Ok::<_, LixError>(receipt)
+        });
+    }
+
+    #[allow(dead_code)]
+    fn lix_handle_is_send_for_every_storage<S>()
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<Lix<S>>();
+        assert_sync::<Lix<S>>();
+    }
+}
