@@ -3904,10 +3904,19 @@ mod tests {
     /// A payload named by two owners, one of which this sweep retires, must
     /// survive.
     ///
-    /// This is the case the reclamation exists to *not* break. The store is
-    /// content addressed, so the second row does not write a second payload —
-    /// it resolves onto the first one. Retiring the commit that happened to
-    /// author it first must therefore not be read as "nobody names this".
+    /// This is the case the reclamation exists to *not* break, and it is the
+    /// dedup hazard stated exactly: the store is content addressed, so writing
+    /// the same content on a second branch does **not** write a second payload
+    /// — it resolves onto the row the first branch already produced. Retiring
+    /// the commit that happened to author it first must therefore not be read
+    /// as "nobody names this".
+    ///
+    /// Two *branches* rather than two rows, because a row's payload is its
+    /// whole snapshot and the snapshot carries the primary key: two distinct
+    /// entities can never share a payload, so a same-entity/different-scope
+    /// fixture is the only one that actually produces co-ownership. An earlier
+    /// version of this test used two paths, believed it had proved dedup, and
+    /// was measuring two unrelated payloads.
     #[tokio::test]
     async fn repository_gc_keeps_a_payload_a_second_owner_still_names() {
         let backend = Memory::new();
@@ -3922,37 +3931,47 @@ mod tests {
             .await
             .expect("shared-payload session should open");
         register_payload_schema(&session).await;
+        let mirror = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-0000000004a1".to_owned()),
+                name: "payload-mirror".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("mirror branch should create");
 
         let shared = out_of_band_payload(0);
         let shared_ref = payload_ref_added_by(&backend, || async {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ('/first', lix_json($1))",
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/shared', lix_json($1))",
                     &[Value::Text(shared.clone())],
                 )
                 .await
                 .expect("first owner should publish");
         })
         .await;
-        let before_second = json_payload_refs(&backend).await;
+        let before_mirror = json_payload_refs(&backend).await;
         session
             .execute(
-                "INSERT INTO gc_payload_row (path, value) VALUES ('/second', lix_json($1))",
-                &[Value::Text(shared.clone())],
+                "INSERT INTO gc_payload_row (path, value, lixcol_branch_id) \
+                 VALUES ('/shared', lix_json($1), $2)",
+                &[Value::Text(shared.clone()), Value::Text(mirror.id.clone())],
             )
             .await
             .expect("second owner should publish");
         assert_eq!(
             json_payload_refs(&backend).await,
-            before_second,
+            before_mirror,
             "the premise of this test is that identical content dedups onto one row"
         );
-        // Churn only `/first`, so the commit that authored the shared payload
-        // becomes retirable while `/second` keeps naming it.
+
+        // Churn only the branch that authored it, so that commit becomes
+        // retirable while the mirror branch keeps naming the payload.
         for revision in 1..=8 {
             session
                 .execute(
-                    "UPDATE gc_payload_row SET value = lix_json($1) WHERE path = '/first'",
+                    "UPDATE gc_payload_row SET value = lix_json($1) WHERE path = '/shared'",
                     &[Value::Text(out_of_band_payload(revision))],
                 )
                 .await
@@ -3974,7 +3993,7 @@ mod tests {
         );
         assert!(
             !plan.changelog.sweep.json_payloads.contains(&shared_ref),
-            "a payload a live row still names must never be proposed for deletion"
+            "a payload a second owner still names must never be proposed for deletion"
         );
         assert!(
             plan.changelog.live.payloads.contains(&shared_ref),
@@ -3987,23 +4006,28 @@ mod tests {
 
         let value = session
             .execute(
-                "SELECT value FROM gc_payload_row WHERE path = '/second'",
-                &[],
+                "SELECT value FROM gc_payload_row WHERE path = '/shared' AND lixcol_branch_id = $1",
+                &[Value::Text(mirror.id.clone())],
             )
             .await
             .expect("second owner should still read")
             .rows()[0]
-            .get::<String>("value")
+            .get::<serde_json::Value>("value")
             .expect("second owner should still carry its payload");
-        assert!(value.contains("rev-00000000-"));
+        assert!(
+            value.to_string().contains("rev-00000000-"),
+            "the surviving owner must materialize the original payload: {value}"
+        );
     }
 
     /// The co-ownership case a naive per-commit delete gets wrong: one payload
     /// named by tracked history *and* by more than one untracked row.
     ///
     /// Untracked rows live only in the hot serving plane — no commit names
-    /// them — so a live set derived from commits alone would delete this
-    /// payload out from under both of them.
+    /// them — so a live set derived from commits alone deletes this payload out
+    /// from under both of them. They are placed on separate branches for the
+    /// same reason as above: identical content is what makes them co-owners of
+    /// one row, and identical content of one entity means distinct scopes.
     #[tokio::test]
     async fn repository_gc_keeps_a_payload_co_owned_by_history_and_untracked_rows() {
         let backend = Memory::new();
@@ -4018,37 +4042,55 @@ mod tests {
             .await
             .expect("co-owned payload session should open");
         register_payload_schema(&session).await;
+        let mut untracked_branches = Vec::new();
+        for (index, name) in ["co-untracked-a", "co-untracked-b"].into_iter().enumerate() {
+            untracked_branches.push(
+                session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: Some(format!("01990000-0000-7000-8000-0000000004b{index}")),
+                        name: name.to_owned(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("untracked co-owner branch should create")
+                    .id,
+            );
+        }
 
         let shared = out_of_band_payload(0);
         let shared_ref = payload_ref_added_by(&backend, || async {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ('/tracked', lix_json($1))",
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/co', lix_json($1))",
                     &[Value::Text(shared.clone())],
                 )
                 .await
                 .expect("tracked owner should publish");
         })
         .await;
-        for path in ["/untracked-a", "/untracked-b"] {
+        let before_untracked = json_payload_refs(&backend).await;
+        for branch_id in &untracked_branches {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value, lixcol_untracked) \
-                     VALUES ($1, lix_json($2), true)",
-                    &[Value::Text(path.to_owned()), Value::Text(shared.clone())],
+                    "INSERT INTO gc_payload_row (path, value, lixcol_branch_id, lixcol_untracked) \
+                     VALUES ('/co', lix_json($1), $2, true)",
+                    &[Value::Text(shared.clone()), Value::Text(branch_id.clone())],
                 )
                 .await
                 .expect("untracked owner should publish");
         }
+        assert_eq!(
+            json_payload_refs(&backend).await,
+            before_untracked,
+            "both untracked rows must resolve onto the payload row history already owns"
+        );
+
         // Retire the tracked owner's commit while both untracked rows stay.
         session
-            .execute(
-                "DELETE FROM gc_payload_row WHERE path = '/tracked'",
-                &[],
-            )
+            .execute("DELETE FROM gc_payload_row WHERE path = '/co'", &[])
             .await
             .expect("tracked owner should delete");
-        for revision in 1..=4 {
+        for revision in 1..=6 {
             session
                 .execute(
                     "INSERT INTO gc_payload_row (path, value) VALUES ($1, lix_json($2))",
@@ -4082,20 +4124,26 @@ mod tests {
             json_ref_exists(&backend, crate::json_store::JSON_SPACE, shared_ref).await,
             "the co-owned payload row must survive the sweep"
         );
-        for path in ["/untracked-a", "/untracked-b"] {
+        for branch_id in &untracked_branches {
             let rows = session
                 .execute(
-                    "SELECT value FROM gc_payload_row WHERE path = $1",
-                    &[Value::Text(path.to_owned())],
+                    "SELECT value FROM gc_payload_row \
+                     WHERE path = '/co' AND lixcol_branch_id = $1",
+                    &[Value::Text(branch_id.clone())],
                 )
                 .await
                 .expect("untracked owner should still read");
-            assert_eq!(rows.rows().len(), 1, "untracked row '{path}' must survive");
+            assert_eq!(
+                rows.rows().len(),
+                1,
+                "untracked row on branch '{branch_id}' must survive"
+            );
+            let value = rows.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("untracked owner should still carry its payload");
             assert!(
-                rows.rows()[0]
-                    .get::<String>("value")
-                    .expect("untracked owner should still carry its payload")
-                    .contains("rev-00000000-")
+                value.to_string().contains("rev-00000000-"),
+                "the untracked owner must materialize the original payload: {value}"
             );
         }
     }
@@ -4173,9 +4221,12 @@ mod tests {
             .await
             .expect("live row should still read")
             .rows()[0]
-            .get::<String>("value")
+            .get::<serde_json::Value>("value")
             .expect("live row should still carry its payload");
-        assert!(value.contains("rev-00000016-"));
+        assert!(
+            value.to_string().contains("rev-00000016-"),
+            "the live row must still materialize its payload: {value}"
+        );
     }
 
     #[tokio::test]
