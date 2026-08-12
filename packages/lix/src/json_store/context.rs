@@ -304,7 +304,11 @@ impl JsonStoreWriter {
         writes.stage_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
     }
 
-    #[allow(dead_code)] // Activated by the checkpoint GC integration.
+    /// Deletes JSON payload rows. Only the `#[cfg(test)]` full-recovery GC
+    /// path consumes untracked reclaim candidates today, so no production
+    /// caller reaches this; see the write-only-space finding for the space it
+    /// serves.
+    #[cfg(test)]
     #[expect(clippy::unused_self)]
     pub(crate) fn stage_delete_refs<I>(&self, writes: &mut StorageWriteSet, refs: I)
     where
