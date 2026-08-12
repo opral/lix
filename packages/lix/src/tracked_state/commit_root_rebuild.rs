@@ -211,14 +211,24 @@ where
 /// 1. the root pointer is live (`load_snapshot_commit_root` also proves the
 ///    commit itself exists in the changelog, so an orphaned manifest cannot
 ///    authorize a resume), and
-/// 2. the content-addressed chunk closure it names is physically readable, so
-///    a damaged root is never resumed from and explicit repair stays total.
+/// 2. the content-addressed chunk closure it names is physically addressable,
+///    so a damaged root is never resumed from and explicit repair stays total.
 ///
-/// This proof is bounded by the size of the addressed tree. It deliberately
-/// does **not** recurse through the ancestry: ordinary commits are rootless
-/// bounded-replay layouts by design, so an ancestry-wide proof can only ever
-/// succeed by reaching genesis, which makes every interval closure replay the
-/// entire history.
+/// It deliberately does **not** recurse through the ancestry: ordinary commits
+/// are rootless bounded-replay layouts by design, so an ancestry-wide proof can
+/// only ever succeed by reaching genesis, which makes every interval closure
+/// replay the entire history.
+///
+/// Obligation (2) is also bounded, to one root-to-leaf path. Chunk-closure
+/// completeness is not a fact this probe owns: chunks are staged in the same
+/// atomic write set that publishes the root and the manifest, and GC reaches
+/// them from refs, so the write path and GC are the single authority for it.
+/// Re-deriving it here by full traversal made a commit-path probe cost
+/// `O(total state)` and, at one boundary per `COMMIT_STATE_MAX_REPLAY_DEPTH`
+/// commits, put an `O(N^2)` term back into commit. What the probe must still
+/// catch is a resume point that is *not addressable at all* — the damage shape
+/// the root-chunk delete/corrupt paths produce — and that is decided by the
+/// root node and the first path below it.
 async fn load_available_root<S>(
     store: &S,
     commit_id: &str,
@@ -249,12 +259,15 @@ async fn commit_root_tree_is_readable<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    // One row is enough: the scan walks root -> leftmost overlapping child ->
+    // leaf and stops, so a missing or corrupt root chunk still fails while the
+    // probe stays `O(tree depth)` instead of `O(tree rows)`.
+    let request = TrackedStateTreeScanRequest {
+        limit: Some(1),
+        ..TrackedStateTreeScanRequest::default()
+    };
     match TrackedStateTree::new()
-        .scan(
-            store,
-            &metadata.root_id,
-            &TrackedStateTreeScanRequest::default(),
-        )
+        .scan(store, &metadata.root_id, &request)
         .await
     {
         Ok(_) => Ok(true),
