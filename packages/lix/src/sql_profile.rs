@@ -39,11 +39,12 @@ pub struct SqlReadProfile {
     /// filtering earlier in the plan changes `scan_rows` and leaves this
     /// unchanged.
     ///
-    /// Entity surfaces record it at every route they can take:
-    /// primary-key projection and direct-snapshot reads examine exactly what
-    /// they emit, the generic row route examines the whole scanned batch
-    /// before `EntityRowFilter`s run, and the columnar route examines the rows
-    /// of the row groups that survived manifest pruning plus its overlay rows.
+    /// Entity surfaces record it at every route they can take, so no scan is
+    /// silently unaccounted: primary-key projection and direct-snapshot reads
+    /// examine exactly what they emit, the generic row route examines the
+    /// whole scanned batch before `EntityRowFilter`s run, and the columnar
+    /// route examines the rows of the row groups that survived manifest
+    /// pruning plus its overlay rows.
     pub provider_rows_examined: u64,
     /// Number of rows retained by the benchmark-only result ceiling probe.
     /// A nonzero value means result conversion was intentionally bypassed;

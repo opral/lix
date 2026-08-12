@@ -1062,8 +1062,8 @@ async fn entity_columnar_scan_source(
     let partition_count = statistics.len();
     let base_partition_count = group_indices.len();
     // Overlay batches reach the partition closure already filtered, so the
-    // examined count has to come from the unfiltered overlay the layout
-    // carries. One overlay partition records it; the rest record nothing.
+    // examined count comes from the unfiltered overlay the layout carries.
+    // One overlay partition records it; the rest record nothing.
     let overlay_rows_examined = layout.overlay.len();
     let stream_schema = Arc::clone(&schema);
     Ok(batch_stream_source_with_statistics_and_source(
@@ -1153,10 +1153,6 @@ async fn entity_columnar_scan_source(
                     },
                 )
                 .await?;
-                // Rows of one row group that survived manifest pruning. Group
-                // pruning is the columnar route's access path, so a pruned
-                // group never reaches this line and never counts.
-                crate::sql_profile::record_provider_rows_examined(batch.num_rows());
                 if !shadow_identities.is_empty() && !statistics_cached {
                     let statistics = entity_columnar_record_batch_statistics(batch.as_ref())?;
                     reader
@@ -1172,6 +1168,18 @@ async fn entity_columnar_scan_source(
                 }
                 RecordBatch::try_new(batch_schema, batch.columns().to_vec())
                     .map_err(DataFusionError::from)
+            });
+            // Rows of one row group that survived manifest pruning: group
+            // pruning is the columnar route's access path, so a pruned group
+            // never reaches here and never counts.
+            //
+            // Mapped over the stream rather than recorded inside the future
+            // above, so nothing is added to that future's state machine.
+            let batches = futures_util::StreamExt::map(batches, |batch| {
+                if let Ok(batch) = &batch {
+                    crate::sql_profile::record_provider_rows_examined(batch.num_rows());
+                }
+                batch
             });
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
         },
