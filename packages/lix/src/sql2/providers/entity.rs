@@ -643,10 +643,6 @@ impl TableSpec for EntitySpec {
                 entity_columnar_projection(&layout.manifest, &schema, &self.spec)
         {
             let group_indices = entity_columnar_group_indices(&layout.manifest, &row_filters);
-            // Recorded here, in the planning frame, rather than anywhere
-            // inside the columnar partition future: that future overflows the
-            // debug-profile stack if anything is added to it.
-            crate::sql_profile::record_provider_rows_examined_gap();
             return Ok(PlannedScan {
                 schema: Arc::clone(&schema),
                 ordering: None,
@@ -694,7 +690,6 @@ impl TableSpec for EntitySpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     {
-                        crate::sql_profile::record_provider_rows_examined(entity_pks.len());
                         return entity_primary_key_record_batch(&spec, schema, entity_pks);
                     }
                     if let Some(direct_entity_snapshot) = direct_entity_snapshot
@@ -703,7 +698,6 @@ impl TableSpec for EntitySpec {
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     {
-                        crate::sql_profile::record_provider_rows_examined(rows.len());
                         let decoder = EntityProjectionDecoder::new(
                             &spec,
                             schema.fields().iter().map(|field| field.name().as_str()),
@@ -719,9 +713,6 @@ impl TableSpec for EntitySpec {
                         .scan_batch(&request)
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
-                    // Before `row_filters` run: this is the row count a
-                    // predicate without an indexed access path pays for.
-                    crate::sql_profile::record_provider_rows_examined(rows.len());
                     let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                     entity_record_batch_with_parsed(
                         &spec,
