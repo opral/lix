@@ -36,7 +36,6 @@ export type RemoteHandshake = {
 
 export type RemoteHandshakeRequest = {
 	activeBranchId?: string;
-	activeAccountId?: string;
 };
 
 export type RemoteExecuteRequest = {

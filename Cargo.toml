@@ -31,7 +31,6 @@ lix_storage_slatedb = { package = "lix-storage-slatedb", path = "packages/storag
 lix_js_sdk = { path = "packages/js-sdk", version = "0.11.0" }
 lix_order_key = { path = "plugins/order-key", version = "0.11.0" }
 lix_plugin_api = { path = "packages/plugin-api", version = "0.11.0" }
-lix_server_protocol = { package = "lix-server-protocol", path = "packages/server-protocol", version = "0.1.0" }
 mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
 
 [workspace.lints.rust]

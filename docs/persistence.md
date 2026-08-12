@@ -91,7 +91,7 @@ const lix = await openLix({
 
 The client needs no local storage option. Files, SQL rows, and branches live on the server.
 
-For S3, the server runs Lix with the Rust SlateDB storage backed by an S3-compatible object store and exposes the workspace through the [Lix server protocol](https://github.com/opral/lix/blob/main/packages/server-protocol/README.md). Clients do not pass S3 to `openLix()`.
+For S3, the server runs Lix with the Rust SlateDB storage backed by an S3-compatible object store and exposes the workspace through the [Lix Server Protocol](./server-protocol.md). Clients do not pass S3 to `openLix()`.
 
 ```text
 JS client ── HTTP ──▶ Lix server ──▶ SlateDB ──▶ S3

@@ -66,7 +66,6 @@ const MAX_COMPRESSED_BODY_RATIO = 0.9;
 
 type RemoteLixClientOptions = {
 	initialActiveBranchId?: RemoteHandshakeRequest["activeBranchId"];
-	initialActiveAccountId?: RemoteHandshakeRequest["activeAccountId"];
 };
 
 export async function openRemoteLixBinding(
@@ -83,7 +82,6 @@ class RemoteLixBinding implements LixBinding {
 	readonly #fetch: NonNullable<RemoteLixServerOptions["fetch"]>;
 	readonly #headers: RemoteLixServerOptions["headers"];
 	readonly #initialActiveBranchId: string | undefined;
-	readonly #initialActiveAccountId: string | undefined;
 	readonly #observationHub: RemoteObservationHub;
 	readonly #requestBlobBases = new Map<string, RequestBlobBase>();
 	#sessionId: string | undefined;
@@ -127,13 +125,6 @@ class RemoteLixBinding implements LixBinding {
 			throw new TypeError("initialActiveBranchId must be a non-empty string");
 		}
 		this.#initialActiveBranchId = clientOptions.initialActiveBranchId;
-		if (
-			clientOptions.initialActiveAccountId !== undefined &&
-			clientOptions.initialActiveAccountId.length === 0
-		) {
-			throw new TypeError("initialActiveAccountId must be a non-empty string");
-		}
-		this.#initialActiveAccountId = clientOptions.initialActiveAccountId;
 		this.#observationHub = new RemoteObservationHub({
 			openStream: (subscriptions, signal) =>
 				this.#requestObserveStream(subscriptions, signal),
@@ -146,9 +137,6 @@ class RemoteLixBinding implements LixBinding {
 		const query = new URLSearchParams();
 		if (this.#initialActiveBranchId !== undefined) {
 			query.set("activeBranchId", this.#initialActiveBranchId);
-		}
-		if (this.#initialActiveAccountId !== undefined) {
-			query.set("activeAccountId", this.#initialActiveAccountId);
 		}
 		const path = query.size === 0 ? "" : `?${query}`;
 		const handshake = decodeHandshake(

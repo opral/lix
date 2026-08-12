@@ -147,13 +147,10 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			try {
 				remoteBinding = await openRemoteLixBinding(options.server, {
 					initialActiveBranchId: restoredBranchId,
-					initialActiveAccountId: restoredAccountId,
 				});
 			} catch (error) {
 				if (!restoredBranchId || !isBranchNotFoundError(error)) throw error;
-				remoteBinding = await openRemoteLixBinding(options.server, {
-					initialActiveAccountId: restoredAccountId,
-				});
+				remoteBinding = await openRemoteLixBinding(options.server);
 			}
 			const activeBranchId = await remoteBinding.activeBranchId();
 			const activeAccountId = await remoteBinding.activeAccountId();

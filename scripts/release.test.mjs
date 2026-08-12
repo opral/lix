@@ -135,7 +135,6 @@ test("updateCargoToml leaves independently released Rust packages untouched", ()
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
 	mkdirSync(join(root, "packages", "js-sdk"), { recursive: true });
 	mkdirSync(join(root, "packages", "storage-rocksdb"), { recursive: true });
-	mkdirSync(join(root, "packages", "server-protocol"), { recursive: true });
 	writeFileSync(
 		join(root, "Cargo.toml"),
 		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_storage_rocksdb = { path = "packages/storage-rocksdb", version = "0.6.2" }\nlix_storage_slatedb = { path = "packages/storage-slatedb", version = "0.6.2" }\nlix = { path = "packages/lix", version = "0.6.2" }\n`,
@@ -148,10 +147,6 @@ test("updateCargoToml leaves independently released Rust packages untouched", ()
 		join(root, "packages", "storage-rocksdb", "Cargo.toml"),
 		`[package]\nname = "lix-storage-rocksdb"\nversion = "0.6.2"\n\n[dependencies]\nlix = { path = "../lix", version = "0.6.2", default-features = false }\n`,
 	);
-	writeFileSync(
-		join(root, "packages", "server-protocol", "Cargo.toml"),
-		`[package]\nname = "lix-server-protocol"\nversion.workspace = true\n\n[dependencies]\nlix = { path = "../lix", version = "0.6.2", default-features = false }\n`,
-	);
 
 	updateCargoToml(root, "0.7.0");
 
@@ -162,7 +157,6 @@ test("updateCargoToml leaves independently released Rust packages untouched", ()
 	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
 	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /version = "0\.6\.2"/);
 	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
-	assert.match(readFileSync(join(root, "packages", "server-protocol", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
 });
 
 test("updateCargoToml updates requirements for workspace-versioned packages", () => {

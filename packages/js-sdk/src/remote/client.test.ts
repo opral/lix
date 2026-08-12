@@ -26,14 +26,13 @@ test("remote handshake requests a restored initial active branch", async () => {
 		},
 		{
 			initialActiveBranchId: "draft / one",
-			initialActiveAccountId: accountId,
 		},
 	);
 
 	const handshakeUrl = new URL(requests[0]?.url ?? "");
 	expect(handshakeUrl.pathname).toBe("/@acme/workspace/lix/v1/");
 	expect(handshakeUrl.searchParams.get("activeBranchId")).toBe("draft / one");
-	expect(handshakeUrl.searchParams.get("activeAccountId")).toBe(accountId);
+	expect(handshakeUrl.searchParams.has("activeAccountId")).toBe(false);
 	expect(requests[0]?.headers.has("lix-session-id")).toBe(false);
 	expect(await binding.activeAccountId()).toBe(accountId);
 	expect(await binding.activeAccountId()).toBe(accountId);
