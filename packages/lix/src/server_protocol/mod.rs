@@ -2036,12 +2036,12 @@ where
                 context.principal,
                 ServerProtocolPrincipal::Authenticated { .. }
             ) {
-                state
-                    .server
-                    .inner
-                    .root
-                    .ensure_account(&active_account_id, &active_account_id, "human")
-                    .await?;
+                Box::pin(state.server.inner.root.ensure_account(
+                    &active_account_id,
+                    &active_account_id,
+                    "human",
+                ))
+                .await?;
             }
             state
                 .server
@@ -9656,8 +9656,7 @@ mod tests {
         let sql_span = spans
             .iter()
             .find(|span| {
-                span.name == "lix.sql.query"
-                    && span.parent.as_ref() == Some(&protocol_span_id)
+                span.name == "lix.sql.query" && span.parent.as_ref() == Some(&protocol_span_id)
             })
             .expect("SQL span under protocol request");
         assert_eq!(sql_span.parent.as_ref(), Some(&protocol_span_id));
