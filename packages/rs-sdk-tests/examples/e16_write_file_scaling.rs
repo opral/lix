@@ -28,7 +28,15 @@
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::path::Path;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tracing::Subscriber;
+use tracing::span::{Attributes, Id};
+use tracing::subscriber::Interest;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::{Context as TracingContext, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 
 use lix::storage::{ReadOptions, Storage};
 use lix::storage_adapter::StorageAdapter;
@@ -51,24 +59,41 @@ fn main() {
     } else {
         sizes
     };
+    let shapes: Vec<&'static str> = match std::env::var("E16_SHAPES") {
+        Ok(value) => SHAPES
+            .into_iter()
+            .filter(|shape| value.split(',').any(|entry| entry.trim() == *shape))
+            .collect(),
+        Err(_) => SHAPES.to_vec(),
+    };
+    assert!(!shapes.is_empty(), "E16_SHAPES selected no known shape");
     let probes = std::env::var("E16_PROBES")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(9usize);
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("create write-scaling runtime");
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    tracing::dispatcher::with_default(&dispatch, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create write-scaling runtime");
 
-    runtime.block_on(async {
-        for files in sizes {
-            run_case(files, probes).await;
-        }
+        runtime.block_on(async {
+            for files in sizes {
+                run_case(files, probes, &shapes, &collector).await;
+            }
+        });
     });
 }
 
-async fn run_case(files: usize, probes: usize) {
+async fn run_case(
+    files: usize,
+    probes: usize,
+    shapes: &[&'static str],
+    collector: &PerfSpanCollector,
+) {
     let root = tempfile::Builder::new()
         .prefix("e16-write-scaling-")
         .tempdir()
@@ -92,16 +117,24 @@ async fn run_case(files: usize, probes: usize) {
     // between cases. Probes run interleaved by shape so that any drift over the
     // measurement window hits all four shapes equally.
     let mut samples: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
+    let mut spans: BTreeMap<&'static str, BTreeMap<&'static str, (f64, u64)>> = BTreeMap::new();
     let before = snapshot(&storage, &db_path).await;
+    let _ = collector.take_ms();
     for probe in 0..probes {
-        for shape in SHAPES {
+        for shape in shapes.iter().copied() {
             let elapsed = run_probe(&lix, shape, files, probe).await;
             samples.entry(shape).or_default().push(elapsed);
+            let shape_spans = spans.entry(shape).or_default();
+            for (name, (ms, count)) in collector.take_ms() {
+                let entry = shape_spans.entry(name).or_insert((0.0, 0));
+                entry.0 += ms;
+                entry.1 += count;
+            }
         }
     }
     let after = snapshot(&storage, &db_path).await;
 
-    for shape in SHAPES {
+    for shape in shapes.iter().copied() {
         let mut values = samples.remove(shape).unwrap_or_default();
         values.sort_by(f64::total_cmp);
         println!(
@@ -117,6 +150,18 @@ p50_ms={:.3},min_ms={:.3},p95_ms={:.3},raw={}",
                 .collect::<Vec<_>>()
                 .join("|"),
         );
+    }
+
+    for (shape, shape_spans) in &spans {
+        let mut ranked: Vec<(&&'static str, &(f64, u64))> = shape_spans.iter().collect();
+        ranked.sort_by(|left, right| right.1.0.total_cmp(&left.1.0));
+        for (name, (ms, count)) in ranked {
+            println!(
+                "write_scaling_span,files={files},shape={shape},span={name},\
+total_ms={ms:.3},per_probe_ms={:.4},entries={count}",
+                ms / probes as f64,
+            );
+        }
     }
 
     // Written volume across the whole probe window, so a latency term can be
@@ -139,6 +184,69 @@ p50_ms={:.3},min_ms={:.3},p95_ms={:.3},raw={}",
     }
 
     lix.close().await.expect("close write-scaling Lix");
+}
+
+/// Sums the engine's own `lix_perf` spans, so the O(files) term can be
+/// attributed to a named phase of the write path instead of to a leaf symbol.
+/// Spans nest, so a parent's total includes its children; read the tree, not
+/// the sum.
+#[derive(Clone, Default)]
+struct PerfSpanCollector {
+    samples: Arc<Mutex<Vec<(&'static str, Duration)>>>,
+}
+
+struct StartedPerfSpan {
+    name: &'static str,
+    started: Instant,
+}
+
+impl PerfSpanCollector {
+    fn take_ms(&self) -> BTreeMap<&'static str, (f64, u64)> {
+        let samples = std::mem::take(&mut *self.samples.lock().expect("span lock"));
+        let mut result: BTreeMap<&'static str, (f64, u64)> = BTreeMap::new();
+        for (name, elapsed) in samples {
+            let entry = result.entry(name).or_insert((0.0, 0));
+            entry.0 += elapsed.as_secs_f64() * 1_000.0;
+            entry.1 += 1;
+        }
+        result
+    }
+}
+
+impl<S> Layer<S> for PerfSpanCollector
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
+        if metadata.target() == "lix_perf" {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: TracingContext<'_, S>) {
+        if attrs.metadata().target() != "lix_perf" {
+            return;
+        }
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(StartedPerfSpan {
+                name: attrs.metadata().name(),
+                started: Instant::now(),
+            });
+        }
+    }
+
+    fn on_close(&self, id: Id, ctx: TracingContext<'_, S>) {
+        let Some(span) = ctx.span(&id) else { return };
+        let Some(started) = span.extensions_mut().remove::<StartedPerfSpan>() else {
+            return;
+        };
+        self.samples
+            .lock()
+            .expect("span lock")
+            .push((started.name, started.started.elapsed()));
+    }
 }
 
 const SHAPES: [&str; 4] = [
