@@ -7940,22 +7940,20 @@ where
         )
         .await
         .expect("begin raw certified storage scan");
-    loop {
-        let page = cursor
-            .next_page(usize::MAX)
+    entries.extend(
+        cursor
+            .collect_all()
             .await
-            .expect("scan raw certified storage space");
-        let has_more = page.has_more;
-        entries.extend(page.entries.into_iter().map(|entry| {
-            let ProjectedValue::FullValue(bytes) = entry.value else {
-                panic!("full certified storage projection must return bytes");
-            };
-            (entry.key, bytes)
-        }));
-        if !has_more {
-            return entries;
-        }
-    }
+            .expect("scan raw certified storage space")
+            .into_iter()
+            .map(|entry| {
+                let ProjectedValue::FullValue(bytes) = entry.value else {
+                    panic!("full certified storage projection must return bytes");
+                };
+                (entry.key, bytes)
+            }),
+    );
+    entries
 }
 
 async fn write_and_verify_ceb2_fixture<StorageImpl>(storage: &StorageImpl)
