@@ -1,4 +1,5 @@
 /docs /docs/what-is-lix 308
 /docs/storage /docs/persistence 308
+/docs/versions /docs/branching 308
 /guide /docs/what-is-lix 308
 /guide/* /docs/:splat 308
