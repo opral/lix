@@ -1495,7 +1495,9 @@ where
                 Ok(query) => query,
                 Err(error) => return error.into_response(),
             };
-            return result_response(handshake(state, query, parts.headers, context).await);
+            return result_response(
+                Box::pin(handshake(state, query, parts.headers, context)).await,
+            );
         }
 
         if path == "/lix/v1/session" {
@@ -2036,12 +2038,12 @@ where
                 context.principal,
                 ServerProtocolPrincipal::Authenticated { .. }
             ) {
-                state
-                    .server
-                    .inner
-                    .root
-                    .ensure_account(&active_account_id, &active_account_id, "human")
-                    .await?;
+                Box::pin(state.server.inner.root.ensure_account(
+                    &active_account_id,
+                    &active_account_id,
+                    "human",
+                ))
+                .await?;
             }
             state
                 .server
@@ -9656,8 +9658,7 @@ mod tests {
         let sql_span = spans
             .iter()
             .find(|span| {
-                span.name == "lix.sql.query"
-                    && span.parent.as_ref() == Some(&protocol_span_id)
+                span.name == "lix.sql.query" && span.parent.as_ref() == Some(&protocol_span_id)
             })
             .expect("SQL span under protocol request");
         assert_eq!(sql_span.parent.as_ref(), Some(&protocol_span_id));
