@@ -7991,12 +7991,14 @@ mod constraints_unchanged_tests {
         let parent_key = SchemaCatalogKey {
             schema_key: "constraint_probe_parent".to_owned(),
         };
-        let schema_index = BTreeMap::from([(parent_key, &parent)]);
+        let schema_index = BTreeMap::from([(parent_key.clone(), &parent)]);
+        let key_index = BTreeMap::from([(parent_key, crate::catalog::SchemaPlanId::for_test(0))]);
         let plan = SchemaPlan::compile_standalone_for_test(
             SchemaCatalogKey {
                 schema_key: "constraint_probe".to_owned(),
             },
             schema,
+            &key_index,
             &schema_index,
         )
         .expect("schema should compile");

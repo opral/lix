@@ -703,9 +703,10 @@ impl SchemaPlan {
     pub(crate) fn compile_standalone_for_test(
         key: SchemaCatalogKey,
         schema: JsonValue,
+        key_index: &BTreeMap<SchemaCatalogKey, SchemaPlanId>,
         schema_index: &BTreeMap<SchemaCatalogKey, &JsonValue>,
     ) -> Result<Self, LixError> {
-        Self::compile(key, schema, &BTreeMap::new(), schema_index)
+        Self::compile(key, schema, key_index, schema_index)
     }
 
     fn compile(

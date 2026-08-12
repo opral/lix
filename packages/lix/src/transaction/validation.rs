@@ -4805,11 +4805,22 @@ mod tests {
     #[tokio::test]
     async fn a_schema_registered_in_this_commit_indexes_its_own_rows() {
         let visible_schemas = vec![registered_schema()];
+        let global_unique_row = |entity_pk: &str, slug: &str| {
+            let mut row = staged_row(
+                "unique_schema",
+                Some(
+                    json!({ "id": entity_pk, "slug": slug, "title": "title" })
+                        .to_string(),
+                ),
+            );
+            row.entity_pk = EntityPk::single(entity_pk);
+            row
+        };
         let staged_writes = PreparedWriteSet {
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(unique_schema()),
-                unique_row("entity-1", "slug-1", "first"),
-                unique_row("entity-2", "slug-2", "second"),
+                global_unique_row("entity-1", "slug-1"),
+                global_unique_row("entity-2", "slug-2"),
             ],
             ..empty_staged_write_set()
         };
