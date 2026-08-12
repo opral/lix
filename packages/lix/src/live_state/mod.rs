@@ -1,6 +1,5 @@
 mod context;
 mod derived;
-mod entity_columnar;
 mod entity_columnar_cache;
 mod entity_decoded_column_cache;
 mod reader;
@@ -10,7 +9,11 @@ pub(crate) mod visibility;
 
 #[allow(unused_imports)]
 pub(crate) use context::{BranchHeadControlCache, LiveStateContext, LiveStateStoreReader};
-pub(crate) use entity_columnar::{
+/// Re-exported for the consumers that already spell these `crate::live_state::…`.
+/// The definitions live in the top-level `entity_columnar` module, which sits
+/// below both state planes; this facade only exists so the move did not have to
+/// touch every call site at once and can be dropped as those are migrated.
+pub(crate) use crate::entity_columnar::{
     ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
     EntityColumnarWriteSets, entity_identity_column_index, entity_row_group_set_id,
 };
@@ -42,8 +45,9 @@ pub(crate) use tracked_head::{
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
     TrackedHeadContext, TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
-    stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
+    load_certified_rows_at_commit, materialize_certified_root_rows, scan_certified_history_rows,
+    stage_certified_entity_batches, stage_delete_tracked_working_diff_epoch,
+    stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

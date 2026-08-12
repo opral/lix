@@ -49,6 +49,7 @@ pub(crate) mod compression;
 mod default_wasm_runtime;
 pub(crate) mod domain;
 mod engine;
+pub(crate) mod entity_columnar;
 pub(crate) mod entity_pk;
 pub(crate) mod filesystem;
 pub(crate) mod functions;
