@@ -154,24 +154,26 @@ jobs:
           cargo test --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
           cargo test --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-fail-fast
 
+      # The e2e test compilation above already builds the real workspace plugin
+      # artifacts. This one external fixture covers the distinct risk: whether
+      # the packaged `lix` crate contains and exposes everything a plugin author
+      # needs. `--no-verify` avoids compiling the native engine a second time;
+      # compiling the extracted package for WASIp2 is the relevant verification.
       - name: Verify the packaged Lix plugin contract
         if: matrix.task == 'test'
         run: |
           rustup target add wasm32-wasip2
-          cargo package --locked -p lix
-          cargo package --locked -p lix --list |
-            rg '^wit/lix-plugin\.wit$'
-          packaged_lix="$(find target/package -maxdepth 1 -type d -name 'lix-*' | head -n 1)"
+          cargo package --locked -p lix --no-verify
+          package_archive="$(find target/package -maxdepth 1 -type f -name 'lix-*.crate' | head -n 1)"
+          tar -tf "$package_archive" |
+            rg '^[^/]+/wit/lix-plugin\.wit$'
+          packaged_lix="$(mktemp -d)"
+          tar -xf "$package_archive" -C "$packaged_lix" --strip-components=1
           downstream="$(mktemp -d)"
           cargo init --lib --name downstream_lix_plugin "$downstream"
           cargo add --manifest-path "$downstream/Cargo.toml" --path "$packaged_lix" lix
           cp packages/lix/examples/plugin_minimal.rs "$downstream/src/lib.rs"
           cargo build --manifest-path "$downstream/Cargo.toml" --target wasm32-wasip2
-
-      - name: Build a downstream Component plugin through the public API
-        if: matrix.task == 'test'
-        run: |
-          cargo build --release -p plugin_csv --target wasm32-wasip2
 
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test
