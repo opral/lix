@@ -79,9 +79,19 @@ where
         gc_state.note_reclaim_failure();
         let mut writes = self.storage.new_write_set();
         stage_checkpoint_gc_state(&mut writes, &gc_state)?;
-        self.storage
-            .commit_write_set(writes, StorageWriteOptions::default())
+        // Through the commit boundary like every other session write, so a
+        // concurrent close cannot race the final pre-commit check.
+        let commit_boundary = self.transaction_commit_boundary();
+        let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
+        let prepared_commit = self
+            .storage
+            .prepare_write_set(writes, StorageWriteOptions::default())
             .await?;
+        commit_at_boundary(Some(&commit_boundary), || async move {
+            let (_, stats) = prepared_commit.commit().await?;
+            Ok(stats)
+        })
+        .await?;
         Ok(())
     }
 
