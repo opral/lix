@@ -1240,6 +1240,9 @@ fn print_census_line(arm: &str, n: usize, phase: &str, scans: usize, us: u128) {
         c.materialize_owned_key_builds,
         c.materialize_owned_key_bytes,
         c.materialize_reverify_rows,
+    );
+}
+
 /// Reads back the `created_at` the engine currently reports for one identity.
 async fn created_at_of(session: &SessionContext<Memory>, table: &str, id: &str) -> String {
     let result = session
@@ -1254,7 +1257,10 @@ async fn created_at_of(session: &SessionContext<Memory>, table: &str, id: &str) 
         .expect("created_at is text")
 }
 
-/// PHASE 8 — the `created_at` consequence of compaction, and who rejects it.
+/// PHASE 9 — the `created_at` consequence of compaction, and who rejects it.
+///
+/// Numbered 9 because #1427 landed its own PHASE 8 (the allocation census)
+/// on the integration branch while this work was in flight.
 ///
 /// Phase 4 established that removing an already-checkpointed delete's tombstone
 /// is safe for *serving*. This phase asks the separate write-path question the

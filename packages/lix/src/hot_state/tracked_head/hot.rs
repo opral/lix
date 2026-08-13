@@ -8156,7 +8156,7 @@ where
         // change is how often the block runs: the untracked-only filter left
         // it empty on ordinary tracked inserts, and it now executes whenever a
         // commit introduces a new identity.
-        let mut canonical_created_ats: Vec<Option<crate::common::LixTimestamp>> = Vec::new();
+        let mut canonical_created_ats: Vec<Option<LixTimestamp>> = Vec::new();
         {
             let mut unresolved = Vec::new();
             let mut unresolved_slots = Vec::new();
