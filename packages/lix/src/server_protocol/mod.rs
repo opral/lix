@@ -2,6 +2,9 @@
 
 #![cfg_attr(test, allow(clippy::large_futures))]
 
+use crate::session::ExecuteOptions;
+#[cfg(test)]
+use crate::session::media_upload::FILE_UPLOAD_PART_BYTES;
 use bytes::Bytes;
 use futures_core::Stream;
 use http::{
@@ -9,13 +12,11 @@ use http::{
     header::{ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
 };
 use http_body::{Body, Frame, SizeHint};
-#[cfg(test)]
-use lix::FILE_UPLOAD_PART_BYTES;
 use lix::storage::Storage;
 use lix::{
-    Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions,
-    ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction,
-    ObserveEvent, ObserveEvents, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
+    Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteResult,
+    ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction, ObserveEvent,
+    ObserveEvents, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1119,6 +1120,11 @@ where
                         "remote transaction capability does not match the active transaction",
                     ));
                 }
+                let execution = active.transaction.execute(&sql, &params);
+                let execution = match options.origin_key {
+                    Some(origin_key) => execution.with_origin_key(origin_key),
+                    None => execution,
+                };
                 tokio::select! {
                     biased;
                     _ = &mut cancelled => {
@@ -1140,7 +1146,7 @@ where
                             Err(error) => Err(error),
                         }
                     }
-                    result = active.transaction.execute_with_options(sql, params, options) => {
+                    result = execution => {
                         transactions.active = Some(active);
                         result
                     }
@@ -1747,7 +1753,7 @@ where
         let child = match self
             .inner
             .root
-            .open_session_at_with_account(active_branch_id, active_account_id)
+            .open_internal_session(active_branch_id, active_account_id)
             .await
         {
             Ok(child) => child,
@@ -4379,6 +4385,7 @@ impl Drop for ObserveTaskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::RequestBlobSpliceProvenance;
     #[cfg(any())]
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use flate2::{Compression, write::GzEncoder};
@@ -4390,7 +4397,7 @@ mod tests {
         StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
     use lix::telemetry::TracingTelemetrySink;
-    use lix::{Blob, Memory, RequestBlobSpliceProvenance, open_lix};
+    use lix::{Blob, Memory, open_lix};
     #[cfg(any())]
     use lix_collaboration_test_support::{
         CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
@@ -8208,15 +8215,6 @@ mod tests {
                     final_bytes
                 );
             }
-        }
-
-        fn resolver_calls(&self) -> u64 {
-            self.app
-                .server
-                .inner
-                .root
-                .plugin_transition_counters()
-                .conflict_resolution_calls
         }
 
         fn resource_counters(&self) -> BTreeMap<String, u64> {

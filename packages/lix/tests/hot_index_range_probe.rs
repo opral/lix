@@ -25,8 +25,7 @@
 
 use std::future::Future;
 
-use lix::integration::{Engine, SessionContext};
-use lix::{Memory, Value};
+use lix::{Lix, Memory, Value, open_lix};
 
 /// Building and optimizing real DataFusion plans recurses per plan node and
 /// overflows libtest's 2 MiB worker stack in the `test` profile.
@@ -117,7 +116,7 @@ fn range_seek_reads_candidates_set_by_its_answer_and_refuses_without_an_index() 
 }
 
 async fn ordinal_range_ids(
-    session: &SessionContext<Memory>,
+    session: &Lix<Memory>,
     table: &str,
     lower: i64,
     upper: i64,
@@ -145,13 +144,11 @@ async fn seeded_session(
     schema_key: &str,
     declare_unique: bool,
     rows: usize,
-) -> SessionContext<Memory> {
-    let storage = Memory::default();
-    Engine::initialize(storage.clone())
+) -> Lix<Memory> {
+    let session = open_lix()
+        .with_storage(Memory::default())
         .await
-        .expect("initialize fixture");
-    let engine = Engine::new(storage).await.expect("open engine");
-    let session = engine.open_session().await.expect("open session");
+        .expect("open lix");
 
     let unique = if declare_unique {
         r#""x-lix-unique":[["/ordinal"]],"#

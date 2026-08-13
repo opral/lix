@@ -91,9 +91,7 @@ mod tests {
             _limit_rows: usize,
         ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>>
         {
-            Box::pin(async {
-                Ok(ScanChunk::new(Vec::new(), false))
-            })
+            Box::pin(async { Ok(ScanChunk::new(Vec::new(), false)) })
         }
     }
 
@@ -345,7 +343,11 @@ mod tests {
             )
             .await
             .expect("begin zero-limit prefix scan");
-        let (result, result_has_more) = cursor.next_page(0).await.expect("zero-limit prefix scan").into_parts();
+        let (result, result_has_more) = cursor
+            .next_page(0)
+            .await
+            .expect("zero-limit prefix scan")
+            .into_parts();
 
         assert!(result.is_empty());
         assert!(!result_has_more);
@@ -385,12 +387,10 @@ mod tests {
         let (next, _next_has_more) = cursor
             .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("second page").into_parts();
+            .expect("second page")
+            .into_parts();
         assert_eq!(
-            next
-                .into_iter()
-                .map(|entry| entry.key)
-                .collect::<Vec<_>>(),
+            next.into_iter().map(|entry| entry.key).collect::<Vec<_>>(),
             [key("b"), key("c")]
         );
     }

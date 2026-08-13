@@ -1548,9 +1548,7 @@ impl<'a> EntityLiveRowRef<'a> {
         }
     }
 
-    fn durable_predecessor(
-        self,
-    ) -> Option<&'a crate::hot_state::CertifiedCurrentStatePredecessor> {
+    fn durable_predecessor(self) -> Option<&'a crate::hot_state::CertifiedCurrentStatePredecessor> {
         match self {
             Self::Owned(_) => None,
             Self::Batch(row) => row.durable_predecessor(),

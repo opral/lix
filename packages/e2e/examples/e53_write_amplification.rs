@@ -23,7 +23,7 @@
 //! Usage: `e53_write_amplification [rows_per_commit] [commits] [report_every]`
 
 use lix::{ExecuteBatchStatement, Value};
-use lix::integration::{Engine, SessionContext};
+use lix::{Lix, open_lix};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{
@@ -60,11 +60,10 @@ async fn main() {
 
     let directory = tempfile::tempdir().expect("create RocksDB directory");
     let storage = RocksDB::open(directory.path()).expect("open RocksDB");
-    Engine::initialize(storage.clone())
+    let session = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("initialize repository");
-    let engine = Engine::new(storage.clone()).await.expect("open engine");
-    let session = engine.open_session().await.expect("open workspace");
+        .expect("open workspace");
     register_schema(&session).await;
 
     println!(
@@ -203,7 +202,7 @@ where
     (rows, bytes)
 }
 
-async fn commit_batch<S>(session: &SessionContext<S>, batch: usize, rows: usize)
+async fn commit_batch<S>(session: &Lix<S>, batch: usize, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -223,7 +222,7 @@ where
     transaction.commit().await.expect("commit batch");
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

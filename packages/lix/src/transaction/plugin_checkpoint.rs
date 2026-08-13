@@ -127,7 +127,8 @@ pub(crate) async fn stage_delete_branch_plugin_checkpoints(
     loop {
         let (chunk, chunk_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         if chunk.is_empty() {
             break;
         }

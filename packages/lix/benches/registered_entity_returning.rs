@@ -1,7 +1,7 @@
 //! Opt-in SQL profiling probe for registered-entity `RETURNING` writes.
 //!
 //! The timer encloses only the target write. Each sample receives a fresh
-//! in-memory engine, registered schema, and (for UPDATE) seeded rows before
+//! in-memory lix, registered schema, and (for UPDATE) seeded rows before
 //! timing starts, so fixture construction and seed writes are excluded. Cases
 //! are rotated on every round to avoid a fixed run-order advantage.
 //!
@@ -31,8 +31,8 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lix::ExecuteResult;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Memory;
+use lix::{Lix, open_lix};
 
 const DEFAULT_ROWS: usize = 1_000;
 const DEFAULT_ROUNDS: usize = 11;
@@ -457,18 +457,12 @@ async fn measure_explicit_pre_staged_case(plans: &SqlPlans, returning: bool) -> 
     elapsed
 }
 
-async fn new_fixture() -> SessionContext<Memory> {
+async fn new_fixture() -> Lix<Memory> {
     let storage = Memory::new();
-    Engine::initialize(storage.clone())
+    let session = open_lix()
+        .with_storage(storage)
         .await
-        .expect("initialize registered-entity RETURNING benchmark storage");
-    let engine = Engine::new(storage)
-        .await
-        .expect("open registered-entity RETURNING benchmark engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("open registered-entity RETURNING benchmark session");
+        .expect("open registered-entity RETURNING benchmark lix");
     let registration = session
         .execute(REGISTER_SCHEMA_SQL, &[])
         .await
@@ -477,7 +471,7 @@ async fn new_fixture() -> SessionContext<Memory> {
     session
 }
 
-async fn seeded_fixture(plans: &SqlPlans) -> SessionContext<Memory> {
+async fn seeded_fixture(plans: &SqlPlans) -> Lix<Memory> {
     let session = new_fixture().await;
     let seed = session
         .execute(&plans.insert, &[])

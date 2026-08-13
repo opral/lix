@@ -4,12 +4,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
     ReadOptions, ScanCursor, SpaceId, Storage, StorageError, StorageRead, WriteOptions,
 };
 use lix::{ObserveEvent, Value};
+use lix::{engine::Engine, session::SessionContext};
 use serde_json::json;
 use support::simulation_test::engine::{SimSession, Simulation};
 
@@ -18,10 +18,7 @@ const NO_EVENT_TIMEOUT: Duration = Duration::from_millis(250);
 const KEY_VALUE_SQL: &str = "SELECT key, value FROM lix_key_value WHERE key = $1 ORDER BY key";
 
 async fn open_default_session(sim: &Simulation, engine: &Engine) -> (SessionContext, SimSession) {
-    let raw_session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let raw_session = engine.open_session().await.expect("session should open");
     let session = sim.wrap_session(raw_session.clone(), engine);
     (raw_session, session)
 }
@@ -64,7 +61,10 @@ fn assert_key_value_row(event: &ObserveEvent, key: &str, value: &str) {
     assert_eq!(event.rows.len(), 1);
     assert_eq!(
         event.rows.rows()[0].values(),
-        &[Value::Text(key.to_string()), Value::Json(json!(value).into()),]
+        &[
+            Value::Text(key.to_string()),
+            Value::Json(json!(value).into()),
+        ]
     );
 }
 
@@ -152,12 +152,7 @@ async fn observe_initial_next_waits_without_rejecting_same_session_write() {
         .await
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
     let mut warmup = session
         .observe("SELECT 1", &[])
         .expect("warmup observe should open");
@@ -213,12 +208,7 @@ async fn observe_close_during_initial_evaluation_does_not_publish_a_final_snapsh
         .await
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
     let mut events = session
         .observe("SELECT 1", &[])
         .expect("observe should open");
@@ -266,12 +256,7 @@ async fn observe_registration_allows_automatic_write_instead_of_rejecting() {
         .await
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
 
     gate.block_next();
     let writer_session = Arc::clone(&session);
@@ -315,12 +300,7 @@ async fn observe_initial_next_waits_for_automatic_write_instead_of_rejecting() {
         .await
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
     let params = [Value::Text("observe-after-automatic-write".to_string())];
     let mut events = session
         .observe(KEY_VALUE_SQL, &params)
@@ -634,10 +614,7 @@ async fn observe_identical_queries_share_one_evaluation_per_generation() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
     let params = [Value::Text("observe-singleflight".to_string())];
     let mut first = session
         .observe(KEY_VALUE_SQL, &params)
@@ -680,10 +657,7 @@ async fn closing_retained_observer_releases_external_watcher_demand() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
     let mut events = session
         .observe("SELECT 1", &[])
         .expect("observe should open");

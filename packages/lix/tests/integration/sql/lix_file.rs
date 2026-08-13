@@ -2878,7 +2878,10 @@ simulation_test!(
             .expect("updated file should load");
         assert_eq!(
             current.rows()[0].values(),
-            &[Value::Blob(b"after".to_vec().into()), Value::Json(metadata.into()),]
+            &[
+                Value::Blob(b"after".to_vec().into()),
+                Value::Json(metadata.into()),
+            ]
         );
         assert_eq!(
             file_descriptor_event_count(&session, &commit_id, file_id).await,

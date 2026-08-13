@@ -1,8 +1,8 @@
 //! How much of the settled repository is byte-identical duplicate content?
 //!
 //! The commit-delta segment plane is keyed `commit_id ++ segment_index`, not by
-//! a content digest, so nothing in the engine can notice that two commits wrote
-//! the same segment bytes. Every other high-volume immutable plane in the engine
+//! a content digest, so nothing in Lix can notice that two commits wrote
+//! the same segment bytes. Every other high-volume immutable plane in Lix
 //! *is* content-addressed. The obvious question is whether that difference costs
 //! anything in practice.
 //!
@@ -31,7 +31,6 @@
 
 use std::path::Path;
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{
@@ -39,6 +38,7 @@ use lix::storage_bench::{
     space_value_duplication,
 };
 use lix::{CreateBranchOptions, MergeBranchOptions, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 const WORKLOADS: &[&str] = &[
@@ -98,20 +98,22 @@ async fn main() {
 async fn run_workload(workload: &str, rows: usize, window: usize) {
     let directory = tempfile::tempdir().expect("create duplication-audit directory");
     let storage = RocksDB::open(directory.path()).expect("open duplication-audit RocksDB");
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize duplication-audit repository");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open duplication-audit engine");
-    let main = engine
-        .open_session()
+        .expect("open duplication-audit lix");
+    let main = lix
+        .open_another_session()
         .await
         .expect("open duplication-audit workspace");
     register_schema(&main).await;
     seed_rows(&main, rows).await;
 
-    apply_workload(&engine, &main, workload, window).await;
+    apply_workload(&lix, &main, workload, window).await;
 
     storage.flush().expect("flush duplication-audit RocksDB");
     let adapter = StorageAdapter::new(storage.clone());
@@ -133,12 +135,8 @@ async fn run_workload(workload: &str, rows: usize, window: usize) {
     );
 }
 
-async fn apply_workload<S>(
-    engine: &Engine<S>,
-    main: &SessionContext<S>,
-    workload: &str,
-    window: usize,
-) where
+async fn apply_workload<S>(lix: &Lix<S>, main: &Lix<S>, workload: &str, window: usize)
+where
     S: Storage + Clone + Send + Sync + 'static,
 {
     match workload {
@@ -169,7 +167,7 @@ async fn apply_workload<S>(
                 restore_rows(main, 0, window).await;
             }
         }
-        // Same shape, driven through the engine's own undo path.
+        // Same shape, driven through Lix's own undo path.
         "undo_roundtrip" => {
             for index in 0..WORKLOAD_COMMITS / 2 {
                 edit_rows(main, 0, window, index + 1).await;
@@ -180,9 +178,9 @@ async fn apply_workload<S>(
         // into main. The merge commits replay content already stored.
         "merge_replay" => {
             let first = create_branch(main, "replay-0").await;
-            edit_on_branch(engine, &first, 0, window, 1).await;
+            edit_on_branch(lix, &first, 0, window, 1).await;
             let second = create_branch(main, "replay-1").await;
-            edit_on_branch(engine, &second, 0, window, 1).await;
+            edit_on_branch(lix, &second, 0, window, 1).await;
             main.merge_branch(MergeBranchOptions {
                 source_branch_id: first,
             })
@@ -194,17 +192,17 @@ async fn apply_workload<S>(
                 })
                 .await;
         }
-        "branches_2_identical" => branch_fanout(engine, main, 2, window, false).await,
-        "branches_2_disjoint" => branch_fanout(engine, main, 2, window, true).await,
-        "branches_10_identical" => branch_fanout(engine, main, 10, window, false).await,
-        "branches_10_disjoint" => branch_fanout(engine, main, 10, window, true).await,
+        "branches_2_identical" => branch_fanout(lix, main, 2, window, false).await,
+        "branches_2_disjoint" => branch_fanout(lix, main, 2, window, true).await,
+        "branches_10_identical" => branch_fanout(lix, main, 10, window, false).await,
+        "branches_10_disjoint" => branch_fanout(lix, main, 10, window, true).await,
         other => panic!("unknown duplication-audit workload '{other}'"),
     }
 }
 
 async fn branch_fanout<S>(
-    engine: &Engine<S>,
-    main: &SessionContext<S>,
+    lix: &Lix<S>,
+    main: &Lix<S>,
     branches: usize,
     window: usize,
     disjoint: bool,
@@ -214,7 +212,7 @@ async fn branch_fanout<S>(
     for index in 0..branches {
         let branch = create_branch(main, &format!("fanout-{index}")).await;
         let start = if disjoint { index * window } else { 0 };
-        edit_on_branch(engine, &branch, start, window, 1).await;
+        edit_on_branch(lix, &branch, start, window, 1).await;
     }
 }
 
@@ -313,7 +311,7 @@ fn percent(part: u64, whole: u64) -> f64 {
     }
 }
 
-async fn create_branch<S>(main: &SessionContext<S>, name: &str) -> String
+async fn create_branch<S>(main: &Lix<S>, name: &str) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -328,7 +326,7 @@ where
 }
 
 async fn edit_on_branch<S>(
-    engine: &Engine<S>,
+    lix: &Lix<S>,
     branch: &str,
     start: usize,
     count: usize,
@@ -336,17 +334,23 @@ async fn edit_on_branch<S>(
 ) where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let session = engine
-        .open_session_at(branch.to_owned())
+    let session = lix
+        .open_another_session()
         .await
         .expect("open duplication-audit branch session");
+    session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: (branch.to_owned()).to_string(),
+        })
+        .await
+        .expect("switch session branch");
     edit_rows(&session, start, count, generation).await;
 }
 
 /// The written value depends only on the row index and the generation, so two
 /// commits given the same `(start, count, generation)` produce byte-identical
 /// content whatever branch or order they run in.
-async fn edit_rows<S>(session: &SessionContext<S>, start: usize, count: usize, generation: usize)
+async fn edit_rows<S>(session: &Lix<S>, start: usize, count: usize, generation: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -382,7 +386,7 @@ where
 
 /// Restores the exact bytes `seed_rows` wrote, so the resulting commit's payload
 /// is content the repository already stored.
-async fn restore_rows<S>(session: &SessionContext<S>, start: usize, count: usize)
+async fn restore_rows<S>(session: &Lix<S>, start: usize, count: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -395,10 +399,7 @@ where
         transaction
             .execute(
                 "UPDATE dup_fixture SET value = lix_json($1) WHERE path = $2",
-                &[
-                    Value::Text(seed_value(index)),
-                    Value::Text(row_path(index)),
-                ],
+                &[Value::Text(seed_value(index)), Value::Text(row_path(index))],
             )
             .await
             .expect("stage duplication-audit restore");
@@ -417,7 +418,7 @@ fn seed_value(index: usize) -> String {
     format!(r#"{{"seed":{index},"pad":"{PAD}"}}"#)
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -444,7 +445,7 @@ where
         .expect("register duplication-audit schema");
 }
 
-async fn seed_rows<S>(session: &SessionContext<S>, rows: usize)
+async fn seed_rows<S>(session: &Lix<S>, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

@@ -361,11 +361,7 @@ where
 }
 
 fn insert_exact_overlay_candidate<'a>(
-    winner: &mut Option<(
-        OverlayTier,
-        MaterializedHotStateRowRef<'a>,
-        Option<&'a str>,
-    )>,
+    winner: &mut Option<(OverlayTier, MaterializedHotStateRowRef<'a>, Option<&'a str>)>,
     tier: OverlayTier,
     row: MaterializedHotStateRowRef<'a>,
     branch_override: Option<&'a str>,
@@ -1324,10 +1320,7 @@ mod tests {
         }
     }
 
-    fn matches_scan_request(
-        row: &MaterializedHotStateRow,
-        request: &HotStateScanRequest,
-    ) -> bool {
+    fn matches_scan_request(row: &MaterializedHotStateRow, request: &HotStateScanRequest) -> bool {
         let filter = &request.filter;
         let branch_matches = filter.branch_ids.is_empty()
             || filter

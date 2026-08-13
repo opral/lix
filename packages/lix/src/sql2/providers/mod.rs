@@ -671,8 +671,8 @@ mod tests {
         CommitGraphChangeHistoryRequest, CommitGraphNode, CommitGraphReader,
         ReachableCommitGraphNode,
     };
-    use crate::json_store::JsonStoreContext;
     use crate::hot_state::{HotStateReader, HotStateScanRequest};
+    use crate::json_store::JsonStoreContext;
     use crate::sql2::HistoryQuerySource;
     use crate::sql2::catalog::{
         PublicCatalog, PublicSurfaceKind, derive_entity_surface_spec_from_schema,

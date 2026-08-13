@@ -1527,7 +1527,10 @@ where
         .then(|| rows.row(rows.len() - 1))
         .and_then(|row| (!row.deleted()).then_some(row.snapshot_content()))
         .flatten();
-    parse_plugin_registry_snapshot(snapshot.map(|snapshot| snapshot.as_str()), observed_commit_id.as_str())
+    parse_plugin_registry_snapshot(
+        snapshot.map(|snapshot| snapshot.as_str()),
+        observed_commit_id.as_str(),
+    )
 }
 
 /// Builds the plugin registry a snapshot describes.

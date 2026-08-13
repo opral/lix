@@ -26,9 +26,9 @@ pub(crate) use self::planner::{
     append_blob_ref_tombstone_row, create_directory_path_with_leaf_id_with_resolvers,
     directory_path_resolvers_for_paths, directory_path_resolvers_from_hot_state,
     directory_path_resolvers_from_path_index, filesystem_storage_scope_key, plan_file_delete,
-    plan_file_descriptor_write,
-    plan_parsed_directory_path_update_with_resolvers, plan_parsed_file_path_update_with_resolvers,
-    plan_parsed_file_path_write_with_resolvers, plan_recursive_directory_delete,
+    plan_file_descriptor_write, plan_parsed_directory_path_update_with_resolvers,
+    plan_parsed_file_path_update_with_resolvers, plan_parsed_file_path_write_with_resolvers,
+    plan_recursive_directory_delete,
 };
 pub(crate) use self::read::{
     FilesystemIndex, collect_gc_binary_blob_roots, filesystem_schema_keys,

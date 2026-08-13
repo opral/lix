@@ -2544,11 +2544,7 @@ where
             return Ok(entries);
         }
         if self
-            .exact_current_state_scope_has_equal_hot_state(
-                left_commit_id,
-                right_commit_id,
-                request,
-            )
+            .exact_current_state_scope_has_equal_hot_state(left_commit_id, right_commit_id, request)
             .await?
             == Some(true)
         {
@@ -8406,7 +8402,8 @@ mod tests {
         let mut writer = tracked_state.writer(&read, &mut writes);
         for plan in plans.iter().rev() {
             crate::tracked_state::commit_root_rebuild::stage_rebuild_plan_with_writer(
-                &mut writer, plan,
+                &mut writer,
+                plan,
             )
             .await
             .expect("seal root should stage");
@@ -8484,7 +8481,8 @@ mod tests {
 
         let resumed = StorageAdapter::new(Memory::new());
         write_two_interval_history_for_test(&resumed, &tracked_state, true).await;
-        let (resumed_plans, resumed_root) = replay_root_for_test(&resumed, &tracked_state, "b3").await;
+        let (resumed_plans, resumed_root) =
+            replay_root_for_test(&resumed, &tracked_state, "b3").await;
 
         assert_eq!(
             genesis_plans, 6,
@@ -8543,7 +8541,8 @@ mod tests {
             .await
             .expect("broken resume point should commit");
 
-        let (broken_plans, broken_root_id) = replay_root_for_test(&broken, &tracked_state, "b3").await;
+        let (broken_plans, broken_root_id) =
+            replay_root_for_test(&broken, &tracked_state, "b3").await;
         assert_eq!(broken_plans, 3, "the broken pointer is still readable");
         assert_ne!(
             broken_root_id, genesis_root,
@@ -8758,7 +8757,8 @@ mod tests {
         let (chunk, chunk_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("chunk inventory should scan").into_parts();
+            .expect("chunk inventory should scan")
+            .into_parts();
         assert!(!chunk_has_more, "test chunk inventory must fit one page");
         chunk
             .into_iter()

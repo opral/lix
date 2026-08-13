@@ -820,7 +820,7 @@ fn assert_history_survived_gc(
     );
 }
 
-async fn branch_head(engine: &lix::integration::Engine, branch_id: &str) -> String {
+async fn branch_head(engine: &lix::engine::Engine, branch_id: &str) -> String {
     engine
         .load_branch_head_commit_id(branch_id)
         .await

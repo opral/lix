@@ -18,11 +18,11 @@ use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::JsonStoreContext;
 use crate::hot_state::{
     HotStateContext, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateProjection,
     HotStateReader,
 };
+use crate::json_store::JsonStoreContext;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::runtime::PluginRuntimeHost;
@@ -151,7 +151,6 @@ impl SessionBranch {
 /// commit or rollback, so all SQL during that window must run through the
 /// transaction handle.
 #[derive(Clone)]
-#[expect(missing_debug_implementations)]
 pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) branch: SessionBranch,
     pub(super) active_account_id: Arc<str>,
@@ -855,12 +854,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized storage should create engine");
-        std::sync::Arc::new(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
-        )
+        std::sync::Arc::new(engine.open_session().await.expect("session should open"))
     }
 
     async fn open_blocking_read_session() -> (
@@ -876,12 +870,7 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         (
-            std::sync::Arc::new(
-                engine
-                    .open_session()
-                    .await
-                    .expect("session should open"),
-            ),
+            std::sync::Arc::new(engine.open_session().await.expect("session should open")),
             gate,
         )
     }
@@ -899,12 +888,7 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         (
-            std::sync::Arc::new(
-                engine
-                    .open_session()
-                    .await
-                    .expect("session should open"),
-            ),
+            std::sync::Arc::new(engine.open_session().await.expect("session should open")),
             gate,
         )
     }

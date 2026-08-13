@@ -165,7 +165,7 @@ IDs, `origin_key`, or generic audit metadata solely to describe a Lix write.
 Those facts already belong to the change:
 
 - [`lix_change`](./history.md) records the change ID, timestamp, metadata, and
-  origin key for workspace-wide activity.
+  origin key for repository-wide activity.
 - `<schema>_history()` records branch-reachable revisions and exposes the
   source change and commit provenance through `lixcol_change_id`,
   `lixcol_change_created_at`, `lixcol_observed_commit_id`, and

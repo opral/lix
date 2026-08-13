@@ -9,10 +9,11 @@ repository = "https://github.com/plimeor/markdown-syntax"
 license = "MIT OR Apache-2.0"
 keywords = ["markdown", "commonmark", "gfm", "parser", "ast"]
 categories = ["parser-implementations", "text-processing", "no-std"]
+publish = false
 
-# The published package ships only the library, license, and readme. The vendored
-# conformance corpus under tests/ is dev-only and is intentionally NOT
-# redistributed (it contains third-party CommonMark/GFM/comrak/markdown-rs cases).
+# Keep the vendored source aligned with the upstream package contents. The
+# conformance corpus under tests/ is dev-only and contains third-party
+# CommonMark/GFM/comrak/markdown-rs cases.
 include = [
     "Cargo.toml",
     "README.md",

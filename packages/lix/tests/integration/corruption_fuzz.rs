@@ -151,7 +151,10 @@ async fn exercise_rejected_batch(
         let error = transaction
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ($1, $2), ($1, $2)",
-                &[Value::Text(duplicate_key.clone()), Value::Json(value.into())],
+                &[
+                    Value::Text(duplicate_key.clone()),
+                    Value::Json(value.into()),
+                ],
             )
             .await
             .expect_err("same-batch duplicate must be rejected");

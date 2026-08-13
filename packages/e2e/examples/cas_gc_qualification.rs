@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, CoreProjection, KeyRange, MAX_SCAN_PAGE_ROWS, ReadOptions, Storage,
     StorageRead,
@@ -15,6 +14,7 @@ use lix::storage_bench::{
     CrudPhysicalWriteAccounting, RepositoryGcCommitBenchResult, collect_repository_gc_for_bench,
     read_binary_cas_for_bench, take_crud_physical_write_accounting,
 };
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
@@ -389,54 +389,61 @@ async fn prepare_retained_fixture<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let initialized = Engine::initialize(storage.clone())
-        .await
-        .expect("initialize retained repository");
-    let engine = Engine::new(storage.clone())
+    let session = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("open retained repository");
-    let session = engine
-        .open_session_at(initialized.main_branch_id)
-        .await
-        .expect("open retained preparation session");
     let total_size = size_mib
         .checked_mul(1024 * 1024)
         .expect("qualification size should fit usize");
     let upload_started = PhaseStart::begin(slate_io);
     let mut expected_hasher = blake3::Hasher::new();
+    let mut payload = Vec::with_capacity(total_size);
     let mut offset = 0_usize;
     let mut part = 0_u64;
     while offset < total_size {
         let part_len = (total_size - offset).min(PART_BYTES);
         let bytes = random_part(part, part_len);
         expected_hasher.update(&bytes);
-        session
-            .upsert_file_content_part(
-                "cas-gc-retained-release".to_owned(),
-                FILE_PATH.to_owned(),
-                offset as u64,
-                total_size as u64,
-                bytes.into(),
-            )
-            .await
-            .expect("upload retained qualification part");
+        payload.extend_from_slice(&bytes);
         offset += part_len;
         part = part.saturating_add(1);
     }
+    session
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+            &[
+                Value::Text(FILE_PATH.to_owned()),
+                Value::Blob(payload.into()),
+            ],
+        )
+        .await
+        .expect("write retained qualification payload through SQL");
     let upload = upload_started.finish(slate_io, None);
     let expected_content_hash = expected_hasher.finalize().to_hex().to_string();
     let uploaded = session
-        .read_file_content(FILE_PATH.to_owned(), None)
+        .execute(
+            "SELECT content, content_identity FROM lix_file WHERE path = $1",
+            &[Value::Text(FILE_PATH.to_owned())],
+        )
         .await
         .expect("read uploaded qualification payload")
-        .expect("uploaded qualification payload should exist");
-    assert_eq!(uploaded.total_size(), total_size as u64);
+        .rows()
+        .first()
+        .expect("uploaded qualification payload should exist")
+        .clone();
+    let uploaded_content = uploaded
+        .get::<Vec<u8>>("content")
+        .expect("uploaded content should decode");
+    assert_eq!(uploaded_content.len(), total_size);
     assert_eq!(
-        blake3::hash(uploaded.content()).to_hex().to_string(),
+        blake3::hash(&uploaded_content).to_hex().to_string(),
         expected_content_hash,
     );
-    let blob_hash = uploaded.content_identity().to_owned();
-    drop(uploaded);
+    let blob_hash = uploaded
+        .get::<String>("content_identity")
+        .expect("uploaded content identity should decode");
     let root_a = branch_commit(&session).await;
     session
         .execute(
@@ -457,9 +464,13 @@ where
     assert_eq!(branch.id, RETAINED_BRANCH_ID);
     for revision in 0..retention_checkpoints {
         session
-            .upsert_file_content(
-                "/qualification/retention.json".to_owned(),
-                format!("{{\"revision\":{revision}}}").into_bytes().into(),
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                &[
+                    Value::Text("/qualification/retention.json".to_owned()),
+                    Value::Blob(format!("{{\"revision\":{revision}}}").into_bytes().into()),
+                ],
             )
             .await
             .expect("publish retention commit");
@@ -493,7 +504,6 @@ where
     drop(bytes);
     drop(adapter);
     drop(session);
-    drop(engine);
     drop(storage);
     PreparedFixture {
         branch_id: branch.id,
@@ -520,13 +530,20 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let cold_started = PhaseStart::begin(slate_io);
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("cold reopen retained repository");
-    let session = engine
-        .open_session_at(fixture.branch_id.clone())
+    let session = lix
+        .open_another_session()
         .await
         .expect("cold reopen retained owner branch");
+    session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: (fixture.branch_id.clone()).to_string(),
+        })
+        .await
+        .expect("switch session branch");
     let diff = session
         .execute(
             "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
@@ -574,8 +591,8 @@ where
     drop(session);
 
     let release_started = PhaseStart::begin(slate_io);
-    let workspace = engine
-        .open_session()
+    let workspace = lix
+        .open_another_session()
         .await
         .expect("open workspace for final owner release");
     workspace
@@ -602,7 +619,7 @@ where
     let final_release_gc = release_started.finish(slate_io, Some(sweep));
     let released = cas_stats(&storage).await;
     drop(adapter);
-    drop(engine);
+    drop(lix);
     drop(storage);
     ReleasedFixture {
         cold_reopen,
@@ -616,11 +633,12 @@ async fn verify_final_state<S>(storage: S, fixture: &PreparedFixture) -> [SpaceS
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("final repository should reopen");
-    let workspace = engine
-        .open_session()
+    let workspace = lix
+        .open_another_session()
         .await
         .expect("final session should open");
     let branches = workspace
@@ -643,7 +661,7 @@ where
     let stats = cas_stats(&storage).await;
     drop(adapter);
     drop(workspace);
-    drop(engine);
+    drop(lix);
     drop(storage);
     stats
 }
@@ -677,7 +695,7 @@ fn finish_result(
     }
 }
 
-async fn branch_commit<S>(session: &SessionContext<S>) -> String
+async fn branch_commit<S>(session: &Lix<S>) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -697,7 +715,7 @@ where
         .expect("branch commit should exist")
 }
 
-async fn read_current_file<S>(session: &SessionContext<S>) -> Vec<u8>
+async fn read_current_file<S>(session: &Lix<S>) -> Vec<u8>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -770,9 +788,9 @@ async fn cas_stats<S: Storage>(storage: &S) -> [SpaceStats; 4] {
 }
 
 async fn space_stats<S: Storage>(storage: &S, space_id: lix::storage::SpaceId) -> SpaceStats {
-    // A space id has exactly one value semantics and the engine registry is
+    // A space id has exactly one value semantics and Lix registry is
     // where it is declared; guessing it here scans a different physical
-    // location than the engine wrote.
+    // location than Lix wrote.
     let space = lix::storage_bench::storage_space_by_id(space_id.0);
     let read = storage
         .begin_read(ReadOptions::default())
@@ -800,7 +818,8 @@ async fn space_stats<S: Storage>(storage: &S, space_id: lix::storage::SpaceId) -
         let (page, page_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan CAS stats").into_parts();
+            .expect("scan CAS stats")
+            .into_parts();
         stats.rows += page.len() as u64;
         stats.value_bytes += page
             .iter()

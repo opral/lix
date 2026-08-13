@@ -1052,7 +1052,12 @@ async fn load_default_branch_id(write_ctx: &SqlWriteContext) -> Result<String> {
         })?;
     serde_json::from_str::<JsonValue>(snapshot)
         .ok()
-        .and_then(|value| value.get("value").and_then(JsonValue::as_str).map(str::to_owned))
+        .and_then(|value| {
+            value
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             DataFusionError::Execution("repository default branch is invalid".to_string())
@@ -1647,13 +1652,9 @@ mod tests {
             point_error_branch: None,
         });
 
-        let rows = load_branch_rows(
-            hot_state,
-            branch_ref.clone(),
-            BranchHeadReadStrategy::Batch,
-        )
-        .await
-        .unwrap();
+        let rows = load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+            .await
+            .unwrap();
 
         assert_eq!(
             rows,
@@ -1692,13 +1693,9 @@ mod tests {
             point_error_branch: None,
         });
 
-        let rows = load_branch_rows(
-            hot_state,
-            branch_ref.clone(),
-            BranchHeadReadStrategy::Batch,
-        )
-        .await
-        .unwrap();
+        let rows = load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+            .await
+            .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 0);
@@ -1729,13 +1726,9 @@ mod tests {
             point_error_branch: None,
         });
 
-        let rows = load_branch_rows(
-            hot_state,
-            branch_ref.clone(),
-            BranchHeadReadStrategy::Batch,
-        )
-        .await
-        .unwrap();
+        let rows = load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+            .await
+            .unwrap();
 
         assert_eq!(rows.len(), 3);
         assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
@@ -1766,13 +1759,9 @@ mod tests {
             point_error_branch: Some("01920000-0000-7000-8000-0000000000b1".to_string()),
         });
 
-        let error = load_branch_rows(
-            hot_state,
-            branch_ref.clone(),
-            BranchHeadReadStrategy::Batch,
-        )
-        .await
-        .unwrap_err();
+        let error = load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+            .await
+            .unwrap_err();
 
         assert!(
             error
@@ -1809,13 +1798,10 @@ mod tests {
                 point_error_branch: None,
             });
 
-            let error = load_branch_rows(
-                hot_state,
-                branch_ref.clone(),
-                BranchHeadReadStrategy::Batch,
-            )
-            .await
-            .unwrap_err();
+            let error =
+                load_branch_rows(hot_state, branch_ref.clone(), BranchHeadReadStrategy::Batch)
+                    .await
+                    .unwrap_err();
 
             assert_eq!(error.code, code);
             assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);

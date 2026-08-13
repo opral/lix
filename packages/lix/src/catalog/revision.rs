@@ -177,7 +177,9 @@ mod tests {
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
                  WHERE lixcol_entity_pk = lix_json('[\"tracked_revision_probe\"]')",
-                &[Value::Json(test_schema("tracked_revision_probe", true).into())],
+                &[Value::Json(
+                    test_schema("tracked_revision_probe", true).into(),
+                )],
             )
             .await
             .expect("compatible tracked schema amendment should commit");

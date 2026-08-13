@@ -195,7 +195,8 @@ where
         &mut self,
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
-        self.reachable_nodes_within_depth(head_commit_id, None).await
+        self.reachable_nodes_within_depth(head_commit_id, None)
+            .await
     }
 
     /// Walks from `head_commit_id` and stops once `max_depth` is complete.
@@ -204,7 +205,10 @@ where
         head_commit_id: &CommitId,
         max_depth: Option<u32>,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
-        if let Some(nodes) = self.reachable_nodes_cache.get(&(*head_commit_id, max_depth)) {
+        if let Some(nodes) = self
+            .reachable_nodes_cache
+            .get(&(*head_commit_id, max_depth))
+        {
             return Ok(Arc::clone(nodes));
         }
         if let Some(max_depth_value) = max_depth
@@ -497,12 +501,18 @@ where
                     &mut state,
                 )
                 .await?;
-                reachable_nodes.push(ReachableCommitGraphNode { commit: node, depth });
+                reachable_nodes.push(ReachableCommitGraphNode {
+                    commit: node,
+                    depth,
+                });
                 if state.entries.len() >= limit {
                     break;
                 }
             }
-            if request.max_depth.is_some_and(|max_depth| depth >= max_depth) {
+            if request
+                .max_depth
+                .is_some_and(|max_depth| depth >= max_depth)
+            {
                 break;
             }
         }

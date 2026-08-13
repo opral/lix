@@ -157,12 +157,6 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
             return;
         }
         let rows = fixture_rows(row_count);
-        if std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OP").as_deref()
-            == Ok("olap_result_ceiling")
-        {
-            profile_olap_result_ceiling(&runtime, &rows, profile_sql_session_storage());
-            return;
-        }
         profile_operation(&runtime, &rows);
         return;
     }
@@ -180,60 +174,6 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
             bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
         }
     }
-}
-
-/// Measures the unavoidable Arrow-to-public-result conversion separately from
-/// query execution. `RESULT_MODE=count_only` is a benchmark-only causal
-/// ceiling: it retains RecordBatch owners and counts rows without converting
-/// them into public row/value vectors. It is not semantic qualification data.
-fn profile_olap_result_ceiling(
-    runtime: &tokio::runtime::Runtime,
-    rows: &[WorkloadRow],
-    profile: StorageProfile,
-) {
-    let shape = sql_session::selected_olap_read_shape().unwrap_or(sql_session::OlapReadShape::Scan);
-    let repeats = profile_sample_count();
-    let fixture = runtime.block_on(sql_session::seeded_fixture_with_read_many_pk_count(
-        profile,
-        rows,
-        READ_MANY_PK_COUNT.min(rows.len()),
-    ));
-    let _ = runtime.block_on(fixture.read_olap_profiled(shape));
-    let mut samples = Vec::with_capacity(repeats);
-    let mut profiles = Vec::with_capacity(repeats);
-    for _ in 0..repeats {
-        reset_allocation_accounting();
-        maybe_print_profile_rss_phase("before_result");
-        let started = Instant::now();
-        let (count, detail) = runtime.block_on(fixture.read_olap_profiled(shape));
-        samples.push(started.elapsed());
-        profiles.push(detail);
-        black_box(count);
-        maybe_print_profile_rss_phase("after_result");
-        print_allocation_accounting("result");
-    }
-    samples.sort_unstable();
-    profiles.sort_by_key(|profile| profile.total);
-    let median = &profiles[profiles.len() / 2];
-    println!(
-        "tracked_state_crud result ceiling: storage={} shape={} mode={} samples={} wall_median={:?} wall_min={:?} wall_max={:?} profile_total={:?} arrow_execution={:?} public_result_materialization={:?} rows={} batches={} arrow_bytes={} count_only_rows={} count_only_batches={}",
-        profile.name(),
-        shape.label(),
-        std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_RESULT_MODE")
-            .unwrap_or_else(|_| "full".into()),
-        repeats,
-        samples[samples.len() / 2],
-        samples[0],
-        samples[samples.len() - 1],
-        median.total,
-        median.arrow_execution,
-        median.public_result_materialization,
-        median.scan_rows,
-        median.scan_batches,
-        median.scan_arrow_bytes,
-        median.result_count_only_rows,
-        median.result_count_only_batches,
-    );
 }
 
 fn accounting_row_count() -> usize {

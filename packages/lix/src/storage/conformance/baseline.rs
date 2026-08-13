@@ -679,7 +679,8 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();
+    .map_err(|error| format!("scan_range failed: {error}"))?
+    .into_parts();
 
     assert_read_entries(&chunk, &[("a", "B")])
 }
@@ -712,7 +713,8 @@ where
     let (first, first_has_more) = cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("first scan_range failed: {error}"))?.into_parts();
+        .map_err(|error| format!("first scan_range failed: {error}"))?
+        .into_parts();
     assert_read_entries(&first, &[("b", "B"), ("c", "C")])?;
     if !first_has_more {
         return Err("first scan chunk did not report has_more".to_string());
@@ -772,7 +774,8 @@ where
     let (first, first_has_more) = cursor
         .next_page(usize::MAX)
         .await
-        .map_err(|error| format!("first capped scan failed: {error}"))?.into_parts();
+        .map_err(|error| format!("first capped scan failed: {error}"))?
+        .into_parts();
     if first.len() != MAX_SCAN_PAGE_ROWS || !first_has_more {
         return Err(format!(
             "oversized scan returned {} rows with has_more={} (expected {} and true)",
@@ -833,7 +836,8 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("included range scan failed: {error}"))?.into_parts();
+    .map_err(|error| format!("included range scan failed: {error}"))?
+    .into_parts();
     assert_read_entries(&included, &[("b", "B"), ("c", "C")])?;
 
     let (excluded, _excluded_has_more) = scan_range(
@@ -846,7 +850,8 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("excluded range scan failed: {error}"))?.into_parts();
+    .map_err(|error| format!("excluded range scan failed: {error}"))?
+    .into_parts();
     assert_read_entries(&excluded, &[("c", "C")])
 }
 
@@ -876,7 +881,8 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();
+    .map_err(|error| format!("scan_range failed: {error}"))?
+    .into_parts();
 
     assert_read_entries(&chunk, &[("c", "C"), ("d", "D")])
 }
@@ -927,7 +933,8 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();
+    .map_err(|error| format!("scan_range failed: {error}"))?
+    .into_parts();
 
     assert_read_entries_bytes(
         &chunk,
@@ -1002,7 +1009,8 @@ where
             let (chunk, chunk_has_more) = cursor
                 .next_page(limit)
                 .await
-                .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?.into_parts();
+                .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?
+                .into_parts();
             actual.extend(entries_to_key_values(&chunk));
             if !chunk_has_more {
                 break;
@@ -1068,7 +1076,8 @@ where
             let (result, result_has_more) = cursor
                 .next_page(limit)
                 .await
-                .map_err(|error| format!("paged scan limit {limit} failed: {error}"))?.into_parts();
+                .map_err(|error| format!("paged scan limit {limit} failed: {error}"))?
+                .into_parts();
             actual.extend(entries_to_key_values(&result));
             if !result_has_more {
                 break;
@@ -1109,7 +1118,8 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();
+    .map_err(|error| format!("scan_range failed: {error}"))?
+    .into_parts();
     if chunk.is_empty() {
         Ok(())
     } else {
@@ -1250,7 +1260,8 @@ where
         BeginScanOptions::default(),
     )
     .await
-    .map_err(|error| format!("old read scan_range failed: {error}"))?.into_parts();
+    .map_err(|error| format!("old read scan_range failed: {error}"))?
+    .into_parts();
     assert_read_entries(&old_scan, &[("a", "A")])?;
 
     assert_get_entries(&storage, test_space, &[("a", Some("C"))]).await
@@ -1285,7 +1296,8 @@ where
     let (first, first_has_more) = old_cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("old cursor first page failed: {error}"))?.into_parts();
+        .map_err(|error| format!("old cursor first page failed: {error}"))?
+        .into_parts();
     assert_read_entries(&first, &[("a", "A"), ("b", "B")])?;
     if !first_has_more {
         return Err("old cursor ended before its second page".to_string());
@@ -1317,7 +1329,8 @@ where
     let (second, second_has_more) = old_cursor
         .next_page(2)
         .await
-        .map_err(|error| format!("old cursor second page failed: {error}"))?.into_parts();
+        .map_err(|error| format!("old cursor second page failed: {error}"))?
+        .into_parts();
     assert_read_entries(&second, &[("c", "C"), ("d", "D")])?;
     if second_has_more {
         return Err("old cursor exposed unexpected rows after its snapshot tail".to_string());
@@ -1343,7 +1356,8 @@ where
     let (restarted_page, _restarted_page_has_more) = restarted
         .next_page(usize::MAX)
         .await
-        .map_err(|error| format!("exclusive restart failed: {error}"))?.into_parts();
+        .map_err(|error| format!("exclusive restart failed: {error}"))?
+        .into_parts();
     assert_read_entries(&restarted_page, &[("c", "C2"), ("e", "E")])
 }
 
@@ -1402,7 +1416,8 @@ where
     let (page, _page_has_more) = cursor
         .next_page(1)
         .await
-        .map_err(|error| format!("cursor failed after unpolled cancellation: {error}"))?.into_parts();
+        .map_err(|error| format!("cursor failed after unpolled cancellation: {error}"))?
+        .into_parts();
     assert_read_entries(&page, &[("a", "A")])
 }
 
@@ -1486,7 +1501,8 @@ where
         },
     )
     .await
-    .map_err(|error| format!("KeyOnly scan_range failed: {error}"))?.into_parts();
+    .map_err(|error| format!("KeyOnly scan_range failed: {error}"))?
+    .into_parts();
     assert_key_only_entries(&key_only_scan, &[key("a")])
 }
 
@@ -1666,7 +1682,8 @@ where
         MAX_SCAN_PAGE_ROWS,
     )
     .await
-    .map_err(|error| format!("scan failed: {error}"))?.into_parts();
+    .map_err(|error| format!("scan failed: {error}"))?
+    .into_parts();
     let rows = result
         .iter()
         .map(|entry| entry.key.clone())

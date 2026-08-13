@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lix::Value;
-use lix::integration::Engine;
+use lix::open_lix;
 use lix::storage::{
     BeginScanOptions, CoreProjection, KeyRange, MAX_SCAN_PAGE_ROWS, ReadOptions, Storage,
     StorageRead,
@@ -92,22 +92,20 @@ fn main() {
         // never pays the profile under test.
         let setup_counters = SlateDBIoCounters::default();
         let storage = open(dir, None, &setup_counters);
-        let initialized = Engine::initialize(storage.clone())
-            .await
-            .expect("initialize reclaim scan repository");
-        let engine = Engine::new(storage.clone())
+        let session = open_lix()
+            .with_storage(storage.clone())
             .await
             .expect("open reclaim scan repository");
-        let session = engine
-            .open_session_at(initialized.main_branch_id)
-            .await
-            .expect("open reclaim scan session");
         let setup_started = Instant::now();
         for index in 0..file_count {
             session
-                .upsert_file_content(
-                    format!("/e3/payload-{index:07}.bin"),
-                    distinct_payload(index as u64, file_kib * 1024).into(),
+                .execute(
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                     ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                    &[
+                        Value::Text(format!("/e3/payload-{index:07}.bin")),
+                        Value::Blob(distinct_payload(index as u64, file_kib * 1024).into()),
+                    ],
                 )
                 .await
                 .expect("write reclaim scan payload");
@@ -128,7 +126,6 @@ fn main() {
         let setup_ms = setup_started.elapsed().as_millis();
         let before = cas_stats(&storage).await;
         drop(session);
-        drop(engine);
         storage.flush().await.expect("flush reclaim scan setup");
         drop(storage);
 

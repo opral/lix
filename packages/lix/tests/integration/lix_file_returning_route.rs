@@ -5,12 +5,12 @@
 //! with `FileIdConstraint::Ids` and no path index, so it is the only caller
 //! whose readback can degrade to a full branch walk.
 
-use lix::integration::Engine;
+use lix::engine::Engine;
 use lix::storage::Memory;
 use lix::storage_bench::take_file_live_scan_accounting;
 use lix::Value;
 
-async fn seed(files: usize) -> lix::integration::SessionContext<Memory> {
+async fn seed(files: usize) -> lix::session::SessionContext<Memory> {
     let storage = Memory::new();
     Engine::initialize(storage.clone())
         .await
@@ -146,7 +146,7 @@ async fn pinned_returning_readback_agrees_with_the_unfiltered_read() {
     let session = seed(8).await;
 
     async fn check(
-        session: &lix::integration::SessionContext<Memory>,
+        session: &lix::session::SessionContext<Memory>,
         id: &str,
         path: &str,
     ) {

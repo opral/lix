@@ -6,7 +6,7 @@ use std::time::Instant;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use lix::integration::Engine;
+use lix::open_lix;
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
@@ -85,7 +85,8 @@ async fn run() {
             match backend {
                 Backend::RocksDB => {
                     let storage = RocksDB::open(path).expect("open RocksDB");
-                    Engine::initialize(storage.clone())
+                    open_lix()
+                        .with_storage(storage.clone())
                         .await
                         .expect("initialize RocksDB");
                     create_bench_branch(&storage).await;
@@ -109,7 +110,8 @@ async fn run() {
                     let counters = SlateDBIoCounters::default();
                     let storage = SlateDB::open_with_io_counters(path, counters.clone())
                         .expect("open SlateDB");
-                    Engine::initialize(storage.clone())
+                    open_lix()
+                        .with_storage(storage.clone())
                         .await
                         .expect("initialize SlateDB");
                     create_bench_branch(&storage).await;
@@ -261,11 +263,12 @@ async fn create_bench_branch<StorageImpl>(storage: &StorageImpl)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open branch-delete benchmark engine");
-    let session = engine
-        .open_session()
+        .expect("open branch-delete benchmark lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open branch-delete benchmark workspace");
     session
@@ -282,11 +285,12 @@ async fn delete_bench_branch<StorageImpl>(storage: &StorageImpl)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open branch-delete benchmark engine");
-    let session = engine
-        .open_session()
+        .expect("open branch-delete benchmark lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open branch-delete benchmark workspace");
     session

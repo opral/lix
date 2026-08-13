@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
     ReadOptions, ScanCursor, Storage, StorageError, StorageRead, WriteOptions,
 };
+use lix::{engine::Engine, session::SessionContext};
 
 #[derive(Clone, Default)]
 struct CountingStorage {
@@ -104,10 +104,7 @@ async fn open_session() -> (CountingStorage, SessionContext<CountingStorage>) {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
     (storage, session)
 }
 

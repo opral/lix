@@ -261,7 +261,8 @@ where
         loop {
             let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?.into_parts();
+                .await?
+                .into_parts();
             for entry in page {
                 let key = storage_codec::decode::<BranchHeadControlKey>(
                     "branch-head control key",

@@ -1947,20 +1947,19 @@ impl FileOwnerReferenceValidator {
         // lanes. This covers each direction: an untracked row pointing at a
         // tracked file, and a tracked row pointing at an untracked file.
         let other_lane = row_domain.with_untracked(!row.untracked());
-        let exists_in_other_lane = match pending_file_descriptors
-            .state_in_domain(&other_lane, file_id)
-        {
-            Some(PendingFileDescriptorState::Present) => true,
-            Some(PendingFileDescriptorState::Tombstone) => false,
-            None => {
-                self.committed_file_descriptor_exists_in_domain(
-                    input.hot_state,
-                    &other_lane,
-                    file_id,
-                )
-                .await?
-            }
-        };
+        let exists_in_other_lane =
+            match pending_file_descriptors.state_in_domain(&other_lane, file_id) {
+                Some(PendingFileDescriptorState::Present) => true,
+                Some(PendingFileDescriptorState::Tombstone) => false,
+                None => {
+                    self.committed_file_descriptor_exists_in_domain(
+                        input.hot_state,
+                        &other_lane,
+                        file_id,
+                    )
+                    .await?
+                }
+            };
         if exists_in_other_lane {
             return Err(lane_mismatched_file_owner_error(row, file_id)?);
         }
@@ -4895,10 +4894,7 @@ mod tests {
         let global_unique_row = |entity_pk: &str, slug: &str| {
             let mut row = staged_row(
                 "unique_schema",
-                Some(
-                    json!({ "id": entity_pk, "slug": slug, "title": "title" })
-                        .to_string(),
-                ),
+                Some(json!({ "id": entity_pk, "slug": slug, "title": "title" }).to_string()),
             );
             row.entity_pk = EntityPk::single(entity_pk);
             row
@@ -4912,9 +4908,10 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        let extracted = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
-            .await
-            .expect("registration plus rows of that schema should validate");
+        let extracted =
+            validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
+                .await
+                .expect("registration plus rows of that schema should validate");
 
         assert_eq!(
             extracted
@@ -4980,10 +4977,7 @@ mod tests {
         );
         row.entity_pk = EntityPk::single("entity-1");
         let staged_writes = PreparedWriteSet {
-            state_rows: prepared_rows![
-                pending_registered_schema_from_definition(schema),
-                row,
-            ],
+            state_rows: prepared_rows![pending_registered_schema_from_definition(schema), row,],
             ..empty_staged_write_set()
         };
 
@@ -4993,7 +4987,10 @@ mod tests {
                 .expect("sparse indexed row should validate");
 
         let [row] = extracted.rows.as_slice() else {
-            panic!("expected exactly one extracted row, got {:?}", extracted.rows);
+            panic!(
+                "expected exactly one extracted row, got {:?}",
+                extracted.rows
+            );
         };
         assert_eq!(
             row.columns,
@@ -5354,15 +5351,14 @@ mod tests {
             )],
         };
 
-        let error = validate_prepared_writes(
-            TransactionValidationInput::from_visible_schemas_for_tests(
+        let error =
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &hot_state,
-            ),
-        )
-        .await
-        .expect_err("an untracked row must not be owned by a tracked file");
+            ))
+            .await
+            .expect_err("an untracked row must not be owned by a tracked file");
 
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
         assert!(
@@ -7237,11 +7233,8 @@ mod tests {
         other_file.file_id = Some("01920000-0000-7000-8000-0000000000b1".into());
         let mut malformed_projection = committed.clone();
         malformed_projection.global = true;
-        let batch = MaterializedHotStateBatch::from_rows(vec![
-            committed,
-            other_file,
-            malformed_projection,
-        ]);
+        let batch =
+            MaterializedHotStateBatch::from_rows(vec![committed, other_file, malformed_projection]);
 
         assert!(indexes.tombstones_identity(batch.row(0)));
         assert!(!indexes.tombstones_identity(batch.row(1)));

@@ -1502,8 +1502,12 @@ where
         crate::filesystem::collect_gc_binary_blob_roots(&store, &controls, &retained_cas_root_ids)
             .await?;
     blob_roots.extend(
-        crate::plugin::runtime::collect_gc_wasm_blob_roots(&store, &controls, &retained_cas_root_ids)
-            .await?,
+        crate::plugin::runtime::collect_gc_wasm_blob_roots(
+            &store,
+            &controls,
+            &retained_cas_root_ids,
+        )
+        .await?,
     );
     let upload_chunks =
         crate::session::stage_reclaimable_upload_receipts(&store, writes, &blob_roots).await?;
@@ -2419,8 +2423,9 @@ mod tests {
         NormalizedJsonRef,
     };
     use crate::storage_adapter::{
-        Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
-        StorageKey, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
+        MAX_SCAN_PAGE_ROWS, Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter,
+        StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey,
+        StoragePrefix, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
         StorageWriteSet,
     };
     use crate::tracked_state::{
@@ -2447,6 +2452,48 @@ mod tests {
         resolve_pending_checkpoint_replacement, retirement_is_proven, stage_checkpoint_gc_state,
         stage_delete_recovery_ref, stage_recovery_ref_rotation,
     };
+
+    async fn space_inventory<R>(read: &R, space: StorageSpace) -> Vec<(Vec<u8>, Vec<u8>)>
+    where
+        R: crate::storage_adapter::StorageAdapterRead,
+    {
+        let range = StoragePrefix {
+            bytes: Bytes::new(),
+        }
+        .to_range()
+        .expect("valid empty test inventory prefix");
+        let mut cursor = read
+            .begin_scan(
+                space,
+                range,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    ..StorageBeginScanOptions::default()
+                },
+            )
+            .await
+            .expect("begin test inventory scan");
+        let mut inventory = Vec::new();
+        loop {
+            let (page, has_more) = cursor
+                .next_page(MAX_SCAN_PAGE_ROWS)
+                .await
+                .expect("scan complete test inventory")
+                .into_parts();
+            inventory.extend(page.into_iter().map(|entry| {
+                let value = match entry.value {
+                    crate::storage_adapter::StorageProjectedValue::KeyOnly => Vec::new(),
+                    crate::storage_adapter::StorageProjectedValue::FullValue(value) => {
+                        value.to_vec()
+                    }
+                };
+                (entry.key.0.to_vec(), value)
+            }));
+            if !has_more {
+                return inventory;
+            }
+        }
+    }
 
     #[tokio::test]
     async fn destructive_consumers_share_the_complete_tracked_control_projection() {
@@ -3288,9 +3335,9 @@ mod tests {
         R: crate::storage_adapter::StorageAdapterRead,
     {
         let wanted = change_id.as_uuid().as_bytes().to_vec();
-        crate::storage_bench::space_inventory(
+        space_inventory(
             read,
-            crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE.name,
+            crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
         )
         .await
         .into_iter()
@@ -4167,7 +4214,7 @@ mod tests {
     /// unrelated payloads.)
     #[cfg(feature = "storage-benches")]
     async fn register_payload_schema<S>(
-        session: &crate::integration::SessionContext<S>,
+        session: &crate::session::SessionContext<S>,
         schema_key: &str,
     ) where
         S: crate::storage::Storage + Clone + Send + Sync + 'static,
@@ -4498,7 +4545,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("payload census read should open");
-        crate::storage_bench::space_inventory(&read, crate::json_store::JSON_SPACE.name)
+        space_inventory(&read, crate::json_store::JSON_SPACE)
             .await
             .into_iter()
             .map(|(key, _)| {
@@ -4734,10 +4781,17 @@ mod tests {
         );
         for table in ["gc_payload_untracked_a", "gc_payload_untracked_b"] {
             let rows = session
-                .execute(&format!("SELECT value FROM {table} WHERE path = '/co'"), &[])
+                .execute(
+                    &format!("SELECT value FROM {table} WHERE path = '/co'"),
+                    &[],
+                )
                 .await
                 .expect("untracked owner should still read");
-            assert_eq!(rows.rows().len(), 1, "untracked row in '{table}' must survive");
+            assert_eq!(
+                rows.rows().len(),
+                1,
+                "untracked row in '{table}' must survive"
+            );
             let value = rows.rows()[0]
                 .get::<serde_json::Value>("value")
                 .expect("untracked owner should still carry its payload");
@@ -5540,10 +5594,7 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("repository should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         let schema = serde_json::json!({
             "x-lix-key": "gc_history_fixture",
             "x-lix-primary-key": ["/path"],
@@ -6667,7 +6718,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("generation census read should open");
-        let prefix = crate::storage_adapter::StoragePrefix {
+        let prefix = StoragePrefix {
             bytes: Bytes::from(crate::hot_state::hot_generation_scope_prefix(
                 branch_id, generation,
             )),
@@ -6677,13 +6728,13 @@ mod tests {
             &read,
             crate::hot_state::ROW_SPACE,
             prefix.to_range().expect("generation prefix should range"),
-            crate::storage_adapter::StorageBeginScanOptions::default(),
+            StorageBeginScanOptions::default(),
         )
         .await
         .expect("generation census scan should open");
         loop {
             let (page, page_has_more) = cursor
-                .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                .next_page(MAX_SCAN_PAGE_ROWS)
                 .await
                 .expect("generation census page should load")
                 .into_parts();

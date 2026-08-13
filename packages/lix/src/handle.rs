@@ -1,13 +1,17 @@
-use lix::storage::Storage;
-use lix::telemetry::TelemetrySink;
+// The hard-cut keeps a small set of crate-internal transport and profiling
+// helpers that no longer have enabled in-crate callers.
+#![cfg_attr(test, allow(dead_code))]
+
 use lix::plugin::runtime::WasmRuntime;
 use lix::plugin::runtime::WasmTransitionCounters;
+use lix::storage::Storage;
+use lix::telemetry::TelemetrySink;
 use lix::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteBatchStatement,
-    ExecuteIdempotency, ExecuteOptions, ExecuteResult, ExecuteStatementMetadata,
-    ExecutionDisposition, LixError, Memory, MergeBranchOptions, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, PreparedDmlParameterBatch,
-    RedoReceipt, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
+    ExecuteIdempotency, ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, LixError,
+    Memory, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    ObserveEvents, PreparedDmlParameterBatch, RedoReceipt, SwitchBranchOptions,
+    SwitchBranchReceipt, UndoReceipt, Value,
 };
 use std::{
     future::{Future, IntoFuture},
@@ -17,7 +21,10 @@ use std::{
 
 use crate::client_state::ClientState;
 use crate::engine::{Engine, EngineOptions};
+use crate::session::{CoherentReadBatch, ExecuteOptions};
 use crate::session::SessionContext;
+#[cfg(test)]
+use crate::transaction_types::TransactionWriteRow;
 
 /// Configures the primary session for a Lix repository.
 ///
@@ -105,12 +112,144 @@ where
     }
 }
 
-/// Clonable session handle for a Lix repository.
+/// Configures another independent session for an open Lix repository.
 ///
-/// Clones are concurrent handles to the same logical session: they share the
-/// active branch, transaction exclusion, file-view state, and close
-/// lifecycle. Use [`Lix::open_session`] when an operation needs an independent
-/// session and lifecycle.
+/// The new session starts on the current branch and inherits the current
+/// account unless [`OpenAnotherSessionBuilder::with_account`] overrides it.
+#[expect(missing_debug_implementations)]
+pub struct OpenAnotherSessionBuilder<'a, StorageImpl = Memory>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix: &'a Lix<StorageImpl>,
+    account_id: Option<String>,
+}
+
+impl<'a, StorageImpl> OpenAnotherSessionBuilder<'a, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    /// Attributes changes from the new session to `account_id`.
+    ///
+    /// This selects an existing account; it does not create one.
+    pub fn with_account(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
+    }
+}
+
+impl<'a, StorageImpl> IntoFuture for OpenAnotherSessionBuilder<'a, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    type Output = Result<Lix<StorageImpl>, LixError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        // SAFETY: the future only borrows a Send + Sync Lix handle and owns the
+        // optional account id. Storage handles satisfy the Storage Send
+        // contract; the remaining compiler limitation is caused by nested
+        // higher-ranked SQL futures.
+        Box::pin(unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                self.lix.open_another_session_inner(self.account_id).await
+            })
+        })
+    }
+}
+
+/// Configures one SQL statement execution.
+#[expect(missing_debug_implementations)]
+pub struct ExecuteBuilder<'a, StorageImpl = Memory>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix: &'a Lix<StorageImpl>,
+    sql: String,
+    params: Vec<Value>,
+    options: ExecuteOptions,
+}
+
+impl<StorageImpl> ExecuteBuilder<'_, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    /// Identifies the caller-defined origin of this execution.
+    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
+        self.options.origin_key = Some(origin_key.into());
+        self
+    }
+}
+
+impl<'a, StorageImpl> IntoFuture for ExecuteBuilder<'a, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    type Output = Result<ExecuteResult, LixError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        // SAFETY: the builder owns the SQL, parameters, and options. The only
+        // borrowed value retained across suspension is a shared reference to
+        // the Sync session; storage handles are Send by the Storage contract.
+        Box::pin(unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                self.lix
+                    .session
+                    .execute_with_options(&self.sql, &self.params, self.options)
+                    .await
+            })
+        })
+    }
+}
+
+/// Configures one atomic SQL batch execution.
+#[expect(missing_debug_implementations)]
+pub struct ExecuteBatchBuilder<'a, StorageImpl = Memory>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix: &'a Lix<StorageImpl>,
+    statements: Vec<ExecuteBatchStatement>,
+    options: ExecuteOptions,
+}
+
+impl<StorageImpl> ExecuteBatchBuilder<'_, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    /// Identifies the caller-defined origin of this batch.
+    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
+        self.options.origin_key = Some(origin_key.into());
+        self
+    }
+}
+
+impl<'a, StorageImpl> IntoFuture for ExecuteBatchBuilder<'a, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    type Output = Result<Vec<ExecuteResult>, LixError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        // SAFETY: as above, the builder owns every request value and borrows
+        // only the Sync session across suspension.
+        Box::pin(unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                self.lix
+                    .session
+                    .execute_batch_with_options(&self.statements, self.options)
+                    .await
+            })
+        })
+    }
+}
+
+/// Clonable handle for a Lix repository.
+///
+/// Clones share the active branch, transaction exclusion, file-view state,
+/// and close lifecycle.
 ///
 /// # Spawning a query onto a runtime
 ///
@@ -207,40 +346,46 @@ where
         ClientState::new(self)
     }
 
-    /// Opens an independent session on this handle's current branch.
+    /// Starts configuring another independent session for this repository.
     ///
-    /// The returned handle has independent session-local state, including its
-    /// acknowledged plugin file views and lifecycle. It deliberately clones
-    /// the existing [`Engine`] instead of constructing another engine over the
-    /// same storage, so engine-wide collaboration and runtime gates remain
-    /// shared by every session.
-    pub async fn open_session(&self) -> Result<Self, LixError> {
+    /// Await the returned builder directly, or call
+    /// [`OpenAnotherSessionBuilder::with_account`] first. The new session
+    /// starts on this handle's current branch and otherwise inherits its
+    /// account.
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), lix::LixError> {
+    /// let lix = lix::open_lix().await?;
+    /// let collaborator = lix.open_another_session().await?;
+    /// # collaborator.close().await?;
+    /// # lix.close().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn open_another_session(&self) -> OpenAnotherSessionBuilder<'_, StorageImpl> {
+        OpenAnotherSessionBuilder {
+            lix: self,
+            account_id: None,
+        }
+    }
+
+    async fn open_another_session_inner(
+        &self,
+        account_id: Option<String>,
+    ) -> Result<Self, LixError> {
         if self.session.is_closed() {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
-                "cannot open a session from a closed Lix handle",
+                "cannot open another session from a closed Lix handle",
             ));
         }
         let active_branch_id = self.active_branch_id().await?;
-        self.open_session_at(active_branch_id).await
-    }
-
-    /// Opens an independent session on `active_branch_id` using this handle's
-    /// existing engine.
-    ///
-    /// The requested branch is validated before the new handle is returned.
-    /// Branch switches update that handle and its clones in place.
-    pub async fn open_session_at(
-        &self,
-        active_branch_id: impl Into<String>,
-    ) -> Result<Self, LixError> {
-        self.open_session_at_with_account(active_branch_id, lix::ANONYMOUS_ACCOUNT_ID)
+        let active_account_id = account_id.unwrap_or_else(|| self.active_account_id().to_owned());
+        self.open_internal_session(active_branch_id, active_account_id)
             .await
     }
 
-    /// Opens an independent session on `active_branch_id` whose changes are
-    /// attributed to `active_account_id`.
-    pub async fn open_session_at_with_account(
+    pub(crate) async fn open_internal_session(
         &self,
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
@@ -260,7 +405,7 @@ where
         {
             return Err(LixError::branch_not_found(
                 active_branch_id,
-                "open_session",
+                "open_another_session",
                 "target",
             ));
         }
@@ -284,19 +429,17 @@ where
     /// transaction boundaries for each statement.
     /// While a transaction is active, call `execute()` on the transaction
     /// handle instead.
-    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        self.session.execute(sql, params).await
-    }
-
-    pub async fn execute_with_options(
-        &self,
-        sql: &str,
-        params: &[Value],
-        options: ExecuteOptions,
-    ) -> Result<ExecuteResult, LixError> {
-        self.session
-            .execute_with_options(sql, params, options)
-            .await
+    pub fn execute<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [Value],
+    ) -> ExecuteBuilder<'a, StorageImpl> {
+        ExecuteBuilder {
+            lix: self,
+            sql: sql.to_string(),
+            params: params.to_vec(),
+            options: ExecuteOptions::default(),
+        }
     }
 
     /// Classifies one SQL execution for a caller that owns its transport
@@ -305,7 +448,10 @@ where
     /// The result comes from Lix's parsed and bound statement route. It is
     /// safe for a transport to abandon [`ExecutionDisposition::CancellableRead`]
     /// work; [`ExecutionDisposition::Durable`] work must be allowed to finish.
-    pub fn execution_disposition(&self, sql: &str) -> Result<ExecutionDisposition, LixError> {
+    pub(crate) fn execution_disposition(
+        &self,
+        sql: &str,
+    ) -> Result<ExecutionDisposition, LixError> {
         self.session.execution_disposition(sql)
     }
 
@@ -314,7 +460,7 @@ where
     /// This structured path is intended for file transfer clients. It uses the
     /// engine's filesystem fast-write path and retains normal plugin and
     /// transaction behavior.
-    pub async fn upsert_file_content(
+    pub(crate) async fn upsert_file_content(
         &self,
         path: impl Into<String>,
         content: impl Into<Blob>,
@@ -326,7 +472,7 @@ where
 
     /// Sends one sequential resumable part through the same logical file
     /// upsert. The final part atomically publishes the ordinary file version.
-    pub async fn upsert_file_content_part(
+    pub(crate) async fn upsert_file_content_part(
         &self,
         upload_id: impl Into<String>,
         path: impl Into<String>,
@@ -351,7 +497,7 @@ where
     /// Each item is a full logical file path and its bytes. Paths must be
     /// unique within the batch. This direct-only API rejects exceptional
     /// layouts that its path index cannot route unambiguously.
-    pub async fn upsert_file_content_batch(
+    pub(crate) async fn upsert_file_content_batch(
         &self,
         writes: Vec<(String, Blob)>,
     ) -> Result<u64, LixError> {
@@ -362,7 +508,7 @@ where
     ///
     /// The returned `None` means the file is absent; `Some` with an empty
     /// [`Blob`] means a present empty file.
-    pub async fn read_file_content(
+    pub(crate) async fn read_file_content(
         &self,
         path: impl Into<String>,
         range: Option<std::ops::Range<u64>>,
@@ -370,8 +516,7 @@ where
         self.session.read_file_content(path.into(), range).await
     }
 
-    #[doc(hidden)]
-    pub async fn execute_with_options_and_metadata(
+    pub(crate) async fn execute_with_options_and_metadata(
         &self,
         sql: &str,
         params: &[Value],
@@ -383,8 +528,7 @@ where
             .await
     }
 
-    #[doc(hidden)]
-    pub fn execute_with_idempotency_and_options_and_metadata(
+    pub(crate) fn execute_with_idempotency_and_options_and_metadata(
         self: Arc<Self>,
         sql: String,
         params: Vec<Value>,
@@ -404,11 +548,25 @@ where
     /// Executes statements sequentially against one atomic snapshot.
     /// Pure reads share one read snapshot; batches containing writes retain
     /// transactional read-after-write and rollback semantics.
-    pub async fn execute_batch(
+    pub fn execute_batch<'a>(
+        &'a self,
+        statements: &'a [ExecuteBatchStatement],
+    ) -> ExecuteBatchBuilder<'a, StorageImpl> {
+        ExecuteBatchBuilder {
+            lix: self,
+            statements: statements.to_vec(),
+            options: ExecuteOptions::default(),
+        }
+    }
+
+    /// Executes read statements against one coherent storage snapshot and
+    /// returns the snapshot metadata required by official storage adapters.
+    #[doc(hidden)]
+    pub async fn execute_coherent_read_batch(
         &self,
-        statements: &[ExecuteBatchStatement],
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.session.execute_batch(statements).await
+        statements: &[(&str, &[Value])],
+    ) -> Result<CoherentReadBatch, LixError> {
+        self.session.execute_coherent_read_batch(statements).await
     }
 
     /// Executes one prepared DML statement shape for a rectangular parameter
@@ -416,7 +574,7 @@ where
     /// parameter row produces one result in input order. This is the public
     /// bulk-write contract used by generated/transport callers; unsupported
     /// shapes fail closed rather than degrading to per-row SQL execution.
-    pub async fn execute_prepared_dml_batch(
+    pub(crate) async fn execute_prepared_dml_batch(
         &self,
         sql: Arc<str>,
         parameter_batch: PreparedDmlParameterBatch,
@@ -426,27 +584,16 @@ where
             .await
     }
 
-    pub async fn execute_batch_with_options(
-        &self,
-        statements: &[ExecuteBatchStatement],
-        options: ExecuteOptions,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.session
-            .execute_batch_with_options(statements, options)
-            .await
-    }
-
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
-    pub fn execute_batch_disposition(
+    pub(crate) fn execute_batch_disposition(
         &self,
         statements: &[ExecuteBatchStatement],
     ) -> Result<ExecutionDisposition, LixError> {
         self.session.execute_batch_disposition(statements)
     }
 
-    #[doc(hidden)]
-    pub async fn execute_batch_with_options_and_metadata(
+    pub(crate) async fn execute_batch_with_options_and_metadata(
         &self,
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
@@ -457,8 +604,7 @@ where
             .await
     }
 
-    #[doc(hidden)]
-    pub fn execute_batch_with_idempotency_and_options_and_metadata(
+    pub(crate) fn execute_batch_with_idempotency_and_options_and_metadata(
         self: Arc<Self>,
         statements: Vec<ExecuteBatchStatement>,
         options: ExecuteOptions,
@@ -497,13 +643,17 @@ where
 
     /// Creates an active global account if it does not exist. Existing mutable
     /// account fields are deliberately left unchanged.
-    pub async fn ensure_account(&self, id: &str, name: &str, kind: &str) -> Result<(), LixError> {
+    pub(crate) async fn ensure_account(
+        &self,
+        id: &str,
+        name: &str,
+        kind: &str,
+    ) -> Result<(), LixError> {
         let branch_id = Box::pin(self.active_branch_id()).await?;
-        let system = Box::pin(
-            self.open_session_at_with_account(branch_id, lix::SYSTEM_ACCOUNT_ID),
-        )
-        .await?;
-        Box::pin(system.execute(
+        let system =
+            Box::pin(self.open_internal_session(branch_id, lix::SYSTEM_ACCOUNT_ID)).await?;
+        system
+            .execute(
                 "INSERT INTO lix_account_by_branch \
                  (id, name, kind, status, lixcol_branch_id, lixcol_global, lixcol_untracked) \
                  VALUES ($1, $2, $3, 'active', $4, true, false) \
@@ -515,8 +665,8 @@ where
                     Value::Text(kind.to_string()),
                     Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
                 ],
-            ))
-        .await?;
+            )
+            .await?;
         Box::pin(system.close()).await
     }
 
@@ -588,14 +738,12 @@ where
 
     /// Returns engine-local transition counters for profiling and
     /// production invariant monitoring.
-    #[doc(hidden)]
-    pub fn plugin_transition_counters(&self) -> WasmTransitionCounters {
+    pub(crate) fn plugin_transition_counters(&self) -> WasmTransitionCounters {
         self.engine.plugin_transition_counters()
     }
 
     /// Starts a new engine-local transition measurement window.
-    #[doc(hidden)]
-    pub fn reset_plugin_transition_counters(&self) {
+    pub(crate) fn reset_plugin_transition_counters(&self) {
         self.engine.reset_plugin_transition_counters();
     }
 }
@@ -608,6 +756,46 @@ where
     inner: lix::SessionTransaction<StorageImpl>,
 }
 
+/// Configures one SQL statement inside an explicit transaction.
+#[expect(missing_debug_implementations)]
+pub struct TransactionExecuteBuilder<'a, StorageImpl = Memory>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    transaction: &'a mut LixTransaction<StorageImpl>,
+    sql: &'a str,
+    params: &'a [Value],
+    options: ExecuteOptions,
+}
+
+impl<StorageImpl> TransactionExecuteBuilder<'_, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    /// Identifies the caller-defined origin of this execution.
+    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
+        self.options.origin_key = Some(origin_key.into());
+        self
+    }
+}
+
+impl<'a, StorageImpl> IntoFuture for TransactionExecuteBuilder<'a, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    type Output = Result<ExecuteResult, LixError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            self.transaction
+                .inner
+                .execute_with_options(self.sql.to_owned(), self.params.to_vec(), self.options)
+                .await
+        })
+    }
+}
+
 impl<StorageImpl> LixTransaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -616,17 +804,22 @@ where
     ///
     /// Writes are staged until `commit()`. Reads use the transaction overlay,
     /// so they can observe writes staged by earlier calls on this handle.
-    pub async fn execute(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<ExecuteResult, LixError> {
-        self.inner.execute(sql, params).await
+    pub fn execute<'a>(
+        &'a mut self,
+        sql: &'a str,
+        params: &'a [Value],
+    ) -> TransactionExecuteBuilder<'a, StorageImpl> {
+        TransactionExecuteBuilder {
+            transaction: self,
+            sql,
+            params,
+            options: ExecuteOptions::default(),
+        }
     }
 
     /// Executes one prepared DML page atomically inside this transaction.
     /// Shape changes and dependency barriers remain explicit `execute` calls.
-    pub async fn execute_prepared_dml_batch(
+    pub(crate) async fn execute_prepared_dml_batch(
         &mut self,
         sql: Arc<str>,
         parameter_batch: PreparedDmlParameterBatch,
@@ -636,13 +829,12 @@ where
             .await
     }
 
-    pub fn execute_with_options(
+    #[cfg(test)]
+    pub(crate) async fn stage_test_row(
         &mut self,
-        sql: String,
-        params: Vec<Value>,
-        options: ExecuteOptions,
-    ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + '_ {
-        self.inner.execute_with_options(sql, params, options)
+        row: TransactionWriteRow,
+    ) -> Result<(), LixError> {
+        self.inner.stage_test_row(row).await
     }
 
     pub async fn commit(self) -> Result<(), LixError> {
@@ -680,22 +872,6 @@ where
     }
 }
 
-/// Opens and initializes an engine for an integration that wraps a storage
-/// adapter with additional host behavior.
-///
-/// Most callers should use [`open_lix`] instead. This exists for adapters such
-/// as `lix-storage-filesystem`, which need the engine before they can expose
-/// their storage implementation.
-pub async fn open_storage_engine<StorageImpl>(
-    storage: StorageImpl,
-    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
-) -> Result<Engine<StorageImpl>, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    open_or_initialize_engine(storage, wasm_runtime, None, None).await
-}
-
 async fn new_engine<StorageImpl>(
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
@@ -730,9 +906,12 @@ mod tests {
     #[tokio::test]
     async fn sessions_share_one_engine_but_have_independent_lifecycles() {
         let root = open_lix().await.expect("open root Lix");
-        let first = root.open_session().await.expect("open first child session");
+        let first = root
+            .open_another_session()
+            .await
+            .expect("open first child session");
         let second = root
-            .open_session()
+            .open_another_session()
             .await
             .expect("open second child session");
 
@@ -766,7 +945,7 @@ mod tests {
             .expect("create draft");
 
         let session = root
-            .open_session_at(main_branch_id.clone())
+            .open_another_session()
             .await
             .expect("open main session");
         let session_clone = session.clone();
@@ -788,9 +967,12 @@ mod tests {
         );
         assert_eq!(root.active_branch_id().await.unwrap(), main_branch_id);
 
-        let Err(error) = root.open_session_at("missing-branch").await else {
-            panic!("missing branch must not open");
-        };
+        let error = session
+            .switch_branch(SwitchBranchOptions {
+                branch_id: "01920000-0000-7000-8000-000000000599".to_string(),
+            })
+            .await
+            .expect_err("missing branch must not open");
         assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
     }
 
@@ -818,7 +1000,7 @@ mod tests {
             .await
             .expect("switch primary session");
         let secondary = primary
-            .open_session()
+            .open_another_session()
             .await
             .expect("open secondary session");
         secondary
@@ -888,13 +1070,16 @@ mod tests {
             .expect("provision unused account");
 
         let author = root
-            .open_session_at_with_account(
-                root.active_branch_id().await.expect("active branch"),
-                AUTHOR_ID,
-            )
+            .open_another_session()
+            .with_account(AUTHOR_ID)
             .await
             .expect("open attributed session");
         assert_eq!(author.active_account_id(), AUTHOR_ID);
+        let inherited = author
+            .open_another_session()
+            .await
+            .expect("open session inheriting the author");
+        assert_eq!(inherited.active_account_id(), AUTHOR_ID);
         let active = author
             .execute("SELECT lix_active_account_id() AS account_id", &[])
             .await
@@ -928,10 +1113,8 @@ mod tests {
         );
 
         let system = root
-            .open_session_at_with_account(
-                root.active_branch_id().await.expect("active branch"),
-                lix::SYSTEM_ACCOUNT_ID,
-            )
+            .open_another_session()
+            .with_account(lix::SYSTEM_ACCOUNT_ID)
             .await
             .expect("open system session");
         system
@@ -958,10 +1141,8 @@ mod tests {
         );
 
         let unused = root
-            .open_session_at_with_account(
-                root.active_branch_id().await.expect("active branch"),
-                UNUSED_ID,
-            )
+            .open_another_session()
+            .with_account(UNUSED_ID)
             .await
             .expect("open unused account session");
 

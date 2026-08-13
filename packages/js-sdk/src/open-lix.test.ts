@@ -708,7 +708,10 @@ test("fs storage imports existing files into a filtered filesystem", async () =>
 });
 
 test("importPaths validates paths and requires an opened storage", async () => {
-	const unopened = new LocalFilesystem({ path: tempFsDir(), syncAllFiles: false });
+	const unopened = new LocalFilesystem({
+		path: tempFsDir(),
+		syncAllFiles: false,
+	});
 	await expect(unopened.importPaths(["note.md"])).rejects.toThrow(
 		"opened with openLix()",
 	);

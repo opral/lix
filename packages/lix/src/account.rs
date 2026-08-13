@@ -153,10 +153,8 @@ mod tests {
         );
 
         let session = lix
-            .open_session_at_with_account(
-                lix.active_branch_id().await.expect("active branch"),
-                AUTHOR_ID,
-            )
+            .open_another_session()
+            .with_account(AUTHOR_ID)
             .await
             .expect("attributed session should open");
         session
@@ -185,10 +183,8 @@ mod tests {
         );
 
         let system = lix
-            .open_session_at_with_account(
-                lix.active_branch_id().await.expect("active branch"),
-                crate::SYSTEM_ACCOUNT_ID,
-            )
+            .open_another_session()
+            .with_account(crate::SYSTEM_ACCOUNT_ID)
             .await
             .expect("system session should open");
         system

@@ -1,8 +1,3 @@
-#![recursion_limit = "256"]
-
-#[macro_use]
-mod support;
-
 mod branching;
 mod checkpoint_gc;
 mod code_structure;
@@ -21,6 +16,7 @@ mod json_pointer_crud_storage;
 #[cfg(feature = "storage-benches")]
 mod lix_file_returning_route;
 mod merge_fuzz;
+mod mutation_identity;
 mod observe;
 mod observe_mutation_revision;
 mod physical_plan_cache;

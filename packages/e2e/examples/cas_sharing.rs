@@ -33,12 +33,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, CoreProjection, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, ReadOptions,
     SpaceId, Storage, StorageRead,
 };
 use lix::{CreateBranchOptions, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{
     SlateDB, SlateDBIoCounters, SlateDBIoSnapshot, SlateDBObjectStoreOptions,
@@ -333,8 +333,12 @@ async fn measure_branches(
     fixture.flush().await;
     let after_base = fixture.layout().await;
 
-    fixture.write_on_branch(BRANCH_A_ID, "sharing-branch-a", FILE_PATH, a).await;
-    fixture.write_on_branch(BRANCH_B_ID, "sharing-branch-b", FILE_PATH, b).await;
+    fixture
+        .write_on_branch(BRANCH_A_ID, "sharing-branch-a", FILE_PATH, a)
+        .await;
+    fixture
+        .write_on_branch(BRANCH_B_ID, "sharing-branch-b", FILE_PATH, b)
+        .await;
     fixture.flush().await;
     let after_branches = fixture.layout().await;
 
@@ -357,9 +361,9 @@ struct Layout {
     presence_rows: u64,
 }
 
-struct BackendFixture<S: Storage + 'static> {
-    engine: Engine<S>,
-    session: SessionContext<S>,
+struct BackendFixture<S: Storage + Clone + Send + Sync + 'static> {
+    lix: Lix<S>,
+    session: Lix<S>,
     storage: S,
     _temp_dir: tempfile::TempDir,
     root: PathBuf,
@@ -371,18 +375,16 @@ where
 {
     async fn create(storage: S, temp_dir: tempfile::TempDir) -> Self {
         let root = temp_dir.path().to_owned();
-        let receipt = Engine::initialize(storage.clone())
+        let lix = open_lix()
+            .with_storage(storage.clone())
             .await
-            .expect("initialize cas sharing engine");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("open cas sharing engine");
-        let session = engine
-            .open_session_at(receipt.main_branch_id)
+            .expect("open cas sharing lix");
+        let session = lix
+            .open_another_session()
             .await
             .expect("open cas sharing session");
         Self {
-            engine,
+            lix,
             session,
             storage,
             _temp_dir: temp_dir,
@@ -419,10 +421,16 @@ where
             .await
             .expect("create cas sharing branch");
         let session = self
-            .engine
-            .open_session_at(branch.id)
+            .lix
+            .open_another_session()
             .await
             .expect("open cas sharing branch session");
+        session
+            .switch_branch(lix::SwitchBranchOptions {
+                branch_id: (branch.id).to_string(),
+            })
+            .await
+            .expect("switch session branch");
         let result = session
             .execute(
                 UPSERT_SQL,
@@ -477,10 +485,9 @@ impl Fixture {
                     Some(profile) => {
                         fs::create_dir_all(&database_path)
                             .expect("create cas sharing SlateDB directory");
-                        let local = object_store::local::LocalFileSystem::new_with_prefix(
-                            &database_path,
-                        )
-                        .expect("open cas sharing local object store");
+                        let local =
+                            object_store::local::LocalFileSystem::new_with_prefix(&database_path)
+                                .expect("open cas sharing local object store");
                         let remote: Arc<dyn object_store::ObjectStore> =
                             Arc::new(RemoteObjectStore::new(Arc::new(local), profile));
                         SlateDB::open_object_store_with_options_and_io_counters(
@@ -550,9 +557,9 @@ async fn space_accounting<S>(storage: &S, space: SpaceId) -> (u64, u64)
 where
     S: Storage,
 {
-    // A space id has exactly one value semantics and the engine registry is
+    // A space id has exactly one value semantics and Lix registry is
     // where it is declared; guessing it here scans a different physical
-    // location than the engine wrote.
+    // location than Lix wrote.
     let space = lix::storage_bench::storage_space_by_id(space.0);
     let read = storage
         .begin_read(ReadOptions::default())
@@ -578,7 +585,8 @@ where
         let (page, page_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan accounting space").into_parts();
+            .expect("scan accounting space")
+            .into_parts();
         rows += page.len() as u64;
         value_bytes += page
             .iter()

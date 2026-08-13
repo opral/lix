@@ -296,11 +296,9 @@ impl EntitySpec {
         // predicate twice and — because a non-empty `row_filters` disqualifies
         // every direct route — forces the point read onto the generic
         // visibility scan.
-        let row_filters =
-            EntityRowFilterAnalyzer::new(&self.spec).analyze_filters(&exact_identity_residual(
-                &EntityPrimaryKeyFilterAnalyzer::new(&self.spec),
-                filters,
-            ))?;
+        let row_filters = EntityRowFilterAnalyzer::new(&self.spec).analyze_filters(
+            &exact_identity_residual(&EntityPrimaryKeyFilterAnalyzer::new(&self.spec), filters),
+        )?;
         let mut request = entity_hot_state_scan_request(
             &self.spec.schema_key,
             self.branch_binding.active_branch_id(),
@@ -2094,9 +2092,9 @@ impl ExactFileIdFilterAnalyzer {
             Expr::BinaryExpr(binary_expr) => {
                 Ok(file_id_from_binary_filter(binary_expr).map(|value| BTreeSet::from([value])))
             }
-            Expr::InList(in_list) => {
-                Ok(file_ids_from_in_list_filter(in_list).map(|values| values.into_iter().collect()))
-            }
+            Expr::InList(in_list) => Ok(
+                file_ids_from_in_list_filter(in_list).map(|values| values.into_iter().collect())
+            ),
             _ => Ok(None),
         }
     }
@@ -3916,8 +3914,8 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk as TestEntityPk;
     use crate::hot_state::{
-        HotStateFilter, HotStateProjection, HotStateReader, HotStateRowFilter,
-        HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateRow,
+        HotStateFilter, HotStateProjection, HotStateReader, HotStateRowFilter, HotStateScanRequest,
+        MaterializedHotStateBatch, MaterializedHotStateRow,
     };
     use crate::sql2::catalog::{
         EntityColumnType, EntitySurfaceShape, derive_entity_surface_spec_from_schema,
@@ -4036,14 +4034,9 @@ mod tests {
             &mut self,
             request: &crate::hot_state::HotStateExactBatchRequest,
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            Ok(
-                crate::hot_state::MaterializedHotStateExactBatch::from_rows(vec![
-                    None;
-                    request
-                        .rows
-                        .len()
-                ]),
-            )
+            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
+                vec![None; request.rows.len()],
+            ))
         }
 
         async fn load_branch_head(
@@ -4195,9 +4188,7 @@ mod tests {
             .constraints
             .push(crate::hot_state::ScanConstraint {
                 field: crate::hot_state::ScanField::EntityPk,
-                operator: crate::hot_state::ScanOperator::Eq(crate::Value::Text(
-                    "row".to_string(),
-                )),
+                operator: crate::hot_state::ScanOperator::Eq(crate::Value::Text("row".to_string())),
             });
         assert!(!super::direct_entity_batch_eligible(
             &payload_schema,

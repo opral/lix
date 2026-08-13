@@ -49,8 +49,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate Cargo configuration
-        run: cargo metadata --format-version 1 --no-deps
+      - name: Validate Cargo configuration and publish surface
+        run: node scripts/validate-cargo-publish-surface.mjs
 
   cargo:
     name: Cargo ${{ matrix.name }}

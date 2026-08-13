@@ -22,12 +22,12 @@
 use std::time::{Duration, Instant};
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_bench::{
     RootReplayCostBucket, root_replay_trace_enabled, take_root_replay_accounting,
     take_root_replay_cost_attribution,
 };
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 #[tokio::main(flavor = "current_thread")]
@@ -52,14 +52,15 @@ async fn main() {
 
     let directory = tempfile::tempdir().expect("create RocksDB directory");
     let storage = RocksDB::open(directory.path()).expect("open RocksDB");
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize repository");
-    let engine = Engine::new(storage.clone()).await.expect("open engine");
-    let session = engine
-        .open_session()
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open workspace");
+        .expect("open lix");
+    let session = lix.open_another_session().await.expect("open workspace");
     register_schema(&session).await;
 
     // Discard setup accounting so the reported numbers cover only the measured
@@ -183,7 +184,7 @@ fn top_latency_indices(latencies: &[Duration], count: usize) -> Vec<(usize, Dura
     indexed
 }
 
-async fn commit_batch<S>(session: &SessionContext<S>, batch: usize, rows: usize)
+async fn commit_batch<S>(session: &Lix<S>, batch: usize, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -203,7 +204,7 @@ where
     transaction.commit().await.expect("commit batch");
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

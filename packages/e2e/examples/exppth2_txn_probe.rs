@@ -11,6 +11,17 @@
 //! 3. `by_path_per_stmt`-- `UPDATE ... WHERE path = $2` (DataFusion), the arm
 //!                         measured flat in repository size. In-run control.
 //!
+//! A fourth arm, `native_per_stmt`, drove the native fast-write path
+//! (`Lix::upsert_file_content`) as a no-SQL reference. It was removed when the
+//! Rust SDK public API hard cut (#1438/#1442) made that method `pub(crate)`:
+//! **the native reference is no longer obtainable from an external test crate**
+//! such as `lix_e2e`, and re-routing it through SQL would just duplicate
+//! `by_path_per_stmt`. Do not go looking for it. The three-path comparison it
+//! existed for is already recorded -- native 251 us, sql_by_id 322,
+//! sql_by_path 444 -- as is the by-id slope it anchored, which collapsed from
+//! 0.2025 to 0.00207 us/file after the fix. The surviving arms carry the
+//! residual slope work.
+//!
 //! Discriminating prediction: if the cause is a revision bump per COMMIT
 //! busting a revision-keyed cache, arm 2 is flat in file count while arm 1
 //! grows. If arm 2 grows too, the cause is elsewhere.
@@ -36,12 +47,7 @@ async fn main() {
         return;
     }
 
-    let all_arms = [
-        "by_id_per_stmt",
-        "by_id_one_txn",
-        "by_path_per_stmt",
-        "native_per_stmt",
-    ];
+    let all_arms = ["by_id_per_stmt", "by_id_one_txn", "by_path_per_stmt"];
     // Only arms named here run, so a control can be re-measured without paying
     // for every fixture again.
     let selected = std::env::var("EXPPTH2_ARMS").unwrap_or_default();
@@ -190,10 +196,6 @@ entries_decoded={decoded} entries_matched={matched} decoded_per_update={:.1}",
     println!("EXPPTH2_PROFILE_DONE");
 }
 
-fn crate_blob(bytes: &[u8]) -> lix::Blob {
-    lix::Blob::from(bytes.to_vec())
-}
-
 async fn run_arm(arm: &str, files: usize, updates: usize, payload: usize) -> f64 {
     let root = tempfile::Builder::new()
         .prefix("expPTH2-")
@@ -280,16 +282,6 @@ async fn run_arm(arm: &str, files: usize, updates: usize, payload: usize) -> f64
                 )
                 .await
                 .expect("update by path");
-            }
-        }
-        "native_per_stmt" => {
-            for index in 0..updates {
-                lix.upsert_file_content(
-                    format!("/exppth2-{index:06}.bin"),
-                    crate_blob(&updated),
-                )
-                .await
-                .expect("native upsert");
             }
         }
         other => panic!("unknown arm {other}"),
