@@ -754,7 +754,14 @@ mod tests {
         use crate::storage_adapter::Memory;
         use serde_json::json;
 
-        const ROWS: usize = 250;
+        // The dense columnar lane is only taken by a *certified parameter
+        // batch* of at least `TYPED_CERTIFIED_INSERT_MIN_ROWS` (32,768) rows;
+        // below that `certified_entity_insert_parameter_batch` falls to the raw
+        // lane, which carries no encoded row groups, and
+        // `try_stage_lossless_columnar_mutations` then sees no dense write set.
+        // A smaller fixture silently produces no columnar commit at all, which
+        // is why arm A asserts engagement rather than assuming it.
+        const ROWS: usize = 32 * 1024;
 
         async fn run(schema_key: &str, uuid_pk: bool) -> (u64, u64, usize) {
             let storage = Memory::new();
@@ -786,31 +793,29 @@ mod tests {
                 .await
                 .expect("schema should register");
 
-            // One dense multi-row INSERT: the shape the lossless columnar
-            // staging path is written for.
-            let values = (0..ROWS)
-                .map(|index| {
-                    let id = if uuid_pk {
-                        uuid::Uuid::from_u128(index as u128 + 1).to_string()
-                    } else {
-                        format!("row-{index}")
-                    };
-                    // Distinct per row on purpose. `derive_entity_row_groups`
-                    // refuses the columnar layout when a non-key string column
-                    // has between 2 and 64 distinct values -- it clusters
-                    // instead -- so a two-valued flag column here silently
-                    // produces no columnar commit at all.
-                    format!("('{id}', 'loc-{index}')")
+            let sql = format!("INSERT INTO {schema_key} (id, locale) VALUES ($1, $2)");
+            let statements = (0..ROWS)
+                .map(|index| crate::session::ExecuteBatchStatement {
+                    label: None,
+                    sql: sql.clone(),
+                    params: vec![
+                        crate::Value::Text(if uuid_pk {
+                            uuid::Uuid::from_u128(index as u128 + 1).to_string()
+                        } else {
+                            format!("row-{index:07}")
+                        }),
+                        // Distinct per row: `derive_entity_row_groups` refuses
+                        // the columnar layout when a non-key string column has
+                        // 2..=64 distinct values, so a flag column here would
+                        // also silently defeat the fixture.
+                        crate::Value::Text(format!("loc-{index:07}")),
+                    ],
                 })
-                .collect::<Vec<_>>()
-                .join(",");
+                .collect::<Vec<_>>();
             session
-                .execute(
-                    &format!("INSERT INTO {schema_key} (id, locale) VALUES {values}"),
-                    &[],
-                )
+                .execute_batch(&statements)
                 .await
-                .expect("rows should insert");
+                .expect("the certified parameter batch should insert");
 
             // Rotate onto a branch so the read is served from a root current
             // base and must fetch payloads from the owning commit delta.
@@ -832,7 +837,7 @@ mod tests {
             let _ = crate::storage_bench::take_tracked_key_allocation_census();
             let rows = session
                 .execute(
-                    &format!("SELECT id FROM {schema_key} WHERE locale = 'loc-0'"),
+                    &format!("SELECT id FROM {schema_key} WHERE locale = 'loc-0000000'"),
                     &[],
                 )
                 .await
