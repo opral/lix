@@ -102,8 +102,18 @@ pub(crate) use storage::{
 pub(crate) use storage::{
     RetainedPhysicalState, collect_current_state_part_json_refs,
     collect_local_commit_delta_json_refs, load_native_current_state_part_owners,
-    stage_delete_commit_state_manifest_for_gc, stage_retire_commit_physical_state,
+    stage_retire_commit_physical_state,
 };
+// Manufacturing a repository swept by the code that shipped before the
+// history-retention fix is the only caller: `session::gc` needs to delete one
+// commit's physical delta the way that sweep did. Deliberately test-gated
+// rather than exported outright -- production reclaim reaches this through
+// `stage_retire_commit_physical_state`, and a second, unconditional route to
+// deleting a manifest is a footgun that would outlive the fixture it was added
+// for. This attribute belongs to the `use` on the next line and nothing else;
+// do not insert between them.
+#[cfg(test)]
+pub(crate) use storage::stage_delete_commit_state_manifest_for_gc;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::decode_change_locator;
 // The storage-space constants are what the space registry
