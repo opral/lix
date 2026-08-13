@@ -186,7 +186,7 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
 
 fn plugin_manifest_schema() -> &'static JsonValue {
     PLUGIN_MANIFEST_SCHEMA.get_or_init(|| {
-        let raw = include_str!("./plugin_manifest.json");
+        let raw = include_str!("plugin_manifest.json");
         serde_json::from_str(raw).expect("plugin_manifest.json must be valid JSON")
     })
 }

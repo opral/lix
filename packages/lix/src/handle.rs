@@ -683,7 +683,7 @@ where
     #[cfg(feature = "default_wasm_runtime")]
     let wasm_runtime = match wasm_runtime {
         Some(wasm_runtime) => Some(wasm_runtime),
-        None => Some(crate::default_wasm_runtime::runtime()?),
+        None => Some(crate::plugin::runtime::default::runtime()?),
     };
     let mut options = EngineOptions::new();
     if let Some(wasm_runtime) = wasm_runtime {

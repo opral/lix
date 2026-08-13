@@ -887,19 +887,19 @@ fn certified_entity_batch_page_key(content_key: &[u8], page_index: u32) -> Stora
 }
 
 fn certified_schema_row_page_local_ref_range(page: &[u8]) -> Result<(u32, u32), LixError> {
-    let page = crate::plugin_wire::Page::decode(page)
+    let page = crate::plugin::wire::Page::decode(page)
         .map_err(|error| head_value_error(format!("invalid certified entity page: {error:?}")))?;
     let section = page.section().map_err(|error| {
         head_value_error(format!("invalid certified entity-page section: {error:?}"))
     })?;
-    if section.representation != crate::plugin_wire::Representation::SchemaRows
-        || section.operation != crate::plugin_wire::Operation::Create
+    if section.representation != crate::plugin::wire::Representation::SchemaRows
+        || section.operation != crate::plugin::wire::Operation::Create
     {
         return Err(head_value_error(
             "certified schema-row entity page must contain created rows",
         ));
     }
-    let layout = crate::plugin_layout::CompiledLayout::parse(section.layout)
+    let layout = crate::plugin::runtime::layout::CompiledLayout::parse(section.layout)
         .map_err(|error| head_value_error(format!("invalid schema-row layout: {error}")))?;
     let mut rows = layout
         .rows(section.payload, section.record_count)
@@ -1699,20 +1699,20 @@ fn decode_certified_entity_batch_rows(
             }
             continue;
         }
-        let entity_page = crate::plugin_wire::Page::decode(page).map_err(|error| {
+        let entity_page = crate::plugin::wire::Page::decode(page).map_err(|error| {
             head_value_error(format!("invalid certified entity page: {error:?}"))
         })?;
         let section = entity_page.section().map_err(|error| {
             head_value_error(format!("invalid certified entity-page section: {error:?}"))
         })?;
-        if section.representation != crate::plugin_wire::Representation::SchemaRows
-            || section.operation != crate::plugin_wire::Operation::Create
+        if section.representation != crate::plugin::wire::Representation::SchemaRows
+            || section.operation != crate::plugin::wire::Operation::Create
         {
             return Err(head_value_error(
                 "certified schema-row entity page must contain created rows",
             ));
         }
-        let layout = crate::plugin_layout::CompiledLayout::parse(section.layout)
+        let layout = crate::plugin::runtime::layout::CompiledLayout::parse(section.layout)
             .map_err(|error| head_value_error(format!("invalid schema-row layout: {error}")))?;
         let mut rows = layout
             .rows(section.payload, section.record_count)
@@ -1737,7 +1737,7 @@ fn decode_certified_entity_batch_rows(
                 .map_err(|error| head_value_error(error.to_string()))?;
             let entity_pk = EntityPk::uuid_from_bytes(id);
             let snapshot = if needs_snapshot {
-                let json = crate::plugin_layout::insert_generated_id(
+                let json = crate::plugin::runtime::layout::insert_generated_id(
                     &rendered_snapshots[rendered.snapshot],
                     layout.generated_id_path(),
                     &uuid::Uuid::from_bytes(id).to_string(),
@@ -14441,9 +14441,9 @@ mod tests {
         page.extend_from_slice(&1_u16.to_le_bytes());
         page.extend_from_slice(&5_u32.to_le_bytes());
         page.extend_from_slice(b"value");
-        let page = crate::plugin_wire::encode_single_section(
-            crate::plugin_wire::Representation::SchemaRows,
-            crate::plugin_wire::Operation::Create,
+        let page = crate::plugin::wire::encode_single_section(
+            crate::plugin::wire::Representation::SchemaRows,
+            crate::plugin::wire::Operation::Create,
             SCHEMA_KEY,
             br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
             1,
@@ -14631,9 +14631,9 @@ mod tests {
         page.extend_from_slice(&1_u16.to_le_bytes());
         page.extend_from_slice(&5_u32.to_le_bytes());
         page.extend_from_slice(b"value");
-        let page = crate::plugin_wire::encode_single_section(
-            crate::plugin_wire::Representation::SchemaRows,
-            crate::plugin_wire::Operation::Create,
+        let page = crate::plugin::wire::encode_single_section(
+            crate::plugin::wire::Representation::SchemaRows,
+            crate::plugin::wire::Operation::Create,
             schema_key,
             br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
             1,

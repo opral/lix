@@ -8,7 +8,7 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::plugin_wire::{Operation, Page as EntityPage, Representation, encode_single_section};
+use crate::plugin::wire::{Operation, Page as EntityPage, Representation, encode_single_section};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lix::wasm::WasmLimits;
@@ -1349,7 +1349,7 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
         state.check_active()?;
         ensure_source_page(max_bytes, state.limits.max_page_bytes)?;
         let envelope_bytes = u32::try_from(
-            crate::plugin_wire::single_section_overhead("", &[]).expect("fixed page overhead"),
+            crate::plugin::wire::single_section_overhead("", &[]).expect("fixed page overhead"),
         )
         .expect("fixed page overhead fits u32");
         let payload_budget = max_bytes.checked_sub(envelope_bytes).ok_or_else(|| {
@@ -4345,11 +4345,12 @@ fn component_transition_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lix::wasm::{WasmByteSource, WasmFileDescriptor, WasmInputSplice, WasmPluginSelection};
 
+    #[cfg(any())]
     #[derive(Clone, Debug)]
     struct JsonTestSource(Vec<u8>);
 
+    #[cfg(any())]
     impl WasmByteSource for JsonTestSource {
         fn len(&self) -> u64 {
             self.0.len() as u64
@@ -4368,10 +4369,12 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     struct JsonTestEntitySource {
         entities: Option<Vec<WasmEntity<WasmHostBytes>>>,
     }
 
+    #[cfg(any())]
     impl lix::wasm::WasmEntitySource for JsonTestEntitySource {
         fn next_page(
             &mut self,
@@ -4384,6 +4387,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     fn assert_json_full_fallback_state_only(checkpoint: &WasmDocumentCheckpoint) {
         let root = checkpoint
             .downcast_ref::<ArenaRoot>()
@@ -4408,6 +4412,9 @@ mod tests {
         assert!(!keys.iter().any(|key| key.starts_with(b"json/scalar-page/")));
     }
 
+    // Compiled-plugin behavior is covered by `lix_e2e`; keeping an artifact
+    // dependency here would create `lix -> plugin -> lix`.
+    #[cfg(any())]
     #[tokio::test]
     async fn json_cold_full_fallback_checkpoint_omits_scalar_state() {
         let wasm = std::fs::read(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"))

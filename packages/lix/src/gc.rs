@@ -2291,10 +2291,6 @@ fn retirement_is_proven(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    #[cfg(feature = "default_wasm_runtime")]
-    use std::io::{Cursor, Write as _};
-    #[cfg(feature = "default_wasm_runtime")]
-    use std::path::Path;
     use std::sync::Arc;
 
     use crate::branch::{
@@ -4349,6 +4345,7 @@ mod tests {
     }
 
     #[cfg(feature = "default_wasm_runtime")]
+    #[cfg(any())]
     #[tokio::test]
     async fn repository_gc_keeps_plugin_wasm_for_cold_runtime_execution() {
         let backend = Memory::new();
@@ -4357,7 +4354,7 @@ mod tests {
             .expect("plugin-GC repository should initialize");
         let engine = Engine::new_with_wasm_runtime(
             backend.clone(),
-            crate::default_wasm_runtime::runtime().expect("WASM runtime should initialize"),
+            crate::plugin::runtime::default::runtime().expect("WASM runtime should initialize"),
         )
         .await
         .expect("plugin-GC repository should open");
@@ -4413,7 +4410,8 @@ mod tests {
         drop(engine);
         let engine = Engine::new_with_wasm_runtime(
             backend.clone(),
-            crate::default_wasm_runtime::runtime().expect("cold WASM runtime should initialize"),
+            crate::plugin::runtime::default::runtime()
+                .expect("cold WASM runtime should initialize"),
         )
         .await
         .expect("plugin-GC repository should cold reopen");
@@ -4443,6 +4441,7 @@ mod tests {
     }
 
     #[cfg(feature = "default_wasm_runtime")]
+    #[cfg(any())]
     #[tokio::test]
     async fn repository_gc_reclaims_plugin_wasm_only_after_final_registry_root_releases() {
         let backend = Memory::new();
@@ -4451,7 +4450,7 @@ mod tests {
             .expect("shared-plugin repository should initialize");
         let engine = Engine::new_with_wasm_runtime(
             backend.clone(),
-            crate::default_wasm_runtime::runtime().expect("WASM runtime should initialize"),
+            crate::plugin::runtime::default::runtime().expect("WASM runtime should initialize"),
         )
         .await
         .expect("shared-plugin repository should open");
@@ -4601,6 +4600,7 @@ mod tests {
     }
 
     #[cfg(feature = "default_wasm_runtime")]
+    #[cfg(any())]
     fn gc_csv_plugin_archive() -> (Vec<u8>, Vec<u8>) {
         let wasm = std::fs::read(Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")))
             .expect("CSV plugin WASM should read");

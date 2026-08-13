@@ -33,6 +33,9 @@ tpch = ["dep:duckdb", "dep:tpchgen"]
 # opened without an explicit runtime a Wasmtime runtime, which would change what
 # every benchmark in this crate measures.
 sdk-tests = ["lix/default_wasm_runtime"]
+# Compiled-plugin qualifications that need the engine's maintenance inspection
+# hooks but no external storage adapter.
+plugin-tests = ["lix/default_wasm_runtime", "lix/storage-benches"]
 # Opt-in profiling build that routes Rust allocations through libc so tools
 # such as heaptrack can attribute transient allocation churn to call stacks.
 # Normal tracked-CRUD builds wrap mimalloc with byte accounting so latency
@@ -471,6 +474,21 @@ required-features = ["sdk-tests", "storage-benches", "slatedb"]
 name = "rust_sdk_api"
 path = "tests/rust_sdk_api.rs"
 required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[test]]
+name = "semantic_merge"
+path = "tests/semantic_merge.rs"
+required-features = ["sdk-tests"]
+
+[[test]]
+name = "plugin_gc"
+path = "tests/plugin_gc.rs"
+required-features = ["plugin-tests"]
+
+[[test]]
+name = "server_protocol_plugin_convergence"
+path = "tests/server_protocol_plugin_convergence.rs"
+required-features = ["plugin-tests", "server-protocol"]
 
 [[test]]
 name = "untracked_plugin_cold_open_bench"

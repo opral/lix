@@ -1,6 +1,15 @@
+//! Host/guest-neutral encoding for the universal Lix plugin entity page.
+//!
+//! Payloads precede a fixed descriptor and magic trailer. A guest can therefore turn
+//! its existing batch buffer into a page by appending metadata without copying
 //! or moving the batch bytes.
 
 #![allow(clippy::missing_errors_doc)]
+#![cfg_attr(not(feature = "default_wasm_runtime"), allow(dead_code))]
+#![cfg_attr(
+    all(target_arch = "wasm32", target_os = "wasi", target_env = "p2"),
+    allow(dead_code)
+)]
 
 const MAGIC: &[u8; 8] = b"LIXEPG01";
 const DESCRIPTOR_BYTES: usize = 16;
@@ -99,7 +108,6 @@ impl<'a> Page<'a> {
         Ok(page)
     }
 
-    #[cfg(test)]
     pub fn record_count(self) -> u32 {
         self.record_count
     }

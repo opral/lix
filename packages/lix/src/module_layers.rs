@@ -91,7 +91,6 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("catalog", "not yet analysed"),
     ("cel", "leaf utility, no layer semantics"),
     ("client_state", "entry-point plumbing, no layer semantics"),
-    ("default_wasm_runtime", "feature-gated harness"),
     ("domain", "pure predicates, no owned invariant"),
     ("engine", "entry point; reaches everywhere by design"),
     (
@@ -111,9 +110,6 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("module_layers", "this guard"),
     ("observe_coordinator", "not yet analysed"),
     ("observe_invalidation", "not yet analysed"),
-    ("plugin_arena", "leaf utility, no layer semantics"),
-    ("plugin_layout", "leaf utility, no layer semantics"),
-    ("plugin_wire", "leaf utility, no layer semantics"),
     ("prepared_dml", "leaf utility, no layer semantics"),
     ("registered_spaces", "cfg-gated harness"),
     ("schema", "not yet analysed"),

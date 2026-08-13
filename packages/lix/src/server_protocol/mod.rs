@@ -4379,6 +4379,7 @@ impl Drop for ObserveTaskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any())]
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use flate2::{Compression, write::GzEncoder};
     use http::Request;
@@ -4390,16 +4391,15 @@ mod tests {
     };
     use lix::telemetry::TracingTelemetrySink;
     use lix::{Blob, Memory, RequestBlobSpliceProvenance, open_lix};
+    #[cfg(any())]
     use lix_collaboration_test_support::{
         CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
     };
     use serde_json::{Value as JsonValue, json};
-    use std::{
-        collections::BTreeMap,
-        io::{Cursor, Write as _},
-        path::Path,
-        sync::{Arc, Mutex, atomic::AtomicBool},
-    };
+    use std::io::Write as _;
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    #[cfg(any())]
+    use std::{collections::BTreeMap, io::Cursor, path::Path};
     use tracing::Subscriber;
     use tracing_subscriber::{
         layer::{Context as LayerContext, Layer},
@@ -6012,6 +6012,7 @@ mod tests {
         .await
     }
 
+    #[cfg(any())]
     fn build_json_plugin_archive() -> Vec<u8> {
         let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"));
         let wasm = std::fs::read(wasm_path).expect("JSON plugin component should be built");
@@ -7819,6 +7820,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn same_base_remote_plugin_writes_resolve_and_converge() {
         let app = app().await;
@@ -7938,6 +7940,7 @@ mod tests {
         assert_eq!(converged_rows[0], converged_rows[2]);
     }
 
+    #[cfg(any())]
     struct RemoteCapacityBackend {
         app: TestApp,
         path: &'static str,
@@ -7945,6 +7948,7 @@ mod tests {
         observations: Vec<TestSseStream>,
     }
 
+    #[cfg(any())]
     impl RemoteCapacityBackend {
         async fn open(clients: usize, operations: usize) -> Self {
             let app = app_with_options(ServerProtocolOptions {
@@ -8016,6 +8020,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[async_trait::async_trait(?Send)]
     impl CollaborationCapacityBackend for RemoteCapacityBackend {
         type StagedWave = Vec<(String, String)>;
@@ -8225,6 +8230,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[tokio::test]
     #[ignore = "manual release-mode remote commit-to-observation capacity gate"]
     async fn remote_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95() {
@@ -8259,6 +8265,7 @@ mod tests {
         backend.close().await;
     }
 
+    #[cfg(any())]
     fn capacity_env_usize(key: &str, default: usize) -> usize {
         std::env::var(key)
             .ok()

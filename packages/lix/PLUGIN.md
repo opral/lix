@@ -1,7 +1,21 @@
-# Lix plugin API v1
+# Writing Lix plugins
 
-The canonical hard-cut Component authoring API. Its WIT package is exactly
-`lix:plugin@1.0.0`.
+Plugin authors depend on the same `lix` crate as engine users:
+
+```toml
+[dependencies]
+lix = "0.11"
+```
+
+Compile the plugin for the Component Model target:
+
+```sh
+cargo build --release --target wasm32-wasip2
+```
+
+The build selects Lix's small plugin-authoring surface automatically; it does
+not compile the repository engine, SQL stack, storage machinery, or default
+Wasm runtime. The WIT package is `lix:plugin@1.0.0`.
 
 ## Author contract
 
@@ -11,16 +25,19 @@ variants passed to the one stateful WIT export. The required cold and restore ca
 from compiling while silently omitting eviction, restart, history, or reopen
 behavior. Stateless conflict resolution has a canonical default.
 
-After implementing `Plugin`, export the component from the plugin crate:
+After implementing `Plugin`, export the component from the plugin crate. A
+complete minimal implementation is available in
+[`examples/plugin_minimal.rs`](examples/plugin_minimal.rs):
 
 ```rust
 struct MyPlugin;
 
-impl lix_plugin_api::Plugin for MyPlugin {
-    // Implement all five required lifecycle callbacks.
+impl lix::plugin::Plugin for MyPlugin {
+    // Implement open, file_changed, entities_changed, restore, and
+    // cold_file_changed. Conflict resolution has a default.
 }
 
-lix_plugin_api::export_plugin!(MyPlugin);
+lix::plugin::export!(MyPlugin);
 ```
 
 The export macro is required; a trait implementation alone does not expose the
@@ -67,3 +84,24 @@ use blob durability. Do not declare `materialization`, `runtime`, or
 
 See [the experiment and profiling contract](../../rfcs/universal-plugin-api.md)
 for the wire shape, correctness gates, and cross-format measurement matrix.
+
+## Installing a plugin
+
+Installing a plugin is a normal tracked repository file write. Write the
+`.lixplugin` archive to its canonical path:
+
+```text
+/.lix/plugins/<plugin-key>.lixplugin
+```
+
+The archive contains `manifest.json`, the schemas declared by that manifest,
+and the compiled Component as `plugin.wasm`. For example:
+
+```sh
+cp target/wasm32-wasip2/release/my_plugin.wasm plugin.wasm
+zip -0 my-plugin.lixplugin manifest.json schemas/*.json plugin.wasm
+```
+
+Updating that file replaces the plugin, and deleting it uninstalls the plugin.
+Lix validates the archive and updates its derived registry and schema state in
+the same transaction. There is intentionally no separate `install_plugin` API.

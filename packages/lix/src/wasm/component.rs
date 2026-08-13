@@ -1,6 +1,6 @@
 //! Host-neutral contract for the fused Wasm Component protocol.
 //!
-//! The Component binding lives in `packages/rs-sdk`; this module deliberately
+//! The Component binding lives under `lix::plugin`; this module deliberately
 //! contains no Wasmtime types. A compiled component factory is shared, while
 //! each branch/file actor owns one isolated mutable instance and all document,
 //! cursor, output-table, and transition handles created by that instance.
