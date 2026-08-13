@@ -1,6 +1,6 @@
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Memory;
+use lix::{engine::Engine, session::SessionContext};
 
 const MULTI_ENTITY_SQL: &str = "SELECT b.id AS bundle_id, m.id AS message_id, \
     v.id AS variant_id FROM bundle b \
@@ -16,10 +16,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     for schema in multi_entity_schemas() {
         session
@@ -158,10 +155,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
     );
 
     session.close().await.expect("session should close");
-    let reopened = engine
-        .open_session()
-        .await
-        .expect("session should reopen");
+    let reopened = engine.open_session().await.expect("session should reopen");
     assert_eq!(
         reopened
             .execute(MULTI_ENTITY_SQL, &bundle_1)

@@ -4,12 +4,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lix::CreateBranchOptions;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory,
     MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, SpaceId, Storage, StorageError,
     StorageRead, StorageWrite, WriteOptions,
 };
+use lix::{engine::Engine, session::SessionContext};
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const UNTRACKED_RACE_BRANCH_ID: &str = "01930000-0000-7000-8000-000000000018";
@@ -161,19 +161,18 @@ async fn committed_media_ingest_part_does_not_invalidate_a_concurrent_project_sa
                 "concurrent-ingest".to_owned(),
                 "/media/import.mov".to_owned(),
                 0,
-                2 * lix::FILE_UPLOAD_PART_BYTES as u64,
-                vec![0x5a; lix::FILE_UPLOAD_PART_BYTES].into(),
+                2 * lix::session::media_upload::FILE_UPLOAD_PART_BYTES as u64,
+                vec![0x5a; lix::session::media_upload::FILE_UPLOAD_PART_BYTES].into(),
             )
             .await;
         gate.release_parked_write();
         progress
     };
-    let (save_result, ingest_result) =
-        tokio::time::timeout(TEST_WAIT_TIMEOUT * 15, async move {
-            tokio::join!(save_future, ingest_future)
-        })
-        .await
-        .expect("interfering writers should not deadlock");
+    let (save_result, ingest_result) = tokio::time::timeout(TEST_WAIT_TIMEOUT * 15, async move {
+        tokio::join!(save_future, ingest_future)
+    })
+    .await
+    .expect("interfering writers should not deadlock");
 
     ingest_result.expect("media ingest part should commit");
     save_result
@@ -317,10 +316,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         session
@@ -555,10 +551,7 @@ async fn existing_session_ignores_later_default_branch_corruption() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     session
         .execute(
@@ -596,10 +589,7 @@ async fn explicit_transaction_open_uses_one_authoritative_snapshot() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     let before = storage.stats();
     let transaction = session
@@ -641,10 +631,7 @@ async fn existing_session_writes_to_its_selected_branch() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     session
         .execute(
@@ -720,10 +707,7 @@ async fn write_changelog_commit_failure_does_not_commit_storage_write() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     storage.fail_write_space(CHANGELOG_COMMIT_SPACE_ID);
     let before = storage.stats();
@@ -756,10 +740,7 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     session
         .execute(
@@ -814,10 +795,7 @@ async fn transaction_read_can_query_history_surfaces() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     session
         .execute(
@@ -855,12 +833,7 @@ async fn close_rejects_idle_explicit_transaction_without_dropping_it() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
 
     let mut tx = session
         .begin_transaction()
@@ -919,12 +892,7 @@ async fn closed_session_still_allows_active_transaction_rollback() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
 
     let tx = session
         .begin_transaction()
@@ -954,10 +922,7 @@ async fn closed_session_active_branch_id_does_not_open_storage_read() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     session.close().await.expect("session close should succeed");
     let before = storage.stats();
@@ -984,12 +949,7 @@ async fn close_during_transaction_open_rejects_opened_transaction() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
 
     gate.block_next_write();
     let opener_session = Arc::clone(&session);
@@ -1033,12 +993,7 @@ async fn close_during_transaction_commit_waits_after_commit_boundary() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
 
     let mut tx = session
         .begin_transaction()
@@ -1103,12 +1058,7 @@ async fn close_waits_for_transaction_blocked_in_storage_commit() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
 
     let mut tx = session
         .begin_transaction()
@@ -1178,12 +1128,7 @@ async fn begin_transaction_cannot_race_with_opening_session_write() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
 
     gate.block_next_write();
     let writer_session = Arc::clone(&session);
@@ -1235,12 +1180,7 @@ async fn session_read_waits_for_automatic_write_instead_of_rejecting() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
-    );
+    let session = Arc::new(engine.open_session().await.expect("session should open"));
 
     gate.block_next_write();
     let writer_session = Arc::clone(&session);

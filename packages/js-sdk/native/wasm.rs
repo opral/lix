@@ -8,9 +8,9 @@ use js_sys::{Array, Function, Reflect};
 use lix::telemetry::{CallbackTelemetrySink, TelemetrySink};
 use lix::{
     CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
-    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
-    LixTransaction as RsLixTransaction, Memory, MergeBranchOptions as RsMergeBranchOptions,
-    MergeBranchOutcome, MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents, SqlScriptPlan,
+    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents, SqlScriptPlan,
     SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
     parse_sql_script as parse_rs_sql_script,
 };
@@ -145,11 +145,12 @@ impl WasmLix {
     ) -> Result<JsValue, JsValue> {
         let params = values_from_js(params)?;
         let options = execute_options_from_js(options)?;
-        let result = self
-            .inner
-            .execute_with_options(&sql, &params, options)
-            .await
-            .map_err(lix_error_to_js)?;
+        let execution = self.inner.execute(&sql, &params);
+        let execution = match options {
+            Some(origin_key) => execution.with_origin_key(origin_key),
+            None => execution,
+        };
+        let result = execution.await.map_err(lix_error_to_js)?;
         execute_result_to_js(result)
     }
 
@@ -161,11 +162,12 @@ impl WasmLix {
     ) -> Result<JsValue, JsValue> {
         let statements = batch_statements_from_js(statements)?;
         let options = execute_options_from_js(options)?;
-        let results = self
-            .inner
-            .execute_batch_with_options(&statements, options)
-            .await
-            .map_err(lix_error_to_js)?;
+        let execution = self.inner.execute_batch(&statements);
+        let execution = match options {
+            Some(origin_key) => execution.with_origin_key(origin_key),
+            None => execution,
+        };
+        let results = execution.await.map_err(lix_error_to_js)?;
         let results = results
             .into_iter()
             .map(ExecuteResultDto::try_from)
@@ -357,10 +359,12 @@ impl WasmLixTransaction {
         let params = values_from_js(params)?;
         let options = execute_options_from_js(options)?;
         let inner = self.inner.as_mut().ok_or_else(transaction_closed_error)?;
-        let result = inner
-            .execute_with_options(sql, params, options)
-            .await
-            .map_err(lix_error_to_js)?;
+        let execution = inner.execute(&sql, &params);
+        let execution = match options {
+            Some(origin_key) => execution.with_origin_key(origin_key),
+            None => execution,
+        };
+        let result = execution.await.map_err(lix_error_to_js)?;
         execute_result_to_js(result)
     }
 
@@ -459,15 +463,13 @@ impl From<SqlScriptPlan> for SqlScriptPlanDto {
     }
 }
 
-fn execute_options_from_js(options: Option<JsValue>) -> Result<RsExecuteOptions, JsValue> {
+fn execute_options_from_js(options: Option<JsValue>) -> Result<Option<String>, JsValue> {
     match options {
         Some(value) if !value.is_null() && !value.is_undefined() => {
             let options: ExecuteOptionsDto = from_js(value)?;
-            Ok(RsExecuteOptions {
-                origin_key: options.origin_key,
-            })
+            Ok(options.origin_key)
         }
-        _ => Ok(RsExecuteOptions::default()),
+        _ => Ok(None),
     }
 }
 

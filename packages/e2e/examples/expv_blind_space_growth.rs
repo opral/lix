@@ -34,13 +34,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{collect_repository_gc_for_bench, layout_accounting};
-use lix::{
-    Blob, CreateBranchOptions, ExecuteIdempotency, ExecuteOptions, ExecuteStatementMetadata, Value,
-};
+use lix::{CreateBranchOptions, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 #[derive(Clone, Copy, Default)]
@@ -88,16 +86,6 @@ async fn main() {
             let rows = parse_usize(arguments.get(2), 10);
             let gc_rounds = parse_usize(arguments.get(3), 12);
             checkpoint_then_gc_scenario(commits, rows, gc_rounds).await;
-        }
-        "idempotency" => {
-            let samples = parse_samples(arguments.get(1));
-            idempotency_scenario(&samples).await;
-        }
-        "idempotency_payload" => {
-            let samples = parse_samples(arguments.get(1));
-            let bytes = parse_usize(arguments.get(2), 65536);
-            let returning = arguments.get(3).map(String::as_str) != Some("plain");
-            idempotency_payload_scenario(&samples, bytes, returning).await;
         }
         "uploads" => {
             let samples = parse_samples(arguments.get(1));
@@ -322,117 +310,6 @@ async fn checkpoint_then_gc_scenario(commits: usize, rows_per_commit: usize, gc_
     }
 }
 
-/// Server `/execute` replay receipts. The write site is
-/// `transaction/context.rs:1879`; this scenario exists to find out what removes
-/// them again.
-async fn idempotency_scenario(samples: &[usize]) {
-    let fixture = Fixture::open().await;
-    register_schema(&fixture.session).await;
-    let mut issued = 0usize;
-    for &target in samples {
-        while issued < target {
-            let mut fingerprint = [0u8; 32];
-            fingerprint[..8].copy_from_slice(&(issued as u64).to_be_bytes());
-            let identity = ExecuteIdempotency::new(
-                Some("expv-principal".to_owned()),
-                format!("expv-key-{issued:012}"),
-                fingerprint,
-            );
-            Arc::clone(&fixture.session)
-                .execute_with_idempotency_and_options_and_metadata(
-                    "INSERT INTO space_growth (path, value) VALUES ($1, lix_json($2))".to_owned(),
-                    vec![
-                        Value::Text(format!("/idem/{issued:012}")),
-                        Value::Text(format!(r#"{{"n":{issued}}}"#)),
-                    ],
-                    ExecuteOptions::default(),
-                    ExecuteStatementMetadata::default(),
-                    Some(identity),
-                )
-                .await
-                .expect("idempotent execute");
-            issued += 1;
-        }
-        report(
-            "idempotency",
-            "live",
-            target as u64,
-            &usage(&fixture.storage).await,
-        );
-    }
-    let result = collect_repository_gc_for_bench(&StorageAdapter::new(fixture.storage.clone()))
-        .await
-        .expect("commit repository GC");
-    println!(
-        "expv_gc,scenario=idempotency,round=1,requests={issued},staged_deletes={},swept_commits={}",
-        result.staged_deletes, result.swept_commits
-    );
-    report(
-        "idempotency",
-        "gc",
-        1,
-        &usage(&fixture.storage).await,
-    );
-}
-
-/// The same replay ledger, measured for the request shape its 8 MiB cap exists
-/// for: a mutation whose `RETURNING` clause projects blob content.
-///
-/// A receipt stores the complete `ExecuteResult` — columns, every returned row
-/// value, `rows_affected` and notices — as `serde_json`. `plain` runs the same
-/// file write without `RETURNING`, so the difference between the two arms is
-/// exactly the cost of retaining a second copy of the response payload.
-async fn idempotency_payload_scenario(samples: &[usize], blob_bytes: usize, returning: bool) {
-    let fixture = Fixture::open().await;
-    let sql = if returning {
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2) RETURNING id, path, content"
-    } else {
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)"
-    };
-    let mut issued = 0usize;
-    for &target in samples {
-        while issued < target {
-            let mut fingerprint = [0u8; 32];
-            fingerprint[..8].copy_from_slice(&(issued as u64).to_be_bytes());
-            fingerprint[8] = u8::from(returning);
-            let identity = ExecuteIdempotency::new(
-                Some("expv-principal".to_owned()),
-                format!("expv-key-{issued:012}"),
-                fingerprint,
-            );
-            // Incompressible, per-request distinct content. A repeated byte
-            // would let the backend compress both the file and its receipt to
-            // almost nothing and would make the physical arm meaningless.
-            let content = pseudo_random_bytes(issued as u64, blob_bytes);
-            Arc::clone(&fixture.session)
-                .execute_with_idempotency_and_options_and_metadata(
-                    sql.to_owned(),
-                    vec![
-                        Value::Text(format!("/expv/payload-{issued:012}.bin")),
-                        Value::Blob(Blob::from(content)),
-                    ],
-                    ExecuteOptions::default(),
-                    ExecuteStatementMetadata::default(),
-                    Some(identity),
-                )
-                .await
-                .expect("idempotent execute");
-            issued += 1;
-        }
-        report(
-            if returning {
-                "idempotency_payload_returning"
-            } else {
-                "idempotency_payload_plain"
-            },
-            "live",
-            target as u64,
-            &usage(&fixture.storage).await,
-        );
-    }
-    fixture.flush();
-}
-
 /// Resumable-upload receipts. `keep` leaves every uploaded file live; `delete`
 /// removes each file again, which is the shape that tells retained-receipt
 /// bytes apart from live-file bytes.
@@ -445,15 +322,13 @@ async fn uploads_scenario(samples: &[usize], bytes_per_upload: usize, delete: bo
             let payload = vec![(uploaded % 251) as u8; bytes_per_upload];
             fixture
                 .session
-                .upsert_file_content_part(
-                    format!("expv-upload-{uploaded:08}"),
-                    path.clone(),
-                    0,
-                    bytes_per_upload as u64,
-                    Blob::from(payload),
+                .execute(
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                     ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                    &[Value::Text(path.clone()), Value::Blob(payload.into())],
                 )
                 .await
-                .expect("upload part");
+                .expect("write uploaded file through SQL");
             if delete {
                 fixture
                     .session
@@ -484,7 +359,7 @@ async fn uploads_scenario(samples: &[usize], bytes_per_upload: usize, delete: bo
 
 struct Fixture {
     storage: RocksDB,
-    session: Arc<SessionContext<RocksDB>>,
+    session: Arc<Lix<RocksDB>>,
     _directory: Option<tempfile::TempDir>,
 }
 
@@ -503,14 +378,15 @@ impl Fixture {
             }
         };
         let storage = RocksDB::open(&path).expect("open RocksDB");
-        Engine::initialize(storage.clone())
+        open_lix()
+            .with_storage(storage.clone())
             .await
             .expect("initialize repository");
-        let engine = Engine::new(storage.clone()).await.expect("open engine");
-        let session = engine
-            .open_session()
+        let lix = open_lix()
+            .with_storage(storage.clone())
             .await
-            .expect("open workspace");
+            .expect("open lix");
+        let session = lix.open_another_session().await.expect("open workspace");
         Self {
             storage,
             session: Arc::new(session),
@@ -518,26 +394,6 @@ impl Fixture {
         }
     }
 
-    fn flush(&self) {
-        self.storage.flush().expect("flush RocksDB");
-    }
-}
-
-/// splitmix64 fill. Deterministic per seed, and statistically incompressible,
-/// which is what a physical byte measurement of a payload plane requires.
-fn pseudo_random_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        let take = (len - out.len()).min(8);
-        out.extend_from_slice(&z.to_le_bytes()[..take]);
-    }
-    out
 }
 
 fn report(scenario: &str, phase: &str, axis: u64, usage: &Usage) {
@@ -576,7 +432,7 @@ where
     accounting
 }
 
-async fn commit_batch<S>(session: &SessionContext<S>, batch: usize, rows: usize)
+async fn commit_batch<S>(session: &Lix<S>, batch: usize, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -596,7 +452,7 @@ where
     transaction.commit().await.expect("commit batch");
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

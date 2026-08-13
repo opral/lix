@@ -107,15 +107,16 @@ where
     let result = future.await;
     let nanos = start.elapsed().as_nanos() as u64;
     let (hits, bytes) = match result.as_ref() {
-        Ok(result) => result.values.iter().flatten().fold(
-            (0u64, 0u64),
-            |(hits, bytes), value| match value {
+        Ok(result) => result
+            .values
+            .iter()
+            .flatten()
+            .fold((0u64, 0u64), |(hits, bytes), value| match value {
                 crate::storage::ProjectedValue::KeyOnly => (hits + 1, bytes),
                 crate::storage::ProjectedValue::FullValue(payload) => {
                     (hits + 1, bytes + payload.len() as u64)
                 }
-            },
-        ),
+            }),
         Err(_) => (0, 0),
     };
     crate::storage_bench::record_plan_load_io(nanos, requests.len() as u64, keys, hits, bytes);

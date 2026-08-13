@@ -28,22 +28,22 @@ Use the same Lix client as a thin client against a hosted repository:
 
 ```ts
 const lix = await openLix({
-	server: {
-		mode: "remote",
-		url: "https://lixray.com/@namespace/repository",
-		headers: async () => ({
-			Authorization: `Bearer ${await accessToken()}`,
-		}),
-	},
+  server: {
+    mode: "remote",
+    url: "https://example.com/repositories/acme",
+    headers: async () => ({
+      Authorization: `Bearer ${await accessToken()}`,
+    }),
+  },
 });
 
 const files = lix.observe("SELECT path FROM lix_file ORDER BY path");
 const initial = await files.next();
 
-await lix.execute(
-	"INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-	["/hello.txt", new TextEncoder().encode("hello")],
-);
+await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
+  "/hello.txt",
+  new TextEncoder().encode("hello"),
+]);
 const update = await files.next();
 
 files.close();
@@ -61,11 +61,11 @@ Browser clients can opt into private, durable client state with IndexedDB:
 import { IndexedDbStorage, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	server: {
-		mode: "remote",
-		url: "https://lixray.com/@namespace/repository",
-	},
-	storage: new IndexedDbStorage({ name: "lixray-client" }),
+  server: {
+    mode: "remote",
+    url: "https://example.com/repositories/acme",
+  },
+  storage: new IndexedDbStorage({ name: "repository-client" }),
 });
 
 const previousUiState = await lix.clientState.get("atelier-ui");
@@ -89,20 +89,21 @@ Filesystem sync uses native Node.js dependencies:
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: "./repository",
-		syncAllFiles: true,
-	}),
+  storage: new LocalFilesystem({
+    path: "./repository",
+    syncAllFiles: true,
+  }),
 });
 
 await lix.execute(
-	"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-	["/hello.txt", new TextEncoder().encode("world")],
+  "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+  ["/hello.txt", new TextEncoder().encode("world")],
 );
 
-const result = await lix.execute("SELECT content FROM lix_file WHERE path = $1", [
-	"/hello.txt",
-]);
+const result = await lix.execute(
+  "SELECT content FROM lix_file WHERE path = $1",
+  ["/hello.txt"],
+);
 const bytes = result.rows[0]?.value("content").asBytes();
 
 console.log(bytes && new TextDecoder().decode(bytes));
@@ -135,8 +136,8 @@ const draft = await lix.createBranch({ name: "Draft" });
 
 await lix.switchBranch({ branchId: draft.id });
 await lix.execute(
-	"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-	["/status.txt", new TextEncoder().encode("draft")],
+  "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+  ["/status.txt", new TextEncoder().encode("draft")],
 );
 
 await lix.switchBranch({ branchId: main });
@@ -150,18 +151,18 @@ const merge = await lix.mergeBranch({ sourceBranchId: draft.id });
 const tx = await lix.beginTransaction();
 
 try {
-	await tx.execute(
-		"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-		["/a.txt", new TextEncoder().encode("1")],
-	);
-	await tx.execute(
-		"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-		["/b.txt", new TextEncoder().encode("2")],
-	);
-	await tx.commit();
+  await tx.execute(
+    "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+    ["/a.txt", new TextEncoder().encode("1")],
+  );
+  await tx.execute(
+    "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+    ["/b.txt", new TextEncoder().encode("2")],
+  );
+  await tx.commit();
 } catch (error) {
-	await tx.rollback();
-	throw error;
+  await tx.rollback();
+  throw error;
 }
 ```
 
@@ -203,6 +204,7 @@ try {
   Hosts that apply one policy to every response can use
   `script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'` globally
   instead. Worker-scoped headers keep those permissions out of the page.
+
 - SQL parameters use normal JavaScript values: `string`, finite `number`, `boolean`, `Uint8Array`, `null`, JSON-compatible arrays, and JSON-compatible plain objects.
 - Use `Value.integer(...)`, `Value.real(...)`, `Value.text(...)`, `Value.json(...)`, or `Value.blob(...)` only when you need to pass an explicit native Lix value.
 

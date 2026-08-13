@@ -11,7 +11,7 @@ mod undo_redo_checkpoint;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
-use lix::integration::Engine;
+use lix::open_lix;
 use lix::storage::conformance::{
     StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
 };
@@ -58,26 +58,21 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
     let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
     let path = temp_dir.path().join("file-sql.slatedb");
     let storage = SlateDB::open(&path).expect("open SlateDB storage");
-    Engine::initialize(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("initialize SlateDB storage");
-    let engine = Engine::new(storage.clone()).await.expect("open engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("open session");
+        .expect("open repository");
 
-    session
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-            &[
-                Value::Text("/adapter.bin".to_string()),
-                Value::Text("aé—".to_string()),
-            ],
-        )
-        .await
-        .expect("insert text through an explicit BYTEA cast");
-    let lengths = session
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+        &[
+            Value::Text("/adapter.bin".to_string()),
+            Value::Text("aé—".to_string()),
+        ],
+    )
+    .await
+    .expect("insert text through an explicit BYTEA cast");
+    let lengths = lix
         .execute(
             "SELECT length(content) AS characters, OCTET_LENGTH(content) AS octets \
              FROM lix_file WHERE path = $1",
@@ -98,34 +93,31 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
         6
     );
 
-    session
-        .execute(
-            "UPDATE lix_file SET content = $2 WHERE path = $1",
-            &[
-                Value::Text("/adapter.bin".to_string()),
-                Value::Blob(vec![0xff, 0x00, 0x61].into()),
-            ],
-        )
-        .await
-        .expect("update with a direct binary parameter");
-    let error = session
+    lix.execute(
+        "UPDATE lix_file SET content = $2 WHERE path = $1",
+        &[
+            Value::Text("/adapter.bin".to_string()),
+            Value::Blob(vec![0xff, 0x00, 0x61].into()),
+        ],
+    )
+    .await
+    .expect("update with a direct binary parameter");
+    let error = lix
         .execute("SELECT X'41'", &[])
         .await
         .expect_err("legacy SQL hex literals should be rejected");
     assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
 
-    drop(session);
-    drop(engine);
+    drop(lix);
     storage.flush().await.expect("flush SlateDB storage");
     drop(storage);
 
     let reopened = SlateDB::open(&path).expect("reopen SlateDB storage");
-    let engine = Engine::new(reopened).await.expect("reopen engine");
-    let session = engine
-        .open_session()
+    let lix = open_lix()
+        .with_storage(reopened)
         .await
-        .expect("reopen session");
-    let result = session
+        .expect("reopen repository");
+    let result = lix
         .execute(
             "SELECT content, OCTET_LENGTH(content) AS octets FROM lix_file WHERE path = $1",
             &[Value::Text("/adapter.bin".to_string())],
@@ -162,29 +154,31 @@ async fn checkpointed_state_survives_undo_redo_and_cold_reopen_on_slatedb() {
     let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
     let path = temp_dir.path().join("undo-redo.slatedb");
     let storage = SlateDB::open(&path).expect("open SlateDB storage");
-    Engine::initialize(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("initialize SlateDB storage");
-    let engine = Engine::new(storage.clone()).await.expect("open engine");
-    let branch_id = undo_redo_checkpoint::stage_checkpointed_a_and_undo_b(&engine).await;
-    drop(engine);
+        .expect("open repository");
+    let branch_id = undo_redo_checkpoint::stage_checkpointed_a_and_undo_b(&lix).await;
+    drop(lix);
     storage.flush().await.expect("flush undo state");
     drop(storage);
 
     let storage = SlateDB::open(&path).expect("reopen SlateDB after undo");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("reopen engine after undo");
-    undo_redo_checkpoint::assert_cold_undo_then_redo(&engine, branch_id.clone()).await;
-    drop(engine);
+        .expect("reopen repository after undo");
+    undo_redo_checkpoint::assert_cold_undo_then_redo(&lix, branch_id.clone()).await;
+    drop(lix);
     storage.flush().await.expect("flush redo state");
     drop(storage);
 
     let storage = SlateDB::open(&path).expect("reopen SlateDB after redo");
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("reopen engine after redo");
-    undo_redo_checkpoint::assert_cold_redo(&engine, branch_id).await;
+        .expect("reopen repository after redo");
+    undo_redo_checkpoint::assert_cold_redo(&lix, branch_id).await;
 }
 
 #[tokio::test]
@@ -303,7 +297,8 @@ async fn slatedb_streams_unbounded_scan_limits() {
     let (result, result_has_more) = cursor
         .next_page(usize::MAX)
         .await
-        .expect("scan slatedb rows").into_parts();
+        .expect("scan slatedb rows")
+        .into_parts();
 
     assert_eq!(result.len(), 10);
     assert!(
@@ -526,7 +521,8 @@ async fn assert_cached_rows(
     let (result, _result_has_more) = cursor
         .next_page(usize::MAX)
         .await
-        .expect("scan cached rows").into_parts();
+        .expect("scan cached rows")
+        .into_parts();
 
     assert_eq!(result.len(), 3);
     let rows = result

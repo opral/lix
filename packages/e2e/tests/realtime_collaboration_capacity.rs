@@ -191,7 +191,7 @@ impl LocalCapacityBackend {
         let mut observations = Vec::with_capacity(clients);
         for _ in 0..clients {
             let peer = root
-                .open_session()
+                .open_another_session()
                 .await
                 .expect("collaborator session should open");
             let mut events = peer
@@ -208,7 +208,6 @@ impl LocalCapacityBackend {
             peers.push(peer);
             observations.push(events);
         }
-        root.reset_plugin_transition_counters();
         Self {
             format,
             path,
@@ -372,12 +371,6 @@ impl CollaborationCapacityBackend for LocalCapacityBackend {
         }
     }
 
-    fn resolver_calls(&self) -> u64 {
-        self.root
-            .plugin_transition_counters()
-            .conflict_resolution_calls
-    }
-
     fn resource_counters(&self) -> BTreeMap<String, u64> {
         BTreeMap::from([
             ("open_peer_sessions".to_owned(), self.peers.len() as u64),
@@ -418,7 +411,7 @@ async fn abandoned_transactions_and_sessions_release_resources() {
         let mut transactions = Vec::with_capacity(clients);
         for client in 0..clients {
             let peer = lix
-                .open_session()
+                .open_another_session()
                 .await
                 .expect("soak session should open");
             let mut transaction = peer

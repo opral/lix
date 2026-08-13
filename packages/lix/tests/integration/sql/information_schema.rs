@@ -1453,7 +1453,10 @@ simulation_test!(
                 )
                 .await
                 .expect("DELETE RETURNING should match SELECT null semantics"),
-            vec![vec![Value::Null, Value::Json(serde_json::Value::Null.into())]],
+            vec![vec![
+                Value::Null,
+                Value::Json(serde_json::Value::Null.into()),
+            ]],
         );
     }
 );

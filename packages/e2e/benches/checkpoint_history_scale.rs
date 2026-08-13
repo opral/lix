@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use lix::changelog::bench::{append_ordered_commits, append_with_shape, stage_append_once};
-use lix::integration::Engine;
+use lix::open_lix;
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{CheckpointCommitScanBenchMode, scan_checkpoint_commits_for_bench};
@@ -349,17 +349,19 @@ async fn initialize_query_fixture<StorageImpl>(storage: StorageImpl, additional_
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize checkpoint-query fixture");
     if additional_checkpoints == 0 {
         return;
     }
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("open checkpoint-query setup engine");
-    let session = engine
-        .open_session()
+        .expect("open checkpoint-query setup lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open checkpoint-query setup session");
     for _ in 0..additional_checkpoints {
@@ -446,11 +448,12 @@ async fn measure_query<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("open checkpoint-query engine");
-    let session = engine
-        .open_session()
+        .expect("open checkpoint-query lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open checkpoint-query session");
     for _ in 0..warmups {

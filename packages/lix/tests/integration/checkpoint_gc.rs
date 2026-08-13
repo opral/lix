@@ -11,10 +11,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -100,10 +97,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -201,10 +195,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         main.create_branch(CreateBranchOptions {
@@ -304,10 +295,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -486,7 +474,7 @@ async fn advance_to_next_gc(session: &support::simulation_test::engine::SimSessi
     }
 }
 
-async fn branch_head(engine: &lix::integration::Engine, branch_id: &str) -> String {
+async fn branch_head(engine: &lix::engine::Engine, branch_id: &str) -> String {
     engine
         .load_branch_head_commit_id(branch_id)
         .await

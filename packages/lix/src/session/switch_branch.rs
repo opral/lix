@@ -1,7 +1,7 @@
+use super::context::SessionContext;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::storage_adapter::{SharedStorageAdapterRead, Storage, StorageReadOptions};
-use super::context::SessionContext;
 
 /// Options for switching a session to another branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,9 +49,7 @@ where
         self.branch.set(branch_id.clone())?;
         self.observe_invalidation.bump();
 
-        Ok(SwitchBranchReceipt {
-            branch_id,
-        })
+        Ok(SwitchBranchReceipt { branch_id })
     }
 }
 

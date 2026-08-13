@@ -1,15 +1,14 @@
-use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
+use lix::{Lix, SwitchBranchOptions, Value};
 
 const A_KEY: &str = "checkpointed-a";
 const B_KEY: &str = "undo-target-b";
 
-async fn value<S>(session: &SessionContext<S>, key: &str) -> Option<String>
+async fn value<S>(lix: &Lix<S>, key: &str) -> Option<String>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let result = session
+    let result = lix
         .execute(
             "SELECT value FROM lix_key_value WHERE key = $1",
             &[Value::Text(key.to_string())],
@@ -27,85 +26,71 @@ where
         })
 }
 
-async fn assert_values<S>(session: &SessionContext<S>, a: &str, b: &str)
+async fn assert_values<S>(lix: &Lix<S>, a: &str, b: &str)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    assert_eq!(value(session, A_KEY).await.as_deref(), Some(a));
-    assert_eq!(value(session, B_KEY).await.as_deref(), Some(b));
+    assert_eq!(value(lix, A_KEY).await.as_deref(), Some(a));
+    assert_eq!(value(lix, B_KEY).await.as_deref(), Some(b));
 }
 
-pub async fn stage_checkpointed_a_and_undo_b<S>(engine: &Engine<S>) -> String
+pub async fn stage_checkpointed_a_and_undo_b<S>(lix: &Lix<S>) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let session = engine
-        .open_session()
-        .await
-        .expect("session opens");
-    session
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ($1, 'a0'), ($2, 'b0')",
-            &[
-                Value::Text(A_KEY.to_string()),
-                Value::Text(B_KEY.to_string()),
-            ],
-        )
-        .await
-        .expect("seed rows commit");
-    session
-        .create_checkpoint()
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ($1, 'a0'), ($2, 'b0')",
+        &[
+            Value::Text(A_KEY.to_string()),
+            Value::Text(B_KEY.to_string()),
+        ],
+    )
+    .await
+    .expect("seed rows commit");
+    lix.create_checkpoint()
         .await
         .expect("seed checkpoint commits");
-    session
-        .execute(
-            "UPDATE lix_key_value SET value = 'a1' WHERE key = $1",
-            &[Value::Text(A_KEY.to_string())],
-        )
-        .await
-        .expect("A commits");
-    session
-        .create_checkpoint()
-        .await
-        .expect("A checkpoint commits");
-    session
-        .execute(
-            "UPDATE lix_key_value SET value = 'b1' WHERE key = $1",
-            &[Value::Text(B_KEY.to_string())],
-        )
-        .await
-        .expect("B commits");
-    assert_values(&session, "a1", "b1").await;
+    lix.execute(
+        "UPDATE lix_key_value SET value = 'a1' WHERE key = $1",
+        &[Value::Text(A_KEY.to_string())],
+    )
+    .await
+    .expect("A commits");
+    lix.create_checkpoint().await.expect("A checkpoint commits");
+    lix.execute(
+        "UPDATE lix_key_value SET value = 'b1' WHERE key = $1",
+        &[Value::Text(B_KEY.to_string())],
+    )
+    .await
+    .expect("B commits");
+    assert_values(lix, "a1", "b1").await;
 
-    session.undo().await.expect("B undoes");
-    assert_values(&session, "a1", "b0").await;
+    lix.undo().await.expect("B undoes");
+    assert_values(lix, "a1", "b0").await;
 
-    session
-        .active_branch_id()
+    lix.active_branch_id()
         .await
         .expect("active branch resolves")
 }
 
-pub async fn assert_cold_undo_then_redo<S>(engine: &Engine<S>, branch_id: String)
+pub async fn assert_cold_undo_then_redo<S>(lix: &Lix<S>, branch_id: String)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let session = engine
-        .open_session_at(branch_id)
+    lix.switch_branch(SwitchBranchOptions { branch_id })
         .await
-        .expect("cold session opens after undo");
-    assert_values(&session, "a1", "b0").await;
-    session.redo().await.expect("B redoes after cold reopen");
-    assert_values(&session, "a1", "b1").await;
+        .expect("cold repository switches to the branch after undo");
+    assert_values(lix, "a1", "b0").await;
+    lix.redo().await.expect("B redoes after cold reopen");
+    assert_values(lix, "a1", "b1").await;
 }
 
-pub async fn assert_cold_redo<S>(engine: &Engine<S>, branch_id: String)
+pub async fn assert_cold_redo<S>(lix: &Lix<S>, branch_id: String)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let session = engine
-        .open_session_at(branch_id)
+    lix.switch_branch(SwitchBranchOptions { branch_id })
         .await
-        .expect("cold session opens after redo");
-    assert_values(&session, "a1", "b1").await;
+        .expect("cold repository switches to the branch after redo");
+    assert_values(lix, "a1", "b1").await;
 }

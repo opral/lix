@@ -704,10 +704,7 @@ mod tests {
         global_only.branch_id = "main".into();
 
         let schemas = context
-            .schema_jsons_for_sql_read_planning(
-                &RowsHotStateReader::new(vec![global_only]),
-                "main",
-            )
+            .schema_jsons_for_sql_read_planning(&RowsHotStateReader::new(vec![global_only]), "main")
             .await
             .expect("schema visibility should load");
 
@@ -725,11 +722,7 @@ mod tests {
 
         let facts = context
             .schema_facts_for_domain(
-                &RowsHotStateReader::new(vec![
-                    valid_schema,
-                    file_scoped_schema,
-                    tombstoned_schema,
-                ]),
+                &RowsHotStateReader::new(vec![valid_schema, file_scoped_schema, tombstoned_schema]),
                 &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true),
             )
             .await

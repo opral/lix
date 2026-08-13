@@ -1,18 +1,15 @@
 use crate::support;
 
 use async_trait::async_trait;
-use lix::integration::{Engine, SessionContext};
 use lix::{ExecuteResult, LixError, Memory, Value};
+use lix::{engine::Engine, session::SessionContext};
 
 simulation_test!(
     sql_file_write_read_and_readdir_roundtrip,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -47,10 +44,7 @@ simulation_test!(
 simulation_test!(sql_path_only_file_reads_as_empty, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
+        engine.open_session().await.expect("session should open"),
         &engine,
     );
 
@@ -72,10 +66,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -166,10 +157,7 @@ async fn sql_update_path_to_plugin_storage_rejects_archive_rename() {
         .await
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     write_file(&session, "/normal.txt", b"normal".to_vec())
         .await
@@ -197,10 +185,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -229,10 +214,7 @@ simulation_test!(
 simulation_test!(sql_write_file_upserts_existing_data, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
+        engine.open_session().await.expect("session should open"),
         &engine,
     );
 
@@ -270,10 +252,7 @@ simulation_test!(sql_write_file_upserts_existing_data, |sim| async move {
 simulation_test!(sql_rm_file_and_recursive_directory, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
+        engine.open_session().await.expect("session should open"),
         &engine,
     );
 
@@ -309,10 +288,7 @@ simulation_test!(sql_rm_file_and_recursive_directory, |sim| async move {
 simulation_test!(sql_file_directory_path_constraints, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
+        engine.open_session().await.expect("session should open"),
         &engine,
     );
 

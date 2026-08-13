@@ -8,6 +8,7 @@ license.workspace = true
 rust-version.workspace = true
 autobenches = false
 autotests = false
+autoexamples = false
 
 [lints]
 workspace = true
@@ -96,6 +97,31 @@ http = "1"
 http-body-util = "0.1"
 
 [[example]]
+name = "e1_json_leak"
+path = "examples/e1_json_leak.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "e24_cas_read_probe"
+path = "examples/e24_cas_read_probe.rs"
+required-features = ["rocksdb"]
+
+[[example]]
+name = "e29_locator_leak"
+path = "examples/e29_locator_leak.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "expY_untracked_mutation_scaling"
+path = "examples/expY_untracked_mutation_scaling.rs"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "expfk_directory_delete_scan"
+path = "examples/expfk_directory_delete_scan.rs"
+required-features = ["rocksdb"]
+
+[[example]]
 name = "expaa_replay_scope"
 path = "examples/expaa_replay_scope.rs"
 required-features = ["storage-benches"]
@@ -149,11 +175,6 @@ required-features = ["storage-benches"]
 name = "chunking_oracle"
 path = "examples/chunking_oracle.rs"
 
-[[bench]]
-name = "request_blob_transport"
-path = "benches/request_blob_transport.rs"
-harness = false
-
 [[test]]
 name = "server_protocol_durable_idempotency"
 path = "tests/server_protocol_durable_idempotency.rs"
@@ -203,24 +224,14 @@ path = "tests/current_state_scoped_root_engagement.rs"
 required-features = ["storage-benches"]
 
 [[test]]
-name = "movie_workspace_qualification"
-path = "tests/movie_workspace_qualification.rs"
-required-features = ["storage-benches", "slatedb"]
-
-[[test]]
 name = "corruption_recovery_qualification"
 path = "tests/corruption_recovery_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
-name = "large_payload_read_qualification"
-path = "tests/large_payload_read_qualification.rs"
-required-features = ["storage-benches", "slatedb"]
-
-[[test]]
 name = "crash_consistency_qualification"
 path = "tests/crash_consistency_qualification.rs"
-required-features = ["rocksdb"]
+required-features = ["rocksdb", "server-protocol"]
 
 [[test]]
 name = "certified_replacement_delete_reopen"
@@ -289,12 +300,6 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
-name = "tpch"
-path = "benches/tpch/main.rs"
-harness = false
-required-features = ["storage-benches", "tpch"]
-
-[[bench]]
 name = "tracked_working_diff"
 path = "benches/tracked_working_diff.rs"
 harness = false
@@ -303,30 +308,6 @@ required-features = ["storage-benches", "slatedb"]
 [[bench]]
 name = "working_diff_file_scope"
 path = "benches/working_diff_file_scope.rs"
-harness = false
-required-features = ["storage-benches", "slatedb"]
-
-[[bench]]
-name = "slatedb_file_api"
-path = "benches/slatedb_file_api.rs"
-harness = false
-required-features = ["storage-benches", "slatedb"]
-
-[[bench]]
-name = "native_file_upsert_component"
-path = "benches/native_file_upsert_component.rs"
-harness = false
-required-features = ["storage-benches", "slatedb"]
-
-[[bench]]
-name = "native_file_read_component"
-path = "benches/native_file_read_component.rs"
-harness = false
-required-features = ["storage-benches", "slatedb"]
-
-[[bench]]
-name = "large_blob_updates"
-path = "benches/large_blob_updates.rs"
 harness = false
 required-features = ["storage-benches", "slatedb"]
 
@@ -411,11 +392,6 @@ required-features = ["lix/storage-benches", "rocksdb", "slatedb"]
 [[example]]
 name = "exppq_write_scaling"
 path = "examples/exppq_write_scaling.rs"
-required-features = ["storage-benches"]
-
-[[example]]
-name = "exppq_point_query"
-path = "examples/exppq_point_query.rs"
 required-features = ["storage-benches"]
 
 [[example]]

@@ -1,5 +1,5 @@
 use lix::Value;
-use lix::integration::Engine;
+use lix::open_lix;
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
@@ -74,14 +74,16 @@ async fn prepare_current_untracked<S>(storage: S)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("untracked repository should initialize");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("untracked repository should open");
-    let session = engine
-        .open_session()
+    let session = lix
+        .open_another_session()
         .await
         .expect("untracked session should open");
     session
@@ -107,7 +109,7 @@ where
         "unrelated CAS garbage must reclaim while the current untracked root survives",
     );
     drop(session);
-    drop(engine);
+    drop(lix);
     drop(adapter);
     drop(storage);
 }
@@ -116,11 +118,12 @@ async fn verify_current_untracked<S>(storage: S)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
         .expect("untracked repository should cold reopen");
-    let session = engine
-        .open_session()
+    let session = lix
+        .open_another_session()
         .await
         .expect("cold untracked session should open");
     let content = session
@@ -140,14 +143,16 @@ async fn prepare_history<S>(storage: S) -> HistoryFixture
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("history repository should initialize");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("history repository should open");
-    let session = engine
-        .open_session()
+    let session = lix
+        .open_another_session()
         .await
         .expect("history preparation session should open");
     let branch = session
@@ -159,10 +164,16 @@ where
         .await
         .expect("history disposable branch should create");
     let branch_id = branch.id;
-    let branch_session = engine
-        .open_session_at(branch_id.clone())
+    let branch_session = lix
+        .open_another_session()
         .await
         .expect("history disposable branch should open");
+    branch_session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: (branch_id.clone()).to_string(),
+        })
+        .await
+        .expect("switch session branch");
     branch_session
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/history.bin', $1)",
@@ -194,7 +205,7 @@ where
     );
     drop(branch_session);
     drop(session);
-    drop(engine);
+    drop(lix);
     drop(adapter);
     drop(storage);
     HistoryFixture {
@@ -210,13 +221,20 @@ async fn verify_history_and_release<S>(storage: S, fixture: HistoryFixture)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("history repository should cold reopen");
-    let session = engine
-        .open_session_at(fixture.branch_id.clone())
+    let session = lix
+        .open_another_session()
         .await
         .expect("history disposable branch should cold reopen");
+    session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: (fixture.branch_id.clone()).to_string(),
+        })
+        .await
+        .expect("switch session branch");
     let diff = session
         .execute(
             "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
@@ -241,8 +259,8 @@ where
     assert_eq!(read_current_file(&session).await, V2);
     drop(session);
 
-    let main = engine
-        .open_session()
+    let main = lix
+        .open_another_session()
         .await
         .expect("history main session should reopen");
     main.execute(
@@ -275,7 +293,7 @@ where
             .is_none(),
         "v2 must reclaim with its deleted branch",
     );
-    drop(engine);
+    drop(lix);
     drop(adapter);
     drop(storage);
 }
@@ -284,11 +302,12 @@ async fn verify_final_state<S>(storage: S)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
         .expect("final history repository should reopen");
-    let session = engine
-        .open_session()
+    let session = lix
+        .open_another_session()
         .await
         .expect("final history session should open");
     let branches = session
@@ -301,7 +320,7 @@ where
     assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
 }
 
-async fn branch_commit<S>(session: &lix::integration::SessionContext<S>, branch_id: &str) -> String
+async fn branch_commit<S>(session: &lix::Lix<S>, branch_id: &str) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -317,7 +336,7 @@ where
         .expect("branch commit should exist")
 }
 
-async fn read_current_file<S>(session: &lix::integration::SessionContext<S>) -> Vec<u8>
+async fn read_current_file<S>(session: &lix::Lix<S>) -> Vec<u8>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

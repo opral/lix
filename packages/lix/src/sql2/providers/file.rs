@@ -2889,9 +2889,11 @@ async fn indexed_file_path_writes(
     writes: &[FastLixFilePathWrite],
     conflict: FastLixFilePathWriteConflict,
 ) -> Result<Option<IndexedFilePathWrites>, LixError> {
-    let index = Box::pin(ctx.filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
-        active_branch_id.to_string(),
-    ])))
+    let index = Box::pin(
+        ctx.filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+            active_branch_id.to_string(),
+        ])),
+    )
     .await?;
     let mut existing = Vec::with_capacity(writes.len());
     for write in writes {
@@ -2954,9 +2956,11 @@ async fn indexed_file_id_writes(
     active_branch_id: &str,
     writes: &[FastLixFilePathWrite],
 ) -> Result<Option<IndexedFilePathWrites>, LixError> {
-    let index = Box::pin(ctx.filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
-        active_branch_id.to_string(),
-    ])))
+    let index = Box::pin(
+        ctx.filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+            active_branch_id.to_string(),
+        ])),
+    )
     .await?;
     let mut unique_ids = BTreeSet::new();
     let mut existing = Vec::with_capacity(writes.len());
@@ -5514,8 +5518,7 @@ async fn plugin_render_context_for_lix_file_scan_cached(
         return Ok(None);
     }
     let branches =
-        load_plugin_render_branches(Arc::clone(&hot_state), request, &host, cache_snapshot)
-            .await?;
+        load_plugin_render_branches(Arc::clone(&hot_state), request, &host, cache_snapshot).await?;
     plugin_render_context_with_branches(
         hot_state,
         host,
@@ -5683,8 +5686,7 @@ async fn plugin_render_context_with_branches(
             // stored content blob, which is asserted by the lane-parity tests.
             // Extending this to both lanes means changing the reader and
             // belongs with the read-path work, not the unskip.
-            let Some(owner) =
-                PluginFileOwner::from_hot_state_row(&owned_row, &branch_id, false)?
+            let Some(owner) = PluginFileOwner::from_hot_state_row(&owned_row, &branch_id, false)?
             else {
                 continue;
             };
@@ -8669,22 +8671,21 @@ mod tests {
             request: &HotStateExactBatchRequest,
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
             self.exact_load_requests.push(request.clone());
-            Ok(
-                crate::hot_state::MaterializedHotStateExactBatch::from_rows(
-                    request
-                        .rows
-                        .iter()
-                        .map(|requested| {
-                            let matches = |row: &&MaterializedHotStateRow| {
-                                row.schema_key == requested.schema_key
-                                    && row.entity_pk == requested.entity_pk
-                                    && row.file_id == requested.file_id
-                                    && request
-                                        .untracked
-                                        .is_none_or(|untracked| row.untracked == untracked)
-                            };
-                            let mut row = self
-                                .rows
+            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
+                request
+                    .rows
+                    .iter()
+                    .map(|requested| {
+                        let matches = |row: &&MaterializedHotStateRow| {
+                            row.schema_key == requested.schema_key
+                                && row.entity_pk == requested.entity_pk
+                                && row.file_id == requested.file_id
+                                && request
+                                    .untracked
+                                    .is_none_or(|untracked| row.untracked == untracked)
+                        };
+                        let mut row =
+                            self.rows
                                 .iter()
                                 .filter(matches)
                                 .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
@@ -8694,21 +8695,20 @@ mod tests {
                                     })
                                 })?
                                 .clone();
-                            if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
-                                && requested.branch_id != crate::GLOBAL_BRANCH_ID
-                            {
-                                row.branch_id = requested.branch_id.clone().into();
-                                row.global = true;
-                            }
-                            if row.deleted && !request.include_tombstones {
-                                None
-                            } else {
-                                Some(row)
-                            }
-                        })
-                        .collect(),
-                ),
-            )
+                        if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
+                            && requested.branch_id != crate::GLOBAL_BRANCH_ID
+                        {
+                            row.branch_id = requested.branch_id.clone().into();
+                            row.global = true;
+                        }
+                        if row.deleted && !request.include_tombstones {
+                            None
+                        } else {
+                            Some(row)
+                        }
+                    })
+                    .collect(),
+            ))
         }
 
         async fn filesystem_path_index(
@@ -8785,34 +8785,30 @@ mod tests {
                 .lock()
                 .expect("scan request mutex should not be poisoned")
                 .push(request.clone());
-            Ok(MaterializedHotStateBatch::from_rows(
-                self.blob_rows.clone(),
-            ))
+            Ok(MaterializedHotStateBatch::from_rows(self.blob_rows.clone()))
         }
 
         async fn load_exact_hot_state_batch(
             &mut self,
             request: &HotStateExactBatchRequest,
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            Ok(
-                crate::hot_state::MaterializedHotStateExactBatch::from_rows(
-                    request
-                        .rows
-                        .iter()
-                        .map(|requested| {
-                            self.blob_rows
-                                .iter()
-                                .find(|row| {
-                                    row.schema_key == requested.schema_key
-                                        && row.entity_pk == requested.entity_pk
-                                        && row.file_id == requested.file_id
-                                        && row.branch_id.as_ref() == requested.branch_id.as_str()
-                                })
-                                .cloned()
-                        })
-                        .collect(),
-                ),
-            )
+            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
+                request
+                    .rows
+                    .iter()
+                    .map(|requested| {
+                        self.blob_rows
+                            .iter()
+                            .find(|row| {
+                                row.schema_key == requested.schema_key
+                                    && row.entity_pk == requested.entity_pk
+                                    && row.file_id == requested.file_id
+                                    && row.branch_id.as_ref() == requested.branch_id.as_str()
+                            })
+                            .cloned()
+                    })
+                    .collect(),
+            ))
         }
 
         async fn filesystem_path_index(
@@ -8947,22 +8943,21 @@ mod tests {
                 .expect("live-state request mutex should not be poisoned")
                 .push(recorded);
 
-            Ok(
-                crate::hot_state::MaterializedHotStateExactBatch::from_rows(
-                    request
-                        .rows
-                        .iter()
-                        .map(|requested| {
-                            let exact_match = |row: &&MaterializedHotStateRow| {
-                                row.schema_key == requested.schema_key
-                                    && row.entity_pk == requested.entity_pk
-                                    && row.file_id == requested.file_id
-                                    && request
-                                        .untracked
-                                        .is_none_or(|untracked| row.untracked == untracked)
-                            };
-                            let mut row = self
-                                .rows
+            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
+                request
+                    .rows
+                    .iter()
+                    .map(|requested| {
+                        let exact_match = |row: &&MaterializedHotStateRow| {
+                            row.schema_key == requested.schema_key
+                                && row.entity_pk == requested.entity_pk
+                                && row.file_id == requested.file_id
+                                && request
+                                    .untracked
+                                    .is_none_or(|untracked| row.untracked == untracked)
+                        };
+                        let mut row =
+                            self.rows
                                 .iter()
                                 .filter(exact_match)
                                 .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
@@ -8972,21 +8967,20 @@ mod tests {
                                     })
                                 })?
                                 .clone();
-                            if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
-                                && requested.branch_id != crate::GLOBAL_BRANCH_ID
-                            {
-                                row.branch_id = requested.branch_id.clone().into();
-                                row.global = true;
-                            }
-                            if row.deleted && !request.include_tombstones {
-                                None
-                            } else {
-                                Some(row)
-                            }
-                        })
-                        .collect(),
-                ),
-            )
+                        if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
+                            && requested.branch_id != crate::GLOBAL_BRANCH_ID
+                        {
+                            row.branch_id = requested.branch_id.clone().into();
+                            row.global = true;
+                        }
+                        if row.deleted && !request.include_tombstones {
+                            None
+                        } else {
+                            Some(row)
+                        }
+                    })
+                    .collect(),
+            ))
         }
     }
 

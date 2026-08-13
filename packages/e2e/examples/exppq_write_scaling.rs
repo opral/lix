@@ -26,8 +26,8 @@
 use std::time::Instant;
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -91,14 +91,12 @@ async fn run_lane<S>(storage: S, lane: Lane, seeded: usize, measured: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize fixture");
-    let engine = Engine::new(storage).await.expect("open engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("open session");
+    let lix = open_lix().with_storage(storage).await.expect("open lix");
+    let session = lix.open_another_session().await.expect("open session");
 
     for schema in schemas() {
         session
@@ -144,7 +142,7 @@ where
     );
 }
 
-async fn insert_row<S>(session: &SessionContext<S>, lane: Lane, index: usize)
+async fn insert_row<S>(session: &Lix<S>, lane: Lane, index: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

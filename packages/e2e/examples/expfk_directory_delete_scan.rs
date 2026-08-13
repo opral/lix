@@ -22,8 +22,8 @@
 use std::time::{Duration, Instant};
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 const SEED_DIRECTORIES: usize = 100;
@@ -66,15 +66,16 @@ async fn main() {
     }
     let storage = RocksDB::open(&path).expect("open RocksDB");
     if seeding {
-        Engine::initialize(storage.clone())
+        open_lix()
+            .with_storage(storage.clone())
             .await
             .expect("initialize repository");
     }
-    let engine = Engine::new(storage.clone()).await.expect("open engine");
-    let session = engine
-        .open_session()
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open workspace");
+        .expect("open lix");
+    let session = lix.open_another_session().await.expect("open workspace");
 
     let seed_started = Instant::now();
     if seeding {
@@ -135,7 +136,7 @@ fn micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000_000.0
 }
 
-async fn seed_files<S>(session: &SessionContext<S>, files: usize, seed_batch: usize)
+async fn seed_files<S>(session: &Lix<S>, files: usize, seed_batch: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -164,7 +165,7 @@ where
 
 /// Empty directories, one per timed sample plus a warmup. These carry no file
 /// children, so the timed transaction stages exactly one directory tombstone.
-async fn seed_victims<S>(session: &SessionContext<S>, samples: usize, seed_batch: usize)
+async fn seed_victims<S>(session: &Lix<S>, samples: usize, seed_batch: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -186,7 +187,7 @@ where
     }
 }
 
-async fn delete_directory<S>(session: &SessionContext<S>, path: &str)
+async fn delete_directory<S>(session: &Lix<S>, path: &str)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -204,7 +205,7 @@ where
     );
 }
 
-async fn count_files<S>(session: &SessionContext<S>) -> i64
+async fn count_files<S>(session: &Lix<S>) -> i64
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

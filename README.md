@@ -15,19 +15,19 @@ AI products want a repository: files for agents, a SQL database for your app, an
 
 <img src="./website/public/assets/lix-repo.svg" alt="A Lix repo holds files, a SQL database, and version control in one system" width="760" />
 
-- 📄 **Files, in any format.** Text and Markdown, but also DOCX, XLSX, and CAD. Plugins map any format to versioned entities.
+- 📄 **Files, in any format.** Store text and binary files. Plugins make supported formats queryable as versioned entities.
 - 🗄️ **SQL database.** File content, app data, and history live in an ACID OLTP database. Query millions of rows with SQL.
 - 🔀 **Version control.** Semantic changes: the clause, cell, or row that changed, not a byte blob. Review, merge, and roll back.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
-- 🧩 **Pluggable storage.** Local filesystem, S3, or OPFS in the browser. Lix runs wherever your product runs.
+- 🧩 **Pluggable storage.** Local filesystem, IndexedDB in the browser, or S3 behind a Lix server.
 - 🔒 **Permissions (soon).** Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.
 
 ## Getting started
 
 <p>
-  <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
+  <a href="https://lix.dev/docs/javascript-quickstart"><img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript</a> ·
+  <a href="https://lix.dev/docs/rust-quickstart"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
   <a href="https://github.com/opral/lix/issues/373" title="The Python SDK is planned. Upvote the issue on GitHub."><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
-  <a href="https://github.com/opral/lix/issues/371" title="The Rust SDK is planned. Upvote the issue on GitHub."><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
   <a href="https://github.com/opral/lix/issues/370" title="The Go SDK is planned. Upvote the issue on GitHub."><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
 </p>
 
@@ -70,9 +70,12 @@ Your product gives every customer their own repository: their files, their data,
 <img src="./website/public/assets/customer-repositories.svg" alt="Your product creates one Lix repository per customer, each holding a different mix of automations, handbooks, pricing, and knowledge files" width="760" />
 
 ```ts
-// One repository per customer, on your storage.
+// One hosted repository per customer.
 const lix = await openLix({
-  storage: new S3Storage({ bucket: `customer-${customer.id}` }),
+  server: {
+    mode: "remote",
+    url: `https://example.com/repositories/${customer.id}`,
+  },
 });
 
 // The agent writes an automation. Lix records the change, no commit needed.
@@ -114,13 +117,13 @@ Update Lix files and rows in one ACID transaction. Lix records the history autom
 
 Plugins map files to SQL rows. A paragraph, cell, or property becomes a row Lix can version.
 
-The file stays a normal file on disk. The rows are queryable with SQL. Lix tracks every change to both.
+With `LocalFilesystem`, the file stays available on disk. Its entities are queryable with SQL. Lix tracks changes to both.
 
 <img src="./website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
 
 ### Runs in-process as part of your infrastructure
 
-Lix runs in-process with pluggable storage: in memory, on the local filesystem, or on an S3 bucket. Mix and match however it serves your infrastructure.
+Lix runs in-process with pluggable storage: in memory, on the local filesystem, or in a server backed by S3.
 
 <img src="./website/public/assets/pluggable-storage.svg" alt="Lix runs in-process inside your product, with an arrow to pluggable storage: memory, filesystem, or S3" width="760" />
 

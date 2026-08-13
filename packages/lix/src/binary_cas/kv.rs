@@ -9,9 +9,9 @@ use crate::binary_cas::codec::{
     encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::{
-    BinaryCasGcSweep, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment,
-    BlobEditSplice, BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes,
-    BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
+    BinaryCasGcSweep, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
+    BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes, BlobRangeBytesBatch,
+    BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
@@ -252,7 +252,8 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
     loop {
         let (page, page_has_more) = manifest_cursor
             .next_page(CAS_RECLAIM_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let blob_id = BlobId::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
                 LixError::new(
@@ -298,7 +299,8 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
     loop {
         let (page, page_has_more) = manifest_chunk_cursor
             .next_page(CAS_RECLAIM_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let (blob_id, offset) = decode_manifest_chunk_key(&entry.key)?;
             let keep = live_manifest_sizes
@@ -337,7 +339,8 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
     loop {
         let (page, page_has_more) = chunk_cursor
             .next_page(CAS_RECLAIM_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let chunk_hash =
                 ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
@@ -373,7 +376,8 @@ pub(in crate::binary_cas) async fn stage_reclaim_unreachable_binary_cas(
     loop {
         let (page, page_has_more) = presence_cursor
             .next_page(CAS_RECLAIM_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let chunk_hash =
                 ChunkHash::from_bytes(entry.key.0.as_ref().try_into().map_err(|_| {
@@ -1052,10 +1056,10 @@ async fn scan_all_values_for_range(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         values.extend(
-            page
-                .into_iter()
+            page.into_iter()
                 .filter_map(|entry| full_value(entry.value))
                 .map(|bytes| bytes.to_vec()),
         );
@@ -1177,9 +1181,11 @@ pub(crate) async fn load_bytes_many(
             let BlobLayout::Chunked { chunk_count } = &metadata.layout else {
                 return None;
             };
-            seen_manifest_hashes
-                .insert(metadata.hash)
-                .then_some((metadata.hash, *chunk_count, metadata.size_bytes))
+            seen_manifest_hashes.insert(metadata.hash).then_some((
+                metadata.hash,
+                *chunk_count,
+                metadata.size_bytes,
+            ))
         })
         .collect::<Vec<_>>();
     let scan_count = chunked_blobs.len();
@@ -1460,13 +1466,9 @@ async fn load_blob_range(
             // the request without reading the whole manifest.
             let anchor_bytes = CHUNK_ANCHOR_BYTES as u64;
             let scan_start = range.start - range.start % anchor_bytes;
-            let manifest = load_declared_manifest_chunk_range(
-                store,
-                metadata.hash,
-                scan_start,
-                range.end,
-            )
-            .await?;
+            let manifest =
+                load_declared_manifest_chunk_range(store, metadata.hash, scan_start, range.end)
+                    .await?;
             if manifest.is_empty() || manifest.len() > *chunk_count as usize {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -2484,9 +2486,7 @@ fn chunk_ranges_from_receipts(
     Ok(ranges)
 }
 
-fn prepare_blob_write(
-    payload: &crate::binary_cas::BlobPayload,
-) -> Result<BlobWritePlan, LixError> {
+fn prepare_blob_write(payload: &crate::binary_cas::BlobPayload) -> Result<BlobWritePlan, LixError> {
     let bytes = payload.bytes();
     let blob_hash = payload
         .hash()
@@ -4162,8 +4162,7 @@ mod tests {
     fn every_non_empty_blob_is_out_of_line() {
         for size in [1, 32 * 1024, 128 * 1024] {
             let payload = BlobPayload::from_bytes(vec![b'a'; size]);
-            let plan = prepare_blob_write(&payload)
-                .expect("non-empty blob should plan");
+            let plan = prepare_blob_write(&payload).expect("non-empty blob should plan");
             assert!(!plan.chunk_ranges.is_empty());
             assert!(matches!(
                 plan.layout,

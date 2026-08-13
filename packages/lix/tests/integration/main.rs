@@ -1,8 +1,3 @@
-#![recursion_limit = "256"]
-
-#[macro_use]
-mod support;
-
 mod branching;
 mod checkpoint_gc;
 mod code_structure;
@@ -17,6 +12,7 @@ mod filesystem_fuzz;
 mod fs_api;
 mod json_pointer_crud_storage;
 mod merge_fuzz;
+mod mutation_identity;
 mod observe;
 mod observe_mutation_revision;
 mod physical_plan_cache;

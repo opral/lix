@@ -18,8 +18,8 @@ use datafusion::physical_plan::Statistics;
 use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::hot_state::{
-    EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey, HotStateContext,
-    HotStateRowFilter, HotStateScanRequest,
+    EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey, HotStateContext, HotStateRowFilter,
+    HotStateScanRequest,
 };
 use crate::storage_adapter::StorageAdapterRead;
 

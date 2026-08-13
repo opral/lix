@@ -8,10 +8,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let baseline = sim.initial_commit_id().to_string();
@@ -192,8 +189,14 @@ simulation_test!(
             )
             .await,
             vec![
-                vec![Value::Text("a".to_string()), Value::Json(json!("one").into())],
-                vec![Value::Text("b".to_string()), Value::Json(json!("two").into())],
+                vec![
+                    Value::Text("a".to_string()),
+                    Value::Json(json!("one").into())
+                ],
+                vec![
+                    Value::Text("b".to_string()),
+                    Value::Json(json!("two").into())
+                ],
             ]
         );
 

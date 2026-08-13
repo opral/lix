@@ -18,9 +18,8 @@ use crate::engine::Engine;
 use crate::session::SessionContext;
 use crate::storage::ProjectedValue;
 use crate::storage_adapter::{
-    Memory, SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead,
-    StorageBeginScanOptions, StorageKey, StoragePrefix, StorageReadOptions, StorageSpace,
-    StorageWriteOptions,
+    Memory, SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageBeginScanOptions,
+    StorageKey, StoragePrefix, StorageReadOptions, StorageSpace, StorageWriteOptions,
 };
 
 fn sizes_from_env(var: &str, default: &[usize]) -> Vec<usize> {
@@ -49,10 +48,7 @@ async fn open_session() -> (Memory, SessionContext<Memory>) {
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
     (storage, session)
 }
 
@@ -124,7 +120,9 @@ async fn row_census(storage: &Memory) -> RowCensus {
     let root_bases = space_values(&read, crate::hot_state::ROOT_CURRENT_BASE_SPACE)
         .await
         .len();
-    let diff_records = space_values(&read, crate::hot_state::DIFF_SPACE).await.len();
+    let diff_records = space_values(&read, crate::hot_state::DIFF_SPACE)
+        .await
+        .len();
     RowCensus {
         entries: rows.len(),
         tombstones,
@@ -142,10 +140,7 @@ async fn reopen_session(storage: &Memory) -> SessionContext<Memory> {
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should reopen");
-    engine
-        .open_session()
-        .await
-        .expect("session should reopen")
+    engine.open_session().await.expect("session should reopen")
 }
 
 /// Every `(key, value)` in one space.
@@ -577,7 +572,9 @@ async fn hot_row_tombstone_generation_rotation() {
 async fn hot_row_tombstone_compaction_premise() {
     let n = sizes_from_env("LIX_TOMBSTONE_SIZES", &[1_000])[0];
     let reps = reps_from_env(5);
-    println!("phase4 | arm,event,row_entries,tombstones,packed_bases,root_bases,diff_records,working_diff_rows,answer_rows,collection_rows,scan_us");
+    println!(
+        "phase4 | arm,event,row_entries,tombstones,packed_bases,root_bases,diff_records,working_diff_rows,answer_rows,collection_rows,scan_us"
+    );
 
     // ---- safe arm: the delete is already checkpointed ----
     {

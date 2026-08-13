@@ -30,7 +30,6 @@ use std::time::{Duration, Instant};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::diff_tracked_commits_for_bench;
@@ -39,6 +38,7 @@ use lix::{
     CreateBranchOptions, ExecuteBatchStatement, MergeBranchOptions, MergeBranchOutcome,
     MergeBranchPreviewOptions, Value,
 };
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -397,14 +397,16 @@ async fn setup<StorageImpl>(
         "changes per commit must not exceed row count"
     );
 
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize tracked-working-diff storage");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open tracked-working-diff engine");
-    let session = engine
-        .open_session()
+        .expect("open tracked-working-diff lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open tracked-working-diff session");
     register_schema(&session).await;
@@ -434,13 +436,20 @@ async fn setup<StorageImpl>(
         .active_branch_id()
         .await
         .expect("load tracked-working-diff branch id");
-    let head_commit_id = engine
-        .load_branch_head_commit_id(&branch_id)
+    let head_commit_id = lix
+        .execute(
+            "SELECT commit_id FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch_id)],
+        )
         .await
         .expect("load tracked-working-diff branch head")
-        .expect("tracked-working-diff fixture must have a branch head");
+        .rows()
+        .first()
+        .expect("tracked-working-diff fixture must have a branch head")
+        .get::<String>("commit_id")
+        .expect("tracked-working-diff head commit id must be text");
     drop(session);
-    drop(engine);
+    drop(lix);
     println!(
         "tracked_working_diff setup backend={} shape={} rows={row_count} commits={commit_count} \
          changes_per_commit={changes_per_commit} working_diffs={working_diffs} \
@@ -464,11 +473,12 @@ async fn measure<StorageImpl>(
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     assert!(path.exists(), "fixture {} does not exist", path.display());
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open tracked-working-diff engine");
-    let session = engine
-        .open_session()
+        .expect("open tracked-working-diff lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open tracked-working-diff session");
 
@@ -516,11 +526,12 @@ async fn measure_history<StorageImpl>(
 {
     assert!(path.exists(), "fixture {} does not exist", path.display());
     let adapter = StorageAdapter::new(storage.clone());
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("open tracked-working-diff engine");
-    let session = engine
-        .open_session()
+        .expect("open tracked-working-diff lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open tracked-working-diff session");
     let expected_changes = working_diff_count(&session).await;
@@ -569,11 +580,12 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     assert!(path.exists(), "fixture {} does not exist", path.display());
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open tracked-working-diff engine");
-    let session = engine
-        .open_session()
+        .expect("open tracked-working-diff lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open tracked-working-diff session");
     let before = working_diff_count(&session).await;
@@ -609,15 +621,17 @@ async fn measure_merge_preview<StorageImpl>(
         "merge preview needs disjoint target and source rows"
     );
     let adapter = StorageAdapter::new(storage.clone());
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize merge-preview storage");
     let (unrelated_history, settle_ms) = seed_unrelated_history(&adapter).await;
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("open merge-preview engine");
-    let target = engine
-        .open_session()
+        .expect("open merge-preview lix");
+    let target = lix
+        .open_another_session()
         .await
         .expect("open merge-preview target session");
     register_schema(&target).await;
@@ -634,10 +648,16 @@ async fn measure_merge_preview<StorageImpl>(
         })
         .await
         .expect("create merge-preview source branch");
-    let source = engine
-        .open_session_at(MERGE_PREVIEW_SOURCE_BRANCH_ID)
+    let source = lix
+        .open_another_session()
         .await
         .expect("open merge-preview source session");
+    source
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: (MERGE_PREVIEW_SOURCE_BRANCH_ID).to_string(),
+        })
+        .await
+        .expect("switch session branch");
 
     for commit_index in 0..commit_count {
         update_commit_range(&target, 0, commit_index, changes_per_commit, "target").await;
@@ -701,15 +721,17 @@ async fn measure_merge_commit<StorageImpl>(
 {
     let row_count = repetitions * changes_per_side * 2;
     let adapter = StorageAdapter::new(storage.clone());
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize merge-commit storage");
     let (unrelated_history, settle_ms) = seed_unrelated_history(&adapter).await;
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("open merge-commit engine");
-    let target = engine
-        .open_session()
+        .expect("open merge-commit lix");
+    let target = lix
+        .open_another_session()
         .await
         .expect("open merge-commit target session");
     register_schema(&target).await;
@@ -730,10 +752,16 @@ async fn measure_merge_commit<StorageImpl>(
             })
             .await
             .expect("create merge-commit source branch");
-        let source = engine
-            .open_session_at(&source_branch_id)
+        let source = lix
+            .open_another_session()
             .await
             .expect("open merge-commit source session");
+        source
+            .switch_branch(lix::SwitchBranchOptions {
+                branch_id: (&source_branch_id).to_string(),
+            })
+            .await
+            .expect("switch session branch");
         update_commit_range(
             &target,
             sample * changes_per_side,
@@ -814,7 +842,7 @@ where
     (changes, settle_ms)
 }
 
-async fn register_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
+async fn register_schema<StorageImpl>(session: &Lix<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -841,7 +869,7 @@ where
     assert_eq!(affected, 1);
 }
 
-async fn seed_rows<StorageImpl>(session: &SessionContext<StorageImpl>, row_count: usize)
+async fn seed_rows<StorageImpl>(session: &Lix<StorageImpl>, row_count: usize)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -878,7 +906,7 @@ where
 }
 
 async fn update_commit<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
+    session: &Lix<StorageImpl>,
     shape: Shape,
     row_count: usize,
     commit_index: usize,
@@ -913,7 +941,7 @@ async fn update_commit<StorageImpl>(
 }
 
 async fn update_commit_range<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
+    session: &Lix<StorageImpl>,
     row_offset: usize,
     commit_index: usize,
     changes_per_commit: usize,
@@ -945,7 +973,7 @@ async fn update_commit_range<StorageImpl>(
 }
 
 #[inline(never)]
-async fn profile_working_diff_query<StorageImpl>(session: &SessionContext<StorageImpl>) -> usize
+async fn profile_working_diff_query<StorageImpl>(session: &Lix<StorageImpl>) -> usize
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -956,7 +984,7 @@ where
         .len()
 }
 
-async fn working_diff_count<StorageImpl>(session: &SessionContext<StorageImpl>) -> usize
+async fn working_diff_count<StorageImpl>(session: &Lix<StorageImpl>) -> usize
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {

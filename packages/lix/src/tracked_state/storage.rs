@@ -3901,7 +3901,8 @@ pub(crate) async fn scan_commit_state_manifest_commit_ids(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in &page {
             let bytes: [u8; 16] = entry.key.0.as_ref().try_into().map_err(|_| {
                 LixError::new(
@@ -9953,7 +9954,8 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry_batch in page.chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS) {
             let commit_ids = entry_batch
                 .iter()
@@ -10121,7 +10123,8 @@ async fn validate_no_orphan_commit_delta_segments(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         if page.is_empty() {
             break;
         }
@@ -10599,7 +10602,8 @@ pub(crate) async fn stage_delete_commit_state_manifest_for_gc(
                 format!("retired columnar mutation authority '{commit_id}' names owner '{owner}'"),
             ));
         }
-        let row_group_id = crate::entity_columnar::entity_row_group_set_id(commit_id, &parts.schema_key);
+        let row_group_id =
+            crate::entity_columnar::entity_row_group_set_id(commit_id, &parts.schema_key);
         if row_group_id.as_bytes() != parts.row_group_set_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -10943,7 +10947,8 @@ pub(crate) async fn stage_sweep_unreachable_content_nodes(
         loop {
             let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?.into_parts();
+                .await?
+                .into_parts();
             for entry in page {
                 let node_id = <[u8; 32]>::try_from(entry.key.0.as_ref()).map_err(|_| {
                     LixError::new(
@@ -10988,7 +10993,8 @@ async fn scan_full_space(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in &page {
             let StorageProjectedValue::FullValue(bytes) = &entry.value else {
                 unreachable!("full commit-delta scan returned a key-only row");
@@ -13737,17 +13743,16 @@ mod tests {
         CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
         DecodedCommitDeltaCache, DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
         TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TrackedStateChunkOverlay,
-        columnar_identity_row_map,
-        decode_commit_delta_with_payloads, decode_encoded_commit_state_manifest,
-        decode_stored_commit_state_authority, encode_commit_delta_segment,
-        encode_commit_delta_segment_with_payloads, encode_commit_delta_segment_with_raw_sidecar,
-        encode_commit_state_manifest, key, load_change_record_by_id, load_commit_delta_change_ids,
-        load_commit_delta_change_records, load_commit_delta_members_with_payloads,
-        load_commit_delta_values_encoded, load_commit_state_manifest,
-        load_owned_commit_delta_entries, scan_change_records_from_commit_deltas,
-        scan_commit_delta_inventory, scan_commit_delta_members, scan_commit_delta_values,
-        stage_change_locators, stage_commit_state_manifest,
-        stage_delete_commit_delta_inventory_entry,
+        columnar_identity_row_map, decode_commit_delta_with_payloads,
+        decode_encoded_commit_state_manifest, decode_stored_commit_state_authority,
+        encode_commit_delta_segment, encode_commit_delta_segment_with_payloads,
+        encode_commit_delta_segment_with_raw_sidecar, encode_commit_state_manifest, key,
+        load_change_record_by_id, load_commit_delta_change_ids, load_commit_delta_change_records,
+        load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
+        load_commit_state_manifest, load_owned_commit_delta_entries,
+        scan_change_records_from_commit_deltas, scan_commit_delta_inventory,
+        scan_commit_delta_members, scan_commit_delta_values, stage_change_locators,
+        stage_commit_state_manifest, stage_delete_commit_delta_inventory_entry,
         stage_fragmented_scoped_current_state_descriptor, value,
     };
 
@@ -18146,8 +18151,7 @@ mod tests {
 
         let mut corrupt = storage.new_write_set();
         corrupt.delete(
-            super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
-                .mutable_view_for_corruption_test(),
+            super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.mutable_view_for_corruption_test(),
             key(super::commit_mutation_inventory_key(manifest.commit_id)),
         );
         storage
@@ -18198,8 +18202,7 @@ mod tests {
         *last ^= 1;
         let mut corrupt = storage.new_write_set();
         corrupt.put(
-            super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
-                .mutable_view_for_corruption_test(),
+            super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.mutable_view_for_corruption_test(),
             key(super::commit_mutation_inventory_key(manifest.commit_id)),
             value(tampered_catalog),
         );
@@ -18219,8 +18222,7 @@ mod tests {
 
         let mut repair = storage.new_write_set();
         repair.put(
-            super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE
-                .mutable_view_for_corruption_test(),
+            super::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.mutable_view_for_corruption_test(),
             key(super::commit_mutation_inventory_key(manifest.commit_id)),
             value(encoded.mutation_inventory),
         );

@@ -123,9 +123,7 @@ pub(crate) async fn stage_json_reclamation_fence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_adapter::{
-        Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions,
-    };
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     async fn stage_publication_only(
         storage: &StorageAdapter<Memory>,

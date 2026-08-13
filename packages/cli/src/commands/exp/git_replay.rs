@@ -2,8 +2,7 @@ use crate::cli::exp::{ExpGitReplayArgs, GitReplayParentTree, GitReplayPlugins, G
 use crate::db;
 use crate::error::CliError;
 use lix::storage::Storage;
-use lix::plugin::runtime::WasmTransitionCounters;
-use lix::{Lix, PreparedDmlParameterBatch, Value, open_lix};
+use lix::{Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use serde::Serialize;
@@ -14,7 +13,6 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use zip::write::SimpleFileOptions;
@@ -168,36 +166,6 @@ struct ReplayPluginCounters {
     conflict_resolution_calls: u64,
     conflict_resolution_records: u64,
     conflict_resolution_takes: u64,
-}
-
-impl From<WasmTransitionCounters> for ReplayPluginCounters {
-    fn from(value: WasmTransitionCounters) -> Self {
-        Self {
-            source_read_calls: value.source_read_calls,
-            source_bytes_read: value.source_bytes_read,
-            packet_pages: value.packet_pages,
-            packet_records: value.packet_records,
-            attachment_reads: value.attachment_reads,
-            attachment_bytes_read: value.attachment_bytes_read,
-            component_import_calls: value.component_import_calls,
-            component_boundary_bytes: value.component_boundary_bytes,
-            guest_linear_memory_high_water_bytes: value.guest_linear_memory_high_water_bytes,
-            host_full_diff_bytes_compared: value.host_full_diff_bytes_compared,
-            host_content_classification_bytes: value.host_content_classification_bytes,
-            full_state_semantic_rows_materialized: value.full_state_semantic_rows_materialized,
-            change_payload_requests: value.change_payload_requests,
-            returned_change_payloads: value.returned_change_payloads,
-            durable_semantic_changes: value.durable_semantic_changes,
-            private_document_cache_hits: value.private_document_cache_hits,
-            shared_renderer_cache_hits: value.shared_renderer_cache_hits,
-            full_document_reparses: value.full_document_reparses,
-            full_renderer_invocations: value.full_renderer_invocations,
-            filesystem_sync_full_renders: value.filesystem_sync_full_renders,
-            conflict_resolution_calls: value.conflict_resolution_calls,
-            conflict_resolution_records: value.conflict_resolution_records,
-            conflict_resolution_takes: value.conflict_resolution_takes,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -466,12 +434,11 @@ where
         {
             marker_only += 1;
         }
-        lix.reset_plugin_transition_counters();
         let execute_started = Instant::now();
         let physical_execution_groups =
             execute_statements_as_transaction(&lix, &statements, commit_sha)?;
         let execute_ms = duration_to_ms(execute_started.elapsed());
-        let plugin_counters = lix.plugin_transition_counters().into();
+        let plugin_counters = ReplayPluginCounters::default();
         phase_totals.execute_ms += execute_ms;
         applied += 1;
         let checkpoint_ms = if checkpoint_every.is_some_and(|interval| (index + 1) % interval == 0)
@@ -629,10 +596,9 @@ fn execute_statements_as_transaction<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    // Keep every statement in one explicit transaction. Maximal contiguous
-    // single-row lix_file runs use the same public prepared page contract as
-    // SDK/benchmark callers; marker and shape/dependency barriers stay in
-    // order through ordinary transaction.execute calls.
+    // Keep every statement in one explicit transaction. Prepared bulk writes
+    // are an engine implementation detail, so the CLI uses the same public SQL
+    // transaction API as other applications.
     let mut transaction = db::block_on(lix.begin_transaction()).map_err(|error| {
         CliError::msg(format!(
             "failed to begin replay transaction {commit_sha}: {error}"
@@ -649,38 +615,15 @@ where
         {
             end += 1;
         }
-        if end - index >= 2 && is_prepared_replay_shape(&statement.sql) {
-            let parameter_batch = PreparedDmlParameterBatch::from_rows(
-                statements[index..end]
-                    .iter()
-                    .map(|statement| statement.params.clone()),
-            )
-            .map_err(|error| {
-                CliError::msg(format!(
-                    "failed at commit {commit_sha} while packing prepared replay batch: {error}"
-                ))
-            })?;
-            db::block_on(transaction.execute_prepared_dml_batch(
-                Arc::<str>::from(statement.sql.as_str()),
-                parameter_batch,
-            ))
-            .map_err(|error| {
-                CliError::msg(format!(
-                    "failed at commit {commit_sha} while executing prepared replay batch: {error}"
-                ))
-            })?;
+        for statement in &statements[index..end] {
+            db::block_on(transaction.execute(&statement.sql, &statement.params)).map_err(
+                |error| {
+                    CliError::msg(format!(
+                        "failed at commit {commit_sha} while executing replay statement: {error}"
+                    ))
+                },
+            )?;
             physical_execution_groups += 1;
-        } else {
-            for statement in &statements[index..end] {
-                db::block_on(transaction.execute(&statement.sql, &statement.params)).map_err(
-                    |error| {
-                        CliError::msg(format!(
-                            "failed at commit {commit_sha} while executing replay statement: {error}"
-                        ))
-                    },
-                )?;
-                physical_execution_groups += 1;
-            }
         }
         index = end;
     }
@@ -693,10 +636,6 @@ where
     Ok(physical_execution_groups)
 }
 
-fn is_prepared_replay_shape(sql: &str) -> bool {
-    sql.starts_with("INSERT INTO lix_file (")
-}
-
 fn git_replay_marker_statement(commit: &ReplayCommit) -> SqlStatement {
     SqlStatement {
         sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
@@ -704,10 +643,13 @@ fn git_replay_marker_statement(commit: &ReplayCommit) -> SqlStatement {
             .to_string(),
         params: vec![
             Value::Text(GIT_REPLAY_MARKER_KEY.to_string()),
-            Value::Json(json!({
-                "sha": commit.sha,
-                "first_parent": commit.first_parent,
-            }).into()),
+            Value::Json(
+                json!({
+                    "sha": commit.sha,
+                    "first_parent": commit.first_parent,
+                })
+                .into(),
+            ),
         ],
     }
 }
@@ -1950,10 +1892,13 @@ fn value_from_optional_blob(data: Option<&Vec<u8>>) -> Value {
 }
 
 fn git_file_metadata_value(row: &WriteRow) -> Value {
-    Value::Json(json!({
-        "git_mode": row.git_mode,
-        "git_oid": row.git_oid,
-    }).into())
+    Value::Json(
+        json!({
+            "git_mode": row.git_mode,
+            "git_oid": row.git_oid,
+        })
+        .into(),
+    )
 }
 
 fn verify_final_git_tree<StorageImpl>(
@@ -2576,8 +2521,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_multi_file_replay_uses_one_prepared_page_and_keeps_marker_atomic() {
-        let before = PreparedDmlParameterBatch::take_execution_counters();
+    fn ordinary_multi_file_replay_keeps_marker_atomic() {
         let lix =
             db::block_on(open_lix().with_storage(Memory::new())).expect("memory Lix should open");
         let statements =
@@ -2610,13 +2554,7 @@ mod tests {
         let physical_execution_groups =
             execute_statements_as_transaction(&lix, &statements, "commit-1")
                 .expect("ordinary replay transaction should commit");
-        assert_eq!(physical_execution_groups, 2);
-        let after = PreparedDmlParameterBatch::take_execution_counters();
-        assert_eq!(
-            (after.0 - before.0, after.1 - before.1),
-            (1, 2),
-            "two contiguous file rows must enter one prepared production page"
-        );
+        assert_eq!(physical_execution_groups, 3);
         let marker = db::block_on(lix.execute(
             "SELECT value FROM lix_key_value WHERE key = $1",
             &[Value::Text(GIT_REPLAY_MARKER_KEY.to_string())],
@@ -3670,8 +3608,8 @@ mod tests {
             commits[0]
                 .get("physical_execution_groups")
                 .and_then(serde_json::Value::as_u64),
-            Some(2),
-            "bulk inserts and the replay marker must use one prepared page plus one marker group"
+            Some((TEXT_FILES + 1) as u64),
+            "each insert and the replay marker must use the public SQL transaction API"
         );
         assert_eq!(
             commits[1]
@@ -3690,8 +3628,8 @@ mod tests {
             commits[1]
                 .get("physical_execution_groups")
                 .and_then(serde_json::Value::as_u64),
-            Some(2),
-            "bulk updates and the replay marker must use one prepared page plus one marker group"
+            Some((TEXT_FILES + 1) as u64),
+            "each update and the replay marker must use the public SQL transaction API"
         );
 
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");

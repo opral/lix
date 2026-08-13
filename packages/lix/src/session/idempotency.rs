@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage_adapter::StorageSpaceId;
 use crate::storage_adapter::{
-    StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions, StorageKey,
-    StorageProjectedValue, StorageSpace, ValueSemantics, exact_get_many,
+    StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
+    StorageKey, StorageProjectedValue, StorageSpace, ValueSemantics, exact_get_many,
 };
 use crate::{LixError, LixNotice, Value};
 
@@ -417,10 +417,8 @@ mod tests {
     #[test]
     fn non_finite_reals_are_refused_before_commit() {
         let identity = identity();
-        let result = ExecuteResult::from_rows(
-            vec!["c".to_owned()],
-            vec![vec![Value::Real(f64::INFINITY)]],
-        );
+        let result =
+            ExecuteResult::from_rows(vec!["c".to_owned()], vec![vec![Value::Real(f64::INFINITY)]]);
         let error =
             ExecuteIdempotencyReceipt::single(&identity, &result).expect_err("must be refused");
         assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
@@ -431,18 +429,11 @@ mod tests {
     /// a different key.
     #[test]
     fn scope_is_decided_by_the_key_alone() {
-        let scoped = ExecuteIdempotency::new(
-            Some("usr_a".to_owned()),
-            "shared-key".to_owned(),
-            [7u8; 32],
-        );
-        let other = ExecuteIdempotency::new(
-            Some("usr_b".to_owned()),
-            "shared-key".to_owned(),
-            [7u8; 32],
-        );
-        let unscoped =
-            ExecuteIdempotency::new(None, "shared-key".to_owned(), [7u8; 32]);
+        let scoped =
+            ExecuteIdempotency::new(Some("usr_a".to_owned()), "shared-key".to_owned(), [7u8; 32]);
+        let other =
+            ExecuteIdempotency::new(Some("usr_b".to_owned()), "shared-key".to_owned(), [7u8; 32]);
+        let unscoped = ExecuteIdempotency::new(None, "shared-key".to_owned(), [7u8; 32]);
         let empty_scope =
             ExecuteIdempotency::new(Some(String::new()), "shared-key".to_owned(), [7u8; 32]);
         let keys = [&scoped, &other, &unscoped, &empty_scope]

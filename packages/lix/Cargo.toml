@@ -37,10 +37,6 @@ server-protocol = [
 ]
 
 [[test]]
-name = "integration"
-path = "tests/integration/main.rs"
-
-[[test]]
 name = "execute_result_allocations"
 path = "tests/execute_result_allocations.rs"
 
@@ -63,21 +59,6 @@ path = "tests/deterministic_sequence_corruption.rs"
 [[test]]
 name = "send_futures"
 path = "tests/send_futures.rs"
-
-# `SqlReadProfile` and `execute_profiled` are the diagnostic surface this test
-# asserts on, and both live behind `storage-benches`. CI's
-# `cargo test --workspace --all-features` run builds it; a plain
-# `cargo test -p lix` skips the target rather than failing to compile it.
-[[test]]
-name = "point_join_scan_scaling"
-path = "tests/point_join_scan_scaling.rs"
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "profile_sql_result_streaming"
-path = "benches/profile_sql_result_streaming.rs"
-harness = false
-required-features = ["storage-benches"]
 
 # Benches that need nothing but `lix` itself. They ran in the e2e crate purely
 # because that is where benches happened to live, which meant measuring the SQL

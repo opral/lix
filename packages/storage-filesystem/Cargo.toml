@@ -28,3 +28,7 @@ tempfile = "3"
 [[example]]
 name = "profile_fs_open"
 path = "examples/profile_fs_open.rs"
+
+[[example]]
+name = "sync_repository"
+path = "examples/sync_repository.rs"

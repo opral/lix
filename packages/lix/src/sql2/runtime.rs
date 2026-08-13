@@ -80,10 +80,7 @@ impl RuntimeReadPlan {
 /// Replaces detached `EmptyTable` scan sources with the current session's
 /// providers. Mirrors the eager rebinding previously done during logical
 /// planning; provider resolution goes through the same shared catalog list.
-async fn rebind_detached_read_plan(
-    state: &SessionState,
-    plan: LogicalPlan,
-) -> Result<LogicalPlan> {
+async fn rebind_detached_read_plan(state: &SessionState, plan: LogicalPlan) -> Result<LogicalPlan> {
     let mut tables = BTreeSet::new();
     plan.apply(|node| {
         if let LogicalPlan::TableScan(scan) = node {
@@ -98,9 +95,7 @@ async fn rebind_detached_read_plan(
             .table(table.table())
             .await?
             .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "cached SQL plan provider '{table}' is unavailable"
-                ))
+                DataFusionError::Plan(format!("cached SQL plan provider '{table}' is unavailable"))
             })?;
         providers.insert(table, provider_as_source(provider));
     }
@@ -199,7 +194,9 @@ async fn create_or_rebind_physical_plan(
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let Some((cache, key)) = physical_planning_cache else {
-        return state.create_physical_plan(&logical_plan.into_bound(state).await?).await;
+        return state
+            .create_physical_plan(&logical_plan.into_bound(state).await?)
+            .await;
     };
     let Some(cached) = cache.physical_read_plan(&key) else {
         let logical_plan = logical_plan.into_bound(state).await?;

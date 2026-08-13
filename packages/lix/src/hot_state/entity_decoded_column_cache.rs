@@ -784,9 +784,8 @@ mod tests {
         let resident_array = array(0);
         let bytes = resident_array.get_array_memory_size();
         let budget = Arc::new(crate::hot_state::EntityColumnarArrayBudget::new(bytes));
-        let mut exact = crate::hot_state::EntityColumnarShadowMaskCache::with_array_budget(
-            Arc::clone(&budget),
-        );
+        let mut exact =
+            crate::hot_state::EntityColumnarShadowMaskCache::with_array_budget(Arc::clone(&budget));
         let shadow = crate::hot_state::EntityColumnarShadowMaskKey {
             row_groups: RowGroupSetId::new([18; 16]),
             branch_id: Arc::from("main"),

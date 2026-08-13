@@ -9,10 +9,6 @@ pub(crate) use tracked_head::{head_decode_entity_pk_probe, hot_decode_entity_pk_
 mod types;
 pub(crate) mod visibility;
 
-#[allow(unused_imports)]
-pub(crate) use context::{
-    BranchHeadControlCache, GlobalKeyValueRowCache, HotStateContext, HotStateContextReader,
-};
 /// Re-exported for the consumers that already spell these `crate::hot_state::…`.
 /// The definitions live in the top-level `entity_columnar` module, which sits
 /// below both state planes; this facade only exists so the move did not have to
@@ -20,6 +16,10 @@ pub(crate) use context::{
 pub(crate) use crate::entity_columnar::{
     ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
     EntityColumnarWriteSets, entity_row_group_set_id,
+};
+#[allow(unused_imports)]
+pub(crate) use context::{
+    BranchHeadControlCache, GlobalKeyValueRowCache, HotStateContext, HotStateContextReader,
 };
 pub(crate) use entity_columnar_cache::{
     EntityColumnarArrayBudget, EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey,
@@ -54,23 +54,21 @@ pub(crate) use tracked_head::{
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
-    CERTIFIED_ENTITY_BATCH_SPACE, CertifiedCurrentStatePredecessor,
+    CERTIFIED_ENTITY_BATCH_SPACE, COLLECTION_CONTROL_SPACE, CertifiedCurrentStatePredecessor,
     CertifiedCurrentStatePredecessorRef, CertifiedEntityBatchFileRef, ColumnarBaseCoordinate,
-    CurrentStateDeltaRef, DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows,
-    EntityColumnarOverlayRow, COLLECTION_CONTROL_SPACE, DIFF_SPACE, FILE_SPACE,
-    INDEX_SPACE, ROW_SPACE, HotIndexEntry, HotIndexValue, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
-    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
-    TrackedHeadContext, TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    load_certified_rows_at_commit, materialize_certified_root_rows, scan_certified_history_rows,
-    stage_certified_entity_batches, stage_delete_tracked_working_diff_epoch,
-    stage_hot_index_entries,
+    CurrentStateDeltaRef, DIFF_SPACE, DeferredFreshHotPlan, DeferredFreshHotRowRef,
+    DeferredFreshHotRows, EntityColumnarOverlayRow, FILE_SPACE, HotIndexEntry, HotIndexValue,
+    HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
+    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
+    ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, load_certified_rows_at_commit,
+    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
+    stage_delete_tracked_working_diff_epoch, stage_hot_index_entries,
     stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{
-    DeclaredColumnEq,
-    Bound, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter,
+    Bound, DeclaredColumnEq, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter,
     HotStateProjection, HotStateRowFilter, HotStateRowIdentityRef, HotStateRowRequest,
     HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateBatchBuilder,
     MaterializedHotStateExactBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,

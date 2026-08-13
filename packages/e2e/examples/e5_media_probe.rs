@@ -22,7 +22,6 @@
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use lix::integration::{Engine, SessionContext};
 use lix::{Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
@@ -62,18 +61,19 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[rank.min(sorted.len() - 1)]
 }
 
-async fn open_session(dir: &Path, initialize: bool) -> (RocksDB, SessionContext<RocksDB>) {
+async fn open_session(dir: &Path, initialize: bool) -> (RocksDB, Lix<RocksDB>) {
     let storage = RocksDB::open(dir).expect("open RocksDB storage");
     if initialize {
-        Engine::initialize(storage.clone())
+        open_lix()
+            .with_storage(storage.clone())
             .await
             .expect("initialize repository");
     }
-    let engine = Engine::new(storage.clone()).await.expect("open engine");
-    let session = engine
-        .open_session()
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open session");
+        .expect("open lix");
+    let session = lix.open_another_session().await.expect("open session");
     (storage, session)
 }
 
@@ -82,7 +82,7 @@ async fn open_session(dir: &Path, initialize: bool) -> (RocksDB, SessionContext<
 /// the claim-2 harness's corrected import granularity.
 const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
-async fn seed(session: &SessionContext<RocksDB>, files: usize, asset_bytes: usize) -> f64 {
+async fn seed(session: &Lix<RocksDB>, files: usize, asset_bytes: usize) -> f64 {
     let started = Instant::now();
     let mut transaction = session
         .begin_transaction()
@@ -130,7 +130,7 @@ async fn seed(session: &SessionContext<RocksDB>, files: usize, asset_bytes: usiz
 }
 
 /// Whole-corpus materialization: the checkout shape.
-async fn read_all(session: &SessionContext<RocksDB>) -> (f64, u64, u64) {
+async fn read_all(session: &Lix<RocksDB>) -> (f64, u64, u64) {
     let started = Instant::now();
     let result = session
         .execute("SELECT path, content FROM lix_file", &[])
@@ -174,7 +174,7 @@ async fn mode_read(dir: PathBuf, asset_bytes: usize, files: usize, reps: usize) 
         );
         samples.push(ms);
         // Warm arm: same open, second read — separates backend I/O from
-        // per-byte engine work.
+        // per-byte lix work.
         let (warm_ms, _, warm_bytes) = read_all(&session).await;
         let warm_mb = (warm_bytes as f64 / (1024.0 * 1024.0)) / (warm_ms / 1000.0);
         println!(
@@ -261,7 +261,11 @@ async fn mode_commit(dir: PathBuf, asset_bytes: usize, files: usize, rounds: usi
         .filter(|(_, ms)| **ms > p50 * 5.0)
         .map(|(round, ms)| format!("{round}:{ms:.1}"))
         .collect::<Vec<_>>();
-    println!("e5_commit stalls_over_5x_median count={} {}", over.len(), over.join(" "));
+    println!(
+        "e5_commit stalls_over_5x_median count={} {}",
+        over.len(),
+        over.join(" ")
+    );
 }
 
 /// Replicates the claim-2 agent harness shape exactly, because the 565.9 ms
@@ -373,7 +377,7 @@ async fn active_commit(lix: &Lix<RocksDB>) -> String {
     }
 }
 
-/// `E5_PERF_SPANS=1` turns on the engine's own `lix_perf` spans and prints one
+/// `E5_PERF_SPANS=1` turns on Lix's own `lix_perf` spans and prints one
 /// line per span close, so a single outlier commit can be attributed to a
 /// materialization stage instead of guessed at.
 fn install_perf_spans() {

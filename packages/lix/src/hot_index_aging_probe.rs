@@ -43,10 +43,7 @@ async fn open_session() -> (Memory, SessionContext<Memory>) {
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
     (storage, session)
 }
 

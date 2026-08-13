@@ -42,8 +42,7 @@ pub(crate) use bind::{
 };
 pub(crate) use catalog::{
     EntityColumnType, EntityIndexedColumn, EntitySurfaceSpec, PublicCatalog,
-    derive_entity_surface_spec_from_schema,
-    entity_visible_fields,
+    derive_entity_surface_spec_from_schema, entity_visible_fields,
 };
 pub(crate) use change_materialization::MaterializedChange;
 pub(crate) use context::WriteContextLiveness;

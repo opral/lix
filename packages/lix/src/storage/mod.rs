@@ -10,7 +10,6 @@ mod predicate;
 mod traits;
 mod types;
 
-pub use crate::handle::open_storage_engine as open_engine;
 pub use cursor::{ScanCursor, StorageScanSource};
 pub use error::{
     Capability, Precondition, PreconditionFailure, PreconditionItemSupport,

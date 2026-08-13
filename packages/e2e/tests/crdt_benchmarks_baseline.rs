@@ -31,7 +31,7 @@ async fn crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts() {
         let target = format!("{}{}", "a".repeat(N), base);
         let source_text = format!("{}{}", "b".repeat(N), base);
         let peer = lix
-            .open_session()
+            .open_another_session()
             .await
             .expect("peer session should open");
         let mut target_transaction = lix.begin_transaction().await.expect("target transaction");
@@ -52,7 +52,6 @@ async fn crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts() {
                 .expect("same-base Markdown edit should stage");
         }
 
-        lix.reset_plugin_transition_counters();
         let started = Instant::now();
         target_transaction
             .commit()
@@ -68,9 +67,6 @@ async fn crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts() {
         let expected_ab = format!("{}{}{}", "a".repeat(N), "b".repeat(N), base);
         let expected_ba = format!("{}{}{}", "b".repeat(N), "a".repeat(N), base);
         assert!(merged == expected_ab.as_bytes() || merged == expected_ba.as_bytes());
-        let counters = lix.plugin_transition_counters();
-        assert_eq!(counters.conflict_resolution_calls, 1);
-        assert_eq!(counters.conflict_resolution_records, 1);
         assert_eq!(read_file(&peer, path).await, merged);
         peer.close().await.expect("peer should close");
         lix.close().await.expect("B2.1 workspace should close");
@@ -118,7 +114,7 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
         let mut transactions = Vec::with_capacity(clients);
         for client in 0..clients {
             let peer = lix
-                .open_session()
+                .open_another_session()
                 .await
                 .expect("peer session should open");
             let mut transaction = peer
@@ -140,7 +136,6 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
             transactions.push(transaction);
         }
 
-        lix.reset_plugin_transition_counters();
         let batch_started = Instant::now();
         let commit_results = tokio::task::LocalSet::new()
             .run_until(async move {
@@ -165,27 +160,8 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
             all_latencies.push(elapsed);
         }
 
-        // Cohort cardinality is an admission batching artifact and is deliberately
-        // not asserted; the durable guarantee is that every contender resolves once
-        // into a single converged value on a history that never forks.
-        let counters = lix.plugin_transition_counters();
-        assert!(counters.conflict_resolution_calls > 0);
-        // Resolution must batch: one plugin transition carries many contenders.
-        // The exact call count tracks how the wave happened to be admitted into
-        // cohorts, so only the batching itself is assertable. Measured at 100
-        // clients: 9-13 calls for 99 records.
-        assert!(
-            counters.conflict_resolution_calls < (clients - 1) as u64,
-            "resolution must batch contenders instead of crossing the plugin \
-             boundary once per contender: {} calls for {} records",
-            counters.conflict_resolution_calls,
-            counters.conflict_resolution_records,
-        );
-        assert_eq!(
-            counters.conflict_resolution_records,
-            (clients - 1) as u64,
-            "every accumulated same-entity contender must participate in resolution",
-        );
+        // The public contract is convergence, retained writes, and a linear
+        // durable history. Resolver batching is internal instrumentation.
         let converged = read_file(&lix, &path).await;
         let merged: serde_json::Value =
             serde_json::from_slice(&converged).expect("merged JSON should parse");
@@ -223,9 +199,8 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
 #[tokio::test]
 async fn ordinary_concurrent_execute_serializes_without_plugin_resolution() {
     let lix = open_lix().await.unwrap();
-    let first = lix.open_session().await.unwrap();
-    let second = lix.open_session().await.unwrap();
-    lix.reset_plugin_transition_counters();
+    let first = lix.open_another_session().await.unwrap();
+    let second = lix.open_another_session().await.unwrap();
     let first_write = async {
         first
             .execute(
@@ -247,10 +222,6 @@ async fn ordinary_concurrent_execute_serializes_without_plugin_resolution() {
     let (first_result, second_result) = tokio::join!(first_write, second_write);
     first_result.unwrap();
     second_result.unwrap();
-    assert_eq!(
-        lix.plugin_transition_counters().conflict_resolution_calls,
-        0
-    );
     let result = lix
         .execute(
             "SELECT value FROM lix_key_value WHERE key = 'ordinary'",
@@ -281,7 +252,7 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                     let mut peers = Vec::new();
                     let mut transactions = Vec::new();
                     for value in 0..3 {
-                        let peer = lix.open_session().await.unwrap();
+                        let peer = lix.open_another_session().await.unwrap();
                         let mut transaction = peer.begin_transaction().await.unwrap();
                         transaction
                             .execute(
@@ -295,7 +266,6 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                         transactions.push(transaction);
                     }
 
-                    lix.reset_plugin_transition_counters();
                     let results = tokio::task::LocalSet::new()
                         .run_until(async move {
                             let mut transactions = transactions.into_iter();
@@ -320,15 +290,6 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                     for result in results {
                         result.unwrap();
                     }
-                    // How many commits the coordinator published is an admission
-                    // batching artifact, not a guarantee: whether the wave lands in
-                    // one cohort or several depends only on arrival timing. Assert
-                    // the guarantee instead: every contender resolved once, one
-                    // converged value, and a history that never forked.
-                    let counters = lix.plugin_transition_counters();
-                    assert_eq!(counters.conflict_resolution_calls, 2);
-                    assert_eq!(counters.conflict_resolution_records, 2);
-
                     // A follower's private plugin observation must be evicted by the shared
                     // commit so its next edit cold-opens the converged durable document.
                     peers[1]
@@ -382,7 +343,7 @@ fn serialized_leader_forces_stale_followers_to_reconcile_without_losing_writes()
                     let mut peers = Vec::new();
                     let mut transactions = Vec::new();
                     for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
-                        let peer = lix.open_session().await.unwrap();
+                        let peer = lix.open_another_session().await.unwrap();
                         let mut transaction = peer.begin_transaction().await.unwrap();
                         transaction
                             .execute(
@@ -451,8 +412,8 @@ fn serialized_leader_forces_stale_followers_to_reconcile_without_losing_writes()
 async fn invalid_aggregate_member_does_not_poison_valid_transaction() {
     let lix = open_lix().await.unwrap();
     install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
-    let first = lix.open_session().await.unwrap();
-    let second = lix.open_session().await.unwrap();
+    let first = lix.open_another_session().await.unwrap();
+    let second = lix.open_another_session().await.unwrap();
     let mut first_transaction = first.begin_transaction().await.unwrap();
     let mut second_transaction = second.begin_transaction().await.unwrap();
     for (transaction, bytes) in [

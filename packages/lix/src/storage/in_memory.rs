@@ -671,7 +671,8 @@ mod tests {
         let (chunk, chunk_has_more) = cursor
             .next_page(MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan after range delete").into_parts();
+            .expect("scan after range delete")
+            .into_parts();
         assert!(chunk.is_empty());
         assert!(!chunk_has_more);
     }
