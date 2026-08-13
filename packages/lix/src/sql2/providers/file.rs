@@ -5908,10 +5908,47 @@ async fn scan_lix_file_live_batch(
         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
         BLOB_REF_SCHEMA_KEY.to_string(),
     ];
-    file_request.filter.entity_pks = target_file_ids
+    // Bound this read on the file id, not the entity PK.
+    //
+    // The hot index key is file-first -- `scope(branch, generation) ++
+    // schema_key ++ file_id ++ entity_pk` -- so an entity PK on its own names
+    // neither a point key nor a prefix. With `entity_pks` set and `file_ids`
+    // empty, `hot_exact_identity_batches` returns a batch but
+    // `may_use_null_point_batch` refuses it (both schema keys here have
+    // file-backed members, and a null-file point key would miss the real row),
+    // `hot_file_scan_prefixes` declines for want of a file id, and the request
+    // lands on the widest arm: a full walk of every `lix_file_descriptor` and
+    // every `lix_binary_blob_ref` row in the branch, filtered in memory. That
+    // is O(files in branch) per statement.
+    //
+    // Pinning `file_ids` *instead of* `entity_pks` -- not in addition to --
+    // routes to `hot_file_scan_prefixes`, one tight `(branch, generation,
+    // schema_key, file_id)` prefix seek per target file. Adding the pin while
+    // keeping `entity_pks` would be much worse than the walk it replaces:
+    // `FiniteHotIdentityBatchRef::new` builds the *cross product*
+    // `entity_pks.len() * file_ids.len()`, so N target files would encode N^2
+    // point keys per schema key.
+    //
+    // Dropping `entity_pks` cannot widen the answer, because `file_id ==
+    // entity_pk` holds by construction for both of these schema keys:
+    // `transaction::normalization::canonicalize_descriptor_file_id` *derives*
+    // the descriptor row's `file_id` from its entity PK on every normalized
+    // write, and both `lix_binary_blob_ref` producers in `filesystem::planner`
+    // (`BlobRefRowInput::append_to` and `append_blob_ref_tombstone_row`,
+    // tombstones included) set the pair from one variable. Both surfaces are
+    // read-only, so no caller can supply a divergent pair.
+    // `scan_exact_file_blob_batch` below already pairs them the same way.
+    file_request.filter.entity_pks.clear();
+    file_request.filter.file_ids = target_file_ids
         .iter()
-        .map(|file_id| file_id_entity_pk(file_id))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|file_id| crate::NullableKeyFilter::Value(file_id.clone()))
+        .collect();
+    // Preserve the canonical-UUID validation the entity-PK projection used to
+    // perform, so a malformed file id stays an error instead of becoming a
+    // silently empty answer.
+    for file_id in target_file_ids {
+        file_id_entity_pk(file_id)?;
+    }
 
     let file_rows = hot_state.scan_batch(&file_request).await?;
 
