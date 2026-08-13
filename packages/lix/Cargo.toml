@@ -135,7 +135,7 @@ datafusion = { version = "53.0.0", default-features = false, features = [
 ] }
 musli = { version = "0.0.149", features = ["storage"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 sha2 = "0.10"
 smallvec = "1.15"
 globset = "0.4"
