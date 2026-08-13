@@ -50,6 +50,7 @@ const MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::immutable(
 );
 const MAX_CASES: usize = 128;
 const MAX_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+const CANONICAL_INLINE_DESCRIPTOR_MAX_BYTES: usize = 128;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -111,7 +112,7 @@ impl Layout {
             Self::Current => "current_production_shape",
             Self::E1 => "e1_inline_descriptor",
             Self::E2 => "e2_shared_descriptor",
-            Self::E3 => "e3_inline_or_chunked",
+            Self::E3 => "selected_descriptor_union_v1",
         }
     }
 
@@ -391,9 +392,11 @@ struct ChunkRef {
 #[derive(Clone, Debug)]
 enum Representation {
     Current(Digest),
-    Inline(Vec<u8>),
     InlineDescriptor(Vec<ChunkRef>),
-    SharedDescriptor(Digest),
+    SharedDescriptor {
+        descriptor_id: Digest,
+        encoded_len: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -727,25 +730,6 @@ async fn measured<T>(
 fn build_row(layout: Layout, case: Case, payload: &[u8]) -> BuiltRow {
     let whole_hash = Digest::of(payload);
     let metadata = deterministic_payload(case.metadata_width, 0x4d);
-    if layout == Layout::E3 && payload.len() <= case.threshold {
-        let row = Row {
-            layout,
-            payload_len: payload.len() as u64,
-            whole_hash,
-            metadata,
-            representation: Representation::Inline(payload.to_vec()),
-        };
-        return BuiltRow {
-            encoded: encode_row(&row),
-            chunks: BTreeMap::new(),
-            descriptors: BTreeMap::new(),
-            blob_refs: BTreeMap::new(),
-            manifests: BTreeMap::new(),
-            manifest_chunks: BTreeMap::new(),
-            identity: whole_hash,
-        };
-    }
-
     let mut chunks = BTreeMap::new();
     let refs = chunk_ranges(payload, case.chunk_policy)
         .into_iter()
@@ -776,20 +760,20 @@ fn build_row(layout: Layout, case: Case, payload: &[u8]) -> BuiltRow {
         manifests.insert(blob_id, manifest);
         blob_refs.insert(blob_id, encode_blob_ref(blob_id, whole_hash, payload.len()));
         Representation::Current(blob_id)
-    } else if layout == Layout::E1 {
+    } else if layout == Layout::E1
+        || (layout == Layout::E3
+            && encode_leaf(&refs).len() <= CANONICAL_INLINE_DESCRIPTOR_MAX_BYTES)
+    {
         Representation::InlineDescriptor(refs)
     } else {
-        let mut leaves = Vec::new();
-        for group in refs.chunks(case.fanout) {
-            let encoded = encode_leaf(group);
-            let hash = Digest::of(&encoded);
-            descriptors.insert(hash, encoded);
-            leaves.push(hash);
+        let descriptor = encode_leaf(&refs);
+        let descriptor_id = Digest::of(&descriptor);
+        let encoded_len = descriptor.len() as u32;
+        descriptors.insert(descriptor_id, descriptor);
+        Representation::SharedDescriptor {
+            descriptor_id,
+            encoded_len,
         }
-        let root = encode_root(payload.len() as u64, whole_hash, &leaves);
-        let root_hash = Digest::of(&root);
-        descriptors.insert(root_hash, root);
-        Representation::SharedDescriptor(root_hash)
     };
     let row = Row {
         layout,
@@ -930,32 +914,23 @@ async fn read_payload<S: Storage>(
             validate_range(&requested, size)?;
             read_chunks(storage, &refs, size as u64, blob_hash, requested).await
         }
-        Representation::Inline(bytes) => {
-            let requested = range.unwrap_or(0..row.payload_len as usize);
-            validate_range(&requested, row.payload_len as usize)?;
-            if Digest::of(&bytes) != row.whole_hash || bytes.len() as u64 != row.payload_len {
-                return Err("inline payload authentication failed".to_owned());
-            }
-            Ok(bytes[requested].to_vec())
-        }
         Representation::InlineDescriptor(refs) => {
             let requested = range.unwrap_or(0..row.payload_len as usize);
             validate_range(&requested, row.payload_len as usize)?;
             read_chunks(storage, &refs, row.payload_len, row.whole_hash, requested).await
         }
-        Representation::SharedDescriptor(root_hash) => {
+        Representation::SharedDescriptor {
+            descriptor_id,
+            encoded_len,
+        } => {
             let requested = range.unwrap_or(0..row.payload_len as usize);
             validate_range(&requested, row.payload_len as usize)?;
-            let root_bytes = get_verified(storage, DESCRIPTOR_SPACE, root_hash).await?;
-            let root = decode_root(&root_bytes)?;
-            if root.payload_len != row.payload_len || root.whole_hash != row.whole_hash {
-                return Err("row/root identity mismatch".to_owned());
+            let descriptor = get_verified(storage, DESCRIPTOR_SPACE, descriptor_id).await?;
+            if descriptor.len() != encoded_len as usize {
+                return Err("external descriptor length mismatch".to_owned());
             }
-            let mut refs = Vec::new();
-            for leaf_hash in root.leaves {
-                let leaf = get_verified(storage, DESCRIPTOR_SPACE, leaf_hash).await?;
-                refs.extend(decode_leaf(&leaf)?);
-            }
+            let refs = decode_leaf(&descriptor)?;
+            validate_descriptor_class(row.layout, &row.representation)?;
             read_chunks(storage, &refs, row.payload_len, row.whole_hash, requested).await
         }
     }
@@ -1055,29 +1030,6 @@ async fn exercise_corruption<S: Storage>(storage: &S, row_key: &Key) {
         .await
         .expect("read row for corruption");
     let row = decode_row(&original_row).expect("decode corruption row");
-    if let Representation::Inline(mut payload) = row.representation.clone() {
-        if payload.is_empty() {
-            let mut corrupt = original_row.clone();
-            corrupt[0] ^= 1;
-            put_rows(storage, ROW_SPACE, vec![(row_key.clone(), corrupt)]).await;
-            assert!(read_payload(storage, row_key, None).await.is_err());
-            put_rows(storage, ROW_SPACE, vec![(row_key.clone(), original_row)]).await;
-            return;
-        }
-        payload[0] ^= 1;
-        let mut corrupt = row;
-        corrupt.representation = Representation::Inline(payload);
-        put_rows(
-            storage,
-            ROW_SPACE,
-            vec![(row_key.clone(), encode_row(&corrupt))],
-        )
-        .await;
-        assert!(read_payload(storage, row_key, None).await.is_err());
-        put_rows(storage, ROW_SPACE, vec![(row_key.clone(), original_row)]).await;
-        return;
-    }
-
     let refs = descriptor_refs(storage, &row)
         .await
         .expect("resolve corruption refs");
@@ -1113,17 +1065,18 @@ async fn descriptor_refs<S: Storage>(storage: &S, row: &Row) -> Result<Vec<Chunk
             Ok(refs)
         }
         Representation::InlineDescriptor(refs) => Ok(refs.clone()),
-        Representation::SharedDescriptor(root_hash) => {
-            let root = decode_root(&get_verified(storage, DESCRIPTOR_SPACE, *root_hash).await?)?;
-            let mut refs = Vec::new();
-            for leaf in root.leaves {
-                refs.extend(decode_leaf(
-                    &get_verified(storage, DESCRIPTOR_SPACE, leaf).await?,
-                )?);
+        Representation::SharedDescriptor {
+            descriptor_id,
+            encoded_len,
+        } => {
+            let descriptor = get_verified(storage, DESCRIPTOR_SPACE, *descriptor_id).await?;
+            if descriptor.len() != *encoded_len as usize {
+                return Err("external descriptor length mismatch".to_owned());
             }
+            let refs = decode_leaf(&descriptor)?;
+            validate_descriptor_class(row.layout, &row.representation)?;
             Ok(refs)
         }
-        Representation::Inline(_) => Ok(Vec::new()),
     }
 }
 
@@ -1157,30 +1110,24 @@ async fn collect_garbage<S: Storage>(storage: &S) {
                     );
                 }
             }
-            Representation::Inline(_) => {}
             Representation::InlineDescriptor(refs) => {
                 live_chunks.extend(refs.iter().map(|item| item.hash));
             }
-            Representation::SharedDescriptor(root_hash) => {
-                live_descriptors.insert(*root_hash);
-                let root = decode_root(
-                    &get_verified(storage, DESCRIPTOR_SPACE, *root_hash)
-                        .await
-                        .expect("verify live root"),
-                )
-                .expect("decode live root");
-                for leaf_hash in root.leaves {
-                    live_descriptors.insert(leaf_hash);
-                    let leaf = get_verified(storage, DESCRIPTOR_SPACE, leaf_hash)
-                        .await
-                        .expect("verify live leaf");
-                    live_chunks.extend(
-                        decode_leaf(&leaf)
-                            .expect("decode live leaf")
-                            .into_iter()
-                            .map(|item| item.hash),
-                    );
-                }
+            Representation::SharedDescriptor {
+                descriptor_id,
+                encoded_len,
+            } => {
+                live_descriptors.insert(*descriptor_id);
+                let descriptor = get_verified(storage, DESCRIPTOR_SPACE, *descriptor_id)
+                    .await
+                    .expect("verify live descriptor");
+                assert_eq!(descriptor.len(), *encoded_len as usize);
+                live_chunks.extend(
+                    decode_leaf(&descriptor)
+                        .expect("decode live descriptor")
+                        .into_iter()
+                        .map(|item| item.hash),
+                );
             }
         }
     }
@@ -1241,7 +1188,7 @@ async fn print_inventory<S: Storage>(context: &MeasureContext<'_>, storage: &S, 
     let mut json_file_descriptor_bytes = 0_u64;
     let mut inline_descriptor_bytes = 0_u64;
     let mut pointer_descriptor_bytes = 0_u64;
-    let mut inline_payload_bytes = 0_u64;
+    let inline_payload_bytes = 0_u64;
     for (_, value) in &rows {
         let row = decode_row(value).expect("inventory row");
         if let Representation::Current(blob_id) = row.representation {
@@ -1253,11 +1200,10 @@ async fn print_inventory<S: Storage>(context: &MeasureContext<'_>, storage: &S, 
         let fixed = (4 + 1 + 8 + 32 + 4 + row.metadata.len() + 1) as u64;
         native_metadata_bytes += fixed;
         match row.representation {
-            Representation::Inline(bytes) => inline_payload_bytes += 8 + bytes.len() as u64,
             Representation::InlineDescriptor(_) => {
                 inline_descriptor_bytes += value.len() as u64 - fixed
             }
-            Representation::SharedDescriptor(_) => pointer_descriptor_bytes += 32,
+            Representation::SharedDescriptor { .. } => pointer_descriptor_bytes += 36,
             Representation::Current(_) => unreachable!(),
         }
     }
@@ -1368,18 +1314,18 @@ fn encode_row(row: &Row) -> Vec<u8> {
     output.extend_from_slice(&row.metadata);
     match &row.representation {
         Representation::Current(_) => unreachable!("current row encoded above"),
-        Representation::Inline(bytes) => {
-            output.push(1);
-            output.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            output.extend_from_slice(bytes);
-        }
         Representation::InlineDescriptor(refs) => {
             output.push(2);
+            output.extend_from_slice(&Digest::of(&encode_leaf(refs)).0);
             encode_refs(&mut output, refs);
         }
-        Representation::SharedDescriptor(hash) => {
+        Representation::SharedDescriptor {
+            descriptor_id,
+            encoded_len,
+        } => {
             output.push(3);
-            output.extend_from_slice(&hash.0);
+            output.extend_from_slice(&descriptor_id.0);
+            output.extend_from_slice(&encoded_len.to_le_bytes());
         }
     }
     output
@@ -1421,27 +1367,23 @@ fn decode_row(bytes: &[u8]) -> Result<Row, String> {
     let metadata_len = input.u32()? as usize;
     let metadata = input.bytes(metadata_len)?.to_vec();
     let representation = match input.u8()? {
-        1 => {
-            let len = input.u64()? as usize;
-            Representation::Inline(input.bytes(len)?.to_vec())
+        1 => return Err("row-inline payload representation is forbidden".to_owned()),
+        2 => {
+            let descriptor_id = input.digest()?;
+            let refs = input.refs()?;
+            if Digest::of(&encode_leaf(&refs)) != descriptor_id {
+                return Err("inline descriptor content ID mismatch".to_owned());
+            }
+            Representation::InlineDescriptor(refs)
         }
-        2 => Representation::InlineDescriptor(input.refs()?),
-        3 => Representation::SharedDescriptor(input.digest()?),
+        3 => Representation::SharedDescriptor {
+            descriptor_id: input.digest()?,
+            encoded_len: input.u32()?,
+        },
         _ => return Err("unknown row representation".to_owned()),
     };
     input.finish()?;
-    let representation_matches_layout = match layout {
-        Layout::Current => false,
-        Layout::E1 => matches!(representation, Representation::InlineDescriptor(_)),
-        Layout::E2 => matches!(representation, Representation::SharedDescriptor(_)),
-        Layout::E3 => matches!(
-            representation,
-            Representation::Inline(_) | Representation::SharedDescriptor(_)
-        ),
-    };
-    if !representation_matches_layout {
-        return Err("layout/representation mismatch".to_owned());
-    }
+    validate_descriptor_class(layout, &representation)?;
     Ok(Row {
         layout,
         payload_len,
@@ -1449,6 +1391,29 @@ fn decode_row(bytes: &[u8]) -> Result<Row, String> {
         metadata,
         representation,
     })
+}
+
+fn validate_descriptor_class(
+    layout: Layout,
+    representation: &Representation,
+) -> Result<(), String> {
+    let valid = match (layout, representation) {
+        (Layout::Current, _) => false,
+        (Layout::E1, Representation::InlineDescriptor(_)) => true,
+        (Layout::E2, Representation::SharedDescriptor { .. }) => true,
+        (Layout::E3, Representation::InlineDescriptor(refs)) => {
+            encode_leaf(refs).len() <= CANONICAL_INLINE_DESCRIPTOR_MAX_BYTES
+        }
+        (Layout::E3, Representation::SharedDescriptor { encoded_len, .. }) => {
+            *encoded_len as usize > CANONICAL_INLINE_DESCRIPTOR_MAX_BYTES
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("noncanonical file content descriptor representation".to_owned())
+    }
 }
 
 fn encode_leaf(refs: &[ChunkRef]) -> Vec<u8> {
@@ -1804,7 +1769,7 @@ fn chunk_policies(args: &[String]) -> Vec<ChunkPolicy> {
 fn print_case(context: &MeasureContext<'_>) {
     let base = deterministic_payload(context.case.size, 0);
     let base_chunk_count = chunk_ranges(&base, context.case.chunk_policy).len();
-    let base_descriptor_bytes = 4_u64.saturating_add((base_chunk_count as u64).saturating_mul(36));
+    let base_descriptor_bytes = 8_u64.saturating_add((base_chunk_count as u64).saturating_mul(36));
     println!(
         "file_layout,kind=case,backend={},layout={},size={},metadata_width={},threshold={},chunk_policy={},chunk_min={},chunk_avg={},chunk_max={},fanout={},carrier_rows={},shared_copies={},base_chunk_count={base_chunk_count},base_descriptor_bytes={base_descriptor_bytes},format=canonical_binary_v1,hash=blake3_256,current_json_envelopes=true",
         context.backend,
@@ -1873,4 +1838,99 @@ fn directory_bytes(path: &Path) -> u64 {
             })
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refs(count: usize) -> Vec<ChunkRef> {
+        (0..count)
+            .map(|index| ChunkRef {
+                len: 1,
+                hash: Digest::of(&[index as u8]),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selected_descriptor_union_rejects_both_noncanonical_classes() {
+        let small = refs(2);
+        let large = refs(4);
+        assert_eq!(encode_leaf(&small).len(), 80);
+        assert_eq!(encode_leaf(&large).len(), 152);
+
+        assert!(validate_descriptor_class(
+            Layout::E3,
+            &Representation::InlineDescriptor(small.clone()),
+        )
+        .is_ok());
+        assert!(
+            validate_descriptor_class(
+                Layout::E3,
+                &Representation::SharedDescriptor {
+                    descriptor_id: Digest::of(&encode_leaf(&small)),
+                    encoded_len: 80,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_descriptor_class(Layout::E3, &Representation::InlineDescriptor(large),)
+                .is_err()
+        );
+        assert!(
+            validate_descriptor_class(
+                Layout::E3,
+                &Representation::SharedDescriptor {
+                    descriptor_id: Digest::of(b"large"),
+                    encoded_len: 152,
+                },
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn selected_descriptor_union_decode_has_one_explicit_tag() {
+        let row = Row {
+            layout: Layout::E3,
+            payload_len: 4,
+            whole_hash: Digest::of(b"data"),
+            metadata: Vec::new(),
+            representation: Representation::InlineDescriptor(refs(4)),
+        };
+        assert!(decode_row(&encode_row(&row)).is_err());
+
+        let small = refs(2);
+        let noncanonical_indirect = Row {
+            layout: Layout::E3,
+            payload_len: 2,
+            whole_hash: Digest::of(b"ab"),
+            metadata: Vec::new(),
+            representation: Representation::SharedDescriptor {
+                descriptor_id: Digest::of(&encode_leaf(&small)),
+                encoded_len: encode_leaf(&small).len() as u32,
+            },
+        };
+        assert!(decode_row(&encode_row(&noncanonical_indirect)).is_err());
+    }
+
+    #[test]
+    fn inline_descriptor_content_id_is_authenticated() {
+        let row = Row {
+            layout: Layout::E3,
+            payload_len: 2,
+            whole_hash: Digest::of(b"ab"),
+            metadata: Vec::new(),
+            representation: Representation::InlineDescriptor(refs(2)),
+        };
+        let mut encoded = encode_row(&row);
+        let descriptor_id_offset = 4 + 1 + 8 + 32 + 4 + 1;
+        encoded[descriptor_id_offset] ^= 1;
+        assert_eq!(
+            decode_row(&encoded).unwrap_err(),
+            "inline descriptor content ID mismatch"
+        );
+    }
 }
