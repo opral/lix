@@ -5281,49 +5281,6 @@ mod tests {
         )
     }
 
-    async fn run_binary_repository_gc(storage: &StorageAdapter<Memory>) {
-        let read = SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("binary repository-GC read should open"),
-        );
-        let mut writes = storage.new_write_set();
-        let mut preconditions = Vec::new();
-        super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
-            .await
-            .expect("binary repository GC should stage");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await
-            .expect("binary repository GC should commit");
-    }
-
-    async fn assert_binary_cas_presence(
-        storage: &StorageAdapter<Memory>,
-        hash: crate::binary_cas::BlobId,
-        expected: bool,
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("binary-CAS presence read should open");
-        let mut reader = crate::binary_cas::BinaryCasContext::new().reader(read);
-        let present = reader
-            .load_bytes_many(&[hash])
-            .await
-            .expect("binary-CAS presence should load")
-            .into_vec()[0]
-            .is_some();
-        assert_eq!(present, expected);
-    }
-
     /// The derivation replaces `gc.reachability_delta.v1`. It must name every
     /// commit that still owns physical state — including one no ref can reach,
     /// which is what a deleted branch leaves behind and what a walk from refs
@@ -6160,24 +6117,6 @@ mod tests {
             )
             .await
         );
-    }
-
-    async fn run_repository_gc(storage: &Memory) {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let read = SharedStorageAdapterRead::new(
-            storage_adapter
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("GC read should open"),
-        );
-        let mut writes = storage_adapter.new_write_set();
-        super::stage_repository_gc_full_recovery(read, &mut writes)
-            .await
-            .expect("repository GC should stage");
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("repository GC should commit");
     }
 
     async fn stage_bare_json(storage: &Memory, content: &str) -> JsonRef {

@@ -542,7 +542,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_write_rejects_slash_in_name_at_schema_boundary,
+    lix_directory_write_rejects_invalid_name_segment_at_validator_boundary,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -562,8 +562,27 @@ simulation_test!(
             .await
             .expect_err("directory name must keep '/' as structural separator");
 
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(error.message.contains("lix_directory_descriptor"));
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(
+            error.message.contains("path segment must not contain '/'"),
+            "{error}"
+        );
+
+        // The half of the removed `pattern` that motivated hardcoding it:
+        // '.' and '..' must not be storable as directory names.
+        let traversal = session
+            .execute(
+                "INSERT INTO lix_directory (id, parent_id, name) \
+                 VALUES ('6469722d-736c-8173-8800-000000000001', NULL, '..')",
+                &[],
+            )
+            .await
+            .expect_err("directory name must not be a traversal segment");
+
+        assert!(
+            traversal.message.contains("cannot be '.' or '..'"),
+            "{traversal}"
+        );
     }
 );
 
