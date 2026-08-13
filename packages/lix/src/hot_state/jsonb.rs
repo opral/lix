@@ -356,7 +356,7 @@ fn decode_indexed_array(bytes: &[u8]) -> Result<Value, String> {
     let data = bytes
         .get(table_end..)
         .ok_or("array page table is truncated")?;
-    let page_slices = slices_from_offsets(bytes, 8, pages, data, "array page")?;
+    let page_slices = slices_from_offsets(bytes, 8, pages, data, "array page", false)?;
     let mut values = Vec::with_capacity(count);
     for mut page in page_slices {
         let expected = (count - values.len()).min(INDEX_PAGE_ENTRIES);
@@ -410,8 +410,9 @@ fn decode_indexed_object(bytes: &[u8]) -> Result<Value, String> {
     let children = bytes
         .get(child_data..)
         .ok_or("object children are truncated")?;
-    let keys = slices_from_offsets(bytes, 4, count, keys, "object key")?;
-    let children = slices_from_offsets(bytes, child_offsets, count, children, "object child")?;
+    let keys = slices_from_offsets(bytes, 4, count, keys, "object key", true)?;
+    let children =
+        slices_from_offsets(bytes, child_offsets, count, children, "object child", false)?;
     let mut object = Map::new();
     let mut previous: Option<Vec<u8>> = None;
     for (key, child) in keys.into_iter().zip(children) {
@@ -431,6 +432,7 @@ fn slices_from_offsets<'a>(
     count: usize,
     data: &'a [u8],
     context: &str,
+    allow_empty: bool,
 ) -> Result<Vec<&'a [u8]>, String> {
     let mut output = Vec::with_capacity(count);
     let mut previous = read_u32(table, start, context)?;
@@ -439,7 +441,7 @@ fn slices_from_offsets<'a>(
     }
     for index in 0..count {
         let next = read_u32(table, start + (index + 1) * 4, context)?;
-        if next <= previous || next > data.len() {
+        if next < previous || (!allow_empty && next == previous) || next > data.len() {
             return Err(format!("{context} offsets are invalid"));
         }
         output.push(&data[previous..next]);
@@ -617,5 +619,15 @@ mod tests {
             let decoded = decode(&encoded).unwrap();
             assert_eq!(encode(&decoded).unwrap(), encoded);
         }
+
+        let mut object = Map::new();
+        object.insert(String::new(), Value::from("empty"));
+        for index in 0..12 {
+            object.insert(format!("key-{index:02}"), Value::from(index));
+        }
+        let value = Value::Object(object);
+        let encoded = encode(&value).unwrap();
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(encode(&decoded).unwrap(), encoded);
     }
 }
