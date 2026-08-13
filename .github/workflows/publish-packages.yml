@@ -279,6 +279,7 @@ jobs:
   publish-rust-crates:
     name: Publish crates.io packages
     runs-on: blacksmith-32vcpu-ubuntu-2404
+    environment: production
     needs: release-version
     if: needs.release-version.outputs.has_release == 'true'
 
