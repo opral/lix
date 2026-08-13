@@ -882,6 +882,20 @@ simulation_test!(
 
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error.message.contains("path segment must not contain '/'"));
+
+        let traversal = session
+            .execute(
+                "INSERT INTO lix_file (id, directory_id, name) \
+                 VALUES ('66696c65-2d73-8c61-8368-000000000001', NULL, '..')",
+                &[],
+            )
+            .await
+            .expect_err("file name must not be a traversal segment");
+
+        assert!(
+            traversal.message.contains("cannot be '.' or '..'"),
+            "{traversal}"
+        );
     }
 );
 

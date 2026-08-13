@@ -3689,6 +3689,8 @@ fn lix_file_existing_update_stage_from_batch(
             let directory_id =
                 update_optional_string_value(batch, assignment_values, row_index, "directory_id")?;
             let name = update_required_string_value(batch, assignment_values, row_index, "name")?;
+            crate::common::validate_lix_path_segment(&name)
+                .map_err(lix_error_to_datafusion_error)?;
             data_filename = Some(name.clone());
             if let Some(path_resolvers) = path_resolvers.as_deref_mut() {
                 let resolver = path_resolvers
@@ -4142,6 +4144,8 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         let directory_id = optional_string_value(batch, row_index, "directory_id")?;
         let name = required_string_value(batch, row_index, "name")?;
+        crate::common::validate_lix_path_segment(&name)
+            .map_err(lix_error_to_datafusion_error)?;
         let mut data_path = None;
 
         let id = if data.is_some() {

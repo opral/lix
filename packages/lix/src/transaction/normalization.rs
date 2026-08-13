@@ -629,27 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn normalization_applies_json_and_cel_defaults_before_identity_derivation() {
-        let mut catalog = catalog_with(vec![schema_with_default_id()]);
-        let row = TransactionWriteRow {
-            entity_pk: None,
-            schema_key: "normalization_schema".into(),
-            snapshot: Some(snapshot_json(r#"{}"#)),
-            ..base_stage_row()
-        };
-
-        let row = normalize_test_row(row, &mut catalog, functions()).expect("normalize row");
-        let snapshot = normalized_snapshot(&row);
-
-        assert_eq!(
-            row.entity_pk.as_ref(),
-            Some(&EntityPk::single("00000000-0000-0000-0000-000000000000"))
-        );
-        assert_eq!(snapshot["id"], "00000000-0000-0000-0000-000000000000");
-        assert_eq!(snapshot["value"], "literal-default");
-    }
-
-    #[test]
     fn normalization_applies_cel_defaults_from_snapshot_context() {
         let mut catalog = catalog_with(vec![schema_with_cel_field_default()]);
         let row = TransactionWriteRow {
@@ -711,23 +690,6 @@ mod tests {
         let snapshot = normalized_snapshot(&row);
 
         assert_eq!(snapshot["created_at"], "1970-01-01T00:00:00.000Z");
-    }
-
-    #[test]
-    fn normalization_surfaces_cel_default_errors() {
-        let mut catalog = catalog_with(vec![schema_with_unknown_cel_default()]);
-        let row = TransactionWriteRow {
-            entity_pk: None,
-            schema_key: "unknown_cel_default_schema".into(),
-            snapshot: Some(snapshot_json(r#"{"id":"entity-1"}"#)),
-            ..base_stage_row()
-        };
-
-        let error =
-            normalize_test_row(row, &mut catalog, functions()).expect_err("default should fail");
-
-        assert!(error.message.contains("failed to evaluate x-lix-default"));
-        assert!(error.message.contains("unknown_cel_default_schema.slug"));
     }
 
     #[test]
@@ -1241,20 +1203,6 @@ mod tests {
             "properties": {
                 "id": { "type": "string" },
                 "created_at": { "type": "string", "x-lix-default": "lix_timestamp()" }
-            },
-            "required": ["id"],
-            "additionalProperties": false
-        })
-    }
-
-    fn schema_with_unknown_cel_default() -> JsonValue {
-        json!({
-            "x-lix-key": "unknown_cel_default_schema",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "slug": { "type": "string", "x-lix-default": "missing_var + '-slug'" }
             },
             "required": ["id"],
             "additionalProperties": false

@@ -1536,6 +1536,8 @@ fn lix_directory_update_write_rows_from_batch(
         let parent_id =
             update_optional_string_value(batch, &assignment_values, row_index, "parent_id")?;
         let name = update_required_string_value(batch, &assignment_values, row_index, "name")?;
+        crate::common::validate_lix_path_segment(&name)
+            .map_err(lix_error_to_datafusion_error)?;
         if let Some(directory_id) = id.as_ref() {
             let resolver = path_resolvers
                 .entry(directory_path_resolver_key(&context))
@@ -1769,6 +1771,8 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
 
         let parent_id = optional_string_value(batch, row_index, "parent_id")?;
         let name = required_string_value(batch, row_index, "name")?;
+        crate::common::validate_lix_path_segment(&name)
+            .map_err(lix_error_to_datafusion_error)?;
         if let Some(path_resolvers) = path_resolvers.as_deref_mut() {
             if let Some(directory_id) = id.as_ref() {
                 let resolver = path_resolvers
