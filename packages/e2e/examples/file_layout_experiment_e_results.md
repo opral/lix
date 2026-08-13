@@ -111,28 +111,39 @@ types are `text`, `uuid`, `int8`, `float8`, `boolean`, `jsonb`, and
 `timestamptz`. File identity/path/size metadata therefore remains native scalar
 columns. `ContentDescriptorV1` is a typed binary cell; it is not JSONB.
 
-The final model codec uses one tag and the same canonical descriptor content
+The final model codec serializes file ID and directory ID as native UUID-width
+fields, name as canonical UTF-8 text, and payload size as native `u64`; its
+metadata-width sweep varies the text field rather than an opaque row blob. It
+uses one descriptor tag and the same canonical descriptor content
 ID for both classes. The inline tag carries the ID and descriptor bytes; the
 external tag carries the ID and canonical length and resolves exactly that
-content-addressed object. Unit gates are 3/3 green for the 128-byte class,
-noncanonical tags, and content-ID substitution.
+content-addressed object. Unit gates are 4/4 green for the 128-byte class,
+noncanonical tags, descriptor-ID substitution, and same-size chunk
+substitution.
 
 Required representative cells are green, including chunk corruption rejection
 and cold reopen:
 
 - 1 MiB / 80-byte inline descriptor, RocksDB and SlateDB, no shared copies:
   log SHA-256
-  `6dfa76d10ebe43299e7ab32a95ddd596fa526eb3d22ccc4a357b53b2fb267e56`.
+  `199290f8aaa408df4c62b0d727ae60239689150c57468b9e48bea0e4165a75ca`.
   After GC the selected layout has zero external descriptor objects and zero
   row-inline payload bytes.
 - 16 MiB / 548-byte external descriptor, RocksDB and SlateDB, 64 additional
   shared references (67 retained rows after version operations): log SHA-256
-  `84aa8af744f26c8f7a1f571f583d0cfb07d1495643d10007bd71cce9bb8bd4a6`.
+  `c3cb0adcef5ed96624b68fd9d4558e7dc6e2ee104f577c156a76140f02237c7d`.
   After GC both adapters retain one 548-byte authenticated descriptor object,
   15 unique chunks, and 67x logical sharing; row-inline payload bytes remain
   zero.
 - release benchmark binary SHA-256
-  `ff65acc9b3177b6dabc90ef5e4c5814873a8762abd3701284f3d5e3a7eae07c2`.
+  `cadbc417a0e0c170eb2af0ff70f8a3a53e249f3870fcc2ad526c007eef0ddb9f`.
+
+Each representative cell additionally rereads the retained payload after GC.
+The corruption gate covers missing and same-size substituted chunks, plus
+external descriptor ID/bytes and declared-length substitution. When an adapter
+refuses immutable same-ID replacement before serving (SlateDB), that rejection
+is itself fail-closed; RocksDB accepts the physically replaced test object and
+the model's digest check rejects it on read.
 
 This child changes only benchmark/report paths. The cells above qualify the
 format model and real RocksDB/SlateDB storage behavior; they do **not** prove

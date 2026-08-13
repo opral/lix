@@ -390,6 +390,27 @@ struct ChunkRef {
 }
 
 #[derive(Clone, Debug)]
+struct NativeFileMetadata {
+    file_id: [u8; 16],
+    directory_id: Option<[u8; 16]>,
+    name: String,
+}
+
+impl NativeFileMetadata {
+    fn for_width(width: usize) -> Self {
+        Self {
+            file_id: *b"experiment-file!",
+            directory_id: Some(*b"experiment-dir!!"),
+            name: "m".repeat(width),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        16 + 1 + self.directory_id.map_or(0, |_| 16) + 4 + self.name.len()
+    }
+}
+
+#[derive(Clone, Debug)]
 enum Representation {
     Current(Digest),
     InlineDescriptor(Vec<ChunkRef>),
@@ -404,7 +425,7 @@ struct Row {
     layout: Layout,
     payload_len: u64,
     whole_hash: Digest,
-    metadata: Vec<u8>,
+    metadata: NativeFileMetadata,
     representation: Representation,
 }
 
@@ -666,6 +687,13 @@ async fn run_reopened<S: BenchStorage>(
     })
     .await;
     print_inventory(&context, &storage, "after_gc").await;
+    measured(&context, "post_gc_read", async {
+        let actual = read_payload(&storage, &state.row_key, None)
+            .await
+            .expect("retained payload must survive GC");
+        assert_eq!(actual, state.expected);
+    })
+    .await;
 }
 
 async fn measured<T>(
@@ -729,7 +757,7 @@ async fn measured<T>(
 
 fn build_row(layout: Layout, case: Case, payload: &[u8]) -> BuiltRow {
     let whole_hash = Digest::of(payload);
-    let metadata = deterministic_payload(case.metadata_width, 0x4d);
+    let metadata = NativeFileMetadata::for_width(case.metadata_width);
     let mut chunks = BTreeMap::new();
     let refs = chunk_ranges(payload, case.chunk_policy)
         .into_iter()
@@ -846,10 +874,17 @@ async fn put_missing_objects<S: Storage>(
 }
 
 async fn put_rows<S: Storage>(storage: &S, space: StorageSpace, entries: Vec<(Key, Vec<u8>)>) {
-    let mut write = storage
-        .begin_write(WriteOptions::default())
+    try_put_rows(storage, space, entries)
         .await
-        .expect("begin experiment write");
+        .expect("put experiment rows");
+}
+
+async fn try_put_rows<S: Storage>(
+    storage: &S,
+    space: StorageSpace,
+    entries: Vec<(Key, Vec<u8>)>,
+) -> Result<(), StorageError> {
+    let mut write = storage.begin_write(WriteOptions::default()).await?;
     write
         .put_many(
             space,
@@ -865,9 +900,9 @@ async fn put_rows<S: Storage>(storage: &S, space: StorageSpace, entries: Vec<(Ke
                     .collect(),
             },
         )
-        .await
-        .expect("put experiment rows");
-    write.commit().await.expect("commit experiment rows");
+        .await?;
+    write.commit().await?;
+    Ok(())
 }
 
 async fn delete_keys<S: Storage>(storage: &S, space: StorageSpace, keys: &[Key]) {
@@ -1030,6 +1065,55 @@ async fn exercise_corruption<S: Storage>(storage: &S, row_key: &Key) {
         .await
         .expect("read row for corruption");
     let row = decode_row(&original_row).expect("decode corruption row");
+    if let Representation::SharedDescriptor {
+        descriptor_id,
+        encoded_len,
+    } = &row.representation
+    {
+        let descriptor = get_one(storage, DESCRIPTOR_SPACE, &descriptor_id.key())
+            .await
+            .expect("read external descriptor for corruption");
+        delete_keys(storage, DESCRIPTOR_SPACE, &[descriptor_id.key()]).await;
+        let mut substituted = descriptor.clone();
+        substituted[0] ^= 1;
+        let substituted_published = try_put_rows(
+            storage,
+            DESCRIPTOR_SPACE,
+            vec![(descriptor_id.key(), substituted)],
+        )
+        .await
+        .is_ok();
+        assert!(read_payload(storage, row_key, None).await.is_err());
+        if substituted_published {
+            delete_keys(storage, DESCRIPTOR_SPACE, &[descriptor_id.key()]).await;
+        }
+        put_rows(
+            storage,
+            DESCRIPTOR_SPACE,
+            vec![(descriptor_id.key(), descriptor)],
+        )
+        .await;
+
+        let mut wrong_length_row = row.clone();
+        wrong_length_row.representation = Representation::SharedDescriptor {
+            descriptor_id: *descriptor_id,
+            encoded_len: encoded_len.saturating_add(1),
+        };
+        put_rows(
+            storage,
+            ROW_SPACE,
+            vec![(row_key.clone(), encode_row(&wrong_length_row))],
+        )
+        .await;
+        assert!(read_payload(storage, row_key, None).await.is_err());
+        put_rows(
+            storage,
+            ROW_SPACE,
+            vec![(row_key.clone(), original_row.clone())],
+        )
+        .await;
+    }
+
     let refs = descriptor_refs(storage, &row)
         .await
         .expect("resolve corruption refs");
@@ -1045,10 +1129,17 @@ async fn exercise_corruption<S: Storage>(storage: &S, row_key: &Key) {
         .await
         .expect("read corruption target");
     delete_keys(storage, CHUNK_SPACE, &[target.key()]).await;
-    // Immutable content-addressed spaces correctly reject replacing an object
-    // under an existing digest.  Exercise the serving contract at that owner
-    // boundary instead: a referenced object that is absent must fail closed.
     assert!(read_payload(storage, row_key, None).await.is_err());
+    let mut substituted = original.clone();
+    substituted[0] ^= 1;
+    let substituted_published =
+        try_put_rows(storage, CHUNK_SPACE, vec![(target.key(), substituted)])
+            .await
+            .is_ok();
+    assert!(read_payload(storage, row_key, None).await.is_err());
+    if substituted_published {
+        delete_keys(storage, CHUNK_SPACE, &[target.key()]).await;
+    }
     put_rows(storage, CHUNK_SPACE, vec![(target.key(), original)]).await;
 }
 
@@ -1197,7 +1288,7 @@ async fn print_inventory<S: Storage>(context: &MeasureContext<'_>, storage: &S, 
             continue;
         }
         logical_bytes += row.payload_len;
-        let fixed = (4 + 1 + 8 + 32 + 4 + row.metadata.len() + 1) as u64;
+        let fixed = (4 + 1 + 8 + 32 + row.metadata.encoded_len() + 1) as u64;
         native_metadata_bytes += fixed;
         match row.representation {
             Representation::InlineDescriptor(_) => {
@@ -1301,7 +1392,7 @@ fn encode_row(row: &Row) -> Vec<u8> {
         return format!(
             "{{\"blob_id\":\"{}\",\"metadata\":\"{}\",\"path\":\"/bench/file.bin\",\"type\":\"file\"}}",
             hex_digest(blob_id),
-            "m".repeat(row.metadata.len()),
+            row.metadata.name,
         )
         .into_bytes();
     }
@@ -1310,8 +1401,16 @@ fn encode_row(row: &Row) -> Vec<u8> {
     output.push(row.layout.tag());
     output.extend_from_slice(&row.payload_len.to_le_bytes());
     output.extend_from_slice(&row.whole_hash.0);
-    output.extend_from_slice(&(row.metadata.len() as u32).to_le_bytes());
-    output.extend_from_slice(&row.metadata);
+    output.extend_from_slice(&row.metadata.file_id);
+    match row.metadata.directory_id {
+        Some(directory_id) => {
+            output.push(1);
+            output.extend_from_slice(&directory_id);
+        }
+        None => output.push(0),
+    }
+    output.extend_from_slice(&(row.metadata.name.len() as u32).to_le_bytes());
+    output.extend_from_slice(row.metadata.name.as_bytes());
     match &row.representation {
         Representation::Current(_) => unreachable!("current row encoded above"),
         Representation::InlineDescriptor(refs) => {
@@ -1340,16 +1439,19 @@ fn decode_row(bytes: &[u8]) -> Result<Row, String> {
                 .as_str()
                 .ok_or_else(|| "current descriptor has no blob_id".to_owned())?,
         )?;
-        let metadata = value["metadata"]
+        let name = value["metadata"]
             .as_str()
             .ok_or_else(|| "current descriptor has no metadata".to_owned())?
-            .as_bytes()
-            .to_vec();
+            .to_owned();
         return Ok(Row {
             layout: Layout::Current,
             payload_len: 0,
             whole_hash: Digest([0; 32]),
-            metadata,
+            metadata: NativeFileMetadata {
+                file_id: [0; 16],
+                directory_id: None,
+                name,
+            },
             representation: Representation::Current(blob_id),
         });
     }
@@ -1364,8 +1466,26 @@ fn decode_row(bytes: &[u8]) -> Result<Row, String> {
     };
     let payload_len = input.u64()?;
     let whole_hash = input.digest()?;
-    let metadata_len = input.u32()? as usize;
-    let metadata = input.bytes(metadata_len)?.to_vec();
+    let mut file_id = [0; 16];
+    file_id.copy_from_slice(input.bytes(16)?);
+    let directory_id = match input.u8()? {
+        0 => None,
+        1 => {
+            let mut directory_id = [0; 16];
+            directory_id.copy_from_slice(input.bytes(16)?);
+            Some(directory_id)
+        }
+        _ => return Err("invalid native directory UUID presence tag".to_owned()),
+    };
+    let name_len = input.u32()? as usize;
+    let name = std::str::from_utf8(input.bytes(name_len)?)
+        .map_err(|_| "file name is not canonical UTF-8".to_owned())?
+        .to_owned();
+    let metadata = NativeFileMetadata {
+        file_id,
+        directory_id,
+        name,
+    };
     let representation = match input.u8()? {
         1 => return Err("row-inline payload representation is forbidden".to_owned()),
         2 => {
@@ -1897,7 +2017,7 @@ mod tests {
             layout: Layout::E3,
             payload_len: 4,
             whole_hash: Digest::of(b"data"),
-            metadata: Vec::new(),
+            metadata: NativeFileMetadata::for_width(0),
             representation: Representation::InlineDescriptor(refs(4)),
         };
         assert!(decode_row(&encode_row(&row)).is_err());
@@ -1907,7 +2027,7 @@ mod tests {
             layout: Layout::E3,
             payload_len: 2,
             whole_hash: Digest::of(b"ab"),
-            metadata: Vec::new(),
+            metadata: NativeFileMetadata::for_width(0),
             representation: Representation::SharedDescriptor {
                 descriptor_id: Digest::of(&encode_leaf(&small)),
                 encoded_len: encode_leaf(&small).len() as u32,
@@ -1922,15 +2042,26 @@ mod tests {
             layout: Layout::E3,
             payload_len: 2,
             whole_hash: Digest::of(b"ab"),
-            metadata: Vec::new(),
+            metadata: NativeFileMetadata::for_width(0),
             representation: Representation::InlineDescriptor(refs(2)),
         };
         let mut encoded = encode_row(&row);
-        let descriptor_id_offset = 4 + 1 + 8 + 32 + 4 + 1;
+        let descriptor_id_offset = 4 + 1 + 8 + 32 + row.metadata.encoded_len() + 1;
         encoded[descriptor_id_offset] ^= 1;
         assert_eq!(
             decode_row(&encoded).unwrap_err(),
             "inline descriptor content ID mismatch"
+        );
+    }
+
+    #[test]
+    fn chunk_content_id_rejects_same_size_substitution() {
+        let original = [1_u8; 32];
+        let substituted = [2_u8; 32];
+        let chunk_id = Digest::of(&original);
+        assert_eq!(
+            verify_object(chunk_id, &substituted).unwrap_err(),
+            "content-addressed object hash mismatch"
         );
     }
 }
