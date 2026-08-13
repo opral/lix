@@ -187,6 +187,11 @@ required-features = ["storage-benches"]
 name = "chunking_oracle"
 path = "examples/chunking_oracle.rs"
 
+[[example]]
+name = "file_layout_experiment_e"
+path = "examples/file_layout_experiment_e.rs"
+required-features = ["rocksdb", "slatedb"]
+
 [[test]]
 name = "server_protocol_durable_idempotency"
 path = "tests/server_protocol_durable_idempotency.rs"
