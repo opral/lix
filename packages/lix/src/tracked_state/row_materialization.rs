@@ -795,8 +795,12 @@ mod tests {
                     } else {
                         format!("row-{index}")
                     };
-                    let locale = if index == 0 { "keep" } else { "drop" };
-                    format!("('{id}', '{locale}')")
+                    // Distinct per row on purpose. `derive_entity_row_groups`
+                    // refuses the columnar layout when a non-key string column
+                    // has between 2 and 64 distinct values -- it clusters
+                    // instead -- so a two-valued flag column here silently
+                    // produces no columnar commit at all.
+                    format!("('{id}', 'loc-{index}')")
                 })
                 .collect::<Vec<_>>()
                 .join(",");
@@ -827,7 +831,10 @@ mod tests {
 
             let _ = crate::storage_bench::take_tracked_key_allocation_census();
             let rows = session
-                .execute(&format!("SELECT id FROM {schema_key} WHERE locale = 'keep'"), &[])
+                .execute(
+                    &format!("SELECT id FROM {schema_key} WHERE locale = 'loc-0'"),
+                    &[],
+                )
                 .await
                 .expect("the rotated scan must succeed, not reject its own payload");
             let census = crate::storage_bench::take_tracked_key_allocation_census();
