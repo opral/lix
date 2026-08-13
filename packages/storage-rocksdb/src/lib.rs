@@ -35,6 +35,18 @@ pub struct PerfProbe {
     context: ::rocksdb::perf::PerfContext,
 }
 
+// `rocksdb::perf::PerfContext` is a raw FFI handle and implements no traits, so
+// the workspace `missing_debug_implementations` lint needs this by hand. The
+// counters are the interesting state and they are read through `read()`.
+impl std::fmt::Debug for PerfProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PerfProbe")
+            .field("counters", &self.read())
+            .finish()
+    }
+}
+
 impl Default for PerfProbe {
     fn default() -> Self {
         Self::new()
