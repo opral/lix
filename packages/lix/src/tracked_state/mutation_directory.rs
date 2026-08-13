@@ -200,6 +200,55 @@ pub(crate) mod seekable_prototype {
         out
     }
 
+    /// Encodes an internal node in the v2 layout.  Children carry cumulative
+    /// entry and row counts so index routing is a binary search rather than a
+    /// prefix-sum walk over every child.
+    pub(crate) fn encode_internal(
+        layout: u8,
+        level: u16,
+        children: &[(Vec<u8>, Vec<u8>, [u8; 32], u32, u64)],
+    ) -> Vec<u8> {
+        let count = children.len();
+        let entry_count: u32 = children.iter().map(|child| child.3).sum();
+        let direct_row_count: u64 = children.iter().map(|child| child.4).sum();
+        let mut out = Vec::new();
+        header(
+            &mut out,
+            1,
+            layout,
+            level,
+            count as u32,
+            entry_count,
+            direct_row_count,
+        );
+        let mut key_offsets = Vec::with_capacity(2 * count + 1);
+        let mut cursor = 0u32;
+        for (first_key, last_key, ..) in children {
+            key_offsets.push(cursor);
+            cursor += first_key.len() as u32;
+            key_offsets.push(cursor);
+            cursor += last_key.len() as u32;
+        }
+        key_offsets.push(cursor);
+        for offset in &key_offsets {
+            put_u32(&mut out, *offset);
+        }
+        let mut cum_entries = 0u32;
+        let mut cum_rows = 0u64;
+        for (_, _, node_id, child_entries, child_rows) in children {
+            cum_entries += child_entries;
+            cum_rows += child_rows;
+            out.extend_from_slice(node_id);
+            put_u32(&mut out, cum_entries);
+            out.extend_from_slice(&cum_rows.to_le_bytes());
+        }
+        for (first_key, last_key, ..) in children {
+            out.extend_from_slice(first_key);
+            out.extend_from_slice(last_key);
+        }
+        out
+    }
+
     /// A borrowed view over an encoded node.  Constructing one copies nothing.
     #[derive(Clone, Copy)]
     pub(crate) struct NodeView<'a> {
@@ -227,10 +276,6 @@ pub(crate) mod seekable_prototype {
                 return Err(directory_error("node shape is invalid"));
             }
             Ok(Self { bytes, count, kind })
-        }
-
-        pub(crate) fn count(&self) -> usize {
-            self.count
         }
 
         fn stride(&self) -> usize {
@@ -285,6 +330,98 @@ pub(crate) mod seekable_prototype {
             } else {
                 None
             }
+        }
+
+        /// The node summary a parent authenticates, read in O(1) from the
+        /// header and the two outermost key slots.  The v1 reader recomputes
+        /// the same four values by walking every entry in the node.
+        pub(crate) fn summary(
+            &self,
+            touched: &mut Touched,
+        ) -> (&'a [u8], &'a [u8], u32, u64) {
+            touched.bytes += 12;
+            let entry_count =
+                u32::from_le_bytes(self.bytes[13..17].try_into().unwrap());
+            let direct_row_count =
+                u64::from_le_bytes(self.bytes[17..25].try_into().unwrap());
+            let first_key = self.key(0, 0, touched);
+            let last_key = self.key(self.count - 1, 1, touched);
+            (first_key, last_key, entry_count, direct_row_count)
+        }
+
+        /// Rejects a node whose *touched* key region is not strictly ordered.
+        /// Under v1 this is enforced for the whole node at decode time by
+        /// `validate_stored_entries`; under v2 the unvisited region is left to
+        /// the content digest and the authenticated parent, and what the
+        /// reader touches is checked here.
+        pub(crate) fn check_local_order(
+            &self,
+            index: usize,
+            touched: &mut Touched,
+        ) -> Result<(), LixError> {
+            let first_key = self.key(index, 0, touched);
+            let last_key = self.key(index, 1, touched);
+            if first_key.is_empty() || first_key > last_key {
+                return Err(directory_error("bounded entries overlap or are unordered"));
+            }
+            if index + 1 < self.count {
+                let next_first = self.key(index + 1, 0, touched);
+                if last_key >= next_first {
+                    return Err(directory_error("bounded entries overlap or are unordered"));
+                }
+            }
+            Ok(())
+        }
+
+        /// Reads one child summary.  Fixed stride, so this is random access
+        /// with no decoding; the only copy is the 32-byte node id, which goes
+        /// on the stack.
+        pub(crate) fn child(
+            &self,
+            index: usize,
+            touched: &mut Touched,
+        ) -> ([u8; 32], u32, u64) {
+            let at = HEADER + 4 * (2 * self.count + 1) + INTERNAL_STRIDE * index;
+            touched.bytes += INTERNAL_STRIDE;
+            let mut node_id = [0u8; 32];
+            node_id.copy_from_slice(&self.bytes[at..at + 32]);
+            let cum_entries = u32::from_le_bytes(self.bytes[at + 32..at + 36].try_into().unwrap());
+            let cum_rows = u64::from_le_bytes(self.bytes[at + 36..at + 44].try_into().unwrap());
+            let (prev_entries, prev_rows) = if index == 0 {
+                (0, 0)
+            } else {
+                let prev = at - INTERNAL_STRIDE;
+                touched.bytes += 12;
+                (
+                    u32::from_le_bytes(self.bytes[prev + 32..prev + 36].try_into().unwrap()),
+                    u64::from_le_bytes(self.bytes[prev + 36..prev + 44].try_into().unwrap()),
+                )
+            };
+            (node_id, cum_entries - prev_entries, cum_rows - prev_rows)
+        }
+
+        /// Routes an entry index to the child that owns it, by binary search
+        /// on the cumulative counts.  This is the path the keyless layouts
+        /// (compact replacement, direct rows) take; v1 walks every child.
+        pub(crate) fn seek_entry_index(
+            &self,
+            entry_index: u32,
+            touched: &mut Touched,
+        ) -> Option<usize> {
+            let mut low = 0usize;
+            let mut high = self.count;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let at = HEADER + 4 * (2 * self.count + 1) + INTERNAL_STRIDE * mid + 32;
+                touched.bytes += 4;
+                let cum = u32::from_le_bytes(self.bytes[at..at + 4].try_into().unwrap());
+                if cum <= entry_index {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            (low < self.count).then_some(low)
         }
 
         /// Materializes exactly one leaf entry.
@@ -2612,6 +2749,11 @@ mod tests {
         println!(
             "DIRNODE_AB entries,v1_node_bytes,v2_node_bytes,v1_read_bytes,v1_allocs,v1_alloc_bytes,v2_read_bytes,v2_key_compares,v2_allocs,v2_alloc_bytes"
         );
+        println!(
+            "DIRNODE_INTERNAL entries,v1_node_bytes,v2_node_bytes,v1_read_bytes,v1_allocs,v1_alloc_bytes,v2_read_bytes,v2_allocs,v2_alloc_bytes"
+        );        println!(
+            "DIRNODE_WRITE entries,v1_node_bytes,v2_node_bytes,v1_encode_allocs,v1_encode_alloc_bytes,v2_encode_allocs,v2_encode_alloc_bytes"
+        );
         for entry_count in [2u32, 8, 32, 64, 128] {
             let raw = (0..entry_count)
                 .map(|index| {
@@ -2643,7 +2785,7 @@ mod tests {
             // Arm v1: decode the whole node, then walk it for the one entry -
             // exactly what `load_mutation_part_read_plan` does at a leaf.
             let ((v1_answer, v1_index), v1_allocs, v1_alloc_bytes) =
-                super::alloc_census::measure(|| {
+                alloc_census::measure(|| {
                     let node = decode_node(&v1_bytes).unwrap();
                     let StoredNode::Leaf { entries, .. } = node else {
                         unreachable!("leaf");
@@ -2663,7 +2805,7 @@ mod tests {
             // Arm v2: binary-search the key table in place, decode one entry.
             let mut touched = Touched::default();
             let ((v2_answer, v2_index), v2_allocs, v2_alloc_bytes) =
-                super::alloc_census::measure(|| {
+                alloc_census::measure(|| {
                     let view = NodeView::new(&v2_bytes, &mut touched).unwrap();
                     let index = view.seek(&probe, &mut touched).unwrap();
                     (view.leaf_entry(index, &mut touched), index)
@@ -2686,7 +2828,220 @@ mod tests {
                 v2_allocs,
                 v2_alloc_bytes,
             );
+
+            // Write side.  Warm reads decode nothing, so the only way this
+            // layout can cost steady-state throughput is at commit, where
+            // every node is encoded once.  Inputs for both arms are built
+            // before the measured region so only the encode is counted.
+            let write_node = StoredNode::Leaf {
+                layout: LAYOUT_BOUNDED_DIRECT,
+                entries: raw
+                    .iter()
+                    .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
+                        first_key: first_key.clone(),
+                        last_key: last_key.clone(),
+                        replacement_part: None,
+                        direct_row_count: *direct_row_count,
+                    })
+                    .collect(),
+            };
+            let (v1_out, v1_enc_allocs, v1_enc_alloc_bytes) =
+                alloc_census::measure(|| encode_node(&write_node).unwrap());
+            let (v2_out, v2_enc_allocs, v2_enc_alloc_bytes) =
+                alloc_census::measure(|| encode_leaf(LAYOUT_BOUNDED_DIRECT, &raw));
+            assert_eq!(v1_out.len(), v1_bytes.len());
+            assert_eq!(v2_out.len(), v2_bytes.len());
+            // Internal-node arm: the other half of a height-2 point read.
+            let child_ids = (0..entry_count)
+                .map(|index| {
+                    // Non-zero fill: `validate_node` rejects an all-zero
+                    // child node id, which index 0 would otherwise produce.
+                    let mut node_id = [0xABu8; 32];
+                    node_id[..4].copy_from_slice(&index.to_be_bytes());
+                    node_id
+                })
+                .collect::<Vec<_>>();
+            let internal_children = raw
+                .iter()
+                .zip(&child_ids)
+                .map(|((first_key, last_key, _), node_id)| {
+                    (first_key.clone(), last_key.clone(), *node_id, 128u32, 128u64)
+                })
+                .collect::<Vec<_>>();
+            let v1_internal = StoredNode::Internal {
+                layout: LAYOUT_BOUNDED_DIRECT,
+                level: 1,
+                children: internal_children
+                    .iter()
+                    .map(|(first_key, last_key, node_id, entries, rows)| StoredChild {
+                        first_key: first_key.clone(),
+                        last_key: last_key.clone(),
+                        node_id: *node_id,
+                        entry_count: *entries,
+                        direct_row_count: *rows,
+                        level: 0,
+                        layout: LAYOUT_BOUNDED_DIRECT,
+                    })
+                    .collect(),
+            };
+            let v1_internal_bytes = encode_node(&v1_internal).unwrap();
+            let v2_internal_bytes =
+                seekable_prototype::encode_internal(LAYOUT_BOUNDED_DIRECT, 1, &internal_children);
+
+            let ((v1_child, v1_child_index), v1_int_allocs, v1_int_alloc_bytes) =
+                alloc_census::measure(|| {
+                    let node = decode_node(&v1_internal_bytes).unwrap();
+                    let StoredNode::Internal { children, .. } = node else {
+                        unreachable!("internal");
+                    };
+                    let mut preceding = 0u32;
+                    let mut found = None;
+                    for (index, child) in children.into_iter().enumerate() {
+                        if child.first_key.as_slice() <= probe.as_slice()
+                            && probe.as_slice() <= child.last_key.as_slice()
+                        {
+                            found = Some(((child.node_id, child.entry_count, preceding), index));
+                            break;
+                        }
+                        preceding += child.entry_count;
+                    }
+                    found.unwrap()
+                });
+
+            let mut int_touched = Touched::default();
+            let ((v2_child, v2_child_index), v2_int_allocs, v2_int_alloc_bytes) =
+                alloc_census::measure(|| {
+                    let view = NodeView::new(&v2_internal_bytes, &mut int_touched).unwrap();
+                    let index = view.seek(&probe, &mut int_touched).unwrap();
+                    let (node_id, entries, _) = view.child(index, &mut int_touched);
+                    ((node_id, entries, 128 * index as u32), index)
+                });
+
+            assert_eq!(v1_child_index, v2_child_index, "internal arms disagree on index");
+            assert_eq!(v1_child, v2_child, "internal arms disagree on child");
+
+            // The keyless layouts route by entry index instead of by key.
+            // Both routings must select the same child.
+            let index_view = NodeView::new(&v2_internal_bytes, &mut Touched::default()).unwrap();
+            assert_eq!(
+                index_view.seek_entry_index(
+                    128 * v2_child_index as u32 + 5,
+                    &mut Touched::default()
+                ),
+                Some(v2_child_index),
+                "index routing disagrees with key routing"
+            );
+
+            println!(
+                "DIRNODE_INTERNAL {},{},{},{},{},{},{},{},{}",
+                entry_count,
+                v1_internal_bytes.len(),
+                v2_internal_bytes.len(),
+                v1_internal_bytes.len() - NODE_MAGIC.len(),
+                v1_int_allocs,
+                v1_int_alloc_bytes,
+                int_touched.bytes,
+                v2_int_allocs,
+                v2_int_alloc_bytes,
+            );
+
+            println!(
+                "DIRNODE_WRITE {},{},{},{},{},{},{}",
+                entry_count,
+                v1_out.len(),
+                v2_out.len(),
+                v1_enc_allocs,
+                v1_enc_alloc_bytes,
+                v2_enc_allocs,
+                v2_enc_alloc_bytes,
+            );
         }
+    }
+
+    /// The v2 reader must vouch for exactly what the v1 reader vouches for.
+    ///
+    /// This is a real gate, not a probe: it fails if the O(1) header-read
+    /// summary ever diverges from the walked summary `node_summary_ref`
+    /// computes, and it fails if a malformed key range inside the region the
+    /// reader touches is accepted.
+    #[test]
+    fn dirnode_v2_summary_matches_walked_summary_and_rejects_touched_disorder() {
+        use super::seekable_prototype::{NodeView, Touched, encode_leaf};
+
+        const KEY_LEN: usize = 27;
+
+        fn keys(index: u32) -> (Vec<u8>, Vec<u8>) {
+            let mut first_key = vec![0u8; KEY_LEN];
+            let mut last_key = vec![0u8; KEY_LEN];
+            first_key[..8].copy_from_slice(&(u64::from(index) * 2).to_be_bytes());
+            last_key[..8].copy_from_slice(&(u64::from(index) * 2 + 1).to_be_bytes());
+            (first_key, last_key)
+        }
+
+        for entry_count in [1u32, 2, 8, 128] {
+            let raw = (0..entry_count)
+                .map(|index| {
+                    let (first_key, last_key) = keys(index);
+                    (first_key, last_key, 7u16)
+                })
+                .collect::<Vec<_>>();
+            let v1_node = StoredNode::Leaf {
+                layout: LAYOUT_BOUNDED_DIRECT,
+                entries: raw
+                    .iter()
+                    .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
+                        first_key: first_key.clone(),
+                        last_key: last_key.clone(),
+                        replacement_part: None,
+                        direct_row_count: *direct_row_count,
+                    })
+                    .collect(),
+            };
+            let node_id = [7u8; 32];
+            let walked = node_summary_ref(&v1_node, node_id).unwrap();
+
+            let v2_bytes = encode_leaf(LAYOUT_BOUNDED_DIRECT, &raw);
+            let mut touched = Touched::default();
+            let view = NodeView::new(&v2_bytes, &mut touched).unwrap();
+            let (first_key, last_key, count, direct_rows) = view.summary(&mut touched);
+
+            assert_eq!(first_key, walked.first_key, "first_key at {entry_count}");
+            assert_eq!(last_key, walked.last_key, "last_key at {entry_count}");
+            assert_eq!(count, walked.entry_count, "entry_count at {entry_count}");
+            assert_eq!(
+                direct_rows, walked.direct_row_count,
+                "direct_row_count at {entry_count}"
+            );
+
+            // Reading the summary must stay O(1): it may not grow with the
+            // number of entries in the node.
+            assert!(
+                touched.bytes < 200,
+                "summary read touched {} bytes at {entry_count} entries",
+                touched.bytes
+            );
+
+            // Every entry the reader touches is order-checked.
+            for index in 0..entry_count as usize {
+                view.check_local_order(index, &mut Touched::default())
+                    .unwrap();
+            }
+        }
+
+        // A node whose touched region is out of order must be refused.
+        let (first_key, last_key) = keys(5);
+        let (later_first, later_last) = keys(9);
+        let disordered = vec![
+            (later_first, later_last, 7u16),
+            (first_key, last_key, 7u16),
+        ];
+        let bad = encode_leaf(LAYOUT_BOUNDED_DIRECT, &disordered);
+        let mut touched = Touched::default();
+        let view = NodeView::new(&bad, &mut touched).unwrap();
+        assert!(
+            view.check_local_order(0, &mut touched).is_err(),
+            "out-of-order touched entries must be rejected"
+        );
     }
 
     fn bounded_entry(index: u32) -> MutationDirectoryEntry {
