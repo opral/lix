@@ -6473,6 +6473,144 @@ mod tests {
         );
     }
 
+    /// The raw-byte prefilter in path resolution must not change any answer,
+    /// including for names it refuses to accelerate.
+    ///
+    /// The prefilter is a necessary-condition test on the snapshot text, so its
+    /// only possible failure is the silent one: skipping a parse that would
+    /// have matched, which drops history rows rather than erroring. That can
+    /// only happen if a name is written to JSON as something other than its
+    /// source bytes, so the fixture uses exactly those names —
+    /// backslash, quote, non-ASCII, emoji — alongside a plain ASCII one.
+    ///
+    /// The oracle is the unfiltered read, which resolves no lookup ids and
+    /// therefore never runs the resolver at all.
+    ///
+    /// The census assertions are the hit and the miss: a plain-ASCII name must
+    /// take the accelerated route AND actually skip parses, and a name carrying
+    /// a character `serde_json` escapes must refuse it. Lower bounds only —
+    /// these counters are process-global.
+    #[tokio::test]
+    async fn path_resolution_prefilter_preserves_every_answer() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        // Plain ASCII first, then the shapes whose JSON encoding may differ
+        // from their source text.
+        let names = ["plain.md", "with space.md", "quo\"te.md", "back\\slash.md", "ünïcode.md", "emoji-🙂.md"];
+        for (index, name) in names.iter().enumerate() {
+            let statement = format!(
+                "INSERT INTO lix_file (path, content) VALUES ('/docs/{name}', CAST('c{index}' AS BYTEA))"
+            );
+            session
+                .execute(&statement, &[])
+                .await
+                .unwrap_or_else(|error| panic!("insert of {name} should succeed: {error}"));
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = CAST('c{index}b' AS BYTEA) \
+                         WHERE path = '/docs/{name}'"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("update of {name} should succeed: {error}"));
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let projection = format!(
+            "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
+             FROM lix_file_history('{head_commit_id}')"
+        );
+        let key = |row: &Vec<Value>| format!("{row:?}");
+        let unfiltered = rows_from_execute_result(
+            session
+                .execute(&projection, &[])
+                .await
+                .expect("unfiltered history should execute"),
+        )
+        .1;
+
+        for name in names {
+            let path = format!("/docs/{name}");
+            let expected: BTreeSet<String> = unfiltered
+                .iter()
+                .filter(|row| row[1] == Value::Text(path.clone()))
+                .map(key)
+                .collect();
+            assert!(
+                !expected.is_empty(),
+                "the oracle must carry history for {path}"
+            );
+            let actual: BTreeSet<String> = rows_from_execute_result(
+                session
+                    .execute(
+                        &format!("{projection} WHERE path = $1"),
+                        &[Value::Text(path.clone())],
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("path history for {path} should execute: {error}")),
+            )
+            .1
+            .iter()
+            .map(key)
+            .collect();
+            assert_eq!(
+                expected, actual,
+                "the prefilter changed the answer for {path}"
+            );
+        }
+
+        #[cfg(feature = "storage-benches")]
+        {
+            // Hit: a plain-ASCII name accelerates and actually skips parses.
+            let _ = crate::storage_bench::take_path_resolver_census();
+            let _ = session
+                .execute(
+                    &format!("{projection} WHERE path = $1"),
+                    &[Value::Text("/docs/plain.md".to_string())],
+                )
+                .await
+                .expect("plain path history should execute");
+            let (seen, parsed, prefiltered, _metadata, on, off) =
+                crate::storage_bench::take_path_resolver_census();
+            assert!(
+                on >= 1 && prefiltered >= 1 && seen > parsed,
+                "a plain ASCII name must take the accelerated route and skip parses:                  seen={seen} parsed={parsed} prefiltered={prefiltered} on={on} off={off}"
+            );
+
+            // Miss: a name carrying a character `serde_json` escapes must
+            // refuse the accelerator rather than risk a wrong byte test.
+            let _ = crate::storage_bench::take_path_resolver_census();
+            let _ = session
+                .execute(
+                    &format!("{projection} WHERE path = $1"),
+                    &[Value::Text("/docs/quo\"te.md".to_string())],
+                )
+                .await
+                .expect("quoted path history should execute");
+            let (_seen, _parsed, _prefiltered, _metadata, _on, off) =
+                crate::storage_bench::take_path_resolver_census();
+            assert!(
+                off >= 1,
+                "a name whose JSON encoding differs from its source text must \
+                 refuse the prefilter"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn execute_sql_rejects_writes_to_history_views_before_planning() {
         for sql in [
