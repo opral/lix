@@ -154,25 +154,6 @@ pub(crate) struct TrackedStateCommitRoot {
     pub(crate) changed_key_count: u64,
     pub(crate) row_count_estimate: u64,
     pub(crate) tree_height: u32,
-    pub(crate) primary_chunk_count: u64,
-    pub(crate) primary_chunk_bytes: u64,
-}
-
-impl TrackedStateCommitRoot {
-    /// Compares immutable serving identity and shape.
-    ///
-    /// Primary chunk counts and bytes describe the publication path's staged
-    /// writes. A rebuild can reach the same content-addressed root through a
-    /// different sequence of intermediate chunks, so those original metrics
-    /// remain manifest-owned accounting rather than rebuilt root identity.
-    pub(crate) fn has_same_authoritative_layout(&self, other: &Self) -> bool {
-        self.commit_id == other.commit_id
-            && self.root_id == other.root_id
-            && self.parent_roots == other.parent_roots
-            && self.changed_key_count == other.changed_key_count
-            && self.row_count_estimate == other.row_count_estimate
-            && self.tree_height == other.tree_height
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
@@ -298,22 +279,9 @@ pub(crate) struct CurrentStatePartDescriptor {
     #[musli(bytes)]
     pub(crate) last_key: Vec<u8>,
     pub(crate) content_digest: [u8; 32],
-    /// Digest of the native part's compact JSON-reference summary. Zero for
-    /// complete-replacement sources whose history authority owns reachability.
-    pub(crate) payload_refs_digest: [u8; 32],
-    /// 0 references an immutable complete-replacement mutation part; 1
-    /// references a native content-addressed current-state data part; 2
-    /// references one authenticated page in a canonical entity row-group set.
-    pub(crate) source_kind: u8,
-    /// Physical immutable source generation. Zero for replacement/native
-    /// sources; the exact row-group-set ID for columnar pages.
-    pub(crate) source_id: [u8; 16],
-    pub(crate) owner_commit_id: [u8; 16],
-    /// Replacement segment index or columnar row-group index. Zero for native
-    /// current-state data parts.
-    pub(crate) part_index: u32,
-    /// Columnar page index inside `part_index`. Zero for other source kinds.
-    pub(crate) source_page_index: u16,
+    /// Which physical source serves this range, plus that source's own
+    /// addressing fields.
+    pub(crate) source: CurrentStatePartSource,
     /// First physical row selected from the source part. Descriptor slicing
     /// allows sparse deletes and updates to retain untouched source bytes.
     pub(crate) source_row_offset: u16,
@@ -322,6 +290,53 @@ pub(crate) struct CurrentStatePartDescriptor {
     /// sparse rewrite. Canonical encodes clear this bit, making compaction
     /// self-stabilizing without guessing from physical row density.
     pub(crate) fragmented: bool,
+}
+
+/// Physical source of one current-state part, with the addressing fields that
+/// source actually uses.
+///
+/// This was previously a `source_kind: u8` discriminator beside the union of
+/// every kind's fields, so each locator carried the other kinds' fields pinned
+/// to zero and a hand-written validator re-proved that pinning on every
+/// decode. Per-variant fields make those combinations unrepresentable instead
+/// of merely rejected, and stop the unused fields from being encoded at all.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
+pub(crate) enum CurrentStatePartSource {
+    /// An immutable complete-replacement mutation part owned by one commit.
+    Replacement(ReplacementPartSource),
+    /// A native content-addressed current-state data part. The part's own rows
+    /// carry per-row authorship, so the locator has no uniform timestamps and
+    /// no owning commit; reachability is proved by the refs summary instead.
+    NativeDataPart {
+        /// Digest of the part's compact JSON-reference summary.
+        payload_refs_digest: [u8; 32],
+    },
+    /// One authenticated page in a canonical entity row-group set.
+    ColumnarPage(ColumnarPageSource),
+}
+
+/// Addressing for a replacement-part source.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct ReplacementPartSource {
+    pub(crate) owner_commit_id: [u8; 16],
+    /// Replacement segment index within the owner commit.
+    pub(crate) part_index: u32,
+    pub(crate) uniform_created_at: LixTimestamp,
+    pub(crate) uniform_updated_at: LixTimestamp,
+}
+
+/// Addressing for one page of a canonical entity row-group set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct ColumnarPageSource {
+    /// Physical immutable row-group-set id.
+    pub(crate) source_id: [u8; 16],
+    pub(crate) owner_commit_id: [u8; 16],
+    /// Row-group index within the set.
+    pub(crate) part_index: u32,
+    /// Page index inside `part_index`.
+    pub(crate) source_page_index: u16,
     pub(crate) uniform_created_at: LixTimestamp,
     pub(crate) uniform_updated_at: LixTimestamp,
 }
@@ -662,35 +677,4 @@ pub(crate) struct TrackedStateTreeDiffEntry {
     pub(crate) key: TrackedStateKey,
     pub(crate) before: Option<TrackedStateIndexValue>,
     pub(crate) after: Option<TrackedStateIndexValue>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn commit_root() -> TrackedStateCommitRoot {
-        TrackedStateCommitRoot {
-            commit_id: CommitId::parse_lix("01920000-0000-7000-8000-000000000001", "test commit")
-                .expect("test commit id should parse"),
-            root_id: TrackedStateRootId::new([1; 32]),
-            parent_roots: Vec::new(),
-            changed_key_count: 3,
-            row_count_estimate: 7,
-            tree_height: 1,
-            primary_chunk_count: 2,
-            primary_chunk_bytes: 128,
-        }
-    }
-
-    #[test]
-    fn authoritative_layout_excludes_publication_write_accounting() {
-        let expected = commit_root();
-        let mut rebuilt = expected.clone();
-        rebuilt.primary_chunk_count = 5;
-        rebuilt.primary_chunk_bytes = 512;
-        assert!(expected.has_same_authoritative_layout(&rebuilt));
-
-        rebuilt.root_id = TrackedStateRootId::new([2; 32]);
-        assert!(!expected.has_same_authoritative_layout(&rebuilt));
-    }
 }

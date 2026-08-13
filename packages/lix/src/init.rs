@@ -59,7 +59,7 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// open, where `unsupported_repository_protocol_error` tells the operator to
 /// recreate the repository. Every hard cut to a persisted record shape has to
 /// move this value with it.
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v67";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v68";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

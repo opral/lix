@@ -962,8 +962,9 @@ const GENERATION_BYTES: usize = 16;
 /// Order-preserving tracked-head key encoding.
 ///
 /// The head table is the normal read serving index, so its storage ordering is
-/// also the visible row ordering: `(branch, generation, schema, entity,
-/// file)`. Musli's storage encoding is excellent for values and structural
+/// also the visible row ordering: `(branch, generation, schema, file,
+/// entity)` - see `encode_hot_row_key_parts`, which writes the file id before
+/// the entity primary key. Musli's storage encoding is excellent for values and structural
 /// prefixes, but length-prefixed strings do not preserve lexical order. This
 /// codec retains exact prefix scans while making every table scan already
 /// ordered and duplicate-free for one branch generation.

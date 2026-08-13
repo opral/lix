@@ -12,8 +12,9 @@ use crate::tracked_state::scoped_range::{
     load_scoped_range_coverage_with_staged, stage_replace_scoped_range, stage_scoped_range_tree,
 };
 use crate::tracked_state::types::{
-    CommitDeltaReplacementScope, CommitStateManifest, CommitStateMutationInventory,
-    CommitStateTouchedScopeFilter, CurrentStatePartDescriptor, CurrentStateScopedRangeRoot,
+    ColumnarPageSource, CommitDeltaReplacementScope, CommitStateManifest,
+    CommitStateMutationInventory, CommitStateTouchedScopeFilter, CurrentStatePartDescriptor,
+    CurrentStatePartSource, CurrentStateScopedRangeRoot, ReplacementPartSource,
 };
 
 const TRANSITION_CONTEXT: &str = "lix current-state scoped-range transition v2";
@@ -103,19 +104,19 @@ async fn stage_disjoint_columnar_current_state_pages(
                 first_key: first_key.clone(),
                 last_key: last_key.clone(),
                 content_digest: parts.manifest_digest,
-                payload_refs_digest: [0; 32],
-                source_kind: 2,
-                source_id: parts.row_group_set_id,
-                owner_commit_id: parts.owner_commit_id,
-                part_index: u32::try_from(group_index)
-                    .map_err(|_| scoped_state_error("columnar group index exceeds u32"))?,
-                source_page_index: u16::try_from(page_index)
-                    .map_err(|_| scoped_state_error("columnar page index exceeds u16"))?,
+                source: CurrentStatePartSource::ColumnarPage(ColumnarPageSource {
+                    source_id: parts.row_group_set_id,
+                    owner_commit_id: parts.owner_commit_id,
+                    part_index: u32::try_from(group_index)
+                        .map_err(|_| scoped_state_error("columnar group index exceeds u32"))?,
+                    source_page_index: u16::try_from(page_index)
+                        .map_err(|_| scoped_state_error("columnar page index exceeds u16"))?,
+                    uniform_created_at: parts.uniform_created_at,
+                    uniform_updated_at: parts.uniform_updated_at,
+                }),
                 source_row_offset: 0,
                 row_count,
                 fragmented: false,
-                uniform_created_at: parts.uniform_created_at,
-                uniform_updated_at: parts.uniform_updated_at,
             });
             global_ordinal = global_ordinal
                 .checked_add(u64::from(row_count))
@@ -580,18 +581,16 @@ pub(crate) async fn stage_complete_replacement_scoped_range_root(
                 first_key: bounds.first_key.clone(),
                 last_key: bounds.last_key.clone(),
                 content_digest: part.content_digest,
-                payload_refs_digest: [0; 32],
-                source_kind: 0,
-                source_id: [0; 16],
-                owner_commit_id: part.owner_commit_id,
-                part_index: u32::try_from(part_index)
-                    .map_err(|_| scoped_state_error("replacement part index overflows"))?,
-                source_page_index: 0,
+                source: CurrentStatePartSource::Replacement(ReplacementPartSource {
+                    owner_commit_id: part.owner_commit_id,
+                    part_index: u32::try_from(part_index)
+                        .map_err(|_| scoped_state_error("replacement part index overflows"))?,
+                    uniform_created_at: part.uniform_created_at,
+                    uniform_updated_at: part.uniform_updated_at,
+                }),
                 source_row_offset: 0,
                 row_count,
                 fragmented: false,
-                uniform_created_at: part.uniform_created_at,
-                uniform_updated_at: part.uniform_updated_at,
             })
         })
         .collect::<Result<Vec<_>, LixError>>()?;
@@ -948,8 +947,8 @@ mod tests {
     use crate::tracked_state::types::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementScope, CommitStateManifest,
         CommitStateMutationInventory, CommitStateMutationPart, CommitStateReplayDebt,
-        CommitStateTouchedScopeFilter, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,
-        TrackedStateKeyRef, TrackedStateSingleStringReplacementRef,
+        CommitStateTouchedScopeFilter, CurrentStatePartSource, TrackedStateCommitDeltaRef,
+        TrackedStateDeltaRef, TrackedStateKeyRef, TrackedStateSingleStringReplacementRef,
     };
 
     use super::{
@@ -1302,13 +1301,13 @@ mod tests {
             descriptors
                 .iter()
                 .map(|descriptor| (
-                    descriptor.source_kind,
+                    matches!(descriptor.source, CurrentStatePartSource::Replacement(_)),
                     descriptor.source_row_offset,
                     descriptor.row_count,
                     descriptor.fragmented,
                 ))
                 .collect::<Vec<_>>(),
-            vec![(0, 0, 1, true), (0, 2, 1, true), (1, 0, 1, true)],
+            vec![(true, 0, 1, true), (true, 2, 1, true), (false, 0, 1, true)],
             "sparse delete/insert must retain two immutable source slices and write only the insert",
         );
     }

@@ -135,8 +135,11 @@ pub(crate) use types::{
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
 };
+pub(crate) use types::CurrentStatePartSource;
 #[cfg(test)]
-pub(crate) use types::{CurrentStatePartDescriptor, TrackedStateCommitRootParent};
+pub(crate) use types::{
+    CurrentStatePartDescriptor, ReplacementPartSource, TrackedStateCommitRootParent,
+};
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 
 /// Builds an authenticated content-addressed closure for a set of retained

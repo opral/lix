@@ -6136,12 +6136,15 @@ mod tests {
                 .parts
                 .iter()
                 .map(|part| {
-                    crate::tracked_state::current_state_descriptor_from_scoped_range_part(part)
-                        .expect("columnar locator should decode")
-                        .source_kind
+                    matches!(
+                        crate::tracked_state::current_state_descriptor_from_scoped_range_part(part)
+                            .expect("columnar locator should decode")
+                            .source,
+                        crate::tracked_state::CurrentStatePartSource::ColumnarPage(_)
+                    )
                 })
                 .collect::<Vec<_>>(),
-            vec![2; 33]
+            vec![true; 33]
         );
         let owner =
             crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle serving owner")
@@ -8727,7 +8730,12 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("active head part descriptors should decode")
                 .into_iter()
-                .find(|descriptor| descriptor.source_kind == 1);
+                .find(|descriptor| {
+                    matches!(
+                        descriptor.source,
+                        crate::tracked_state::CurrentStatePartSource::NativeDataPart { .. }
+                    )
+                });
             if live_descriptor.is_some() {
                 break;
             }

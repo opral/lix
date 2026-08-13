@@ -33,8 +33,8 @@ pub(crate) use crate::tracked_state::types::{
     CommitDeltaLifecycleSummary, CommitDeltaReplacementScope,
 };
 use crate::tracked_state::types::{
-    CommitStateManifest, CommitStateMutationInventory, CommitStateMutationPart,
-    CurrentStatePartDescriptor, CurrentStateScopedRangeRoot,
+    ColumnarPageSource, CommitStateManifest, CommitStateMutationInventory, CommitStateMutationPart,
+    CurrentStatePartDescriptor, CurrentStatePartSource, CurrentStateScopedRangeRoot,
     StoredCommitDeltaReplacementGeneration, StoredReplacementPart, StoredReplacementPartsAuthority,
     TRACKED_STATE_HASH_BYTES, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
     TrackedStateCommitRoot, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
@@ -954,7 +954,7 @@ async fn load_current_state_values_from_descriptors(
         ));
     }
     let mut routed = BTreeMap::<
-        (u8, [u8; 16], [u8; 16], u32, u16, [u8; 32], u16),
+        (CurrentStatePartSource, [u8; 32], u16),
         (CurrentStatePartDescriptor, Vec<usize>),
     >::new();
     for (output_index, descriptor) in descriptors.into_iter().enumerate() {
@@ -963,11 +963,7 @@ async fn load_current_state_values_from_descriptors(
         };
         routed
             .entry((
-                descriptor.source_kind,
-                descriptor.source_id,
-                descriptor.owner_commit_id,
-                descriptor.part_index,
-                descriptor.source_page_index,
+                descriptor.source.clone(),
                 descriptor.content_digest,
                 descriptor.source_row_offset,
             ))
@@ -979,13 +975,18 @@ async fn load_current_state_values_from_descriptors(
 
     let replacement = routed
         .iter()
-        .filter(|(_, (descriptor, _))| descriptor.source_kind == 0)
+        .filter_map(|(_, (descriptor, output_indices))| match &descriptor.source {
+            CurrentStatePartSource::Replacement(source) => {
+                Some((descriptor, source, output_indices))
+            }
+            _ => None,
+        })
         .collect::<Vec<_>>();
     let storage_keys = replacement
         .iter()
-        .map(|(_, (descriptor, _))| {
-            let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
-            let mut key = commit_delta_segment_key(owner, descriptor.part_index as usize)?;
+        .map(|(descriptor, source, _)| {
+            let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
+            let mut key = commit_delta_segment_key(owner, source.part_index as usize)?;
             key.extend_from_slice(&descriptor.content_digest);
             Ok(StorageKey(Bytes::from(key)))
         })
@@ -993,11 +994,11 @@ async fn load_current_state_values_from_descriptors(
     let loaded = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
         .materialize(store, StorageGetOptions::default())
         .await?;
-    for ((_, (descriptor, output_indices)), value) in replacement.into_iter().zip(loaded.value) {
+    for ((descriptor, source, output_indices), value) in replacement.into_iter().zip(loaded.value) {
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
             replacement_payload_error("current-state directory references a missing part")
         })?;
-        let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+        let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
         let decoded = crate::tracked_state::replacement_part::decode_replacement_part(
             &descriptor.content_digest,
             &bytes,
@@ -1015,7 +1016,7 @@ async fn load_current_state_values_from_descriptors(
                     "replacement current-state route escaped its source slice",
                 ));
             }
-            let packed = descriptor
+            let packed = source
                 .part_index
                 .checked_mul(
                     u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("row bound fits u32"),
@@ -1027,14 +1028,19 @@ async fn load_current_state_values_from_descriptors(
                 change_id: change_id_from_packed_address(owner, packed),
                 commit_id: owner,
                 deleted: false,
-                created_at: descriptor.uniform_created_at,
-                updated_at: descriptor.uniform_updated_at,
+                created_at: source.uniform_created_at,
+                updated_at: source.uniform_updated_at,
             });
         }
     }
     let native = routed
         .iter()
-        .filter(|(_, (descriptor, _))| descriptor.source_kind == 1)
+        .filter(|(_, (descriptor, _))| {
+            matches!(
+                descriptor.source,
+                CurrentStatePartSource::NativeDataPart { .. }
+            )
+        })
         .collect::<Vec<_>>();
     let native_keys = native
         .iter()
@@ -1071,13 +1077,18 @@ async fn load_current_state_values_from_descriptors(
     }
     let columnar = routed
         .iter()
-        .filter(|(_, (descriptor, _))| descriptor.source_kind == 2)
+        .filter_map(|(_, (descriptor, output_indices))| match &descriptor.source {
+            CurrentStatePartSource::ColumnarPage(source) => {
+                Some((descriptor, source, output_indices))
+            }
+            _ => None,
+        })
         .collect::<Vec<_>>();
     let mut columnar_manifests = HashMap::new();
-    for (_, (descriptor, _)) in &columnar {
-        let id = crate::columnar_row_group::RowGroupSetId::new(descriptor.source_id);
+    for (_, source, _) in &columnar {
+        let id = crate::columnar_row_group::RowGroupSetId::new(source.source_id);
         if let std::collections::hash_map::Entry::Vacant(entry) =
-            columnar_manifests.entry(descriptor.source_id)
+            columnar_manifests.entry(source.source_id)
         {
             let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
                 .await?
@@ -1093,15 +1104,15 @@ async fn load_current_state_values_from_descriptors(
                 replacement_payload_error("current-state columnar identity contract drifted")
             })?;
         let mut page_routes = BTreeMap::new();
-        for (_, (descriptor, output_indices)) in &columnar {
-            if descriptor.source_id == source_id {
+        for (descriptor, source, output_indices) in &columnar {
+            if source.source_id == source_id {
                 page_routes
                     .entry((
-                        descriptor.part_index as usize,
-                        usize::from(descriptor.source_page_index),
+                        source.part_index as usize,
+                        usize::from(source.source_page_index),
                     ))
                     .or_insert_with(Vec::new)
-                    .push((descriptor, output_indices.as_slice()));
+                    .push((*descriptor, *source, output_indices.as_slice()));
             }
         }
         let coordinates = page_routes.keys().copied().collect::<Vec<_>>();
@@ -1112,10 +1123,11 @@ async fn load_current_state_values_from_descriptors(
             &coordinates,
             &[identity_column_index],
             |coordinate, batch| {
-                for (descriptor, output_indices) in &page_routes[&coordinate] {
+                for (descriptor, source, output_indices) in &page_routes[&coordinate] {
                     apply_columnar_identity_page(
                         manifest,
                         descriptor,
+                        source,
                         output_indices,
                         &batch,
                         encoded_keys,
@@ -1133,6 +1145,7 @@ async fn load_current_state_values_from_descriptors(
 fn apply_columnar_identity_page(
     manifest: &crate::columnar_row_group::RowGroupManifest,
     descriptor: &CurrentStatePartDescriptor,
+    source: &ColumnarPageSource,
     output_indices: &[usize],
     batch: &datafusion::arrow::record_batch::RecordBatch,
     encoded_keys: &[Bytes],
@@ -1144,19 +1157,19 @@ fn apply_columnar_identity_page(
     if manifest.content_digest()? != descriptor.content_digest
         || manifest.namespace != first_key.schema_key
         || crate::entity_columnar::entity_row_group_set_id(
-            CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id)),
+            CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id)),
             &manifest.namespace,
         )
         .as_bytes()
-            != descriptor.source_id
+            != source.source_id
     {
         return Err(replacement_payload_error(
             "current-state columnar descriptor disagrees with its manifest",
         ));
     }
-    let group_index = usize::try_from(descriptor.part_index)
+    let group_index = usize::try_from(source.part_index)
         .map_err(|_| replacement_payload_error("columnar group index exceeds usize"))?;
-    let page_index = usize::from(descriptor.source_page_index);
+    let page_index = usize::from(source.source_page_index);
     let identities = batch
         .column(0)
         .as_any()
@@ -1225,13 +1238,13 @@ fn apply_columnar_identity_page(
             .map_err(|_| replacement_payload_error("columnar row ordinal exceeds u32"))?
             .checked_add(1)
             .ok_or_else(|| replacement_payload_error("columnar change address overflows"))?;
-        let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+        let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
         values[output_index] = Some(TrackedStateIndexValue {
             change_id: change_id_from_packed_address(owner, packed),
             commit_id: owner,
             deleted: false,
-            created_at: descriptor.uniform_created_at,
-            updated_at: descriptor.uniform_updated_at,
+            created_at: source.uniform_created_at,
+            updated_at: source.uniform_updated_at,
         });
     }
     Ok(())
@@ -3175,7 +3188,6 @@ fn stage_scoped_native_current_state_rows(
     if rows.is_empty() {
         return Ok(());
     }
-    let timestamp = crate::common::LixTimestamp::from_unix_millis_utc_lossy(0);
     for part in encode_bounded_current_state_data_parts(rows)? {
         stage_scoped_current_state_bytes(
             writes,
@@ -3193,17 +3205,12 @@ fn stage_scoped_native_current_state_rows(
             first_key: part.first_key,
             last_key: part.last_key,
             content_digest: part.digest,
-            payload_refs_digest: part.refs_digest,
-            source_kind: 1,
-            source_id: [0; 16],
-            owner_commit_id: [0; 16],
-            part_index: 0,
-            source_page_index: 0,
+            source: CurrentStatePartSource::NativeDataPart {
+                payload_refs_digest: part.refs_digest,
+            },
             source_row_offset: 0,
             row_count: part.row_count,
             fragmented,
-            uniform_created_at: timestamp,
-            uniform_updated_at: timestamp,
         });
     }
     Ok(())
@@ -3236,10 +3243,10 @@ async fn load_scoped_current_state_descriptor_rows(
         CURRENT_STATE_DATA_PART_SPACE, CurrentStateDataRow, decode_current_state_data_part,
     };
 
-    let rows = match descriptor.source_kind {
-        0 => {
-            let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
-            let mut physical_key = commit_delta_segment_key(owner, descriptor.part_index as usize)?;
+    let rows = match &descriptor.source {
+        CurrentStatePartSource::Replacement(source) => {
+            let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
+            let mut physical_key = commit_delta_segment_key(owner, source.part_index as usize)?;
             physical_key.extend_from_slice(&descriptor.content_digest);
             let bytes = if let Some(bytes) =
                 writes.staged_value(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &physical_key)
@@ -3270,7 +3277,7 @@ async fn load_scoped_current_state_descriptor_rows(
                     let encoded_key = decoded.key(ordinal)?.ok_or_else(|| {
                         replacement_payload_error("replacement source omitted a key")
                     })?;
-                    let packed = descriptor
+                    let packed = source
                         .part_index
                         .checked_mul(
                             u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
@@ -3289,8 +3296,8 @@ async fn load_scoped_current_state_descriptor_rows(
                             change_id: change_id_from_packed_address(owner, packed),
                             commit_id: owner,
                             deleted: false,
-                            created_at: descriptor.uniform_created_at,
-                            updated_at: descriptor.uniform_updated_at,
+                            created_at: source.uniform_created_at,
+                            updated_at: source.uniform_updated_at,
                         },
                         snapshot: owned_scoped_json_slot(decoded.snapshot(ordinal)?.ok_or_else(
                             || replacement_payload_error("replacement source omitted snapshot"),
@@ -3302,7 +3309,7 @@ async fn load_scoped_current_state_descriptor_rows(
                 })
                 .collect::<Result<Vec<_>, LixError>>()?
         }
-        1 => {
+        CurrentStatePartSource::NativeDataPart { .. } => {
             let physical_key = descriptor.content_digest.to_vec();
             let bytes = if let Some(bytes) =
                 writes.staged_value(CURRENT_STATE_DATA_PART_SPACE, &physical_key)
@@ -3325,8 +3332,8 @@ async fn load_scoped_current_state_descriptor_rows(
                 })?
                 .to_vec()
         }
-        2 => {
-            let id = crate::columnar_row_group::RowGroupSetId::new(descriptor.source_id);
+        CurrentStatePartSource::ColumnarPage(source) => {
+            let id = crate::columnar_row_group::RowGroupSetId::new(source.source_id);
             let staged_manifest =
                 crate::columnar_row_group::load_staged_row_group_manifest(writes, id)?;
             let manifest = match staged_manifest {
@@ -3341,20 +3348,20 @@ async fn load_scoped_current_state_descriptor_rows(
             if manifest.content_digest()? != descriptor.content_digest
                 || manifest.namespace != schema_key
                 || crate::entity_columnar::entity_row_group_set_id(
-                    CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id)),
+                    CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id)),
                     &manifest.namespace,
                 )
                 .as_bytes()
-                    != descriptor.source_id
+                    != source.source_id
             {
                 return Err(replacement_payload_error(
                     "columnar current-state source disagrees with its descriptor",
                 ));
             }
             let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
-            let group_index = usize::try_from(descriptor.part_index)
+            let group_index = usize::try_from(source.part_index)
                 .map_err(|_| replacement_payload_error("columnar group index exceeds usize"))?;
-            let page_index = usize::from(descriptor.source_page_index);
+            let page_index = usize::from(source.source_page_index);
             let batch = if crate::columnar_row_group::load_staged_row_group_manifest(writes, id)?
                 .is_some()
             {
@@ -3391,8 +3398,8 @@ async fn load_scoped_current_state_descriptor_rows(
                 )
                 .ok_or_else(|| replacement_payload_error("columnar page base overflows"))?;
             let synthetic_parts = crate::tracked_state::types::ColumnarMutationPartSet {
-                owner_commit_id: descriptor.owner_commit_id,
-                row_group_set_id: descriptor.source_id,
+                owner_commit_id: source.owner_commit_id,
+                row_group_set_id: source.source_id,
                 manifest_digest: descriptor.content_digest,
                 schema_key: manifest.namespace.clone(),
                 row_count: manifest.groups.iter().map(|group| group.row_count).sum(),
@@ -3405,11 +3412,11 @@ async fn load_scoped_current_state_descriptor_rows(
                 last_key: descriptor.last_key.clone(),
                 page_first_keys: vec![descriptor.first_key.clone()],
                 page_last_keys: vec![descriptor.last_key.clone()],
-                uniform_created_at: descriptor.uniform_created_at,
-                uniform_updated_at: descriptor.uniform_updated_at,
+                uniform_created_at: source.uniform_created_at,
+                uniform_updated_at: source.uniform_updated_at,
                 origin_key: None,
             };
-            let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+            let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
             let start = usize::from(descriptor.source_row_offset);
             let end = start + usize::from(descriptor.row_count);
             if end > batch.num_rows() {
@@ -3447,19 +3454,14 @@ async fn load_scoped_current_state_descriptor_rows(
                             change_id,
                             commit_id: owner,
                             deleted: false,
-                            created_at: descriptor.uniform_created_at,
-                            updated_at: descriptor.uniform_updated_at,
+                            created_at: source.uniform_created_at,
+                            updated_at: source.uniform_updated_at,
                         },
                         snapshot: record.snapshot,
                         metadata: record.metadata,
                     })
                 })
                 .collect::<Result<Vec<_>, LixError>>()?
-        }
-        _ => {
-            return Err(replacement_payload_error(
-                "current-state descriptor has unknown source",
-            ));
         }
     };
     if rows.first().map(|row| row.encoded_key.as_slice()) != Some(descriptor.first_key.as_slice())
@@ -10842,7 +10844,9 @@ pub(crate) async fn stage_retire_commit_physical_state(
         for part in reachable.parts {
             let descriptor =
                 crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
-            if descriptor.source_kind == 1
+            if let CurrentStatePartSource::NativeDataPart {
+                payload_refs_digest,
+            } = descriptor.source
                 && !retained.native_parts.contains(&descriptor.content_digest)
             {
                 writes.delete(
@@ -10851,9 +10855,9 @@ pub(crate) async fn stage_retire_commit_physical_state(
                 );
                 writes.delete(
                     crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-                    key(descriptor.payload_refs_digest.to_vec()),
+                    key(payload_refs_digest.to_vec()),
                 );
-                released_part_refs_digests.insert(descriptor.payload_refs_digest);
+                released_part_refs_digests.insert(payload_refs_digest);
             }
         }
     }
@@ -13714,6 +13718,7 @@ mod tests {
     use crate::LixError;
     use crate::changelog::{COMMIT_SPACE, ChangeId, CommitId, CommitRecord};
     use crate::common::LixTimestamp;
+    use crate::tracked_state::types::CurrentStatePartSource;
     use crate::entity_pk::EntityPk;
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageReadOptions, StorageSpace, StorageWriteOptions,
@@ -13796,17 +13801,12 @@ mod tests {
             first_key: rows[0].encoded_key.clone(),
             last_key: rows[1].encoded_key.clone(),
             content_digest: [7; 32],
-            payload_refs_digest: [8; 32],
-            source_kind: 1,
-            source_id: [0; 16],
-            owner_commit_id: [0; 16],
-            part_index: 0,
-            source_page_index: 0,
+            source: CurrentStatePartSource::NativeDataPart {
+                payload_refs_digest: [8; 32],
+            },
             source_row_offset: 4,
             row_count: 2,
             fragmented: false,
-            uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
         };
         let mutations = rows
             .iter()
@@ -13836,7 +13836,10 @@ mod tests {
             1,
             "adjacent updates must remain one native run"
         );
-        assert_eq!(output[0].source_kind, 1);
+        assert!(matches!(
+            output[0].source,
+            CurrentStatePartSource::NativeDataPart { .. }
+        ));
         assert_eq!(output[0].row_count, 2);
         let bytes = writes
             .staged_value(CURRENT_STATE_DATA_PART_SPACE, &output[0].content_digest)
@@ -13858,7 +13861,10 @@ mod tests {
         )
         .expect("one native update should retain a source slice");
         assert_eq!(output.len(), 2);
-        assert_eq!(output[1].source_kind, 1);
+        assert!(matches!(
+            output[1].source,
+            CurrentStatePartSource::NativeDataPart { .. }
+        ));
         assert_eq!(output[1].source_row_offset, 5);
         assert_eq!(output[1].row_count, 1);
 
@@ -13893,17 +13899,12 @@ mod tests {
             first_key: alternating_rows[0].encoded_key.clone(),
             last_key: alternating_rows.last().unwrap().encoded_key.clone(),
             content_digest: [9; 32],
-            payload_refs_digest: [10; 32],
-            source_kind: 1,
-            source_id: [0; 16],
-            owner_commit_id: [0; 16],
-            part_index: 0,
-            source_page_index: 0,
+            source: CurrentStatePartSource::NativeDataPart {
+                payload_refs_digest: [10; 32],
+            },
             source_row_offset: 0,
             row_count: alternating_rows.len() as u16,
             fragmented: false,
-            uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
         };
         let alternating_mutations = alternating_rows
             .iter()
@@ -13946,17 +13947,12 @@ mod tests {
                     first_key: key.clone(),
                     last_key: key,
                     content_digest: *blake3::hash(&index.to_be_bytes()).as_bytes(),
-                    payload_refs_digest: [8; 32],
-                    source_kind: 1,
-                    source_id: [0; 16],
-                    owner_commit_id: [0; 16],
-                    part_index: 0,
-                    source_page_index: 0,
+                    source: CurrentStatePartSource::NativeDataPart {
+                        payload_refs_digest: [8; 32],
+                    },
                     source_row_offset: 0,
                     row_count: 1,
                     fragmented,
-                    uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-                    uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
                 },
             )
             .unwrap()
@@ -18259,8 +18255,6 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
-            primary_chunk_count: 1,
-            primary_chunk_bytes: 64,
         };
         let mut writes = storage.new_write_set();
         manifest.snapshot_root = Some(Box::new(authoritative.clone()));
@@ -18326,8 +18320,6 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
-            primary_chunk_count: 1,
-            primary_chunk_bytes: 64,
         };
         original.snapshot_root = Some(Box::new(rebuilt));
         let error = encode_commit_state_manifest(&original)
