@@ -26,12 +26,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use lix::integration::{Engine, SessionContext};
 use lix::registered_spaces::HOT_ROW_SPACE;
 use lix::storage::ReadOptions;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{layout_accounting, space_inventory};
 use lix::{CreateBranchOptions, Value};
+use lix::{Lix, open_lix};
 use lix_storage_slatedb::SlateDB;
 
 const SEED_BATCH_ROWS: usize = 5_000;
@@ -89,14 +89,16 @@ fn main() {
 async fn run(rows: usize, scenario: &str, dir: &Path) {
     std::fs::create_dir_all(dir).expect("create anatomy directory");
     let storage = SlateDB::open(dir).expect("open anatomy SlateDB");
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize anatomy repository");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open anatomy engine");
-    let main = engine
-        .open_session()
+        .expect("open anatomy lix");
+    let main = lix
+        .open_another_session()
         .await
         .expect("open anatomy session");
     register_schema(&main).await;
@@ -128,21 +130,21 @@ async fn run(rows: usize, scenario: &str, dir: &Path) {
         "base" => Vec::new(),
         "single" => {
             let branch = create_branch(&main, "branch-0").await;
-            modify_rows(&engine, &branch, 0, one_percent).await;
+            modify_rows(&lix, &branch, 0, one_percent).await;
             vec![branch]
         }
         "identical" => {
             let first = create_branch(&main, "branch-0").await;
-            modify_rows(&engine, &first, 0, one_percent).await;
+            modify_rows(&lix, &first, 0, one_percent).await;
             let second = create_branch(&main, "branch-1").await;
-            modify_rows(&engine, &second, 0, one_percent).await;
+            modify_rows(&lix, &second, 0, one_percent).await;
             vec![first, second]
         }
         "disjoint" => {
             let first = create_branch(&main, "branch-0").await;
-            modify_rows(&engine, &first, 0, one_percent).await;
+            modify_rows(&lix, &first, 0, one_percent).await;
             let second = create_branch(&main, "branch-1").await;
-            modify_rows(&engine, &second, one_percent, one_percent).await;
+            modify_rows(&lix, &second, one_percent, one_percent).await;
             vec![first, second]
         }
         other => panic!("unknown scenario '{other}'"),
@@ -453,11 +455,7 @@ paired_identity_normalized_equal={paired_ident_norm_equal},paired_content_equal=
 }
 
 fn describe_diff(a: &[u8], b: &[u8]) -> String {
-    let common_prefix = a
-        .iter()
-        .zip(b.iter())
-        .take_while(|(x, y)| x == y)
-        .count();
+    let common_prefix = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
     let common_suffix = a
         .iter()
         .rev()
@@ -509,8 +507,7 @@ fn parse_value(value: &[u8]) -> Parsed {
     let snapshot_kind = (flags >> HEAD_VALUE_SNAPSHOT_SHIFT) & HEAD_VALUE_SLOT_MASK;
     let metadata_kind = (flags >> HEAD_VALUE_METADATA_SHIFT) & HEAD_VALUE_SLOT_MASK;
     let working_diff_tag = (flags >> HEAD_VALUE_WORKING_DIFF_SHIFT) & HEAD_VALUE_WORKING_DIFF_MASK;
-    let snapshot_len =
-        u32::from_be_bytes(value[50..54].try_into().expect("snapshot len")) as usize;
+    let snapshot_len = u32::from_be_bytes(value[50..54].try_into().expect("snapshot len")) as usize;
     let metadata_len = u32::from_be_bytes(value[54..58].try_into().expect("metadata len")) as usize;
     let has_columnar = value[58] == 1;
     let snapshot_fingerprint = match snapshot_kind {
@@ -631,7 +628,7 @@ async fn hot_inventory(storage: &SlateDB) -> Vec<(Vec<u8>, Vec<u8>)> {
     inventory
 }
 
-async fn create_branch(main: &SessionContext<SlateDB>, name: &str) -> String {
+async fn create_branch(main: &Lix<SlateDB>, name: &str) -> String {
     main.create_branch(CreateBranchOptions {
         id: None,
         name: name.to_owned(),
@@ -642,11 +639,17 @@ async fn create_branch(main: &SessionContext<SlateDB>, name: &str) -> String {
     .id
 }
 
-async fn modify_rows(engine: &Engine<SlateDB>, branch: &str, start: usize, count: usize) {
-    let session = engine
-        .open_session_at(branch.to_owned())
+async fn modify_rows(lix: &Lix<SlateDB>, branch: &str, start: usize, count: usize) {
+    let session = lix
+        .open_another_session()
         .await
         .expect("open anatomy branch session");
+    session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: (branch.to_owned()).to_string(),
+        })
+        .await
+        .expect("switch session branch");
     let mut written = 0usize;
     while written < count {
         let batch = (count - written).min(SEED_BATCH_ROWS);
@@ -682,7 +685,7 @@ fn row_path(index: usize) -> String {
     format!("/branch/fixture/{index:09}")
 }
 
-async fn register_schema(session: &SessionContext<SlateDB>) {
+async fn register_schema(session: &Lix<SlateDB>) {
     let schema = serde_json::json!({
         "x-lix-key": "branch_fixture",
         "x-lix-primary-key": ["/path"],
@@ -706,7 +709,7 @@ async fn register_schema(session: &SessionContext<SlateDB>) {
         .expect("register anatomy schema");
 }
 
-async fn seed_rows(session: &SessionContext<SlateDB>, rows: usize) {
+async fn seed_rows(session: &Lix<SlateDB>, rows: usize) {
     let mut written = 0usize;
     while written < rows {
         let batch = (rows - written).min(SEED_BATCH_ROWS);
@@ -727,10 +730,7 @@ async fn seed_rows(session: &SessionContext<SlateDB>, rows: usize) {
                 .await
                 .expect("stage anatomy seed row");
         }
-        transaction
-            .commit()
-            .await
-            .expect("commit anatomy seed");
+        transaction.commit().await.expect("commit anatomy seed");
         written += batch;
     }
 }

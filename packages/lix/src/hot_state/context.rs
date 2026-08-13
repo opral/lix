@@ -340,9 +340,7 @@ impl HotStateContext {
         std::sync::Arc::clone(&self.entity_columnar_scan_cache)
     }
 
-    pub(crate) fn entity_decoded_column_cache(
-        &self,
-    ) -> crate::hot_state::EntityDecodedColumnCache {
+    pub(crate) fn entity_decoded_column_cache(&self) -> crate::hot_state::EntityDecodedColumnCache {
         self.entity_decoded_column_cache.clone()
     }
 
@@ -1738,11 +1736,11 @@ mod tests {
         CommitLoadRequest,
     };
     use crate::entity_pk::EntityPk;
-    use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::hot_state::{
-        CurrentStateDeltaRef, HotStateExactBatchRequest, HotStateExactRowRequest,
-        HotStateFilter, HotStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
+        CurrentStateDeltaRef, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter,
+        HotStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
     };
+    use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
     use crate::tracked_state::{
@@ -3694,14 +3692,11 @@ mod tests {
         )
         .await;
 
-        let loaded = load_selected_tab_at(
-            &hot_state,
-            &storage,
-            "01920000-0000-7000-8000-0000000000a1",
-        )
-        .await
-        .expect("load should succeed")
-        .expect("global row should be visible for requested branch");
+        let loaded =
+            load_selected_tab_at(&hot_state, &storage, "01920000-0000-7000-8000-0000000000a1")
+                .await
+                .expect("load should succeed")
+                .expect("global row should be visible for requested branch");
 
         assert_eq!(
             loaded.branch_id.as_ref(),
@@ -3813,14 +3808,11 @@ mod tests {
         )
         .await;
 
-        let loaded = load_selected_tab_at(
-            &hot_state,
-            &storage,
-            "01920000-0000-7000-8000-0000000000a1",
-        )
-        .await
-        .expect("load should succeed")
-        .expect("branch row should be visible");
+        let loaded =
+            load_selected_tab_at(&hot_state, &storage, "01920000-0000-7000-8000-0000000000a1")
+                .await
+                .expect("load should succeed")
+                .expect("branch row should be visible");
 
         assert_eq!(
             loaded.branch_id.as_ref(),
@@ -4369,14 +4361,11 @@ mod tests {
         )
         .await;
 
-        let loaded = load_selected_tab_at(
-            &hot_state,
-            &storage,
-            "01920000-0000-7000-8000-0000000000a1",
-        )
-        .await
-        .expect("load should succeed")
-        .expect("branch row should be visible");
+        let loaded =
+            load_selected_tab_at(&hot_state, &storage, "01920000-0000-7000-8000-0000000000a1")
+                .await
+                .expect("load should succeed")
+                .expect("branch row should be visible");
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"branch-row\"}")
@@ -4415,10 +4404,7 @@ mod tests {
                     Some("change-branch"),
                     "commit-merge",
                 ),
-                commit_hot_state_row_with_parents(
-                    "commit-merge",
-                    &["parent-left", "parent-right"],
-                ),
+                commit_hot_state_row_with_parents("commit-merge", &["parent-left", "parent-right"]),
             ];
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();

@@ -16,11 +16,11 @@ use crate::filesystem::{
     UncachedFilesystemPathIndexReader,
 };
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::JsonStoreReader;
 use crate::hot_state::{
     HotStateExactBatchRequest, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateExactBatch,
 };
+use crate::json_store::JsonStoreReader;
 use crate::plugin::runtime::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::TrackedStateScanRequest;

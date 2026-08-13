@@ -252,7 +252,6 @@ mod tests {
         out
     }
 
-
     /// The corpus the three-way differential runs over: valid encodings, every
     /// truncation of them, every single-byte mutation to a grammar-significant
     /// value, and shapes the generators cannot reach. Decode is where a
@@ -264,9 +263,9 @@ mod tests {
             encoded_entity_pk(vec![EntityPkComponent::String("a\0b".into())]),
             encoded_entity_pk(vec![EntityPkComponent::Integer(-1)]),
             encoded_entity_pk(vec![EntityPkComponent::Uuid([7; 16])]),
-            encoded_entity_pk(vec![EntityPkComponent::Bytes(
-                bytes::Bytes::from_static(&[0, 0xff]),
-            )]),
+            encoded_entity_pk(vec![EntityPkComponent::Bytes(bytes::Bytes::from_static(
+                &[0, 0xff],
+            ))]),
             encoded_entity_pk(vec![
                 EntityPkComponent::String("a".into()),
                 EntityPkComponent::Integer(7),
@@ -369,8 +368,21 @@ mod tests {
     /// the encoder here and by all three decoders.
     #[test]
     fn ordered_integer_round_trips() {
-        for value in [i64::MIN, i64::MIN + 1, -2, -1, 0, 1, 2, i64::MAX - 1, i64::MAX] {
-            assert_eq!(i64_from_ordered_integer(ordered_integer_from_i64(value)), value);
+        for value in [
+            i64::MIN,
+            i64::MIN + 1,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            i64::MAX - 1,
+            i64::MAX,
+        ] {
+            assert_eq!(
+                i64_from_ordered_integer(ordered_integer_from_i64(value)),
+                value
+            );
         }
         assert_eq!(ordered_integer_from_i64(i64::MIN), 0);
         assert_eq!(ordered_integer_from_i64(0), 1_u64 << 63);
@@ -382,7 +394,10 @@ mod tests {
         assert!(is_key_part_terminator(KEY_PART_FINAL));
         assert!(is_key_part_terminator(KEY_PART_MORE));
         for byte in [0x02u8, 0x03, 0x7f, KEY_ESCAPE] {
-            assert!(!is_key_part_terminator(byte), "{byte:#04x} is not a terminator");
+            assert!(
+                !is_key_part_terminator(byte),
+                "{byte:#04x} is not a terminator"
+            );
         }
     }
 
@@ -429,7 +444,9 @@ mod tests {
             vec![0x01, 0x02, b'x', 0x00, 0x00]
         );
         assert_eq!(
-            encoded_entity_pk(vec![EntityPkComponent::Bytes(bytes::Bytes::from_static(&[0xaa]))]),
+            encoded_entity_pk(vec![EntityPkComponent::Bytes(bytes::Bytes::from_static(
+                &[0xaa]
+            ))]),
             vec![0x01, 0x03, 0xaa, 0x00, 0x00]
         );
         assert_eq!(

@@ -15,7 +15,7 @@ pub mod simulation_test;
 /// hides a real failure in a wide sweep.
 ///
 /// ```text
-/// LIX_FUZZ_SEEDS=512 cargo test -p lix --all-features --test integration -- fuzz
+/// LIX_FUZZ_SEEDS=512 cargo test -p lix --all-features --lib -- fuzz
 /// LIX_FUZZ_SEEDS=512 LIX_FUZZ_SEED_START=512 cargo test ...   # next disjoint window
 /// ```
 pub fn fuzz_seeds(default: &[u64]) -> Vec<u64> {
@@ -29,19 +29,16 @@ pub fn fuzz_seeds(default: &[u64]) -> Vec<u64> {
 }
 
 fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .map(|raw| {
-            raw.trim().parse::<u64>().unwrap_or_else(|error| {
-                panic!("{name} must be a u64 seed budget, got {raw:?}: {error}")
-            })
+    std::env::var(name).ok().map(|raw| {
+        raw.trim().parse::<u64>().unwrap_or_else(|error| {
+            panic!("{name} must be a u64 seed budget, got {raw:?}: {error}")
         })
+    })
 }
 
-#[macro_export]
 macro_rules! simulation_test {
     ($name:ident, |$sim:ident| $body:expr) => {
-        $crate::simulation_test!(
+        simulation_test!(
             $name,
             options =
                 $crate::support::simulation_test::engine::SimulationOptions::default(),
@@ -49,7 +46,7 @@ macro_rules! simulation_test {
         );
     };
     ($name:ident, options = $options:expr, |$sim:ident| $body:expr) => {
-        $crate::simulation_test!(
+        simulation_test!(
             @single $name,
             base,
             Base,
@@ -57,7 +54,7 @@ macro_rules! simulation_test {
             |$sim| $body
         );
         #[cfg(feature = "all-simulations")]
-        $crate::simulation_test!(
+        simulation_test!(
             @single $name,
             tracked_state_rebuild,
             TrackedStateRebuild,

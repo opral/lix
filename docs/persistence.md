@@ -41,17 +41,33 @@ import { LocalFilesystem, openLix } from "@lix-js/sdk";
 const lix = await openLix({
   storage: new LocalFilesystem({
     path: "/var/data/repository",
-    syncAllFiles: true,
   }),
 });
 ```
 
 Lix stores its repository state in `<repository>/.lix/.internal` and synchronizes repository files. Reopen the same path to resume the existing state.
 
-Two options change this behavior:
+In Rust, open the storage, pass it to Lix, then start synchronization on that
+repository:
+
+```rust
+use lix::open_lix;
+use lix_storage_filesystem::LocalFilesystem;
+
+let storage = LocalFilesystem::open("./repository")?;
+let lix = open_lix().with_storage(storage.clone()).await?;
+let sync = storage.start_sync(&lix).await?;
+
+sync.sync_disk_to_lix().await?;
+```
+
+Keep `sync` alive while filesystem synchronization should run. It owns a
+separate session on the existing Lix repository; the storage adapter does not
+open or configure the Lix engine.
+
+One option changes this behavior:
 
 - `lixDir` stores the repository state outside the repository. The repository does not receive a `.lix` directory.
-- `syncAllFiles: false` starts without importing files. Import exact file paths with `storage.importPaths(["notes/today.md"])`.
 
 ## IndexedDB
 

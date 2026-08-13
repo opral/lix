@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
     ReadOptions, ScanCursor, Storage, StorageError, StorageRead, WriteOptions,
 };
 use lix::{ExecuteResult, Value};
+use lix::{engine::Engine, session::SessionContext};
 use serde::Serialize;
 
 const FILES_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_FILES";

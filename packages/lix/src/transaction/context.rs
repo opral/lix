@@ -53,10 +53,9 @@ use crate::hot_state::HotStateRowRequest;
 use crate::hot_state::{
     BranchHeadControlCache, CertifiedCurrentStatePredecessor, HotStateContext,
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
-    HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
-    MaterializedHotStateExactBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
-    StagedHotStateRows, TrackedHeadContext, TrackedWorkingDiff, overlay_load_exact_batch,
-    overlay_scan_batch,
+    HotStateReader, HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateExactBatch,
+    MaterializedHotStateRow, MaterializedHotStateRowRef, StagedHotStateRows, TrackedHeadContext,
+    TrackedWorkingDiff, overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::runtime::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
@@ -78,8 +77,8 @@ use crate::plugin::runtime::{
     transport_splice_preserves_utf8, validate_create_changes, validate_create_reservation,
 };
 use crate::session::{
-    EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionBranch,
-    encode_receipt,
+    EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt,
+    SessionBranch, encode_receipt,
 };
 use crate::sql2::{
     CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
@@ -119,11 +118,11 @@ use crate::transaction::stale_commit::{
 };
 use crate::transaction_types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
-    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
-    StagedIndexValues, TransactionFileContent, TransactionJson, TransactionWrite,
-    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
-    TransactionWriteOutcome, TransactionWriteRow, TypedMutationJournalBatch,
-    canonicalize_transaction_json_batch, stage_json_from_value,
+    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedIndexValues,
+    TransactionFileContent, TransactionJson, TransactionWrite, TransactionWriteMode,
+    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
+    TransactionWriteRow, TypedMutationJournalBatch, canonicalize_transaction_json_batch,
+    stage_json_from_value,
 };
 
 pub(crate) struct CertifiedHistoryStoreReader<S> {
@@ -146,8 +145,8 @@ where
         commit_ids: &BTreeSet<CommitId>,
         request: &TrackedStateScanRequest,
     ) -> Result<Vec<CertifiedHistoryChange>, LixError> {
-        let rows = crate::hot_state::scan_certified_history_rows(&self.store, commit_ids, request)
-            .await?;
+        let rows =
+            crate::hot_state::scan_certified_history_rows(&self.store, commit_ids, request).await?;
         // Certified rows may use generated IDs that intentionally have no
         // standalone or packed change record. Their embedded commit is the
         // immutable authoring authority and survives inherited manifests.
@@ -210,11 +209,6 @@ where
         Ok(changes)
     }
 }
-use crate::transaction::validation::{
-    TransactionValidationInput, fresh_plugin_file_import_certificate,
-    prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
-    validate_certified_tracked_insert_identities, validate_prepared_writes,
-};
 use crate::plugin::runtime::{
     WASM_COMPONENT_API_VERSION, WasmCertifiedEntityBatch, WasmChangeEffect, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictTake,
@@ -222,6 +216,11 @@ use crate::plugin::runtime::{
     WasmEntityChange, WasmEntityConflict, WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor,
     WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput,
     WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
+};
+use crate::transaction::validation::{
+    TransactionValidationInput, fresh_plugin_file_import_certificate,
+    prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
+    validate_certified_tracked_insert_identities, validate_prepared_writes,
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
@@ -1543,11 +1542,9 @@ where
             // mutation fence from the same pinned snapshot. Both live in the
             // one revision space, so one batched point read over two adjacent
             // keys replaces two independent lookups.
-            let [catalog_revision, opening_tracked_mutation_revision] = load_revisions(
-                &read,
-                [REVISION_KEY_CATALOG, REVISION_KEY_TRACKED_MUTATION],
-            )
-            .await?;
+            let [catalog_revision, opening_tracked_mutation_revision] =
+                load_revisions(&read, [REVISION_KEY_CATALOG, REVISION_KEY_TRACKED_MUTATION])
+                    .await?;
             let catalog_revision = catalog_revision.map(CatalogRevision::from_storage_bytes);
             let (sql_schema_catalog, tracked_schema_catalog) = {
                 let visible_hot_state = hot_state.reader(&read);
@@ -4262,8 +4259,7 @@ where
                     .extend(selected.schema_keys().iter().cloned());
             }
         }
-        let mut state_batches =
-            Vec::<MaterializedHotStateBatch>::with_capacity(state_groups.len());
+        let mut state_batches = Vec::<MaterializedHotStateBatch>::with_capacity(state_groups.len());
         let mut state_group_keys = Vec::<PluginStateGroupKey>::with_capacity(state_groups.len());
         for (group_key, group) in state_groups {
             let rows = overlay_scan_batch(
@@ -4660,7 +4656,11 @@ where
                             "lix.perf.plugin_open_file_drain"
                         ))
                         .await?;
-                        crate::plugin::runtime::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
+                        crate::plugin::runtime::certify_dense_fresh_file(
+                            &mut validated,
+                            creates,
+                            &schemas,
+                        )?;
                         Ok((actor, validated))
                     });
                     PendingFreshPluginOpen {
@@ -5766,7 +5766,11 @@ where
                     "lix.perf.plugin_open_file_drain"
                 ))
                 .await?;
-                crate::plugin::runtime::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
+                crate::plugin::runtime::certify_dense_fresh_file(
+                    &mut validated,
+                    creates,
+                    &schemas,
+                )?;
                 let certified_row_count = validated
                     .certified_batches
                     .iter()
@@ -6612,6 +6616,20 @@ where
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn stage_engine_test_rows(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.ensure_plugin_generation_read_guard().await;
+        let prepared = self.prepare_transaction_rows(rows).await?;
+        self.staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared,
+            })
+    }
+
     async fn require_existing_transaction_write_branch_ids(
         &mut self,
         write: &TransactionWrite,
@@ -6666,7 +6684,6 @@ where
         }
         Ok(())
     }
-
 
     /// Stages the protocol replay receipt into this transaction's final
     /// storage write set. The receipt is guarded by `KeyAbsent` during commit,
@@ -9658,7 +9675,10 @@ fn v2_actor_key_is_descriptor_successor(
 }
 
 #[cfg(test)]
-fn v2_create_context(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::plugin::runtime::WasmCreateContext {
+fn v2_create_context(
+    seed: [u8; 16],
+    actor_key: &PluginActorKey,
+) -> crate::plugin::runtime::WasmCreateContext {
     BoundCreateContext::bind(local_mutation_identity(seed), actor_key)
         .expect("local mutation seeds are generated as UUIDv7")
         .creates()
@@ -11880,6 +11900,7 @@ mod tests {
     use crate::branch::BranchContext;
     use crate::engine::Engine;
     use crate::functions::{DeterministicFunctionProvider, FunctionProvider};
+    use crate::plugin::runtime::WasmEntity;
     use crate::storage_adapter::{Memory, StorageReadOptions};
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateKey, TrackedStateScanRequest,
@@ -11888,7 +11909,6 @@ mod tests {
         StagedCommitChangeBatchBuilder, StagedCommitChangeRefs,
     };
     use crate::transaction_types::TransactionJson;
-    use crate::plugin::runtime::WasmEntity;
 
     fn raw_write_rows(rows: Vec<TransactionWriteRow>) -> RawWriteBatch {
         RawWriteBatch::from_test_rows(rows)
@@ -12470,11 +12490,13 @@ mod tests {
         ) -> Result<crate::plugin::runtime::WasmEntityTransition, LixError> {
             self.accepted_len = input.accepted.as_ref().map_or(0, |accepted| accepted.len());
             match &self.behavior {
-                UpgradePreflightBehavior::Render(_) => Ok(crate::plugin::runtime::WasmEntityTransition {
-                    transition: crate::plugin::runtime::WasmTransitionHandle(1),
-                    document: WasmDocumentHandle(2),
-                    edits: crate::plugin::runtime::WasmEditCursorHandle(3),
-                }),
+                UpgradePreflightBehavior::Render(_) => {
+                    Ok(crate::plugin::runtime::WasmEntityTransition {
+                        transition: crate::plugin::runtime::WasmTransitionHandle(1),
+                        document: WasmDocumentHandle(2),
+                        edits: crate::plugin::runtime::WasmEditCursorHandle(3),
+                    })
+                }
                 UpgradePreflightBehavior::Trap => Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     "synthetic replacement trap",
@@ -12744,10 +12766,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("engine should open initialized storage");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
 
         let values = (0..32)
             .map(|index| format!("('/seed-{index:02}.md', CAST('byte-01' AS BYTEA))"))
@@ -12833,10 +12852,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("engine should open initialized storage");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
 
         let values = (0..file_count)
             .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
@@ -12930,10 +12946,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("engine should open initialized storage");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
 
         let values = (0..file_count)
             .map(|index| {
@@ -13025,10 +13038,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("engine should open initialized storage");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
 
         session
             .execute(
@@ -14160,9 +14170,10 @@ mod tests {
             values.push(value);
             offsets.push((start, end));
         }
-        let canonical =
-            crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(values, normalized, offsets, 3, 3)
-                .expect("canonical raw batch");
+        let canonical = crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(
+            values, normalized, offsets, 3, 3,
+        )
+        .expect("canonical raw batch");
         let arena_probe = canonical[0].clone();
         let rows = canonical
             .into_iter()
@@ -14279,10 +14290,12 @@ mod tests {
 
         let mut source = VecEntityChangeSource::new(changes, limits)
             .expect("lazy semantic change should fit the packet bounds");
-        let page =
-            crate::plugin::runtime::WasmEntityChangeSource::next_page(&mut source, limits.max_page_bytes)
-                .expect("semantic renderer packet should page")
-                .expect("one semantic change page should be emitted");
+        let page = crate::plugin::runtime::WasmEntityChangeSource::next_page(
+            &mut source,
+            limits.max_page_bytes,
+        )
+        .expect("semantic renderer packet should page")
+        .expect("one semantic change page should be emitted");
         assert_eq!(page.changes.len(), 1);
         assert!(matches!(
             page.changes[0],

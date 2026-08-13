@@ -20,10 +20,10 @@
 use std::time::Instant;
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::layout_accounting;
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 #[tokio::main]
@@ -75,14 +75,15 @@ async fn measure(
 ) -> (f64, f64) {
     let directory = tempfile::tempdir().expect("create RocksDB directory");
     let storage = RocksDB::open(directory.path()).expect("open RocksDB");
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize repository");
-    let engine = Engine::new(storage.clone()).await.expect("open engine");
-    let session = engine
-        .open_session()
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open workspace");
+        .expect("open lix");
+    let session = lix.open_another_session().await.expect("open workspace");
 
     seed(&session, population, untracked).await;
 
@@ -131,7 +132,7 @@ where
     println!("  layout lane={lane} population={population} TOTAL bytes={total}");
 }
 
-async fn seed<S>(session: &SessionContext<S>, population: usize, untracked: bool)
+async fn seed<S>(session: &Lix<S>, population: usize, untracked: bool)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -152,7 +153,7 @@ where
     transaction.commit().await.expect("commit seed");
 }
 
-async fn mutate<S>(session: &SessionContext<S>, target: usize, revision: usize)
+async fn mutate<S>(session: &Lix<S>, target: usize, revision: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

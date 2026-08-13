@@ -1,12 +1,12 @@
 //! Measures a one-row registered-schema insert using standard SQL
-//! `INSERT ... DEFAULT VALUES`, excluding engine and schema-registration setup.
+//! `INSERT ... DEFAULT VALUES`, excluding lix and schema-registration setup.
 
-use std::hint::black_box;
+use std::{future::IntoFuture, hint::black_box};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Memory;
+use lix::{Lix, open_lix};
 use serde_json::json;
 
 const DEFAULT_VALUES_SQL: &str = "INSERT INTO bench_default_values DEFAULT VALUES";
@@ -19,17 +19,13 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("create benchmark runtime")
 }
 
-fn fixture(runtime: &tokio::runtime::Runtime) -> SessionContext<Memory> {
+fn fixture(runtime: &tokio::runtime::Runtime) -> Lix<Memory> {
     runtime.block_on(async {
         let storage = Memory::new();
-        Engine::initialize(storage.clone())
+        let session = open_lix()
+            .with_storage(storage)
             .await
-            .expect("initialize benchmark storage");
-        let engine = Engine::new(storage).await.expect("open benchmark engine");
-        let session = engine
-            .open_session()
-            .await
-            .expect("open benchmark session");
+            .expect("open benchmark lix");
         let schema = json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "x-lix-key": "bench_default_values",
@@ -57,10 +53,10 @@ fn fixture(runtime: &tokio::runtime::Runtime) -> SessionContext<Memory> {
     })
 }
 
-fn execute(runtime: &tokio::runtime::Runtime, session: &SessionContext<Memory>, sql: &str) {
+fn execute(runtime: &tokio::runtime::Runtime, session: &Lix<Memory>, sql: &str) {
     black_box(
         runtime
-            .block_on(session.execute(sql, &[]))
+            .block_on(session.execute(sql, &[]).into_future())
             .expect("execute benchmark SQL"),
     );
 }
@@ -70,7 +66,7 @@ fn entity_default_values(c: &mut Criterion) {
     let mut group = c.benchmark_group("entity_default_values");
     group.throughput(Throughput::Elements(1));
     // Each sample receives a fresh preconfigured session, so this captures
-    // cold transaction behavior without charging engine boot or registration.
+    // cold transaction behavior without charging lix boot or registration.
     group.bench_function("cold_standard_sql", |b| {
         b.iter_batched_ref(
             || fixture(&runtime),

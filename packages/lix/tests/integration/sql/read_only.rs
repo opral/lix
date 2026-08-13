@@ -5,10 +5,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -54,10 +51,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -97,10 +91,7 @@ simulation_test!(
 simulation_test!(read_only_history_views_reject_dml, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
+        engine.open_session().await.expect("session should open"),
         &engine,
     );
 
@@ -129,10 +120,7 @@ simulation_test!(read_only_history_views_reject_dml, |sim| async move {
 simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-        engine
-            .open_session()
-            .await
-            .expect("session should open"),
+        engine.open_session().await.expect("session should open"),
         &engine,
     );
 

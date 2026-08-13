@@ -83,7 +83,6 @@ async fn markdown_lix_byte_hotpath_profile() {
     write_file(&lix, "/profile.md", corpus.bytes.clone()).await;
 
     let mut bytes = corpus.bytes;
-    lix.reset_plugin_transition_counters();
     let started = Instant::now();
     for sample in 0..samples {
         let index = spread_index(sample, samples, corpus.edit_offsets.len() / 2);
@@ -92,9 +91,8 @@ async fn markdown_lix_byte_hotpath_profile() {
         write_file(&lix, "/profile.md", bytes.clone()).await;
     }
     let elapsed = started.elapsed();
-    let counters = lix.plugin_transition_counters();
     eprintln!(
-        "markdown_lix_hot_profile bytes={} samples={} total_ms={:.3} mean_ms={:.3} counters={counters:?}",
+        "markdown_lix_hot_profile bytes={} samples={} total_ms={:.3} mean_ms={:.3}",
         bytes.len(),
         samples,
         elapsed.as_secs_f64() * 1_000.0,

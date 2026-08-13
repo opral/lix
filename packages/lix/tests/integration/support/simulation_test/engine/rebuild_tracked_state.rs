@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lix::LixError;
-use lix::integration::Engine;
+use lix::engine::Engine;
 
 use super::mode::SimulationMode;
 

@@ -1,8 +1,8 @@
 use crate::support;
 use std::collections::BTreeSet;
 
-use lix::integration::{Engine, SessionContext};
 use lix::{CreateBranchOptions, ExecuteResult, MergeBranchOptions, SwitchBranchOptions, Value};
+use lix::{engine::Engine, session::SessionContext};
 use serde_json::json;
 
 simulation_test!(engine_new_rejects_uninitialized_storage, |sim| async move {
@@ -582,7 +582,10 @@ fn assert_single_json(result: ExecuteResult, expected: &str) {
     assert_eq!(row_set.len(), 1);
     let expected_json = serde_json::from_str::<serde_json::Value>(expected)
         .expect("expected JSON value should parse");
-    assert_eq!(row_set.rows()[0].values(), &[Value::Json(expected_json.into())]);
+    assert_eq!(
+        row_set.rows()[0].values(),
+        &[Value::Json(expected_json.into())]
+    );
 }
 
 fn assert_closed(error: lix::LixError) {

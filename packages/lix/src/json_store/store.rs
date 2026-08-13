@@ -502,10 +502,12 @@ pub(crate) fn decode_stored_json(bytes: &[u8]) -> Result<Bytes, LixError> {
     let stored_payload = decode_stored_json_payload(Bytes::copy_from_slice(bytes))?;
     match stored_payload.codec {
         JsonCodec::Raw => Ok(stored_payload.data),
-        JsonCodec::Zstd => {
-            decode_json_zstd_payload(&stored_payload.data, stored_payload.uncompressed_len, "audit")
-                .map(Bytes::from)
-        }
+        JsonCodec::Zstd => decode_json_zstd_payload(
+            &stored_payload.data,
+            stored_payload.uncompressed_len,
+            "audit",
+        )
+        .map(Bytes::from),
     }
 }
 

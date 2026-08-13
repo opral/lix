@@ -394,5 +394,8 @@ fn assert_single_text(result: ExecuteResult, expected: &str) {
     assert_eq!(row_set.len(), 1);
     let expected_json = serde_json::from_str::<serde_json::Value>(expected)
         .expect("expected value should be valid JSON");
-    assert_eq!(row_set.rows()[0].values(), &[Value::Json(expected_json.into())]);
+    assert_eq!(
+        row_set.rows()[0].values(),
+        &[Value::Json(expected_json.into())]
+    );
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use lix::Value;
-use lix::integration::Engine;
+use lix::engine::Engine;
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
     ReadOptions, ScanChunk, ScanCursor, Storage, StorageError, StorageRead, StorageScanSource,
@@ -142,10 +142,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     let unrelated_values = (0..UNRELATED_FILE_COUNT)
         .map(|index| {
@@ -276,10 +273,7 @@ async fn lix_file_history_path_lookup_does_not_rescan_unrelated_observed_state()
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     let unrelated_values = (0..UNRELATED_FILE_COUNT)
         .map(|index| {
@@ -400,10 +394,7 @@ async fn lix_file_history_path_filter_equals_unfiltered_scan_over_many_files() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     let bulk_values = (0..BULK_FILE_COUNT)
         .map(|index| format!("('/bulk/f{index:03}.txt', CAST('bulk' AS BYTEA))"))
@@ -548,10 +539,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     let engine = Engine::new(storage.clone())
         .await
         .expect("engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("session should open");
+    let session = engine.open_session().await.expect("session should open");
 
     let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
         .map(|index| {

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Memory;
+use lix::{Lix, open_lix};
 use serde_json::json;
 
 fn diff_command_benches(c: &mut Criterion) {
@@ -178,25 +178,21 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("create diff command benchmark runtime")
 }
 
-async fn new_session() -> SessionContext<Memory> {
+async fn new_session() -> Lix<Memory> {
     let storage = Memory::new();
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage)
         .await
-        .expect("initialize benchmark storage");
-    let engine = Engine::new(storage).await.expect("open benchmark engine");
-    engine
-        .open_session()
-        .await
-        .expect("open benchmark session")
+        .expect("open benchmark lix")
 }
 
-async fn seeded_session(rows: usize) -> SessionContext<Memory> {
+async fn seeded_session(rows: usize) -> Lix<Memory> {
     let session = new_session().await;
     execute(&session, &insert_sql(rows)).await;
     session
 }
 
-async fn apply_fixture(rows: usize, selected: usize) -> (SessionContext<Memory>, String) {
+async fn apply_fixture(rows: usize, selected: usize) -> (Lix<Memory>, String) {
     let session = new_session().await;
     let baseline = active_commit(&session).await;
     execute(&session, &insert_sql(rows)).await;
@@ -219,7 +215,7 @@ fn command_sql(command: &str, source: &str, extra_predicate: &str, selected: usi
     )
 }
 
-async fn active_commit(session: &SessionContext<Memory>) -> String {
+async fn active_commit(session: &Lix<Memory>) -> String {
     let result = session
         .execute("SELECT lix_active_branch_commit_id()", &[])
         .await
@@ -230,7 +226,7 @@ async fn active_commit(session: &SessionContext<Memory>) -> String {
     commit_id.clone()
 }
 
-async fn execute(session: &SessionContext<Memory>, sql: &str) {
+async fn execute(session: &Lix<Memory>, sql: &str) {
     black_box(
         session
             .execute(sql, &[])

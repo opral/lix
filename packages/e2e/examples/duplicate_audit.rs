@@ -22,7 +22,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{
@@ -31,6 +30,7 @@ use lix::storage_bench::{
     space_inventory,
 };
 use lix::{CreateBranchOptions, Value};
+use lix::{Lix, open_lix};
 use lix_storage_slatedb::SlateDB;
 
 /// Prefix/suffix widths probed for near-duplicates. A pair of rows that agree
@@ -83,14 +83,16 @@ async fn build(corpus: &str, dir: &Path) {
         dir.display()
     );
     let storage = SlateDB::open(dir).expect("open SlateDB corpus");
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize corpus repository");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open corpus engine");
-    let session = engine
-        .open_session()
+        .expect("open corpus lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open corpus workspace");
     register_schema(&session).await;
@@ -117,7 +119,14 @@ async fn build(corpus: &str, dir: &Path) {
         }
         "edits" => {
             seed_rows(&session, shape, rows, commit_rows).await;
-            edit_rows(&session, shape, env_usize("LIX_AUDIT_EDIT_ROUNDS", 20), 100, rows).await;
+            edit_rows(
+                &session,
+                shape,
+                env_usize("LIX_AUDIT_EDIT_ROUNDS", 20),
+                100,
+                rows,
+            )
+            .await;
         }
         "branches" => {
             let base = rows / 5;
@@ -131,10 +140,16 @@ async fn build(corpus: &str, dir: &Path) {
                     })
                     .await
                     .expect("create audit branch");
-                let branch_session = engine
-                    .open_session_at(branch.id.clone())
+                let branch_session = lix
+                    .open_another_session()
                     .await
                     .expect("open audit branch session");
+                branch_session
+                    .switch_branch(lix::SwitchBranchOptions {
+                        branch_id: (branch.id.clone()).to_string(),
+                    })
+                    .await
+                    .expect("switch session branch");
                 edit_rows(&branch_session, shape, 3, 100, base).await;
             }
         }
@@ -157,10 +172,16 @@ async fn build(corpus: &str, dir: &Path) {
                 })
                 .await
                 .expect("create GC-disposable branch");
-            let branch_session = engine
-                .open_session_at(branch.id.clone())
+            let branch_session = lix
+                .open_another_session()
                 .await
                 .expect("open GC-disposable branch");
+            branch_session
+                .switch_branch(lix::SwitchBranchOptions {
+                    branch_id: (branch.id.clone()).to_string(),
+                })
+                .await
+                .expect("switch session branch");
             edit_rows(&branch_session, shape, 10, 200, rows / 2).await;
             seed_media(&branch_session, env_usize("LIX_AUDIT_FILES", 20)).await;
             edit_media(&branch_session, env_usize("LIX_AUDIT_FILES", 20), 3).await;
@@ -183,7 +204,7 @@ async fn build(corpus: &str, dir: &Path) {
         other => panic!("unknown corpus '{other}'"),
     }
     drop(session);
-    drop(engine);
+    drop(lix);
     storage.flush().await.expect("flush SlateDB WAL");
     storage
         .flush_memtable_for_diagnostics()
@@ -193,7 +214,7 @@ async fn build(corpus: &str, dir: &Path) {
     println!("BUILT\tcorpus={corpus}\tdir={}", dir.display());
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -243,12 +264,8 @@ impl RowShape {
     }
 }
 
-async fn seed_rows<S>(
-    session: &SessionContext<S>,
-    shape: RowShape,
-    rows: usize,
-    commit_rows: usize,
-) where
+async fn seed_rows<S>(session: &Lix<S>, shape: RowShape, rows: usize, commit_rows: usize)
+where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let mut index = 0;
@@ -275,7 +292,7 @@ async fn seed_rows<S>(
 /// Rewrites a small window of rows repeatedly. If a rewrite re-stores
 /// unchanged neighbouring content, the duplicate accounting will show it.
 async fn edit_rows<S>(
-    session: &SessionContext<S>,
+    session: &Lix<S>,
     shape: RowShape,
     rounds: usize,
     window: usize,
@@ -318,7 +335,7 @@ fn media_bytes(file: usize, revision: usize, len: usize) -> Vec<u8> {
     bytes
 }
 
-async fn seed_media<S>(session: &SessionContext<S>, files: usize)
+async fn seed_media<S>(session: &Lix<S>, files: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -339,7 +356,7 @@ where
 
 /// Edits each media file in place by rewriting a 4 KiB window. A working
 /// chunker should re-store only the chunks covering that window.
-async fn edit_media<S>(session: &SessionContext<S>, files: usize, rounds: usize)
+async fn edit_media<S>(session: &Lix<S>, files: usize, rounds: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -423,8 +440,10 @@ async fn audit(dir: &Path) {
                 global_entry.2 += 1;
                 record_near_duplicates(&mut near, value, digest);
             }
-            if let Some(expected) = recompute_content_address(space_id, value)
-                .unwrap_or_else(|error| panic!("{space_name}: content address decode failed: {error}"))
+            if let Some(expected) =
+                recompute_content_address(space_id, value).unwrap_or_else(|error| {
+                    panic!("{space_name}: content address decode failed: {error}")
+                })
             {
                 if key.as_slice() == expected.as_slice() {
                     audit.verified_rows += 1;
@@ -457,9 +476,10 @@ async fn audit(dir: &Path) {
             audit
                 .near_duplicate_rows
                 .insert(("prefix", *width), near_duplicate_count(&near[index * 2]));
-            audit
-                .near_duplicate_rows
-                .insert(("suffix", *width), near_duplicate_count(&near[index * 2 + 1]));
+            audit.near_duplicate_rows.insert(
+                ("suffix", *width),
+                near_duplicate_count(&near[index * 2 + 1]),
+            );
         }
         audits.push((space_id, space_name, audit));
     }

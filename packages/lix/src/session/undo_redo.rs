@@ -722,10 +722,7 @@ mod tests {
     #[tokio::test]
     async fn branch_forked_at_checkpoint_starts_at_an_undo_floor() {
         let engine = setup_engine().await;
-        let session = engine
-            .open_session()
-            .await
-            .expect("session opens");
+        let session = engine.open_session().await.expect("session opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('before-fork', 'kept')",
@@ -758,10 +755,7 @@ mod tests {
     #[tokio::test]
     async fn branch_forked_at_undo_commit_resets_undo_history() {
         let engine = setup_engine().await;
-        let session = engine
-            .open_session()
-            .await
-            .expect("session opens");
+        let session = engine.open_session().await.expect("session opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('abandoned', 'change')",
@@ -1059,10 +1053,7 @@ mod tests {
             .await
             .expect("storage initializes");
         let engine = Engine::new(storage).await.expect("engine opens");
-        let first = engine
-            .open_session()
-            .await
-            .expect("first session opens");
+        let first = engine.open_session().await.expect("first session opens");
         first
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('durable', 'yes')",
@@ -1089,10 +1080,7 @@ mod tests {
             .await
             .expect("storage initializes");
         let engine = Engine::new(storage).await.expect("engine opens");
-        let main = engine
-            .open_session()
-            .await
-            .expect("main session opens");
+        let main = engine.open_session().await.expect("main session opens");
         let draft = main
             .create_branch(CreateBranchOptions {
                 id: Some("01930000-0000-7000-8000-000000000099".to_string()),

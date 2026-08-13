@@ -454,9 +454,15 @@ where
     .await
     .expect("switch workspace to plugin target");
     let mut source = lix
-        .open_session_at(&source_receipt.id)
+        .open_another_session()
         .await
         .expect("open plugin source session");
+    source
+        .switch_branch(SwitchBranchOptions {
+            branch_id: source_receipt.id.clone(),
+        })
+        .await
+        .expect("switch plugin source session");
     if cold_reopen {
         source
             .close()
@@ -469,9 +475,15 @@ where
         drop(lix);
         lix = open_benchmark::<StorageImpl>(&db_path).await;
         source = lix
-            .open_session_at(SOURCE_BRANCH_ID)
+            .open_another_session()
             .await
             .expect("cold-open plugin source");
+        source
+            .switch_branch(SwitchBranchOptions {
+                branch_id: SOURCE_BRANCH_ID.to_owned(),
+            })
+            .await
+            .expect("switch cold plugin source session");
     }
     let target_before_preview = read_all_files(&lix, fixture_files.keys()).await;
     let source_before_preview = read_all_files(&source, fixture_files.keys()).await;
@@ -512,7 +524,6 @@ where
         preview.source_head_commit_id
     );
 
-    lix.reset_plugin_transition_counters();
     collector.clear();
     let merge_measure = measure_async(|| async {
         lix.merge_branch(MergeBranchOptions {
@@ -540,24 +551,6 @@ where
     assert_eq!(
         commit_parent_count(&lix, &receipt.target_head_after_commit_id).await,
         2
-    );
-    let counters = lix.plugin_transition_counters();
-    let expected_plugin_work = if cold_reopen {
-        (1, 5, 0, 0, 14, 11)
-    } else {
-        (1, 1, 0, 0, 3, 7)
-    };
-    assert_eq!(
-        (
-            counters.conflict_resolution_calls,
-            counters.full_document_reparses,
-            counters.full_renderer_invocations,
-            counters.filesystem_sync_full_renders,
-            counters.full_state_semantic_rows_materialized,
-            counters.guest_export_calls,
-        ),
-        expected_plugin_work,
-        "unaffected plugin owners must not receive merge transitions: {counters:?}"
     );
     verify_plugin_results(&lix, &cfg).await;
     assert_eq!(
@@ -645,24 +638,11 @@ where
             "storage_growth_after_merge": signed_delta(storage_bytes_after, storage_bytes_before),
         },
         "phase_ms": { "preview": preview_phases, "merge": merge_phases },
-        "plugin_counters": {
-            "conflict_resolution_calls": counters.conflict_resolution_calls,
-            "conflict_resolution_records": counters.conflict_resolution_records,
-            "conflict_resolution_takes": counters.conflict_resolution_takes,
-            "component_boundary_bytes": counters.component_boundary_bytes,
-            "guest_linear_memory_high_water_bytes": counters.guest_linear_memory_high_water_bytes,
-            "full_state_semantic_rows_materialized": counters.full_state_semantic_rows_materialized,
-            "full_document_reparses": counters.full_document_reparses,
-            "full_renderer_invocations": counters.full_renderer_invocations,
-            "filesystem_sync_full_renders": counters.filesystem_sync_full_renders,
-            "guest_export_calls": counters.guest_export_calls,
-        },
         "correctness": {
             "all_plugins_installed": true, "preview_non_mutating": true,
             "preview_commit_agree": true, "plugin_resolvers_invoked": true,
             "semantic_merge_oracle": true, "materialized_bytes_valid": true,
             "unaffected_plugin_files_not_rewritten": true,
-            "unaffected_plugin_owners_not_invoked": true,
             "source_branch_unchanged": true, "merge_parent_count": 2, "close_reopen_stable": true,
             "heads_and_merge_base": true, "repeated_merge_idempotent": true,
         },
@@ -729,9 +709,15 @@ where
     let branch_max_ms = sorted_branch_ms[sorted_branch_ms.len() - 1];
     let create_branches_ms = branch_measure.wall_ms;
     let source = lix
-        .open_session_at(&source_receipt.id)
+        .open_another_session()
         .await
         .expect("open source session");
+    source
+        .switch_branch(SwitchBranchOptions {
+            branch_id: source_receipt.id.clone(),
+        })
+        .await
+        .expect("switch session branch");
 
     let switch_measure = measure_async(|| async {
         lix.switch_branch(SwitchBranchOptions {

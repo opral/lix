@@ -12,7 +12,7 @@
 //! ## How the window is swept
 //!
 //! [`CrashStorage`] wraps a real backend — [`RocksDB`] or `SlateDB`, selected by
-//! the [`CrashBackend`] type parameter — and counts every mutation the engine
+//! the [`CrashBackend`] type parameter — and counts every mutation Lix
 //! issues at the storage boundary: `begin_write`, each `put_many`,
 //! `delete_many` and `delete_range`, the moment before `commit()` is delegated,
 //! and the moment after it returns. A child process is launched once per kill
@@ -31,7 +31,7 @@
 //!
 //! SIGKILL models *process* death: the kernel keeps the page cache, so anything
 //! the process had already handed to `write(2)` survives. It therefore proves
-//! that the engine does not publish in observable stages. It does **not** model
+//! that Lix does not publish in observable stages. It does **not** model
 //! power loss, which additionally requires the backend to have fsynced before
 //! acknowledging. See
 //! `rocksdb_honours_await_durable_by_syncing_the_wal_before_acknowledging` in
@@ -89,6 +89,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use lix::server_protocol::{
+    FILE_UPLOAD_ID_HEADER, LixServerProtocol, SESSION_ID_HEADER, ServerProtocolBody,
+    ServerProtocolContext,
+};
 use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
     StorageWrite, WriteOptions,
@@ -227,7 +231,7 @@ struct CrashStorage<B> {
     inner: B,
     killer: Arc<Killer>,
     /// Overrides [`WriteOptions::await_durable`] to `true` on every write
-    /// transaction the engine opens.
+    /// transaction Lix opens.
     ///
     /// No SQL path sets the flag on its own — `stage_atomic_cas_publication`,
     /// the only writer that does, is reachable only from the resumable
@@ -358,7 +362,7 @@ struct Workload {
     /// commit, and one that widens the swept window.
     ///
     /// Note it does **not** set `await_durable`; measured, not assumed. The
-    /// blob is written with `INSERT INTO lix_file`, and the engine raises that
+    /// blob is written with `INSERT INTO lix_file`, and Lix raises that
     /// flag only in the resumable media-upload session, which is exercised by
     /// `await_durable_publication_round_trips_through_the_resumable_upload_path`
     /// below. See also [`Workload::force_await_durable`].
@@ -395,7 +399,9 @@ fn blob_for(generation: i64, size: usize) -> Vec<u8> {
 }
 
 fn env_flag(name: &str) -> bool {
-    std::env::var(name).map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+    std::env::var(name)
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -503,7 +509,9 @@ async fn child_main<B: CrashBackend>(
     println!("E20_EVENTS {}", killer.events());
     println!("E36_DURABLE_WRITES {durable} {total}");
     let _ = std::io::stdout().flush();
-    lix.close().await.expect("child closes crash-consistency Lix");
+    lix.close()
+        .await
+        .expect("child closes crash-consistency Lix");
 }
 
 fn append_ack(path: &Path, generation: u64) {
@@ -554,12 +562,16 @@ async fn verify_after_crash<B: CrashBackend>(
     let lix = open_lix()
         .with_storage(storage.clone())
         .await
-        .map_err(|error| format!("engine did not open: {error}"))?;
+        .map_err(|error| format!("lix did not open: {error}"))?;
 
     // 2. Is the branch ref pointing at a commit whose record exists?
-    let head = scalar_text(&lix, "SELECT lix_active_branch_commit_id() AS commit_id", &[])
-        .await
-        .map_err(|error| format!("active branch ref unreadable: {error}"))?;
+    let head = scalar_text(
+        &lix,
+        "SELECT lix_active_branch_commit_id() AS commit_id",
+        &[],
+    )
+    .await
+    .map_err(|error| format!("active branch ref unreadable: {error}"))?;
     let head_records = scalar_i64(
         &lix,
         "SELECT COUNT(*) AS n FROM lix_commit WHERE id = $1",
@@ -734,7 +746,7 @@ async fn verify_after_crash<B: CrashBackend>(
     let lix = open_lix()
         .with_storage(storage.clone())
         .await
-        .map_err(|error| format!("second engine open failed: {error}"))?;
+        .map_err(|error| format!("second lix open failed: {error}"))?;
     let observed = read_generations(&lix)
         .await
         .map_err(|error| format!("SELECT after recovery reopen failed: {error:?}"))?;
@@ -841,9 +853,7 @@ async fn upsert_generation<S: Storage + Clone + Send + Sync + 'static>(
         } else {
             transaction
                 .execute(
-                    &format!(
-                        "UPDATE {SCHEMA_KEY} SET generation = $1, payload = $2 WHERE id = $3"
-                    ),
+                    &format!("UPDATE {SCHEMA_KEY} SET generation = $1, payload = $2 WHERE id = $3"),
                     &[
                         Value::Integer(generation),
                         Value::Text(payload),
@@ -903,7 +913,10 @@ async fn read_generations<S: Storage + Clone + Send + Sync + 'static>(
     Ok(result
         .rows()
         .iter()
-        .map(|row| row.get::<i64>("generation").expect("generation is an integer"))
+        .map(|row| {
+            row.get::<i64>("generation")
+                .expect("generation is an integer")
+        })
         .collect())
 }
 
@@ -980,7 +993,7 @@ fn result_column(sql: &str) -> &'static str {
 /// Sweep every kill point in the publication window of one shipping adapter.
 ///
 /// Identical code, identical invariants and an identical null control for every
-/// backend: the only thing that varies is which adapter the engine was handed.
+/// backend: the only thing that varies is which adapter Lix was handed.
 /// That is what makes the two arms comparable — a second harness would only
 /// prove that two harnesses agree.
 fn sweep<B: CrashBackend>(workload: Workload) {
@@ -1251,7 +1264,7 @@ fn slatedb_durable_acknowledgement_survives_sigkill() {
 }
 
 /// `WriteOptions::await_durable` is documented as "do not acknowledge the commit
-/// until the backend has crossed its durable persistence boundary". The engine
+/// until the backend has crossed its durable persistence boundary". The lix
 /// raises it on the resumable media-upload path — the per-part commit and the
 /// finalizing CAS publication. SlateDB waits for its WAL upload; RocksDB must
 /// fsync the WAL before acknowledging.
@@ -1325,26 +1338,56 @@ fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
     block_on(move || async move {
         {
             let storage = RocksDB::open(&path).expect("open durable round-trip store");
-            let lix = open_lix()
-                .with_storage(storage.clone())
-                .await
-                .expect("open durable round-trip Lix");
-            let total_size = content.len() as u64;
-            let progress = lix
-                .upsert_file_content_part(
-                    "e35-durable-round-trip".to_owned(),
-                    UPLOAD_PATH.to_owned(),
-                    0,
-                    total_size,
-                    content,
-                )
-                .await
-                .expect("publish durable round-trip upload");
-            assert_eq!(
-                progress.next_offset, total_size,
-                "the durable upload did not consume the whole part"
+            let lix = Arc::new(
+                open_lix()
+                    .with_storage(storage.clone())
+                    .await
+                    .expect("open durable round-trip Lix"),
             );
-            lix.close().await.expect("close durable round-trip Lix");
+            let server = LixServerProtocol::new(Arc::clone(&lix));
+            let handshake = server
+                .handle(
+                    http::Request::builder()
+                        .method("GET")
+                        .uri("/lix/v1")
+                        .body(ServerProtocolBody::empty())
+                        .expect("build durable upload handshake"),
+                    ServerProtocolContext::anonymous(),
+                )
+                .await;
+            let handshake_body = http_body_util::BodyExt::collect(handshake.into_body())
+                .await
+                .expect("collect durable upload handshake")
+                .to_bytes();
+            let handshake_json: serde_json::Value =
+                serde_json::from_slice(&handshake_body).expect("decode durable upload handshake");
+            let session_id = handshake_json["sessionId"]
+                .as_str()
+                .expect("durable upload handshake returns a session");
+            let total_size = content.len() as u64;
+            let response = server
+                .handle(
+                    http::Request::builder()
+                        .method("POST")
+                        .uri("/lix/v1/file/upsert?path=%2Fdurable-round-trip.bin")
+                        .header(SESSION_ID_HEADER, session_id)
+                        .header(FILE_UPLOAD_ID_HEADER, "e35-durable-round-trip")
+                        .header(
+                            http::header::CONTENT_RANGE,
+                            format!("bytes 0-{}/{total_size}", total_size - 1),
+                        )
+                        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                        .body(ServerProtocolBody::from(content))
+                        .expect("build durable upload request"),
+                    ServerProtocolContext::anonymous(),
+                )
+                .await;
+            assert_eq!(
+                response.status(),
+                http::StatusCode::OK,
+                "the durable upload protocol did not publish the whole part"
+            );
+            server.close().await.expect("close durable upload server");
         }
 
         let storage = RocksDB::open(&path).expect("reopen durable round-trip store");
@@ -1458,10 +1501,7 @@ fn run_child<B: CrashBackend>(
         .env(BACKEND_ENV, B::NAME)
         .env("LIX_CRASH_DB", dir.join("database"))
         .env("LIX_CRASH_ACK", &ack)
-        .env(
-            "LIX_CRASH_CONSISTENCY_ROWS",
-            workload.rows.to_string(),
-        )
+        .env("LIX_CRASH_CONSISTENCY_ROWS", workload.rows.to_string())
         .env(
             "LIX_CRASH_CONSISTENCY_COMMITS",
             workload.commits.to_string(),
@@ -1472,7 +1512,11 @@ fn run_child<B: CrashBackend>(
         )
         .env(
             "LIX_CRASH_AWAIT_DURABLE",
-            if workload.force_await_durable { "1" } else { "0" },
+            if workload.force_await_durable {
+                "1"
+            } else {
+                "0"
+            },
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

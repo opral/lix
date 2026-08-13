@@ -6,19 +6,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
     StorageWrite, WriteOptions,
 };
-use lix::plugin::runtime::WasmRuntime;
-use lix::{LixError, LixPath, Value};
+use lix::{Lix, LixError, LixPath, SYSTEM_ACCOUNT_ID, Value};
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 use tokio::sync::oneshot;
@@ -33,15 +30,6 @@ const FILE_UPSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const FILESYSTEM_PARALLEL_SNAPSHOT_MAX_WORKERS: usize = 8;
 // Avoid paying thread startup cost for tiny directory roots.
 const FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS: usize = 4;
-
-#[derive(Clone)]
-pub(crate) struct FilesystemSync<StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    inner: StorageImpl,
-    supervisor: FilesystemSupervisor<StorageImpl>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FilesystemLayout {
@@ -113,34 +101,32 @@ struct FilesystemPathFilter {
     include_files: Option<BTreeSet<String>>,
 }
 
-pub(crate) struct FilesystemWrite<'a, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    inner: StorageImpl::Write<'a>,
-    supervisor: FilesystemSupervisor<StorageImpl>,
-}
-
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct LocalFilesystem {
-    inner: FilesystemSync<RocksDBFilesystem>,
+    inner: RocksDBFilesystem,
+    layout: FilesystemLayout,
+    sync_all_files: bool,
+    supervisor: Arc<Mutex<Option<Weak<FilesystemSupervisorInner>>>>,
 }
 
 pub type LocalFilesystemRead<'a> = crate::RocksDBFilesystemRead<'a>;
 
 #[expect(missing_debug_implementations)]
-pub struct LocalFilesystemWrite<'a> {
-    inner: FilesystemWrite<'a, RocksDBFilesystem>,
+pub struct LocalFilesystemWrite {
+    inner: crate::RocksDBFilesystemWrite,
+    supervisor: Option<Weak<FilesystemSupervisorInner>>,
 }
 
 #[derive(Clone)]
-struct FilesystemSupervisor<StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+struct FilesystemSupervisor {
     inner: Arc<FilesystemSupervisorInner>,
-    _marker: PhantomData<fn() -> StorageImpl>,
+}
+
+#[derive(Clone)]
+#[expect(missing_debug_implementations)]
+pub struct LocalFilesystemSync {
+    supervisor: FilesystemSupervisor,
 }
 
 struct FilesystemSupervisorInner {
@@ -159,11 +145,8 @@ struct FilesystemWatchPath {
     recursive: bool,
 }
 
-struct FilesystemState<StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    session: SessionContext<StorageImpl>,
+struct FilesystemState {
+    lix: Lix<LocalFilesystem>,
     layout: FilesystemLayout,
     path_filter: Mutex<FilesystemPathFilter>,
     sync_lock: tokio::sync::Mutex<()>,
@@ -207,12 +190,9 @@ impl Snapshot {
 
 impl FilesystemPathFilter {
     fn from_sync_all_files(sync_all_files: bool) -> Self {
-        let include_files = if sync_all_files {
-            None
-        } else {
-            Some(BTreeSet::new())
-        };
-        Self { include_files }
+        Self {
+            include_files: (!sync_all_files).then(BTreeSet::new),
+        }
     }
 
     fn is_unfiltered(&self) -> bool {
@@ -321,7 +301,7 @@ enum FilesystemEvent {
 }
 
 impl LocalFilesystem {
-    pub async fn open<P>(dir: P) -> Result<Self, LixError>
+    pub fn open<P>(dir: P) -> Result<Self, LixError>
     where
         P: AsRef<Path>,
     {
@@ -330,45 +310,75 @@ impl LocalFilesystem {
             lix_dir: None,
             sync_all_files: true,
         })
-        .await
     }
 
-    pub async fn open_with_options(options: LocalFilesystemOpenOptions) -> Result<Self, LixError> {
-        Self::open_with_options_and_runtime(options, None).await
-    }
-
-    /// Opens a filesystem storage whose disk-sync supervisor uses the same
-    /// component runtime as the Lix session that owns it.
-    pub async fn open_with_options_and_wasm_runtime(
-        options: LocalFilesystemOpenOptions,
-        wasm_runtime: Arc<dyn WasmRuntime>,
-    ) -> Result<Self, LixError> {
-        Self::open_with_options_and_runtime(options, Some(wasm_runtime)).await
-    }
-
-    async fn open_with_options_and_runtime(
-        options: LocalFilesystemOpenOptions,
-        wasm_runtime: Option<Arc<dyn WasmRuntime>>,
-    ) -> Result<Self, LixError> {
+    pub fn open_with_options(options: LocalFilesystemOpenOptions) -> Result<Self, LixError> {
         let layout = prepare_filesystem_layout(&options.root, options.lix_dir.as_deref())?;
-        let storage = open_filesystem_rocksdb(&layout)?;
-        let engine = lix::storage::open_engine(storage.clone(), wasm_runtime).await?;
-        let inner =
-            FilesystemSync::open_with_engine(storage, engine, layout, options.sync_all_files)
-                .await?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: open_filesystem_rocksdb(&layout)?,
+            layout,
+            sync_all_files: options.sync_all_files,
+            supervisor: Arc::new(Mutex::new(None)),
+        })
     }
 
+    /// Starts bidirectional filesystem synchronization using another session
+    /// on the supplied Lix repository.
+    pub async fn start_sync(
+        &self,
+        lix: &Lix<LocalFilesystem>,
+    ) -> Result<LocalFilesystemSync, LixError> {
+        if self
+            .supervisor
+            .lock()
+            .expect("filesystem supervisor lock should not poison")
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some()
+        {
+            return Err(LixError::new(
+                "LIX_FILESYSTEM_SYNC_ALREADY_STARTED",
+                "filesystem synchronization is already running",
+            ));
+        }
+
+        let sync_lix = lix
+            .open_another_session()
+            .with_account(SYSTEM_ACCOUNT_ID)
+            .await?;
+        let supervisor = FilesystemSupervisor::open(
+            sync_lix,
+            self.layout.clone(),
+            FilesystemPathFilter::from_sync_all_files(self.sync_all_files),
+        )
+        .await?;
+        *self
+            .supervisor
+            .lock()
+            .expect("filesystem supervisor lock should not poison") =
+            Some(Arc::downgrade(&supervisor.inner));
+        Ok(LocalFilesystemSync { supervisor })
+    }
+}
+
+impl LocalFilesystemSync {
     pub async fn import_paths<I, S>(&self, paths: I) -> Result<(), LixError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.inner.import_paths(paths).await
+        self.supervisor
+            .import_paths(
+                paths
+                    .into_iter()
+                    .map(|path| path.as_ref().to_string())
+                    .collect(),
+            )
+            .await
     }
 
     pub async fn sync_disk_to_lix(&self) -> Result<(), LixError> {
-        self.inner.sync_disk_to_lix().await
+        self.supervisor.sync_disk_to_lix().await
     }
 }
 
@@ -379,7 +389,7 @@ impl Storage for LocalFilesystem {
         Self: 'a;
 
     type Write<'a>
-        = LocalFilesystemWrite<'a>
+        = LocalFilesystemWrite
     where
         Self: 'a;
 
@@ -397,119 +407,17 @@ impl Storage for LocalFilesystem {
         async move {
             Ok(LocalFilesystemWrite {
                 inner: self.inner.begin_write(opts).await?,
+                supervisor: self
+                    .supervisor
+                    .lock()
+                    .expect("filesystem supervisor lock should not poison")
+                    .clone(),
             })
         }
     }
 }
 
-impl StorageWrite for LocalFilesystemWrite<'_> {
-    fn put_many(
-        &mut self,
-        space: StorageSpace,
-        entries: PutBatch,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        self.inner.put_many(space, entries)
-    }
-
-    fn delete_many(
-        &mut self,
-        space: StorageSpace,
-        keys: &[Key],
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        self.inner.delete_many(space, keys)
-    }
-
-    fn delete_range(
-        &mut self,
-        space: StorageSpace,
-        range: KeyRange,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        self.inner.delete_range(space, range)
-    }
-
-    fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
-        self.inner.commit()
-    }
-
-    fn rollback(self) -> impl Future<Output = Result<(), StorageError>> + Send {
-        self.inner.rollback()
-    }
-}
-
-impl<StorageImpl> FilesystemSync<StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    async fn open_with_engine(
-        storage: StorageImpl,
-        engine: Engine<StorageImpl>,
-        layout: FilesystemLayout,
-        sync_all_files: bool,
-    ) -> Result<Self, LixError> {
-        Ok(Self {
-            inner: storage,
-            supervisor: FilesystemSupervisor::open(engine, layout, sync_all_files).await?,
-        })
-    }
-
-    async fn import_paths<I, S>(&self, paths: I) -> Result<(), LixError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.supervisor
-            .import_paths(
-                paths
-                    .into_iter()
-                    .map(|path| path.as_ref().to_string())
-                    .collect(),
-            )
-            .await
-    }
-
-    async fn sync_disk_to_lix(&self) -> Result<(), LixError> {
-        self.supervisor.sync_disk_to_lix().await
-    }
-}
-
-impl<StorageImpl> Storage for FilesystemSync<StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    type Read<'a>
-        = StorageImpl::Read<'a>
-    where
-        Self: 'a;
-
-    type Write<'a>
-        = FilesystemWrite<'a, StorageImpl>
-    where
-        Self: 'a;
-
-    fn begin_read(
-        &self,
-        opts: ReadOptions,
-    ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
-        self.inner.begin_read(opts)
-    }
-
-    fn begin_write(
-        &self,
-        opts: WriteOptions,
-    ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
-        async move {
-            Ok(FilesystemWrite {
-                inner: self.inner.begin_write(opts).await?,
-                supervisor: self.supervisor.clone(),
-            })
-        }
-    }
-}
-
-impl<StorageImpl> StorageWrite for FilesystemWrite<'_, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+impl StorageWrite for LocalFilesystemWrite {
     fn put_many(
         &mut self,
         space: StorageSpace,
@@ -537,7 +445,12 @@ where
     fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         async move {
             let result = self.inner.commit().await?;
-            self.supervisor.sync_from_lix().await?;
+            if let Some(inner) = self.supervisor.and_then(|inner| inner.upgrade()) {
+                if thread::current().name() != Some("lix-sdk-filesystem-sync") {
+                    let supervisor = FilesystemSupervisor { inner };
+                    supervisor.sync_from_lix().await?;
+                }
+            }
             Ok(result)
         }
     }
@@ -547,21 +460,16 @@ where
     }
 }
 
-impl<StorageImpl> FilesystemSupervisor<StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+impl FilesystemSupervisor {
     async fn open(
-        engine: Engine<StorageImpl>,
+        lix: Lix<LocalFilesystem>,
         layout: FilesystemLayout,
-        sync_all_files: bool,
+        path_filter: FilesystemPathFilter,
     ) -> Result<Self, LixError> {
         validate_filesystem_root_directory(&layout.root)?;
         validate_filesystem_lix_directory(&layout.lix_dir)?;
-        let path_filter = FilesystemPathFilter::from_sync_all_files(sync_all_files);
-        let session = engine.open_session().await?;
         let state = Arc::new(FilesystemState {
-            session,
+            lix,
             layout,
             path_filter: Mutex::new(path_filter),
             sync_lock: tokio::sync::Mutex::new(()),
@@ -614,7 +522,6 @@ where
                 event_tx,
                 worker: Mutex::new(Some(worker)),
             }),
-            _marker: PhantomData,
         })
     }
 
@@ -691,10 +598,7 @@ impl FilesystemSupervisorInner {
     }
 }
 
-impl<StorageImpl> FilesystemState<StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+impl FilesystemState {
     fn path_filter(&self) -> FilesystemPathFilter {
         self.path_filter
             .lock()
@@ -749,7 +653,9 @@ where
         let _guard = self.sync_lock.lock().await;
         let path_filter = self.path_filter();
         let lix_revision = self.collect_lix_revision().await?;
-        if self.is_last_materialized_lix_revision(&lix_revision) {
+        if lix_revision.storage_mutation_revision.is_some()
+            && self.is_last_materialized_lix_revision(&lix_revision)
+        {
             let local = collect_local_snapshot(&self.layout, &path_filter)?;
             if self.is_last_materialized_disk(&local) {
                 return Ok(());
@@ -776,7 +682,9 @@ where
         let local = collect_local_snapshot(&self.layout, &path_filter)?;
         if skip_if_last_materialized && self.is_last_materialized_disk(&local) {
             let lix_revision = self.collect_lix_revision().await?;
-            if self.is_last_materialized(&local, &lix_revision) {
+            if lix_revision.storage_mutation_revision.is_some()
+                && self.is_last_materialized(&local, &lix_revision)
+            {
                 return Ok(());
             }
         }
@@ -811,7 +719,7 @@ where
     }
 
     async fn close(&self) -> Result<(), LixError> {
-        self.session.close().await
+        self.lix.close().await
     }
 
     async fn collect_lix_snapshot_read(&self) -> Result<LixSnapshotRead, LixError> {
@@ -821,10 +729,7 @@ where
             ("SELECT path FROM lix_directory ORDER BY path", &[]),
             ("SELECT path, content FROM lix_file ORDER BY path", &[]),
         ];
-        let batch = self
-            .session
-            .execute_coherent_read_batch(&statements)
-            .await?;
+        let batch = self.lix.execute_coherent_read_batch(&statements).await?;
         let [directories, files] = batch.results.try_into().map_err(|results: Vec<_>| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -854,7 +759,7 @@ where
     }
 
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
-        let batch = self.session.execute_coherent_read_batch(&[]).await?;
+        let batch = self.lix.execute_coherent_read_batch(&[]).await?;
         Ok(LixRevision {
             active_branch_id: batch.active_branch_id,
             active_branch_commit_id: batch.active_branch_commit_id,
@@ -889,7 +794,7 @@ where
                     continue;
                 }
                 needs_fresh_lix_read = true;
-                self.session
+                self.lix
                     .execute(
                         "DELETE FROM lix_file WHERE path = $1",
                         &[Value::Text(path.clone())],
@@ -923,7 +828,7 @@ where
             sort_directories_deepest_first(&mut directories_to_remove);
             for path in directories_to_remove {
                 needs_fresh_lix_read = true;
-                self.session
+                self.lix
                     .execute(
                         "DELETE FROM lix_directory WHERE path = $1",
                         &[Value::Text(path)],
@@ -946,7 +851,7 @@ where
         sort_directories_shallowest_first(&mut directories_to_create);
         for path in directories_to_create {
             needs_fresh_lix_read = true;
-            self.session
+            self.lix
                 .execute(
                     "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
                     &[Value::Text(path)],
@@ -997,7 +902,7 @@ where
                 params.push(Value::Text((*path).to_string()));
                 params.push(Value::Blob((*data).to_vec().into()));
             }
-            self.session.execute(&sql, &params).await?;
+            self.lix.execute(&sql, &params).await?;
             start = end;
         }
         Ok(())
@@ -1165,14 +1070,12 @@ where
     }
 }
 
-fn filesystem_worker<StorageImpl>(
-    state: Arc<FilesystemState<StorageImpl>>,
+fn filesystem_worker(
+    state: Arc<FilesystemState>,
     event_rx: mpsc::Receiver<FilesystemEvent>,
     mut poll_filesystem: bool,
     mut debouncer: Option<FilesystemWatcher>,
-) where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() else {
         return;
     };
@@ -1262,17 +1165,14 @@ fn filesystem_worker<StorageImpl>(
     }
 }
 
-fn drain_filesystem_events<StorageImpl>(
+fn drain_filesystem_events(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesystemState<StorageImpl>>,
+    state: &Arc<FilesystemState>,
     event_rx: &mpsc::Receiver<FilesystemEvent>,
     mut sync_disk: bool,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
-) -> bool
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+) -> bool {
     let mut sync_disk_replies = Vec::new();
     let mut sync_replies = Vec::new();
     let mut import_replies = Vec::new();
@@ -1310,16 +1210,13 @@ where
     false
 }
 
-fn sync_disk_to_lix_for_replies<StorageImpl>(
+fn sync_disk_to_lix_for_replies(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesystemState<StorageImpl>>,
+    state: &Arc<FilesystemState>,
     replies: Vec<oneshot::Sender<Result<(), LixError>>>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+) -> Result<(), LixError> {
     let result = runtime.block_on(state.sync_disk_to_lix(true));
     if result.is_ok() {
         refresh_filesystem_watcher(state, debouncer, poll_filesystem);
@@ -1330,16 +1227,13 @@ where
     result
 }
 
-fn import_paths_for_replies<StorageImpl>(
+fn import_paths_for_replies(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesystemState<StorageImpl>>,
+    state: &Arc<FilesystemState>,
     replies: Vec<(Vec<String>, oneshot::Sender<Result<(), LixError>>)>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+) -> Result<(), LixError> {
     let mut first_error = None;
     for (paths, reply) in replies {
         let result = runtime.block_on(state.import_paths(paths));
@@ -1353,16 +1247,13 @@ where
     first_error.map_or(Ok(()), Err)
 }
 
-fn sync_from_lix_for_replies<StorageImpl>(
+fn sync_from_lix_for_replies(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<FilesystemState<StorageImpl>>,
+    state: &Arc<FilesystemState>,
     replies: Vec<oneshot::Sender<Result<(), LixError>>>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+) -> Result<(), LixError> {
     let result = runtime.block_on(state.sync_from_lix());
     if result.is_ok() {
         refresh_filesystem_watcher(state, debouncer, poll_filesystem);
@@ -1373,13 +1264,11 @@ where
     result
 }
 
-fn refresh_filesystem_watcher<StorageImpl>(
-    state: &Arc<FilesystemState<StorageImpl>>,
+fn refresh_filesystem_watcher(
+    state: &Arc<FilesystemState>,
     debouncer: &mut Option<FilesystemWatcher>,
     poll_filesystem: &mut bool,
-) where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+) {
     let Some(watcher) = debouncer.as_mut() else {
         *poll_filesystem = true;
         return;
@@ -2468,13 +2357,13 @@ mod tests {
     use lix::Value;
 
     async fn lix_read_file<StorageImpl>(
-        session: &SessionContext<StorageImpl>,
+        lix: &Lix<StorageImpl>,
         path: &str,
     ) -> Result<Option<Vec<u8>>, LixError>
     where
         StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
-        let result = session
+        let result = lix
             .execute(
                 "SELECT content FROM lix_file WHERE path = $1",
                 &[Value::Text(path.to_string())],
@@ -2488,33 +2377,35 @@ mod tests {
     }
 
     async fn lix_write_file<StorageImpl>(
-        session: &SessionContext<StorageImpl>,
+        lix: &Lix<StorageImpl>,
         path: &str,
         data: Vec<u8>,
     ) -> Result<(), LixError>
     where
         StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
-        session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+        lix.execute(
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                &[Value::Text(path.to_string()), Value::Blob(data.into())],
-            )
-            .await?;
+            &[Value::Text(path.to_string()), Value::Blob(data.into())],
+        )
+        .await?;
         Ok(())
     }
 
     async fn open_test_filesystem_state(
         layout: FilesystemLayout,
         path_filter: FilesystemPathFilter,
-    ) -> FilesystemState<RocksDBFilesystem> {
-        let storage = open_filesystem_rocksdb(&layout).unwrap();
-        let engine = lix::storage::open_engine(storage.clone(), None)
-            .await
-            .unwrap();
+    ) -> FilesystemState {
+        let storage = LocalFilesystem {
+            inner: open_filesystem_rocksdb(&layout).unwrap(),
+            layout: layout.clone(),
+            sync_all_files: path_filter.is_unfiltered(),
+            supervisor: Arc::new(Mutex::new(None)),
+        };
+        let lix = lix::open_lix().with_storage(storage).await.unwrap();
         FilesystemState {
-            session: engine.open_session().await.unwrap(),
+            lix,
             layout,
             path_filter: Mutex::new(path_filter),
             sync_lock: tokio::sync::Mutex::new(()),
@@ -2701,7 +2592,9 @@ mod tests {
             b"internal",
         )
         .unwrap();
-        let path_filter = FilesystemPathFilter::from_sync_all_files(false);
+        let path_filter = FilesystemPathFilter {
+            include_files: Some(BTreeSet::new()),
+        };
 
         let snapshot = collect_local_snapshot(&layout, &path_filter).unwrap();
 
@@ -2766,6 +2659,10 @@ mod tests {
         let local = collect_local_snapshot(&state.layout, &path_filter).unwrap();
         let lix_revision = state.collect_lix_revision().await.unwrap();
         assert!(
+            lix_revision.storage_mutation_revision.is_some(),
+            "idle synchronization needs a storage revision to skip a full file snapshot"
+        );
+        assert!(
             state.is_last_materialized(&local, &lix_revision),
             "an unchanged filesystem should be recognized as already materialized"
         );
@@ -2780,7 +2677,7 @@ mod tests {
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
         state.sync_disk_to_lix(false).await.unwrap();
-        lix_write_file(&state.session, "/sql.txt", b"updated".to_vec())
+        lix_write_file(&state.lix, "/sql.txt", b"updated".to_vec())
             .await
             .unwrap();
         state.sync_from_lix().await.unwrap();
@@ -2790,7 +2687,7 @@ mod tests {
         );
 
         state
-            .session
+            .lix
             .execute(
                 "DELETE FROM lix_file WHERE path = $1",
                 &[Value::Text("/sql.txt".to_string())],
@@ -2801,7 +2698,7 @@ mod tests {
 
         assert!(!tempdir.path().join("sql.txt").exists());
         let rows = state
-            .session
+            .lix
             .execute(
                 "SELECT path FROM lix_file WHERE path = $1",
                 &[Value::Text("/sql.txt".to_string())],
@@ -2820,7 +2717,7 @@ mod tests {
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
         state.sync_disk_to_lix(false).await.unwrap();
-        lix_write_file(&state.session, "/sql.txt", b"first".to_vec())
+        lix_write_file(&state.lix, "/sql.txt", b"first".to_vec())
             .await
             .unwrap();
         state.sync_from_lix().await.unwrap();
@@ -2829,7 +2726,7 @@ mod tests {
             b"first"
         );
 
-        lix_write_file(&state.session, "/sql.txt", b"second".to_vec())
+        lix_write_file(&state.lix, "/sql.txt", b"second".to_vec())
             .await
             .unwrap();
         state.sync_disk_to_lix(true).await.unwrap();
@@ -2860,7 +2757,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            lix_read_file(&state.session, "/disk.txt")
+            lix_read_file(&state.lix, "/disk.txt")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -2881,7 +2778,7 @@ mod tests {
 
         state.sync_disk_to_lix(true).await.unwrap();
         assert_eq!(
-            lix_read_file(&state.session, "/disk.txt")
+            lix_read_file(&state.lix, "/disk.txt")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -2892,7 +2789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_filesystem_sync_disk_to_lix_respects_include_paths() {
+    async fn local_filesystem_sync_disk_to_lix_syncs_repository_files() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"initial").unwrap();
         std::fs::write(tempdir.path().join("ignored.md"), b"ignored").unwrap();
@@ -2900,17 +2797,16 @@ mod tests {
         let storage = LocalFilesystem::open_with_options(LocalFilesystemOpenOptions {
             root: tempdir.path().to_path_buf(),
             lix_dir: None,
-            sync_all_files: false,
+            sync_all_files: true,
         })
-        .await
         .unwrap();
         let lix = lix::open_lix().with_storage(storage.clone()).await.unwrap();
-        storage.import_paths(["tracked.md"]).await.unwrap();
+        let sync = storage.start_sync(&lix).await.unwrap();
 
         std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
         std::fs::write(tempdir.path().join("ignored.md"), b"changed").unwrap();
 
-        storage.sync_disk_to_lix().await.unwrap();
+        sync.sync_disk_to_lix().await.unwrap();
 
         let tracked = lix
             .execute(
@@ -2936,7 +2832,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(ignored.rows().is_empty());
+        assert_eq!(
+            ignored
+                .rows()
+                .first()
+                .unwrap()
+                .get::<Vec<u8>>("content")
+                .unwrap(),
+            b"changed"
+        );
 
         lix.close().await.unwrap();
     }
@@ -2951,14 +2855,14 @@ mod tests {
             lix_dir: None,
             sync_all_files: true,
         })
-        .await
         .unwrap();
         let lix = lix::open_lix().with_storage(storage.clone()).await.unwrap();
+        let sync = storage.start_sync(&lix).await.unwrap();
 
         lix.close().await.unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"changed").unwrap();
 
-        storage.sync_disk_to_lix().await.unwrap();
+        sync.sync_disk_to_lix().await.unwrap();
 
         let lix = lix::open_lix().with_storage(storage).await.unwrap();
         let tracked = lix
@@ -2991,9 +2895,9 @@ mod tests {
             lix_dir: Some(lix_dir.clone()),
             sync_all_files: true,
         })
-        .await
         .unwrap();
-        let lix = lix::open_lix().with_storage(storage).await.unwrap();
+        let lix = lix::open_lix().with_storage(storage.clone()).await.unwrap();
+        let _sync = storage.start_sync(&lix).await.unwrap();
 
         lix.execute(
             "INSERT INTO lix_file (path, content) VALUES ($1, $2)",

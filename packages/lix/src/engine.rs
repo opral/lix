@@ -7,9 +7,9 @@ use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
-use crate::init::InitReceipt;
 use crate::hot_state::HotStateContext;
 use crate::hot_state::HotStateRowRequest;
+use crate::init::InitReceipt;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::runtime::{
@@ -31,8 +31,7 @@ use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
-#[expect(missing_debug_implementations)]
-pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
+pub(crate) struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
     tracked_state: Arc<TrackedStateContext>,
     hot_state: Arc<HotStateContext>,
@@ -49,8 +48,7 @@ pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memor
     telemetry: Option<Arc<dyn TelemetrySink>>,
 }
 
-#[expect(missing_debug_implementations)]
-pub struct EngineOptions {
+pub(crate) struct EngineOptions {
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     plugin_max_memory_bytes: u64,
@@ -69,16 +67,16 @@ impl Default for EngineOptions {
 }
 
 impl EngineOptions {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub fn with_wasm_runtime(mut self, wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
+    pub(crate) fn with_wasm_runtime(mut self, wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
         self.wasm_runtime = Some(wasm_runtime);
         self
     }
 
-    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
+    pub(crate) fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
         self.telemetry = Some(telemetry);
         self
     }
@@ -95,7 +93,7 @@ impl EngineOptions {
     /// candidates, and upgrade preflight Stores consume the same
     /// repository-wide budget. Completed publications may retire their Stores
     /// under pressure and cold-open again after commit.
-    pub fn with_plugin_resource_limits(
+    pub(crate) fn with_plugin_resource_limits(
         mut self,
         max_memory_bytes: u64,
         max_live_stores: usize,
@@ -115,7 +113,7 @@ where
     /// Initialization is a storage lifecycle operation, separate from runtime
     /// construction. Call this before `Engine::new(...)` for a brand-new
     /// storage.
-    pub async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
+    pub(crate) async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
         let storage = StorageAdapter::new(storage);
 
         crate::init::initialize(storage, &TrackedStateContext::new()).await
@@ -129,12 +127,13 @@ where
     /// Deterministic runtime sequencing is serialized within this Engine
     /// context. Independently constructing multiple Engine values over the same
     /// cloned storage is outside that MVP runtime-sharing boundary.
-    pub async fn new(storage: StorageImpl) -> Result<Self, LixError> {
+    pub(crate) async fn new(storage: StorageImpl) -> Result<Self, LixError> {
         Self::new_with_options(storage, EngineOptions::new()).await
     }
 
     /// Creates an engine with a WASM component runtime for installed plugins.
-    pub async fn new_with_wasm_runtime(
+    #[allow(dead_code)]
+    pub(crate) async fn new_with_wasm_runtime(
         storage: StorageImpl,
         wasm_runtime: Arc<dyn WasmRuntime>,
     ) -> Result<Self, LixError> {
@@ -145,7 +144,7 @@ where
         .await
     }
 
-    pub async fn new_with_options(
+    pub(crate) async fn new_with_options(
         storage: StorageImpl,
         options: EngineOptions,
     ) -> Result<Self, LixError> {
@@ -205,7 +204,7 @@ where
     /// This is the public engine-level form of the typed `branch_ref` context:
     /// callers should not need to know that branch heads are represented as
     /// untracked `lix_branch_ref` rows in hot_state.
-    pub async fn load_branch_head_commit_id(
+    pub(crate) async fn load_branch_head_commit_id(
         &self,
         branch_id: &str,
     ) -> Result<Option<String>, LixError> {
@@ -223,7 +222,7 @@ where
         Ok(result)
     }
 
-    pub async fn open_session_at(
+    pub(crate) async fn open_session_at(
         &self,
         active_branch_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
@@ -231,7 +230,7 @@ where
             .await
     }
 
-    pub async fn open_session_at_with_account(
+    pub(crate) async fn open_session_at_with_account(
         &self,
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
@@ -259,12 +258,12 @@ where
         .await
     }
 
-    pub async fn open_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
+    pub(crate) async fn open_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
         self.open_session_with_account(crate::ANONYMOUS_ACCOUNT_ID)
             .await
     }
 
-    pub async fn open_session_with_account(
+    pub(crate) async fn open_session_with_account(
         &self,
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
@@ -293,14 +292,16 @@ where
     /// Returns process-local work accumulated by completed v2 transitions on
     /// this engine. The snapshot is shared by every session cloned from it.
     #[doc(hidden)]
-    pub fn plugin_transition_counters(&self) -> WasmTransitionCounters {
+    #[allow(dead_code)]
+    pub(crate) fn plugin_transition_counters(&self) -> WasmTransitionCounters {
         self.plugin_host.transition_counters()
     }
 
     /// Resets the process-local v2 transition aggregate used by profiling and
     /// invariant tests. This does not mutate durable repository state.
     #[doc(hidden)]
-    pub fn reset_plugin_transition_counters(&self) {
+    #[allow(dead_code)]
+    pub(crate) fn reset_plugin_transition_counters(&self) {
         self.plugin_host.reset_transition_counters();
     }
 
@@ -313,7 +314,10 @@ where
     /// heads restore content-addressed chunks only after their immutable root
     /// metadata passes a full changelog coverage audit. Rootless heads receive
     /// the same audit transiently and remain bounded-replay layouts.
-    pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
+    pub(crate) async fn rebuild_tracked_state_for_branch(
+        &self,
+        branch_id: &str,
+    ) -> Result<(), LixError> {
         let head_commit_id = self
             .load_branch_head_commit_id(branch_id)
             .await?
@@ -514,10 +518,7 @@ mod tests {
             .begin_scan(space, range, StorageBeginScanOptions::default())
             .await
             .expect("begin test scan");
-        cursor
-            .collect_all()
-            .await
-            .expect("read test scan page")
+        cursor.collect_all().await.expect("read test scan page")
     }
 
     async fn register_json_pointer_schema_in_scope(session: &SessionContext<Memory>, global: bool) {
@@ -993,10 +994,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         assert_eq!(
             session
@@ -1042,10 +1040,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
 
         // These values exercise the order-preserving tracked-head codec's
@@ -1115,10 +1110,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
@@ -1166,10 +1158,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
@@ -1304,10 +1293,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
 
         let head_before = engine
@@ -1408,10 +1394,7 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
 
         for path in ["/clean", "/modified", "/removed", "/recycled-source"] {
@@ -1625,10 +1608,7 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
 
         let files = [
@@ -1866,13 +1846,13 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
 
-        let files = ["66696c65-0000-8000-8000-000000000000", "66696c65-0001-8000-8000-000000000001"];
+        let files = [
+            "66696c65-0000-8000-8000-000000000000",
+            "66696c65-0001-8000-8000-000000000001",
+        ];
         for (index, file) in files.iter().enumerate() {
             session
                 .execute(
@@ -2039,10 +2019,7 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
@@ -2129,10 +2106,7 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         session
             .execute(
@@ -2222,10 +2196,7 @@ mod tests {
             .await
             .expect("write global tracked entity row");
 
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         register_json_pointer_schema(&session).await;
         let rows = session
             .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
@@ -2250,10 +2221,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
 
         let rows = session
             .execute("SELECT id, commit_id FROM lix_branch_ref ORDER BY id", &[])
@@ -2282,8 +2250,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read initialized hot rows");
-        let hot_rows = scan_test_space(&read, crate::hot_state::ROW_SPACE)
-            .await;
+        let hot_rows = scan_test_space(&read, crate::hot_state::ROW_SPACE).await;
         assert!(
             !hot_rows.is_empty(),
             "initialized repository must have hot rows"
@@ -2367,10 +2334,7 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         for schema in [
             json!({
                 "x-lix-key": "index_probe_parent",
@@ -2469,10 +2433,7 @@ mod tests {
         let engine = Engine::new(storage.clone())
             .await
             .expect("engine should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         (storage, session)
     }
 
@@ -2482,8 +2443,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read the index plane");
-        let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE)
-            .await;
+        let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE).await;
         let witnesses = entries
             .iter()
             .filter(|entry| match &entry.value {
@@ -2592,9 +2552,7 @@ mod tests {
             .join(",");
         session
             .execute(
-                &format!(
-                    r#"INSERT INTO degraded_child (id, "parentId", locale) VALUES {values}"#
-                ),
+                &format!(r#"INSERT INTO degraded_child (id, "parentId", locale) VALUES {values}"#),
                 &[],
             )
             .await

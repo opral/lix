@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use lix::integration::Engine;
+use lix::open_lix;
 use lix::storage::Storage;
 use lix::{Memory, Value};
 use lix_storage_rocksdb::RocksDB;
@@ -72,12 +72,16 @@ async fn run_backend<S>(backend: &str, storage: S, file_count: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize benchmark storage");
-    let engine = Engine::new(storage).await.expect("open benchmark engine");
-    let session = engine
-        .open_session()
+    let lix = open_lix()
+        .with_storage(storage)
+        .await
+        .expect("open benchmark lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open benchmark session");
 

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::{Memory, ObserveEvent, ObserveEvents, Value};
+use lix::{engine::Engine, session::SessionContext};
 use serde_json::json;
 
 const NEXT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -66,7 +66,10 @@ fn assert_key_value_row(event: &ObserveEvent, key: &str, value: &str) {
     assert_eq!(event.rows.len(), 1);
     assert_eq!(
         event.rows.rows()[0].values(),
-        &[Value::Text(key.to_string()), Value::Json(json!(value).into()),]
+        &[
+            Value::Text(key.to_string()),
+            Value::Json(json!(value).into()),
+        ]
     );
 }
 

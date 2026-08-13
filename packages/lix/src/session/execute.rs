@@ -762,7 +762,10 @@ where
     /// Lix's bound route. It does not use SQL-text heuristics, and callers
     /// must still execute the statement to receive the normal validation and
     /// query-planning errors.
-    pub fn execution_disposition(&self, sql: &str) -> Result<ExecutionDisposition, LixError> {
+    pub(crate) fn execution_disposition(
+        &self,
+        sql: &str,
+    ) -> Result<ExecutionDisposition, LixError> {
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         execution_disposition(&statement)
     }
@@ -773,7 +776,7 @@ where
     /// A batch is cancellable only when every parsed and bound statement is a
     /// pure read. Any durable statement makes the whole batch durable so its
     /// atomic transaction can complete after a transport disconnects.
-    pub fn execute_batch_disposition(
+    pub(crate) fn execute_batch_disposition(
         &self,
         statements: &[ExecuteBatchStatement],
     ) -> Result<ExecutionDisposition, LixError> {
@@ -808,7 +811,7 @@ where
     /// This diagnostic API is available only to storage benchmarks. It uses
     /// the normal public execution path and does not alter query semantics.
     #[cfg(feature = "storage-benches")]
-    pub async fn execute_profiled(
+    pub(crate) async fn execute_profiled(
         &self,
         sql: &str,
         params: &[Value],
@@ -821,8 +824,7 @@ where
     /// collected-batch and live-batch consumers. No stream escapes the scoped
     /// storage read, and this does not change the public execution contract.
     #[cfg(feature = "storage-benches")]
-    #[doc(hidden)]
-    pub async fn execute_result_streaming_profiled(
+    pub(crate) async fn execute_result_streaming_profiled(
         &self,
         sql: &str,
         params: &[Value],
@@ -963,7 +965,7 @@ where
         Ok(profile)
     }
 
-    pub async fn execute_with_options(
+    pub(crate) async fn execute_with_options(
         &self,
         sql: &str,
         params: &[Value],
@@ -978,8 +980,7 @@ where
         .await
     }
 
-    #[doc(hidden)]
-    pub async fn execute_with_options_and_metadata(
+    pub(crate) async fn execute_with_options_and_metadata(
         &self,
         sql: &str,
         params: &[Value],
@@ -997,8 +998,7 @@ where
     /// the protocol makes a clean hard cut requiring an idempotency key for
     /// SQL writes, while in-process callers may continue to own their own
     /// transaction/retry contract. Read routes ignore a supplied key.
-    #[doc(hidden)]
-    pub fn execute_with_idempotency_and_options_and_metadata(
+    pub(crate) fn execute_with_idempotency_and_options_and_metadata(
         self: Arc<Self>,
         sql: String,
         params: Vec<Value>,
@@ -1032,7 +1032,11 @@ where
     /// This stays separate from the batch API so the established one-file
     /// transfer path does not pay for batch-vector allocation or duplicate
     /// validation.
-    pub async fn upsert_file_content(&self, path: String, content: Blob) -> Result<u64, LixError> {
+    pub(crate) async fn upsert_file_content(
+        &self,
+        path: String,
+        content: Blob,
+    ) -> Result<u64, LixError> {
         self.ensure_open()?;
         // Preserve the public filesystem path contract before entering a
         // write transaction. The lower-level fast helper maps this validation
@@ -1085,7 +1089,7 @@ where
     /// opened. This is deliberately a direct filesystem write: if the path
     /// index cannot route an exceptional layout unambiguously, the batch is
     /// rejected instead of copying the complete payload into a SQL fallback.
-    pub async fn upsert_file_content_batch(
+    pub(crate) async fn upsert_file_content_batch(
         &self,
         writes: Vec<(String, Blob)>,
     ) -> Result<u64, LixError> {
@@ -1123,7 +1127,7 @@ where
     /// active-branch file selection, plugin rendering, and session file-view
     /// acknowledgement as `SELECT content FROM lix_file WHERE path = $1`, while
     /// avoiding SQL parsing, planning, and a JSON-shaped result envelope.
-    pub fn read_file_content(
+    pub(crate) fn read_file_content(
         &self,
         path: String,
         requested_range: Option<Range<u64>>,
@@ -1554,7 +1558,7 @@ where
     /// certificate or the physical parameter-batch route; shapes that require
     /// sequential statement semantics are rejected instead of silently
     /// degrading to per-row execution.
-    pub async fn execute_prepared_dml_batch(
+    pub(crate) async fn execute_prepared_dml_batch(
         &self,
         sql: Arc<str>,
         parameter_batch: PreparedDmlParameterBatch,
@@ -1610,7 +1614,7 @@ where
         result.map_err(|error| normalize_sql_surface_error(error, &sql_for_error))
     }
 
-    pub async fn execute_batch_with_options(
+    pub(crate) async fn execute_batch_with_options(
         &self,
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
@@ -1623,8 +1627,7 @@ where
         .await
     }
 
-    #[doc(hidden)]
-    pub async fn execute_batch_with_options_and_metadata(
+    pub(crate) async fn execute_batch_with_options_and_metadata(
         &self,
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
@@ -1674,8 +1677,7 @@ where
     /// Executes a protocol SQL batch with durable replay for batches that
     /// contain at least one SQL write. Pure read batches and batches that only
     /// persist runtime-function state retain their existing execution path.
-    #[doc(hidden)]
-    pub fn execute_batch_with_idempotency_and_options_and_metadata(
+    pub(crate) fn execute_batch_with_idempotency_and_options_and_metadata(
         self: Arc<Self>,
         statements: Vec<ExecuteBatchStatement>,
         options: ExecuteOptions,
@@ -2409,9 +2411,13 @@ where
         let functions = runtime_functions
             .as_ref()
             .map_or_else(FunctionProviderHandle::system, FunctionContext::provider);
-        let (statement, late_file_content_column) = match late_file_content_read {
-            Some(plan) => (*plan.statement, Some(plan.data_column_index)),
-            None => (statement, None),
+        let (statement, late_file_content_column, rewritten_sql) = match late_file_content_read {
+            Some(plan) => {
+                let statement = *plan.statement;
+                let rewritten_sql = statement.to_string();
+                (statement, Some(plan.data_column_index), Some(rewritten_sql))
+            }
+            None => (statement, None, None),
         };
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
@@ -2431,7 +2437,7 @@ where
             sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
         let mut query = sql2::execute_read_statement_in_session_with_result(
             &read_session,
-            sql,
+            rewritten_sql.as_deref().unwrap_or(sql),
             statement,
             params,
         )
@@ -2895,7 +2901,7 @@ where
     /// Executes one public prepared-DML parameter page inside this explicit
     /// transaction. The page is atomic with surrounding statements; callers
     /// use ordinary `execute` for shape changes or dependency barriers.
-    pub async fn execute_prepared_dml_batch(
+    pub(crate) async fn execute_prepared_dml_batch(
         &mut self,
         sql: Arc<str>,
         parameter_batch: PreparedDmlParameterBatch,
@@ -3146,7 +3152,7 @@ where
         result
     }
 
-    pub fn execute_with_options(
+    pub(crate) fn execute_with_options(
         &mut self,
         sql: String,
         params: Vec<Value>,
@@ -4488,10 +4494,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized storage should create engine");
-        engine
-            .open_session()
-            .await
-            .expect("session should open")
+        engine.open_session().await.expect("session should open")
     }
 
     async fn assert_columnar_lifecycle_current(
@@ -4594,10 +4597,7 @@ mod tests {
             Engine::new_with_options(storage, EngineOptions::new().with_telemetry(Arc::new(sink)))
                 .await
                 .expect("initialized storage should create engine");
-        engine
-            .open_session()
-            .await
-            .expect("session should open")
+        engine.open_session().await.expect("session should open")
     }
 
     fn batch_statement(sql: &str) -> ExecuteBatchStatement {

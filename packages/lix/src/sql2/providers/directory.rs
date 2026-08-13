@@ -27,9 +27,7 @@ use crate::filesystem::{
     FilesystemPathSelection,
 };
 use crate::functions::FunctionProviderHandle;
-use crate::hot_state::{
-    HotStateFilter, HotStateProjection, HotStateReader, HotStateScanRequest,
-};
+use crate::hot_state::{HotStateFilter, HotStateProjection, HotStateReader, HotStateScanRequest};
 use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
@@ -2637,25 +2635,23 @@ mod tests {
             &mut self,
             request: &crate::hot_state::HotStateExactBatchRequest,
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            Ok(
-                crate::hot_state::MaterializedHotStateExactBatch::from_rows(
-                    request
-                        .rows
-                        .iter()
-                        .map(|requested| {
-                            self.rows
-                                .iter()
-                                .find(|row| {
-                                    row.schema_key == requested.schema_key
-                                        && row.entity_pk == requested.entity_pk
-                                        && row.file_id == requested.file_id
-                                        && row.branch_id.as_ref() == requested.branch_id.as_str()
-                                })
-                                .cloned()
-                        })
-                        .collect(),
-                ),
-            )
+            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
+                request
+                    .rows
+                    .iter()
+                    .map(|requested| {
+                        self.rows
+                            .iter()
+                            .find(|row| {
+                                row.schema_key == requested.schema_key
+                                    && row.entity_pk == requested.entity_pk
+                                    && row.file_id == requested.file_id
+                                    && row.branch_id.as_ref() == requested.branch_id.as_str()
+                            })
+                            .cloned()
+                    })
+                    .collect(),
+            ))
         }
 
         async fn load_branch_head(

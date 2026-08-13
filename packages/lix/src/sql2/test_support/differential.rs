@@ -5,8 +5,7 @@ mod tests {
     use crate::common::serialize_row_metadata;
     use crate::entity_pk::EntityPk;
     use crate::hot_state::{
-        HotStateFilter, HotStateScanRequest, MaterializedHotStateBatch,
-        MaterializedHotStateRowRef,
+        HotStateFilter, HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateRowRef,
     };
     use crate::session::CreateBranchOptions;
     use crate::sql2::test_support::generators::{
@@ -122,10 +121,7 @@ mod tests {
 
     async fn run_case(case: &DifferentialSqlCase, mode: WriteExecutorMode) -> DifferentialOutcome {
         let engine = open_initialized_engine().await;
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         create_probe_branches(&session).await;
         let active_branch_id = session
             .active_branch_id()
@@ -207,10 +203,7 @@ mod tests {
 
     async fn run_baseline(case: &DifferentialSqlCase) -> DifferentialOutcome {
         let engine = open_initialized_engine().await;
-        let session = engine
-            .open_session()
-            .await
-            .expect("session should open");
+        let session = engine.open_session().await.expect("session should open");
         create_probe_branches(&session).await;
         let active_branch_id = session
             .active_branch_id()
