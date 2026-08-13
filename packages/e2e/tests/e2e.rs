@@ -27,7 +27,7 @@ use lix::{
     MergeBranchPreviewOptions, MergeConflictChangeKind, SwitchBranchOptions,
 };
 use lix::{Value, open_lix};
-use lix_storage_filesystem::{FilesystemStorage, FilesystemStorageSync};
+use lix_storage_filesystem::FilesystemStorage;
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use sha2::{Digest as _, Sha256};
@@ -6173,7 +6173,7 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
         .with_storage(storage_a.clone())
         .await
         .expect("first independent Lix opens");
-    let _sync_a = storage_a
+    storage_a
         .start_sync(&lix_a)
         .await
         .expect("first shared filesystem sync starts");
@@ -6199,7 +6199,7 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
         .with_storage(storage_b.clone())
         .await
         .expect("second independent Lix opens");
-    let _sync_b = storage_b
+    storage_b
         .start_sync(&lix_b)
         .await
         .expect("second shared filesystem sync starts");
@@ -6891,7 +6891,7 @@ fn csv_row_id(rows: &[CsvV2Row], cells: &[&str]) -> String {
 
 struct SyncedFilesystemLix {
     lix: Lix<FilesystemStorage>,
-    _sync: FilesystemStorageSync,
+    _storage: FilesystemStorage,
 }
 
 impl Deref for SyncedFilesystemLix {
@@ -6905,8 +6905,11 @@ impl Deref for SyncedFilesystemLix {
 async fn open_filesystem_lix(path: &Path) -> SyncedFilesystemLix {
     let storage = FilesystemStorage::new(path).open().unwrap();
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
-    let sync = storage.start_sync(&lix).await.unwrap();
-    SyncedFilesystemLix { lix, _sync: sync }
+    storage.start_sync(&lix).await.unwrap();
+    SyncedFilesystemLix {
+        lix,
+        _storage: storage,
+    }
 }
 
 async fn open_rocksdb_lix(path: &Path) -> Lix<RocksDB> {

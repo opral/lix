@@ -9,7 +9,7 @@ use lix::{
     ObserveEvents as RsObserveEvents, RedoReceipt, SwitchBranchOptions as RsSwitchBranchOptions,
     SwitchBranchReceipt, UndoReceipt, Value, open_lix,
 };
-use lix_storage_filesystem::{FilesystemStorage, FilesystemStorageSync};
+use lix_storage_filesystem::FilesystemStorage;
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -48,7 +48,7 @@ pub struct NativeLix {
 
 enum NativeLixInner {
     Memory(RsLix<Memory>),
-    FilesystemStorage(RsLix<FilesystemStorage>, FilesystemStorageSync),
+    FilesystemStorage(RsLix<FilesystemStorage>, FilesystemStorage),
 }
 
 enum NativeLixTransactionInner {
@@ -692,7 +692,7 @@ impl NativeLixInner {
         paths: Vec<String>,
     ) -> std::result::Result<(), LixError> {
         match self {
-            Self::FilesystemStorage(_, sync) => sync.import_paths(paths).await,
+            Self::FilesystemStorage(_, storage) => storage.import_paths(paths).await,
             Self::Memory(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_STORAGE",
                 "importFilesystemPaths requires a filesystem storage",
@@ -722,7 +722,7 @@ impl NativeLixInner {
 
     async fn sync_disk_to_lix(&self) -> std::result::Result<(), LixError> {
         match self {
-            Self::FilesystemStorage(_, sync) => sync.sync_disk_to_lix().await,
+            Self::FilesystemStorage(_, storage) => storage.sync_disk_to_lix().await,
             Self::Memory(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_STORAGE",
                 "syncDiskToLix requires a filesystem storage",
@@ -733,7 +733,10 @@ impl NativeLixInner {
     async fn close(&self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(lix) => lix.close().await,
-            Self::FilesystemStorage(lix, _) => lix.close().await,
+            Self::FilesystemStorage(lix, storage) => {
+                storage.stop_sync().await?;
+                lix.close().await
+            }
         }
     }
 }
@@ -881,8 +884,8 @@ fn open_filesystem_storage_native(
         })?,
         None => rt.block_on(async { open_lix().with_storage(storage.clone()).await })?,
     };
-    let sync = rt.block_on(storage.start_sync(&lix))?;
-    NativeLix::new(NativeLixInner::FilesystemStorage(lix, sync))
+    rt.block_on(storage.start_sync(&lix))?;
+    NativeLix::new(NativeLixInner::FilesystemStorage(lix, storage))
 }
 
 #[napi]
