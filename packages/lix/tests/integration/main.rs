@@ -25,3 +25,4 @@ mod pooled_session_reuse;
 mod sql;
 mod storage_accounting;
 mod transaction;
+mod version_control_model_fuzz;

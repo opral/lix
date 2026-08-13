@@ -43,7 +43,7 @@ pub(crate) const CHECKPOINT_GC_STATE_NAMESPACE: &str = "checkpoint.gc_state.v1";
 pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
-const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 2;
 const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthenticatedControlCommitReachability {
@@ -139,6 +139,19 @@ pub(crate) struct CheckpointGcState {
     pub(crate) checkpoint_sequence: u64,
     pub(crate) last_gc_sequence: u64,
     pub(crate) collectible_interval_count: u64,
+    /// Live commit-manifest count observed by the last successful reclaim.
+    ///
+    /// Approximate between sweeps and trued up by every sweep, which already
+    /// enumerates the plane. This is a trigger heuristic and never an
+    /// authority: drift costs a slightly early or late sweep and nothing else.
+    pub(crate) live_manifest_estimate: u64,
+    /// Retired commits per collectible interval observed by the last
+    /// successful reclaim. Same status: approximate and self-correcting.
+    pub(crate) yield_per_interval_estimate: u64,
+    /// Consecutive reclaim attempts that failed before reaching
+    /// `mark_collected`. Damps the retry so a persistently failing sweep
+    /// cannot re-arm a full repository pass on every checkpoint.
+    pub(crate) consecutive_reclaim_failures: u64,
 }
 
 impl CheckpointGcState {
@@ -153,9 +166,20 @@ impl CheckpointGcState {
         self.collectible_interval_count > 0
     }
 
-    pub(crate) fn mark_collected(&mut self) {
+    /// Records one successful reclaim and re-derives both trigger estimates
+    /// from what that sweep actually observed.
+    pub(crate) fn mark_collected(&mut self, reclaimed_commits: u64, live_manifest_count: u64) {
+        let intervals = self.collectible_interval_count.max(1);
+        self.yield_per_interval_estimate = reclaimed_commits / intervals;
+        self.live_manifest_estimate = live_manifest_count;
         self.last_gc_sequence = self.checkpoint_sequence;
         self.collectible_interval_count = 0;
+        self.consecutive_reclaim_failures = 0;
+    }
+
+    /// Records one reclaim attempt that did not reach [`Self::mark_collected`].
+    pub(crate) fn note_reclaim_failure(&mut self) {
+        self.consecutive_reclaim_failures = self.consecutive_reclaim_failures.saturating_add(1);
     }
 }
 
@@ -188,6 +212,9 @@ struct StoredCheckpointGcState {
     checkpoint_sequence: u64,
     last_gc_sequence: u64,
     collectible_interval_count: u64,
+    live_manifest_estimate: u64,
+    yield_per_interval_estimate: u64,
+    consecutive_reclaim_failures: u64,
 }
 
 /// One authenticated checkpoint replacement that is still pending physical
@@ -265,6 +292,9 @@ pub(crate) fn stage_checkpoint_gc_state(
             checkpoint_sequence: state.checkpoint_sequence,
             last_gc_sequence: state.last_gc_sequence,
             collectible_interval_count: state.collectible_interval_count,
+            live_manifest_estimate: state.live_manifest_estimate,
+            yield_per_interval_estimate: state.yield_per_interval_estimate,
+            consecutive_reclaim_failures: state.consecutive_reclaim_failures,
         },
     )?;
     writes.put(
@@ -568,6 +598,9 @@ pub(crate) async fn load_checkpoint_gc_state(
         checkpoint_sequence: stored.checkpoint_sequence,
         last_gc_sequence: stored.last_gc_sequence,
         collectible_interval_count: stored.collectible_interval_count,
+        live_manifest_estimate: stored.live_manifest_estimate,
+        yield_per_interval_estimate: stored.yield_per_interval_estimate,
+        consecutive_reclaim_failures: stored.consecutive_reclaim_failures,
     };
     validate_checkpoint_gc_state(state)?;
     Ok(state)
@@ -624,6 +657,9 @@ fn validate_stored_recovery_ref(
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RepositoryGcSweep {
+    /// Live commit manifests this sweep had to scan to plan. Feeds the reclaim
+    /// trigger's inventory estimate; in-memory only, never persisted here.
+    pub(crate) live_manifest_count: u64,
     pub(crate) tracked_commit_roots: Vec<CommitId>,
     pub(crate) standalone_changes: Vec<ChangeId>,
     /// Derived serving rows reclaimed from branch generations that no live
@@ -641,6 +677,10 @@ pub(crate) struct RepositoryGcPlan {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RepositoryGcProfile {
+    /// Graph-reachable commits this sweep found with no physical manifest --
+    /// history a sweep predating the history-retention fix already reclaimed.
+    /// Reported so the condition is observable; never a retention input.
+    pub(crate) history_manifests_missing: u64,
     pub(crate) root_discovery_us: u64,
     pub(crate) changelog_us: u64,
     pub(crate) tracked_root_stage_us: u64,
@@ -830,6 +870,10 @@ struct AuthenticatedServingDependencyClosure {
     /// payload_refs_digest` pairing exists, so the walk has to carry it out.
     /// Rediscovering it later would mean re-reading the scoped-range trees.
     native_part_refs_digests: BTreeSet<[u8; 32]>,
+    /// Graph-reachable commits with no physical manifest, i.e. commits whose
+    /// history delta a pre-fix sweep already reclaimed. Counted so the
+    /// condition is observable; never a retention input.
+    history_manifests_missing: u64,
 }
 
 async fn load_authenticated_serving_dependency_closure<S>(
@@ -837,10 +881,24 @@ async fn load_authenticated_serving_dependency_closure<S>(
     chronology_roots: BTreeSet<CommitId>,
     serving_dependencies: BTreeSet<CommitId>,
     history_dependencies: BTreeSet<CommitId>,
-    // Commits reachable from the roots through canonical parent links. This
-    // retains the *semantic* plane only: the public history surfaces walk the
-    // commit graph, so their projections are load-bearing, while their physical
-    // delta segments are exactly what compaction is supposed to free.
+    // Commits reachable from the roots through canonical parent links.
+    //
+    // These retain **both** planes. It is tempting to retain only the semantic
+    // projection here and let the physical delta segments go, on the grounds
+    // that compaction is supposed to free them — that is what this code did,
+    // and it silently truncated entity history. An entity `_history()` row is
+    // served out of the per-commit delta, not out of the projection:
+    // `CommitGraphContext::change_history_from_commit` walks the graph and then
+    // calls `load_member_changes`, which reads
+    // `load_commit_delta_members_with_payloads_for_schemas`. That function
+    // returns an empty member list for a commit whose replay state is gone, so
+    // a commit whose delta was retired is indistinguishable from a commit that
+    // changed nothing, and the history rows disappear without an error.
+    //
+    // What compaction frees is the *unreachable* interior: an intra-interval
+    // commit stops being on the canonical parent chain once the checkpoint
+    // supersedes it, so it never enters this set and is still retired. The set
+    // retained here is the checkpoint chain, which compaction shortens.
     graph_reachable: BTreeSet<CommitId>,
 ) -> Result<AuthenticatedServingDependencyClosure, LixError>
 where
@@ -864,6 +922,47 @@ where
     physical_dependencies.extend(history_dependencies.iter().copied());
     let mut semantic_dependencies = serving_dependencies;
     semantic_dependencies.extend(history_dependencies.iter().copied());
+    // Retain the delta of every graph-reachable commit that still has one.
+    //
+    // Tolerating absence is deliberate, and it is scoped to exactly this set.
+    // A repository swept by the code that shipped before this fix has commits
+    // that are graph-reachable and have no manifest, because that sweep deleted
+    // it; those manifests are gone and cannot be recomputed. Demanding one here
+    // would abort every future sweep on such a repository -- silently, because
+    // `collect_checkpoint_garbage_best_effort` swallows the error, so
+    // collection would simply stop forever while writes kept succeeding.
+    //
+    // Nothing else is relaxed. Serving dependencies, selected-source owners and
+    // physical authorities keep their existing hard demand, so a manifest
+    // missing from any of those classes still fails the sweep exactly as it
+    // does today. Within this set we *cannot* tell a commit swept before the
+    // fix from a manifest missing for a reason that should not happen -- after
+    // this fix no graph-reachable commit is ever swept, so absence is either
+    // legacy or corruption and nothing at hand separates them. Both are
+    // tolerated and both are counted, so the condition is observable rather
+    // than silent.
+    let graph_reachable_ids = graph_reachable.iter().copied().collect::<Vec<_>>();
+    let graph_reachable_manifests =
+        crate::tracked_state::load_commit_state_manifests(store, &graph_reachable_ids).await?;
+    let mut history_manifests_missing = 0u64;
+    for (commit_id, manifest) in graph_reachable_ids
+        .into_iter()
+        .zip(graph_reachable_manifests)
+    {
+        if manifest.is_some() {
+            physical_dependencies.insert(commit_id);
+        } else {
+            history_manifests_missing += 1;
+        }
+    }
+    if history_manifests_missing > 0 {
+        tracing::warn!(
+            history_manifests_missing,
+            "repository contains commits whose history delta was reclaimed by a garbage \
+             collection sweep predating the history-retention fix; their entity history is \
+             permanently truncated and cannot be recovered"
+        );
+    }
     semantic_dependencies.extend(graph_reachable);
     let mut cas_logical_dependencies = history_dependencies;
     let mut manifests = BTreeMap::new();
@@ -1048,6 +1147,7 @@ where
         scoped_nodes,
         native_parts,
         native_part_refs_digests,
+        history_manifests_missing,
     })
 }
 
@@ -1086,8 +1186,12 @@ where
 /// links.
 ///
 /// This is the reachability the public history surfaces actually read: a
-/// `_history()` query walks the commit graph, so a projection on that chain is
-/// load-bearing no matter how far below the serving checkpoint it sits. The
+/// `_history()` query walks the commit graph, so a commit on that chain is
+/// load-bearing no matter how far below the serving checkpoint it sits — and
+/// load-bearing in **both** planes, because an entity history row is served out
+/// of the commit delta while only the commit metadata comes from the
+/// projection. Retaining the projection alone leaves the walk finding the
+/// commit and reading zero members from it, which is silent truncation. The
 /// ledger expressed the same retention by pinning every checkpoint commit it
 /// had ever seen, forever, in a row it could never consume. Walking refs states
 /// it directly, costs one commit-record read per reachable commit, and shrinks
@@ -1352,10 +1456,14 @@ where
         scoped_nodes: active_scoped_nodes,
         native_parts: active_current_parts,
         native_part_refs_digests: active_current_part_refs_digests,
+        history_manifests_missing,
     } = load_authenticated_repository_retention(&store, &controls).await?;
 
     // Retirement candidates are derived here, not read from a ledger.
     let candidates = derive_retirement_candidates(&store).await?;
+    // The inventory this sweep had to scan. Feeds the reclaim trigger's
+    // self-correcting denominator; captured before `candidates` is consumed.
+    let live_manifest_count = candidates.len() as u64;
 
     // Derive both physical retirement and logical CAS retention from the one
     // authenticated serving closure. In particular, do not perform a second
@@ -1494,6 +1602,7 @@ where
             repair: GcRepairSet::default(),
         },
         sweep: RepositoryGcSweep {
+            live_manifest_count,
             tracked_commit_roots: reclaimed_commits.into_iter().collect(),
             // Superseded branch-ref facts and stale serving generations are
             // retired by the publication that supersedes them, in that same
@@ -1503,6 +1612,7 @@ where
             binary_cas,
         },
         profile: RepositoryGcProfile {
+            history_manifests_missing,
             root_discovery_us: elapsed_micros(started),
             changelog_us: 0,
             tracked_root_stage_us: 0,
@@ -1571,12 +1681,19 @@ where
     Ok(RepositoryGcPlan {
         changelog: changelog_plan,
         sweep: RepositoryGcSweep {
+            // The recovery-only rebuild path never feeds the reclaim trigger;
+            // it rediscovers liveness by scanning rather than from the
+            // manifest inventory, so it has no inventory figure to report.
+            live_manifest_count: 0,
             tracked_commit_roots: swept_snapshot_authorities,
             standalone_changes: Vec::new(),
             reclaimed_generation_rows: 0,
             binary_cas: Default::default(),
         },
         profile: RepositoryGcProfile {
+            // The recovery-only rebuild path rediscovers liveness by scanning;
+            // it does not consult the graph-reachable manifest set at all.
+            history_manifests_missing: 0,
             root_discovery_us,
             changelog_us,
             tracked_root_stage_us,
@@ -2407,6 +2524,87 @@ mod tests {
         assert!(!reachability.chronology_roots.contains(&tracked_generation));
     }
 
+    /// Builds `old_root -> active` with the head at `active`, optionally
+    /// omitting `old_root`'s physical manifest to model a repository already
+    /// swept by the code that shipped before the history-retention fix.
+    async fn history_retention_fixture(with_old_manifest: bool) -> super::RepositoryGcPlan {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("history retention timestamp", "2026-01-01T00:00:00Z");
+        let old_root = replay_commit_record("history-retained-old", 0, None, timestamp);
+        let active = replay_commit_record(
+            "history-retained-active",
+            1,
+            Some(old_root.commit_id),
+            timestamp,
+        );
+        let mut old_manifest =
+            test_commit_state_manifest(&old_root, CommitStateMutationInventory::default());
+        old_manifest.replay_debt = CommitStateReplayDebt::default();
+        old_manifest.snapshot_root = Some(Box::new(test_snapshot_root(old_root.commit_id)));
+        let mut active_manifest =
+            test_commit_state_manifest(&active, CommitStateMutationInventory::default());
+        active_manifest.replay_debt = CommitStateReplayDebt::default();
+        active_manifest.snapshot_root = Some(Box::new(test_snapshot_root(active.commit_id)));
+
+        let control_ref = ChangeId::for_test_label("history-retained-control");
+        let active_control = replay_branch_control(active.commit_id, control_ref, timestamp);
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(&mut writes, "main", active_control)
+            .expect("history retention control should stage");
+        let manifests = if with_old_manifest {
+            vec![old_manifest, active_manifest]
+        } else {
+            vec![active_manifest]
+        };
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[old_root.clone(), active.clone()],
+            &manifests,
+        )
+        .await;
+
+        let plan = run_ordinary_repository_gc(&storage).await;
+        assert!(
+            !plan.sweep.tracked_commit_roots.contains(&old_root.commit_id),
+            "an ancestor of the live head is what _history() reads; it must not be retired"
+        );
+        plan
+    }
+
+    /// The fix: a commit reachable from the head through parent links keeps its
+    /// physical delta, because that delta is what an entity `_history()` row is
+    /// served out of.
+    #[tokio::test]
+    async fn ordinary_gc_retains_the_delta_of_a_graph_reachable_commit() {
+        let plan = history_retention_fixture(true).await;
+        assert_eq!(
+            plan.profile.history_manifests_missing, 0,
+            "a repository with intact history reports nothing missing"
+        );
+    }
+
+    /// The tolerance, and its inversion against the test above: the same
+    /// repository with that manifest already reclaimed by a pre-fix sweep must
+    /// still complete a sweep, and must say so rather than tolerating silently.
+    ///
+    /// Demanding the manifest here would abort every future sweep on such a
+    /// repository, and `collect_checkpoint_garbage_best_effort` swallows the
+    /// error, so collection would stop permanently while writes kept
+    /// succeeding. Worse, `checkpoint_gc_due` derives its age limit from
+    /// `last_gc_sequence`, which only a *successful* sweep advances, so the
+    /// due-predicate would latch: every later checkpoint would pay for a
+    /// doomed full-repository sweep, forever.
+    #[tokio::test]
+    async fn ordinary_gc_tolerates_and_counts_history_reclaimed_before_the_fix() {
+        let plan = history_retention_fixture(false).await;
+        assert_eq!(
+            plan.profile.history_manifests_missing, 1,
+            "the commit whose delta a pre-fix sweep reclaimed must be counted, not swallowed"
+        );
+    }
+
     #[tokio::test]
     async fn ordinary_gc_accepts_rootless_tracked_serving_generation() {
         let storage = StorageAdapter::new(Memory::new());
@@ -2414,13 +2612,35 @@ mod tests {
             "rootless serving generation timestamp",
             "2026-01-01T00:00:00Z",
         );
-        let old_root = replay_commit_record("rootless-serving-old", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `old_root`, which is what compaction actually produces: `old_root` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `old_root` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `old_root` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // entity `_history()` row is served out of. The release under test here
+        // is a rootless tracked serving generation, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("rootless-serving-base", 0, None, timestamp);
+        let old_root = replay_commit_record(
+            "rootless-serving-old",
+            1,
+            Some(base.commit_id),
+            timestamp,
+        );
         let active = replay_commit_record(
             "rootless-serving-active",
             1,
-            Some(old_root.commit_id),
+            Some(base.commit_id),
             timestamp,
         );
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
         let mut old_manifest =
             test_commit_state_manifest(&old_root, CommitStateMutationInventory::default());
         old_manifest.replay_debt = CommitStateReplayDebt::default();
@@ -2442,8 +2662,8 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[old_root.clone(), active.clone()],
-            &[old_manifest, active_manifest],
+            &[base.clone(), old_root.clone(), active.clone()],
+            &[base_manifest, old_manifest, active_manifest],
         )
         .await;
 
@@ -2470,6 +2690,14 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&serving_generation)
+        );
+        // The interval base is still on the head's first-parent chain, so it is
+        // what `_history()` reads and must survive the same sweep. Without this
+        // the fixture would pass just as well against a collector that retires
+        // the whole chain.
+        assert!(
+            !plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            "a commit reachable from the live head owns entity history and must not be retired"
         );
     }
 
@@ -2883,17 +3111,46 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("selected owner timestamp", "2026-01-01T00:00:00Z");
-        let owner = replay_commit_record("selected-owner-source", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `owner`, which is what compaction actually produces: `owner` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `owner` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `owner` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // entity `_history()` row is served out of. The release under test here
+        // is the finite selected-source owner pin, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("selected-owner-base", 0, None, timestamp);
+        let owner = replay_commit_record(
+            "selected-owner-source",
+            1,
+            Some(base.commit_id),
+            timestamp,
+        );
         let checkpoint = replay_commit_record(
             "selected-owner-checkpoint",
             1,
-            Some(owner.commit_id),
+            Some(base.commit_id),
             timestamp,
         );
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
+        // `released` parents onto the interval base too, because the commit
+        // holding the selection is itself interior. A commit that is still
+        // graph-reachable keeps its delta, and that delta is what names the
+        // selected source -- so while the selecting commit is on the chain the
+        // owner is correctly pinned by it, and the release under test could
+        // never be reached. Superseding the selector is the event that
+        // releases the owner, which is exactly what this test is named for.
         let released = replay_commit_record(
             "selected-owner-released",
-            2,
-            Some(checkpoint.commit_id),
+            1,
+            Some(base.commit_id),
             timestamp,
         );
         let selected_change = packed_change(
@@ -2944,8 +3201,13 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest],
+            &[
+                base.clone(),
+                owner.clone(),
+                checkpoint.clone(),
+                released.clone(),
+            ],
+            &[base_manifest, owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3005,6 +3267,10 @@ mod tests {
                 .tracked_commit_roots
                 .contains(&owner.commit_id)
         );
+        assert!(
+            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            "the interval base stays on the head's first-parent chain and owns entity history"
+        );
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3043,13 +3309,35 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("scoped owner timestamp", "2026-01-01T00:00:00Z");
-        let owner = replay_commit_record("scoped-part-owner", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `owner`, which is what compaction actually produces: `owner` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `owner` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `owner` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // entity `_history()` row is served out of. The release under test here
+        // is the scoped-descriptor owner pin, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("scoped-part-base", 0, None, timestamp);
+        let owner = replay_commit_record(
+            "scoped-part-owner",
+            1,
+            Some(base.commit_id),
+            timestamp,
+        );
         let checkpoint = replay_commit_record(
             "scoped-part-checkpoint",
             1,
-            Some(owner.commit_id),
+            Some(base.commit_id),
             timestamp,
         );
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
         let released = replay_commit_record(
             "scoped-part-released",
             2,
@@ -3139,8 +3427,13 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest],
+            &[
+                base.clone(),
+                owner.clone(),
+                checkpoint.clone(),
+                released.clone(),
+            ],
+            &[base_manifest, owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3174,6 +3467,10 @@ mod tests {
                 .tracked_commit_roots
                 .contains(&owner.commit_id)
         );
+        assert!(
+            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            "the interval base stays on the head's first-parent chain and owns entity history"
+        );
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3191,9 +3488,26 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("native row owner timestamp", "2026-01-01T00:00:00Z");
-        let owner = replay_commit_record("native-row-owner", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `owner`, which is what compaction actually produces: `owner` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `owner` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `owner` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // entity `_history()` row is served out of. The release under test here
+        // is the native-row owner pin, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("native-row-base", 0, None, timestamp);
+        let owner = replay_commit_record("native-row-owner", 1, Some(base.commit_id), timestamp);
         let checkpoint =
-            replay_commit_record("native-row-checkpoint", 1, Some(owner.commit_id), timestamp);
+            replay_commit_record("native-row-checkpoint", 1, Some(base.commit_id), timestamp);
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
         let released = replay_commit_record(
             "native-row-released",
             2,
@@ -3341,8 +3655,13 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest],
+            &[
+                base.clone(),
+                owner.clone(),
+                checkpoint.clone(),
+                released.clone(),
+            ],
+            &[base_manifest, owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3455,6 +3774,10 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&owner.commit_id)
+        );
+        assert!(
+            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            "the interval base stays on the head's first-parent chain and owns entity history"
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4054,6 +4377,108 @@ mod tests {
                 "undo landed on the wrong revision after reclaim"
             );
         }
+    }
+
+    /// Demonstrates, mechanically, that the in-record `format_version` cannot
+    /// gate an arity change to `StoredCheckpointGcState`.
+    ///
+    /// Every storage record is `#[musli(packed)]` -- positional and untagged --
+    /// so a reader's field count is part of its wire contract. Decoding fails on
+    /// **arity**, before any field value (including `format_version`) can be
+    /// inspected. The upgrade mechanism for such a change is therefore
+    /// `REPOSITORY_PROTOCOL_VALUE`, which makes `Engine::new` reject the
+    /// repository outright, not the per-record version field.
+    ///
+    /// Reading the derive is not evidence for this; the readers below are
+    /// constructed and run.
+    #[test]
+    fn packed_arity_change_cannot_be_gated_by_the_in_record_format_version() {
+        // Today's shipping shape: format_version + 3 counters.
+        #[derive(musli::Encode, musli::Decode)]
+        #[musli(packed)]
+        struct ArityOld {
+            format_version: u32,
+            checkpoint_sequence: u64,
+            last_gc_sequence: u64,
+            collectible_interval_count: u64,
+        }
+
+        // Proposed shape: the same, plus the two self-correcting estimates the
+        // ratio trigger needs.
+        #[derive(musli::Encode, musli::Decode)]
+        #[musli(packed)]
+        struct ArityNew {
+            format_version: u32,
+            checkpoint_sequence: u64,
+            last_gc_sequence: u64,
+            collectible_interval_count: u64,
+            live_manifest_estimate: u64,
+            yield_per_interval_estimate: u64,
+        }
+
+        let new_bytes = crate::storage_codec::encode(
+            "arity demo new",
+            &ArityNew {
+                format_version: 2,
+                checkpoint_sequence: 7,
+                last_gc_sequence: 3,
+                collectible_interval_count: 4,
+                live_manifest_estimate: 512,
+                yield_per_interval_estimate: 9,
+            },
+        )
+        .expect("new record should encode");
+
+        let old_bytes = crate::storage_codec::encode(
+            "arity demo old",
+            &ArityOld {
+                format_version: 1,
+                checkpoint_sequence: 7,
+                last_gc_sequence: 3,
+                collectible_interval_count: 4,
+            },
+        )
+        .expect("old record should encode");
+
+        // Direction 1: an OLD reader against a NEW record.
+        let old_reads_new = crate::storage_codec::decode::<ArityOld>("arity demo", &new_bytes);
+        let old_reads_new_err = old_reads_new
+            .err()
+            .expect("a 4-field reader must reject a 6-field record");
+        println!("ARITY old_reader_vs_new_record: {}", old_reads_new_err.message);
+
+        // Direction 2: a NEW reader against an OLD record.
+        let new_reads_old = crate::storage_codec::decode::<ArityNew>("arity demo", &old_bytes);
+        let new_reads_old_err = new_reads_old
+            .err()
+            .expect("a 6-field reader must reject a 4-field record");
+        println!("ARITY new_reader_vs_old_record: {}", new_reads_old_err.message);
+
+        // The sharp point: bumping `format_version` inside the record does not
+        // help, because a same-arity record still decodes cleanly and a
+        // different-arity record never reaches the field at all. So the version
+        // field can express "same shape, new meaning" and can never express
+        // "new shape".
+        let bumped = crate::storage_codec::encode(
+            "arity demo bumped",
+            &ArityOld {
+                format_version: 999,
+                checkpoint_sequence: 7,
+                last_gc_sequence: 3,
+                collectible_interval_count: 4,
+            },
+        )
+        .expect("bumped record should encode");
+        let decoded = crate::storage_codec::decode::<ArityOld>("arity demo", &bumped)
+            .expect("a same-arity record decodes regardless of its version value");
+        assert_eq!(
+            decoded.format_version, 999,
+            "the version field is only observable once arity already matched"
+        );
+        println!(
+            "ARITY same_arity_decodes_despite_version=999 checkpoint_sequence={}",
+            decoded.checkpoint_sequence
+        );
     }
 
     #[cfg(feature = "storage-benches")]
@@ -4966,10 +5391,16 @@ mod tests {
     #[tokio::test]
     async fn repository_gc_state_round_trips() {
         let storage = StorageAdapter::new(Memory::new());
+        // Distinct values per field: a positional `#[musli(packed)]` record
+        // will round-trip a permuted field order undetected if the values
+        // collide.
         let expected = CheckpointGcState {
             checkpoint_sequence: 129,
             last_gc_sequence: 64,
             collectible_interval_count: 65,
+            live_manifest_estimate: 4_096,
+            yield_per_interval_estimate: 7,
+            consecutive_reclaim_failures: 3,
         };
         let mut writes = storage.new_write_set();
         stage_checkpoint_gc_state(&mut writes, &expected)
