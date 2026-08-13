@@ -106,6 +106,18 @@ path = "examples/expab_plan_load.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
+name = "e53_hot_locality"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "e53_write_amplification"
+required-features = ["storage-benches"]
+
+[[example]]
+name = "e53_hot_locality_slatedb"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
 name = "space_growth"
 path = "examples/space_growth.rs"
 required-features = ["storage-benches"]
