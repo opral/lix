@@ -3880,6 +3880,146 @@ mod tests {
             .expect("payload fixture schema should register");
     }
 
+
+    /// Undo-to-last-checkpoint must survive reclaim at any cadence.
+    ///
+    /// The retention floor for the undo interval is
+    /// `BranchHeadTrackedReachability::serving_checkpoint_commit_id`, read from
+    /// the *live* branch head control at sweep time -- see
+    /// `authenticated_control_commit_reachability`. It is not derived from the
+    /// reclaim schedule or from any stored sequence, so no cadence can move it.
+    ///
+    /// This test pins that property mechanically by running the full shipping
+    /// sweep after **every single commit**, which is strictly more aggressive
+    /// than any cadence the engine would ever schedule. If a future change ties
+    /// the undo floor to reclaim scheduling, this fails loudly.
+    ///
+    /// # Two things this fixture already paid for
+    ///
+    /// **1. The churn ordering is load-bearing.** `update -> checkpoint ->
+    /// sweep` retires commits; `checkpoint -> update -> sweep` retires
+    /// *nothing*, because the sweep then never observes a released interval.
+    /// Two earlier versions of this test used the second ordering and retired
+    /// zero across every iteration. If you reorder the churn loop below, expect
+    /// the `retired_total` guard to fire — that is the guard working, not a
+    /// broken fixture. Measured onset with the correct ordering, checkpointing
+    /// every revision: `tracked_roots` is 0, 1, 0, then 2 from revision 4 on.
+    ///
+    /// **2. `tracked_commit_roots` is the counter that observes retirement.**
+    /// The plausibly-named `plan.changelog.sweep.commits` reads **0 at every
+    /// iteration** on this fixture while `tracked_commit_roots` is non-zero, so
+    /// a guard written against it would fail forever against working code — and
+    /// would eventually be "fixed" by deleting the guard. Do not swap the
+    /// counter without re-running the measurement.
+    ///
+    /// # Keep the non-vacuity guard
+    ///
+    /// `retired_total > 0` is the most important line here. It failed two
+    /// fixtures that would otherwise have gone green while proving nothing at
+    /// all about undo retention: a sweep that retires nothing trivially
+    /// preserves undo. The assertions below are only evidence because the sweep
+    /// underneath them is doing real work.
+    #[tokio::test]
+    async fn undo_to_last_checkpoint_survives_reclaim_after_every_commit() {
+        let backend = Memory::new();
+        Engine::initialize(backend.clone())
+            .await
+            .expect("repository should initialize");
+        let engine = Engine::new(backend.clone())
+            .await
+            .expect("repository should open");
+        let session = engine.open_session().await.expect("session should open");
+        let schema = serde_json::json!({
+            "x-lix-key": "gc_undo_cadence_fixture",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("undo cadence fixture schema should register");
+        session
+            .execute(
+                "INSERT INTO gc_undo_cadence_fixture (path, value) VALUES ('/row', 'v0')",
+                &[],
+            )
+            .await
+            .expect("seed row should publish");
+
+        // Churn phase: `update -> checkpoint -> sweep`, the ordering that
+        // actually retires. See the note above before changing it.
+        const CHURN: usize = 8;
+        let mut retired_total = 0usize;
+        for revision in 1..=CHURN {
+            session
+                .execute(
+                    "UPDATE gc_undo_cadence_fixture SET value = $1 WHERE path = '/row'",
+                    &[Value::Text(format!("v{revision}"))],
+                )
+                .await
+                .expect("churn commit should publish");
+            session
+                .create_checkpoint()
+                .await
+                .expect("churn checkpoint should publish");
+            let plan = run_shipping_repository_gc(&backend).await;
+            retired_total += plan.sweep.tracked_commit_roots.len();
+        }
+
+        // Non-vacuity. Do not remove: a sweep that never retires anything would
+        // let every assertion below pass while proving nothing about retention.
+        assert!(
+            retired_total > 0,
+            "the fixture must actually retire commits, or the undo assertions below are vacuous"
+        );
+
+        // Undo phase: two commits past the last checkpoint, still sweeping
+        // after each, so the retained undo interval is exactly {v9, v10}.
+        for revision in (CHURN + 1)..=(CHURN + 2) {
+            session
+                .execute(
+                    "UPDATE gc_undo_cadence_fixture SET value = $1 WHERE path = '/row'",
+                    &[Value::Text(format!("v{revision}"))],
+                )
+                .await
+                .expect("post-checkpoint commit should publish");
+            run_shipping_repository_gc(&backend).await;
+        }
+
+        // Undo must walk back to the last checkpoint's state (v8). Undo *past*
+        // the last checkpoint is deliberately not asserted: checkpointing is
+        // permitted to retire the last-1 interval.
+        for expected in ["v9", "v8"] {
+            session
+                .undo()
+                .await
+                .expect("undo must survive reclaim at every commit");
+            let value = session
+                .execute(
+                    "SELECT value FROM gc_undo_cadence_fixture WHERE path = '/row'",
+                    &[],
+                )
+                .await
+                .expect("undone row should read")
+                .rows()[0]
+                .get::<String>("value")
+                .expect("undone row should have a value");
+            assert_eq!(
+                value, expected,
+                "undo landed on the wrong revision after reclaim"
+            );
+        }
+    }
+
     async fn run_shipping_repository_gc(backend: &Memory) -> super::RepositoryGcPlan {
         let storage = StorageAdapter::new(backend.clone());
         let read = SharedStorageAdapterRead::new(
