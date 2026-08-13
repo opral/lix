@@ -12,6 +12,10 @@ mod hot;
 pub(crate) use hot::hot_decode_entity_pk_probe;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
+#[cfg(test)]
+pub(crate) use hot::WORKING_DIFF_PATH_HITS;
+#[cfg(test)]
+pub(crate) use hot::hot_generation_scope_prefix;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use hot::{
     BROAD_CANONICAL_CREATED_AT_HITS, BROAD_CANONICAL_CREATED_AT_KEYS,
@@ -21,19 +25,14 @@ pub(crate) use hot::{
     INTERVAL_LOCAL_TOMBSTONE_CANDIDATES, INTERVAL_LOCAL_TOMBSTONE_ELIDED,
     INTERVAL_LOCAL_TOMBSTONE_OFFERED, INTERVAL_LOCAL_TOMBSTONE_ROUTES,
 };
-#[cfg(test)]
-pub(crate) use hot::WORKING_DIFF_PATH_HITS;
-#[cfg(test)]
-pub(crate) use hot::hot_generation_scope_prefix;
 pub(crate) use hot::{
-    RootBaseBatchCache,
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, COLLECTION_CONTROL_SPACE, CertifiedEntityBatchFileRef,
     DIFF_SPACE, DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows,
     EntityColumnarOverlayRow, FILE_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache,
     HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
-    ROW_SPACE, load_certified_rows_at_commit, materialize_certified_root_rows,
+    ROW_SPACE, RootBaseBatchCache, load_certified_rows_at_commit, materialize_certified_root_rows,
     scan_certified_history_rows, stage_certified_entity_batches, stage_hot_index_entries,
     stage_retire_hot_generation,
 };
@@ -1604,8 +1603,10 @@ fn typed_slot_canonical_json(record: &[u8]) -> Result<String, LixError> {
     let layout =
         crate::hot_state::typed_slots::builtin_layout_for_fingerprint(parsed.layout_fingerprint())
             .ok_or_else(|| {
-            head_value_error("typed snapshot slot names a column layout this build does not know")
-        })?;
+                head_value_error(
+                    "typed snapshot slot names a column layout this build does not know",
+                )
+            })?;
     parsed
         .to_canonical_json(layout)
         .map_err(|error| head_value_error(&format!("typed snapshot slot: {error}")))
@@ -1622,18 +1623,22 @@ fn typed_slot_canonical_json(record: &[u8]) -> Result<String, LixError> {
 fn typed_snapshot_record(
     layout: &crate::hot_state::typed_slots::TypedSlotLayout,
     json: &str,
-) -> Option<Vec<u8>> {
-    let serde_json::Value::Object(map) = serde_json::from_str::<serde_json::Value>(json).ok()?
+) -> Result<Vec<u8>, LixError> {
+    let serde_json::Value::Object(map) = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|error| head_value_error(&format!("typed snapshot JSON is invalid: {error}")))?
     else {
-        return None;
+        return Err(head_value_error("typed snapshot is not a JSON object"));
     };
     if map.keys().any(|key| layout.index_of(key).is_none()) {
-        return None;
+        return Err(head_value_error(
+            "typed snapshot contains a column absent from its authenticated layout",
+        ));
     }
-    let record = crate::hot_state::typed_slots::encode_typed_slots(layout, &map).ok()?;
+    let record = crate::hot_state::typed_slots::encode_typed_slots(layout, &map)
+        .map_err(|error| head_value_error(&format!("typed snapshot encoding failed: {error}")))?;
     #[cfg(test)]
     crate::hot_state::typed_slots::record_typed_slot_record_written();
-    Some(record)
+    Ok(record)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1718,18 +1723,9 @@ fn append_head_value_with_typed_layout(
     typed_layout: Option<&crate::hot_state::typed_slots::TypedSlotLayout>,
 ) -> Result<std::ops::Range<usize>, LixError> {
     let snapshot: HeadSlotEncode<'_> = value.snapshot.into();
-    // A dirty working-diff row prefixes its inline payload with the JSON
-    // fingerprint; that lane keeps JSON text rather than growing a second
-    // framing this round.
-    let fingerprint_inline = matches!(
-        value.working_diff_baseline,
-        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. }
-    );
     let typed_record = match (typed_layout, snapshot) {
-        (Some(layout), HeadSlotEncode::Inline { json, .. })
-            if !value.deleted && !fingerprint_inline =>
-        {
-            typed_snapshot_record(layout, json)
+        (Some(layout), HeadSlotEncode::Inline { json, .. }) if !value.deleted => {
+            Some(typed_snapshot_record(layout, json)?)
         }
         _ => None,
     };

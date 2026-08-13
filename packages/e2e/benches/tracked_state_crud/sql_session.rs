@@ -14,7 +14,8 @@ const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
 const BOUND_INSERT_ALL_SQL: &str = "INSERT INTO tracked_crud_insert (path, value) VALUES ($1, $2)";
 const BOUND_SEED_JSON_SQL: &str =
     "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))";
-const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
+const BOUND_UPDATE_ALL_SQL: &str =
+    "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
 const BOUND_OLAP_UPDATE_LANE_SQL: &str = "UPDATE olap_row SET lane = $1 WHERE id = $2";
 const BOUND_OLAP_UPDATE_SCORE_SQL: &str = "UPDATE olap_row SET score = $1 WHERE id = $2";
 const BOUND_OLAP_UPDATE_ACTIVE_SQL: &str = "UPDATE olap_row SET active = $1 WHERE id = $2";
@@ -1811,22 +1812,21 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "json_pointer",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": {
-                "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-            }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "json_pointer",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false }
+        ],
+        "primary_key": ["path"]
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, $2)",
+            &[
+                Value::Text("json_pointer".into()),
+                Value::Json(schema.into()),
+            ],
         )
         .await
         .expect("register json_pointer schema")
@@ -1839,20 +1839,21 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "tracked_crud_insert",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "required": ["path", "value"],
-        "properties": {
-            "path": { "type": "string" },
-            "value": { "type": "string" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "tracked_crud_insert",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "text", "nullable": false }
+        ],
+        "primary_key": ["path"]
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, $2)",
+            &[
+                Value::Text("tracked_crud_insert".into()),
+                Value::Json(schema.into()),
+            ],
         )
         .await
         .expect("register tracked_crud_insert schema")
@@ -1865,23 +1866,21 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let schema = serde_json::json!({
-        "x-lix-key": "olap_row",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "required": ["id", "ordinal", "lane", "score", "active"],
-        "properties": {
-            "id": { "type": "string" },
-            "ordinal": { "type": "integer" },
-            "lane": { "type": "string" },
-            "score": { "type": "number" },
-            "active": { "type": "boolean" }
-        },
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "olap_row",
+        "columns": [
+            { "name": "id", "type": "text", "nullable": false },
+            { "name": "ordinal", "type": "bigint", "nullable": false },
+            { "name": "lane", "type": "text", "nullable": false },
+            { "name": "score", "type": "double precision", "nullable": false },
+            { "name": "active", "type": "boolean", "nullable": false }
+        ],
+        "primary_key": ["id"]
     });
     let affected = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, $2)",
+            &[Value::Text("olap_row".into()), Value::Json(schema.into())],
         )
         .await
         .expect("register olap_row schema")

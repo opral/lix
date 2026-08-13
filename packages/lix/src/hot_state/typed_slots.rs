@@ -37,7 +37,8 @@
 //!
 //! # Scalar columns only, by design
 //!
-//! `String`, `Integer`, `Number` and `Boolean` columns get typed payloads.
+//! `String`, `Uuid`, `Integer`, `Number`, `Boolean` and `Timestamptz` columns
+//! get typed payloads.
 //! `Json`-declared columns keep their JSON text verbatim in a `Json` slot:
 //! `lix_key_value.value` and `json_pointer.value` are arbitrary JSON by design
 //! — a `::json` column, not a value of unknown type — and this format
@@ -90,7 +91,14 @@ const TAG_U64: u8 = 5;
 const TAG_F64: u8 = 6;
 const TAG_STR: u8 = 7;
 const TAG_JSON: u8 = 8;
+const TAG_UUID: u8 = 9;
+const TAG_TIMESTAMPTZ_MICROS: u8 = 10;
 
+const LAYOUT_FINGERPRINT_DOMAIN: &[u8] = b"lix-row-envelope-layout-v1";
+const ROW_ENVELOPE_VERSION: u8 = 2;
+const CELL_ABSENT: u8 = 0;
+const CELL_NULL: u8 = 1;
+const CELL_VALUE: u8 = 2;
 
 // Counted at every point on the decode path that hands bytes to a JSON
 // tokenizer, so a test can assert that reading columns out of a typed record
@@ -100,6 +108,7 @@ const TAG_JSON: u8 = 8;
 #[cfg(test)]
 thread_local! {
     static TYPED_SLOTS_JSON_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TYPED_SLOTS_JSON_SERIALIZES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -111,13 +120,27 @@ fn record_typed_slots_json_parse() {
 fn record_typed_slots_json_parse() {}
 
 #[cfg(test)]
+fn record_typed_slots_json_serialize() {
+    TYPED_SLOTS_JSON_SERIALIZES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_typed_slots_json_serialize() {}
+
+#[cfg(test)]
 fn reset_typed_slots_json_parse_count() {
     TYPED_SLOTS_JSON_PARSES.with(|count| count.set(0));
+    TYPED_SLOTS_JSON_SERIALIZES.with(|count| count.set(0));
 }
 
 #[cfg(test)]
 fn typed_slots_json_parse_count() -> usize {
     TYPED_SLOTS_JSON_PARSES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn typed_slots_json_serialize_count() -> usize {
+    TYPED_SLOTS_JSON_SERIALIZES.with(std::cell::Cell::get)
 }
 
 /// The declared type of a column, as the schema catalog resolves it.
@@ -129,9 +152,13 @@ fn typed_slots_json_parse_count() -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeclaredType {
     String,
+    Uuid,
     Integer,
     Number,
     Boolean,
+    /// An absolute timestamp stored as signed UTC microseconds since Unix
+    /// epoch. This is experiment-owned until Schema v1 declares timestamptz.
+    Timestamptz,
     /// Arbitrary JSON by design. Stored as verbatim JSON text.
     Json,
 }
@@ -147,10 +174,12 @@ impl DeclaredType {
     fn fingerprint_tag(self) -> u8 {
         match self {
             Self::String => 1,
-            Self::Integer => 2,
-            Self::Number => 3,
-            Self::Boolean => 4,
-            Self::Json => 5,
+            Self::Uuid => 2,
+            Self::Integer => 3,
+            Self::Number => 4,
+            Self::Boolean => 5,
+            Self::Json => 6,
+            Self::Timestamptz => 7,
         }
     }
 }
@@ -190,6 +219,9 @@ type Result<T> = std::result::Result<T, TypedSlotError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TypedSlotLayout {
     columns: Vec<(String, DeclaredType)>,
+    /// Full schema identity, including primary-key columns that are omitted
+    /// from the row value. The bool marks primary-key membership.
+    fingerprint_columns: Vec<(String, DeclaredType, bool)>,
     /// Slot indexes ordered by column name, so canonical JSON can be emitted in
     /// serde_json's key order without sorting per row.
     name_order: Vec<usize>,
@@ -197,10 +229,43 @@ pub(crate) struct TypedSlotLayout {
 }
 
 impl TypedSlotLayout {
-    pub(crate) fn new(
+    pub(crate) fn new(columns: impl IntoIterator<Item = (String, DeclaredType)>) -> Result<Self> {
+        let columns: Vec<(String, DeclaredType)> = columns.into_iter().collect();
+        let fingerprint_columns = columns
+            .iter()
+            .map(|(name, declared)| (name.clone(), *declared, false))
+            .collect();
+        Self::from_parts(columns, fingerprint_columns)
+    }
+
+    pub(crate) fn new_row_values(
         columns: impl IntoIterator<Item = (String, DeclaredType)>,
+        primary_key: impl IntoIterator<Item = String>,
     ) -> Result<Self> {
         let columns: Vec<(String, DeclaredType)> = columns.into_iter().collect();
+        let primary_key: BTreeSet<String> = primary_key.into_iter().collect();
+        for key in &primary_key {
+            if !columns.iter().any(|(name, _)| name == key) {
+                return Err(TypedSlotError::new(format!(
+                    "primary-key column '{key}' is absent from the row schema"
+                )));
+            }
+        }
+        let fingerprint_columns = columns
+            .iter()
+            .map(|(name, declared)| (name.clone(), *declared, primary_key.contains(name)))
+            .collect();
+        let value_columns = columns
+            .into_iter()
+            .filter(|(name, _)| !primary_key.contains(name))
+            .collect();
+        Self::from_parts(value_columns, fingerprint_columns)
+    }
+
+    fn from_parts(
+        columns: Vec<(String, DeclaredType)>,
+        fingerprint_columns: Vec<(String, DeclaredType, bool)>,
+    ) -> Result<Self> {
         if columns.len() > usize::from(u16::MAX) {
             return Err(TypedSlotError::new(format!(
                 "typed slot layout has {} columns, which exceeds the {} the directory can address",
@@ -221,6 +286,7 @@ impl TypedSlotLayout {
         let name_order = by_name.values().copied().collect();
         Ok(Self {
             columns,
+            fingerprint_columns,
             name_order,
             by_name,
         })
@@ -252,10 +318,12 @@ impl TypedSlotLayout {
     /// trust into something it checks.
     pub(crate) fn fingerprint(&self) -> [u8; LAYOUT_FINGERPRINT_BYTES] {
         let mut hasher = blake3::Hasher::new();
-        for (name, declared) in &self.columns {
+        hasher.update(LAYOUT_FINGERPRINT_DOMAIN);
+        for (name, declared, primary_key) in &self.fingerprint_columns {
             hasher.update(&(name.len() as u64).to_be_bytes());
             hasher.update(name.as_bytes());
             hasher.update(&[declared.fingerprint_tag()]);
+            hasher.update(&[u8::from(*primary_key)]);
         }
         let mut fingerprint = [0_u8; LAYOUT_FINGERPRINT_BYTES];
         fingerprint.copy_from_slice(&hasher.finalize().as_bytes()[..LAYOUT_FINGERPRINT_BYTES]);
@@ -269,6 +337,43 @@ impl TypedSlotLayout {
             .iter()
             .all(|(_, declared)| declared.is_scalar())
     }
+
+    fn fixed_width(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|(_, declared)| fixed_width(*declared))
+            .sum()
+    }
+
+    fn varlen_count(&self) -> usize {
+        self.columns
+            .iter()
+            .filter(|(_, declared)| fixed_width(*declared) == 0)
+            .count()
+    }
+}
+
+fn fixed_width(declared: DeclaredType) -> usize {
+    match declared {
+        DeclaredType::Boolean => 1,
+        DeclaredType::Integer | DeclaredType::Number | DeclaredType::Timestamptz => 8,
+        DeclaredType::Uuid => 16,
+        DeclaredType::String | DeclaredType::Json => 0,
+    }
+}
+
+fn cell_bitmap_bytes(count: usize) -> usize {
+    count.saturating_mul(2).div_ceil(8)
+}
+
+fn write_cell_state(bitmap: &mut [u8], index: usize, state: u8) {
+    let bit = index * 2;
+    bitmap[bit / 8] |= state << (bit % 8);
+}
+
+fn read_cell_state(bitmap: &[u8], index: usize) -> u8 {
+    let bit = index * 2;
+    (bitmap[bit / 8] >> (bit % 8)) & 0b11
 }
 
 /// One decoded slot. Borrowed from the record; nothing is copied or parsed.
@@ -286,9 +391,276 @@ pub(crate) enum TypedSlot<'a> {
     I64(i64),
     U64(u64),
     F64(f64),
+    Uuid(uuid::Uuid),
+    /// Signed UTC microseconds since Unix epoch.
+    TimestamptzMicros(i64),
     Str(&'a str),
     /// Verbatim JSON text for a `Json`-declared column.
     Json(&'a str),
+}
+
+/// Borrowed variable-width bytes from a row envelope.
+///
+/// JSONB remains JSON by contract, but callers can pass its canonical bytes to
+/// a JSONB owner without first allocating a `str` or a `serde_json::Value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypedVarlenRef<'a> {
+    Text(&'a str),
+    Jsonb(&'a [u8]),
+}
+
+/// Native SQL cell input for the durable row envelope.
+///
+/// This is the stable write boundary: an ordinary row never becomes a JSON
+/// object. JSON bytes are possible only in a column declared `jsonb`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TypedCellRef<'a> {
+    Absent,
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Uuid(uuid::Uuid),
+    TimestamptzMicros(i64),
+    Text(&'a str),
+    Jsonb(&'a [u8]),
+}
+
+/// A2: schema-addressed native row value. Primary-key cells are absent because
+/// their sole durable owner is the authenticated state key.
+///
+/// ```text
+/// version | layout-fingerprint | count | 2-bit states
+/// fixed-width slots (schema widths, zero-filled for NULL/absent)
+/// u32 varlen offsets (count + 1) | concatenated text/jsonb bytes
+/// ```
+pub(crate) fn encode_row_envelope(
+    layout: &TypedSlotLayout,
+    cells: &[TypedCellRef<'_>],
+) -> Result<Vec<u8>> {
+    if cells.len() != layout.len() {
+        return Err(TypedSlotError::new(format!(
+            "native row has {} cells but its layout declares {}",
+            cells.len(),
+            layout.len()
+        )));
+    }
+    let bitmap_bytes = cell_bitmap_bytes(layout.len());
+    let fixed_bytes = layout.fixed_width();
+    let varlen_count = layout.varlen_count();
+    let offsets_bytes = (varlen_count + 1) * 4;
+    let prefix = HEADER_BYTES + bitmap_bytes;
+    let fixed_start = prefix;
+    let offsets_start = fixed_start + fixed_bytes;
+    let payload_start = offsets_start + offsets_bytes;
+    let mut bytes = vec![0; payload_start];
+    bytes[0] = ROW_ENVELOPE_VERSION;
+    bytes[1..1 + LAYOUT_FINGERPRINT_BYTES].copy_from_slice(&layout.fingerprint());
+    bytes[1 + LAYOUT_FINGERPRINT_BYTES..HEADER_BYTES]
+        .copy_from_slice(&(layout.len() as u16).to_be_bytes());
+
+    let mut fixed_cursor = fixed_start;
+    let mut varlen_index = 0;
+    for (index, cell) in cells.iter().copied().enumerate() {
+        let declared = layout.declared_type(index).expect("layout index");
+        let state = match cell {
+            TypedCellRef::Absent => CELL_ABSENT,
+            TypedCellRef::Null => CELL_NULL,
+            _ => CELL_VALUE,
+        };
+        write_cell_state(&mut bytes[HEADER_BYTES..prefix], index, state);
+        let width = fixed_width(declared);
+        if width != 0 {
+            if state == CELL_VALUE {
+                let target = &mut bytes[fixed_cursor..fixed_cursor + width];
+                match (declared, cell) {
+                    (DeclaredType::Boolean, TypedCellRef::Bool(value)) => {
+                        target[0] = u8::from(value);
+                    }
+                    (DeclaredType::Integer, TypedCellRef::I64(value)) => {
+                        target.copy_from_slice(&value.to_be_bytes());
+                    }
+                    (DeclaredType::Number, TypedCellRef::F64(value)) if value.is_finite() => {
+                        target.copy_from_slice(&value.to_be_bytes());
+                    }
+                    (DeclaredType::Uuid, TypedCellRef::Uuid(value)) => {
+                        target.copy_from_slice(value.as_bytes());
+                    }
+                    (DeclaredType::Timestamptz, TypedCellRef::TimestamptzMicros(value)) => {
+                        target.copy_from_slice(&value.to_be_bytes());
+                    }
+                    _ => {
+                        return Err(TypedSlotError::new(format!(
+                            "native cell {index} {cell:?} does not match declared type {declared:?}"
+                        )));
+                    }
+                }
+            }
+            fixed_cursor += width;
+            continue;
+        }
+
+        let offset = u32::try_from(bytes.len() - payload_start)
+            .map_err(|_| TypedSlotError::new("row envelope varlen payload exceeds u32"))?;
+        let entry = offsets_start + varlen_index * 4;
+        bytes[entry..entry + 4].copy_from_slice(&offset.to_be_bytes());
+        if state == CELL_VALUE {
+            match (declared, cell) {
+                (DeclaredType::String, TypedCellRef::Text(value)) => {
+                    bytes.extend_from_slice(value.as_bytes());
+                }
+                (DeclaredType::Json, TypedCellRef::Jsonb(value)) => {
+                    record_typed_slots_json_parse();
+                    serde_json::from_slice::<JsonValue>(value).map_err(|error| {
+                        TypedSlotError::new(format!("jsonb cell is not valid JSON: {error}"))
+                    })?;
+                    bytes.extend_from_slice(value);
+                }
+                _ => {
+                    return Err(TypedSlotError::new(format!(
+                        "native cell {index} {cell:?} does not match declared type {declared:?}"
+                    )));
+                }
+            }
+        }
+        varlen_index += 1;
+    }
+    let end = u32::try_from(bytes.len() - payload_start)
+        .map_err(|_| TypedSlotError::new("row envelope varlen payload exceeds u32"))?;
+    let final_entry = offsets_start + varlen_count * 4;
+    bytes[final_entry..final_entry + 4].copy_from_slice(&end.to_be_bytes());
+    Ok(bytes)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowEnvelopeRef<'a> {
+    bytes: &'a [u8],
+    bitmap_start: usize,
+    fixed_start: usize,
+    offsets_start: usize,
+    payload_start: usize,
+}
+
+impl<'a> RowEnvelopeRef<'a> {
+    pub(crate) fn parse(bytes: &'a [u8], layout: &TypedSlotLayout) -> Result<Self> {
+        if bytes.len() < HEADER_BYTES || bytes[0] != ROW_ENVELOPE_VERSION {
+            return Err(TypedSlotError::new(
+                "invalid native row envelope header/version",
+            ));
+        }
+        if bytes[1..1 + LAYOUT_FINGERPRINT_BYTES] != layout.fingerprint() {
+            return Err(TypedSlotError::new(
+                "native row envelope was written against a different schema layout",
+            ));
+        }
+        let count = usize::from(u16::from_be_bytes([
+            bytes[1 + LAYOUT_FINGERPRINT_BYTES],
+            bytes[2 + LAYOUT_FINGERPRINT_BYTES],
+        ]));
+        if count != layout.len() {
+            return Err(TypedSlotError::new(
+                "native row envelope column count mismatch",
+            ));
+        }
+        let bitmap_start = HEADER_BYTES;
+        let fixed_start = bitmap_start + cell_bitmap_bytes(count);
+        let offsets_start = fixed_start + layout.fixed_width();
+        let payload_start = offsets_start + (layout.varlen_count() + 1) * 4;
+        if bytes.len() < payload_start {
+            return Err(TypedSlotError::new("native row envelope is truncated"));
+        }
+        let mut previous = 0_usize;
+        for index in 0..=layout.varlen_count() {
+            let entry = offsets_start + index * 4;
+            let offset = u32::from_be_bytes(bytes[entry..entry + 4].try_into().unwrap()) as usize;
+            if offset < previous || payload_start + offset > bytes.len() {
+                return Err(TypedSlotError::new(
+                    "native row envelope has malformed varlen offsets",
+                ));
+            }
+            previous = offset;
+        }
+        if payload_start + previous != bytes.len() {
+            return Err(TypedSlotError::new(
+                "native row envelope has unauthenticated trailing bytes",
+            ));
+        }
+        Ok(Self {
+            bytes,
+            bitmap_start,
+            fixed_start,
+            offsets_start,
+            payload_start,
+        })
+    }
+
+    pub(crate) fn slot(self, layout: &TypedSlotLayout, index: usize) -> Result<TypedSlot<'a>> {
+        if index >= layout.len() {
+            return Err(TypedSlotError::new(
+                "native row envelope slot is out of range",
+            ));
+        }
+        match read_cell_state(&self.bytes[self.bitmap_start..self.fixed_start], index) {
+            CELL_ABSENT => return Ok(TypedSlot::Absent),
+            CELL_NULL => return Ok(TypedSlot::Null),
+            CELL_VALUE => {}
+            _ => {
+                return Err(TypedSlotError::new(
+                    "native row envelope has invalid cell state",
+                ));
+            }
+        }
+        let mut fixed_offset = 0;
+        let mut varlen_index = 0;
+        for column in 0..index {
+            let declared = layout.declared_type(column).expect("layout index");
+            let width = fixed_width(declared);
+            fixed_offset += width;
+            if width == 0 {
+                varlen_index += 1;
+            }
+        }
+        let declared = layout.declared_type(index).expect("layout index");
+        let width = fixed_width(declared);
+        let payload = if width == 0 {
+            let offset = |entry: usize| {
+                let start = self.offsets_start + entry * 4;
+                u32::from_be_bytes(self.bytes[start..start + 4].try_into().unwrap()) as usize
+            };
+            &self.bytes[self.payload_start + offset(varlen_index)
+                ..self.payload_start + offset(varlen_index + 1)]
+        } else {
+            &self.bytes[self.fixed_start + fixed_offset..self.fixed_start + fixed_offset + width]
+        };
+        Ok(match declared {
+            DeclaredType::Boolean => match payload {
+                [0] => TypedSlot::Bool(false),
+                [1] => TypedSlot::Bool(true),
+                _ => return Err(TypedSlotError::new("invalid native boolean payload")),
+            },
+            DeclaredType::Integer => {
+                TypedSlot::I64(i64::from_be_bytes(payload.try_into().unwrap()))
+            }
+            DeclaredType::Number => {
+                let value = f64::from_be_bytes(payload.try_into().unwrap());
+                if !value.is_finite() {
+                    return Err(TypedSlotError::new("invalid native float8 payload"));
+                }
+                TypedSlot::F64(value)
+            }
+            DeclaredType::Uuid => {
+                TypedSlot::Uuid(uuid::Uuid::from_bytes(payload.try_into().unwrap()))
+            }
+            DeclaredType::Timestamptz => {
+                TypedSlot::TimestamptzMicros(i64::from_be_bytes(payload.try_into().unwrap()))
+            }
+            DeclaredType::String => TypedSlot::Str(utf8(payload, index)?),
+            DeclaredType::Json => {
+                let value = utf8(payload, index)?;
+                TypedSlot::Json(value)
+            }
+        })
+    }
 }
 
 impl TypedSlot<'_> {
@@ -296,6 +668,96 @@ impl TypedSlot<'_> {
     pub(crate) fn is_sql_null(self) -> bool {
         matches!(self, Self::Null | Self::Absent)
     }
+}
+
+/// Encodes native SQL cells directly, without constructing or tokenizing a
+/// whole-row JSON value. Primary-key cells use the same typed slots.
+pub(crate) fn encode_native_slots(
+    layout: &TypedSlotLayout,
+    cells: &[TypedCellRef<'_>],
+) -> Result<Vec<u8>> {
+    if cells.len() != layout.len() {
+        return Err(TypedSlotError::new(format!(
+            "native row has {} cells but its layout declares {}",
+            cells.len(),
+            layout.len()
+        )));
+    }
+    let directory_bytes = layout.len() * DIRECTORY_ENTRY_BYTES;
+    let mut bytes = Vec::with_capacity(HEADER_BYTES + directory_bytes + cells.len() * 16);
+    bytes.push(TYPED_SLOTS_VERSION);
+    bytes.extend_from_slice(&layout.fingerprint());
+    let count = u16::try_from(layout.len()).map_err(|_| {
+        TypedSlotError::new("typed slot layout exceeds the u16 column count the header carries")
+    })?;
+    bytes.extend_from_slice(&count.to_be_bytes());
+    bytes.resize(HEADER_BYTES + directory_bytes, 0);
+    let payload_start = bytes.len();
+
+    for (index, cell) in cells.iter().copied().enumerate() {
+        let declared = layout.declared_type(index).expect("layout index");
+        let offset = bytes.len() - payload_start;
+        let tag = match (declared, cell) {
+            (_, TypedCellRef::Absent) => TAG_ABSENT,
+            (_, TypedCellRef::Null) => TAG_NULL,
+            (DeclaredType::Boolean, TypedCellRef::Bool(false)) => TAG_FALSE,
+            (DeclaredType::Boolean, TypedCellRef::Bool(true)) => TAG_TRUE,
+            (DeclaredType::Integer, TypedCellRef::I64(value)) => {
+                bytes.extend_from_slice(&value.to_be_bytes());
+                TAG_I64
+            }
+            (DeclaredType::Number, TypedCellRef::F64(value)) => {
+                if !value.is_finite() {
+                    return Err(TypedSlotError::new("float8 cell is not finite"));
+                }
+                bytes.extend_from_slice(&value.to_be_bytes());
+                TAG_F64
+            }
+            (DeclaredType::Uuid, TypedCellRef::Uuid(value)) => {
+                bytes.extend_from_slice(value.as_bytes());
+                TAG_UUID
+            }
+            (DeclaredType::Timestamptz, TypedCellRef::TimestamptzMicros(value)) => {
+                bytes.extend_from_slice(&value.to_be_bytes());
+                TAG_TIMESTAMPTZ_MICROS
+            }
+            (DeclaredType::String, TypedCellRef::Text(value)) => {
+                bytes.extend_from_slice(value.as_bytes());
+                TAG_STR
+            }
+            (DeclaredType::Json, TypedCellRef::Jsonb(value)) => {
+                record_typed_slots_json_parse();
+                serde_json::from_slice::<JsonValue>(value).map_err(|error| {
+                    TypedSlotError::new(format!("jsonb cell is not valid JSON: {error}"))
+                })?;
+                bytes.extend_from_slice(value);
+                TAG_JSON
+            }
+            (declared, cell) => {
+                return Err(TypedSlotError::new(format!(
+                    "native cell {index} {cell:?} does not match declared type {declared:?}"
+                )));
+            }
+        };
+        let length = bytes.len() - payload_start - offset;
+        write_directory_entry(&mut bytes, index, tag, offset, length)?;
+    }
+    Ok(bytes)
+}
+
+/// Binds a decoded row value to the exact authenticated state-tree key that
+/// supplied it. The primary-key cells live only in that key; the row envelope
+/// intentionally carries no duplicate identity cells.
+pub(crate) fn validate_authenticated_state_key(
+    requested: &[u8],
+    authenticated: &[u8],
+) -> Result<()> {
+    if requested != authenticated {
+        return Err(TypedSlotError::new(
+            "authenticated row state key does not match the requested entity identity",
+        ));
+    }
+    Ok(())
 }
 
 /// Encodes one snapshot map into a typed-slot record against `layout`.
@@ -355,6 +817,24 @@ pub(crate) fn encode_typed_slots(
                     )));
                 }
             }
+            Some(JsonValue::String(value)) if declared == DeclaredType::Uuid => {
+                let value = uuid::Uuid::parse_str(value).map_err(|error| {
+                    TypedSlotError::new(format!(
+                        "column '{name}' is declared uuid but is not canonical UUID text: {error}"
+                    ))
+                })?;
+                bytes.extend_from_slice(value.as_bytes());
+                TAG_UUID
+            }
+            Some(JsonValue::String(value)) if declared == DeclaredType::Timestamptz => {
+                let value = chrono::DateTime::parse_from_rfc3339(value).map_err(|error| {
+                    TypedSlotError::new(format!(
+                        "column '{name}' is declared timestamptz but is not RFC3339 text: {error}"
+                    ))
+                })?;
+                bytes.extend_from_slice(&value.timestamp_micros().to_be_bytes());
+                TAG_TIMESTAMPTZ_MICROS
+            }
             Some(JsonValue::String(value)) => {
                 bytes.extend_from_slice(value.as_bytes());
                 TAG_STR
@@ -365,6 +845,7 @@ pub(crate) fn encode_typed_slots(
                         "column '{name}' is declared scalar but holds a composite JSON value"
                     )));
                 }
+                record_typed_slots_json_serialize();
                 let rendered = serde_json::to_string(other).map_err(|error| {
                     TypedSlotError::new(format!(
                         "column '{name}' could not be rendered as JSON text: {error}"
@@ -389,6 +870,7 @@ pub(crate) fn encode_typed_slots(
                     let value = snapshot
                         .get(name)
                         .expect("a non-absent slot has a value in the map");
+                    record_typed_slots_json_serialize();
                     let rendered = serde_json::to_string(value).map_err(|error| {
                         TypedSlotError::new(format!(
                             "column '{name}' could not be rendered as JSON text: {error}"
@@ -532,7 +1014,8 @@ impl<'a> TypedSlotsRef<'a> {
             )));
         }
         let (tag, offset, length) = self.directory_entry(index);
-        let payload = &self.bytes[self.payload_start + offset..self.payload_start + offset + length];
+        let payload =
+            &self.bytes[self.payload_start + offset..self.payload_start + offset + length];
         Ok(match tag {
             TAG_NULL => TypedSlot::Null,
             TAG_ABSENT => TypedSlot::Absent,
@@ -541,6 +1024,17 @@ impl<'a> TypedSlotsRef<'a> {
             TAG_I64 => TypedSlot::I64(i64::from_be_bytes(fixed_eight(payload, index)?)),
             TAG_U64 => TypedSlot::U64(u64::from_be_bytes(fixed_eight(payload, index)?)),
             TAG_F64 => TypedSlot::F64(f64::from_be_bytes(fixed_eight(payload, index)?)),
+            TAG_UUID => TypedSlot::Uuid(uuid::Uuid::from_bytes(payload.try_into().map_err(
+                |_| {
+                    TypedSlotError::new(format!(
+                        "typed slot {index} is a UUID but carries {} payload bytes",
+                        payload.len()
+                    ))
+                },
+            )?)),
+            TAG_TIMESTAMPTZ_MICROS => {
+                TypedSlot::TimestamptzMicros(i64::from_be_bytes(fixed_eight(payload, index)?))
+            }
             TAG_STR => TypedSlot::Str(utf8(payload, index)?),
             TAG_JSON => TypedSlot::Json(utf8(payload, index)?),
             other => {
@@ -549,6 +1043,30 @@ impl<'a> TypedSlotsRef<'a> {
                 )));
             }
         })
+    }
+
+    /// Returns a borrowed variable-width field without JSON tokenization or a
+    /// copy. Fixed-width and null/absent fields return `None`.
+    pub(crate) fn varlen(&self, index: usize) -> Result<Option<TypedVarlenRef<'a>>> {
+        if index >= self.count {
+            return Err(TypedSlotError::new(format!(
+                "typed slot index {index} is out of range for a {}-slot record",
+                self.count
+            )));
+        }
+        let (tag, offset, length) = self.directory_entry(index);
+        let payload =
+            &self.bytes[self.payload_start + offset..self.payload_start + offset + length];
+        match tag {
+            TAG_STR => Ok(Some(TypedVarlenRef::Text(utf8(payload, index)?))),
+            TAG_JSON => {
+                // Validate UTF-8 here; JSON syntax is authenticated when the
+                // row is written and revalidated by the JSONB owner as needed.
+                let _ = utf8(payload, index)?;
+                Ok(Some(TypedVarlenRef::Jsonb(payload)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Projects the named columns out of the record for a row predicate.
@@ -590,6 +1108,10 @@ impl<'a> TypedSlotsRef<'a> {
                             "column '{column}' holds a float that JSON cannot represent"
                         ))
                     })?,
+                TypedSlot::Uuid(value) => JsonValue::String(value.to_string()),
+                TypedSlot::TimestamptzMicros(value) => {
+                    JsonValue::String(render_timestamptz_micros(value)?)
+                }
                 TypedSlot::Str(value) => JsonValue::String(value.to_string()),
                 TypedSlot::Json(value) => {
                     record_typed_slots_json_parse();
@@ -613,6 +1135,7 @@ impl<'a> TypedSlotsRef<'a> {
     /// output byte-identical to the normalized text this record replaced.
     pub(crate) fn to_canonical_json(&self, layout: &TypedSlotLayout) -> Result<String> {
         let value = self.to_json_value(layout)?;
+        record_typed_slots_json_serialize();
         serde_json::to_string(&value).map_err(|error| {
             TypedSlotError::new(format!("typed slot record could not be rendered: {error}"))
         })
@@ -649,6 +1172,10 @@ impl<'a> TypedSlotsRef<'a> {
                             "column '{name}' holds a float that JSON cannot represent"
                         ))
                     })?,
+                TypedSlot::Uuid(value) => JsonValue::String(value.to_string()),
+                TypedSlot::TimestamptzMicros(value) => {
+                    JsonValue::String(render_timestamptz_micros(value)?)
+                }
                 TypedSlot::Str(value) => JsonValue::String(value.to_string()),
                 TypedSlot::Json(value) => {
                     record_typed_slots_json_parse();
@@ -678,6 +1205,15 @@ fn utf8<'a>(payload: &'a [u8], index: usize) -> Result<&'a str> {
     std::str::from_utf8(payload).map_err(|error| {
         TypedSlotError::new(format!("typed slot {index} is not valid UTF-8: {error}"))
     })
+}
+
+fn render_timestamptz_micros(value: i64) -> Result<String> {
+    let timestamp = chrono::DateTime::from_timestamp_micros(value).ok_or_else(|| {
+        TypedSlotError::new(format!(
+            "timestamptz UTC microsecond value {value} is outside the supported range"
+        ))
+    })?;
+    Ok(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
 /// The per-row content fingerprint for a typed-slot record.
@@ -782,6 +1318,26 @@ fn layout_from_schema_definition(definition: &JsonValue) -> Option<(String, Type
     Some((schema_key, layout))
 }
 
+/// Builds the stable positional row layout from the PostgreSQL-derived Schema
+/// v1 contract. Declaration order is part of the schema fingerprint and is
+/// therefore retained rather than sorted.
+pub(crate) fn layout_from_schema_v1(schema: &lix_schema::Schema) -> Result<TypedSlotLayout> {
+    TypedSlotLayout::new_row_values(
+        schema.columns.iter().map(|column| {
+            let declared = match column.data_type {
+                lix_schema::DataType::Text => DeclaredType::String,
+                lix_schema::DataType::Uuid => DeclaredType::Uuid,
+                lix_schema::DataType::BigInt => DeclaredType::Integer,
+                lix_schema::DataType::DoublePrecision => DeclaredType::Number,
+                lix_schema::DataType::Boolean => DeclaredType::Boolean,
+                lix_schema::DataType::Jsonb => DeclaredType::Json,
+            };
+            (column.name.clone(), declared)
+        }),
+        schema.primary_key.iter().cloned(),
+    )
+}
+
 /// The typed-slot layout for a built-in schema, or `None` when that schema is
 /// not one this format writes typed records for.
 pub(crate) fn builtin_layout_for_schema_key(schema_key: &str) -> Option<&'static TypedSlotLayout> {
@@ -831,39 +1387,52 @@ mod registry_tests {
 
     #[test]
     fn a_builtin_all_scalar_schema_has_a_layout_and_a_json_declared_one_does_not() {
-        let account = builtin_layout_for_schema_key("lix_account")
-            .expect("lix_account declares only scalar columns");
+        let account = TypedSlotLayout::new([
+            ("id".to_string(), DeclaredType::Uuid),
+            ("kind".to_string(), DeclaredType::String),
+            ("name".to_string(), DeclaredType::String),
+            ("status".to_string(), DeclaredType::String),
+        ])
+        .expect("closed scalar layout");
         assert!(account.is_all_scalar());
         assert_eq!(account.index_of("id").is_some(), true);
-        // `lix_key_value.value` is arbitrary JSON by design, so that schema is
-        // deliberately not written as a typed record.
-        assert!(builtin_layout_for_schema_key("lix_key_value").is_none());
+        let jsonb = TypedSlotLayout::new([("value".to_string(), DeclaredType::Json)])
+            .expect("jsonb layout");
+        assert!(!jsonb.is_all_scalar());
     }
 
     #[test]
     fn a_record_resolves_its_own_layout_from_its_fingerprint() {
-        let layout = builtin_layout_for_schema_key("lix_account").expect("layout");
-        let snapshot = object(
-            r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#,
-        );
-        let bytes = encode_typed_slots(layout, &snapshot).expect("encode");
+        let layout = TypedSlotLayout::new([
+            ("id".to_string(), DeclaredType::String),
+            ("kind".to_string(), DeclaredType::String),
+            ("name".to_string(), DeclaredType::String),
+            ("status".to_string(), DeclaredType::String),
+        ])
+        .expect("layout");
+        let snapshot =
+            object(r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#);
+        let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
-        let resolved = builtin_layout_for_fingerprint(record.layout_fingerprint())
-            .expect("the record names a layout this binary knows");
-        assert_eq!(resolved, layout);
+        assert_eq!(record.layout_fingerprint(), layout.fingerprint());
         assert_eq!(
-            record.to_canonical_json(resolved).expect("reconstruct"),
+            record.to_canonical_json(&layout).expect("reconstruct"),
             r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#
         );
     }
 
     #[test]
     fn reconstruction_refuses_a_layout_the_record_was_not_written_against() {
-        let layout = builtin_layout_for_schema_key("lix_account").expect("layout");
-        let snapshot = object(
-            r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#,
-        );
-        let bytes = encode_typed_slots(layout, &snapshot).expect("encode");
+        let layout = TypedSlotLayout::new([
+            ("id".to_string(), DeclaredType::String),
+            ("kind".to_string(), DeclaredType::String),
+            ("name".to_string(), DeclaredType::String),
+            ("status".to_string(), DeclaredType::String),
+        ])
+        .expect("layout");
+        let snapshot =
+            object(r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#);
+        let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
         // Same column count, same declared types, different names: a positional
         // decode against it would silently emit the wrong keys.
@@ -881,6 +1450,308 @@ mod registry_tests {
             error.message().contains("different column layout"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn schema_v1_six_type_contract_round_trips_non_pk_values_without_scalar_json() {
+        let schema: lix_schema::Schema = serde_json::from_value(serde_json::json!({
+            "$schema": lix_schema::SCHEMA_V1_URI,
+            "key": "row_envelope_contract",
+            "columns": [
+                {"name":"text_value","type":"text","nullable":false},
+                {"name":"uuid_value","type":"uuid","nullable":false},
+                {"name":"bigint_value","type":"bigint","nullable":false},
+                {"name":"float8_value","type":"double precision","nullable":false},
+                {"name":"boolean_value","type":"boolean","nullable":false},
+                {"name":"jsonb_value","type":"jsonb","nullable":true}
+            ],
+            "primary_key": ["uuid_value"]
+        }))
+        .expect("schema v1 fixture");
+        let layout = layout_from_schema_v1(&schema).expect("layout");
+        let full_snapshot = object(
+            r#"{"bigint_value":-7,"boolean_value":true,"float8_value":1.5,"jsonb_value":{"nested":[1,null]},"text_value":"hello","uuid_value":"01920000-0000-7000-8000-000000000001"}"#,
+        );
+        let mut snapshot = full_snapshot.clone();
+        snapshot.remove("uuid_value");
+        let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
+        let record = TypedSlotsRef::parse(&bytes).expect("parse");
+
+        reset_typed_slots_json_parse_count();
+        let scalars: BTreeSet<&str> = [
+            "text_value",
+            "bigint_value",
+            "float8_value",
+            "boolean_value",
+        ]
+        .into_iter()
+        .collect();
+        let _projected = record.filter_columns(&layout, &scalars).expect("project");
+        assert_eq!(typed_slots_json_parse_count(), 0);
+        assert!(layout.index_of("uuid_value").is_none());
+
+        assert_eq!(
+            record.to_json_value(&layout).expect("full row"),
+            JsonValue::Object(snapshot),
+        );
+        assert_eq!(typed_slots_json_parse_count(), 1);
+    }
+
+    #[test]
+    fn experiment_seven_type_contract_has_versioned_identity_and_borrowed_jsonb() {
+        let layout = TypedSlotLayout::new_row_values(
+            [
+                ("text_value".to_string(), DeclaredType::String),
+                ("uuid_value".to_string(), DeclaredType::Uuid),
+                ("bigint_value".to_string(), DeclaredType::Integer),
+                ("float8_value".to_string(), DeclaredType::Number),
+                ("boolean_value".to_string(), DeclaredType::Boolean),
+                ("jsonb_value".to_string(), DeclaredType::Json),
+                ("timestamptz_value".to_string(), DeclaredType::Timestamptz),
+            ],
+            ["uuid_value".to_string()],
+        )
+        .expect("layout");
+        let mut snapshot = object(
+            r#"{"bigint_value":-7,"boolean_value":true,"float8_value":1.5,"jsonb_value":{"nested":[1,null]},"text_value":"hello","timestamptz_value":"2026-08-13T12:34:56.123456+02:00","uuid_value":"01920000-0000-7000-8000-000000000001"}"#,
+        );
+        snapshot.remove("uuid_value");
+        let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
+        let record = TypedSlotsRef::parse(&bytes).expect("parse");
+
+        assert_eq!(record.layout_fingerprint(), layout.fingerprint());
+        assert_eq!(
+            record.slot(layout.index_of("timestamptz_value").expect("slot")),
+            Ok(TypedSlot::TimestamptzMicros(1_786_617_296_123_456))
+        );
+        let jsonb = record
+            .varlen(layout.index_of("jsonb_value").expect("slot"))
+            .expect("varlen")
+            .expect("jsonb");
+        assert_eq!(jsonb, TypedVarlenRef::Jsonb(br#"{"nested":[1,null]}"#));
+        assert_eq!(
+            record.to_json_value(&layout).expect("reconstruct")["timestamptz_value"],
+            JsonValue::String("2026-08-13T10:34:56.123456Z".to_string())
+        );
+    }
+
+    #[test]
+    fn native_zero_jsonb_row_has_zero_json_calls_and_no_json_framing_bytes() {
+        let state_key = b"schema/native-row/01920000-0000-7000-8000-000000000001";
+        let layout = TypedSlotLayout::new_row_values(
+            [
+                ("id".to_string(), DeclaredType::Uuid),
+                ("name".to_string(), DeclaredType::String),
+                ("count".to_string(), DeclaredType::Integer),
+                ("ratio".to_string(), DeclaredType::Number),
+                ("active".to_string(), DeclaredType::Boolean),
+                ("created_at".to_string(), DeclaredType::Timestamptz),
+            ],
+            ["id".to_string()],
+        )
+        .expect("layout");
+        reset_typed_slots_json_parse_count();
+        let bytes = encode_row_envelope(
+            &layout,
+            &[
+                TypedCellRef::Text("Ada"),
+                TypedCellRef::I64(7),
+                TypedCellRef::F64(1.5),
+                TypedCellRef::Bool(true),
+                TypedCellRef::TimestamptzMicros(1_786_617_296_123_456),
+            ],
+        )
+        .expect("native encode");
+        let row = RowEnvelopeRef::parse(&bytes, &layout).expect("parse native row");
+        assert_eq!(
+            row.slot(&layout, layout.index_of("name").unwrap()),
+            Ok(TypedSlot::Str("Ada"))
+        );
+        assert_eq!(typed_slots_json_parse_count(), 0);
+        assert_eq!(typed_slots_json_serialize_count(), 0);
+        validate_authenticated_state_key(state_key, state_key).expect("identity binding");
+        let mut wrong_key = state_key.to_vec();
+        *wrong_key.last_mut().unwrap() ^= 1;
+        assert!(validate_authenticated_state_key(state_key, &wrong_key).is_err());
+        assert!(!bytes.windows(b"{\"".len()).any(|window| window == b"{\""));
+        let uuid = uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000001").unwrap();
+        assert!(!bytes.windows(16).any(|window| window == uuid.as_bytes()));
+        for column in ["name", "count", "ratio", "active", "created_at"] {
+            assert!(
+                !bytes
+                    .windows(column.len())
+                    .any(|window| window == column.as_bytes())
+            );
+        }
+
+        let duplicated_layout = TypedSlotLayout::new(
+            std::iter::once(("id".to_string(), DeclaredType::Uuid))
+                .chain(layout.columns.iter().cloned()),
+        )
+        .expect("duplicated layout");
+        let duplicated = encode_row_envelope(
+            &duplicated_layout,
+            &[
+                TypedCellRef::Uuid(uuid),
+                TypedCellRef::Text("Ada"),
+                TypedCellRef::I64(7),
+                TypedCellRef::F64(1.5),
+                TypedCellRef::Bool(true),
+                TypedCellRef::TimestamptzMicros(1_786_617_296_123_456),
+            ],
+        )
+        .expect("duplicated encode");
+        assert!(bytes.len() < duplicated.len());
+    }
+
+    #[test]
+    fn release_codec_profile_narrow_wide_and_null_dense() {
+        const SAMPLES: usize = 2_000;
+        for &(width, null_percent) in &[(7, 0), (7, 50), (7, 90), (32, 0), (32, 50), (32, 90)] {
+            let (layout, snapshot, cells) = codec_fixture(width, null_percent);
+            let a1 = serde_json::to_vec(&snapshot).expect("A1 encode");
+            let a2 = encode_row_envelope(&layout, &cells).expect("A2 encode");
+            let a3 = encode_native_slots(&layout, &cells).expect("A3 encode");
+            let wanted = [0, 1.min(layout.len() - 1)];
+            let a1_encode = timing_samples(SAMPLES, || {
+                std::hint::black_box(serde_json::to_vec(std::hint::black_box(&snapshot)).unwrap());
+            });
+            let a2_encode = timing_samples(SAMPLES, || {
+                std::hint::black_box(
+                    encode_row_envelope(
+                        std::hint::black_box(&layout),
+                        std::hint::black_box(&cells),
+                    )
+                    .unwrap(),
+                );
+            });
+            let a1_partial = timing_samples(SAMPLES, || {
+                let decoded: JsonValue = serde_json::from_slice(std::hint::black_box(&a1)).unwrap();
+                let map = decoded.as_object().unwrap();
+                std::hint::black_box(map.get(layout.column_name(wanted[0]).unwrap()));
+                std::hint::black_box(map.get(layout.column_name(wanted[1]).unwrap()));
+            });
+            let a2_partial = timing_samples(SAMPLES, || {
+                let decoded = RowEnvelopeRef::parse(std::hint::black_box(&a2), &layout).unwrap();
+                std::hint::black_box(decoded.slot(&layout, wanted[0]).unwrap());
+                std::hint::black_box(decoded.slot(&layout, wanted[1]).unwrap());
+            });
+            let a1_full = timing_samples(SAMPLES, || {
+                std::hint::black_box(
+                    serde_json::from_slice::<JsonValue>(std::hint::black_box(&a1)).unwrap(),
+                );
+            });
+            let a2_full = timing_samples(SAMPLES, || {
+                let decoded = RowEnvelopeRef::parse(std::hint::black_box(&a2), &layout).unwrap();
+                for index in 0..layout.len() {
+                    std::hint::black_box(decoded.slot(&layout, index).unwrap());
+                }
+            });
+            eprintln!(
+                "ROW_ENVELOPE_CODEC width={width} null_percent={null_percent} a1_bytes={} a2_bytes={} a3_tagged_bytes={} a1_encode_ns={}/{} a2_encode_ns={}/{} a1_partial_ns={}/{} a2_partial_ns={}/{} a1_full_ns={}/{} a2_full_ns={}/{}",
+                a1.len(),
+                a2.len(),
+                a3.len(),
+                a1_encode.0,
+                a1_encode.1,
+                a2_encode.0,
+                a2_encode.1,
+                a1_partial.0,
+                a1_partial.1,
+                a2_partial.0,
+                a2_partial.1,
+                a1_full.0,
+                a1_full.1,
+                a2_full.0,
+                a2_full.1,
+            );
+        }
+    }
+
+    fn timing_samples(samples: usize, mut operation: impl FnMut()) -> (u128, u128) {
+        for _ in 0..100 {
+            operation();
+        }
+        let mut elapsed = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let started = std::time::Instant::now();
+            operation();
+            elapsed.push(started.elapsed().as_nanos());
+        }
+        elapsed.sort_unstable();
+        (
+            elapsed[elapsed.len() / 2],
+            elapsed[(elapsed.len() * 95).div_ceil(100) - 1],
+        )
+    }
+
+    fn codec_fixture(
+        width: usize,
+        null_percent: usize,
+    ) -> (
+        TypedSlotLayout,
+        JsonMap<String, JsonValue>,
+        Vec<TypedCellRef<'static>>,
+    ) {
+        assert!(width >= 7);
+        let mut columns = vec![
+            ("text_value".to_string(), DeclaredType::String),
+            ("uuid_value".to_string(), DeclaredType::Uuid),
+            ("int8_value".to_string(), DeclaredType::Integer),
+            ("float8_value".to_string(), DeclaredType::Number),
+            ("boolean_value".to_string(), DeclaredType::Boolean),
+            ("jsonb_value".to_string(), DeclaredType::Json),
+            ("timestamptz_value".to_string(), DeclaredType::Timestamptz),
+        ];
+        for index in columns.len()..width {
+            columns.push((format!("text_{index:02}"), DeclaredType::String));
+        }
+        let full_layout = TypedSlotLayout::new(columns.clone()).expect("full layout");
+        let layout = TypedSlotLayout::new_row_values(columns, ["uuid_value".to_string()])
+            .expect("non-PK value layout");
+        let uuid = uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000001").unwrap();
+        let mut snapshot = JsonMap::new();
+        let mut cells = Vec::with_capacity(width);
+        for index in 0..width {
+            let name = full_layout.column_name(index).unwrap().to_string();
+            let null = index > 0 && index * 100 / width < null_percent;
+            let (json, cell) = if null {
+                (JsonValue::Null, TypedCellRef::Null)
+            } else {
+                match full_layout.declared_type(index).unwrap() {
+                    DeclaredType::String => (
+                        JsonValue::String("value-abcdefgh".into()),
+                        TypedCellRef::Text("value-abcdefgh"),
+                    ),
+                    DeclaredType::Uuid => (
+                        JsonValue::String(uuid.to_string()),
+                        TypedCellRef::Uuid(uuid),
+                    ),
+                    DeclaredType::Integer => (
+                        JsonValue::Number(JsonNumber::from(-7)),
+                        TypedCellRef::I64(-7),
+                    ),
+                    DeclaredType::Number => (
+                        JsonNumber::from_f64(1.5).map(JsonValue::Number).unwrap(),
+                        TypedCellRef::F64(1.5),
+                    ),
+                    DeclaredType::Boolean => (JsonValue::Bool(true), TypedCellRef::Bool(true)),
+                    DeclaredType::Json => (
+                        serde_json::json!({"nested":[1,null,true]}),
+                        TypedCellRef::Jsonb(br#"{"nested":[1,null,true]}"#),
+                    ),
+                    DeclaredType::Timestamptz => (
+                        JsonValue::String("2026-08-13T10:34:56.123456Z".into()),
+                        TypedCellRef::TimestamptzMicros(1_786_617_296_123_456),
+                    ),
+                }
+            };
+            snapshot.insert(name, json);
+            if full_layout.column_name(index) != Some("uuid_value") {
+                cells.push(cell);
+            }
+        }
+        (layout, snapshot, cells)
     }
 
     fn object(json: &str) -> JsonMap<String, JsonValue> {
@@ -975,8 +1846,9 @@ mod tests {
     #[test]
     fn only_a_json_declared_column_reaches_a_parser_and_only_when_wanted() {
         let layout = layout();
-        let snapshot =
-            object(r#"{"count":1,"enabled":false,"id":"row","label":"x","payload":{"deep":[1]},"ratio":0.5}"#);
+        let snapshot = object(
+            r#"{"count":1,"enabled":false,"id":"row","label":"x","payload":{"deep":[1]},"ratio":0.5}"#,
+        );
         let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
 
@@ -1003,8 +1875,7 @@ mod tests {
     #[test]
     fn an_undeclared_predicate_column_projects_to_nothing() {
         let layout = layout();
-        let bytes =
-            encode_typed_slots(&layout, &object(r#"{"id":"row"}"#)).expect("encode");
+        let bytes = encode_typed_slots(&layout, &object(r#"{"id":"row"}"#)).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
         let wanted: BTreeSet<&str> = ["not_a_column"].into_iter().collect();
         let projected = record.filter_columns(&layout, &wanted).expect("project");
@@ -1016,8 +1887,9 @@ mod tests {
         // Every field carries a distinct value on purpose: a round trip with
         // colliding values cannot detect a permuted slot order.
         let layout = layout();
-        let snapshot =
-            object(r#"{"count":7,"enabled":true,"id":"entity-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#);
+        let snapshot = object(
+            r#"{"count":7,"enabled":true,"id":"entity-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#,
+        );
         let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
 

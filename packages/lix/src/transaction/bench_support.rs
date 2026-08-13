@@ -303,7 +303,9 @@ where
             Arc::clone(&self.hot_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            crate::plugin::runtime::PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
+            crate::plugin::runtime::PluginRuntimeHost::new(Arc::new(
+                crate::plugin::runtime::UnsupportedWasmRuntime,
+            )),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::new(crate::sql2::SqlPlanningCache::default()),
@@ -469,7 +471,8 @@ async fn seed_visible_schema_rows<StorageImpl>(
         .map(|schema| {
             let key = crate::schema::schema_key_from_definition(schema)
                 .expect("seed schema key should derive");
-            let snapshot_content = json!({ "value": schema }).to_string();
+            let snapshot_content =
+                json!({ "schema_key": key.schema_key, "value": schema }).to_string();
             crate::tracked_state::MaterializedTrackedStateRow {
                 entity_pk: crate::schema::registered_schema_entity_pk(&key.schema_key)
                     .expect("registered schema identity should derive"),
@@ -618,15 +621,13 @@ async fn seed_visible_schema_rows<StorageImpl>(
 
 fn json_pointer_schema() -> JsonValue {
     json!({
-        "x-lix-key": "json_pointer",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "properties": {
-            "path": { "type": "string" },
-            "value": true
-        },
-        "required": ["path", "value"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "json_pointer",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false }
+        ],
+        "primary_key": ["path"]
     })
 }
 

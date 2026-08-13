@@ -1005,9 +1005,11 @@ fn print_profile_samples(
 ) {
     samples.sort_unstable();
     let median = samples[samples.len() / 2];
+    let p95_index = (samples.len() * 95).div_ceil(100).saturating_sub(1);
+    let p95 = samples[p95_index];
     let profile_detail = profile_read_many_detail(operation, read_many_pk_count);
     println!(
-        "tracked_state_crud profile: {layer}/{}/{} samples{profile_detail}: median={median:?} min={:?} max={:?}",
+        "tracked_state_crud profile: {layer}/{}/{} samples{profile_detail}: median={median:?} p95={p95:?} min={:?} max={:?}",
         profile_operation_name(operation),
         samples.len(),
         samples[0],

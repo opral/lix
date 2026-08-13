@@ -21,12 +21,12 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use tracing::Instrument as _;
 
+use crate::plugin::runtime::WasmCertifiedEntityBatch;
 use crate::storage_adapter::{
     BufferRange, DeferredFinalPutPage, DeferredFinalPutSource, EncodedMutationBatch, EncodedPut,
     PutBatch, PutEntry,
 };
 use crate::tracked_state::TrackedStateReadColumns;
-use crate::plugin::runtime::WasmCertifiedEntityBatch;
 
 use super::*;
 
@@ -539,9 +539,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
                             WorkingDiffBaseline::Disabled
                         },
                     ),
-                    crate::hot_state::typed_slots::builtin_layout_for_schema_key(
-                        delta.schema_key,
-                    ),
+                    crate::hot_state::typed_slots::builtin_layout_for_schema_key(delta.schema_key),
                 )
                 .expect("deferred fresh hot rows were validated before staging"),
             );
@@ -3596,8 +3594,7 @@ async fn scan_root_current_base_rows(
             }
             let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
             let produced = Arc::new(
-                Box::pin(reader.scan_batch_at_commit(&base_commit_id.to_string(), request))
-                    .await?,
+                Box::pin(reader.scan_batch_at_commit(&base_commit_id.to_string(), request)).await?,
             );
             if let Some(cache) = cache {
                 cache.insert(base_commit_id, request.clone(), Arc::clone(&produced));
@@ -3618,12 +3615,18 @@ async fn scan_root_current_base_rows(
         if row.schema_key() == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
             continue;
         }
-        if previous_scope.as_ref().is_some_and(|(schema_key, file_id)| {
-            schema_key == row.schema_key() && file_id.as_deref() == row.file_id()
-        }) {
+        if previous_scope
+            .as_ref()
+            .is_some_and(|(schema_key, file_id)| {
+                schema_key == row.schema_key() && file_id.as_deref() == row.file_id()
+            })
+        {
             continue;
         }
-        let scope = (row.schema_key().to_owned(), row.file_id().map(str::to_owned));
+        let scope = (
+            row.schema_key().to_owned(),
+            row.file_id().map(str::to_owned),
+        );
         scopes.insert((scope.0.clone(), None));
         if scope.1.is_some() {
             scopes.insert(scope.clone());
@@ -4069,9 +4072,7 @@ fn root_tracked_row_is_active(
     if verdict.disqualified {
         return false;
     }
-    verdict
-        .floor
-        .is_none_or(|floor| row.created_at() >= floor)
+    verdict.floor.is_none_or(|floor| row.created_at() >= floor)
 }
 
 fn materialize_packed_slot(
@@ -5005,9 +5006,11 @@ impl RootBaseBatchCache {
             return;
         }
         let mut entries = self.entries();
-        if let Some(index) = entries.resident.iter().position(|entry| {
-            entry.base_commit_id == base_commit_id && entry.request == request
-        }) {
+        if let Some(index) = entries
+            .resident
+            .iter()
+            .position(|entry| entry.base_commit_id == base_commit_id && entry.request == request)
+        {
             let previous = entries.resident.remove(index);
             entries.rows = entries.rows.saturating_sub(previous.batch.len());
         }
@@ -5525,10 +5528,7 @@ where
             return Ok(None);
         }
         let witness = StorageKey(Bytes::from(encode_hot_index_witness_key(
-            branch_id,
-            generation,
-            schema_key,
-            ordinal,
+            branch_id, generation, schema_key, ordinal,
         )));
         let present = PointReadPlan::new(INDEX_SPACE, &[witness])
             .materialize(&self.store, StorageGetOptions::default())
@@ -8413,9 +8413,12 @@ where
             }
             #[cfg(any(test, feature = "storage-benches"))]
             if !unresolved.is_empty() {
-                BROAD_CANONICAL_CREATED_AT_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                BROAD_CANONICAL_CREATED_AT_KEYS
-                    .fetch_add(unresolved.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                BROAD_CANONICAL_CREATED_AT_LOOKUPS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                BROAD_CANONICAL_CREATED_AT_KEYS.fetch_add(
+                    unresolved.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             if !unresolved.is_empty()
                 && let Some(control) = BranchHeadControlContext::new()
@@ -8439,7 +8442,8 @@ where
                 .flatten()
                 .is_some()
             {
-                let mut reader = crate::tracked_state::TrackedStateContext::new().reader(self.store);
+                let mut reader =
+                    crate::tracked_state::TrackedStateContext::new().reader(self.store);
                 let canonical = reader
                     .load_projected_batch_at_commit_refs(
                         &control.head_commit_id.to_string(),
@@ -8789,12 +8793,12 @@ where
                             previous.as_ref(),
                         )?;
                         Some(append_head_value_with_typed_layout(
-                    &mut next_value_bytes,
-                    &value,
-                    crate::hot_state::typed_slots::builtin_layout_for_schema_key(
-                        delta.schema_key,
-                    ),
-                )?)
+                            &mut next_value_bytes,
+                            &value,
+                            crate::hot_state::typed_slots::builtin_layout_for_schema_key(
+                                delta.schema_key,
+                            ),
+                        )?)
                     },
                 );
             }
@@ -12130,8 +12134,7 @@ async fn hot_scan_entries<'a>(
                     let value = full_value_bytes(entry.value)?;
                     #[cfg(any(test, feature = "storage-benches"))]
                     {
-                        HOT_SCAN_MATCHED_ENTRIES
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        HOT_SCAN_MATCHED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if value.len() > 1 && value[1] & 0b0000_0001 != 0 {
                             HOT_SCAN_TOMBSTONE_ENTRIES
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12439,8 +12442,7 @@ async fn scan_hot_file_entries(
                     let value = full_value_bytes(entry.value)?;
                     #[cfg(any(test, feature = "storage-benches"))]
                     {
-                        HOT_SCAN_MATCHED_ENTRIES
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        HOT_SCAN_MATCHED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if value.len() > 1 && value[1] & 0b0000_0001 != 0 {
                             HOT_SCAN_TOMBSTONE_ENTRIES
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -13798,8 +13800,8 @@ mod tests {
         let cache = RootBaseBatchCache::default();
         let first = CommitId::for_test_label("root-base-cache-first");
         let second = CommitId::for_test_label("root-base-cache-second");
-        let request = |schema_key: &str, columns: &[&str], limit: Option<usize>| {
-            TrackedStateScanRequest {
+        let request =
+            |schema_key: &str, columns: &[&str], limit: Option<usize>| TrackedStateScanRequest {
                 filter: TrackedStateFilter {
                     schema_keys: vec![schema_key.to_owned()],
                     ..TrackedStateFilter::default()
@@ -13808,8 +13810,7 @@ mod tests {
                     columns: columns.iter().map(|column| (*column).to_owned()).collect(),
                 },
                 limit,
-            }
-        };
+            };
         let batch = Arc::new(crate::tracked_state::MaterializedTrackedStateBatch::default());
 
         let stored = request("s", &["change_id"], None);
@@ -13821,15 +13822,21 @@ mod tests {
             "a different base commit must miss"
         );
         assert!(
-            cache.get(first, &request("other", &["change_id"], None)).is_none(),
+            cache
+                .get(first, &request("other", &["change_id"], None))
+                .is_none(),
             "a different schema filter must miss"
         );
         assert!(
-            cache.get(first, &request("s", &["snapshot_content"], None)).is_none(),
+            cache
+                .get(first, &request("s", &["snapshot_content"], None))
+                .is_none(),
             "a different projection must miss"
         );
         assert!(
-            cache.get(first, &request("s", &["change_id"], Some(1))).is_none(),
+            cache
+                .get(first, &request("s", &["change_id"], Some(1)))
+                .is_none(),
             "a different limit must miss"
         );
     }
@@ -13882,31 +13889,32 @@ mod tests {
         let filed = ("s".to_owned(), Some("f".to_owned()));
 
         // Reference implementation: the pre-memo predicate, verbatim.
-        let reference = |created_at: LixTimestamp,
-                         file_id: Option<&str>,
-                         active: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
-                         stored: &BTreeMap<(String, Option<String>), HotCollectionControl>| {
-            [
-                Some(("s".to_owned(), None)),
-                file_id.map(|file_id| ("s".to_owned(), Some(file_id.to_owned()))),
-            ]
-            .into_iter()
-            .flatten()
-            .all(|scope| {
-                let root = active
-                    .get(&scope)
-                    .map_or(branch_generation, |generation| generation.commit_id);
-                if stored
-                    .get(&scope)
-                    .is_some_and(|control| control.active_generation != root)
-                {
-                    return false;
-                }
-                active
-                    .get(&scope)
-                    .is_none_or(|generation| created_at >= generation.created_at)
-            })
-        };
+        let reference =
+            |created_at: LixTimestamp,
+             file_id: Option<&str>,
+             active: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
+             stored: &BTreeMap<(String, Option<String>), HotCollectionControl>| {
+                [
+                    Some(("s".to_owned(), None)),
+                    file_id.map(|file_id| ("s".to_owned(), Some(file_id.to_owned()))),
+                ]
+                .into_iter()
+                .flatten()
+                .all(|scope| {
+                    let root = active
+                        .get(&scope)
+                        .map_or(branch_generation, |generation| generation.commit_id);
+                    if stored
+                        .get(&scope)
+                        .is_some_and(|control| control.active_generation != root)
+                    {
+                        return false;
+                    }
+                    active
+                        .get(&scope)
+                        .is_none_or(|generation| created_at >= generation.created_at)
+                })
+            };
 
         let stamp = |text: &str| LixTimestamp::expect_parse("memo test timestamp", text);
         let low = stamp("2026-01-01T00:00:00Z");
@@ -13956,8 +13964,7 @@ mod tests {
                     stamp("2026-03-01T00:00:00Z"),
                     stamp("2027-01-01T00:00:00Z"),
                 ] {
-                    let verdict =
-                        memo.verdict("s", file_id, branch_generation, active, stored);
+                    let verdict = memo.verdict("s", file_id, branch_generation, active, stored);
                     let actual = !verdict.disqualified
                         && verdict.floor.is_none_or(|floor| created_at >= floor);
                     assert_eq!(
@@ -15682,7 +15689,9 @@ mod tests {
             append_batch_text(&mut value, file_id).unwrap();
             value.extend_from_slice(commit_id.as_uuid().as_bytes());
             append_batch_text(&mut value, "2026-01-01T00:00:00Z").unwrap();
-            value.extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes());
+            value.extend_from_slice(
+                &crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes(),
+            );
             value.extend_from_slice(&0_u64.to_le_bytes());
             value.extend_from_slice(&0_u64.to_le_bytes());
             value.extend_from_slice(&0_u32.to_le_bytes());
@@ -15792,8 +15801,9 @@ mod tests {
         let malformed_content_key = StorageKey(Bytes::from_static(b"malformed-content"));
         let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
         append_batch_text(&mut manifest_key, "unrelated.md").unwrap();
-        manifest_key
-            .extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+        manifest_key.extend_from_slice(
+            &crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes(),
+        );
         manifest_key.extend_from_slice(
             CommitId::for_test_label("unrelated-certified-commit")
                 .as_uuid()
@@ -15876,8 +15886,9 @@ mod tests {
         let malformed_content_key = StorageKey(Bytes::from_static(b"matching-malformed-content"));
         let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
         append_batch_text(&mut manifest_key, FILE_ID).unwrap();
-        manifest_key
-            .extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+        manifest_key.extend_from_slice(
+            &crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes(),
+        );
         manifest_key.extend_from_slice(
             CommitId::for_test_label("matching-certified-commit")
                 .as_uuid()

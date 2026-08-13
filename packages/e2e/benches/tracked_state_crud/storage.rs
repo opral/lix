@@ -48,16 +48,16 @@ impl StorageProfile {
     pub(crate) fn storage(self) -> ProfileStorage {
         match self {
             Self::RocksDB => {
-                let dir = TempDir::new().expect("create rocksdb bench tempdir");
-                let storage = RocksDB::open(dir.path().join("bench.rocksdb"))
-                    .expect("open rocksdb bench storage");
+                let (path, dir) = profile_path("rocksdb");
+                let storage =
+                    RocksDB::open(path.join("bench.rocksdb")).expect("open rocksdb bench storage");
                 ProfileStorage::RocksDB { storage, _dir: dir }
             }
             #[cfg(feature = "slatedb")]
             Self::SlateDB => {
-                let dir = TempDir::new().expect("create slatedb bench tempdir");
+                let (path, dir) = profile_path("slatedb");
                 let storage =
-                    SlateDB::open(dir.path().join("bench.slatedb")).expect("open slatedb storage");
+                    SlateDB::open(path.join("bench.slatedb")).expect("open slatedb storage");
                 ProfileStorage::SlateDB { storage, _dir: dir }
             }
             #[cfg(feature = "slatedb")]
@@ -95,4 +95,19 @@ impl StorageProfile {
             }
         }
     }
+}
+
+fn profile_path(adapter: &str) -> (std::path::PathBuf, TempDir) {
+    if let Some(root) = std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_DB_ROOT") {
+        let root = std::path::PathBuf::from(root).join(adapter);
+        std::fs::create_dir_all(&root).expect("create retained benchmark database root");
+        let mut dir = tempfile::Builder::new()
+            .prefix("sample-")
+            .tempdir_in(root)
+            .expect("create retained benchmark database directory");
+        dir.disable_cleanup(true);
+        return (dir.path().to_path_buf(), dir);
+    }
+    let dir = TempDir::new().expect("create benchmark tempdir");
+    (dir.path().to_path_buf(), dir)
 }
