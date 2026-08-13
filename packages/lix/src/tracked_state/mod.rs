@@ -102,7 +102,7 @@ pub(crate) use storage::{
 pub(crate) use storage::{
     RetainedPhysicalState, collect_current_state_part_json_refs,
     collect_local_commit_delta_json_refs, load_native_current_state_part_owners,
-    stage_retire_commit_physical_state,
+    stage_delete_commit_state_manifest_for_gc, stage_retire_commit_physical_state,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::decode_change_locator;
