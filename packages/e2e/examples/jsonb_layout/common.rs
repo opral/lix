@@ -1,5 +1,8 @@
 use serde_json::Value;
 
+pub const MAX_ENCODED_BYTES: usize = u32::MAX as usize;
+pub const MAX_NUMBER_DIGITS: usize = MAX_ENCODED_BYTES - 41 - 12;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PathSegment {
     Key(String),
@@ -50,19 +53,58 @@ pub fn normalize_jsonb(value: &mut Value) -> Result<(), String> {
                 values.insert(key, value);
             }
         }
-        Value::Number(number) if !number.is_i64() && !number.is_u64() => {
-            if let Some(number) = number.as_f64() {
-                if number.is_finite()
-                    && number.fract() == 0.0
-                    && number.abs() <= 9_007_199_254_740_992.0
-                {
-                    *value = Value::from(number as i64);
-                }
-            }
+        Value::Number(number) => {
+            let canonical = canonical_decimal(&number.to_string())?;
+            *number = serde_json::from_str(&canonical)
+                .map_err(|error| format!("canonical JSONB number is invalid: {error}"))?;
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Value::Null | Value::Bool(_) => {}
     }
     Ok(())
+}
+
+/// Canonical decimal spelling with no precision loss. The coefficient carries
+/// no leading/trailing zero; the exponent is the sole scale authority.
+pub fn canonical_decimal(raw: &str) -> Result<String, String> {
+    let (negative, raw) = raw
+        .strip_prefix('-')
+        .map_or((false, raw), |raw| (true, raw));
+    let exponent_at = raw.find(['e', 'E']);
+    let (mantissa, exponent) = exponent_at.map_or((raw, "0"), |at| (&raw[..at], &raw[at + 1..]));
+    let exponent = exponent
+        .parse::<i64>()
+        .map_err(|_| "JSONB exponent exceeds i64")?;
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("JSONB number has invalid decimal digits".into());
+    }
+    let mut digits = format!("{integer}{fraction}");
+    let first_nonzero = digits.find(|byte: char| byte != '0');
+    let Some(first_nonzero) = first_nonzero else {
+        return Ok("0".into());
+    };
+    digits.drain(..first_nonzero);
+    let mut scale = i64::try_from(fraction.len())
+        .map_err(|_| "JSONB fractional scale exceeds i64")?
+        .checked_sub(exponent)
+        .ok_or("JSONB decimal scale overflow")?;
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+        scale = scale.checked_sub(1).ok_or("JSONB decimal scale overflow")?;
+    }
+    if digits.len() > MAX_NUMBER_DIGITS {
+        return Err("JSONB numeric coefficient exceeds the v1 cell bound".into());
+    }
+    let sign = if negative { "-" } else { "" };
+    if scale == 0 {
+        Ok(format!("{sign}{digits}"))
+    } else {
+        let exponent = scale.checked_neg().ok_or("JSONB exponent overflow")?;
+        Ok(format!("{sign}{digits}e{exponent}"))
+    }
 }
 
 pub fn canonical_text(value: &Value) -> Result<Vec<u8>, String> {
@@ -224,6 +266,42 @@ mod tests {
         let object = parse_jsonb(r#"{"a":3,"b":2}"#).unwrap();
         for equivalent in [r#" { "b" : 2, "a" : 3 } "#, r#"{"a":1,"\u0061":3,"b":2}"#] {
             assert_eq!(parse_jsonb(equivalent).unwrap(), object, "{equivalent}");
+        }
+    }
+
+    #[test]
+    fn jsonb_numbers_are_lossless_across_precision_boundaries() {
+        for equivalent in [
+            [
+                "9007199254740993",
+                "9007199254740993.0",
+                "90071992547409930e-1",
+            ],
+            [
+                "1.234567890123456789",
+                "1234567890123456789e-18",
+                "1.2345678901234567890",
+            ],
+            [
+                "18446744073709551616",
+                "184467440737095516160e-1",
+                "1.8446744073709551616e19",
+            ],
+        ] {
+            let expected = parse_jsonb(equivalent[0]).unwrap();
+            for spelling in equivalent {
+                assert_eq!(parse_jsonb(spelling).unwrap(), expected, "{spelling}");
+            }
+        }
+        assert_ne!(
+            parse_jsonb("9007199254740993").unwrap(),
+            parse_jsonb("9007199254740992").unwrap()
+        );
+        for spelling in ["1e9223372036854775807", "1e-9223372036854775807"] {
+            assert!(parse_jsonb(spelling).is_ok(), "{spelling}");
+        }
+        for spelling in ["1e9223372036854775808", "1e-9223372036854775808"] {
+            assert!(parse_jsonb(spelling).is_err(), "{spelling}");
         }
     }
 

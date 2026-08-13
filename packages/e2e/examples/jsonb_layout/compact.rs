@@ -1,26 +1,24 @@
 use serde_json::{Map, Number, Value};
 
-use super::common::{self, content_id, JsonbCodec, PathSegment};
+use super::common::{self, JsonbCodec, PathSegment, content_id};
 
 pub struct CompactCodec;
 
 const MAGIC: &[u8; 4] = b"LJCI";
 const VERSION: u8 = 1;
 const HEADER: usize = 41;
-const SMALL_LIMIT: usize = 8;
+const SMALL_LIMIT: usize = 12;
 const INDEX_PAGE_ENTRIES: usize = 32;
 
 const NULL: u8 = 0;
 const FALSE: u8 = 1;
 const TRUE: u8 = 2;
-const I64: u8 = 3;
-const U64: u8 = 4;
-const F64: u8 = 5;
-const STRING: u8 = 6;
-const SMALL_ARRAY: u8 = 7;
-const INDEXED_ARRAY: u8 = 8;
-const SMALL_OBJECT: u8 = 9;
-const INDEXED_OBJECT: u8 = 10;
+const NUMBER: u8 = 3;
+const STRING: u8 = 4;
+const SMALL_ARRAY: u8 = 5;
+const INDEXED_ARRAY: u8 = 6;
+const SMALL_OBJECT: u8 = 7;
+const INDEXED_OBJECT: u8 = 8;
 
 impl JsonbCodec for CompactCodec {
     const NAME: &'static str = "compact-indexed";
@@ -37,6 +35,7 @@ impl JsonbCodec for CompactCodec {
 
     fn project_path(bytes: &[u8], path: &[PathSegment]) -> Result<Option<Vec<u8>>, String> {
         let mut frame = open(bytes)?;
+        validate_frame(frame)?;
         for segment in path {
             let parsed = Container::parse(frame)?;
             frame = match (parsed, segment) {
@@ -70,6 +69,7 @@ impl JsonbCodec for CompactCodec {
         let mut replacement = replacement.clone();
         common::normalize_jsonb(&mut replacement)?;
         let replacement = encode_frame(&replacement)?;
+        validate_frame(open(bytes)?)?;
         if path.is_empty() {
             return wrap(replacement);
         }
@@ -148,20 +148,22 @@ fn encode_frame(value: &Value) -> Result<Vec<u8>, String> {
 }
 
 fn encode_number(number: &Number, output: &mut Vec<u8>) -> Result<(), String> {
-    if let Some(value) = number.as_i64() {
-        output.push(I64);
-        put_varint(((value << 1) ^ (value >> 63)) as u64, output);
-    } else if let Some(value) = number.as_u64() {
-        output.push(U64);
-        put_varint(value, output);
-    } else {
-        let value = number
-            .as_f64()
-            .filter(|value| value.is_finite())
-            .ok_or_else(|| "JSON number has no finite representation".to_owned())?;
-        output.push(F64);
-        output.extend_from_slice(&value.to_bits().to_le_bytes());
-    }
+    let canonical = common::canonical_decimal(&number.to_string())?;
+    let (negative, unsigned) = canonical
+        .strip_prefix('-')
+        .map_or((false, canonical.as_str()), |value| (true, value));
+    let (digits, exponent) = unsigned
+        .split_once('e')
+        .map_or((unsigned, 0_i64), |(digits, exponent)| {
+            (digits, exponent.parse().expect("canonical exponent"))
+        });
+    let scale = exponent
+        .checked_neg()
+        .ok_or("JSONB numeric scale overflow")?;
+    output.push(NUMBER);
+    output.push(u8::from(negative));
+    put_varint(((scale << 1) ^ (scale >> 63)) as u64, output);
+    output.extend_from_slice(digits.as_bytes());
     Ok(())
 }
 
@@ -247,7 +249,7 @@ impl<'a> Container<'a> {
             INDEXED_ARRAY => parse_indexed_array(payload).map(Self::Array),
             SMALL_OBJECT => parse_small_object(payload).map(Self::Object),
             INDEXED_OBJECT => parse_indexed_object(payload).map(Self::Object),
-            NULL | FALSE | TRUE | I64 | U64 | F64 | STRING => Ok(Self::Scalar),
+            NULL | FALSE | TRUE | NUMBER | STRING => Ok(Self::Scalar),
             _ => Err(format!("unknown compact JSONB tag {tag}")),
         }
     }
@@ -415,31 +417,7 @@ fn decode_frame(frame: &[u8]) -> Result<Value, String> {
         NULL if payload.is_empty() => Ok(Value::Null),
         FALSE if payload.is_empty() => Ok(Value::Bool(false)),
         TRUE if payload.is_empty() => Ok(Value::Bool(true)),
-        I64 => {
-            let mut payload = payload;
-            let raw = take_varint(&mut payload, "i64")?;
-            if !payload.is_empty() {
-                return Err("i64 has trailing bytes".to_owned());
-            }
-            Ok(Value::from(((raw >> 1) as i64) ^ -((raw & 1) as i64)))
-        }
-        U64 => {
-            let mut payload = payload;
-            let value = take_varint(&mut payload, "u64")?;
-            if !payload.is_empty() || value <= i64::MAX as u64 {
-                return Err("u64 is not canonical".to_owned());
-            }
-            Ok(Value::from(value))
-        }
-        F64 if payload.len() == 8 => {
-            let value = f64::from_bits(u64::from_le_bytes(payload.try_into().expect("eight")));
-            if !value.is_finite()
-                || (value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_992.0)
-            {
-                return Err("f64 is not canonical".to_owned());
-            }
-            Ok(Value::Number(Number::from_f64(value).ok_or("invalid f64")?))
-        }
+        NUMBER => decode_number(payload),
         STRING => {
             let value = std::str::from_utf8(payload).map_err(|_| "invalid UTF-8 string")?;
             reject_nul(value, "string")?;
@@ -470,6 +448,40 @@ fn decode_frame(frame: &[u8]) -> Result<Value, String> {
         }),
         _ => Err(format!("invalid compact JSONB tag or payload {tag}")),
     }
+}
+
+fn decode_number(mut payload: &[u8]) -> Result<Value, String> {
+    let (&negative, rest) = payload.split_first().ok_or("number sign is truncated")?;
+    if negative > 1 {
+        return Err("number sign is invalid".into());
+    }
+    payload = rest;
+    let raw_scale = take_varint(&mut payload, "number scale")?;
+    let scale = ((raw_scale >> 1) as i64) ^ -((raw_scale & 1) as i64);
+    let digits = std::str::from_utf8(payload).map_err(|_| "number digits are not UTF-8")?;
+    if digits.len() > common::MAX_NUMBER_DIGITS {
+        return Err("number coefficient exceeds the v1 cell bound".to_owned());
+    }
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && (digits.starts_with('0') || digits.ends_with('0')))
+        || (digits == "0" && (negative != 0 || scale != 0))
+    {
+        return Err("number coefficient is not canonical".into());
+    }
+    let sign = if negative == 1 { "-" } else { "" };
+    let spelling = if scale == 0 {
+        format!("{sign}{digits}")
+    } else {
+        let exponent = scale.checked_neg().ok_or("number exponent overflow")?;
+        format!("{sign}{digits}e{exponent}")
+    };
+    let number = serde_json::from_str::<Number>(&spelling)
+        .map_err(|error| format!("invalid canonical number: {error}"))?;
+    if common::canonical_decimal(&number.to_string())? != spelling {
+        return Err("number spelling is not canonical".into());
+    }
+    Ok(Value::Number(number))
 }
 
 fn validate_frame(frame: &[u8]) -> Result<(), String> {
@@ -596,4 +608,61 @@ fn push_u32(value: usize, output: &mut Vec<u8>, context: &str) -> Result<(), Str
             .to_le_bytes(),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_untouched_sibling_fails_projection_and_rewrite() {
+        let mut encoded = CompactCodec::encode(&serde_json::json!({"a": 1, "z": 2})).unwrap();
+        let child_offset = {
+            let Container::Object(entries) = Container::parse(open(&encoded).unwrap()).unwrap()
+            else {
+                panic!("object")
+            };
+            entries[1].1.as_ptr() as usize - encoded.as_ptr() as usize
+        };
+        encoded[child_offset] = 0xff;
+        let hash = content_id(&encoded[HEADER..]);
+        encoded[9..HEADER].copy_from_slice(&hash);
+
+        assert!(
+            CompactCodec::project_path(&encoded, &[PathSegment::Key("missing".into())]).is_err()
+        );
+        assert!(
+            CompactCodec::rewrite_path(
+                &encoded,
+                &[PathSegment::Key("a".into())],
+                &serde_json::json!(3),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn trusted_outer_content_id_rejects_recomputed_substitution() {
+        let original = CompactCodec::encode(&serde_json::json!({"a": 1})).unwrap();
+        let substituted = CompactCodec::encode(&serde_json::json!({"a": 2})).unwrap();
+        assert_eq!(original.len(), substituted.len());
+        let trusted_id = content_id(&original);
+        assert_ne!(content_id(&substituted), trusted_id);
+        assert_eq!(
+            CompactCodec::decode(&substituted).unwrap(),
+            serde_json::json!({"a": 2})
+        );
+    }
+
+    #[test]
+    fn noncanonical_numeric_coefficient_fails_after_envelope_rehash() {
+        let root = [NUMBER, 0, 0, b'4', b'0'];
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(MAGIC);
+        encoded.push(VERSION);
+        encoded.extend_from_slice(&u32::try_from(HEADER + root.len()).unwrap().to_le_bytes());
+        encoded.extend_from_slice(&content_id(&root));
+        encoded.extend_from_slice(&root);
+        assert!(CompactCodec::decode(&encoded).is_err());
+    }
 }

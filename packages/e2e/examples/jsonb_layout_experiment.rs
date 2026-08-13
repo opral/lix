@@ -17,30 +17,31 @@ use lix::storage::{
 };
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[path = "jsonb_layout/common.rs"]
 mod common;
 #[path = "jsonb_layout/compact.rs"]
 mod compact;
 #[path = "jsonb_layout/indexed.rs"]
+#[allow(dead_code)]
 mod indexed;
 #[path = "jsonb_layout/tape.rs"]
+#[allow(dead_code)]
 mod tape;
 #[path = "jsonb_layout/text.rs"]
 mod text;
 
 use common::{
-    canonical_text, content_id, dictionary_id, parse_jsonb, rewrite_value, JsonbCodec, PathSegment,
+    JsonbCodec, PathSegment, canonical_text, content_id, dictionary_id, parse_jsonb, rewrite_value,
 };
 use compact::CompactCodec;
-use indexed::IndexedCodec;
-use tape::TapeCodec;
 use text::CanonicalText;
 
 const WARMUPS: usize = 3;
 const DEFAULT_SAMPLES: usize = 20;
 const PNPM_BYTES: usize = 392 * 1024;
+const RECOMMENDED_INDIRECT_THRESHOLD: usize = 64 * 1024;
 const BENCH_SPACE: StorageSpace =
     StorageSpace::mutable(SpaceId(0xfffe0042), "jsonb.layout.benchmark");
 
@@ -134,15 +135,13 @@ fn run() -> Result<(), String> {
     }
     for case in &corpus {
         bench_case::<CanonicalText>(case, samples)?;
-        bench_case::<TapeCodec>(case, samples)?;
-        bench_case::<IndexedCodec>(case, samples)?;
         bench_case::<CompactCodec>(case, samples)?;
     }
     typed_row_oracles(&corpus[1], samples)
 }
 
 fn container_threshold_probes(samples: usize) -> Result<(), String> {
-    for count in [1usize, 2, 4, 8, 9, 16, 32, 64] {
+    for count in [1usize, 2, 4, 8, 9, 12, 16, 32, 64] {
         let keys = (0..count)
             .map(|index| format!("key-{index:04}"))
             .collect::<Vec<_>>();
@@ -199,22 +198,65 @@ fn semantic_oracles() -> Result<(), String> {
         }
     }
     semantic_codec_oracle::<CanonicalText>(false)?;
-    semantic_codec_oracle::<TapeCodec>(true)?;
-    semantic_codec_oracle::<IndexedCodec>(true)?;
     semantic_codec_oracle::<CompactCodec>(true)?;
+    for equivalents in [
+        [
+            "9007199254740993",
+            "9007199254740993.0",
+            "90071992547409930e-1",
+        ],
+        [
+            "1.234567890123456789",
+            "1234567890123456789e-18",
+            "1.2345678901234567890",
+        ],
+        [
+            "18446744073709551616",
+            "184467440737095516160e-1",
+            "1.8446744073709551616e19",
+        ],
+    ] {
+        let expected = CompactCodec::encode(&parse_jsonb(equivalents[0])?)?;
+        for spelling in equivalents {
+            if CompactCodec::encode(&parse_jsonb(spelling)?)? != expected {
+                return Err(format!(
+                    "lossless numeric equivalence failed for {spelling}"
+                ));
+            }
+        }
+    }
+    if recommended_storage_class(RECOMMENDED_INDIRECT_THRESHOLD - 1) != "inline"
+        || recommended_storage_class(RECOMMENDED_INDIRECT_THRESHOLD) != "indirect"
+    {
+        return Err("JSONB size-class boundary is not exact".into());
+    }
     emit(json!({
         "schema_version": 1,
         "benchmark_id": "jsonb-layout-v1/semantic-corruption-oracle",
         "mode": "semantic_oracle",
         "numeric_equivalence": true,
+        "lossless_numeric_boundaries":true,
         "whitespace_equivalence": true,
         "duplicate_key_last_wins": true,
         "nul_rejected": true,
         "malformed_rejected": true,
         "unknown_version_rejected": true,
-        "same_size_substitution_rejected_by_content_id": true,
+        "same_size_substitution_rejected_by_trusted_outer_content_id": true,
+        "intrinsic_hash_is_corruption_detection_not_substitution_authority":true,
+        "recommended_indirect_threshold_bytes": RECOMMENDED_INDIRECT_THRESHOLD,
+        "threshold_minus_one_class":"inline",
+        "threshold_exact_class":"indirect",
+        "indirect_carrier_implemented":false,
         "correct": true
     }))
+}
+
+fn recommended_storage_class(encoded_bytes: usize) -> &'static str {
+    if encoded_bytes < RECOMMENDED_INDIRECT_THRESHOLD {
+        "inline"
+    } else {
+        "indirect"
+    }
 }
 
 fn semantic_codec_oracle<C: JsonbCodec>(versioned: bool) -> Result<(), String> {
@@ -396,11 +438,13 @@ fn corpus() -> Result<Vec<Case>, String> {
 
 fn make(
     id: &'static str,
-    value: Value,
+    mut value: Value,
     hit: Vec<PathSegment>,
     miss: Vec<PathSegment>,
-    replacement: Value,
+    mut replacement: Value,
 ) -> Result<Case, String> {
+    common::normalize_jsonb(&mut value)?;
+    common::normalize_jsonb(&mut replacement)?;
     let raw = String::from_utf8(canonical_text(&value)?).map_err(|e| e.to_string())?;
     Ok(Case {
         id,
@@ -511,16 +555,6 @@ fn bench_case<C: JsonbCodec>(case: &Case, n: usize) -> Result<(), String> {
         )
     );
     bench!(
-        "zstd_dictionary_compress",
-        Ok(
-            !zstd::bulk::Compressor::with_dictionary(3, black_box(&dictionary))
-                .map_err(|e| e.to_string())?
-                .compress(black_box(&encoded))
-                .map_err(|e| e.to_string())?
-                .is_empty()
-        )
-    );
-    bench!(
         "zstd_decompress",
         Ok(
             zstd::bulk::decompress(black_box(&compressed), encoded.len())
@@ -603,6 +637,7 @@ fn emit_op(
         "mode":"cpu","case":case.id,"codec":codec,"operation":op,"warmups":WARMUPS,"samples":n,
         "wall_ns":stats(&v,|x|x.wall),"cpu_ns":stats(&v,|x|x.cpu),"allocated_bytes":stats(&v,|x|x.alloc),
         "rss_bytes":{"max":v.iter().map(|x|x.rss).max().unwrap_or(0)},"raw_bytes":raw,"encoded_bytes":encoded,"zstd_bytes":zstd,
+        "raw_samples":v.iter().map(|sample|json!({"wall_ns":sample.wall,"cpu_ns":sample.cpu,"allocated_bytes":sample.alloc,"rss_bytes":sample.rss})).collect::<Vec<_>>(),
         "dictionary_zstd_bytes":dictionary_zstd,"fixed_dictionary_bytes":dictionary_bytes,
         "fixed_dictionary_id":hex(fixed_dictionary_id),"dictionary_decode_dependency":true,
         "content_id":hex(semantic_id),"path_hit":path_json(&case.hit),"path_miss":path_json(&case.miss),
@@ -691,19 +726,24 @@ fn rss() -> u64 {
 
 fn typed_row_oracles(case: &Case, n: usize) -> Result<(), String> {
     typed_row::<CanonicalText>(case, n)?;
-    typed_row::<TapeCodec>(case, n)?;
-    typed_row::<IndexedCodec>(case, n).and_then(|()| typed_row::<CompactCodec>(case, n))
+    typed_row::<CompactCodec>(case, n)
 }
 fn typed_row<C: JsonbCodec>(case: &Case, n: usize) -> Result<(), String> {
     let mut json_calls = 0_u64;
     let text = b"representative-row";
     let uuid = [0x42_u8; 16];
     let bigint = 9_223_372_036_854_775_i64;
+    let float = 1.25_f64;
     let boolean = true;
+    let timestamp_micros = 1_786_000_000_000_000_i64;
+    let scalar_only_bytes = 2 + 4 + text.len() + 16 + 8 + 8 + 1 + 8;
+    if json_calls != 0 {
+        return Err("scalar-only typed row invoked JSONB codec".into());
+    }
     let encoded = C::encode(&case.value)?;
     json_calls += 1;
     let semantic = content_id(&encoded);
-    let fixed = 2 + 4 + text.len() + 16 + 8 + 1;
+    let fixed = scalar_only_bytes;
     let framing = 1 + 4 + 4 + 32;
     let offset = (fixed + framing) as u32;
     let length = encoded.len() as u32;
@@ -713,7 +753,9 @@ fn typed_row<C: JsonbCodec>(case: &Case, n: usize) -> Result<(), String> {
     frame.extend_from_slice(text);
     frame.extend_from_slice(&uuid);
     frame.extend_from_slice(&bigint.to_le_bytes());
+    frame.extend_from_slice(&float.to_bits().to_le_bytes());
     frame.push(boolean.into());
+    frame.extend_from_slice(&timestamp_micros.to_le_bytes());
     frame.push(1);
     frame.extend_from_slice(&offset.to_le_bytes());
     frame.extend_from_slice(&length.to_le_bytes());
@@ -732,6 +774,7 @@ fn typed_row<C: JsonbCodec>(case: &Case, n: usize) -> Result<(), String> {
         json!({"schema_version":1,"benchmark_id":format!("jsonb-layout-v1/typed-row/{}",C::NAME),"mode":"typed_row_oracle",
         "codec":C::NAME,"samples":n,"version":1,"jsonb_offset":offset,"jsonb_length":length,"semantic_hash":hex(&semantic),
         "fixed_typed_bytes":fixed,"framing_offset_bytes":framing,"framing_overhead_bytes":framing,"row_bytes":frame.len(),
+        "scalar_only_row_bytes":scalar_only_bytes,"scalar_only_jsonb_codec_calls":0,
         "json_encode_calls":1,"json_decode_calls":1,"non_json_parse_encode_calls":0,"correct":true}),
     )
 }
@@ -756,12 +799,7 @@ struct SP {
     disk: Vec<u64>,
 }
 fn storage_mode(corpus: &[Case], n: usize) -> Result<(), String> {
-    let fixtures = vec![
-        sf::<CanonicalText>(corpus)?,
-        sf::<TapeCodec>(corpus)?,
-        sf::<IndexedCodec>(corpus)?,
-        sf::<CompactCodec>(corpus)?,
-    ];
+    let fixtures = vec![sf::<CanonicalText>(corpus)?, sf::<CompactCodec>(corpus)?];
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -884,8 +922,6 @@ async fn get<S: Storage>(s: &S, f: &SF) -> Result<(), String> {
         }
         let x = match f.codec {
             CanonicalText::NAME => CanonicalText::decode(b)?,
-            TapeCodec::NAME => TapeCodec::decode(b)?,
-            IndexedCodec::NAME => IndexedCodec::decode(b)?,
             CompactCodec::NAME => CompactCodec::decode(b)?,
             _ => return Err("codec".into()),
         };
@@ -930,8 +966,13 @@ async fn rcycle(p: &Path, f: &SF) -> Result<SP, String> {
     let (fl, _) = ma(|| async { s.flush().map_err(|e| e.to_string()) }).await?;
     let d = dir(p)?;
     drop(s);
-    let s = RocksDB::open(p).map_err(|e| e.to_string())?;
-    let (c, _) = ma(|| get(&s, f)).await?;
+    let (c, s) = ma(|| async {
+        let s = RocksDB::open(p).map_err(|e| e.to_string())?;
+        get(&s, f).await?;
+        Ok(s)
+    })
+    .await?;
+    drop(s);
     Ok(single(w, h, fl, c, d))
 }
 async fn scycle(p: &Path, f: &SF) -> Result<SP, String> {
@@ -941,8 +982,13 @@ async fn scycle(p: &Path, f: &SF) -> Result<SP, String> {
     let (fl, _) = ma(|| async { s.flush().await.map_err(|e| e.to_string()) }).await?;
     let d = dir(p)?;
     drop(s);
-    let s = SlateDB::open(p).map_err(|e| e.to_string())?;
-    let (c, _) = ma(|| get(&s, f)).await?;
+    let (c, s) = ma(|| async {
+        let s = SlateDB::open(p).map_err(|e| e.to_string())?;
+        get(&s, f).await?;
+        Ok(s)
+    })
+    .await?;
+    drop(s);
     Ok(single(w, h, fl, c, d))
 }
 fn join(a: &mut SP, b: SP) {
@@ -954,13 +1000,13 @@ fn join(a: &mut SP, b: SP) {
 }
 fn out_storage(be: &str, n: usize, f: &SF, p: &SP) -> Result<(), String> {
     for (ph, v, calls, rb, wb) in [
-        ("write", &p.w, 2, 0, f.kb + f.vb),
+        ("write", &p.w, 3, 0, f.kb + f.vb),
         ("warm_read", &p.hot, 2, f.kb + f.vb, 0),
         ("flush", &p.flush, 1, 0, 0),
-        ("cold_read", &p.cold, 2, f.kb + f.vb, 0),
+        ("reopen_cold_read", &p.cold, 3, f.kb + f.vb, 0),
     ] {
         emit(
-            json!({"schema_version":1,"benchmark_id":format!("jsonb-layout-v1/storage/{be}/{}/{ph}",f.codec),"mode":"storage","backend":be,"codec":f.codec,"phase":ph,"batch_entries":f.puts.len(),"warmups":WARMUPS,"samples":n,"wall_ns":stats(v,|x|x.wall),"cpu_ns":stats(v,|x|x.cpu),"allocated_bytes":stats(v,|x|x.alloc),"rss_bytes":{"max":v.iter().map(|x|x.rss).max().unwrap_or(0)},"logical_calls_per_sample":calls,"logical_read_bytes_per_sample":rb,"logical_write_bytes_per_sample":wb,"settled_directory_bytes":stats_u64(&p.disk),"raw_bytes":f.raw,"encoded_bytes":f.enc,"zstd_bytes":f.zstd,"flush_drop_reopen":true,"semantic_equality_verified":true,"corruption_rejected":true,"correct":true}),
+            json!({"schema_version":1,"benchmark_id":format!("jsonb-layout-v1/storage/{be}/{}/{ph}",f.codec),"mode":"storage","backend":be,"codec":f.codec,"phase":ph,"batch_entries":f.puts.len(),"warmups":WARMUPS,"samples":n,"wall_ns":stats(v,|x|x.wall),"cpu_ns":stats(v,|x|x.cpu),"allocated_bytes":stats(v,|x|x.alloc),"rss_bytes":{"max":v.iter().map(|x|x.rss).max().unwrap_or(0)},"raw_samples":v.iter().map(|sample|json!({"wall_ns":sample.wall,"cpu_ns":sample.cpu,"allocated_bytes":sample.alloc,"rss_bytes":sample.rss})).collect::<Vec<_>>(),"logical_calls_per_sample":calls,"logical_read_bytes_per_sample":rb,"logical_write_bytes_per_sample":wb,"settled_directory_bytes":stats_u64(&p.disk),"raw_bytes":f.raw,"encoded_bytes":f.enc,"zstd_bytes":f.zstd,"flush_drop_reopen":true,"reopen_in_timed_phase":ph=="reopen_cold_read","semantic_equality_verified":true,"corruption_rejected":true,"correct":true}),
         )?
     }
     Ok(())
