@@ -91,6 +91,24 @@ pub(crate) const COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     COLLECTION_CONTROL_NAMESPACE,
     ValueSemantics::Mutable,
 );
+
+/// Engagement counters for the canonical `created_at` recovery that shares the
+/// retention fence's batch.
+///
+/// These sit *inside* the route they measure: `LOOKUPS` counts commits that
+/// submitted a non-empty key list, `KEYS` the identities submitted, and `HITS`
+/// the inheritances actually applied. A timing instrument one layer up cannot
+/// distinguish "the recovery is free" from "the recovery never ran", so the
+/// counts are read directly rather than inferred from a flat measurement.
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static BROAD_CANONICAL_CREATED_AT_LOOKUPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static BROAD_CANONICAL_CREATED_AT_KEYS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static BROAD_CANONICAL_CREATED_AT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Generation-local immutable current-state bases.
 ///
 /// Each tiny record points at one already-authored packed commit delta. Fresh
@@ -8071,7 +8089,15 @@ where
         // so checkpoint-expanded tombstones do not decrement the freshly reset
         // live count.
         apply_incremental_collection_generation_deltas(&mut collection_controls, &sorted)?;
-        for (delta, previous) in sorted.iter().zip(&mut previous_values) {
+        // A predecessor nulled here is absent for a reason that has nothing to
+        // do with a missing serving row: its generation was retired. Canonical
+        // state still holds that identity, so a canonical `created_at` lookup
+        // would happily resolve it and silently change the timestamp a
+        // re-insert after a generation retirement reports today. Remember which
+        // slots were nulled for that reason so the lookup below can exclude
+        // them. This is transaction-local and durably stores nothing.
+        let mut retired_predecessor = vec![false; previous_values.len()];
+        for (index, (delta, previous)) in sorted.iter().zip(&mut previous_values).enumerate() {
             if delta.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
                 continue;
             }
@@ -8091,6 +8117,7 @@ where
                 });
             if belongs_to_retired_generation {
                 *previous = None;
+                retired_predecessor[index] = true;
             }
         }
         // Narrowed retention fence.
@@ -8107,22 +8134,57 @@ where
         //
         // Consulting canonical state at the branch head restores the fence
         // where the serving view cannot carry it, and keeps the refusal on the
-        // insert. Cost is bounded to commits that actually contain an
-        // untracked write with an unresolvable predecessor; every other commit
-        // builds an empty key list and performs no additional I/O.
+        // insert.
+        //
+        // This block's key list used to be untracked-only, which left it empty
+        // on every ordinary commit. It no longer is — see the note below on
+        // the second question the same batch now answers, and the cost that
+        // widening carries.
+        // The same batch answers a second question. A tracked insert whose
+        // predecessor is absent is either a genuinely new identity — canonical
+        // holds nothing, the lookup misses, and `delta.created_at` stands — or
+        // an identity whose serving-view predecessor is gone while canonical
+        // still carries its `created_at`. Serving-layer tombstone compaction
+        // creates exactly the second case, and nothing else in the engine
+        // rejects the fresh timestamp that would otherwise be minted, so the
+        // recovery has to happen here.
+        //
+        // This rides the retention fence's existing read: same commit, same
+        // key list, same `identity_only` projection. `created_at` is a
+        // descriptor column rather than a change-record payload, so it is
+        // already materialized and the projection does not widen. What does
+        // change is how often the block runs: the untracked-only filter left
+        // it empty on ordinary tracked inserts, and it now executes whenever a
+        // commit introduces a new identity.
+        let mut canonical_created_ats: Vec<Option<LixTimestamp>> = Vec::new();
         {
-            let unresolved = sorted
-                .iter()
-                .zip(&previous_values)
-                .filter(|(delta, previous)| {
-                    delta.untracked && !delta.deleted && previous.is_none()
-                })
-                .map(|(delta, _)| TrackedStateKeyRef {
+            let mut unresolved = Vec::new();
+            let mut unresolved_slots = Vec::new();
+            for (index, (delta, previous)) in sorted.iter().zip(&previous_values).enumerate() {
+                // The fence's key set must be preserved exactly: it always
+                // included retired-generation slots, and dropping them here
+                // would quietly weaken it. Only the *tracked* retired slots
+                // are excluded, and only because they must not inherit — they
+                // never reached the fence in the first place.
+                if delta.deleted
+                    || previous.is_some()
+                    || (!delta.untracked && retired_predecessor[index])
+                {
+                    continue;
+                }
+                unresolved.push(TrackedStateKeyRef {
                     schema_key: delta.schema_key,
                     file_id: delta.file_id,
                     entity_pk: delta.entity_pk,
-                })
-                .collect::<Vec<_>>();
+                });
+                unresolved_slots.push((index, delta.untracked));
+            }
+            #[cfg(any(test, feature = "storage-benches"))]
+            if !unresolved.is_empty() {
+                BROAD_CANONICAL_CREATED_AT_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                BROAD_CANONICAL_CREATED_AT_KEYS
+                    .fetch_add(unresolved.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             if !unresolved.is_empty()
                 && let Some(control) = BranchHeadControlContext::new()
                     .reader(self.store)
@@ -8153,11 +8215,17 @@ where
                         &ChangeRecordProjection::identity_only(),
                     )
                     .await?;
-                for (slot, key) in unresolved.iter().enumerate() {
-                    // Any canonical row for the identity — live or tombstoned —
-                    // means it has been tracked, which is exactly what
-                    // `reject_retention_change` refuses to flip.
-                    if canonical.row(slot).is_some() {
+                canonical_created_ats = vec![None; sorted.len()];
+                for (slot, (index, untracked)) in unresolved_slots.iter().copied().enumerate() {
+                    let Some(row) = canonical.row(slot) else {
+                        continue;
+                    };
+                    if untracked {
+                        // Any canonical row for the identity — live or
+                        // tombstoned — means it has been tracked, which is
+                        // exactly what `reject_retention_change` refuses to
+                        // flip.
+                        let key = &unresolved[slot];
                         return Err(LixError::new(
                             LixError::CODE_UNIQUE,
                             format!(
@@ -8166,13 +8234,30 @@ where
                             ),
                         ));
                     }
+                    // A tracked insert over an identity canonical still knows.
+                    // Inherit its first `created_at` rather than minting a new
+                    // one, which is what the serving view's predecessor would
+                    // have supplied had it still been there.
+                    canonical_created_ats[index] = Some(row.created_at());
+                    #[cfg(any(test, feature = "storage-benches"))]
+                    BROAD_CANONICAL_CREATED_AT_HITS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
         let mut created_ats = Vec::with_capacity(sorted.len());
-        for (delta, previous) in sorted.iter().zip(&previous_values) {
+        for (index, (delta, previous)) in sorted.iter().zip(&previous_values).enumerate() {
             let Some(previous) = previous else {
-                created_ats.push(delta.created_at);
+                // Canonical supplies the timestamp when it still knows the
+                // identity; otherwise this is a genuinely new row and mints
+                // its own.
+                created_ats.push(
+                    canonical_created_ats
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(delta.created_at),
+                );
                 continue;
             };
             let existing = previous.view()?;
@@ -12789,6 +12874,79 @@ mod tests {
         StorageGetManyResult, StorageKeyRange, StorageReadOptions, StorageScanCursor,
         StorageWriteOptions,
     };
+
+    /// `HotCollectionControl` is `#[musli(packed)]`: its fields are positional
+    /// and the encoding carries no field tags or length prefix. Appending a
+    /// fourth field therefore appends bytes that a three-field reader cannot
+    /// account for, and `storage_codec::decode` rejects trailing bytes rather
+    /// than ignoring them.
+    ///
+    /// This pins the cost of carrying a per-collection flag (for example a
+    /// "this collection has been compacted" bit) on the control record: it is
+    /// an on-disk format break that requires a repository protocol bump, the
+    /// same way the `ordered_identity_digest` field did. It is not an additive
+    /// change.
+    #[test]
+    fn adding_a_field_to_the_packed_collection_control_breaks_older_readers() {
+        #[derive(musli::Encode)]
+        #[musli(packed)]
+        struct WidenedHotCollectionControl {
+            active_generation: CommitId,
+            live_count: u64,
+            ordered_identity_digest: Option<[u8; 32]>,
+            compacted: bool,
+        }
+
+        let generation = CommitId::for_test_label("compaction-arity");
+
+        // Both digest states matter. A `None` option and a `Some` option lay
+        // out differently in packed mode, so each has to be checked
+        // separately: the danger to rule out is not only a loud failure but a
+        // decode that silently succeeds with wrong field values.
+        for digest in [None, Some([0xA5u8; 32])] {
+            let current = HotCollectionControl {
+                active_generation: generation,
+                live_count: 7,
+                ordered_identity_digest: digest,
+            };
+            let current_bytes = storage_codec::encode("hot collection control", &current)
+                .expect("current control should encode");
+
+            // Sanity: the three-field control round-trips today, so any
+            // failure below is caused by the added field and nothing else.
+            let round_tripped: HotCollectionControl =
+                storage_codec::decode("hot collection control", &current_bytes)
+                    .expect("current control should round-trip");
+            assert_eq!(round_tripped, current);
+
+            let widened = WidenedHotCollectionControl {
+                active_generation: generation,
+                live_count: 7,
+                ordered_identity_digest: digest,
+                compacted: true,
+            };
+            let widened_bytes = storage_codec::encode("widened hot collection control", &widened)
+                .expect("widened control should encode");
+            assert!(
+                widened_bytes.len() > current_bytes.len(),
+                "the fourth positional field must actually widen the encoding"
+            );
+
+            let error = storage_codec::decode::<HotCollectionControl>(
+                "hot collection control",
+                &widened_bytes,
+            )
+            .expect_err(
+                "a three-field reader must reject a four-field control rather than \
+                 silently decoding it",
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("failed to decode hot collection control"),
+                "expected a decode rejection, got: {message}"
+            );
+        }
+    }
 
     /// The root-base cache has no invalidation rule — it relies entirely on the
     /// key being exact. So the key must actually discriminate: a different base
