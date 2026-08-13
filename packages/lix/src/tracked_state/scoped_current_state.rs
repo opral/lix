@@ -675,6 +675,10 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
     let inherited_scope_filter =
         advance_touched_scope_filter_from_topology(graph_parents, selected_source, Some(&[]))?;
     if inventory.columnar_parts.is_some() {
+        // Bootstrap half of the accelerator: this is the only arm that can
+        // mint a scoped root with no parent root in hand.
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_certified_current_state_columnar_root_publication();
         let root = stage_disjoint_columnar_current_state_pages(
             store,
             writes,
@@ -737,6 +741,11 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
             touched_scope_filter,
         });
     };
+    // Sustain half: the fall-through, not the `else` above. Reaching here means
+    // this publication inherited a scoped root from its serving base and will
+    // carry it forward rather than dropping the accelerator.
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_certified_current_state_parent_root_hit();
     if touched.is_empty() {
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
