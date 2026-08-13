@@ -1461,12 +1461,54 @@ where
     Ok(entries)
 }
 
+/// Routes the descriptor + blob-ref traversal for a known set of file IDs.
+///
+/// # Why this pins `file_ids` as well as the entity primary keys
+///
+/// `lix_binary_blob_ref` is touched by *every* content commit, so the
+/// touched-scope digest's schema-family test can never prove this projection
+/// absent: some commit in almost every workload has a blob-ref member. The
+/// digest also carries a `(schema_key, file_id)` **pair** token, which is
+/// exactly the discriminator this traversal needs — but `scope_digest_outcome`
+/// only reaches the pair probe when the request pins `file_ids`, and returns
+/// `LoadedPresent` otherwise. Leaving `file_ids` empty therefore loaded one
+/// commit delta per reachable commit to discover that its blob-ref member
+/// belongs to a different file.
+///
+/// # Why pinning cannot drop a history row
+///
+/// `change_matches_history_request` treats a non-empty `file_ids` as requiring
+/// a non-null `file_id` that is in the set, so pinning would be a correctness
+/// bug if any matching row could carry a null or different `file_id`. It
+/// cannot, for either of this route's two schema keys:
+///
+/// * `lix_file_descriptor` — `canonicalize_descriptor_file_id` rewrites
+///   `file_id` to the row's own `entity_pk` on **every** normalized descriptor
+///   row, on all three exits of the row normalizer and for tombstones as well
+///   as live rows, and errors if that identity is not a single value. The
+///   planner really can hand it a descriptor row with `file_id: None` (an
+///   `INSERT` that leaves the file ID to the engine), and normalization is what
+///   closes that hole. `delete_restriction_source_domains` already depends on
+///   the same invariant.
+/// * `lix_binary_blob_ref` — every producer (`BlobRefRowInput::append_to` and
+///   `append_blob_ref_tombstone_row`) sets `entity_pk` and `file_id` from the
+///   same file ID, and both schemas are read-only public surfaces, so no caller
+///   can supply a divergent pair.
+///
+/// Because `file_id == entity_pk` holds for both, and this route already pins
+/// `resolved_entity_pks` to the same IDs, the added predicate is implied by the
+/// one already applied: it cannot reject a change the existing entity-PK test
+/// accepts. The identities compare byte-for-byte rather than merely
+/// semantically because `EntityPk::uuid_from_canonical` accepts only the exact
+/// lowercase hyphenated form — a file ID that is not canonical already fails
+/// this function before any pinning happens.
 fn file_history_descriptor_blob_route(
     route: &HistoryRoute,
     lookup_ids: &FileHistoryLookupIds,
 ) -> Result<HistoryRoute, LixError> {
     let mut route = route.clone();
     route.entity_pks = lookup_ids.entity_pks()?;
+    route.file_ids = lookup_ids.0.iter().cloned().collect();
     route.resolved_entity_pks = lookup_ids
         .0
         .iter()
@@ -3069,6 +3111,16 @@ mod tests {
             vec![
                 r#"["01920000-0000-7000-8000-0000000000a2"]"#.to_string(),
                 r#"["01920000-0000-7000-8000-0000000000b2"]"#.to_string()
+            ]
+        );
+        // The digest's `(schema_key, file_id)` pair probe is only reached when
+        // the request pins `file_ids`; without this the blob-ref projection
+        // loads one commit delta per reachable content commit.
+        assert_eq!(
+            route.file_ids,
+            vec![
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                "01920000-0000-7000-8000-0000000000b2".to_string()
             ]
         );
         assert_eq!(route.as_of_commit_ids, vec!["commit-start".to_string()]);
