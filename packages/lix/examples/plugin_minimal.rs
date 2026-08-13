@@ -29,3 +29,9 @@ impl Plugin for MinimalPlugin {
 }
 
 lix::plugin::export!(MinimalPlugin);
+
+// Cargo builds examples as binaries during `cargo test --all-targets`. The
+// packaged-plugin qualification copies this source into a downstream
+// `wasm32-wasip2` library, where no binary entry point is needed.
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+fn main() {}
