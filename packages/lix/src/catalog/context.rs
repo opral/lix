@@ -17,7 +17,7 @@ use crate::hot_state::{
     HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateRowRef,
 };
-use crate::schema::schema_key_from_definition;
+use crate::schema::schema_from_registered_snapshot;
 use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -366,13 +366,7 @@ fn decode_registered_schema_row(
             format!("invalid registered schema snapshot JSON: {err}"),
         )
     })?;
-    let schema = snapshot.get("value").cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "registered schema snapshot missing value",
-        )
-    })?;
-    let key = schema_key_from_definition(&schema)?;
+    let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
     Ok(Some((key, schema)))
 }
 

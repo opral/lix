@@ -71,8 +71,8 @@ impl BenchStorage for RocksDB {
     }
 }
 
-const SEED_SQL: &str = "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
-const UPDATE_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+const SEED_SQL: &str = "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))";
+const UPDATE_SQL: &str = "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
 const READ_SQL: &str = "SELECT value FROM json_pointer WHERE path = $1";
 const SEED_COMMIT_ROWS: usize = 1_000;
 const MIN_RUN: usize = 6;
@@ -174,7 +174,7 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await

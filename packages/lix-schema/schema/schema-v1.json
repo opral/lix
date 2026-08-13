@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lix.dev/schema-v1.json",
+  "title": "Lix Schema v1",
+  "description": "A JSON representation of the PostgreSQL-compatible relational subset supported by Lix.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "key", "columns", "primary_key"],
+  "properties": {
+    "$schema": { "const": "https://lix.dev/schema-v1.json" },
+    "key": { "$ref": "#/$defs/identifier" },
+    "description": { "type": "string" },
+    "columns": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/column" }
+    },
+    "primary_key": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/identifier" }
+    },
+    "unique": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "foreign_keys": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/foreign_key" }
+    },
+    "examples": { "type": "array" },
+    "deprecated": { "type": "boolean", "default": false }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "maxLength": 63
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "type": {
+          "enum": ["text", "uuid", "bigint", "double precision", "boolean", "jsonb"]
+        },
+        "nullable": { "type": "boolean", "default": true },
+        "default_value": true,
+        "default_expression": {
+          "const": "uuidv7()",
+          "description": "PostgreSQL-dialect default expression. Schema v1 supports only uuidv7() on uuid columns."
+        },
+        "description": { "type": "string" },
+        "examples": { "type": "array" },
+        "deprecated": { "type": "boolean", "default": false }
+      },
+      "not": { "required": ["default_value", "default_expression"] }
+    },
+    "foreign_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["columns", "references"],
+      "properties": {
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "references": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_key", "columns"],
+          "properties": {
+            "schema_key": { "$ref": "#/$defs/identifier" },
+            "columns": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/identifier" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

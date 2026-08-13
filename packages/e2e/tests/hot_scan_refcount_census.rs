@@ -40,7 +40,7 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
         "additionalProperties": false
     });
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(schema.to_string())],
     )
     .await

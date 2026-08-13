@@ -154,7 +154,7 @@ async fn register_schema<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::
         "additionalProperties": false
     });
     lix.execute(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
         &[Value::Text(schema.to_string())],
     )
     .await

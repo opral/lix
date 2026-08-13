@@ -898,14 +898,9 @@ impl CanonicalJsonBatchBuilder {
             ));
         }
         if let Some(plan) = plan {
-            if let Err(errors) = plan.compiled_schema.validate(&value) {
-                let details = errors
-                    .take(3)
-                    .map(|error| error.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; ");
+            if let Err(error) = plan.compiled_schema.validate(&value) {
                 return Err(invalid_guest(format!(
-                    "component snapshot failed schema validation: {details}"
+                    "component snapshot failed schema validation: {error}"
                 )));
             }
             let primary_key = plan.primary_key.as_deref().ok_or_else(|| {
@@ -2265,14 +2260,9 @@ fn validate_certified_record(
     }
     let value: serde_json::Value = serde_json::from_slice(snapshot)
         .map_err(|error| invalid_guest(format!("certified snapshot is invalid JSON: {error}")))?;
-    if let Err(errors) = plan.compiled_schema.validate(&value) {
-        let details = errors
-            .take(3)
-            .map(|error| error.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
+    if let Err(error) = plan.compiled_schema.validate(&value) {
         return Err(invalid_guest(format!(
-            "certified snapshot failed schema validation: {details}"
+            "certified snapshot failed schema validation: {error}"
         )));
     }
     let primary_key = plan

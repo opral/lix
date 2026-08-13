@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), $2, false)",
+                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), $2, false)",
                     &[
                         crate::Value::Text(schema.to_string()),
                         crate::Value::Boolean(global),
@@ -1045,7 +1045,7 @@ mod tests {
         assert_eq!(
             session
                 .execute(
-                    "INSERT INTO json_pointer (path, value) VALUES ('/a', lix_json('{\"n\":1}')), ('/b', lix_json('{\"n\":2}')), ('/c', lix_json('{\"n\":3}'))",
+                    "INSERT INTO json_pointer (path, value) VALUES ('/a', CAST('{\"n\":1}' AS JSONB)), ('/b', CAST('{\"n\":2}' AS JSONB)), ('/c', CAST('{\"n\":3}' AS JSONB))",
                     &[],
                 )
                 .await
@@ -1098,7 +1098,7 @@ mod tests {
             assert_eq!(
                 session
                     .execute(
-                        "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))",
+                        "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))",
                         &[
                             crate::Value::Text((*path).to_string()),
                             crate::Value::Text(json!({"index": index}).to_string()),
@@ -1160,7 +1160,7 @@ mod tests {
         register_json_pointer_schema(&session).await;
         session
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ('/committed', lix_json('{\"source\":\"tracked\"}'))",
+                "INSERT INTO json_pointer (path, value) VALUES ('/committed', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1172,7 +1172,7 @@ mod tests {
             .expect("transaction should open");
         transaction
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ('/staged', lix_json('{\"source\":\"staged\"}'))",
+                "INSERT INTO json_pointer (path, value) VALUES ('/staged', CAST('{\"source\":\"staged\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1209,7 +1209,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/tracked', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/tracked', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1217,7 +1217,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/untracked', lix_json('{\"source\":\"untracked\"}'), true)",
+                 VALUES ('/untracked', CAST('{\"source\":\"untracked\"}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1239,7 +1239,7 @@ mod tests {
         let error = session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/tracked', lix_json('{\"source\":\"collision\"}'), true)",
+                 VALUES ('/tracked', CAST('{\"source\":\"collision\"}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1249,7 +1249,7 @@ mod tests {
         let error = session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/untracked', lix_json('{\"source\":\"collision\"}'))",
+                 VALUES ('/untracked', CAST('{\"source\":\"collision\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -1260,7 +1260,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                     VALUES ('/tracked', lix_json('{\"source\":\"tracked-upsert\"}'), true) \
+                     VALUES ('/tracked', CAST('{\"source\":\"tracked-upsert\"}' AS JSONB), true) \
                      ON CONFLICT (path) DO UPDATE SET value = excluded.value",
                     &[],
                 )
@@ -1273,7 +1273,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                     VALUES ('/untracked', lix_json('{\"source\":\"untracked-upsert\"}'), false) \
+                     VALUES ('/untracked', CAST('{\"source\":\"untracked-upsert\"}' AS JSONB), false) \
                      ON CONFLICT (path) DO UPDATE SET value = excluded.value",
                     &[],
                 )
@@ -1373,7 +1373,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                     VALUES ('/history-free', lix_json('{\"source\":\"untracked\"}'), true)",
+                     VALUES ('/history-free', CAST('{\"source\":\"untracked\"}' AS JSONB), true)",
                     &[],
                 )
                 .await
@@ -1446,7 +1446,7 @@ mod tests {
         for path in ["/clean", "/modified", "/removed", "/recycled-source"] {
             session
                 .execute(
-                    "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json('{\"v\":0}'))",
+                    "INSERT INTO json_pointer (path, value) VALUES ($1, CAST('{\"v\":0}' AS JSONB))",
                     &[crate::Value::Text(path.to_string())],
                 )
                 .await
@@ -1466,7 +1466,7 @@ mod tests {
 
         session
             .execute(
-                "UPDATE json_pointer SET value = lix_json('{\"v\":1}') WHERE path = '/modified'",
+                "UPDATE json_pointer SET value = CAST('{\"v\":1}' AS JSONB) WHERE path = '/modified'",
                 &[],
             )
             .await
@@ -1477,7 +1477,7 @@ mod tests {
             .expect("delete should dirty the row");
         session
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ('/added', lix_json('{\"v\":1}'))",
+                "INSERT INTO json_pointer (path, value) VALUES ('/added', CAST('{\"v\":1}' AS JSONB))",
                 &[],
             )
             .await
@@ -1485,7 +1485,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/added-then-removed', lix_json('{\"v\":1}'))",
+                 VALUES ('/added-then-removed', CAST('{\"v\":1}' AS JSONB))",
                 &[],
             )
             .await
@@ -1500,7 +1500,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/untracked', lix_json('{\"v\":1}'), true)",
+                 VALUES ('/untracked', CAST('{\"v\":1}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1514,7 +1514,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/recycled', lix_json('{\"v\":1}'), true)",
+                 VALUES ('/recycled', CAST('{\"v\":1}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1526,7 +1526,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/recycled', lix_json('{\"v\":2}'))",
+                 VALUES ('/recycled', CAST('{\"v\":2}' AS JSONB))",
                 &[],
             )
             .await
@@ -1538,7 +1538,7 @@ mod tests {
         let retention_flip = session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/modified', lix_json('{\"v\":9}'), true)",
+                 VALUES ('/modified', CAST('{\"v\":9}' AS JSONB), true)",
                 &[],
             )
             .await;
@@ -1602,7 +1602,7 @@ mod tests {
             let finite = session
                 .execute(
                     "SELECT entity_pk, diff_type FROM lix_working_diff \
-                     WHERE schema_key = 'json_pointer' AND entity_pk = lix_json($1) \
+                     WHERE schema_key = 'json_pointer' AND entity_pk = CAST($1 AS JSONB) \
                      ORDER BY entity_pk",
                     &[crate::Value::Text(entity_pk.clone())],
                 )
@@ -1689,7 +1689,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_file_id) \
-                     VALUES ($1, lix_json('{\"v\":0}'), $2)",
+                     VALUES ($1, CAST('{\"v\":0}' AS JSONB), $2)",
                     &[
                         crate::Value::Text(path.to_string()),
                         file.map_or(crate::Value::Null, |file| {
@@ -1707,7 +1707,7 @@ mod tests {
 
         session
             .execute(
-                "UPDATE json_pointer SET value = lix_json('{\"v\":1}') \
+                "UPDATE json_pointer SET value = CAST('{\"v\":1}' AS JSONB) \
                  WHERE path IN ('/modified', '/modified-b', '/modified-none')",
                 &[],
             )
@@ -1721,7 +1721,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_file_id) \
-                     VALUES ($1, lix_json('{\"v\":1}'), $2)",
+                     VALUES ($1, CAST('{\"v\":1}' AS JSONB), $2)",
                     &[
                         crate::Value::Text(path.to_string()),
                         file.map_or(crate::Value::Null, |file| {
@@ -1756,7 +1756,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/untracked', lix_json('{\"v\":1}'), true)",
+                 VALUES ('/untracked', CAST('{\"v\":1}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1924,7 +1924,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_file_id) \
-                     VALUES ($1, lix_json('{\"v\":0}'), $2)",
+                     VALUES ($1, CAST('{\"v\":0}' AS JSONB), $2)",
                     &[
                         crate::Value::Text(path.to_string()),
                         file.map_or(crate::Value::Null, |file| {
@@ -1950,7 +1950,7 @@ mod tests {
             session
                 .execute(
                     "INSERT INTO json_pointer (path, value, lixcol_file_id) \
-                     VALUES ($1, lix_json('{\"v\":1}'), $2)",
+                     VALUES ($1, CAST('{\"v\":1}' AS JSONB), $2)",
                     &[
                         crate::Value::Text(path.to_string()),
                         file.map_or(crate::Value::Null, |file| {
@@ -2070,7 +2070,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/checkpointed', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/checkpointed', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -2102,7 +2102,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/repository', lix_json('{\"source\":\"untracked\"}'), true)",
+                 VALUES ('/repository', CAST('{\"source\":\"untracked\"}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -2125,7 +2125,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/after-checkpoint', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/after-checkpoint', CAST('{\"source\":\"tracked\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -2157,7 +2157,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/dirty', lix_json('{\"value\":\"before-checkpoint\"}'))",
+                 VALUES ('/dirty', CAST('{\"value\":\"before-checkpoint\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -2236,7 +2236,7 @@ mod tests {
         global_session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_global, lixcol_untracked) \
-                 VALUES ('/global', lix_json('{\"source\":\"global\"}'), true, false)",
+                 VALUES ('/global', CAST('{\"source\":\"global\"}' AS JSONB), true, false)",
                 &[],
             )
             .await
@@ -2409,7 +2409,7 @@ mod tests {
         ] {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2530,7 +2530,7 @@ mod tests {
         for schema in index_probe_schemas("counted_parent", "counted_child") {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2576,7 +2576,7 @@ mod tests {
         for schema in index_probe_schemas("degraded_parent", "degraded_child") {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2675,7 +2675,7 @@ mod tests {
         for schema in index_probe_schemas("stale_parent", "stale_child") {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2758,7 +2758,7 @@ mod tests {
         for schema in index_probe_schemas("ckpt_parent", "ckpt_child") {
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                     &[crate::Value::Text(schema.to_string())],
                 )
                 .await
@@ -2824,7 +2824,7 @@ mod tests {
         let (_storage, session) = open_index_probe_session().await;
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                 &[crate::Value::Text(
                     json!({
                         "x-lix-key": "probe_unique",

@@ -85,7 +85,7 @@ where
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -138,7 +138,7 @@ async fn run_cell(shape: &str, cadence: usize, edits: usize) {
 
     session
         .execute(
-            "INSERT INTO leak_row (path, value) VALUES ($1, lix_json($2))",
+            "INSERT INTO leak_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
             &[
                 Value::Text("/agent/file".to_owned()),
                 Value::Text(payload(0)),
@@ -151,7 +151,7 @@ async fn run_cell(shape: &str, cadence: usize, edits: usize) {
         if shape == "insert" {
             session
                 .execute(
-                    "INSERT INTO leak_row (path, value) VALUES ($1, lix_json($2))",
+                    "INSERT INTO leak_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
                     &[
                         Value::Text(format!("/agent/file-{revision}")),
                         Value::Text(payload(revision)),
@@ -162,7 +162,7 @@ async fn run_cell(shape: &str, cadence: usize, edits: usize) {
         } else {
             session
                 .execute(
-                    "UPDATE leak_row SET value = lix_json($2) WHERE path = $1",
+                    "UPDATE leak_row SET value = CAST($2 AS JSONB) WHERE path = $1",
                     &[
                         Value::Text("/agent/file".to_owned()),
                         Value::Text(payload(revision)),

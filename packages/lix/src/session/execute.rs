@@ -2229,7 +2229,7 @@ where
     /// Persists execution-scoped runtime function state after a successful read.
     ///
     /// Reads do not otherwise own a write transaction, but SQL functions such as
-    /// `lix_uuid_v7()` can still advance runtime state. Persisting happens only
+    /// `uuidv7()` can still advance runtime state. Persisting happens only
     /// after successful execution so failed reads do not consume durable
     /// sequence state.
     async fn persist_runtime_functions_if_needed(
@@ -4861,7 +4861,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES \
-                 ('01920000-0000-7000-8000-0000000000f1', '/b.txt', $1, lix_json('{\"rank\":2}')), \
+                 ('01920000-0000-7000-8000-0000000000f1', '/b.txt', $1, CAST('{\"rank\":2}' AS JSONB)), \
                  ('01920000-0000-7000-8000-0000000000f2', '/nested/a.txt', $2, NULL), \
                  ('01920000-0000-7000-8000-0000000000f3', '/a.txt', $3, NULL)",
                 &[
@@ -5010,7 +5010,7 @@ mod tests {
             ExecuteBatchExecution::Transaction(_)
         ));
         assert!(matches!(
-            classify_execute_batch(&[batch_statement("SELECT lix_uuid_v7()")], &cache).unwrap(),
+            classify_execute_batch(&[batch_statement("SELECT uuidv7()")], &cache).unwrap(),
             ExecuteBatchExecution::Transaction(_)
         ));
     }
@@ -5092,7 +5092,7 @@ mod tests {
         );
         assert_eq!(
             session
-                .execution_disposition("SELECT lix_uuid_v7()")
+                .execution_disposition("SELECT uuidv7()")
                 .unwrap(),
             ExecutionDisposition::Durable
         );
@@ -5224,7 +5224,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5268,7 +5268,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5439,7 +5439,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5503,7 +5503,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5927,7 +5927,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -6007,7 +6007,7 @@ mod tests {
             "additionalProperties": false
         });
         main.execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -6467,14 +6467,14 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let insert_sql =
-            "INSERT INTO ordered_packed_update_probe (path, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO ordered_packed_update_probe (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let insert_statements = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -6489,7 +6489,7 @@ mod tests {
 
         crate::transaction::take_complete_replacement_packed_current_base_retirements();
         let update_sql =
-            "UPDATE ordered_packed_update_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE ordered_packed_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for version in 1..=2 {
             let update_statements = (0..ROW_COUNT)
                 .map(|row_index| ExecuteBatchStatement {
@@ -6616,7 +6616,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -6709,14 +6709,14 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema \
                  (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, true)",
+                 VALUES (CAST($1 AS JSONB), false, true)",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .expect("untracked schema registration should succeed");
 
         let sql = "INSERT INTO expdl_dense_untracked_lane_probe \
-                   (path, value, lixcol_untracked) VALUES ($1, lix_json($2), TRUE)";
+                   (path, value, lixcol_untracked) VALUES ($1, CAST($2 AS JSONB), TRUE)";
         let statements = (0..ROW_COUNT)
             .map(|index| ExecuteBatchStatement {
                 label: None,
@@ -6793,7 +6793,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -6819,7 +6819,7 @@ mod tests {
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_insert_probe\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"amended_parameter_insert_probe\"]' AS JSONB)",
                 &[Value::Json(amended_schema.into())],
             )
             .await
@@ -6896,14 +6896,14 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
         session
             .execute(
-                "INSERT INTO amended_parameter_update_probe (path, value) VALUES ('a', lix_json('\"old-a\"')), ('b', lix_json('\"old-b\"'))",
+                "INSERT INTO amended_parameter_update_probe (path, value) VALUES ('a', CAST('\"old-a\"' AS JSONB)), ('b', CAST('\"old-b\"' AS JSONB))",
                 &[],
             )
             .await
@@ -6930,13 +6930,13 @@ mod tests {
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_update_probe\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"amended_parameter_update_probe\"]' AS JSONB)",
                 &[Value::Json(amended_schema.into())],
             )
             .await
             .expect("compatible schema amendment should stage");
 
-        let sql = "UPDATE amended_parameter_update_probe SET value = lix_json($1) WHERE path = $2";
+        let sql = "UPDATE amended_parameter_update_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let statements = [
             ExecuteBatchStatement {
                 label: None,
@@ -7029,7 +7029,7 @@ mod tests {
         });
         setup
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7132,7 +7132,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7252,7 +7252,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7260,7 +7260,7 @@ mod tests {
 
         sql2::take_certified_entity_insert_parameter_batch_executions();
         let sql =
-            "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, CAST($2 AS JSONB))";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -7307,7 +7307,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7365,7 +7365,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7429,7 +7429,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7502,7 +7502,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema \
                  (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, true)",
+                 VALUES (CAST($1 AS JSONB), false, true)",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7566,7 +7566,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7640,7 +7640,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7677,7 +7677,7 @@ mod tests {
         let error = session
             .execute_prepared_dml_batch(
                 Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
+                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
                 ),
                 PreparedDmlParameterBatch::from_rows([
                     vec![Value::Text("{invalid".into()), Value::Text("a".into())],
@@ -7710,7 +7710,7 @@ mod tests {
         let error = transaction
             .execute_prepared_dml_batch(
                 Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = lix_json($1) WHERE id = $2",
+                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
                 ),
                 PreparedDmlParameterBatch::from_rows([
                     vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
@@ -7756,7 +7756,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7818,7 +7818,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7862,7 +7862,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7914,7 +7914,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7924,7 +7924,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO explicit_uuid_key_probe (id, value, lixcol_entity_pk) \
-                 VALUES ($1, 'value', lix_json($2))",
+                 VALUES ($1, 'value', CAST($2 AS JSONB))",
                 &[
                     Value::Text(UUID.to_string()),
                     Value::Text(format!("[\"{UUID}\"]")),
@@ -7964,7 +7964,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -7972,13 +7972,13 @@ mod tests {
         session
             .execute(
                 "INSERT INTO certified_replacement_probe (path, value) VALUES \
-                 ('/a', lix_json('\"old-a\"')), ('/b', lix_json('\"old-b\"'))",
+                 ('/a', CAST('\"old-a\"' AS JSONB)), ('/b', CAST('\"old-b\"' AS JSONB))",
                 &[],
             )
             .await
             .unwrap();
 
-        let sql = "UPDATE certified_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        let sql = "UPDATE certified_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let missing_results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -8147,14 +8147,14 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let insert_sql =
-            "INSERT INTO packed_replacement_probe (path, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO packed_replacement_probe (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8170,7 +8170,7 @@ mod tests {
         crate::transaction::take_complete_replacement_packed_current_base_publications();
         crate::transaction::take_rootless_replacement_generation_publications();
         sql2::take_certified_generation_identity_replacements();
-        let update_sql = "UPDATE packed_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        let update_sql = "UPDATE packed_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8459,7 +8459,7 @@ mod tests {
             .unwrap();
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"branch\":true}') WHERE path = '/00000'",
+                "UPDATE packed_replacement_probe SET value = CAST('{\"branch\":true}' AS JSONB) WHERE path = '/00000'",
                 &[],
             )
             .await
@@ -8472,7 +8472,7 @@ mod tests {
             .unwrap();
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"main\":true}') WHERE path = '/32767'",
+                "UPDATE packed_replacement_probe SET value = CAST('{\"main\":true}' AS JSONB) WHERE path = '/32767'",
                 &[],
             )
             .await
@@ -8550,7 +8550,7 @@ mod tests {
 
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"overlay\":true}') WHERE path = '/00000'",
+                "UPDATE packed_replacement_probe SET value = CAST('{\"overlay\":true}' AS JSONB) WHERE path = '/00000'",
                 &[],
             )
             .await
@@ -8601,7 +8601,7 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO packed_replacement_probe (path, value) VALUES ('/32767', lix_json('{\"reinserted\":true}'))",
+                "INSERT INTO packed_replacement_probe (path, value) VALUES ('/32767', CAST('{\"reinserted\":true}' AS JSONB))",
                 &[],
             )
             .await
@@ -8800,14 +8800,14 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
 
         let insert_sql =
-            "INSERT INTO staged_generation_probe (path, value) VALUES ($1, lix_json($2))";
+            "INSERT INTO staged_generation_probe (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8829,7 +8829,7 @@ mod tests {
             .await
             .unwrap();
 
-        let update_sql = "UPDATE staged_generation_probe SET value = lix_json($1) WHERE path = $2";
+        let update_sql = "UPDATE staged_generation_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         let updates = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -8897,7 +8897,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -8990,7 +8990,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9053,7 +9053,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9139,7 +9139,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9154,7 +9154,7 @@ mod tests {
             .unwrap();
 
         sql2::take_entity_update_parameter_batch_executions();
-        let sql = "UPDATE parameter_batch_error_probe SET value = lix_json($1) WHERE id = $2";
+        let sql = "UPDATE parameter_batch_error_probe SET value = CAST($1 AS JSONB) WHERE id = $2";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -9207,7 +9207,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9259,7 +9259,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -9791,7 +9791,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(custom_schema.to_string())],
             )
             .await
@@ -9827,7 +9827,7 @@ mod tests {
         next_schema["x-lix-key"] = serde_json::json!("custom_catalog_probe_after_mutation");
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(next_schema.to_string())],
             )
             .await
@@ -10097,14 +10097,14 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .expect("json pointer schema should register");
         session
             .execute(
-                "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text("/certified".to_string()),
                     Value::Text("{\"step\":0}".to_string()),
@@ -10118,7 +10118,7 @@ mod tests {
             .await
             .expect("transaction should begin");
         assert_eq!(sql2::take_certified_single_path_value_replacements(), 0);
-        let sql = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+        let sql = "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
         for step in [1, 2] {
             let result = transaction
                 .execute(
@@ -10184,7 +10184,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10192,7 +10192,7 @@ mod tests {
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
-                sql: "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ($1, lix_json($2))"
+                sql: "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ($1, CAST($2 AS JSONB))"
                     .to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -10209,7 +10209,7 @@ mod tests {
             .await
             .expect("transaction should begin");
         let update_sql =
-            "UPDATE packed_journal_overlay_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE packed_journal_overlay_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         transaction
             .execute(
                 update_sql,
@@ -10222,7 +10222,7 @@ mod tests {
             .expect("base update should prepare packed membership");
         transaction
             .execute(
-                "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ('2000', lix_json('{\"state\":\"inserted\"}'))",
+                "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ('2000', CAST('{\"state\":\"inserted\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -10316,7 +10316,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10324,7 +10324,7 @@ mod tests {
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
-                sql: "INSERT INTO stale_journal_replacement_probe (path, value) VALUES ($1, lix_json($2))"
+                sql: "INSERT INTO stale_journal_replacement_probe (path, value) VALUES ($1, CAST($2 AS JSONB))"
                     .to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -10352,7 +10352,7 @@ mod tests {
             .await
             .expect("replacement transaction should begin");
         let update_sql =
-            "UPDATE stale_journal_replacement_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE stale_journal_replacement_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             let result = replacement
                 .execute(
@@ -10370,7 +10370,7 @@ mod tests {
         concurrent_session
             .execute(
                 "INSERT INTO stale_journal_replacement_probe (path, value) \
-                 VALUES ('2000', lix_json('{\"state\":\"concurrent\"}'))",
+                 VALUES ('2000', CAST('{\"state\":\"concurrent\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -10438,7 +10438,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10447,7 +10447,7 @@ mod tests {
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
                 sql:
-                    "INSERT INTO direct_journal_seal_probe (path, value) VALUES ($1, lix_json($2))"
+                    "INSERT INTO direct_journal_seal_probe (path, value) VALUES ($1, CAST($2 AS JSONB))"
                         .to_string(),
                 params: vec![
                     Value::Text(format!("{row_index:04}")),
@@ -10465,7 +10465,7 @@ mod tests {
             .await
             .expect("direct journal transaction should begin");
         let update_sql =
-            "UPDATE direct_journal_seal_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE direct_journal_seal_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             let result = transaction
                 .execute(
@@ -10563,7 +10563,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10573,7 +10573,7 @@ mod tests {
                 &(0..ROW_COUNT)
                     .map(|row_index| ExecuteBatchStatement {
                         label: None,
-                        sql: "INSERT INTO journal_read_your_writes_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
+                        sql: "INSERT INTO journal_read_your_writes_probe (path, value) VALUES ($1, CAST($2 AS JSONB))".to_string(),
                         params: vec![
                             Value::Text(format!("{row_index:04}")),
                             Value::Text("{\"state\":\"base\"}".to_string()),
@@ -10598,7 +10598,7 @@ mod tests {
 
         let mut transaction = session.begin_transaction().await.unwrap();
         let update_sql =
-            "UPDATE journal_read_your_writes_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE journal_read_your_writes_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             transaction
                 .execute(
@@ -10658,7 +10658,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10666,7 +10666,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO mixed_journal_lifecycle_probe (path, value) \
-                 VALUES ('existing', lix_json('{\"state\":\"base\"}'))",
+                 VALUES ('existing', CAST('{\"state\":\"base\"}' AS JSONB))",
                 &[],
             )
             .await
@@ -10687,14 +10687,14 @@ mod tests {
         transaction
             .execute(
                 "INSERT INTO mixed_journal_lifecycle_probe (path, value) \
-                 VALUES ('inserted', lix_json('{\"state\":\"inserted\"}'))",
+                 VALUES ('inserted', CAST('{\"state\":\"inserted\"}' AS JSONB))",
                 &[],
             )
             .await
             .unwrap();
         transaction
             .execute(
-                "UPDATE mixed_journal_lifecycle_probe SET value = lix_json($1) WHERE path = $2",
+                "UPDATE mixed_journal_lifecycle_probe SET value = CAST($1 AS JSONB) WHERE path = $2",
                 &[
                     Value::Text("{\"state\":\"updated\"}".to_string()),
                     Value::Text("existing".to_string()),
@@ -10737,7 +10737,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -10747,7 +10747,7 @@ mod tests {
                 &(0..ROW_COUNT)
                     .map(|row_index| ExecuteBatchStatement {
                         label: None,
-                        sql: "INSERT INTO rooted_journal_parent_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
+                        sql: "INSERT INTO rooted_journal_parent_probe (path, value) VALUES ($1, CAST($2 AS JSONB))".to_string(),
                         params: vec![
                             Value::Text(format!("{row_index:04}")),
                             Value::Text("{\"state\":\"base\"}".to_string()),
@@ -10775,7 +10775,7 @@ mod tests {
         );
         let mut transaction = session.begin_transaction().await.unwrap();
         let update_sql =
-            "UPDATE rooted_journal_parent_probe SET value = lix_json($1) WHERE path = $2";
+            "UPDATE rooted_journal_parent_probe SET value = CAST($1 AS JSONB) WHERE path = $2";
         for row_index in 0..ROW_COUNT {
             transaction
                 .execute(
@@ -10976,7 +10976,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -11042,7 +11042,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
                 &[Value::Text(added_schema.to_string())],
             )
             .await

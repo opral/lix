@@ -2607,7 +2607,10 @@ mod tests {
 
         let plan = run_ordinary_repository_gc(&storage).await;
         assert!(
-            !plan.sweep.tracked_commit_roots.contains(&old_root.commit_id),
+            !plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&old_root.commit_id),
             "an ancestor of the live head is what _history() reads; it must not be retired"
         );
         plan
@@ -2665,12 +2668,8 @@ mod tests {
         // is a rootless tracked serving generation, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("rootless-serving-base", 0, None, timestamp);
-        let old_root = replay_commit_record(
-            "rootless-serving-old",
-            1,
-            Some(base.commit_id),
-            timestamp,
-        );
+        let old_root =
+            replay_commit_record("rootless-serving-old", 1, Some(base.commit_id), timestamp);
         let active = replay_commit_record(
             "rootless-serving-active",
             1,
@@ -3164,12 +3163,8 @@ mod tests {
         // is the finite selected-source owner pin, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("selected-owner-base", 0, None, timestamp);
-        let owner = replay_commit_record(
-            "selected-owner-source",
-            1,
-            Some(base.commit_id),
-            timestamp,
-        );
+        let owner =
+            replay_commit_record("selected-owner-source", 1, Some(base.commit_id), timestamp);
         let checkpoint = replay_commit_record(
             "selected-owner-checkpoint",
             1,
@@ -3308,7 +3303,10 @@ mod tests {
                 .contains(&owner.commit_id)
         );
         assert!(
-            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            !released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&base.commit_id),
             "the interval base stays on the head's first-parent chain and owns entity history"
         );
         let read = storage
@@ -3362,18 +3360,9 @@ mod tests {
         // is the scoped-descriptor owner pin, not graph reachability, so the fixture models the
         // compaction instead of contradicting it.
         let base = replay_commit_record("scoped-part-base", 0, None, timestamp);
-        let owner = replay_commit_record(
-            "scoped-part-owner",
-            1,
-            Some(base.commit_id),
-            timestamp,
-        );
-        let checkpoint = replay_commit_record(
-            "scoped-part-checkpoint",
-            1,
-            Some(base.commit_id),
-            timestamp,
-        );
+        let owner = replay_commit_record("scoped-part-owner", 1, Some(base.commit_id), timestamp);
+        let checkpoint =
+            replay_commit_record("scoped-part-checkpoint", 1, Some(base.commit_id), timestamp);
         let mut base_manifest =
             test_commit_state_manifest(&base, CommitStateMutationInventory::default());
         base_manifest.replay_debt = CommitStateReplayDebt::default();
@@ -3508,7 +3497,10 @@ mod tests {
                 .contains(&owner.commit_id)
         );
         assert!(
-            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            !released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&base.commit_id),
             "the interval base stays on the head's first-parent chain and owns entity history"
         );
         let read = storage
@@ -3811,7 +3803,10 @@ mod tests {
                 .contains(&owner.commit_id)
         );
         assert!(
-            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            !released_plan
+                .sweep
+                .tracked_commit_roots
+                .contains(&base.commit_id),
             "the interval base stays on the head's first-parent chain and owns entity history"
         );
         let read = storage
@@ -4235,13 +4230,12 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, false)",
+                 VALUES (CAST($1 AS JSONB), false, false)",
                 &[Value::Text(schema.to_string())],
             )
             .await
             .expect("payload fixture schema should register");
     }
-
 
     /// Undo-to-last-checkpoint must survive reclaim at any cadence.
     ///
@@ -4330,7 +4324,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -4474,14 +4468,20 @@ mod tests {
         let old_reads_new_err = old_reads_new
             .err()
             .expect("a 4-field reader must reject a 6-field record");
-        println!("ARITY old_reader_vs_new_record: {}", old_reads_new_err.message);
+        println!(
+            "ARITY old_reader_vs_new_record: {}",
+            old_reads_new_err.message
+        );
 
         // Direction 2: a NEW reader against an OLD record.
         let new_reads_old = crate::storage_codec::decode::<ArityNew>("arity demo", &old_bytes);
         let new_reads_old_err = new_reads_old
             .err()
             .expect("a 6-field reader must reject a 4-field record");
-        println!("ARITY new_reader_vs_old_record: {}", new_reads_old_err.message);
+        println!(
+            "ARITY new_reader_vs_old_record: {}",
+            new_reads_old_err.message
+        );
 
         // The sharp point: bumping `format_version` inside the record does not
         // help, because a same-arity record still decodes cleanly and a
@@ -4607,7 +4607,7 @@ mod tests {
         let shared_ref = payload_ref_added_by(&backend, || async {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ('/shared', lix_json($1))",
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/shared', CAST($1 AS JSONB))",
                     &[Value::Text(shared.clone())],
                 )
                 .await
@@ -4617,7 +4617,7 @@ mod tests {
         let before_mirror = json_payload_refs(&backend).await;
         session
             .execute(
-                "INSERT INTO gc_payload_mirror (path, value) VALUES ('/shared', lix_json($1))",
+                "INSERT INTO gc_payload_mirror (path, value) VALUES ('/shared', CAST($1 AS JSONB))",
                 &[Value::Text(shared.clone())],
             )
             .await
@@ -4633,7 +4633,7 @@ mod tests {
         for revision in 1..=8 {
             session
                 .execute(
-                    "UPDATE gc_payload_row SET value = lix_json($1) WHERE path = '/shared'",
+                    "UPDATE gc_payload_row SET value = CAST($1 AS JSONB) WHERE path = '/shared'",
                     &[Value::Text(out_of_band_payload(revision))],
                 )
                 .await
@@ -4714,7 +4714,7 @@ mod tests {
         let shared_ref = payload_ref_added_by(&backend, || async {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ('/co', lix_json($1))",
+                    "INSERT INTO gc_payload_row (path, value) VALUES ('/co', CAST($1 AS JSONB))",
                     &[Value::Text(shared.clone())],
                 )
                 .await
@@ -4727,7 +4727,7 @@ mod tests {
                 .execute(
                     &format!(
                         "INSERT INTO {table} (path, value, lixcol_untracked) \
-                         VALUES ('/co', lix_json($1), true)"
+                         VALUES ('/co', CAST($1 AS JSONB), true)"
                     ),
                     &[Value::Text(shared.clone())],
                 )
@@ -4748,7 +4748,7 @@ mod tests {
         for revision in 1..=6 {
             session
                 .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ($1, lix_json($2))",
+                    "INSERT INTO gc_payload_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
                     &[
                         Value::Text(format!("/churn-{revision}")),
                         Value::Text(out_of_band_payload(revision)),
@@ -4822,7 +4822,7 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO gc_payload_row (path, value) VALUES ('/row', lix_json($1))",
+                "INSERT INTO gc_payload_row (path, value) VALUES ('/row', CAST($1 AS JSONB))",
                 &[Value::Text(out_of_band_payload(0))],
             )
             .await
@@ -4832,7 +4832,7 @@ mod tests {
             live_ref = payload_ref_added_by(&backend, || async {
                 session
                     .execute(
-                        "UPDATE gc_payload_row SET value = lix_json($1) WHERE path = '/row'",
+                        "UPDATE gc_payload_row SET value = CAST($1 AS JSONB) WHERE path = '/row'",
                         &[Value::Text(out_of_band_payload(revision))],
                     )
                     .await
@@ -5585,6 +5585,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_gc_reclaims_retired_untracked_update_without_inventory_sweep() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("repository should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        let old_value = serde_json::json!({
+            "payload": "old-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
+        });
+        let old_json = old_value.to_string();
+        let old_ref = key_value_snapshot_ref("gc-update-untracked", &old_value);
+        let new_value = serde_json::json!({
+            "payload": "new-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
+        });
+        let new_json = new_value.to_string();
+        let new_ref = key_value_snapshot_ref("gc-update-untracked", &new_value);
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+                 VALUES ('gc-update-untracked', CAST($1 AS JSONB), true)",
+                &[Value::Text(old_json)],
+            )
+            .await
+            .expect("old untracked value should write");
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = CAST($1 AS JSONB) \
+                 WHERE key = 'gc-update-untracked'",
+                &[Value::Text(new_json)],
+            )
+            .await
+            .expect("untracked value should update in the same generation");
+
+        // A bare JSON object has no reclaim candidate. It proves this GC is
+        // deliberately targeted rather than a full JSON-store inventory scan.
+        let bare_orphan_ref =
+            stage_bare_json(&storage, &format!("\"{}\"", "bare-".repeat(1024))).await;
+
+        run_repository_gc(&storage).await;
+
+        assert!(
+            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, old_ref).await,
+            "the superseded untracked payload should be reclaimed"
+        );
+        assert!(
+            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, new_ref).await,
+            "the current untracked payload must remain stored"
+        );
+        assert!(
+            json_ref_exists(
+                &storage,
+                crate::json_store::store::JSON_SPACE,
+                bare_orphan_ref,
+            )
+            .await,
+            "candidate GC must not scan and sweep unrelated JSON"
+        );
+        assert!(
+            !json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, old_ref,).await,
+            "a dead payload should consume its reclamation candidate"
+        );
+
+        let visible = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'gc-update-untracked'",
+                &[],
+            )
+            .await
+            .expect("live untracked value should remain readable after GC");
+        assert_eq!(visible.rows()[0].values(), &[Value::Json(new_value.into())]);
+    }
+
+    #[tokio::test]
     async fn repository_gc_retains_active_history_diff_undo_redo_and_reclaims_deleted_branch_refs()
     {
         let storage = Memory::new();
@@ -5608,7 +5687,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                "INSERT INTO lix_registered_schema (schema_key, value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB), false, false)",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -5622,14 +5701,14 @@ mod tests {
             .expect("history baseline should have a commit id");
         session
             .execute(
-                "INSERT INTO gc_history_fixture (path, value) VALUES ('/row', lix_json('{\"v\":1}'))",
+                "INSERT INTO gc_history_fixture (path, value) VALUES ('/row', CAST('{\"v\":1}' AS JSONB))",
                 &[],
             )
             .await
             .expect("history fixture first commit should publish");
         session
             .execute(
-                "UPDATE gc_history_fixture SET value = lix_json('{\"v\":2}') WHERE path = '/row'",
+                "UPDATE gc_history_fixture SET value = CAST('{\"v\":2}' AS JSONB) WHERE path = '/row'",
                 &[],
             )
             .await
@@ -5888,6 +5967,112 @@ mod tests {
             .await
             .expect("retired branch absence should read");
         assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn repository_gc_reclaims_retired_untracked_delete() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("repository should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        let deleted_value = serde_json::json!({
+            "payload": "delete-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
+        });
+        let deleted_json = deleted_value.to_string();
+        let deleted_ref = key_value_snapshot_ref("gc-delete-untracked", &deleted_value);
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+                 VALUES ('gc-delete-untracked', CAST($1 AS JSONB), true)",
+                &[Value::Text(deleted_json)],
+            )
+            .await
+            .expect("untracked value should write");
+        session
+            .execute(
+                "DELETE FROM lix_key_value WHERE key = 'gc-delete-untracked'",
+                &[],
+            )
+            .await
+            .expect("untracked value should delete physically");
+
+        run_repository_gc(&storage).await;
+
+        assert!(
+            !json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, deleted_ref,).await,
+            "a deleted untracked payload should be reclaimed"
+        );
+        assert!(
+            !json_ref_exists(
+                &storage,
+                UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
+                deleted_ref,
+            )
+            .await,
+            "a reclaimed deletion should consume its candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_gc_keeps_candidate_reachable_from_tracked_history() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("repository should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("repository should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        let shared_value = serde_json::json!({
+            "payload": "shared-".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
+        });
+        let shared_json = shared_value.to_string();
+        let shared_ref = key_value_snapshot_ref("gc-tracked-candidate", &shared_value);
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('gc-tracked-candidate', CAST($1 AS JSONB))",
+                &[Value::Text(shared_json)],
+            )
+            .await
+            .expect("tracked owner should write");
+
+        // Candidate records are merely ownership-loss hints. Injecting one
+        // for a tracked payload exercises the exact same liveness proof that
+        // protects a hash shared with retained history.
+        stage_untracked_reclaim_candidate(&storage, shared_ref).await;
+
+        run_repository_gc(&storage).await;
+
+        assert!(
+            json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await,
+            "reachable tracked history must retain a candidate payload"
+        );
+        assert!(
+            json_ref_exists(&storage, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, shared_ref,).await,
+            "a candidate rooted by history must survive for later re-evaluation"
+        );
+        let tracked = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'gc-tracked-candidate'",
+                &[],
+            )
+            .await
+            .expect("tracked owner should remain readable");
+        assert_eq!(
+            tracked.rows()[0].values(),
+            &[Value::Json(shared_value.into())]
+        );
     }
 
     #[tokio::test]
@@ -6776,7 +6961,7 @@ mod tests {
         });
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -6784,7 +6969,7 @@ mod tests {
         for row in 0..16 {
             session
                 .execute(
-                    "INSERT INTO gc_generation_fixture (path, value) VALUES ($1, lix_json($2))",
+                    "INSERT INTO gc_generation_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))",
                     &[
                         Value::Text(format!("/row/{row}")),
                         Value::Text(format!(r#"{{"v":{row}}}"#)),
@@ -6808,7 +6993,7 @@ mod tests {
         for row in 0..16 {
             branch_session
                 .execute(
-                    "UPDATE gc_generation_fixture SET value = lix_json($2) WHERE path = $1",
+                    "UPDATE gc_generation_fixture SET value = CAST($2 AS JSONB) WHERE path = $1",
                     &[
                         Value::Text(format!("/row/{row}")),
                         Value::Text(format!(r#"{{"v":{}}}"#, row + 100)),

@@ -27,23 +27,17 @@ fn fixture(runtime: &tokio::runtime::Runtime) -> Lix<Memory> {
             .await
             .expect("open benchmark lix");
         let schema = json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "bench_default_values",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "x-lix-default": "lix_uuid_v7()"
-                },
-                "label": { "type": "string", "default": "untitled" }
-            },
-            "required": ["id", "label"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "bench_default_values",
+            "columns": [
+                { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
+                { "name": "label", "type": "text", "nullable": false, "default_value": "untitled" }
+            ],
+            "primary_key": ["id"]
         });
         let registered = session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1 ->> 'key', $1)",
                 &[Value::Json(schema.into())],
             )
             .await

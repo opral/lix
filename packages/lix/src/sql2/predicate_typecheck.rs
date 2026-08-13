@@ -459,7 +459,10 @@ fn is_json_expr<'a>(
             .inner()
             .get(LIX_VALUE_TYPE_METADATA_KEY)
             .is_some_and(|value| value == LIX_VALUE_TYPE_JSON),
-        Expr::ScalarFunction(function) => matches!(function.name(), "lix_json" | "lix_json_get"),
+        Expr::ScalarFunction(function) => matches!(
+            function.name(),
+            "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+        ),
         Expr::Alias(alias) => is_json_expr(&alias.expr, lookup_field),
         Expr::Cast(cast) => is_json_expr(&cast.expr, lookup_field),
         Expr::TryCast(cast) => is_json_expr(&cast.expr, lookup_field),
@@ -500,5 +503,5 @@ fn json_predicate_type_error(expr: &Expr) -> LixError {
         LixError::CODE_TYPE_MISMATCH,
         format!("JSON columns can only be compared with JSON expressions, got {expr}"),
     )
-    .with_hint("Wrap JSON text with lix_json(...), use lix_json_get(...) for JSON values, or use IS NULL for null checks.")
+    .with_hint("Cast JSON text with ::jsonb, use PostgreSQL -> or ->> for JSON access, or use IS NULL for null checks.")
 }

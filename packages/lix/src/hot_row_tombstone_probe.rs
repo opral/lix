@@ -250,7 +250,7 @@ fn probe_schema(key: &str) -> serde_json::Value {
 async fn register(session: &SessionContext<Memory>, schema: serde_json::Value) {
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
             &[crate::Value::Text(schema.to_string())],
         )
         .await

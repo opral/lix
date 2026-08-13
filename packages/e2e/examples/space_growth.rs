@@ -124,7 +124,7 @@ where
     for index in 0..rows {
         transaction
             .execute(
-                "INSERT INTO space_growth (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO space_growth (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text(format!("/row/{batch:08}/{index:08}")),
                     Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
@@ -155,7 +155,7 @@ where
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await

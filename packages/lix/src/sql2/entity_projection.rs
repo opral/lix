@@ -441,7 +441,7 @@ mod tests {
     use crate::transaction_types::TransactionJson;
     use crate::{Json, LixError, Value};
 
-    fn lix_json(canonical: &str) -> Json {
+    fn canonical_json(canonical: &str) -> Json {
         Json::from_canonical_text(canonical)
     }
 
@@ -610,7 +610,7 @@ mod tests {
             arrow_rows[0],
             vec![
                 Value::Text("line\nquote: \"".to_string()),
-                Value::Json(lix_json(r#"{"z":[true,null],"a":"value"}"#)),
+                Value::Json(canonical_json(r#"{"z":[true,null],"a":"value"}"#)),
                 Value::Integer(7),
                 Value::Real(4.5),
                 Value::Boolean(true),

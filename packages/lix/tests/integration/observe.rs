@@ -736,7 +736,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let (raw_session, _) = open_default_session(&sim, &engine).await;
 
-        match raw_session.observe("SELECT lix_uuid_v7()", &[]) {
+        match raw_session.observe("SELECT uuidv7()", &[]) {
             Ok(_) => panic!("observe should reject durable runtime functions"),
             Err(error) => {
                 assert_eq!(error.code, lix::LixError::CODE_INVALID_PARAM);
@@ -1163,7 +1163,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
                  VALUES ('lix_deterministic_mode', \
-                 lix_json('{\"enabled\":true}'), true, true)",
+                 CAST('{\"enabled\":true}' AS JSONB), true, true)",
                 &[],
             )
             .await
@@ -1174,7 +1174,7 @@ simulation_test!(
         assert!(initial.rows.is_empty());
 
         session
-            .execute("SELECT lix_uuid_v7()", &[])
+            .execute("SELECT uuidv7()", &[])
             .await
             .expect("deterministic uuid read should succeed");
 

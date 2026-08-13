@@ -262,7 +262,7 @@ simulation_test!(
         );
 
         let error = session
-            .execute("SELECT lix_json('{\"a\":1}') ->> 'a'", &[])
+            .execute("SELECT CAST('{\"a\":1}' AS JSONB) ->> 'a'", &[])
             .await
             .expect_err("Postgres JSON arrow operator should fail with a dialect error");
 
@@ -289,7 +289,7 @@ simulation_test!(
         );
 
         let error = session
-            .execute("SELECT lix_uuid_v7('unexpected')", &[])
+            .execute("SELECT uuidv7('unexpected')", &[])
             .await
             .expect_err("wrong UDF arity should fail as public invalid input");
 

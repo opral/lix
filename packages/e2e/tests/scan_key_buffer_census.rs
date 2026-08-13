@@ -60,7 +60,7 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
         "additionalProperties": false
     });
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(schema.to_string())],
     )
     .await

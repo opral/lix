@@ -3482,17 +3482,23 @@ where
                             )
                         })?
                         .to_string();
-                    let definition = row
+                    let snapshot = row
                         .snapshot
                         .as_ref()
-                        .and_then(|snapshot| snapshot.get("value"))
-                        .cloned()
                         .ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
-                                "plugin schema row is missing its definition",
+                                "plugin schema row is missing its snapshot",
                             )
                         })?;
+                    let (snapshot_key, definition) =
+                        crate::schema::schema_from_registered_snapshot(snapshot)?;
+                    if snapshot_key.schema_key != schema_key {
+                        return Err(LixError::new(
+                            LixError::CODE_SCHEMA_DEFINITION,
+                            "plugin schema row identity does not match schema_key",
+                        ));
+                    }
                     Ok((schema_key, definition))
                 })
                 .collect::<Result<BTreeMap<_, _>, LixError>>()?;
@@ -11227,12 +11233,14 @@ async fn preflight_owned_generation_upgrades(
                 format!("active plugin schema snapshot is invalid JSON: {error}"),
             )
         })?;
-        let definition = snapshot.get("value").cloned().ok_or_else(|| {
-            LixError::new(
+        let (snapshot_key, definition) =
+            crate::schema::schema_from_registered_snapshot(&snapshot)?;
+        if snapshot_key.schema_key != schema_key {
+            return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
-                format!("active plugin schema '{schema_key}' is missing its definition"),
-            )
-        })?;
+                format!("active plugin schema '{schema_key}' has mismatched snapshot identity"),
+            ));
+        }
         if registered_schema_definitions
             .insert(
                 (row.branch_id().to_string(), schema_key.to_string()),

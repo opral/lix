@@ -365,7 +365,7 @@ where
             let index = start + written + offset;
             transaction
                 .execute(
-                    "UPDATE dup_fixture SET value = lix_json($1) WHERE path = $2",
+                    "UPDATE dup_fixture SET value = CAST($1 AS JSONB) WHERE path = $2",
                     &[
                         Value::Text(format!(
                             r#"{{"seed":{index},"generation":{generation},"pad":"{PAD}"}}"#
@@ -398,7 +398,7 @@ where
         let index = start + offset;
         transaction
             .execute(
-                "UPDATE dup_fixture SET value = lix_json($1) WHERE path = $2",
+                "UPDATE dup_fixture SET value = CAST($1 AS JSONB) WHERE path = $2",
                 &[Value::Text(seed_value(index)), Value::Text(row_path(index))],
             )
             .await
@@ -438,7 +438,7 @@ where
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -460,7 +460,7 @@ where
             let index = written + offset;
             transaction
                 .execute(
-                    "INSERT INTO dup_fixture (path, value) VALUES ($1, lix_json($2))",
+                    "INSERT INTO dup_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))",
                     &[Value::Text(row_path(index)), Value::Text(seed_value(index))],
                 )
                 .await

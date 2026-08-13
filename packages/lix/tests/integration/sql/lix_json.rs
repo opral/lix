@@ -18,8 +18,8 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT \
-                lix_json('{\"name\":\"Ada\",\"tags\":[\"db\"]}') AS document, \
-                lix_json(NULL) AS json_null, \
+                CAST('{\"name\":\"Ada\",\"tags\":[\"db\"]}' AS JSONB) AS document, \
+                CAST(NULL AS JSONB) AS json_null, \
                 lix_json_get('{\"name\":\"Ada\",\"tags\":[\"db\"]}', 'tags') AS tags, \
                 lix_json_get('{\"name\":\"Ada\"}', 'missing') AS missing",
                 &[],
@@ -177,7 +177,7 @@ simulation_test!(
 
         session
             .execute(
-                "SELECT entity_pk FROM lix_change WHERE entity_pk = lix_json('[\"state-latest\"]')",
+                "SELECT entity_pk FROM lix_change WHERE entity_pk = CAST('[\"state-latest\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -201,7 +201,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_json_predicate_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"meta\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_json_predicate_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"meta\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -213,7 +213,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_json_predicate_schema (id, meta, lixcol_untracked) \
-                 VALUES ('json-predicate-1', lix_json('{\"flag\":true}'), false)",
+                 VALUES ('json-predicate-1', CAST('{\"flag\":true}' AS JSONB), false)",
                 &[],
             )
             .await
@@ -231,7 +231,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id FROM engine_json_predicate_schema WHERE meta = lix_json('{\"flag\":true}')",
+                "SELECT id FROM engine_json_predicate_schema WHERE meta = CAST('{\"flag\":true}' AS JSONB)",
                 &[],
             )
             .await
@@ -259,7 +259,7 @@ simulation_test!(
         let error = session
             .execute(
                 "UPDATE lix_registered_schema \
-                 SET value = lix_json('{\"x-lix-key\":\"engine_schema_update_history\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}') \
+                 SET value = CAST('{\"x-lix-key\":\"engine_schema_update_history\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB) \
                  WHERE lixcol_entity_pk = 'engine_schema_update_history'",
                 &[],
             )

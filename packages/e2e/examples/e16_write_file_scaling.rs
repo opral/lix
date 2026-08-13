@@ -444,7 +444,7 @@ where
         }
         "key_value_write" => {
             lix.execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text(format!("e16-probe-{probe:05}")),
                     Value::Text(format!("\"{probe}\"")),

@@ -1,8 +1,9 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, Value, open_lix};
+use lix::{PreparedDmlParameterBatch, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -58,18 +59,20 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
             .expect("initialize durable Lix");
         register_schema(&lix).await;
 
-        let inserts = (0..ROW_COUNT)
-            .map(|index| ExecuteBatchStatement {
-                label: None,
-                sql: format!("INSERT INTO {SCHEMA_KEY} (path, value) VALUES ($1, lix_json($2))"),
-                params: vec![
-                    Value::Text(format!("/{index:04}")),
-                    Value::Text(format!(r#"{{"generation":0,"index":{index}}}"#)),
-                ],
-            })
-            .collect::<Vec<_>>();
+        let inserts = PreparedDmlParameterBatch::from_rows((0..ROW_COUNT).map(|index| {
+            vec![
+                Value::Text(format!("/{index:04}")),
+                Value::Text(format!(r#"{{"generation":0,"index":{index}}}"#)),
+            ]
+        }))
+        .expect("build insert parameter batch");
         let inserted = lix
-            .execute_batch(&inserts)
+            .execute_prepared_dml_batch(
+                Arc::from(format!(
+                    "INSERT INTO {SCHEMA_KEY} (path, value) VALUES ($1, CAST($2 AS JSONB))"
+                )),
+                inserts,
+            )
             .await
             .expect("insert complete collection");
         assert_eq!(
@@ -80,18 +83,20 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
             ROW_COUNT as u64
         );
 
-        let replacements = (0..ROW_COUNT)
-            .map(|index| ExecuteBatchStatement {
-                label: None,
-                sql: format!("UPDATE {SCHEMA_KEY} SET value = lix_json($1) WHERE path = $2"),
-                params: vec![
-                    Value::Text(format!(r#"{{"generation":1,"index":{index}}}"#)),
-                    Value::Text(format!("/{index:04}")),
-                ],
-            })
-            .collect::<Vec<_>>();
+        let replacements = PreparedDmlParameterBatch::from_rows((0..ROW_COUNT).map(|index| {
+            vec![
+                Value::Text(format!(r#"{{"generation":1,"index":{index}}}"#)),
+                Value::Text(format!("/{index:04}")),
+            ]
+        }))
+        .expect("build replacement parameter batch");
         let replaced = lix
-            .execute_batch(&replacements)
+            .execute_prepared_dml_batch(
+                Arc::from(format!(
+                    "UPDATE {SCHEMA_KEY} SET value = CAST($1 AS JSONB) WHERE path = $2"
+                )),
+                replacements,
+            )
             .await
             .expect("replace complete collection");
         assert_eq!(
@@ -150,7 +155,7 @@ async fn register_schema<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::
         "additionalProperties": false
     });
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
         &[Value::Text(schema.to_string())],
     )
     .await

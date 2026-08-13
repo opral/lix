@@ -74,7 +74,7 @@ where
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -137,7 +137,7 @@ async fn main() {
 
         session
             .execute(
-                "INSERT INTO locator_row (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO locator_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text("/agent/file".to_owned()),
                     Value::Text(serde_json::json!({ "revision": 0 }).to_string()),
@@ -164,7 +164,7 @@ async fn main() {
             if insert_arm {
                 session
                     .execute(
-                        "INSERT INTO locator_row (path, value) VALUES ($1, lix_json($2))",
+                        "INSERT INTO locator_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
                         &[
                             Value::Text(format!("/agent/file-{revision}")),
                             Value::Text(serde_json::json!({ "revision": revision }).to_string()),
@@ -175,7 +175,7 @@ async fn main() {
             } else {
                 session
                     .execute(
-                        "UPDATE locator_row SET value = lix_json($2) WHERE path = $1",
+                        "UPDATE locator_row SET value = CAST($2 AS JSONB) WHERE path = $1",
                         &[
                             Value::Text("/agent/file".to_owned()),
                             Value::Text(serde_json::json!({ "revision": revision }).to_string()),

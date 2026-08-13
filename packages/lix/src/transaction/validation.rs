@@ -3400,9 +3400,9 @@ fn primary_key_identity_error(
     error: EntityPkError,
 ) -> LixError {
     let reason = match error {
-        EntityPkError::EmptyPrimaryKey => "empty x-lix-primary-key".to_string(),
+        EntityPkError::EmptyPrimaryKey => "empty primary_key".to_string(),
         EntityPkError::EmptyPrimaryKeyPath { index } => {
-            format!("empty x-lix-primary-key pointer at index {index}")
+            format!("empty primary_key column at index {index}")
         }
         EntityPkError::MissingPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
@@ -3500,20 +3500,16 @@ fn validate_foreign_key_definition(
 }
 
 fn validate_schema_field_pointer(schema: &JsonValue, pointer: &[String]) -> Result<(), String> {
-    if pointer.is_empty() {
-        return Err("empty pointer does not name a field".to_string());
-    }
-    let mut current = schema;
-    for segment in pointer {
-        let properties = current
-            .get("properties")
-            .and_then(JsonValue::as_object)
-            .ok_or_else(|| format!("schema segment before '{segment}' has no object properties"))?;
-        current = properties
-            .get(segment)
-            .ok_or_else(|| format!("property '{segment}' does not exist"))?;
-    }
-    Ok(())
+    let [column] = pointer else {
+        return Err("Schema v1 fields are top-level column names".to_string());
+    };
+    let schema = crate::schema::parse_lix_schema(schema).map_err(|error| error.to_string())?;
+    schema
+        .columns
+        .iter()
+        .any(|candidate| candidate.name == *column)
+        .then_some(())
+        .ok_or_else(|| format!("column '{column}' does not exist"))
 }
 
 fn referenced_properties_are_keyed(
