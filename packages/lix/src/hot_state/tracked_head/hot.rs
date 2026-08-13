@@ -527,7 +527,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
             let delta = self.state_rows.row(row_index).delta;
             key_ranges.push(append_hot_mutation_identity(&mut key_bytes, &scope, &delta));
             value_ranges.push(
-                append_head_value(
+                append_head_value_with_typed_layout(
                     &mut value_bytes,
                     &delta.value_ref(
                         delta.created_at,
@@ -538,6 +538,9 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
                         } else {
                             WorkingDiffBaseline::Disabled
                         },
+                    ),
+                    crate::hot_state::typed_slots::builtin_layout_for_schema_key(
+                        delta.schema_key,
                     ),
                 )
                 .expect("deferred fresh hot rows were validated before staging"),
@@ -8785,7 +8788,13 @@ where
                             delta,
                             previous.as_ref(),
                         )?;
-                        Some(append_head_value(&mut next_value_bytes, &value)?)
+                        Some(append_head_value_with_typed_layout(
+                    &mut next_value_bytes,
+                    &value,
+                    crate::hot_state::typed_slots::builtin_layout_for_schema_key(
+                        delta.schema_key,
+                    ),
+                )?)
                     },
                 );
             }
