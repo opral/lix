@@ -2579,6 +2579,9 @@ async fn interval_local_delete_publishes_no_tombstone() {
         census.root_bases
     );
 
+    // Both counter assertions are `>=`, the only bleed-safe direction for a
+    // process-global counter. The effect they predict is asserted immediately
+    // below from the space footprint, which is local to this fixture.
     assert!(
         counters.candidates >= N as u64,
         "every interval-local delete must reach the elision route, saw {}",
@@ -2659,15 +2662,16 @@ async fn clean_pre_image_delete_still_publishes_a_tombstone() {
         working_diff_rows(&session, "p13cln").await
     );
 
+    // The refusal is asserted from the SPACE FOOTPRINT, which is local to this
+    // fixture, and never from the elision counters, which are process-global:
+    // in the parallel suite a concurrent test's publications land in them, and
+    // an `assert_eq!(elided, 0)` here read 251 for a fixture that offered 50.
+    // Only the `>=` direction of a global counter is safe, because bleed can
+    // only inflate it - and `>=` cannot express a refusal. The tombstones
+    // surviving in this collection is the refusal.
     assert_eq!(
-        counters.candidates, 0,
-        "a Clean pre-image must not even be offered as an elision candidate"
-    );
-    assert_eq!(counters.elided, 0, "and nothing may be elided");
-    assert!(
-        census.tombstones >= N as u64 as usize,
-        "the delete of a checkpointed row must still publish its tombstone, saw {}",
-        census.tombstones
+        census.tombstones, N,
+        "the delete of a checkpointed row must still publish its tombstone"
     );
     assert_eq!(
         working_diff_rows(&session, "p13cln").await,
@@ -2725,18 +2729,18 @@ async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
         census.entries, census.tombstones, census.packed_bases, census.root_bases
     );
 
+    // Engagement in the `>=` direction only - safe under counter bleed,
+    // because a concurrent test can only inflate it. It establishes that this
+    // route runs at all; what establishes that gate (a) *refused for these
+    // rows* is the fixture-local tombstone count below.
     assert!(
         counters.candidates >= N as u64,
-        "the deltas must reach the route, or the refusal below is vacuous"
+        "the deltas must reach the route, or the refusal below is vacuous, saw {}",
+        counters.candidates
     );
     assert_eq!(
-        counters.elided, 0,
-        "gate (a) must refuse every elision while a base is visible"
-    );
-    assert!(
-        census.tombstones >= N,
-        "the tombstones must survive over a base, saw {}",
-        census.tombstones
+        census.tombstones, N,
+        "gate (a) must keep every tombstone while a base is visible"
     );
 
     let session = reopen_session(&storage).await;
