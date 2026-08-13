@@ -1,4 +1,5 @@
 use crate::LixError;
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::gc::{
     RepositoryGcPlan, load_checkpoint_gc_state, stage_checkpoint_gc_state,
     stage_repository_gc_with_preconditions,
@@ -36,7 +37,10 @@ where
         let mut preconditions = Vec::new();
         let plan =
             stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions).await?;
-        gc_state.mark_collected();
+        gc_state.mark_collected(
+            plan.sweep.tracked_commit_roots.len() as u64,
+            plan.sweep.live_manifest_count,
+        );
         stage_checkpoint_gc_state(&mut writes, &gc_state)?;
         let commit_boundary = self.transaction_commit_boundary();
         let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
@@ -60,6 +64,27 @@ where
         Ok(Some(plan))
     }
 
+    /// Persists one failed reclaim attempt so the trigger can damp its retry.
+    ///
+    /// Deliberately a tiny single-key write rather than part of the sweep's
+    /// write set: the sweep's write set is exactly what did not commit.
+    async fn record_reclaim_failure(&self) -> Result<(), LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let mut gc_state = load_checkpoint_gc_state(&read).await?;
+        drop(read);
+        gc_state.note_reclaim_failure();
+        let mut writes = self.storage.new_write_set();
+        stage_checkpoint_gc_state(&mut writes, &gc_state)?;
+        self.storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await?;
+        Ok(())
+    }
+
     /// Checkpoint creation must not fail merely because opportunistic cleanup
     /// could not complete. Repository-global debt is cleared only in the same
     /// atomic write as a successful sweep, so every later checkpoint retries
@@ -81,6 +106,19 @@ where
             }
             Ok(None) => {}
             Err(error) => {
+                // Persistent failure here used to be undetectable: one
+                // `tracing::warn!` and no counter, invisible in production
+                // without a subscriber and invisible in tests entirely. Record
+                // it so the next occurrence is findable, and damp the retry so
+                // a failing sweep cannot re-arm a full repository pass on every
+                // checkpoint.
+                reclaim_failures_total().fetch_add(1, Ordering::Relaxed);
+                if let Err(record_error) = self.record_reclaim_failure().await {
+                    tracing::warn!(
+                        error = %record_error,
+                        "could not record reclaim failure; retry damping is skipped"
+                    );
+                }
                 tracing::warn!(
                     error = %error,
                     "post-checkpoint garbage collection failed; checkpoint remains committed"
@@ -345,4 +383,16 @@ mod tests {
             "the delta this test reclaimed by hand must be counted as tolerated, not swallowed"
         );
     }
+}
+
+/// Process-global count of reclaim attempts that failed before reaching
+/// `mark_collected`.
+///
+/// A persistently failing sweep previously produced no observable signal at
+/// all, which is why one went unnoticed. This is the cheap half of making the
+/// next one findable; the persisted `consecutive_reclaim_failures` is the half
+/// that survives a restart.
+pub(crate) fn reclaim_failures_total() -> &'static AtomicU64 {
+    static RECLAIM_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+    &RECLAIM_FAILURES_TOTAL
 }

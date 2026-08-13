@@ -43,7 +43,7 @@ pub(crate) const CHECKPOINT_GC_STATE_NAMESPACE: &str = "checkpoint.gc_state.v1";
 pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
-const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 2;
 const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthenticatedControlCommitReachability {
@@ -139,6 +139,19 @@ pub(crate) struct CheckpointGcState {
     pub(crate) checkpoint_sequence: u64,
     pub(crate) last_gc_sequence: u64,
     pub(crate) collectible_interval_count: u64,
+    /// Live commit-manifest count observed by the last successful reclaim.
+    ///
+    /// Approximate between sweeps and trued up by every sweep, which already
+    /// enumerates the plane. This is a trigger heuristic and never an
+    /// authority: drift costs a slightly early or late sweep and nothing else.
+    pub(crate) live_manifest_estimate: u64,
+    /// Retired commits per collectible interval observed by the last
+    /// successful reclaim. Same status: approximate and self-correcting.
+    pub(crate) yield_per_interval_estimate: u64,
+    /// Consecutive reclaim attempts that failed before reaching
+    /// `mark_collected`. Damps the retry so a persistently failing sweep
+    /// cannot re-arm a full repository pass on every checkpoint.
+    pub(crate) consecutive_reclaim_failures: u64,
 }
 
 impl CheckpointGcState {
@@ -153,9 +166,20 @@ impl CheckpointGcState {
         self.collectible_interval_count > 0
     }
 
-    pub(crate) fn mark_collected(&mut self) {
+    /// Records one successful reclaim and re-derives both trigger estimates
+    /// from what that sweep actually observed.
+    pub(crate) fn mark_collected(&mut self, reclaimed_commits: u64, live_manifest_count: u64) {
+        let intervals = self.collectible_interval_count.max(1);
+        self.yield_per_interval_estimate = reclaimed_commits / intervals;
+        self.live_manifest_estimate = live_manifest_count;
         self.last_gc_sequence = self.checkpoint_sequence;
         self.collectible_interval_count = 0;
+        self.consecutive_reclaim_failures = 0;
+    }
+
+    /// Records one reclaim attempt that did not reach [`Self::mark_collected`].
+    pub(crate) fn note_reclaim_failure(&mut self) {
+        self.consecutive_reclaim_failures = self.consecutive_reclaim_failures.saturating_add(1);
     }
 }
 
@@ -188,6 +212,9 @@ struct StoredCheckpointGcState {
     checkpoint_sequence: u64,
     last_gc_sequence: u64,
     collectible_interval_count: u64,
+    live_manifest_estimate: u64,
+    yield_per_interval_estimate: u64,
+    consecutive_reclaim_failures: u64,
 }
 
 /// One authenticated checkpoint replacement that is still pending physical
@@ -265,6 +292,9 @@ pub(crate) fn stage_checkpoint_gc_state(
             checkpoint_sequence: state.checkpoint_sequence,
             last_gc_sequence: state.last_gc_sequence,
             collectible_interval_count: state.collectible_interval_count,
+            live_manifest_estimate: state.live_manifest_estimate,
+            yield_per_interval_estimate: state.yield_per_interval_estimate,
+            consecutive_reclaim_failures: state.consecutive_reclaim_failures,
         },
     )?;
     writes.put(
@@ -568,6 +598,9 @@ pub(crate) async fn load_checkpoint_gc_state(
         checkpoint_sequence: stored.checkpoint_sequence,
         last_gc_sequence: stored.last_gc_sequence,
         collectible_interval_count: stored.collectible_interval_count,
+        live_manifest_estimate: stored.live_manifest_estimate,
+        yield_per_interval_estimate: stored.yield_per_interval_estimate,
+        consecutive_reclaim_failures: stored.consecutive_reclaim_failures,
     };
     validate_checkpoint_gc_state(state)?;
     Ok(state)
@@ -624,6 +657,9 @@ fn validate_stored_recovery_ref(
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RepositoryGcSweep {
+    /// Live commit manifests this sweep had to scan to plan. Feeds the reclaim
+    /// trigger's inventory estimate; in-memory only, never persisted here.
+    pub(crate) live_manifest_count: u64,
     pub(crate) tracked_commit_roots: Vec<CommitId>,
     pub(crate) standalone_changes: Vec<ChangeId>,
     /// Derived serving rows reclaimed from branch generations that no live
@@ -1425,6 +1461,9 @@ where
 
     // Retirement candidates are derived here, not read from a ledger.
     let candidates = derive_retirement_candidates(&store).await?;
+    // The inventory this sweep had to scan. Feeds the reclaim trigger's
+    // self-correcting denominator; captured before `candidates` is consumed.
+    let live_manifest_count = candidates.len() as u64;
 
     // Derive both physical retirement and logical CAS retention from the one
     // authenticated serving closure. In particular, do not perform a second
@@ -1563,6 +1602,7 @@ where
             repair: GcRepairSet::default(),
         },
         sweep: RepositoryGcSweep {
+            live_manifest_count,
             tracked_commit_roots: reclaimed_commits.into_iter().collect(),
             // Superseded branch-ref facts and stale serving generations are
             // retired by the publication that supersedes them, in that same
@@ -1641,6 +1681,10 @@ where
     Ok(RepositoryGcPlan {
         changelog: changelog_plan,
         sweep: RepositoryGcSweep {
+            // The recovery-only rebuild path never feeds the reclaim trigger;
+            // it rediscovers liveness by scanning rather than from the
+            // manifest inventory, so it has no inventory figure to report.
+            live_manifest_count: 0,
             tracked_commit_roots: swept_snapshot_authorities,
             standalone_changes: Vec::new(),
             reclaimed_generation_rows: 0,
@@ -4159,6 +4203,108 @@ mod tests {
             .expect("payload fixture schema should register");
     }
 
+    /// Demonstrates, mechanically, that the in-record `format_version` cannot
+    /// gate an arity change to `StoredCheckpointGcState`.
+    ///
+    /// Every storage record is `#[musli(packed)]` -- positional and untagged --
+    /// so a reader's field count is part of its wire contract. Decoding fails on
+    /// **arity**, before any field value (including `format_version`) can be
+    /// inspected. The upgrade mechanism for such a change is therefore
+    /// `REPOSITORY_PROTOCOL_VALUE`, which makes `Engine::new` reject the
+    /// repository outright, not the per-record version field.
+    ///
+    /// Reading the derive is not evidence for this; the readers below are
+    /// constructed and run.
+    #[test]
+    fn packed_arity_change_cannot_be_gated_by_the_in_record_format_version() {
+        // Today's shipping shape: format_version + 3 counters.
+        #[derive(musli::Encode, musli::Decode)]
+        #[musli(packed)]
+        struct ArityOld {
+            format_version: u32,
+            checkpoint_sequence: u64,
+            last_gc_sequence: u64,
+            collectible_interval_count: u64,
+        }
+
+        // Proposed shape: the same, plus the two self-correcting estimates the
+        // ratio trigger needs.
+        #[derive(musli::Encode, musli::Decode)]
+        #[musli(packed)]
+        struct ArityNew {
+            format_version: u32,
+            checkpoint_sequence: u64,
+            last_gc_sequence: u64,
+            collectible_interval_count: u64,
+            live_manifest_estimate: u64,
+            yield_per_interval_estimate: u64,
+        }
+
+        let new_bytes = crate::storage_codec::encode(
+            "arity demo new",
+            &ArityNew {
+                format_version: 2,
+                checkpoint_sequence: 7,
+                last_gc_sequence: 3,
+                collectible_interval_count: 4,
+                live_manifest_estimate: 512,
+                yield_per_interval_estimate: 9,
+            },
+        )
+        .expect("new record should encode");
+
+        let old_bytes = crate::storage_codec::encode(
+            "arity demo old",
+            &ArityOld {
+                format_version: 1,
+                checkpoint_sequence: 7,
+                last_gc_sequence: 3,
+                collectible_interval_count: 4,
+            },
+        )
+        .expect("old record should encode");
+
+        // Direction 1: an OLD reader against a NEW record.
+        let old_reads_new = crate::storage_codec::decode::<ArityOld>("arity demo", &new_bytes);
+        let old_reads_new_err = old_reads_new
+            .err()
+            .expect("a 4-field reader must reject a 6-field record");
+        println!("ARITY old_reader_vs_new_record: {}", old_reads_new_err.message);
+
+        // Direction 2: a NEW reader against an OLD record.
+        let new_reads_old = crate::storage_codec::decode::<ArityNew>("arity demo", &old_bytes);
+        let new_reads_old_err = new_reads_old
+            .err()
+            .expect("a 6-field reader must reject a 4-field record");
+        println!("ARITY new_reader_vs_old_record: {}", new_reads_old_err.message);
+
+        // The sharp point: bumping `format_version` inside the record does not
+        // help, because a same-arity record still decodes cleanly and a
+        // different-arity record never reaches the field at all. So the version
+        // field can express "same shape, new meaning" and can never express
+        // "new shape".
+        let bumped = crate::storage_codec::encode(
+            "arity demo bumped",
+            &ArityOld {
+                format_version: 999,
+                checkpoint_sequence: 7,
+                last_gc_sequence: 3,
+                collectible_interval_count: 4,
+            },
+        )
+        .expect("bumped record should encode");
+        let decoded = crate::storage_codec::decode::<ArityOld>("arity demo", &bumped)
+            .expect("a same-arity record decodes regardless of its version value");
+        assert_eq!(
+            decoded.format_version, 999,
+            "the version field is only observable once arity already matched"
+        );
+        println!(
+            "ARITY same_arity_decodes_despite_version=999 checkpoint_sequence={}",
+            decoded.checkpoint_sequence
+        );
+    }
+
     async fn run_shipping_repository_gc(backend: &Memory) -> super::RepositoryGcPlan {
         let storage = StorageAdapter::new(backend.clone());
         let read = SharedStorageAdapterRead::new(
@@ -5063,10 +5209,16 @@ mod tests {
     #[tokio::test]
     async fn repository_gc_state_round_trips() {
         let storage = StorageAdapter::new(Memory::new());
+        // Distinct values per field: a positional `#[musli(packed)]` record
+        // will round-trip a permuted field order undetected if the values
+        // collide.
         let expected = CheckpointGcState {
             checkpoint_sequence: 129,
             last_gc_sequence: 64,
             collectible_interval_count: 65,
+            live_manifest_estimate: 4_096,
+            yield_per_interval_estimate: 7,
+            consecutive_reclaim_failures: 3,
         };
         let mut writes = storage.new_write_set();
         stage_checkpoint_gc_state(&mut writes, &expected)
