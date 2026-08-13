@@ -1086,31 +1086,80 @@ async fn load_file_history_filesystem_context<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let lookup_ids = lookup_ids.cloned();
-    let (event_entries, context_entries) =
-        load_file_history_entry_sets(event_route, context_route, move |route| {
-            let commit_graph = Arc::clone(&commit_graph);
-            let query_source = query_source.clone();
-            let lookup_ids = lookup_ids.clone();
-            async move {
-                load_file_history_filesystem_entries(
-                    commit_graph,
-                    query_source,
-                    &route,
-                    lookup_ids.as_ref(),
-                    metadata_projection,
-                )
-                .await
-            }
-        })
+    let event_entries = load_file_history_filesystem_entries(
+        Arc::clone(&commit_graph),
+        query_source.clone(),
+        event_route,
+        lookup_ids,
+        metadata_projection,
+    )
+    .await?;
+    let event_descriptors = parse_file_history_descriptors(&event_entries)?;
+    // The context set contributes descriptors and nothing else (see
+    // `FileHistoryFilesystemContext::descriptors`, whose only consumer is
+    // `file_history_events`' `context_descriptors`). Loading the blob-ref and
+    // directory projections over the anchor route as well materialized one
+    // change per reachable content commit and then dropped every one of them,
+    // and it widened the touched-scope digest's schema-family test from
+    // `lix_file_descriptor` alone to a family every content commit touches --
+    // so the anchor walk could not prune the commits it was about to discard.
+    let descriptors = if event_route == context_route {
+        event_descriptors.clone()
+    } else {
+        let context_entries = load_file_history_descriptor_entries(
+            commit_graph,
+            query_source,
+            context_route,
+            lookup_ids,
+            metadata_projection,
+        )
         .await?;
+        parse_file_history_descriptors(&context_entries)?
+    };
 
     Ok(FileHistoryFilesystemContext {
-        event_descriptors: parse_file_history_descriptors(&event_entries)?,
         event_directories: parse_file_history_directories(&event_entries)?,
         event_blobs: parse_file_history_blobs(&event_entries)?,
-        descriptors: parse_file_history_descriptors(&context_entries)?,
+        event_descriptors,
+        descriptors,
     })
+}
+
+/// Loads the descriptor-only projection a shaped file-history row needs for
+/// path context.
+///
+/// This is deliberately narrower than
+/// [`load_file_history_filesystem_entries`]: restricting the traversal to
+/// `lix_file_descriptor` is what lets `scope_digest_outcome`'s schema-family
+/// test prove a content-only commit absent, which it cannot do once
+/// `lix_binary_blob_ref` is in the same request.
+async fn load_file_history_descriptor_entries<S>(
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlHistoryQuerySource<S>,
+    route: &HistoryRoute,
+    lookup_ids: Option<&FileHistoryLookupIds>,
+    metadata_projection: HistoryMetadataProjection,
+) -> Result<Vec<HistoryEntry>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let route = match lookup_ids {
+        Some(lookup_ids) => file_history_descriptor_blob_route(route, lookup_ids)?,
+        None => route.clone(),
+    };
+    load_history_entries(
+        HistoryViewDescriptor {
+            view_name: "lix_file_history",
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
+        },
+        commit_graph,
+        query_source,
+        &route,
+        vec![FILE_DESCRIPTOR_SCHEMA_KEY.to_string()],
+        metadata_projection,
+        None,
+    )
+    .await
 }
 
 async fn load_file_history_observed_states<S>(
