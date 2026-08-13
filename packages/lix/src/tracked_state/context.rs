@@ -9126,7 +9126,7 @@ mod tests {
                 filter: crate::tracked_state::TrackedStateFilter {
                     schema_keys: vec![SCHEMA_KEY.to_owned()],
                     entity_pks: vec![key.entity_pk.clone()],
-                    file_ids: vec![crate::NullableKeyFilter::Value(FILE_ID.to_owned())],
+                    file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_owned())],
                     include_tombstones: true,
                 },
                 read_columns: crate::tracked_state::TrackedStateReadColumns {
