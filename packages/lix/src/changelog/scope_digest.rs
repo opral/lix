@@ -360,6 +360,48 @@ mod tests {
         );
     }
 
+    /// expEK MEASUREMENT — NOT FOR MERGE.
+    ///
+    /// The per-scope digest is affordable because a commit touches a handful of
+    /// scopes. A per-*entity* token set inserts one token per distinct entity,
+    /// so the marginal cost of a token is the whole write-time question. This
+    /// times the existing token insertion path directly rather than modelling
+    /// BLAKE3 throughput.
+    #[test]
+    #[ignore]
+    fn expek_token_insertion_cost() {
+        use std::time::Instant;
+
+        let warm = CommitTouchedScopeDigest::exact([&scope("warm", Some("warm"))]);
+        std::hint::black_box(&warm);
+
+        for token_count in [1usize, 8, 64, 512, 4096] {
+            let scopes = (0..token_count)
+                .map(|index| {
+                    scope(
+                        "lix_binary_blob_ref",
+                        Some(&format!("01920000-0000-7000-8000-{index:012}")),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let reps = (1_000_000 / token_count).max(4);
+            let start = Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(CommitTouchedScopeDigest::exact(scopes.iter()));
+            }
+            let elapsed = start.elapsed();
+            // Each scope inserts TWO tokens (family + family/file pair), so the
+            // per-token figure divides by 2 * token_count.
+            let per_token_ns =
+                elapsed.as_nanos() as f64 / (reps as f64 * token_count as f64 * 2.0);
+            eprintln!(
+                "expek_token_cost scopes={token_count} reps={reps}                  total_ms={:.3} per_scope_ns={:.1} per_token_ns={per_token_ns:.1}",
+                elapsed.as_secs_f64() * 1000.0,
+                per_token_ns * 2.0,
+            );
+        }
+    }
+
     #[test]
     fn digest_round_trips_through_the_record_codec() {
         let digest = CommitTouchedScopeDigest::exact([&scope("lix_file_descriptor", None)]);
