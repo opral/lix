@@ -1,5 +1,6 @@
 [package]
 name = "lix_e2e"
+workspace = "../../tooling"
 version.workspace = true
 publish = false
 authors.workspace = true
