@@ -12814,9 +12814,15 @@ mod tests {
         }
 
         let stats = transaction_path_index_build_stats();
+        // The property under test is that builds do not scale with the number of
+        // staged revisions: five loop iterations produce a constant, small build
+        // count because later revisions advance the projection by delta. The
+        // constant itself is route-dependent -- the by-path content update now
+        // takes the fast content-update route, which needs only the data
+        // projection, where the DataFusion route also built the metadata one.
         assert_eq!(
-            stats.builds, 2,
-            "the data and metadata projections may each build once; later revisions must advance by delta"
+            stats.builds, 1,
+            "the data projection may build once; later revisions must advance by delta"
         );
         assert!(
             stats.descriptor_rows > 0,

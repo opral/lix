@@ -4233,3 +4233,130 @@ simulation_test!(
             .expect("retry transaction rollback should succeed");
     }
 );
+
+// The by-path fast content-update route is an UPDATE, never an upsert. This is
+// the correctness gate for routing `WHERE path = ?` off DataFusion: an absent
+// path must affect zero rows and must not create a descriptor.
+simulation_test!(
+    lix_file_update_content_by_absent_path_affects_no_rows_and_creates_nothing,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('61627365-6e74-8070-8174-682d70726500', '/present.txt', CAST('one' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("seed file insert should succeed");
+
+        let baseline = session
+            .execute("SELECT id, path FROM lix_file ORDER BY path", &[])
+            .await
+            .expect("baseline listing should succeed");
+        assert_eq!(baseline.len(), 1);
+
+        // Parameterized form -- exactly what the JS SDK and CLI emit.
+        let absent = session
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE path = $2",
+                &[
+                    Value::Blob(b"ignored".to_vec().into()),
+                    Value::Text("/absent.txt".to_string()),
+                ],
+            )
+            .await
+            .expect("update against an absent path should succeed with no rows");
+        assert_eq!(absent.rows_affected(), 0);
+
+        // Literal form, and the metadata-bearing shape, take the same route.
+        let absent_literal = session
+            .execute(
+                "UPDATE lix_file SET content = CAST('ignored' AS BYTEA) \
+                 WHERE path = '/absent-literal.txt'",
+                &[],
+            )
+            .await
+            .expect("literal update against an absent path should succeed");
+        assert_eq!(absent_literal.rows_affected(), 0);
+
+        let absent_with_metadata = session
+            .execute(
+                "UPDATE lix_file SET content = $1, lixcol_metadata = $2 WHERE path = $3",
+                &[
+                    Value::Blob(b"ignored".to_vec().into()),
+                    Value::Text(json!({"key": "value"}).to_string()),
+                    Value::Text("/absent-metadata.txt".to_string()),
+                ],
+            )
+            .await
+            .expect("metadata update against an absent path should succeed");
+        assert_eq!(absent_with_metadata.rows_affected(), 0);
+
+        // Nothing was created: the listing is byte-for-byte the seed listing.
+        let after = session
+            .execute("SELECT id, path FROM lix_file ORDER BY path", &[])
+            .await
+            .expect("post-update listing should succeed");
+        assert_rows_eq(
+            after,
+            vec![vec![
+                Value::Text("61627365-6e74-8070-8174-682d70726500".to_string()),
+                Value::Text("/present.txt".to_string()),
+            ]],
+        );
+
+        // ... and the file that does exist is untouched.
+        let untouched = session
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/present.txt'",
+                &[],
+            )
+            .await
+            .expect("present file read should succeed");
+        assert_rows_eq(untouched, vec![vec![Value::Blob(b"one".to_vec().into())]]);
+
+        // Positive control: the same statement shape against a present path
+        // updates exactly one row.
+        let present = session
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE path = $2",
+                &[
+                    Value::Blob(b"two".to_vec().into()),
+                    Value::Text("/present.txt".to_string()),
+                ],
+            )
+            .await
+            .expect("update against a present path should succeed");
+        assert_eq!(present.rows_affected(), 1);
+
+        let updated = session
+            .execute(
+                "SELECT id, content FROM lix_file WHERE path = '/present.txt'",
+                &[],
+            )
+            .await
+            .expect("updated file read should succeed");
+        assert_rows_eq(
+            updated,
+            vec![vec![
+                Value::Text("61627365-6e74-8070-8174-682d70726500".to_string()),
+                Value::Blob(b"two".to_vec().into()),
+            ]],
+        );
+
+        let final_listing = session
+            .execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .await
+            .expect("final listing should succeed");
+        assert_eq!(final_listing.len(), 1);
+    }
+);

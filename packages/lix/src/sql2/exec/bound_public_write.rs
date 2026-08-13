@@ -2150,8 +2150,20 @@ pub(crate) async fn try_execute_bound_public_write(
     }
 }
 
+/// The column an `UPDATE lix_file SET content = ...` predicate selects by.
+///
+/// `id` and `path` are both single-descriptor equality selectors resolved from
+/// the same path index, so they share one update route. Everything else — more
+/// than one row, or a non-`Eq` predicate — stays on DataFusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastFileContentUpdateSelectorColumn {
+    Id,
+    Path,
+}
+
 struct FastFileContentUpdateShape {
-    id: BoundExpr,
+    selector_column: FastFileContentUpdateSelectorColumn,
+    selector: BoundExpr,
     data: BoundExpr,
     metadata: Option<BoundExpr>,
     data_parameter_index: Option<usize>,
@@ -2163,30 +2175,38 @@ async fn execute_file_content_update(
     metadata: &ExecuteStatementMetadata,
     shape: &FastFileContentUpdateShape,
 ) -> Result<u64, LixError> {
-    let id = eval_fast_file_nullable_text(&shape.id, params, "id")?;
+    let column = match shape.selector_column {
+        FastFileContentUpdateSelectorColumn::Id => "id",
+        FastFileContentUpdateSelectorColumn::Path => "path",
+    };
+    let selector = eval_fast_file_nullable_text(&shape.selector, params, column)?.map(|value| {
+        match shape.selector_column {
+            FastFileContentUpdateSelectorColumn::Id => {
+                crate::sql2::providers::FastLixFileContentUpdateSelector::Id(value)
+            }
+            FastFileContentUpdateSelectorColumn::Path => {
+                crate::sql2::providers::FastLixFileContentUpdateSelector::Path(value)
+            }
+        }
+    });
     let data = eval_fast_file_blob(&shape.data, params, "content")?;
+    let metadata_update = match &shape.metadata {
+        Some(metadata_expr) => Some(eval_fast_file_metadata(metadata_expr, params)?),
+        None => None,
+    };
     let splice_provenance = fast_file_content_update_splice_provenance(shape, metadata);
-    if let Some(metadata_expr) = &shape.metadata {
-        let row_metadata = eval_fast_file_metadata(metadata_expr, params)?;
-        crate::sql2::providers::execute_fast_lix_file_content_update_by_id_with_metadata(
-            ctx,
-            id,
-            data,
-            row_metadata,
-            splice_provenance,
-            metadata.mutation_identity(),
-        )
-        .await
-    } else {
-        crate::sql2::providers::execute_fast_lix_file_content_update_by_id(
-            ctx,
-            id,
-            data,
-            splice_provenance,
-            metadata.mutation_identity(),
-        )
-        .await
-    }
+    // One awaited future, not one per selector/metadata permutation. The write
+    // path's future-size budget is tight enough that extra inlined state
+    // machines here are themselves a regression.
+    crate::sql2::providers::execute_fast_lix_file_content_update(
+        ctx,
+        selector,
+        data,
+        metadata_update,
+        splice_provenance,
+        metadata.mutation_identity(),
+    )
+    .await
 }
 
 fn fast_file_content_update_splice_provenance(
@@ -2234,9 +2254,10 @@ fn fast_file_content_update_shape(
     {
         return None;
     }
-    let id = fast_file_id_predicate_value(&plan.bound.predicate)?;
+    let (selector_column, selector) = fast_file_selector_predicate_value(&plan.bound.predicate)?;
     Some(FastFileContentUpdateShape {
-        id: id.clone(),
+        selector_column,
+        selector: selector.clone(),
         data: assignment.value.clone(),
         metadata,
         data_parameter_index: match &assignment.value {
@@ -2246,24 +2267,30 @@ fn fast_file_content_update_shape(
     })
 }
 
-fn fast_file_id_predicate_value(predicate: &BoundPredicate) -> Option<&BoundExpr> {
+fn fast_file_selector_predicate_value(
+    predicate: &BoundPredicate,
+) -> Option<(FastFileContentUpdateSelectorColumn, &BoundExpr)> {
     let BoundPredicate::Eq(left, right) = predicate else {
         return None;
     };
-    fast_file_id_column_value(left, right).or_else(|| fast_file_id_column_value(right, left))
+    fast_file_selector_column_value(left, right)
+        .or_else(|| fast_file_selector_column_value(right, left))
 }
 
-fn fast_file_id_column_value<'a>(
+fn fast_file_selector_column_value<'a>(
     column_expr: &BoundExpr,
     value_expr: &'a BoundExpr,
-) -> Option<&'a BoundExpr> {
+) -> Option<(FastFileContentUpdateSelectorColumn, &'a BoundExpr)> {
     let BoundExpr::Column(column) = column_expr else {
         return None;
     };
-    if column.name == "id" && fast_file_text_expr_supported(value_expr) {
-        Some(value_expr)
-    } else {
-        None
+    if !fast_file_text_expr_supported(value_expr) {
+        return None;
+    }
+    match column.name.as_str() {
+        "id" => Some((FastFileContentUpdateSelectorColumn::Id, value_expr)),
+        "path" => Some((FastFileContentUpdateSelectorColumn::Path, value_expr)),
+        _ => None,
     }
 }
 
@@ -7838,8 +7865,9 @@ mod primary_key_route_tests {
 #[cfg(test)]
 mod splice_provenance_tests {
     use super::{
-        BoundExpr, FastFileContentUpdateShape, fast_file_blob_expr_splice_provenance,
-        fast_file_content_update_splice_provenance,
+        BoundExpr, BoundPredicate, FastFileContentUpdateSelectorColumn, FastFileContentUpdateShape,
+        fast_file_blob_expr_splice_provenance, fast_file_content_update_splice_provenance,
+        fast_file_selector_predicate_value,
     };
     use crate::common::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
     use crate::sql2::bind::expr::BoundParamRef;
@@ -7856,6 +7884,40 @@ mod splice_provenance_tests {
         )
     }
 
+    /// `id` and `path` are the only two single-descriptor equality selectors.
+    /// Every other column, and every non-`Eq` predicate, stays on DataFusion.
+    #[test]
+    fn fast_file_content_update_selects_by_id_or_path_only() {
+        fn column(name: &str) -> BoundExpr {
+            BoundExpr::Column(crate::sql2::bind::expr::BoundColumnRef {
+                table: "lix_file".to_string(),
+                column_id: 0,
+                name: name.to_string(),
+            })
+        }
+        let value = BoundExpr::Param(BoundParamRef { index: 2 });
+
+        for (name, expected) in [
+            ("id", Some(FastFileContentUpdateSelectorColumn::Id)),
+            ("path", Some(FastFileContentUpdateSelectorColumn::Path)),
+            ("content", None),
+            ("lixcol_metadata", None),
+        ] {
+            // Both operand orders resolve identically.
+            for predicate in [
+                BoundPredicate::Eq(column(name), value.clone()),
+                BoundPredicate::Eq(value.clone(), column(name)),
+            ] {
+                let resolved = fast_file_selector_predicate_value(&predicate)
+                    .map(|(selector_column, _)| selector_column);
+                assert_eq!(resolved, expected, "column {name}");
+            }
+        }
+
+        // A non-`Eq` predicate has no fast shape at all.
+        assert!(fast_file_selector_predicate_value(&BoundPredicate::True).is_none());
+    }
+
     #[test]
     fn fast_file_content_update_uses_the_bound_data_parameter_metadata() {
         let expected = splice("content");
@@ -7864,7 +7926,8 @@ mod splice_provenance_tests {
             ..ExecuteStatementMetadata::default()
         };
         let shape = FastFileContentUpdateShape {
-            id: BoundExpr::Param(BoundParamRef { index: 2 }),
+            selector_column: FastFileContentUpdateSelectorColumn::Id,
+            selector: BoundExpr::Param(BoundParamRef { index: 2 }),
             data: BoundExpr::Param(BoundParamRef { index: 3 }),
             metadata: None,
             data_parameter_index: Some(3),
@@ -7883,7 +7946,8 @@ mod splice_provenance_tests {
             ..ExecuteStatementMetadata::default()
         };
         let parameter_shape = FastFileContentUpdateShape {
-            id: BoundExpr::Param(BoundParamRef { index: 1 }),
+            selector_column: FastFileContentUpdateSelectorColumn::Id,
+            selector: BoundExpr::Param(BoundParamRef { index: 1 }),
             data: BoundExpr::Param(BoundParamRef { index: 2 }),
             metadata: None,
             data_parameter_index: Some(2),
@@ -7894,7 +7958,8 @@ mod splice_provenance_tests {
         );
 
         let literal_shape = FastFileContentUpdateShape {
-            id: BoundExpr::Param(BoundParamRef { index: 1 }),
+            selector_column: FastFileContentUpdateSelectorColumn::Path,
+            selector: BoundExpr::Param(BoundParamRef { index: 1 }),
             data: BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Text(
                 "literal".to_string(),
             )),
