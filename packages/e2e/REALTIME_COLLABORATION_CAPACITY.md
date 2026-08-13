@@ -149,8 +149,18 @@ cargo test -p lix_e2e \
   abandoned_transactions_and_sessions_release_resources \
   -- --ignored --exact --nocapture
 
+# ⚠️ INERT — this command runs zero tests and exits 0. Do not read it as a pass.
+# `server_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95`
+# carries `#[cfg(any())]` in packages/lix/src/server_protocol/mod.rs, together
+# with the whole `RemoteCapacityBackend` apparatus it needs, so it compiles in
+# no configuration. Measured: exit 0, `running 0 tests ... 2301 filtered out`.
+# The filter is also mis-spelled independently of that — the emitted name is
+# `server_protocol::tests::…`, so `--exact` on `tests::…` matches nothing even
+# once the item is compiled back in. The two `--test
+# realtime_collaboration_capacity` commands above are the live gate; unlike this
+# one they name a target, so a stale name there exits 101 instead of 0.
 cargo test -p lix --features "server-protocol storage-benches" --release \
-  tests::server_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95 \
+  server_protocol::tests::server_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95 \
   -- --ignored --exact --nocapture
 ```
 

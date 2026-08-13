@@ -108,6 +108,21 @@ jobs:
         if: matrix.task == 'clippy'
         run: cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings
 
+      # The one supported configuration nothing else here builds: `cfg(test)`
+      # with `storage-benches` OFF, which is exactly what a plain
+      # `cargo test -p lix` — the dev loop `packages/lix/AGENTS.md` documents —
+      # compiles. Every other step has the feature on (`--all-features`), and a
+      # `--no-default-features` check has no test targets at all, so a
+      # `#[cfg(test)]` item that calls the feature-only `storage_bench` module
+      # breaks `cargo test -p lix` while clippy, the full test matrix and the
+      # `--all-features` build all stay green. Two such call sites had
+      # accumulated in `gc.rs` before this step existed. `check` rather than
+      # `test`: the matrix below already runs the tests, this only has to prove
+      # the configuration compiles.
+      - name: Check lix test targets with default features
+        if: matrix.task == 'clippy'
+        run: cargo check -p lix --tests
+
       # `--all-features` is deliberate: it is the only thing that compiles
       # feature-gated sources such as `packages/lix/src/storage_bench.rs`
       # (behind `lix/storage-benches`), where a stale assertion once survived

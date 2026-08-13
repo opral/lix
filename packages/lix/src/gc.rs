@@ -2871,6 +2871,13 @@ mod tests {
         assert!(!closure.cas_logical_dependencies.contains(&owner.commit_id));
     }
 
+    // `crate::storage_bench` exists only under `feature = "storage-benches"`,
+    // so every `#[cfg(test)]` item that reaches into it must carry the same
+    // gate. Without it `cargo check -p lix --tests` — `cfg(test)` with the
+    // feature off, which is what a plain `cargo test -p lix` builds — fails
+    // to compile the whole lib test target, while `--all-features` and CI
+    // stay green.
+    #[cfg(feature = "storage-benches")]
     #[tokio::test]
     async fn ordinary_gc_releases_finite_selected_owner_only_after_checkpoint_release() {
         let storage = StorageAdapter::new(Memory::new());
@@ -3015,6 +3022,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "storage-benches")]
     /// Is there still a row in the change-locator plane for `change_id`?
     async fn locator_row_exists<R>(read: &R, change_id: ChangeId) -> bool
     where
@@ -3832,6 +3840,7 @@ mod tests {
     /// probe: a payload at or under 1 KiB never reaches the store at all, and
     /// the store is content addressed, so re-writing byte-identical content
     /// dedups onto one row and leaks nothing.
+    #[cfg(feature = "storage-benches")]
     fn out_of_band_payload(revision: usize) -> String {
         let filler = format!("rev-{revision:08}-");
         let mut body = String::with_capacity(2_048);
@@ -3851,6 +3860,7 @@ mod tests {
     /// distinct owners a co-ownership fixture needs. (An earlier version used
     /// two different paths, believed it had proved dedup, and was measuring two
     /// unrelated payloads.)
+    #[cfg(feature = "storage-benches")]
     async fn register_payload_schema<S>(
         session: &crate::integration::SessionContext<S>,
         schema_key: &str,
@@ -3880,6 +3890,7 @@ mod tests {
             .expect("payload fixture schema should register");
     }
 
+    #[cfg(feature = "storage-benches")]
     async fn run_shipping_repository_gc(backend: &Memory) -> super::RepositoryGcPlan {
         let storage = StorageAdapter::new(backend.clone());
         let read = SharedStorageAdapterRead::new(
@@ -3907,6 +3918,7 @@ mod tests {
         plan
     }
 
+    #[cfg(feature = "storage-benches")]
     async fn json_payload_refs(backend: &Memory) -> BTreeSet<JsonRef> {
         let storage = StorageAdapter::new(backend.clone());
         let read = storage
@@ -3928,6 +3940,7 @@ mod tests {
     /// engine's JSON normalization in the test. Re-deriving the content address
     /// here would make the fixture depend on a normalization detail rather than
     /// on the reachability behaviour under test.
+    #[cfg(feature = "storage-benches")]
     async fn payload_ref_added_by<F, Fut>(backend: &Memory, publish: F) -> JsonRef
     where
         F: FnOnce() -> Fut,
@@ -3953,6 +3966,7 @@ mod tests {
     /// owner does **not** write a second payload — it resolves onto the row the
     /// first owner already produced. Retiring the commit that happened to
     /// author it first must therefore not be read as "nobody names this".
+    #[cfg(feature = "storage-benches")]
     #[tokio::test]
     async fn repository_gc_keeps_a_payload_a_second_owner_still_names() {
         let backend = Memory::new();
@@ -4054,6 +4068,7 @@ mod tests {
     /// Untracked rows live only in the hot serving plane — no commit names
     /// them — so a live set derived from commits alone deletes this payload out
     /// from under both of them.
+    #[cfg(feature = "storage-benches")]
     #[tokio::test]
     async fn repository_gc_keeps_a_payload_co_owned_by_history_and_untracked_rows() {
         let backend = Memory::new();
@@ -4162,6 +4177,7 @@ mod tests {
 
     /// The leak this reclamation exists to close: superseded payloads are
     /// actually reclaimed, and the live one is not.
+    #[cfg(feature = "storage-benches")]
     #[tokio::test]
     async fn repository_gc_reclaims_superseded_out_of_band_payloads() {
         let backend = Memory::new();
