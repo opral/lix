@@ -546,14 +546,10 @@ mod tests {
             Domain::schema_catalog("main", false),
             crate::schema::SchemaKey::new(schema_key),
             json!({
-                "x-lix-key": schema_key,
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" }
-                },
-                "required": ["id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": schema_key,
+                "columns": [{ "name": "id", "type": "text", "nullable": false }],
+                "primary_key": ["id"]
             }),
         )
     }
@@ -574,10 +570,10 @@ mod tests {
             .expect("schema visibility should load");
 
         assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_registered_schema")
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_registered_schema")
         }));
         assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_key_value")
         }));
     }
 
@@ -618,7 +614,7 @@ mod tests {
             .expect("schema visibility should load");
 
         assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
+            schema.get("key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
         }));
     }
 
@@ -662,10 +658,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_key_value")
         }));
         assert!(!schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
+            schema.get("key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
         }));
     }
 
@@ -686,7 +682,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_key_value")
         }));
     }
 
@@ -723,7 +719,7 @@ mod tests {
             .expect("schema facts should load");
         let schema_keys = facts
             .iter()
-            .filter_map(|fact| fact.schema().get("x-lix-key").and_then(JsonValue::as_str))
+            .filter_map(|fact| fact.schema().get("key").and_then(JsonValue::as_str))
             .collect::<Vec<_>>();
 
         assert_eq!(schema_keys, vec!["valid_schema"]);
@@ -825,14 +821,12 @@ mod tests {
             ),
             snapshot_content: Some(
                 json!({
+                    "schema_key": schema_key,
                     "value": {
-                        "x-lix-key": schema_key,
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" }
-                        },
-                        "required": ["id"],
-                        "additionalProperties": false
+                        "$schema": "https://lix.dev/schema-v1.json",
+                        "key": schema_key,
+                        "columns": [{ "name": "id", "type": "text", "nullable": false }],
+                        "primary_key": ["id"]
                     }
                 })
                 .to_string()
@@ -843,12 +837,8 @@ mod tests {
 
     fn registered_schema_entity_pk(schema_key: &str) -> crate::entity_pk::EntityPk {
         crate::entity_pk::EntityPk::from_primary_key_paths(
-            &json!({
-                "value": {
-                    "x-lix-key": schema_key,
-                }
-            }),
-            &[vec!["value".to_string(), "x-lix-key".to_string()]],
+            &json!({ "schema_key": schema_key }),
+            &[vec!["schema_key".to_string()]],
         )
         .expect("registered schema identity should derive")
     }

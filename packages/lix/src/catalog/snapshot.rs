@@ -2516,15 +2516,13 @@ mod tests {
                 schema_key: "uuid_format_row".to_owned(),
             },
             json!({
-                "x-lix-key": "uuid_format_row",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "external_id": {"type": "string", "format": "uuid"},
-                    "id": {"type": "string"}
-                },
-                "required": ["external_id", "id"],
-                "additionalProperties": false
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "uuid_format_row",
+                "columns": [
+                    {"name": "external_id", "type": "uuid", "nullable": false},
+                    {"name": "id", "type": "text", "nullable": false}
+                ],
+                "primary_key": ["id"]
             }),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -2867,35 +2865,29 @@ mod tests {
 
     fn schema_json(schema_key: &str) -> JsonValue {
         json!({
-            "x-lix-key": schema_key,
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" }
-            },
-            "required": ["id"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"]
         })
     }
 
     fn child_schema_json(schema_key: &str, parent_schema_key: &str) -> JsonValue {
         json!({
-            "x-lix-key": schema_key,
-            "x-lix-primary-key": ["/id"],
-            "x-lix-foreign-keys": [{
-                "properties": ["/parent_id"],
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": schema_key,
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "parent_id", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "columns": ["parent_id"],
                 "references": {
-                    "schemaKey": parent_schema_key,
-                    "properties": ["/id"]
+                    "schema_key": parent_schema_key,
+                    "columns": ["id"]
                 }
-            }],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "parent_id": { "type": "string" }
-            },
-            "required": ["id", "parent_id"],
-            "additionalProperties": false
+            }]
         })
     }
 }
