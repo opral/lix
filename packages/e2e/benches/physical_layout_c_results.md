@@ -37,18 +37,18 @@ Range is 1%/500 rows. Proof objects include the leaf and authenticated internal 
 
 | Row width | Target | Point bytes / objects | Range bytes / objects | Full scan bytes | D=1 replace bytes / puts | D=100 | D=1000 |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 64 B | 4 KiB | 4,301 / 4 | 31,129 / 22 | 2,689,375 | 3,584 / 4 | 231,826 / 171 | 1,647,269 / 1,072 |
-| 256 B | 4 KiB | 3,983 / 4 | 52,453 / 52 | 4,945,598 | 3,525 / 4 | 238,457 / 208 | 1,248,302 / 1,167 |
-| 1 KiB | 4 KiB | 4,795 / 4 | 146,008 / 208 | 14,312,119 | 4,406 / 4 | 253,049 / 223 | 1,506,490 / 1,564 |
-| 4 KiB | 16 KiB | 13,607 / 4 | 337,183 / 204 | 32,830,923 | 12,768 / 4 | 744,875 / 202 | 2,379,986 / 1,135 |
+| 64 B | 4 KiB | 4,422 / 4 | 31,644 / 22 | 2,732,257 | 3,696 / 4 | 236,253 / 171 | 1,672,719 / 1,072 |
+| 256 B | 4 KiB | 4,095 / 4 | 53,749 / 52 | 5,066,771 | 3,609 / 4 | 243,827 / 208 | 1,277,862 / 1,167 |
+| 1 KiB | 4 KiB | 4,923 / 4 | 151,192 / 208 | 14,831,404 | 4,504 / 4 | 259,374 / 223 | 1,548,504 / 1,564 |
+| 4 KiB | 16 KiB | 13,778 / 4 | 342,742 / 204 | 33,386,958 | 12,916 / 4 | 752,695 / 202 | 2,415,316 / 1,135 |
 
 N=1,000/10,000/50,000 changes tree height and proof bytes but does not change the selected target. Increasing D changes touched pages rather than the target crossover.
 
-PK identity is stored once in the prefix-compressed page key directory; opaque row payload excludes duplicate PK cells. At N=50,000 the logical key bytes are 1,800,000 in every case. Logical payload/stored authenticated object bytes are respectively: 3.2/2.69 MB (64 B), 12.8/4.95 MB (256 B), 51.2/14.31 MB (1 KiB), and 204.8/32.83 MB (4 KiB). The rewrite columns above are physical new object bytes and can therefore be compared directly with the separate logical key/payload columns in the CSV.
+PK identity is stored once in the prefix-compressed page key directory; opaque row payload excludes duplicate PK cells. At N=50,000 the logical key bytes are 1,800,000 in every case. Logical payload/stored authenticated object bytes are respectively: 3.2/2.73 MB (64 B), 12.8/5.07 MB (256 B), 51.2/14.83 MB (1 KiB), and 204.8/33.39 MB (4 KiB). The rewrite columns above are physical new object bytes and can therefore be compared directly with the separate logical key/payload columns in the CSV.
 
-At 256-byte rows, C2 4 KiB scans 4.95 MB versus C1's 13.84 MB, while point and D=1 each remain about 4 KiB. At 4 KiB rows, 16 KiB pages reduce scan bytes to 32.83 MB; 4 KiB pages offer no useful packing because each page approaches one row.
+At 256-byte rows, C2 4 KiB scans 5.07 MB versus C1's 13.95 MB, while point and D=1 each remain about 4 KiB. At 4 KiB rows, 16 KiB pages reduce scan bytes to 33.39 MB; 4 KiB pages offer no useful packing because each page approaches one row.
 
-PAX's strongest case is partial projection of wide rows: at 4 KiB rows and a 256 KiB target it reads 11.9 KiB instead of about 38 KiB for a full page. That benefit does not offset the additional authenticated sidecar object for point, mutation, full scan, or corruption handling. PAX may be reconsidered only as a non-authoritative derived accelerator.
+PAX's strongest case is partial projection of wide rows: at 4 KiB rows and a 256 KiB target it reads 40,473 bytes instead of 68,439 bytes for a full point. That benefit does not offset the additional authenticated sidecar object for point, mutation, full scan, or corruption handling. PAX may be reconsidered only as a non-authoritative derived accelerator.
 
 ## Insert, delete, and branch sharing
 
@@ -56,12 +56,12 @@ The content-defined split policy removes the catastrophic full-tree shift observ
 
 | Row width | Insert D=1 bytes / puts / leaf delta | Delete D=1 | Insert D=100 | Delete D=100 | Branch-copy new page bytes |
 |---:|---:|---:|---:|---:|---:|
-| 64 B | 3,601 / 4 / 0 | 3,533 / 4 / 0 | 427,471 / 303 / +6 | 403,968 / 285 / -8 | 0 |
-| 256 B | 3,557 / 4 / 0 | 3,443 / 4 / 0 | 376,667 / 349 / +10 | 375,633 / 339 / -9 | 0 |
-| 1 KiB | 4,598 / 5 / +1 | 4,193 / 4 / 0 | 472,615 / 532 / +52 | 411,410 / 439 / -29 | 0 |
-| 4 KiB | 12,941 / 5 / +1 | 12,157 / 4 / 0 | 1,151,554 / 463 / +52 | 1,058,014 / 389 / -30 | 0 |
+| 64 B | 3,710 / 4 / 0 | 3,650 / 4 / 0 | 434,610 / 303 / +6 | 411,094 / 285 / -8 | 0 |
+| 256 B | 3,619 / 4 / 0 | 3,529 / 4 / 0 | 385,183 / 349 / +10 | 384,016 / 339 / -9 | 0 |
+| 1 KiB | 4,710 / 5 / +1 | 4,287 / 4 / 0 | 486,803 / 532 / +52 | 423,449 / 439 / -29 | 0 |
+| 4 KiB | 13,114 / 5 / +1 | 12,297 / 4 / 0 | 1,166,026 / 463 / +52 | 1,070,735 / 389 / -30 | 0 |
 
-A 10,000-row single insertion preserves 953/954 existing leaf ObjectIds; a deletion preserves 950/954. All pages outside the bounded adjacent boundary interval retain byte-identical ObjectIds. An unchanged branch copies the authenticated root and adds zero page objects or page bytes; branch descriptor metadata is outside this page-only model.
+A 10,000-row single insertion preserves 953/954 existing leaf ObjectIds; a deletion preserves 950/954. Prefix/suffix interval assertions prove every page outside the bounded adjacent boundary interval retains its byte-identical ObjectId. An unchanged branch has a distinct authenticated branch-ref object but shares the exact page-object set and root, adding zero page objects or page bytes. Changing one row changes exactly one leaf (plus the PAX sidecar when applicable) and one authenticated object on each root-path level.
 
 ## Boundary and corruption controls
 
@@ -74,13 +74,13 @@ For 10,000 rows of 256 bytes at 4 KiB:
 | Adversarial force-max | 834 | 1,284 / 3,788 | 0 | 833 | 0 |
 | Adversarial force-min | 1,429 | 1,284 / 2,223 | 1,428 | 0 | 0 |
 
-The low minimum is the final page only. The highly compressible 10,000 x 4 KiB control produced 824 leaves, completed without quadratic growth, and had a maximum decoded leaf of 61,800 bytes under a 64 KiB target. Corrupt object bytes are rejected by ObjectId mismatch before decode.
+The low minimum is the final page only. The highly compressible 10,000 x 4 KiB control produced 824 leaves, completed without quadratic growth, and had a maximum decoded leaf of 61,880 bytes under a 64 KiB target. The verifier starts from an authenticated branch-ref ObjectId, derives branch identity and root linkage from its bytes, and recursively authenticates ObjectId, envelope, domain, schema/layout fingerprint, embedded min/max bounds, ordered parent edges, row counts, directory offsets, payload bounds, and PAX sidecar binding. Independent envelope, domain, fingerprint, bound, directory, payload, and root-link mutations all fail closed.
 
-All 36 physical RocksDB/SlateDB cells wrote the exact authenticated object set, flushed, dropped, cold reopened, fetched the root, reauthenticated ObjectId, and decoded within the hard allocation limit.
+All 36 physical RocksDB/SlateDB cells wrote the exact authenticated branch and page closure, flushed, dropped, cold reopened, batch-fetched the closure, and recursively reauthenticated every typed edge within the hard allocation limit.
 
 ## Evidence
 
-- Final combined model and physical-backend sweep: `/root/repos/lix-evidence/experiment-c-ff57/model/backend-sweep-cdc-final.csv`, SHA-256 `0018792c3a11b2188ecab447d3fb27f10e977a018ba6a48c5be3407f7ca70839`; stderr is empty (SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+- Final combined model and physical-backend sweep: `/root/repos/lix-evidence/experiment-c-ff57/model/backend-sweep-reviewed.csv`, SHA-256 `ad2452a2df410dfbb2029ae9f3ca8af8a19b6886a302181d36c4d8d0091dc615`; stderr is empty (SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
 - Rejected intermediate sweeps remain evidence only and are not used for the decision.
 
 ## Final-rebind requirement
