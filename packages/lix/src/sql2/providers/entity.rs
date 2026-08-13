@@ -2738,7 +2738,9 @@ impl EntityRowFilter {
     /// single row.
     fn collect_filter_columns<'a>(&'a self, out: &mut BTreeSet<&'a str>) {
         match self {
-            Self::ColumnEq { column, .. } | Self::ColumnIn { column, .. } => {
+            Self::ColumnEq { column, .. }
+            | Self::ColumnIn { column, .. }
+            | Self::ColumnRange { column, .. } => {
                 out.insert(column.as_str());
             }
             Self::And(left, right) | Self::Or(left, right) => {
@@ -4463,13 +4465,24 @@ mod tests {
                     values: vec![super::EntityFilterValue::String("y".to_string())],
                 }),
             )),
-            Box::new(leaf("right")),
+            Box::new(super::EntityRowFilter::And(
+                Box::new(leaf("right")),
+                // A range leaf. Its column drives the same partial parse, and a
+                // range column missing from this set reads `None` from the partial
+                // snapshot and drops every row it should have matched.
+                Box::new(super::EntityRowFilter::ColumnRange {
+                    column: "ranged".to_string(),
+                    column_type: EntityColumnType::Integer,
+                    op: super::EntityRangeOp::GtEq,
+                    value: super::EntityFilterValue::Integer(1),
+                }),
+            )),
         );
         let mut columns = std::collections::BTreeSet::new();
         filter.collect_filter_columns(&mut columns);
         assert_eq!(
             columns.into_iter().collect::<Vec<_>>(),
-            vec!["left", "middle", "right"],
+            vec!["left", "middle", "ranged", "right"],
             "a column missed here silently drops the predicate that reads it"
         );
     }

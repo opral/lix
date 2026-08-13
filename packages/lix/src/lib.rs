@@ -71,7 +71,11 @@ mod handle;
 mod hot_index_aging_probe;
 #[cfg(test)]
 mod hot_row_tombstone_probe;
-#[cfg(test)]
+// Calls `SessionContext::execute_profiled`, which is `storage-benches`-only, so
+// the module needs the same gate. Without it `cargo check -p lix --tests` --
+// cfg(test) with the feature off, which is what a plain `cargo test -p lix`
+// builds -- fails while `--all-features` and clippy stay green.
+#[cfg(all(test, feature = "storage-benches"))]
 mod json_predicate_pushdown_probe;
 pub(crate) mod init;
 pub(crate) mod json_store;
