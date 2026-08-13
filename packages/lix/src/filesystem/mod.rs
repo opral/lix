@@ -14,7 +14,9 @@ pub(crate) use self::path_index::{
     stage_path_index_revision,
 };
 #[cfg(test)]
-pub(crate) use self::path_index::{full_rebuild_stats, reset_full_rebuild_stats};
+pub(crate) use self::path_index::{
+    full_rebuild_stats, path_index_cache_stats, reset_full_rebuild_stats,
+};
 pub(crate) use self::persistent_map::{PersistentMap, PersistentMapRangeCursor};
 pub(crate) use self::planner::directory_path_resolvers_from_state_batch;
 pub(crate) use self::planner::{

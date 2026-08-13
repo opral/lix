@@ -12760,8 +12760,8 @@ mod tests {
     /// which is a different layer from the timing instrument that first showed
     /// the slope.
     #[tokio::test]
-    async fn content_updates_rebuild_the_whole_path_index_once_per_statement() {
-        async fn measure(files: usize, updates: usize) -> (usize, usize) {
+    async fn content_updates_hit_the_path_index_cache_and_do_not_rebuild_it() {
+        async fn measure(files: usize, updates: usize) -> (usize, usize, usize, usize) {
             let storage = Memory::new();
             Engine::initialize(storage.clone())
                 .await
@@ -12810,40 +12810,41 @@ mod tests {
                     .await
                     .expect("content update should commit");
             }
-            crate::filesystem::full_rebuild_stats()
+            let (builds, rows) = crate::filesystem::full_rebuild_stats();
+            let (hits, misses) = crate::filesystem::path_index_cache_stats();
+            (builds, rows, hits, misses)
         }
 
         let updates = 10;
-        let (small_builds, small_rows) = measure(50, updates).await;
-        let (large_builds, large_rows) = measure(500, updates).await;
-
-        // One full reconstruction per statement: the per-commit advance does
-        // not keep this cache warm across content updates.
-        assert_eq!(
-            small_builds, updates,
-            "50-file repository rebuilt {small_builds} times for {updates} content updates"
+        let (small_builds, small_rows, small_hits, small_misses) = measure(50, updates).await;
+        let (large_builds, large_rows, large_hits, large_misses) = measure(500, updates).await;
+        println!(
+            "PATHINDEX files=50 builds={small_builds} rebuilt_rows={small_rows} hits={small_hits} misses={small_misses}"
         );
-        assert_eq!(
-            large_builds, updates,
-            "500-file repository rebuilt {large_builds} times for {updates} content updates"
+        println!(
+            "PATHINDEX files=500 builds={large_builds} rebuilt_rows={large_rows} hits={large_hits} misses={large_misses}"
         );
 
-        // ... and each rebuild reads the whole repository, so the per-statement
-        // cost is O(descriptors), not O(rows touched).
-        let small_per_build = small_rows / small_builds;
-        let large_per_build = large_rows / large_builds;
+        // Connectivity: the lane really is exercised, so a zero rebuild count
+        // below is a positive result and not an instrument pointed elsewhere.
         assert!(
-            small_per_build >= 50,
-            "each rebuild should read the whole 50-file repository, read {small_per_build}"
+            small_hits >= updates && large_hits >= updates,
+            "each content update must consult the path-index cache: {small_hits} / {large_hits}"
         );
-        assert!(
-            large_per_build >= 500,
-            "each rebuild should read the whole 500-file repository, read {large_per_build}"
+
+        // The measured result: content updates HIT this cache. The visible
+        // filesystem path index is NOT rebuilt per statement, so it is not the
+        // source of the per-statement cost that scales with repository size.
+        assert_eq!(
+            small_builds, 0,
+            "50-file repository rebuilt the path index {small_builds} times"
         );
-        assert!(
-            large_per_build >= small_per_build * 5,
-            "rebuild cost must track descriptor count: {small_per_build} -> {large_per_build}"
+        assert_eq!(
+            large_builds, 0,
+            "500-file repository rebuilt the path index {large_builds} times"
         );
+        assert_eq!(small_rows, 0, "no rebuild should read descriptor rows");
+        assert_eq!(large_rows, 0, "no rebuild should read descriptor rows");
     }
 
     #[tokio::test]
