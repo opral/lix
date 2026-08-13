@@ -3919,6 +3919,31 @@ mod tests {
     /// all about undo retention: a sweep that retires nothing trivially
     /// preserves undo. The assertions below are only evidence because the sweep
     /// underneath them is doing real work.
+    /// # This test is about undo, not history
+    ///
+    /// **Undo survives reclaim; entity history does not.** These are different
+    /// properties over different planes, and this test asserts only the first.
+    /// Do not read its name as "reclaim is safe for history".
+    ///
+    /// Undo reads current state, which the sweep leaves intact. `_history()`
+    /// reads each commit's *delta*, and the sweep deletes those. The commit
+    /// record survives -- `collect_ref_reachable_commit_ids` feeds
+    /// `graph_reachable` into `semantic_dependencies`, so
+    /// `stage_delete_commit_projection` retains it -- but the delta does not,
+    /// because `graph_reachable` never reaches `physical_dependencies`, so
+    /// `stage_retire_commit_physical_state` frees it. The loss is silent by
+    /// construction: `load_point_replay_commit_state` returning `None` makes a
+    /// commit whose manifest was retired indistinguishable from one that
+    /// changed nothing, so the walk emits zero rows and no error is possible.
+    ///
+    /// Measured on this engine -- checkpointed rounds, then one sweep, history
+    /// depth before -> after: 4 -> 3, 8 -> 3, 12 -> 3, with **zero** semantic
+    /// projections deleted in every case. The survivor count is a constant,
+    /// not a fraction, so the loss grows without bound as a repository ages.
+    ///
+    /// This is a known defect under repair at the time of writing; the
+    /// retention fix belongs to `physical_dependencies`, not here. When it
+    /// lands, a sibling test should pin history the way this one pins undo.
     #[tokio::test]
     async fn undo_to_last_checkpoint_survives_reclaim_after_every_commit() {
         let backend = Memory::new();
