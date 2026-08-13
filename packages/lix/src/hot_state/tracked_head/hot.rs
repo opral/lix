@@ -5468,7 +5468,6 @@ where
     ///
     /// Bounds are half-open in key space and closed in value space, so each
     /// inclusive value bound becomes an exclusive key bound one successor up.
-    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn scan_hot_index_range_candidates(
         &self,
         branch_id: &str,
