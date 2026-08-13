@@ -17,6 +17,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
 
 use crate::branch::BranchRefReader;
@@ -395,12 +396,11 @@ impl EntitySpec {
             .scan_batch(&request)
             .await
             .map_err(lix_error_to_datafusion_error)?;
-        let batch = entity_record_batch_with_parsed(
+        let batch = entity_record_batch(
             &self.spec,
             Arc::clone(&self.schema),
             &rows,
             EntityBatchProjection::for_request(&request),
-            None,
         )?;
         let mut post_rows = BTreeMap::new();
         for row_index in 0..batch.num_rows() {
@@ -481,13 +481,7 @@ impl EntitySpec {
                     .map_err(lix_error_to_datafusion_error)?;
                 let filtered = apply_entity_batch_filters(rows, &row_filters)?;
                 capture_entity_update_snapshots(&filtered.rows, &update_snapshots)?;
-                entity_record_batch_with_parsed(
-                    &spec,
-                    schema,
-                    &filtered.rows,
-                    batch_projection,
-                    filtered.parsed_snapshots.as_deref(),
-                )
+                entity_record_batch(&spec, schema, &filtered.rows, batch_projection)
             },
         );
         let spec = Arc::clone(&self.spec);
@@ -774,13 +768,7 @@ impl TableSpec for EntitySpec {
                     // predicate without an indexed access path pays for.
                     record_rows_examined(rows.len());
                     let filtered = apply_entity_batch_filters(rows, &row_filters)?;
-                    entity_record_batch_with_parsed(
-                        &spec,
-                        schema,
-                        &filtered.rows,
-                        batch_projection,
-                        filtered.parsed_snapshots.as_deref(),
-                    )
+                    entity_record_batch(&spec, schema, &filtered.rows, batch_projection)
                 },
             ),
         })
@@ -832,13 +820,7 @@ impl TableSpec for EntitySpec {
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
                 let filtered = apply_entity_batch_filters(rows, &row_filters)?;
-                entity_record_batch_with_parsed(
-                    &spec,
-                    schema,
-                    &filtered.rows,
-                    batch_projection,
-                    filtered.parsed_snapshots.as_deref(),
-                )
+                entity_record_batch(&spec, schema, &filtered.rows, batch_projection)
             },
         );
         let spec = Arc::clone(&self.spec);
@@ -2501,6 +2483,23 @@ impl EntityRowFilter {
         }
     }
 
+    /// Names every top-level snapshot column this predicate reads.
+    ///
+    /// Row predicates are `ColumnEq` / `ColumnIn` over visible top-level
+    /// columns, so the set is small and known before the scan decodes a
+    /// single row.
+    fn collect_filter_columns<'a>(&'a self, out: &mut BTreeSet<&'a str>) {
+        match self {
+            Self::ColumnEq { column, .. } | Self::ColumnIn { column, .. } => {
+                out.insert(column.as_str());
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.collect_filter_columns(out);
+                right.collect_filter_columns(out);
+            }
+        }
+    }
+
     fn matches_snapshot(&self, snapshot: Option<&JsonValue>, schema_key: &str) -> Result<bool> {
         match self {
             Self::ColumnEq {
@@ -2894,18 +2893,23 @@ fn apply_entity_batch_filters(
     filters: &[EntityRowFilter],
 ) -> Result<FilteredEntityBatch> {
     if filters.is_empty() {
-        return Ok(FilteredEntityBatch {
-            rows,
-            parsed_snapshots: None,
-        });
+        return Ok(FilteredEntityBatch { rows });
+    }
+    let mut filter_columns = BTreeSet::new();
+    for filter in filters {
+        filter.collect_filter_columns(&mut filter_columns);
     }
     let mut filtered = MaterializedHotStateBatchBuilder::with_capacity(rows.len());
-    let mut parsed_snapshots = Vec::with_capacity(rows.len());
     for row in rows.iter() {
         let Some(snapshot_content) = row.snapshot_content().map(AsRef::<str>::as_ref) else {
             continue;
         };
-        let snapshot = parse_snapshot_value(snapshot_content).map_err(|error| {
+        // The predicate reads a handful of named columns. Materializing the
+        // whole snapshot map here charged every *scanned* row for a DOM the
+        // predicate never looked at; the projection below decodes the
+        // *surviving* rows on its own streaming path.
+        let snapshot = parse_snapshot_filter_columns(snapshot_content, &filter_columns)
+            .map_err(|error| {
             DataFusionError::External(Box::new(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -2914,7 +2918,7 @@ fn apply_entity_batch_filters(
                     row.entity_pk()
                 ),
             )))
-        })?;
+            })?;
         let mut matches = true;
         for filter in filters {
             if !filter.matches_snapshot(Some(&snapshot), row.schema_key())? {
@@ -2924,21 +2928,15 @@ fn apply_entity_batch_filters(
         }
         if matches {
             filtered.push_ref(row, None);
-            parsed_snapshots.push(Some(snapshot));
         }
     }
     Ok(FilteredEntityBatch {
         rows: filtered.finish(),
-        parsed_snapshots: Some(parsed_snapshots),
     })
 }
 
 struct FilteredEntityBatch {
     rows: MaterializedHotStateBatch,
-    /// Parsed snapshots retained only when row predicates already needed a
-    /// DOM. Projection consumes this side column instead of parsing winners a
-    /// second time.
-    parsed_snapshots: Option<Vec<Option<JsonValue>>>,
 }
 
 fn entity_hot_state_scan_request(
@@ -3076,31 +3074,16 @@ impl EntityBatchProjection {
     }
 }
 
-#[cfg(test)]
 fn entity_record_batch(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
     rows: &MaterializedHotStateBatch,
     projection: EntityBatchProjection,
 ) -> Result<RecordBatch> {
-    entity_record_batch_with_parsed(spec, schema, rows, projection, None)
-}
-
-fn entity_record_batch_with_parsed(
-    spec: &EntitySurfaceSpec,
-    schema: SchemaRef,
-    rows: &MaterializedHotStateBatch,
-    projection: EntityBatchProjection,
-    parsed_snapshots: Option<&[Option<JsonValue>]>,
-) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
         return RecordBatch::try_new_with_options(schema, vec![], &options)
             .map_err(DataFusionError::from);
-    }
-    if let Some(parsed_snapshots) = parsed_snapshots {
-        debug_assert_eq!(parsed_snapshots.len(), rows.len());
-        return entity_record_batch_from_parsed_snapshots(spec, schema, rows, parsed_snapshots);
     }
 
     match projection {
@@ -3352,11 +3335,146 @@ fn parse_snapshot_value(snapshot: &str) -> serde_json::Result<JsonValue> {
     serde_json::from_str(snapshot)
 }
 
+/// Materializes only the top-level fields named in `wanted`.
+///
+/// A row predicate reads a handful of named columns, so building the whole
+/// snapshot map charges every *scanned* row for fields the predicate never
+/// looks at. The returned value is a partial object that is only ever read
+/// through `EntityRowFilter::matches_snapshot`; it must not reach projection.
+///
+/// Semantics are those of `serde_json::from_str::<JsonValue>` restricted to
+/// `wanted`: the whole document is still validated (so malformed JSON and
+/// trailing bytes are still rejected here), duplicate keys are still
+/// last-wins, and a non-object snapshot still yields a value from which no
+/// column can be read.
+fn parse_snapshot_filter_columns(
+    snapshot: &str,
+    wanted: &BTreeSet<&str>,
+) -> serde_json::Result<JsonValue> {
+    #[cfg(test)]
+    ENTITY_SNAPSHOT_FILTER_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+    let mut deserializer = serde_json::Deserializer::from_str(snapshot);
+    let value = FilterColumnSeed { wanted }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
+struct FilterColumnSeed<'a> {
+    wanted: &'a BTreeSet<&'a str>,
+}
+
+impl<'de> DeserializeSeed<'de> for FilterColumnSeed<'_> {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(FilterColumnVisitor {
+            wanted: self.wanted,
+        })
+    }
+}
+
+struct FilterColumnVisitor<'a> {
+    wanted: &'a BTreeSet<&'a str>,
+}
+
+/// Every non-object snapshot collapses to `Null`, which is exactly what
+/// `JsonValue::get` on the original non-object snapshot would have produced
+/// for any column: `None`.
+macro_rules! filter_column_scalar {
+    ($name:ident, $ty:ty) => {
+        fn $name<E>(self, _value: $ty) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::Null)
+        }
+    };
+}
+
+impl<'de> Visitor<'de> for FilterColumnVisitor<'_> {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON entity snapshot")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            if self.wanted.contains(key.as_ref()) {
+                let value = map.next_value::<JsonValue>()?;
+                object.insert(key.into_owned(), value);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(JsonValue::Object(object))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(JsonValue::Null)
+    }
+
+    filter_column_scalar!(visit_bool, bool);
+    filter_column_scalar!(visit_i64, i64);
+    filter_column_scalar!(visit_u64, u64);
+    filter_column_scalar!(visit_i128, i128);
+    filter_column_scalar!(visit_u128, u128);
+    filter_column_scalar!(visit_f64, f64);
+    filter_column_scalar!(visit_str, &str);
+    filter_column_scalar!(visit_borrowed_str, &'de str);
+    filter_column_scalar!(visit_string, String);
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::Null)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::Null)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static ENTITY_SNAPSHOT_PARSE_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+}
+
+// Counted inside the predicate-column parser so a test can distinguish
+// "the streaming filter ran" from "the filter route was never taken", which
+// read identically when only full parses were counted.
+#[cfg(test)]
+thread_local! {
+    static ENTITY_SNAPSHOT_FILTER_PARSE_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_entity_snapshot_filter_parse_count() {
+    ENTITY_SNAPSHOT_FILTER_PARSE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn entity_snapshot_filter_parse_count() -> usize {
+    ENTITY_SNAPSHOT_FILTER_PARSE_COUNT.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -3816,7 +3934,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_entity_projection_reuses_each_candidate_parse_once() {
+    fn filtered_entity_scan_never_builds_a_candidate_snapshot_dom() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
@@ -3842,34 +3960,38 @@ mod tests {
         };
 
         super::reset_entity_snapshot_parse_count();
+        super::reset_entity_snapshot_filter_parse_count();
         let filtered = super::apply_entity_batch_filters(
             live_batch(vec![winner, rejected, tombstone]),
             &[filter],
         )
-        .expect("entity filter should build a parsed side column");
+        .expect("entity filter should select the matching row");
         assert_eq!(filtered.rows.len(), 1);
+        // Engagement: the streaming predicate parser observed both candidates
+        // carrying a snapshot. Without this, a zero full-parse count would
+        // read identically to a filter route that never ran at all.
         assert_eq!(
-            filtered
-                .parsed_snapshots
-                .as_ref()
-                .expect("filtered rows retain parsed snapshots")
-                .len(),
-            filtered.rows.len()
+            super::entity_snapshot_filter_parse_count(),
+            2,
+            "the streaming predicate parser must observe every candidate"
         );
-        assert_eq!(super::entity_snapshot_parse_count(), 2);
+        assert_eq!(
+            super::entity_snapshot_parse_count(),
+            0,
+            "deciding a row predicate must not build a snapshot DOM"
+        );
 
-        let batch = super::entity_record_batch_with_parsed(
+        let batch = entity_record_batch(
             &spec,
             entity_surface_schema(&spec, EntitySurfaceShape::Active),
             &filtered.rows,
             super::EntityBatchProjection::RawTrackedProjection,
-            filtered.parsed_snapshots.as_deref(),
         )
-        .expect("mixed-retention projection should consume the parsed side column");
+        .expect("mixed-retention projection should build the batch");
         assert_eq!(
             super::entity_snapshot_parse_count(),
-            2,
-            "Arrow projection must not parse a filtered winner again"
+            filtered.rows.len(),
+            "projection parses the surviving rows only"
         );
         assert_eq!(
             batch
@@ -3880,6 +4002,114 @@ mod tests {
                 .expect("body is utf8")
                 .value(0),
             "hello"
+        );
+    }
+
+    /// The predicate parser sees a partial object. Anything it gets wrong is a
+    /// wrong answer, not a slow one, so the rejection cases are asserted as
+    /// hard as the acceptance cases.
+    #[test]
+    fn predicate_column_parse_matches_the_full_snapshot_parse() {
+        fn wanted<'a>(names: &[&'a str]) -> std::collections::BTreeSet<&'a str> {
+            names.iter().copied().collect()
+        }
+
+        for snapshot in [
+            // Ordinary object: the wanted column sits after several others.
+            r#"{"a":1,"body":"hello","c":[1,2,{"d":null}],"e":"tail"}"#,
+            // Wanted column first, and absent columns around it.
+            r#"{"body":"hello"}"#,
+            // Duplicate keys: serde_json is last-wins, and so is the partial
+            // parse. A first-wins reader would return a different row here.
+            r#"{"body":"first","body":"hello"}"#,
+            // The wanted column is absent entirely.
+            r#"{"a":1,"z":2}"#,
+            // Escapes and non-ASCII inside a value the predicate skips.
+            r#"{"skipped":"é\n\"x\"","body":"hello"}"#,
+            // An escaped predicate KEY. A key comparison taken straight
+            // off the input bytes without unescaping would miss this
+            // column and silently drop the row.
+            r#"{"\u0062ody":"hello"}"#,
+            // An escaped predicate VALUE, which the filter later compares
+            // by equality against an unescaped literal.
+            r#"{"body":"\u0068ello"}"#,
+            // Nested objects that themselves contain the wanted key name.
+            r#"{"nested":{"body":"decoy"},"body":"hello"}"#,
+            // Empty object.
+            r#"{}"#,
+            // Non-object roots: no column is readable from any of them.
+            r#"[1,2,3]"#,
+            r#""hello""#,
+            r#"12345678901234567890"#,
+            r#"1.5"#,
+            r#"true"#,
+            r#"null"#,
+        ] {
+            let full = super::parse_snapshot_value(snapshot)
+                .unwrap_or_else(|error| panic!("{snapshot} should parse: {error}"));
+            let partial = super::parse_snapshot_filter_columns(snapshot, &wanted(&["body"]))
+                .unwrap_or_else(|error| panic!("{snapshot} should parse partially: {error}"));
+            assert_eq!(
+                partial.get("body"),
+                full.get("body"),
+                "partial parse disagreed with the full parse on {snapshot}"
+            );
+        }
+
+        // Multiple predicate columns are all recovered in one pass.
+        let both = super::parse_snapshot_filter_columns(
+            r#"{"body":"hello","skip":9,"lane":"L1"}"#,
+            &wanted(&["body", "lane"]),
+        )
+        .expect("multi-column predicate parse");
+        assert_eq!(both.get("body"), Some(&json!("hello")));
+        assert_eq!(both.get("lane"), Some(&json!("L1")));
+        assert_eq!(both.get("skip"), None, "unwanted columns stay unparsed");
+
+        // Rejection: a malformed document must still fail here, even when the
+        // damage is entirely inside a value the predicate skips over.
+        for malformed in [
+            r#"{"body":"hello","skip":}"#,
+            r#"{"body":"hello""#,
+            r#"{"skip":[1,2,,3],"body":"hello"}"#,
+            r#"{"body":"hello"} trailing"#,
+            r#""#,
+        ] {
+            assert!(
+                super::parse_snapshot_value(malformed).is_err(),
+                "fixture {malformed} must be malformed for the full parser"
+            );
+            assert!(
+                super::parse_snapshot_filter_columns(malformed, &wanted(&["body"])).is_err(),
+                "the predicate parser must reject {malformed} exactly as the full parser does"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_filter_columns_walks_the_whole_predicate_tree() {
+        let leaf = |column: &str| super::EntityRowFilter::ColumnEq {
+            column: column.to_string(),
+            column_type: EntityColumnType::String,
+            value: super::EntityFilterValue::String("x".to_string()),
+        };
+        let filter = super::EntityRowFilter::And(
+            Box::new(super::EntityRowFilter::Or(
+                Box::new(leaf("left")),
+                Box::new(super::EntityRowFilter::ColumnIn {
+                    column: "middle".to_string(),
+                    column_type: EntityColumnType::String,
+                    values: vec![super::EntityFilterValue::String("y".to_string())],
+                }),
+            )),
+            Box::new(leaf("right")),
+        );
+        let mut columns = std::collections::BTreeSet::new();
+        filter.collect_filter_columns(&mut columns);
+        assert_eq!(
+            columns.into_iter().collect::<Vec<_>>(),
+            vec!["left", "middle", "right"],
+            "a column missed here silently drops the predicate that reads it"
         );
     }
 
