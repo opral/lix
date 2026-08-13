@@ -1,4 +1,6 @@
 mod context;
+/// expEK measurement instrument — NOT FOR MERGE.
+pub(crate) mod expek_probe;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod scope_digest_census;
 mod types;

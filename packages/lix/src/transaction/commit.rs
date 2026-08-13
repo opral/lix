@@ -1512,6 +1512,22 @@ async fn stage_changelog_commits(
             // so nothing a history read asks for can be found in it.
             None => CommitTouchedScopeDigest::exact(std::iter::empty()),
         };
+        // expEK instrument — NOT FOR MERGE. Members and scopes per commit are
+        // the two cardinalities that decide whether a per-entity token set is
+        // affordable in bytes and in write time.
+        if crate::commit_graph::expek_probe::enabled() {
+            let member_count = mutation_inventories
+                .get(&commit_id)
+                .map_or(0u64, |inventory| u64::from(inventory.member_count));
+            let scope_count = mutation_inventories
+                .get(&commit_id)
+                .and_then(|inventory| {
+                    crate::tracked_state::commit_delta_member_scopes(commit_id, inventory).ok()
+                })
+                .flatten()
+                .map_or(u64::MAX, |scopes| scopes.len() as u64);
+            crate::commit_graph::expek_probe::record_commit_write(member_count, scope_count);
+        }
         touched_scope_digests.insert(commit_id, touched_scope_digest.clone());
         topology_records.insert(
             commit_id,

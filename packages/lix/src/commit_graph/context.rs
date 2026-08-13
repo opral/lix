@@ -470,6 +470,7 @@ where
             scope_digest_census()
                 .since(&census_before)
                 .emit(start_commit_id);
+            crate::commit_graph::expek_probe::drain_and_print("unbounded");
             return Ok(CommitGraphHistory {
                 entries: state.entries,
                 reachable_nodes: nodes,
@@ -509,6 +510,7 @@ where
         scope_digest_census()
             .since(&census_before)
             .emit(start_commit_id);
+        crate::commit_graph::expek_probe::drain_and_print("limited");
         Ok(CommitGraphHistory {
             entries: state.entries,
             reachable_nodes: Arc::from(reachable_nodes),
@@ -561,13 +563,44 @@ where
             outcome,
         );
         if outcome == ScopeDigestOutcome::Pruned {
+            crate::commit_graph::expek_probe::with_row(&shaping.member_schema_keys, |row| {
+                row.pruned_scope += 1;
+            });
             return Ok(());
         }
 
-        for change in self
+        let members = self
             .load_member_changes(node.commit_id, &shaping.member_schema_keys)
-            .await?
-        {
+            .await?;
+
+        // expEK instrument: would an exact `(schema_key, entity_pk)` membership
+        // test have skipped this delta load? Measured against the members that
+        // were actually loaded, so it is a fact about this commit, not a model.
+        if crate::commit_graph::expek_probe::enabled() {
+            let entity_present = !request.entity_pks.is_empty()
+                && members
+                    .iter()
+                    .any(|change| request.entity_pks.contains(&change.entity_pk));
+            let distinct = members
+                .iter()
+                .map(|change| (&change.schema_key, &change.entity_pk))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len() as u64;
+            crate::commit_graph::expek_probe::with_row(&shaping.member_schema_keys, |row| {
+                row.loaded += 1;
+                row.members_loaded += members.len() as u64;
+                row.distinct_entities_loaded += distinct;
+                if request.entity_pks.is_empty() {
+                    row.loaded_no_entity_filter += 1;
+                } else if entity_present {
+                    row.loaded_entity_present += 1;
+                } else {
+                    row.loaded_entity_absent += 1;
+                }
+            });
+        }
+
+        for change in members {
             if !state.seen_changes.insert(history_change_identity(&change)) {
                 continue;
             }
