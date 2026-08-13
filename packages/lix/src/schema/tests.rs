@@ -81,13 +81,13 @@ fn restricts_defaults_to_supported_postgresql_expression() {
 #[tokio::test]
 async fn postgresql_jsonb_syntax_registers_queries_and_updates_entities() {
     use crate::Value;
-    use crate::integration::Engine;
+    use crate::engine::Engine;
     use crate::storage::Memory;
 
     let storage = Memory::new();
     Engine::initialize(storage.clone()).await.unwrap();
     let engine = Engine::new(storage).await.unwrap();
-    let session = engine.open_workspace_session().await.unwrap();
+    let session = engine.open_session().await.unwrap();
     let definition = json!({
         "$schema": "https://lix.dev/schema-v1.json",
         "key": "acme_jsonb_probe",

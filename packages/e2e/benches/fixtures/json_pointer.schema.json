@@ -1,40 +1,20 @@
 {
-  "x-lix-key": "json_pointer",
-  "x-lix-primary-key": [
-    "/path"
-  ],
-  "type": "object",
-  "properties": {
-    "path": {
-      "type": "string",
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "json_pointer",
+  "columns": [
+    {
+      "name": "path",
+      "type": "text",
+      "nullable": false,
       "description": "RFC 6901 JSON Pointer path (empty string for root)."
     },
-    "value": {
-      "anyOf": [
-        {
-          "type": "object"
-        },
-        {
-          "type": "array"
-        },
-        {
-          "type": "string"
-        },
-        {
-          "type": "number"
-        },
-        {
-          "type": "boolean"
-        },
-        {
-          "type": "null"
-        }
-      ]
+    {
+      "name": "value",
+      "type": "jsonb",
+      "nullable": false
     }
-  },
-  "required": [
-    "path",
-    "value"
   ],
-  "additionalProperties": false
+  "primary_key": [
+    "path"
+  ]
 }
