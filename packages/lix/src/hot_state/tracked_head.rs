@@ -1321,17 +1321,26 @@ fn working_diff_error(message: &str) -> LixError {
 /// 50..54  snapshot payload byte length (big endian u32)
 /// 54..58  metadata payload byte length (big endian u32)
 /// 58      columnar base-coordinate presence (0 or 1)
-/// 59..    snapshot payload, metadata payload, then an optional fixed
+/// 59      payload encoding: bit 0 snapshot is a typed-slot record, bit 1
+///          metadata is. Zero means both payloads are JSON text.
+/// 60..    snapshot payload, metadata payload, then an optional fixed
 ///          checkpoint before-image, then an optional 24-byte base coordinate
 /// ```
 ///
 /// Slot payloads are either inline UTF-8 JSON, a fixed 32-byte `JsonRef`, or
 /// that same fingerprint followed by inline JSON for dirty working-diff rows.
+///
+/// An inline payload is additionally either JSON text or a *typed-slot record*
+/// (`hot_state::typed_slots`), whose fixed-width number payloads are not valid
+/// UTF-8 and so cannot travel through the `&str`-typed inline slot. Which one a
+/// row carries is stated by the payload-encoding byte and is never inferred
+/// from the payload's own bytes: a format that guesses its own discriminant has
+/// no way to fail loudly when the guess is wrong.
 /// Persisting fingerprints only while a row is dirty keeps repeated diff
 /// classification independent of payload size without taxing checkpointed
 /// current state.
-const HEAD_VALUE_VERSION: u8 = 9;
-const HEAD_VALUE_HEADER_BYTES: usize = 59;
+const HEAD_VALUE_VERSION: u8 = 10;
+const HEAD_VALUE_HEADER_BYTES: usize = 60;
 const COLUMNAR_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
 const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
@@ -1344,6 +1353,8 @@ const HEAD_SLOT_NONE: u8 = 0;
 const HEAD_SLOT_REF: u8 = 1;
 const HEAD_SLOT_INLINE: u8 = 2;
 const HEAD_SLOT_INLINE_FINGERPRINTED: u8 = 3;
+const HEAD_PAYLOAD_TYPED_SNAPSHOT: u8 = 0b0000_0001;
+const HEAD_PAYLOAD_TYPED_METADATA: u8 = 0b0000_0010;
 const HEAD_WORKING_DIFF_DISABLED: u8 = 0;
 const HEAD_WORKING_DIFF_CLEAN: u8 = 1;
 const HEAD_WORKING_DIFF_BEFORE_ABSENT: u8 = 2;
@@ -1356,7 +1367,13 @@ enum HeadSlotView<'a> {
     None,
     Ref(JsonRef),
     Inline(&'a str),
-    InlineFingerprinted { json_ref: JsonRef, json: &'a str },
+    InlineFingerprinted {
+        json_ref: JsonRef,
+        json: &'a str,
+    },
+    /// A typed-slot record. Not UTF-8, and deliberately a separate variant
+    /// rather than a reinterpretation of `Inline`.
+    Typed(&'a [u8]),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1558,7 +1575,65 @@ fn working_diff_slot_fingerprint(slot: HeadSlotView<'_>) -> WorkingDiffSlotFinge
             kind: WORKING_DIFF_SLOT_INLINE,
             hash: *json_ref.as_hash_array(),
         },
+        // The fingerprint must agree across the two representations, because a
+        // row's before-image may be stored as JSON text while its current
+        // version is a typed record. It does, and only because reconstruction
+        // is byte-identical to the text the record replaced: hashing the
+        // reconstruction is hashing the same bytes the JSON slot would have
+        // hashed. An unresolvable record answers `unresolved` rather than
+        // guessing -- an accelerator may decline, but must never be confidently
+        // wrong.
+        HeadSlotView::Typed(record) => match typed_slot_canonical_json(record) {
+            Ok(json) => WorkingDiffSlotFingerprint {
+                kind: WORKING_DIFF_SLOT_INLINE,
+                hash: *JsonRef::for_content(json.as_bytes()).as_hash_array(),
+            },
+            Err(_) => WorkingDiffSlotFingerprint::unresolved(),
+        },
     }
+}
+
+/// Rebuilds the JSON text a typed-slot record was encoded from.
+///
+/// The layout comes from the record's own fingerprint, so no schema key has to
+/// be threaded to a read site, and a record whose layout this binary does not
+/// know is an error rather than a positional misread.
+fn typed_slot_canonical_json(record: &[u8]) -> Result<String, LixError> {
+    let parsed = crate::hot_state::typed_slots::TypedSlotsRef::parse(record)
+        .map_err(|error| head_value_error(&format!("typed snapshot slot: {error}")))?;
+    let layout =
+        crate::hot_state::typed_slots::builtin_layout_for_fingerprint(parsed.layout_fingerprint())
+            .ok_or_else(|| {
+            head_value_error("typed snapshot slot names a column layout this build does not know")
+        })?;
+    parsed
+        .to_canonical_json(layout)
+        .map_err(|error| head_value_error(&format!("typed snapshot slot: {error}")))
+}
+
+/// Encodes one snapshot as a typed-slot record, or declines.
+///
+/// Declining is always safe: the row is then stored as JSON text exactly as it
+/// is today. The key check is the load-bearing one -- `encode_typed_slots`
+/// writes a slot per *declared* column, so a key the layout does not declare
+/// would be silently dropped. Closed schemas make that unreachable, and this
+/// check is what makes it a mechanism rather than a reading of the schema
+/// files.
+fn typed_snapshot_record(
+    layout: &crate::hot_state::typed_slots::TypedSlotLayout,
+    json: &str,
+) -> Option<Vec<u8>> {
+    let serde_json::Value::Object(map) = serde_json::from_str::<serde_json::Value>(json).ok()?
+    else {
+        return None;
+    };
+    if map.keys().any(|key| layout.index_of(key).is_none()) {
+        return None;
+    }
+    let record = crate::hot_state::typed_slots::encode_typed_slots(layout, &map).ok()?;
+    #[cfg(test)]
+    crate::hot_state::typed_slots::record_typed_slot_record_written();
+    Some(record)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1569,6 +1644,7 @@ enum HeadSlotEncode<'a> {
         json_ref: Option<JsonRef>,
         json: &'a str,
     },
+    Typed(&'a [u8]),
 }
 
 impl<'a> From<JsonSlotRef<'a>> for HeadSlotEncode<'a> {
@@ -1597,6 +1673,7 @@ impl<'a> From<HeadSlotView<'a>> for HeadSlotEncode<'a> {
                 json_ref: Some(json_ref),
                 json,
             },
+            HeadSlotView::Typed(record) => Self::Typed(record),
         }
     }
 }
@@ -1625,6 +1702,41 @@ fn append_head_value(
     bytes: &mut Vec<u8>,
     value: &HeadValueRef<'_>,
 ) -> Result<std::ops::Range<usize>, LixError> {
+    append_head_value_with_typed_layout(bytes, value, None)
+}
+
+/// Stages one head row, encoding its snapshot as a typed-slot record when the
+/// caller resolved a layout for the row's schema.
+///
+/// The typed record replaces the row's *stored* snapshot payload only. Change
+/// records are content-addressed by their JSON text and are untouched by this;
+/// what changes is the representation of current state in the head, which is a
+/// copy.
+fn append_head_value_with_typed_layout(
+    bytes: &mut Vec<u8>,
+    value: &HeadValueRef<'_>,
+    typed_layout: Option<&crate::hot_state::typed_slots::TypedSlotLayout>,
+) -> Result<std::ops::Range<usize>, LixError> {
+    let snapshot: HeadSlotEncode<'_> = value.snapshot.into();
+    // A dirty working-diff row prefixes its inline payload with the JSON
+    // fingerprint; that lane keeps JSON text rather than growing a second
+    // framing this round.
+    let fingerprint_inline = matches!(
+        value.working_diff_baseline,
+        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. }
+    );
+    let typed_record = match (typed_layout, snapshot) {
+        (Some(layout), HeadSlotEncode::Inline { json, .. })
+            if !value.deleted && !fingerprint_inline =>
+        {
+            typed_snapshot_record(layout, json)
+        }
+        _ => None,
+    };
+    let snapshot = match typed_record.as_deref() {
+        Some(record) => HeadSlotEncode::Typed(record),
+        None => snapshot,
+    };
     append_head_value_parts(
         bytes,
         HeadValueEncode {
@@ -1634,7 +1746,7 @@ fn append_head_value(
             deleted: value.deleted,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            snapshot: value.snapshot.into(),
+            snapshot,
             metadata: value.metadata.into(),
             columnar_base_coordinate: value.columnar_base_coordinate,
             working_diff_baseline: value.working_diff_baseline,
@@ -1781,6 +1893,14 @@ fn append_head_value_parts(
             .to_be_bytes(),
     );
     bytes.push(u8::from(value.columnar_base_coordinate.is_some()));
+    let mut payload_encoding = 0_u8;
+    if matches!(value.snapshot, HeadSlotEncode::Typed(_)) {
+        payload_encoding |= HEAD_PAYLOAD_TYPED_SNAPSHOT;
+    }
+    if matches!(value.metadata, HeadSlotEncode::Typed(_)) {
+        payload_encoding |= HEAD_PAYLOAD_TYPED_METADATA;
+    }
+    bytes.push(payload_encoding);
     append_slot_payload(bytes, value.snapshot, fingerprint_inline);
     append_slot_payload(bytes, value.metadata, fingerprint_inline);
     match value.working_diff_baseline {
@@ -1819,7 +1939,7 @@ fn encoded_slot_kind(slot: HeadSlotEncode<'_>, fingerprint_inline: bool) -> u8 {
         HeadSlotEncode::None => HEAD_SLOT_NONE,
         HeadSlotEncode::Ref(_) => HEAD_SLOT_REF,
         HeadSlotEncode::Inline { .. } if fingerprint_inline => HEAD_SLOT_INLINE_FINGERPRINTED,
-        HeadSlotEncode::Inline { .. } => HEAD_SLOT_INLINE,
+        HeadSlotEncode::Inline { .. } | HeadSlotEncode::Typed(_) => HEAD_SLOT_INLINE,
     }
 }
 
@@ -1831,6 +1951,7 @@ fn encoded_slot_len(slot: HeadSlotEncode<'_>, fingerprint_inline: bool) -> usize
             JSON_REF_BYTES.saturating_add(json.len())
         }
         HeadSlotEncode::Inline { json, .. } => json.len(),
+        HeadSlotEncode::Typed(record) => record.len(),
     }
 }
 
@@ -1844,6 +1965,7 @@ fn append_slot_payload(bytes: &mut Vec<u8>, slot: HeadSlotEncode<'_>, fingerprin
             bytes.extend_from_slice(json.as_bytes());
         }
         HeadSlotEncode::Inline { json, .. } => bytes.extend_from_slice(json.as_bytes()),
+        HeadSlotEncode::Typed(record) => bytes.extend_from_slice(record),
     }
 }
 
@@ -1890,13 +2012,19 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     let metadata_end = snapshot_end
         .checked_add(metadata_len)
         .ok_or_else(|| head_value_error("metadata payload length overflow"))?;
+    let payload_encoding = bytes[59];
+    if payload_encoding & !(HEAD_PAYLOAD_TYPED_SNAPSHOT | HEAD_PAYLOAD_TYPED_METADATA) != 0 {
+        return Err(head_value_error("invalid payload encoding byte"));
+    }
     let snapshot = decode_slot(
         snapshot_kind,
+        payload_encoding & HEAD_PAYLOAD_TYPED_SNAPSHOT != 0,
         &bytes[HEAD_VALUE_HEADER_BYTES..snapshot_end],
         "snapshot",
     )?;
     let metadata = decode_slot(
         metadata_kind,
+        payload_encoding & HEAD_PAYLOAD_TYPED_METADATA != 0,
         &bytes[snapshot_end..metadata_end],
         "metadata",
     )?;
@@ -2044,7 +2172,23 @@ fn read_u32(bytes: &[u8], field: &str) -> Result<u32, LixError> {
     Ok(u32::from_be_bytes(bytes))
 }
 
-fn decode_slot<'a>(kind: u8, bytes: &'a [u8], field: &str) -> Result<HeadSlotView<'a>, LixError> {
+fn decode_slot<'a>(
+    kind: u8,
+    typed: bool,
+    bytes: &'a [u8],
+    field: &str,
+) -> Result<HeadSlotView<'a>, LixError> {
+    if typed {
+        // The typed payload rides the inline slot kind and is distinguished by
+        // the header's encoding byte. Any other kind with the typed bit set is
+        // a corrupt row, not a payload to reinterpret.
+        return match kind {
+            HEAD_SLOT_INLINE => Ok(HeadSlotView::Typed(bytes)),
+            _ => Err(head_value_error(&format!(
+                "{field} is marked as a typed-slot record but carries slot kind {kind}"
+            ))),
+        };
+    }
     match kind {
         HEAD_SLOT_NONE if bytes.is_empty() => Ok(HeadSlotView::None),
         HEAD_SLOT_NONE => Err(head_value_error(&format!(
@@ -2223,7 +2367,7 @@ where
             &mut deferred,
             row_index,
             DeferredJsonField::Snapshot,
-        );
+        )?;
         let metadata = materialize_live_slot(
             !value.deleted && projection.metadata,
             &bytes,
@@ -2232,7 +2376,7 @@ where
             &mut deferred,
             row_index,
             DeferredJsonField::Metadata,
-        );
+        )?;
         identity.push_materialized(
             &mut rows,
             snapshot_content,
@@ -2296,12 +2440,26 @@ fn materialize_live_slot(
     deferred: &mut Vec<DeferredJson>,
     row_index: usize,
     field: DeferredJsonField,
-) -> Option<SharedStr> {
+) -> Result<Option<SharedStr>, LixError> {
     if !include {
-        return None;
+        return Ok(None);
     }
-    match slot {
+    Ok(match slot {
         HeadSlotView::None => None,
+        // Reconstruction on demand is what lets a typed record serve the
+        // existing text consumers unchanged. It is byte-identical to the
+        // normalized text it replaced, so content addressing over the result is
+        // unaffected -- that property is a correctness precondition here, not a
+        // nicety.
+        HeadSlotView::Typed(record) => {
+            let json = typed_slot_canonical_json(record)?;
+            #[cfg(test)]
+            crate::hot_state::typed_slots::record_typed_slot_read_served();
+            Some(
+                SharedStr::from_utf8(Bytes::from(json.into_bytes()))
+                    .expect("reconstructed canonical JSON is UTF-8"),
+            )
+        }
         HeadSlotView::Inline(json) | HeadSlotView::InlineFingerprinted { json, .. } => {
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_hot_scan_value_handle_clone();
@@ -2319,7 +2477,7 @@ fn materialize_live_slot(
             });
             None
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2490,6 +2648,115 @@ mod tests {
             .expect("working diff must be current")
     }
 
+    /// A read served out of a stored typed-slot record, and the byte-identity
+    /// the whole staged landing rests on.
+    ///
+    /// The counter is the point. A decode branch that exists but is never taken
+    /// looks exactly like a live one in a diff, so engagement is asserted from
+    /// the counter the read path increments, with a positive control -- a schema
+    /// carrying a JSON-declared column -- taking the other route in the same
+    /// run.
+    #[test]
+    fn a_head_row_for_an_all_scalar_schema_is_stored_typed_and_read_back_byte_identically() {
+        use crate::hot_state::typed_slots::{
+            TYPED_SLOT_READS_SERVED, TYPED_SLOT_RECORDS_WRITTEN, builtin_layout_for_schema_key,
+        };
+        use std::sync::atomic::Ordering;
+
+        let json = r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#;
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("typed-change")),
+            commit_id: Some(CommitId::for_test_label("typed-commit")),
+            untracked: false,
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: JsonSlotRef::Inline(json),
+            metadata: JsonSlotRef::None,
+            columnar_base_coordinate: None,
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+
+        let writes_before = TYPED_SLOT_RECORDS_WRITTEN.load(Ordering::Relaxed);
+        let reads_before = TYPED_SLOT_READS_SERVED.load(Ordering::Relaxed);
+
+        let mut typed_bytes = Vec::new();
+        append_head_value_with_typed_layout(
+            &mut typed_bytes,
+            &value,
+            builtin_layout_for_schema_key("lix_account"),
+        )
+        .expect("stage a typed head row");
+        assert!(
+            TYPED_SLOT_RECORDS_WRITTEN.load(Ordering::Relaxed) > writes_before,
+            "the writer did not encode a typed record"
+        );
+        // The discriminant is in the header, never inferred from the payload.
+        assert_eq!(
+            typed_bytes[59] & HEAD_PAYLOAD_TYPED_SNAPSHOT,
+            HEAD_PAYLOAD_TYPED_SNAPSHOT
+        );
+        assert_ne!(typed_bytes[HEAD_VALUE_HEADER_BYTES], b'{');
+
+        let typed_bytes = Bytes::from(typed_bytes);
+        let decoded = decode_head_value(&typed_bytes).expect("decode a typed head row");
+        assert!(matches!(decoded.snapshot, HeadSlotView::Typed(_)));
+
+        let mut json_refs = Vec::new();
+        let mut deferred = Vec::new();
+        let snapshot = materialize_live_slot(
+            true,
+            &typed_bytes,
+            decoded.snapshot,
+            &mut json_refs,
+            &mut deferred,
+            0,
+            DeferredJsonField::Snapshot,
+        )
+        .expect("materialize a typed row")
+        .expect("snapshot view");
+        // Content addressing hashes this text, so a reconstruction that differs
+        // by one byte is a correctness break rather than a slow path.
+        assert_eq!(snapshot.as_str(), json);
+        assert!(
+            TYPED_SLOT_READS_SERVED.load(Ordering::Relaxed) > reads_before,
+            "the read was not served out of a typed record"
+        );
+
+        // Positive control, same run: `lix_key_value.value` is arbitrary JSON by
+        // design, so that schema has no layout and the same call stores text.
+        let control_json = r#"{"key":"k","value":{"nested":true}}"#;
+        let control = HeadValueRef {
+            snapshot: JsonSlotRef::Inline(control_json),
+            ..value
+        };
+        let mut control_bytes = Vec::new();
+        append_head_value_with_typed_layout(
+            &mut control_bytes,
+            &control,
+            builtin_layout_for_schema_key("lix_key_value"),
+        )
+        .expect("stage a json head row");
+        assert_eq!(control_bytes[59] & HEAD_PAYLOAD_TYPED_SNAPSHOT, 0);
+        let control_bytes = Bytes::from(control_bytes);
+        let control_decoded = decode_head_value(&control_bytes).expect("decode a json head row");
+        assert_eq!(control_decoded.snapshot, HeadSlotView::Inline(control_json));
+    }
+
+    /// The dirty/clean transition compares payload fingerprints, and a row's
+    /// before-image may be stored as text while its current version is typed.
+    #[test]
+    fn a_typed_slot_fingerprints_identically_to_the_json_text_it_replaced() {
+        let json = r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#;
+        let layout = crate::hot_state::typed_slots::builtin_layout_for_schema_key("lix_account")
+            .expect("lix_account has a typed-slot layout");
+        let record = typed_snapshot_record(layout, json).expect("typed record");
+        assert_eq!(
+            working_diff_slot_fingerprint(HeadSlotView::Typed(&record)),
+            working_diff_slot_fingerprint(HeadSlotView::Inline(json))
+        );
+    }
+
     #[test]
     fn v8_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
         let snapshot_ref = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
@@ -2563,6 +2830,7 @@ mod tests {
             0,
             DeferredJsonField::Snapshot,
         )
+        .expect("materialize snapshot")
         .expect("snapshot view");
         let metadata = materialize_live_slot(
             true,
@@ -2573,6 +2841,7 @@ mod tests {
             0,
             DeferredJsonField::Metadata,
         )
+        .expect("materialize metadata")
         .expect("metadata view");
 
         assert!(snapshot.shares_buffer_with(&metadata));

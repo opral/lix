@@ -15,13 +15,19 @@
 //!
 //! ```text
 //!  0        format version (1)
-//!  1..3     declared column count (big endian u16)
-//!  3..3+9n  directory, 9 bytes per declared column, in layout order:
+//!  1..9     layout fingerprint (blake3 prefix over the declared columns)
+//!  9..11    declared column count (big endian u16)
+//!  11..11+9n directory, 9 bytes per declared column, in layout order:
 //!               [0]    slot tag
 //!               [1..5] payload offset within the payload area (big endian u32)
 //!               [5..9] payload byte length (big endian u32)
-//!  3+9n..   payload area
+//!  11+9n..  payload area
 //! ```
+//!
+//! The layout fingerprint is what makes resolving a layout a *mechanism*
+//! rather than a convention. A reader that looked the layout up by schema key
+//! and got a different column set than the writer used would decode every slot
+//! at the wrong name, silently. Reconstruction refuses instead.
 //!
 //! Column *names* are not stored. A reader resolves a name to a slot index once
 //! per batch against the schema layout, then indexes the directory directly, so
@@ -70,7 +76,9 @@ use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 /// stored-format change.
 pub(crate) const TYPED_SLOTS_VERSION: u8 = 1;
 
-const HEADER_BYTES: usize = 3;
+const HEADER_BYTES: usize = 11;
+/// Bytes of the layout digest carried in the header, at offset 1.
+pub(crate) const LAYOUT_FINGERPRINT_BYTES: usize = 8;
 const DIRECTORY_ENTRY_BYTES: usize = 9;
 
 const TAG_NULL: u8 = 0;
@@ -131,6 +139,19 @@ pub(crate) enum DeclaredType {
 impl DeclaredType {
     pub(crate) fn is_scalar(self) -> bool {
         !matches!(self, Self::Json)
+    }
+
+    /// Stable discriminant for the layout fingerprint. Written into stored
+    /// records, so these numbers are a format constant and must not be
+    /// renumbered without a `REPOSITORY_PROTOCOL_VALUE` bump.
+    fn fingerprint_tag(self) -> u8 {
+        match self {
+            Self::String => 1,
+            Self::Integer => 2,
+            Self::Number => 3,
+            Self::Boolean => 4,
+            Self::Json => 5,
+        }
     }
 }
 
@@ -223,6 +244,24 @@ impl TypedSlotLayout {
         self.columns.get(index).map(|(_, declared)| *declared)
     }
 
+    /// A digest of the declared columns, in layout order.
+    ///
+    /// Every record carries this, and reconstruction refuses a layout whose
+    /// fingerprint does not match the record's. That converts "the registry
+    /// handed back the columns the writer used" from something a reader has to
+    /// trust into something it checks.
+    pub(crate) fn fingerprint(&self) -> [u8; LAYOUT_FINGERPRINT_BYTES] {
+        let mut hasher = blake3::Hasher::new();
+        for (name, declared) in &self.columns {
+            hasher.update(&(name.len() as u64).to_be_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&[declared.fingerprint_tag()]);
+        }
+        let mut fingerprint = [0_u8; LAYOUT_FINGERPRINT_BYTES];
+        fingerprint.copy_from_slice(&hasher.finalize().as_bytes()[..LAYOUT_FINGERPRINT_BYTES]);
+        fingerprint
+    }
+
     /// True when every declared column is scalar, so no slot in this layout
     /// carries JSON text.
     pub(crate) fn is_all_scalar(&self) -> bool {
@@ -270,6 +309,7 @@ pub(crate) fn encode_typed_slots(
     let directory_bytes = layout.len() * DIRECTORY_ENTRY_BYTES;
     let mut bytes = Vec::with_capacity(HEADER_BYTES + directory_bytes + snapshot.len() * 16);
     bytes.push(TYPED_SLOTS_VERSION);
+    bytes.extend_from_slice(&layout.fingerprint());
     let count = u16::try_from(layout.len()).map_err(|_| {
         TypedSlotError::new("typed slot layout exceeds the u16 column count the header carries")
     })?;
@@ -409,7 +449,10 @@ impl<'a> TypedSlotsRef<'a> {
                 bytes[0]
             )));
         }
-        let count = usize::from(u16::from_be_bytes([bytes[1], bytes[2]]));
+        let count = usize::from(u16::from_be_bytes([
+            bytes[1 + LAYOUT_FINGERPRINT_BYTES],
+            bytes[2 + LAYOUT_FINGERPRINT_BYTES],
+        ]));
         let payload_start = HEADER_BYTES + count * DIRECTORY_ENTRY_BYTES;
         if bytes.len() < payload_start {
             return Err(TypedSlotError::new(
@@ -449,6 +492,13 @@ impl<'a> TypedSlotsRef<'a> {
 
     pub(crate) fn len(&self) -> usize {
         self.count
+    }
+
+    /// The digest of the layout this record was encoded against.
+    pub(crate) fn layout_fingerprint(&self) -> [u8; LAYOUT_FINGERPRINT_BYTES] {
+        let mut fingerprint = [0_u8; LAYOUT_FINGERPRINT_BYTES];
+        fingerprint.copy_from_slice(&self.bytes[1..1 + LAYOUT_FINGERPRINT_BYTES]);
+        fingerprint
     }
 
     fn directory_entry(&self, index: usize) -> (u8, usize, usize) {
@@ -569,6 +619,11 @@ impl<'a> TypedSlotsRef<'a> {
     }
 
     pub(crate) fn to_json_value(&self, layout: &TypedSlotLayout) -> Result<JsonValue> {
+        if layout.fingerprint() != self.layout_fingerprint() {
+            return Err(TypedSlotError::new(
+                "typed slot record was written against a different column layout",
+            ));
+        }
         if layout.len() != self.count {
             return Err(TypedSlotError::new(format!(
                 "typed slot record has {} slots but its layout declares {}",
@@ -637,6 +692,203 @@ fn utf8<'a>(payload: &'a [u8], index: usize) -> Result<&'a str> {
 /// them.
 pub(crate) fn typed_slots_fingerprint(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
+}
+
+/// Typed-slot layouts for the crate's built-in schemas.
+///
+/// The layouts are derived from the schema definitions compiled into this
+/// binary (`schema/builtin/*.json`, `include_str!`-ed), so a layout is a
+/// deterministic function of the binary rather than of repository content or
+/// of the order in which surfaces happened to be built. Two consequences that
+/// this design leans on:
+///
+/// * A change to a built-in schema changes the layout, hence the fingerprint,
+///   hence the stored bytes — which is a stored-format change and is carried by
+///   `REPOSITORY_PROTOCOL_VALUE` like any other.
+/// * A reader never has to trust that a schema-key lookup returned the writer's
+///   columns: `to_json_value` compares the fingerprint the record carries
+///   against the layout it was handed and refuses on a mismatch.
+///
+/// Only schemas that are closed (`additionalProperties: false`) and whose every
+/// declared property is scalar get a layout. A schema carrying a JSON-declared
+/// column is skipped entirely here: the format supports a verbatim `Json` slot,
+/// but the writer this registry feeds is deliberately scoped to the all-scalar
+/// case for now.
+struct BuiltinTypedSlotLayouts {
+    by_schema_key: BTreeMap<String, TypedSlotLayout>,
+    by_fingerprint: BTreeMap<[u8; LAYOUT_FINGERPRINT_BYTES], String>,
+}
+
+static BUILTIN_LAYOUTS: std::sync::OnceLock<BuiltinTypedSlotLayouts> = std::sync::OnceLock::new();
+
+fn builtin_layouts() -> &'static BuiltinTypedSlotLayouts {
+    BUILTIN_LAYOUTS.get_or_init(|| {
+        let mut by_schema_key = BTreeMap::new();
+        let mut by_fingerprint = BTreeMap::new();
+        for definition in crate::schema::seed_schema_definitions() {
+            let Some((schema_key, layout)) = layout_from_schema_definition(definition) else {
+                continue;
+            };
+            let fingerprint = layout.fingerprint();
+            if by_fingerprint
+                .insert(fingerprint, schema_key.clone())
+                .is_some()
+            {
+                // Two built-in schemas with identical column sets would be
+                // indistinguishable to a reader resolving by fingerprint, and
+                // their records reconstruct identically, so this is not a
+                // correctness hazard. It is still surprising enough to keep the
+                // first registration rather than silently rebinding.
+                continue;
+            }
+            by_schema_key.insert(schema_key, layout);
+        }
+        BuiltinTypedSlotLayouts {
+            by_schema_key,
+            by_fingerprint,
+        }
+    })
+}
+
+fn declared_type_from_json_schema_type(declared: &JsonValue) -> Option<DeclaredType> {
+    match declared.get("type")?.as_str()? {
+        "string" => Some(DeclaredType::String),
+        "integer" => Some(DeclaredType::Integer),
+        "number" => Some(DeclaredType::Number),
+        "boolean" => Some(DeclaredType::Boolean),
+        _ => None,
+    }
+}
+
+fn layout_from_schema_definition(definition: &JsonValue) -> Option<(String, TypedSlotLayout)> {
+    let schema_key = definition.get("x-lix-key")?.as_str()?.to_string();
+    if definition.get("additionalProperties") != Some(&JsonValue::Bool(false)) {
+        return None;
+    }
+    let properties = definition.get("properties")?.as_object()?;
+    if properties.is_empty() {
+        return None;
+    }
+    // Sorted by name so the layout order does not depend on whether serde_json
+    // preserves object order in this build.
+    let mut columns: Vec<(String, DeclaredType)> = Vec::with_capacity(properties.len());
+    for (name, declared) in properties {
+        let declared = declared_type_from_json_schema_type(declared)?;
+        columns.push((name.clone(), declared));
+    }
+    columns.sort_by(|left, right| left.0.cmp(&right.0));
+    let layout = TypedSlotLayout::new(columns).ok()?;
+    debug_assert!(layout.is_all_scalar());
+    Some((schema_key, layout))
+}
+
+/// The typed-slot layout for a built-in schema, or `None` when that schema is
+/// not one this format writes typed records for.
+pub(crate) fn builtin_layout_for_schema_key(schema_key: &str) -> Option<&'static TypedSlotLayout> {
+    builtin_layouts().by_schema_key.get(schema_key)
+}
+
+/// The layout a stored record was encoded against, resolved from the record's
+/// own fingerprint.
+///
+/// A read path needs no schema key at all: the record says which layout it
+/// belongs to, and an unknown fingerprint is an error rather than a guess.
+pub(crate) fn builtin_layout_for_fingerprint(
+    fingerprint: [u8; LAYOUT_FINGERPRINT_BYTES],
+) -> Option<&'static TypedSlotLayout> {
+    let layouts = builtin_layouts();
+    let schema_key = layouts.by_fingerprint.get(&fingerprint)?;
+    layouts.by_schema_key.get(schema_key)
+}
+
+/// Counts reads that were served out of a stored typed-slot record.
+///
+/// A decode branch that exists but is never taken is worse than an admitted
+/// gap, so the tests assert on this counter rather than on the branch being
+/// present in the source.
+#[cfg(test)]
+pub(crate) static TYPED_SLOT_READS_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Counts typed-slot records handed to the storage encoder.
+#[cfg(test)]
+pub(crate) static TYPED_SLOT_RECORDS_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn record_typed_slot_read_served() {
+    TYPED_SLOT_READS_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn record_typed_slot_record_written() {
+    TYPED_SLOT_RECORDS_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn a_builtin_all_scalar_schema_has_a_layout_and_a_json_declared_one_does_not() {
+        let account = builtin_layout_for_schema_key("lix_account")
+            .expect("lix_account declares only scalar columns");
+        assert!(account.is_all_scalar());
+        assert_eq!(account.index_of("id").is_some(), true);
+        // `lix_key_value.value` is arbitrary JSON by design, so that schema is
+        // deliberately not written as a typed record.
+        assert!(builtin_layout_for_schema_key("lix_key_value").is_none());
+    }
+
+    #[test]
+    fn a_record_resolves_its_own_layout_from_its_fingerprint() {
+        let layout = builtin_layout_for_schema_key("lix_account").expect("layout");
+        let snapshot = object(
+            r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#,
+        );
+        let bytes = encode_typed_slots(layout, &snapshot).expect("encode");
+        let record = TypedSlotsRef::parse(&bytes).expect("parse");
+        let resolved = builtin_layout_for_fingerprint(record.layout_fingerprint())
+            .expect("the record names a layout this binary knows");
+        assert_eq!(resolved, layout);
+        assert_eq!(
+            record.to_canonical_json(resolved).expect("reconstruct"),
+            r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#
+        );
+    }
+
+    #[test]
+    fn reconstruction_refuses_a_layout_the_record_was_not_written_against() {
+        let layout = builtin_layout_for_schema_key("lix_account").expect("layout");
+        let snapshot = object(
+            r#"{"id":"account-1","kind":"human","name":"Ada","status":"active"}"#,
+        );
+        let bytes = encode_typed_slots(layout, &snapshot).expect("encode");
+        let record = TypedSlotsRef::parse(&bytes).expect("parse");
+        // Same column count, same declared types, different names: a positional
+        // decode against it would silently emit the wrong keys.
+        let impostor = TypedSlotLayout::new([
+            ("id".to_string(), DeclaredType::String),
+            ("kind".to_string(), DeclaredType::String),
+            ("name".to_string(), DeclaredType::String),
+            ("state".to_string(), DeclaredType::String),
+        ])
+        .expect("impostor layout");
+        let error = record
+            .to_canonical_json(&impostor)
+            .expect_err("a mismatched layout must be refused");
+        assert!(
+            error.message().contains("different column layout"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn object(json: &str) -> JsonMap<String, JsonValue> {
+        match serde_json::from_str::<JsonValue>(json).expect("valid json") {
+            JsonValue::Object(map) => map,
+            other => panic!("expected an object, got {other}"),
+        }
+    }
 }
 
 #[cfg(test)]
