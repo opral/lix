@@ -18,6 +18,11 @@
 //! development, when the direct-route mitigation and the seek cancelled each
 //! other and every correctness test stayed green.
 
+// The whole target reads `storage_bench` counters, which exist only under
+// `storage-benches`. Without this the target breaks `cargo check -p lix --tests`
+// while `--all-features` stays green. Same line as `preimage_route_census`.
+#![cfg(feature = "storage-benches")]
+
 use std::future::Future;
 
 use lix::integration::{Engine, SessionContext};

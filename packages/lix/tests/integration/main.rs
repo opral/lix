@@ -16,6 +16,9 @@ mod execute_batch_benchmark;
 mod filesystem_fuzz;
 mod fs_api;
 mod json_pointer_crud_storage;
+// Imports `lix::storage_bench` at module scope, which exists only under
+// `storage-benches`; the `integration` target itself carries no required-features.
+#[cfg(feature = "storage-benches")]
 mod lix_file_returning_route;
 mod merge_fuzz;
 mod observe;
