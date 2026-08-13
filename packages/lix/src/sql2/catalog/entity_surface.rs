@@ -663,7 +663,7 @@ fn json_schema_default_expression(default: &JsonValue) -> String {
     }
 }
 
-fn arrow_data_type_for_entity_column_type(column_type: EntityColumnType) -> DataType {
+pub(crate) fn arrow_data_type_for_entity_column_type(column_type: EntityColumnType) -> DataType {
     match column_type {
         EntityColumnType::String | EntityColumnType::Json => DataType::Utf8,
         EntityColumnType::Integer => DataType::Int64,

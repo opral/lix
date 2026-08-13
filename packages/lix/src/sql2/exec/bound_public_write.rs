@@ -7,6 +7,8 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
+use datafusion::logical_expr::Operator;
+use datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer;
 use serde_json::Value as JsonValue;
 use tracing::Instrument;
 
@@ -21,12 +23,14 @@ use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
 use crate::sql2::SqlWriteExecutionContext;
-use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
+use crate::sql2::bind::expr::{BoundBinaryOperator, BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundWriteInput,
     BoundWriteOp, BoundWriteTarget, EntityWriteSurface, FileWriteSurface,
 };
-use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
+use crate::sql2::catalog::entity_surface::{
+    EntitySurfaceColumn, arrow_data_type_for_entity_column_type,
+};
 use crate::sql2::catalog::{EntityColumnType, EntitySurfaceSpec};
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
@@ -60,6 +64,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static FAST_BINARY_ARITHMETIC_EVALUATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -90,6 +96,16 @@ pub(crate) fn take_certified_generation_identity_replacements() -> usize {
 #[cfg(test)]
 pub(crate) fn take_certified_single_path_value_replacements() -> usize {
     CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| executions.replace(0))
+}
+
+/// Counts evaluations that ran inside the fast writer's arithmetic arm.
+///
+/// The counter sits in `eval_binary_entity_value` itself, i.e. in the new
+/// route, not at the router. A statement that is admitted but whose arithmetic
+/// never evaluates (zero matched rows) therefore reads as zero.
+#[cfg(test)]
+pub(crate) fn take_fast_binary_arithmetic_evaluations() -> usize {
+    FAST_BINARY_ARITHMETIC_EVALUATIONS.with(|evaluations| evaluations.replace(0))
 }
 
 #[cfg(test)]
@@ -6273,9 +6289,149 @@ fn eval_expr_value(
             LixError::CODE_UNSUPPORTED_SQL,
             format!("bound entity write does not support function '{name}' yet"),
         )),
-        BoundExpr::Binary { .. } => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "bound entity write evaluates binary expressions through DataFusion",
+        BoundExpr::Binary { left, op, right } => eval_binary_entity_value(
+            left,
+            *op,
+            right,
+            context,
+            ctx,
+            params,
+            active_branch_commit_id,
+        ),
+    }
+}
+
+/// Evaluates a flat arithmetic expression the way the DataFusion writer would.
+///
+/// Operand types are coerced with DataFusion's own `BinaryTypeCoercer` and the
+/// operation is applied with the same kernels `BinaryExpr::evaluate` selects:
+/// wrapping for `+ - *` (the physical expression is built with
+/// `fail_on_overflow` off) and checked for `/ %`. A column operand is first
+/// cast to the Arrow type its surface presents, so the arithmetic sees the same
+/// input value the DataFusion writer would read from the entity table rather
+/// than whatever shape the JSON snapshot happens to hold.
+fn eval_binary_entity_value(
+    left: &BoundExpr,
+    op: BoundBinaryOperator,
+    right: &BoundExpr,
+    context: &EntityEvalContext<'_>,
+    ctx: &mut dyn SqlWriteExecutionContext,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+) -> Result<EntityEvalValue, LixError> {
+    let left_scalar =
+        binary_operand_scalar(left, context, ctx, params, active_branch_commit_id)?;
+    let right_scalar =
+        binary_operand_scalar(right, context, ctx, params, active_branch_commit_id)?;
+    let operator = match op {
+        BoundBinaryOperator::Add => Operator::Plus,
+        BoundBinaryOperator::Subtract => Operator::Minus,
+        BoundBinaryOperator::Multiply => Operator::Multiply,
+        BoundBinaryOperator::Divide => Operator::Divide,
+        BoundBinaryOperator::Modulo => Operator::Modulo,
+    };
+    let (left_type, right_type) = BinaryTypeCoercer::new(
+        &left_scalar.data_type(),
+        &operator,
+        &right_scalar.data_type(),
+    )
+    .get_input_types()
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("SQL arithmetic operands cannot be combined: {error}"),
+        )
+    })?;
+    let left_scalar = left_scalar.cast_to(&left_type).map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("SQL arithmetic left operand is not numeric: {error}"),
+        )
+    })?;
+    let right_scalar = right_scalar.cast_to(&right_type).map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("SQL arithmetic right operand is not numeric: {error}"),
+        )
+    })?;
+    let result = match op {
+        BoundBinaryOperator::Add => left_scalar.add(&right_scalar),
+        BoundBinaryOperator::Subtract => left_scalar.sub(&right_scalar),
+        BoundBinaryOperator::Multiply => left_scalar.mul(&right_scalar),
+        BoundBinaryOperator::Divide => left_scalar.div(&right_scalar),
+        BoundBinaryOperator::Modulo => left_scalar.rem(&right_scalar),
+    }
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("SQL arithmetic failed: {error}"),
+        )
+    })?;
+    #[cfg(test)]
+    FAST_BINARY_ARITHMETIC_EVALUATIONS
+        .with(|evaluations| evaluations.set(evaluations.get().saturating_add(1)));
+    entity_eval_value_from_arithmetic_scalar(result)
+}
+
+fn binary_operand_scalar(
+    expr: &BoundExpr,
+    context: &EntityEvalContext<'_>,
+    ctx: &mut dyn SqlWriteExecutionContext,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+) -> Result<ScalarValue, LixError> {
+    let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
+    let scalar = scalar_from_entity_eval_value(value);
+    let BoundExpr::Column(column) = expr else {
+        return Ok(scalar);
+    };
+    let Some(surface_column) = context
+        .visible_columns
+        .iter()
+        .find(|candidate| candidate.name == column.name)
+    else {
+        return Ok(scalar);
+    };
+    let target_type = arrow_data_type_for_entity_column_type(surface_column.column_type);
+    if scalar.data_type() == target_type {
+        return Ok(scalar);
+    }
+    scalar.cast_to(&target_type).map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!(
+                "column '{}' does not hold a {target_type} value for SQL arithmetic: {error}",
+                column.name
+            ),
+        )
+    })
+}
+
+fn entity_eval_value_from_arithmetic_scalar(
+    value: ScalarValue,
+) -> Result<EntityEvalValue, LixError> {
+    if value.is_null() {
+        return Ok(EntityEvalValue::SqlNull);
+    }
+    match value {
+        ScalarValue::Int64(Some(value)) => Ok(EntityEvalValue::Json(JsonValue::Number(
+            value.into(),
+        ))),
+        ScalarValue::UInt64(Some(value)) => Ok(EntityEvalValue::Json(JsonValue::Number(
+            value.into(),
+        ))),
+        ScalarValue::Float64(Some(value)) => serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .map(EntityEvalValue::Json)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "SQL arithmetic produced a non-finite number",
+                )
+            }),
+        other => Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("SQL arithmetic produced unsupported value {other:?}"),
         )),
     }
 }
@@ -6779,10 +6935,10 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         | BoundExpr::Param(_)
         | BoundExpr::Literal(_) => Ok(()),
         BoundExpr::Cast { expr, .. } => validate_expr_supported(expr),
-        BoundExpr::Binary { .. } => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "bound entity write evaluates binary expressions through DataFusion",
-        )),
+        BoundExpr::Binary { left, right, .. } => {
+            validate_binary_operand_supported(left)?;
+            validate_binary_operand_supported(right)
+        }
         BoundExpr::Function { name, args } => {
             match name.as_str() {
                 "lix_json" if args.len() == 1 => {}
@@ -6804,6 +6960,26 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
             }
             Ok(())
         }
+    }
+}
+
+/// Arithmetic admitted by the fast entity writer.
+///
+/// Only a flat `<operand> <arith op> <operand>` is admitted, where each operand
+/// is a bare column, parameter, or literal -- the `SET k = k + 1` family. Any
+/// nesting, cast, or function call inside the arithmetic keeps the whole
+/// statement on the generic DataFusion writer, which evaluates arbitrary
+/// expressions.
+fn validate_binary_operand_supported(expr: &BoundExpr) -> Result<(), LixError> {
+    match expr {
+        BoundExpr::Column(_) | BoundExpr::Param(_) | BoundExpr::Literal(_) => Ok(()),
+        BoundExpr::ExcludedColumn(_)
+        | BoundExpr::Cast { .. }
+        | BoundExpr::Function { .. }
+        | BoundExpr::Binary { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound entity write evaluates compound binary expressions through DataFusion",
+        )),
     }
 }
 
