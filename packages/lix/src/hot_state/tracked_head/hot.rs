@@ -10574,10 +10574,22 @@ impl LiveMaterializationIdentity for HotScanIdentity {
         untracked: bool,
         branch_id: &str,
     ) {
-        rows.push_materialized_ref(
-            &self.entity_pk,
-            self.schema_key(),
-            self.file_id(),
+        // `self` is consumed here, so the primary key moves into the column
+        // instead of being cloned out of a value about to be dropped. The
+        // identity strings stay borrowed: they are slices of the retained key
+        // and the builder interns them into its shared dictionary.
+        let Self {
+            key,
+            schema_key,
+            entity_pk,
+            file_id,
+        } = self;
+        let schema_key = schema_key.as_str(&key);
+        let file_id = file_id.as_ref().map(|file_id| file_id.as_str(&key));
+        rows.push_materialized_interned(
+            entity_pk,
+            schema_key,
+            file_id,
             snapshot_content,
             metadata,
             deleted,

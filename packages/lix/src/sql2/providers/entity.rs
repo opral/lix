@@ -28,7 +28,7 @@ use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::{
     HotStateFilter, HotStateProjection, HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
-use crate::hot_state::{MaterializedHotStateBatch, MaterializedHotStateBatchBuilder};
+use crate::hot_state::MaterializedHotStateBatch;
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
@@ -2899,36 +2899,55 @@ fn apply_entity_batch_filters(
             parsed_snapshots: None,
         });
     }
-    let mut filtered = MaterializedHotStateBatchBuilder::with_capacity(rows.len());
     let mut parsed_snapshots = Vec::with_capacity(rows.len());
-    for row in rows.iter() {
-        let Some(snapshot_content) = row.snapshot_content().map(AsRef::<str>::as_ref) else {
-            continue;
-        };
-        let snapshot = parse_snapshot_value(snapshot_content).map_err(|error| {
-            DataFusionError::External(Box::new(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "entity scan filter could not parse snapshot_content for schema '{}' entity_pk '{:?}': {error}",
-                    row.schema_key(),
-                    row.entity_pk()
-                ),
-            )))
-        })?;
-        let mut matches = true;
-        for filter in filters {
-            if !filter.matches_snapshot(Some(&snapshot), row.schema_key())? {
-                matches = false;
-                break;
+    // The batch is compacted in place. Rebuilding it row by row cloned every
+    // surviving row's shared identity and snapshot buffers and then dropped
+    // the originals, which is pure atomic refcount traffic over bytes that
+    // never move.
+    let mut failure: Option<DataFusionError> = None;
+    let rows = rows.filter(
+        |row| {
+            if failure.is_some() {
+                return false;
             }
-        }
-        if matches {
-            filtered.push_ref(row, None);
+            let Some(snapshot_content) = row.snapshot_content().map(AsRef::<str>::as_ref) else {
+                return false;
+            };
+            let snapshot = match parse_snapshot_value(snapshot_content) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    failure = Some(DataFusionError::External(Box::new(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "entity scan filter could not parse snapshot_content for schema '{}' entity_pk '{:?}': {error}",
+                            row.schema_key(),
+                            row.entity_pk()
+                        ),
+                    ))));
+                    return false;
+                }
+            };
+            for filter in filters {
+                match filter.matches_snapshot(Some(&snapshot), row.schema_key()) {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(error) => {
+                        failure = Some(error);
+                        return false;
+                    }
+                }
+            }
             parsed_snapshots.push(Some(snapshot));
-        }
+            true
+        },
+        None,
+    );
+    if let Some(failure) = failure {
+        return Err(failure);
     }
+    debug_assert_eq!(rows.len(), parsed_snapshots.len());
     Ok(FilteredEntityBatch {
-        rows: filtered.finish(),
+        rows,
         parsed_snapshots: Some(parsed_snapshots),
     })
 }
