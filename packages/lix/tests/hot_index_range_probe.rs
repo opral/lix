@@ -1,17 +1,22 @@
-//! The hot-index range seek must actually seek, and must refuse when it cannot.
+//! The hot-index range seek must actually seek, must read a number of entries
+//! set by its **answer** rather than by the collection, and must refuse when it
+//! has no index to seek.
 //!
 //! This lives in its own `[[test]]` target because `storage_bench` counters are
 //! **process-global**. In the shared suite a concurrent test can only inflate
-//! them — harmless for a `>=` assertion, but fatal for the two assertions that
-//! matter here: "resolved fewer candidates than the collection" and "did not
-//! engage at all" are both *upper* bounds, which inflation pushes toward a
-//! spurious failure. A dedicated target is its own process, and both arms run
-//! sequentially inside one `#[test]` so that even libtest's own parallelism
-//! cannot interleave them.
+//! them — harmless for a `>=` assertion, but fatal for the assertions that
+//! matter here, which are *upper* bounds that inflation pushes toward a
+//! spurious failure. A dedicated target is its own process; and every arm runs
+//! sequentially inside one `#[test]` because libtest runs `#[test]` functions
+//! within a single binary concurrently, so a dedicated target alone is
+//! necessary but not sufficient.
 //!
-//! Without these assertions the 144-pair bound differential in the integration
-//! suite is vacuous: it would pass identically against a silently-refusing
-//! seek, proving nothing about the seek while looking like thorough coverage.
+//! Without the engagement assertions the 144-pair bound differential in the
+//! integration suite is vacuous: it passes identically against a
+//! silently-refusing seek, proving nothing about the seek while looking like
+//! thorough coverage. That is not hypothetical — it is what happened during
+//! development, when the direct-route mitigation and the seek cancelled each
+//! other and every correctness test stayed green.
 
 use std::future::Future;
 
@@ -22,9 +27,13 @@ use lix::{Memory, Value};
 /// overflows libtest's 2 MiB worker stack in the `test` profile.
 const RANGE_PROBE_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 
-/// Ordinals seeded into both fixtures. Spans zero and negatives so the
-/// order-preserving sign flip is exercised, not just the positive half.
-const ORDINALS: [i64; 10] = [-3, -2, -1, 0, 1, 2, 3, 4, 5, 6];
+/// The measured query selects a closed interval of three ordinals.
+const ANSWER_ROWS: u64 = 3;
+
+/// Collection sizes the same three-row answer is read from. The point of the
+/// pair is the *slope*: a seek's candidate count is set by its answer, so it
+/// must not move when the collection grows 20x. A scan's would grow with it.
+const COLLECTION_SIZES: [usize; 2] = [10, 200];
 
 fn run_on_sized_stack<Body, Fut>(name: &str, body: Body)
 where
@@ -47,35 +56,43 @@ where
 }
 
 #[test]
-fn range_seek_engages_on_a_declared_column_and_refuses_on_an_undeclared_one() {
+fn range_seek_reads_candidates_set_by_its_answer_and_refuses_without_an_index() {
     run_on_sized_stack("hot_index_range_probe", || async {
-        // ---- hit: the column declares `x-lix-unique`, so entries exist -----
-        let session = seeded_session("range_seek_note", true).await;
-        // Drain what seeding wrote — uniqueness validation probes the same
-        // index — so the census below describes the read, not the writes.
-        let _ = lix::storage_bench::take_hot_index_probe_census();
-        let answered = ordinal_range_ids(&session, "range_seek_note", 2, 4).await;
-        let hit = lix::storage_bench::take_hot_index_probe_census();
+        // ---- the access-path claim, as a curve rather than a point ---------
+        let mut candidates_by_size = Vec::new();
+        for rows in COLLECTION_SIZES {
+            let session = seeded_session("range_seek_note", true, rows).await;
+            // Seeding a declared-unique collection probes this same index
+            // during uniqueness validation, so drain immediately before the
+            // measured read or the census describes the writes too.
+            let _ = lix::storage_bench::take_hot_index_probe_census();
+            let answered = ordinal_range_ids(&session, "range_seek_note", 2, 4).await;
+            let census = lix::storage_bench::take_hot_index_probe_census();
 
+            assert_eq!(
+                answered,
+                vec!["n5".to_string(), "n6".to_string(), "n7".to_string()],
+                "ordinals 2,3,4 are the sixth through eighth rows at {rows} rows"
+            );
+            assert!(
+                census.range_probes_engaged >= 1,
+                "the range seek should engage on a declared column at {rows} rows; \
+                 census={census:?}"
+            );
+            candidates_by_size.push(census.range_probe_candidates);
+        }
+
+        // A seek reads entries proportional to its answer. A scan would read
+        // the collection, so this is the assertion that distinguishes them.
         assert_eq!(
-            answered,
-            vec!["n5".to_string(), "n6".to_string(), "n7".to_string()],
-            "ordinals 2,3,4 are the sixth through eighth rows of the fixture"
-        );
-        assert!(
-            hit.range_probes_engaged >= 1,
-            "the range seek should engage on a declared column; census={hit:?}"
-        );
-        // A closed interval over 3 of 10 values that resolves all 10 is a walk
-        // wearing a counter, not a seek.
-        assert!(
-            hit.range_probe_candidates < ORDINALS.len() as u64,
-            "seek over 3 of 10 values resolved {} candidates; census={hit:?}",
-            hit.range_probe_candidates
+            candidates_by_size,
+            vec![ANSWER_ROWS, ANSWER_ROWS],
+            "candidates must be set by the {ANSWER_ROWS}-row answer, not by the \
+             collection: {candidates_by_size:?} at sizes {COLLECTION_SIZES:?}"
         );
 
-        // ---- miss: no declaration, so there is no index to seek ------------
-        let session = seeded_session("range_scan_note", false).await;
+        // ---- the refusal: no declaration means no index to seek ------------
+        let session = seeded_session("range_scan_note", false, COLLECTION_SIZES[0]).await;
         let _ = lix::storage_bench::take_hot_index_probe_census();
         let answered = ordinal_range_ids(&session, "range_scan_note", 2, 4).await;
         let miss = lix::storage_bench::take_hot_index_probe_census();
@@ -85,8 +102,8 @@ fn range_seek_engages_on_a_declared_column_and_refuses_on_an_undeclared_one() {
             vec!["n5".to_string(), "n6".to_string(), "n7".to_string()],
             "refusing to seek must not change the answer"
         );
-        // Exact zero is only safe because this is a dedicated process and the
-        // two arms are sequential.
+        // Exact zero is only defensible because this is a dedicated process
+        // and every arm above it ran sequentially.
         assert_eq!(
             miss.range_probes_engaged, 0,
             "an undeclared column has no index entries and must not seek; census={miss:?}"
@@ -119,7 +136,11 @@ async fn ordinal_range_ids(
         .collect()
 }
 
-async fn seeded_session(schema_key: &str, declare_unique: bool) -> SessionContext<Memory> {
+async fn seeded_session(
+    schema_key: &str,
+    declare_unique: bool,
+    rows: usize,
+) -> SessionContext<Memory> {
     let storage = Memory::default();
     Engine::initialize(storage.clone())
         .await
@@ -143,7 +164,10 @@ async fn seeded_session(schema_key: &str, declare_unique: bool) -> SessionContex
         .await
         .expect("register schema");
 
-    for (index, ordinal) in ORDINALS.iter().enumerate() {
+    // Ordinals start at -3 so the range spans zero and negatives, exercising
+    // the order-preserving sign flip rather than only the positive half.
+    for index in 0..rows {
+        let ordinal = index as i64 - 3;
         session
             .execute(
                 &format!("INSERT INTO {schema_key} (id, ordinal) VALUES ($1, {ordinal})"),
