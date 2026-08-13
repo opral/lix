@@ -12803,8 +12803,8 @@ mod tests {
                     .execute(
                         "UPDATE lix_file SET content = $1 WHERE id = $2",
                         &[
-                            crate::Value::Blob(b"byte-02".to_vec().into()),
-                            crate::Value::Text(id.clone()),
+                            Value::Blob(b"byte-02".to_vec().into()),
+                            Value::Text(id.clone()),
                         ],
                     )
                     .await
@@ -12899,8 +12899,8 @@ mod tests {
                     .execute(
                         "UPDATE lix_file SET content = $1 WHERE id = $2",
                         &[
-                            crate::Value::Blob(b"byte-02".to_vec().into()),
-                            crate::Value::Text(id.clone()),
+                            Value::Blob(b"byte-02".to_vec().into()),
+                            Value::Text(id.clone()),
                         ],
                     )
                     .await
