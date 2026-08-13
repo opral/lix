@@ -104,6 +104,7 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("hot_index_aging_probe", "cfg(test) measurement probe"),
     ("hot_row_tombstone_probe", "cfg(test) measurement probe"),
     ("init", "entry point; reaches everywhere by design"),
+    ("json_predicate_pushdown_probe", "cfg(test) measurement probe"),
     ("lib", "crate root"),
     ("module_layers", "this guard"),
     ("observe_coordinator", "not yet analysed"),
