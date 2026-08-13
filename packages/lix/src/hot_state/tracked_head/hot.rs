@@ -8158,7 +8158,15 @@ where
             let mut unresolved = Vec::new();
             let mut unresolved_slots = Vec::new();
             for (index, (delta, previous)) in sorted.iter().zip(&previous_values).enumerate() {
-                if delta.deleted || previous.is_some() || retired_predecessor[index] {
+                // The fence's key set must be preserved exactly: it always
+                // included retired-generation slots, and dropping them here
+                // would quietly weaken it. Only the *tracked* retired slots
+                // are excluded, and only because they must not inherit — they
+                // never reached the fence in the first place.
+                if delta.deleted
+                    || previous.is_some()
+                    || (!delta.untracked && retired_predecessor[index])
+                {
                     continue;
                 }
                 unresolved.push(TrackedStateKeyRef {
