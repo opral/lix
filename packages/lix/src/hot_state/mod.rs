@@ -73,6 +73,7 @@ pub(crate) use tracked_head::{
 #[allow(unused_imports)]
 pub(crate) use types::{
     DeclaredColumnEq,
+    DeclaredColumnRange,
     Bound, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter,
     HotStateProjection, HotStateRowFilter, HotStateRowIdentityRef, HotStateRowRequest,
     HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateBatchBuilder,

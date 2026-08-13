@@ -124,6 +124,13 @@ required-features = ["storage-benches"]
 name = "plugin_arena_scorecard"
 path = "tests/plugin_arena_scorecard.rs"
 
+# Its own process: `storage_bench` counters are process-global, and this target
+# asserts two *upper* bounds that a concurrent test could inflate into a
+# spurious failure.
+[[test]]
+name = "hot_index_range_probe"
+path = "tests/hot_index_range_probe.rs"
+
 [dependencies]
 
 [target.'cfg(any(not(target_arch = "wasm32"), all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]

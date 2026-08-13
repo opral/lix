@@ -873,21 +873,27 @@ where
         request: &HotStateScanRequest,
         scope: &HotStateScanScope,
     ) -> Result<Option<HotStateScanRequest>, LixError> {
-        let Some(predicate) = request.filter.declared_column_eq.as_ref() else {
+        if request.filter.declared_column_eq.is_none()
+            && request.filter.declared_column_range.is_none()
+        {
             return Ok(None);
-        };
-        if !request.filter.entity_pks.is_empty() {
-            let mut rewritten = request.clone();
-            rewritten.filter.declared_column_eq = None;
-            return Ok(Some(rewritten));
         }
         let mut rewritten = request.clone();
         rewritten.filter.declared_column_eq = None;
+        rewritten.filter.declared_column_range = None;
+        // An identity filter already names its rows, so no index can narrow it.
+        if !request.filter.entity_pks.is_empty() {
+            return Ok(Some(rewritten));
+        }
         // Every branch in scope must be witnessed. A branch whose index is
         // incomplete would contribute no candidates and silently drop its
         // rows, which is the false negative this design cannot have — so one
         // unwitnessed branch sends the whole read back to the scan.
         let mut unique = std::collections::BTreeSet::new();
+        // An equality probe is a point prefix per value and is strictly
+        // cheaper than walking an interval, so when a scan carries both the
+        // equality wins and the range stays a residual predicate.
+        if let Some(predicate) = request.filter.declared_column_eq.as_ref() {
         for branch_id in &scope.storage_branch_ids {
             let Some(control) = scope.branch_heads.get(branch_id).copied() else {
                 return Ok(Some(rewritten));
@@ -916,6 +922,40 @@ where
                 return Ok(Some(rewritten));
             };
             unique.extend(candidates);
+        }
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_hot_index_equality_probe_engaged();
+        } else if let Some(predicate) = request.filter.declared_column_range.as_ref() {
+            for branch_id in &scope.storage_branch_ids {
+                let Some(control) = scope.branch_heads.get(branch_id).copied() else {
+                    return Ok(Some(rewritten));
+                };
+                if !control.may_have_schema(&predicate.schema_key) {
+                    continue;
+                }
+                let Some(candidates) = self
+                    .tracked_head
+                    .reader(&self.store)
+                    .scan_hot_index_range_candidates(
+                        branch_id,
+                        control.tracked_generation,
+                        &predicate.schema_key,
+                        predicate.ordinal,
+                        predicate
+                            .lower
+                            .as_ref()
+                            .map(|(value, inclusive)| (value, *inclusive)),
+                        predicate
+                            .upper
+                            .as_ref()
+                            .map(|(value, inclusive)| (value, *inclusive)),
+                    )
+                    .await?
+                else {
+                    return Ok(Some(rewritten));
+                };
+                unique.extend(candidates);
+            }
         }
         if unique.is_empty() {
             rewritten.filter.rows = HotStateRowFilter::None;

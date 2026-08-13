@@ -294,6 +294,291 @@ simulation_test!(
     }
 );
 
+// The bound-exactness differential.
+//
+// `StoragePrefix::to_range` yields a half-open `[lo, hi)`, so an inclusive
+// upper bound is the one place a range access path silently loses rows: every
+// row equal to `hi` vanishes and the answer is still plausibly shaped. This
+// sweeps every `(lo, hi)` pair over a fixture that brackets the data on both
+// sides and compares against the set computed directly from the fixture, so a
+// bound error at either end fails here rather than in a benchmark.
+//
+// The ordinals deliberately span zero and negatives: the order-preserving
+// integer key encoding is `value ^ (1 << 63)`, and a naive encoder that skips
+// the sign flip orders every negative above every positive.
+simulation_test!(
+    entity_range_pushdown_matches_full_scan_at_every_bound,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        register_range_note_schema(&session).await;
+        let ordinals: Vec<i64> = vec![-3, -2, -1, 0, 1, 2, 3, 4, 5, 6];
+        for (index, ordinal) in ordinals.iter().enumerate() {
+            insert_range_note(&session, &format!("n{index}"), *ordinal).await;
+        }
+
+        for lower in -5_i64..=8 {
+            for upper in -5_i64..=8 {
+                let result = session
+                    .execute(
+                        &format!(
+                            "SELECT id FROM range_note \
+                             WHERE ordinal BETWEEN {lower} AND {upper} ORDER BY id"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("range query should succeed");
+                let expected = expected_range_note_ids(&ordinals, |ordinal| {
+                    ordinal >= lower && ordinal <= upper
+                });
+                assert_eq!(
+                    range_note_ids(&result),
+                    expected,
+                    "BETWEEN {lower} AND {upper} must return exactly the full-scan answer"
+                );
+            }
+        }
+    }
+);
+
+// The same differential for each half-bounded operator, in both operand
+// orders.
+//
+// `5 < ordinal` is `ordinal > 5`, so the literal-on-the-left spelling has to
+// reverse the comparison. Reusing the operator returns the complement of the
+// requested rows — an error that a one-sided test with the column always on
+// the left cannot see.
+simulation_test!(
+    entity_range_pushdown_matches_full_scan_for_each_operator,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        register_range_note_schema(&session).await;
+        let ordinals: Vec<i64> = vec![-3, -2, -1, 0, 1, 2, 3, 4, 5, 6];
+        for (index, ordinal) in ordinals.iter().enumerate() {
+            insert_range_note(&session, &format!("n{index}"), *ordinal).await;
+        }
+
+        for bound in -5_i64..=8 {
+            for (operator, reversed) in [("<", ">"), ("<=", ">="), (">", "<"), (">=", "<=")] {
+                let expected = expected_range_note_ids(&ordinals, |ordinal| match operator {
+                    "<" => ordinal < bound,
+                    "<=" => ordinal <= bound,
+                    ">" => ordinal > bound,
+                    _ => ordinal >= bound,
+                });
+
+                let column_first = session
+                    .execute(
+                        &format!(
+                            "SELECT id FROM range_note WHERE ordinal {operator} {bound} ORDER BY id"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("range query should succeed");
+                assert_eq!(
+                    range_note_ids(&column_first),
+                    expected,
+                    "ordinal {operator} {bound} must match the full-scan answer"
+                );
+
+                // The mirrored spelling of the identical predicate.
+                let literal_first = session
+                    .execute(
+                        &format!(
+                            "SELECT id FROM range_note WHERE {bound} {reversed} ordinal ORDER BY id"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("reversed range query should succeed");
+                assert_eq!(
+                    range_note_ids(&literal_first),
+                    expected,
+                    "{bound} {reversed} ordinal must match ordinal {operator} {bound}"
+                );
+            }
+        }
+    }
+);
+
+// Engagement, asserted at the plan.
+//
+// Before this change a range predicate was `Unsupported`: the provider never
+// saw it, so it could not reach row-group pruning or any index. `Exact` would
+// be wrong — the hot index returns a candidate superset and the open/closed
+// bound distinction is enforced by the residual — so the predicate must appear
+// as a *partial* filter, meaning pushed down **and** still re-checked above.
+simulation_test!(
+    entity_range_pushdown_reaches_the_table_scan_inexactly,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        register_range_note_schema(&session).await;
+
+        let explain = session
+            .execute(
+                "EXPLAIN VERBOSE SELECT id FROM range_note WHERE ordinal BETWEEN 2 AND 4",
+                &[],
+            )
+            .await
+            .expect("EXPLAIN should succeed");
+        let plan = explain_plan_text(&explain);
+
+        let partial = partial_filters_text(&plan)
+            .unwrap_or_else(|| panic!("range predicate should reach the scan:\n{plan}"));
+        assert!(
+            partial.contains("ordinal"),
+            "the ordinal range should be pushed to the scan, got partial_filters={partial}:\n{plan}"
+        );
+        assert!(
+            plan.contains("Filter:") || plan.contains("FilterExec"),
+            "an Inexact pushdown must retain a residual filter above the scan:\n{plan}"
+        );
+    }
+);
+
+// The rejection cases, asserted as hard as the acceptance cases.
+//
+// A `Number` column has no total order (NaN), and `Boolean`/`Json` have no
+// useful range, so none of them may become a pushed range. Over-claiming here
+// is a wrong answer rather than a slow one, which is why this is asserted
+// rather than left to the residual.
+simulation_test!(
+    entity_range_pushdown_refuses_columns_without_a_total_order,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        register_range_note_schema(&session).await;
+        insert_range_note(&session, "n0", 1).await;
+
+        for predicate in ["weight > 1.5", "weight BETWEEN 0.5 AND 2.5"] {
+            let explain = session
+                .execute(
+                    &format!("EXPLAIN VERBOSE SELECT id FROM range_note WHERE {predicate}"),
+                    &[],
+                )
+                .await
+                .expect("EXPLAIN should succeed");
+            let plan = explain_plan_text(&explain);
+            if let Some(partial) = partial_filters_text(&plan) {
+                assert!(
+                    !partial.contains("weight"),
+                    "a float column must not become a pushed range, got partial_filters={partial}:\n{plan}"
+                );
+            }
+        }
+
+        // Refusing to push it must not change the answer.
+        let result = session
+            .execute("SELECT id FROM range_note WHERE weight > 0.5 ORDER BY id", &[])
+            .await
+            .expect("float range query should still answer");
+        assert_eq!(range_note_ids(&result), vec!["n0".to_string()]);
+    }
+);
+
+async fn register_range_note_schema(
+    session: &crate::support::simulation_test::engine::SimSession,
+) {
+    // `ordinal` is declared unique so this one fixture also carries hot-index
+    // entries, letting the same differential cover the index range seek when
+    // that path lands. `weight` is the deliberate negative control: a float
+    // column that must never become a pushed range.
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"range_note\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-unique\":[[\"/ordinal\"]],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"ordinal\":{\"type\":\"integer\"},\"lane\":{\"type\":\"string\"},\"weight\":{\"type\":\"number\"}},\"required\":[\"id\",\"ordinal\",\"lane\",\"weight\"],\"additionalProperties\":false}'),\
+             false,\
+             false\
+             )",
+            &[],
+        )
+        .await
+        .expect("range_note schema should register");
+}
+
+async fn insert_range_note(
+    session: &crate::support::simulation_test::engine::SimSession,
+    id: &str,
+    ordinal: i64,
+) {
+    session
+        .execute(
+            &format!(
+                "INSERT INTO range_note (id, ordinal, lane, weight) \
+                 VALUES ('{id}', {ordinal}, 'lane-{}', 1.5)",
+                ordinal.rem_euclid(4)
+            ),
+            &[],
+        )
+        .await
+        .expect("range_note row should insert");
+}
+
+fn range_note_ids(result: &ExecuteResult) -> Vec<String> {
+    result
+        .rows()
+        .iter()
+        .filter_map(|row| match row.values().first() {
+            Some(Value::Text(value)) => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The answer computed straight from the fixture, ordered the way the query
+/// orders it. This is the "full scan" side of the differential.
+fn expected_range_note_ids(ordinals: &[i64], matches: impl Fn(i64) -> bool) -> Vec<String> {
+    let mut ids: Vec<String> = ordinals
+        .iter()
+        .enumerate()
+        .filter(|(_, ordinal)| matches(**ordinal))
+        .map(|(index, _)| format!("n{index}"))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The `partial_filters=[...]` list from an EXPLAIN, when the scan has one.
+fn partial_filters_text(plan: &str) -> Option<String> {
+    let start = plan.find("partial_filters=[")? + "partial_filters=[".len();
+    let rest = &plan[start..];
+    let end = rest.find(']')?;
+    Some(rest[..end].to_string())
+}
+
 async fn register_pushdown_note_schema(
     session: &crate::support::simulation_test::engine::SimSession,
 ) {

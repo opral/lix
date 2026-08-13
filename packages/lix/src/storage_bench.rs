@@ -769,6 +769,72 @@ pub fn take_tracked_key_allocation_census() -> TrackedKeyAllocationCensus {
     }
 }
 
+/// Hot-index probe routing, counted where the probe *decides*.
+///
+/// A probe that resolves candidates rewrites the request's `entity_pks`, which
+/// sends `hot_scan_entries` down its point-batch arm instead of the
+/// full-prefix fallback. Counting the decision here rather than the rows the
+/// scan returns is what distinguishes a seek from a walk: a count taken at the
+/// layer that returns the answer reads identically under both.
+///
+/// The refusal counters exist because a probe that silently declines is
+/// indistinguishable from one that never ran, and "the seek engaged" is
+/// otherwise unfalsifiable. Attribution is the **fallback going to zero**, not
+/// an engaged counter going positive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotIndexProbeCensus {
+    /// Equality/IN probes that resolved a candidate set.
+    pub equality_probes_engaged: u64,
+    /// Range probes that resolved a candidate set.
+    pub range_probes_engaged: u64,
+    /// Candidates resolved by range probes, before the residual re-check.
+    pub range_probe_candidates: u64,
+    /// Probes that fell back because a branch in scope carried no witness.
+    pub probes_refused_unwitnessed: u64,
+    /// Probes that fell back because the candidate set exceeded its budget.
+    pub probes_refused_over_budget: u64,
+}
+
+static HOT_INDEX_EQUALITY_PROBES_ENGAGED: AtomicU64 = AtomicU64::new(0);
+static HOT_INDEX_RANGE_PROBES_ENGAGED: AtomicU64 = AtomicU64::new(0);
+static HOT_INDEX_RANGE_PROBE_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static HOT_INDEX_PROBES_REFUSED_UNWITNESSED: AtomicU64 = AtomicU64::new(0);
+static HOT_INDEX_PROBES_REFUSED_OVER_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_hot_index_equality_probe_engaged() {
+    HOT_INDEX_EQUALITY_PROBES_ENGAGED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_index_range_probe_engaged(candidates: usize) {
+    HOT_INDEX_RANGE_PROBES_ENGAGED.fetch_add(1, Ordering::Relaxed);
+    HOT_INDEX_RANGE_PROBE_CANDIDATES.fetch_add(candidates as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_index_probe_refused_unwitnessed() {
+    HOT_INDEX_PROBES_REFUSED_UNWITNESSED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_index_probe_refused_over_budget() {
+    HOT_INDEX_PROBES_REFUSED_OVER_BUDGET.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Drains the hot-index probe census.
+///
+/// These counters are process-global and the suite runs tests in parallel, so
+/// assertions against them must be thresholds scaled to the caller's own
+/// fixture, never exact values.
+pub fn take_hot_index_probe_census() -> HotIndexProbeCensus {
+    HotIndexProbeCensus {
+        equality_probes_engaged: HOT_INDEX_EQUALITY_PROBES_ENGAGED.swap(0, Ordering::Relaxed),
+        range_probes_engaged: HOT_INDEX_RANGE_PROBES_ENGAGED.swap(0, Ordering::Relaxed),
+        range_probe_candidates: HOT_INDEX_RANGE_PROBE_CANDIDATES.swap(0, Ordering::Relaxed),
+        probes_refused_unwitnessed: HOT_INDEX_PROBES_REFUSED_UNWITNESSED
+            .swap(0, Ordering::Relaxed),
+        probes_refused_over_budget: HOT_INDEX_PROBES_REFUSED_OVER_BUDGET
+            .swap(0, Ordering::Relaxed),
+    }
+}
+
 pub(crate) fn record_entity_point_snapshot_cache_hit() {
     ENTITY_POINT_SNAPSHOT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
 }
