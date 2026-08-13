@@ -16,7 +16,10 @@
 //!   count and the answer size pinned, by committing edits to a file the query
 //!   never asks about. Growth here is a real `O(commits traversed)` term. Its
 //!   `depth0` lane asks for a single row via `lixcol_depth = 0`, so any growth
-//!   there is work that a depth bound failed to prune.
+//!   there is work that a depth bound failed to prune. Its `null_control_kv`
+//!   lane reads a *different* history surface over the same commit graph, so it
+//!   cannot execute any `lix_file_history` routing change: whatever spread that
+//!   lane shows between two arms is the harness's noise floor.
 //!
 //! Both are `#[ignore]`d; run them by name with `--release`. Every knob is an
 //! environment variable so a curve can be widened without editing this file.
@@ -297,19 +300,39 @@ async fn history_commits_at_fixed_files() {
         let by_path_depth0 = "SELECT lixcol_depth FROM lix_file_history($1) \
                               WHERE path = $2 AND lixcol_depth = 0"
             .to_string();
+        // Null control. This walks the same commit graph over the same fixture
+        // through the same `load_history_entries` traversal and the same
+        // touched-scope digest, but it is a different history surface, so it
+        // cannot reach `lix_file_history`'s descriptor/blob route at all. Any
+        // arm-to-arm movement it shows is this harness's noise floor: a
+        // `lix_file_history` delta smaller than it is unresolvable.
+        let null_control_kv = "SELECT lixcol_depth FROM lix_key_value_history($1) \
+                               ORDER BY lixcol_depth DESC"
+            .to_string();
 
-        for (label, sql, arg) in [
-            ("by_path", &by_path, probe_path.clone()),
-            ("by_id", &by_id, file_id.clone()),
-            ("by_path_depth0", &by_path_depth0, noise_path.clone()),
+        for (label, sql, params) in [
+            (
+                "by_path",
+                &by_path,
+                vec![Value::Text(head.clone()), Value::Text(probe_path.clone())],
+            ),
+            (
+                "by_id",
+                &by_id,
+                vec![Value::Text(head.clone()), Value::Text(file_id.clone())],
+            ),
+            (
+                "by_path_depth0",
+                &by_path_depth0,
+                vec![Value::Text(head.clone()), Value::Text(noise_path.clone())],
+            ),
+            (
+                "null_control_kv",
+                &null_control_kv,
+                vec![Value::Text(head.clone())],
+            ),
         ] {
-            let (d, rows) = timed(
-                &lix,
-                sql,
-                &[Value::Text(head.clone()), Value::Text(arg)],
-                samples,
-            )
-            .await;
+            let (d, rows) = timed(&lix, sql, &params, samples).await;
             emit(
                 &format!(
                     "fixed_files {label} files={files} noise_commits={noise_commits} rows={rows}"
