@@ -491,3 +491,8 @@ required-features = ["sdk-tests", "storage-benches", "slatedb"]
 name = "e16_write_file_scaling"
 path = "examples/e16_write_file_scaling.rs"
 required-features = ["sdk-tests", "storage-benches", "slatedb"]
+
+[[example]]
+name = "expsnd_three_path"
+path = "examples/expsnd_three_path.rs"
+required-features = ["storage-benches"]
