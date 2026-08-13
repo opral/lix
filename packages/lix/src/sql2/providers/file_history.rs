@@ -1075,6 +1075,35 @@ where
     Ok(Some(FileHistoryLookupIds(file_ids)))
 }
 
+// Engagement counters for the descriptor-only context load.
+//
+// Thread-local, not process-global: `cargo test` runs many tests concurrently
+// in one binary and a global counter reports every other test's history reads
+// too, which makes an exact assertion pass in isolation and fail in a full run.
+// `#[tokio::test]` drives its future on the calling thread, so a test observes
+// exactly its own loads. The same reasoning is written out at
+// `filesystem::path_index`'s rebuild counters.
+#[cfg(test)]
+thread_local! {
+    static CONTEXT_DESCRIPTOR_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CONTEXT_DESCRIPTOR_REUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_file_history_context_census() {
+    CONTEXT_DESCRIPTOR_LOADS.with(|loads| loads.set(0));
+    CONTEXT_DESCRIPTOR_REUSES.with(|reuses| reuses.set(0));
+}
+
+/// `(separate descriptor-only anchor loads, reuses of the event descriptors)`.
+#[cfg(test)]
+pub(crate) fn file_history_context_census() -> (usize, usize) {
+    (
+        CONTEXT_DESCRIPTOR_LOADS.with(std::cell::Cell::get),
+        CONTEXT_DESCRIPTOR_REUSES.with(std::cell::Cell::get),
+    )
+}
+
 async fn load_file_history_filesystem_context<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
@@ -1104,8 +1133,12 @@ where
     // `lix_file_descriptor` alone to a family every content commit touches --
     // so the anchor walk could not prune the commits it was about to discard.
     let descriptors = if event_route == context_route {
+        #[cfg(test)]
+        CONTEXT_DESCRIPTOR_REUSES.with(|reuses| reuses.set(reuses.get() + 1));
         event_descriptors.clone()
     } else {
+        #[cfg(test)]
+        CONTEXT_DESCRIPTOR_LOADS.with(|loads| loads.set(loads.get() + 1));
         let context_entries = load_file_history_descriptor_entries(
             commit_graph,
             query_source,

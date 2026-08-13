@@ -1191,3 +1191,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) use file_history::{file_history_context_census, reset_file_history_context_census};
