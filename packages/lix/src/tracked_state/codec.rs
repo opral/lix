@@ -541,6 +541,25 @@ pub(crate) fn encode_schema_file_prefix(schema_key: &str, file_id: Option<&str>)
 
 pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
     let key = decode_key_borrowed(bytes)?;
+    #[cfg(feature = "storage-benches")]
+    {
+        // Counted here, inside the owned decode, because the whole question is
+        // how much `into_owned()` adds over the borrowed decode that already
+        // ran. A count taken at either caller cannot separate the two.
+        let mut owned_bytes = 0usize;
+        let mut escaped = 0u32;
+        if matches!(key.schema_key, Cow::Owned(_)) {
+            escaped += 1;
+        }
+        owned_bytes += key.schema_key.len();
+        if let Some(file_id) = key.file_id.as_ref() {
+            if matches!(file_id, Cow::Owned(_)) {
+                escaped += 1;
+            }
+            owned_bytes += file_id.len();
+        }
+        crate::storage_bench::record_key_decode_owned(bytes.len(), owned_bytes, escaped);
+    }
     Ok(TrackedStateKey {
         schema_key: key.schema_key.into_owned(),
         file_id: key.file_id.map(Cow::into_owned),

@@ -1128,3 +1128,117 @@ async fn retention_fence_durability_across_supported_operations() {
         drop(session);
     }
 }
+
+/// PHASE 8 — the allocation census, and the decision point for whether the
+/// per-row identity work on the payload fetch is worth removing.
+///
+/// The retained profile that motivated this attributed ~6.6% of a rotated
+/// collection scan to `load_commit_delta_entry_at_index` and ~6.7% to
+/// `codec::decode_key`. That profile was recorded at `49a4bf45a`, which is
+/// **before** the root-base serving cache landed. The cache changes the
+/// question from "what does one read cost" to "how many reads pay it at all",
+/// and no percentage from that profile can answer the second question.
+///
+/// So this counts, per scan, at the sites themselves:
+///
+/// - `rows` — `load_commit_delta_entry_at_index` calls, the per-row payload fetch.
+/// - `decodes` / `dec_in_b` — `codec::decode_key` calls and the encoded bytes
+///   they consumed, all callers.
+/// - `own_b` / `esc` — the bytes `into_owned()` copies over what
+///   `decode_key_borrowed` already produced, and how many of those strings were
+///   escaped and so allocate regardless. `own_b` is the ceiling on what a
+///   borrow-based fix at that site can remove; it is not the cost of the decode.
+/// - `acct_b` — the per-row `account_id.to_string()`.
+/// - `enc` / `enc_b` — per-row `encode_key_ref` reaching the binary search.
+/// - `clones` / `clone_b` — the deep key clone `load_commit_delta_change_records`
+///   makes to build its request vector.
+/// - `matkey` / `matkey_b` — owned `TrackedStateKey` values
+///   `materialize_index_payloads` builds from keys it already holds borrowed.
+/// - `reverify` — rows reaching the post-fetch identity re-check.
+/// - `hit` / `miss` — root-base serving cache, and `dur`/`exa`/`rep` the
+///   `scan_batch_at_commit` arm, so a zero census is never ambiguous between
+///   "no allocation" and "the lane never ran".
+///
+/// `cold` is the first read of the rotated generation; `warm` aggregates the
+/// next `reps` reads. Per-scan numbers are `warm / reps`.
+#[cfg(feature = "storage-benches")]
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn rotated_generation_key_allocation_census() {
+    let sizes = sizes_from_env("LIX_TOMBSTONE_SIZES", &[100, 1_000, 10_000]);
+    let reps = reps_from_env(5);
+    println!(
+        "phase8 | arm,n,phase,scans,rows,decodes,dec_in_b,own_b,esc,acct_b,enc,enc_b,\
+clones,clone_b,matkey,matkey_b,reverify,hit,miss,dur,exa,rep,us"
+    );
+    for n in sizes {
+        for rotate in [false, true] {
+            let (_storage, session) = open_session().await;
+            register(&session, probe_schema("censusrow")).await;
+            insert_rows(&session, "censusrow", n).await;
+            if rotate {
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e52-census".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id.clone(),
+                    })
+                    .await
+                    .expect("branch should switch");
+            }
+            let scan = scan_sql("censusrow");
+            let arm = if rotate { "rot" } else { "main" };
+
+            // Discard everything setup recorded, so the cold line is the cold
+            // read and nothing else.
+            let _ = crate::storage_bench::take_tracked_key_allocation_census();
+            let _ = crate::storage_bench::take_root_base_batch_cache_accounting();
+            let _ = crate::storage_bench::take_tracked_scan_branch_accounting();
+
+            let started = Instant::now();
+            let rows = session.execute(&scan, &[]).await.expect("cold scan");
+            let cold_us = started.elapsed().as_micros();
+            assert_eq!(rows.len(), 1, "the cold scan must answer exactly one row");
+            print_census_line(arm, n, "cold", 1, cold_us);
+
+            let started = Instant::now();
+            for _ in 0..reps {
+                let rows = session.execute(&scan, &[]).await.expect("warm scan");
+                assert_eq!(rows.len(), 1, "the warm scan must answer exactly one row");
+            }
+            let warm_us = started.elapsed().as_micros();
+            print_census_line(arm, n, "warm", reps, warm_us);
+        }
+    }
+}
+
+/// Drains every census counter and prints one CSV line. Draining is what makes
+/// the next phase's line attributable to that phase alone.
+#[cfg(feature = "storage-benches")]
+fn print_census_line(arm: &str, n: usize, phase: &str, scans: usize, us: u128) {
+    let c = crate::storage_bench::take_tracked_key_allocation_census();
+    let (hit, miss) = crate::storage_bench::take_root_base_batch_cache_accounting();
+    let (dur, exa, rep) = crate::storage_bench::take_tracked_scan_branch_accounting();
+    println!(
+        "{arm},{n},{phase},{scans},{},{},{},{},{},{},{},{},{},{},{},{},{},{hit},{miss},{dur},{exa},{rep},{us}",
+        c.commit_delta_rows_loaded,
+        c.key_decode_calls,
+        c.key_decode_input_bytes,
+        c.key_decode_owned_string_bytes,
+        c.key_decode_escaped_strings,
+        c.commit_delta_account_id_bytes,
+        c.commit_delta_point_key_encodes,
+        c.commit_delta_point_key_encode_bytes,
+        c.commit_delta_request_key_clones,
+        c.commit_delta_request_key_clone_bytes,
+        c.materialize_owned_key_builds,
+        c.materialize_owned_key_bytes,
+        c.materialize_reverify_rows,
+    );
+}

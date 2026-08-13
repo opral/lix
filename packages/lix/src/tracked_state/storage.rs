@@ -7734,6 +7734,11 @@ async fn load_columnar_owned_entries(
                 .checked_add(1)
                 .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
             let change_id = change_id_from_packed_address(commit_id, packed);
+            // The columnar route establishes identity by JSON text match, not
+            // by the byte-equality assert the packed route uses. Counted here
+            // so a test can prove which of the two served a row.
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_commit_delta_columnar_row();
             output[output_index] = Some(LoadedCommitDeltaEntry {
                 value: TrackedStateIndexValue {
                     change_id,
@@ -7769,6 +7774,12 @@ pub(crate) async fn load_commit_delta_change_records(
     commit_id: CommitId,
     keys: &[TrackedStateKey],
 ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
+    #[cfg(feature = "storage-benches")]
+    for key in keys {
+        crate::storage_bench::record_commit_delta_request_key_clone(
+            key.schema_key.len() + key.file_id.as_ref().map_or(0, String::len),
+        );
+    }
     let requests = keys
         .iter()
         .cloned()
@@ -12395,6 +12406,11 @@ fn find_loaded_commit_delta_entry<S>(
 where
     S: AsRef<[u8]>,
 {
+    // One encoded key reaches the search per point request, so counting it
+    // here counts the caller's per-row `encode_key_ref` without instrumenting
+    // eleven separate call sites.
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_point_key_encode(target_key.len());
     let Some(index) = find_commit_delta_entry_index(leaf, target_key)? else {
         return Ok(None);
     };
@@ -12431,6 +12447,11 @@ where
         ));
     }
     let payload = payloads.decode(index)?;
+    // Inside the payload fetch, not above it: this is the row-granular site the
+    // profile attributed the cost to, and it is the one that re-proves an
+    // identity `find_commit_delta_entry_index` already asserted byte-equal.
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_row_loaded(account_id.len());
     let key = decode_key(entry.key)?;
     let (snapshot, metadata, origin_key, base_coordinate, selected_ref) = match payload {
         CommitDeltaPayload::Authored(payload) => (
