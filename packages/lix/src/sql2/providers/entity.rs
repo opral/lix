@@ -1902,7 +1902,7 @@ fn declared_column_eq(
 fn declared_column_range(
     spec: &EntitySurfaceSpec,
     row_filters: &[EntityRowFilter],
-) -> Option<crate::hot_state::DeclaredColumnRange> {
+) -> Option<Box<crate::hot_state::DeclaredColumnRange>> {
     let mut bounds = Vec::new();
     for filter in row_filters {
         collect_conjunctive_ranges(filter, &mut bounds);
@@ -1929,12 +1929,12 @@ fn declared_column_range(
             }
         }
         if lower.is_some() || upper.is_some() {
-            return Some(crate::hot_state::DeclaredColumnRange {
+            return Some(Box::new(crate::hot_state::DeclaredColumnRange {
                 schema_key: spec.schema_key.clone(),
                 ordinal: indexed.ordinal,
                 lower,
                 upper,
-            });
+            }));
         }
     }
     None

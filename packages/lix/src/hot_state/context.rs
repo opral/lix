@@ -923,6 +923,7 @@ where
             };
             unique.extend(candidates);
         }
+            #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_hot_index_equality_probe_engaged();
         } else if let Some(predicate) = request.filter.declared_column_range.as_ref() {
             for branch_id in &scope.storage_branch_ids {

@@ -5492,10 +5492,12 @@ where
         let Some(StorageProjectedValue::FullValue(witness_value)) =
             present.value.into_iter().next().flatten()
         else {
+            #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_hot_index_probe_refused_unwitnessed();
             return Ok(None);
         };
         let Some(entries_published) = decode_hot_index_witness(&witness_value) else {
+            #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_hot_index_probe_refused_unwitnessed();
             return Ok(None);
         };
@@ -5569,6 +5571,7 @@ where
                 })?);
             }
             if candidates.len() > budget {
+                #[cfg(feature = "storage-benches")]
                 crate::storage_bench::record_hot_index_probe_refused_over_budget();
                 return Ok(None);
             }
@@ -5576,6 +5579,7 @@ where
                 break;
             }
         }
+        #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_hot_index_range_probe_engaged(candidates.len());
         Ok(Some(candidates))
     }

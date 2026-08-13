@@ -1300,8 +1300,16 @@ pub(crate) struct HotStateFilter {
     pub(crate) declared_column_eq: Option<DeclaredColumnEq>,
     /// A range on an indexed column, resolved the same way and under the same
     /// candidate-superset contract as [`Self::declared_column_eq`].
+    ///
+    /// **Boxed deliberately.** This filter is carried inside
+    /// `HotStateScanRequest`, which is cloned through deep async chains, and an
+    /// async state machine sizes its frames from the types it holds. Inline,
+    /// this variant added ~100 bytes to every such frame and overflowed
+    /// libtest's 2 MiB worker stack in `cas_gc_history_retention` — a test with
+    /// no logical connection to range predicates, which aborted rather than
+    /// failed. Boxing keeps the growth to one pointer. Do not unbox it.
     #[serde(default)]
-    pub(crate) declared_column_range: Option<DeclaredColumnRange>,
+    pub(crate) declared_column_range: Option<Box<DeclaredColumnRange>>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
 }
