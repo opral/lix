@@ -3982,3 +3982,54 @@ pub fn take_hot_blob_ref_scan_accounting() -> (u64, u64, u64, u64, u64, u64) {
         HOT_BLOB_REF_SCAN_ENTRIES_MATCHED.swap(0, Ordering::Relaxed),
     )
 }
+
+static FILE_LIVE_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_POINT_BATCH: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_FILE_PREFIX: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_ENTRIES_DECODED: AtomicU64 = AtomicU64::new(0);
+static FILE_LIVE_SCAN_ENTRIES_MATCHED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_file_live_scan_call() {
+    FILE_LIVE_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_file_live_scan_point_batch() {
+    FILE_LIVE_SCAN_POINT_BATCH.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_file_live_scan_file_prefix() {
+    FILE_LIVE_SCAN_FILE_PREFIX.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_file_live_scan_fallback() {
+    FILE_LIVE_SCAN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_file_live_scan_entry(matched: bool) {
+    FILE_LIVE_SCAN_ENTRIES_DECODED.fetch_add(1, Ordering::Relaxed);
+    if matched {
+        FILE_LIVE_SCAN_ENTRIES_MATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Accounting for the two-schema `scan_lix_file_live_batch` read that every
+/// `lix_file ... RETURNING` statement issues:
+/// `(calls, point_batch, file_prefix, fallback, entries_decoded, entries_matched)`.
+///
+/// The engagement gate is the request's schema-key pair, which is identical in
+/// both arms, so a zero reads as "this route did not run" and never as "the
+/// counter did not run". Entries are counted at BOTH per-entry decode loops --
+/// the wide arm's in `hot_scan_entries` and the prefix arm's in
+/// `scan_hot_file_entries` -- because counting only the wide arm would make a
+/// seek indistinguishable from a census that never fired.
+pub fn take_file_live_scan_accounting() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        FILE_LIVE_SCAN_CALLS.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_POINT_BATCH.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_FILE_PREFIX.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_FALLBACK.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_ENTRIES_DECODED.swap(0, Ordering::Relaxed),
+        FILE_LIVE_SCAN_ENTRIES_MATCHED.swap(0, Ordering::Relaxed),
+    )
+}

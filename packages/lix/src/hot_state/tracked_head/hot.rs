@@ -11651,6 +11651,22 @@ async fn hot_scan_entries<'a>(
     let is_blob_ref_probe = filter.schema_keys.len() == 1
         && filter.schema_keys[0] == "lix_binary_blob_ref"
         && !filter.entity_pks.is_empty();
+    // Site A: the `scan_lix_file_live_batch` request shape. Keyed on the schema
+    // pair alone so the gate is arm-invariant.
+    #[cfg(feature = "storage-benches")]
+    let is_file_live_batch = filter.schema_keys.len() == 2
+        && filter
+            .schema_keys
+            .iter()
+            .any(|key| key == "lix_file_descriptor")
+        && filter
+            .schema_keys
+            .iter()
+            .any(|key| key == "lix_binary_blob_ref");
+    #[cfg(feature = "storage-benches")]
+    if is_file_live_batch {
+        crate::storage_bench::record_file_live_scan_call();
+    }
     #[cfg(feature = "storage-benches")]
     if is_blob_ref_probe {
         crate::storage_bench::record_hot_blob_ref_scan_call();
@@ -11664,6 +11680,10 @@ async fn hot_scan_entries<'a>(
             #[cfg(feature = "storage-benches")]
             if is_blob_ref_probe {
                 crate::storage_bench::record_hot_blob_ref_scan_point_batch();
+            }
+            #[cfg(feature = "storage-benches")]
+            if is_file_live_batch {
+                crate::storage_bench::record_file_live_scan_point_batch();
             }
             let entries = HotScanEntries::Finite(
                 hot_scan_finite_identity_batches(store, identities, limit).await?,
@@ -11680,6 +11700,10 @@ async fn hot_scan_entries<'a>(
         if is_blob_ref_probe {
             crate::storage_bench::record_hot_blob_ref_scan_file_prefix();
         }
+        #[cfg(feature = "storage-benches")]
+        if is_file_live_batch {
+            crate::storage_bench::record_file_live_scan_file_prefix();
+        }
         let entries = HotScanEntries::Decoded(
             scan_hot_file_entries(store, branch_id, generation, prefixes, filter, limit).await?,
         );
@@ -11689,6 +11713,10 @@ async fn hot_scan_entries<'a>(
     #[cfg(feature = "storage-benches")]
     if is_blob_ref_probe {
         crate::storage_bench::record_hot_blob_ref_scan_fallback();
+    }
+    #[cfg(feature = "storage-benches")]
+    if is_file_live_batch {
+        crate::storage_bench::record_file_live_scan_fallback();
     }
     let scope = hot_scope_prefix(branch_id, generation);
     let mut prefixes = hot_row_scan_prefixes(&scope, filter);
@@ -11730,6 +11758,12 @@ async fn hot_scan_entries<'a>(
                 #[cfg(feature = "storage-benches")]
                 if is_blob_ref_probe {
                     crate::storage_bench::record_hot_blob_ref_scan_entry(
+                        identity.matches_filter(filter),
+                    );
+                }
+                #[cfg(feature = "storage-benches")]
+                if is_file_live_batch {
+                    crate::storage_bench::record_file_live_scan_entry(
                         identity.matches_filter(filter),
                     );
                 }
@@ -12012,6 +12046,21 @@ async fn scan_hot_file_entries(
                 .await?.into_parts();
             for entry in page {
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                #[cfg(feature = "storage-benches")]
+                if filter.schema_keys.len() == 2
+                    && filter
+                        .schema_keys
+                        .iter()
+                        .any(|key| key == "lix_file_descriptor")
+                    && filter
+                        .schema_keys
+                        .iter()
+                        .any(|key| key == "lix_binary_blob_ref")
+                {
+                    crate::storage_bench::record_file_live_scan_entry(
+                        identity.matches_filter(filter),
+                    );
+                }
                 if identity.matches_filter(filter) {
                     rows.push((identity, full_value_bytes(entry.value)?));
                 }
