@@ -8242,8 +8242,24 @@ mod tests {
     #[tokio::test]
     async fn bound_file_content_update_fast_path_rejects_broader_shapes() {
         let (mut ctx, _, _) = counting_write_context(Vec::new());
+        // `id` and `path` are both single-descriptor equality selectors and both
+        // take the fast content-update route.
         for sql in [
+            "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE path = '/readme.md'",
+        ] {
+            let plan = create_write_logical_plan(&mut ctx, sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql} should plan: {error}"));
+            let crate::sql2::exec::SqlLogicalPlan::Write(plan) = plan else {
+                panic!("{sql} should produce a write plan");
+            };
+            assert!(
+                crate::sql2::exec::bound_public_write::supports_bound_public_write(&plan.plan),
+                "single-descriptor equality selector should take the fast path: {sql}"
+            );
+        }
+        for sql in [
             "UPDATE lix_file SET content = CAST('A' AS BYTEA), name = 'renamed.md' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             "UPDATE lix_file SET content = content WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             "UPDATE lix_file_by_branch SET content = CAST('A' AS BYTEA) WHERE id = '01920000-0000-7000-8000-0000000000d2' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'",

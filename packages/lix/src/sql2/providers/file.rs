@@ -3216,6 +3216,18 @@ async fn load_exact_existing_materializations(
     Ok(materializations)
 }
 
+/// Which column an `UPDATE lix_file SET content = ...` predicate selected the
+/// target descriptor by.
+///
+/// Both variants resolve through the same single path-index request; `Path`
+/// exists so the by-path predicate — the form the JS SDK and CLI emit — reaches
+/// this update route instead of falling through to DataFusion. Neither variant
+/// can create a descriptor: an unmatched selector affects zero rows.
+pub(crate) enum FastLixFileContentUpdateSelector {
+    Id(String),
+    Path(String),
+}
+
 pub(crate) async fn execute_fast_lix_file_content_update_by_id(
     ctx: &mut dyn SqlWriteExecutionContext,
     file_id: Option<String>,
@@ -3223,9 +3235,9 @@ pub(crate) async fn execute_fast_lix_file_content_update_by_id(
     splice_provenance: Option<RequestBlobSpliceProvenance>,
     mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
-    execute_fast_lix_file_content_update_by_id_impl(
+    execute_fast_lix_file_content_update_impl(
         ctx,
-        file_id,
+        file_id.map(FastLixFileContentUpdateSelector::Id),
         data,
         None,
         splice_provenance,
@@ -3242,9 +3254,9 @@ pub(crate) async fn execute_fast_lix_file_content_update_by_id_with_metadata(
     splice_provenance: Option<RequestBlobSpliceProvenance>,
     mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
-    execute_fast_lix_file_content_update_by_id_impl(
+    execute_fast_lix_file_content_update_impl(
         ctx,
-        file_id,
+        file_id.map(FastLixFileContentUpdateSelector::Id),
         data,
         Some(metadata),
         splice_provenance,
@@ -3253,9 +3265,53 @@ pub(crate) async fn execute_fast_lix_file_content_update_by_id_with_metadata(
     .await
 }
 
-async fn execute_fast_lix_file_content_update_by_id_impl(
+pub(crate) async fn execute_fast_lix_file_content_update_by_path(
     ctx: &mut dyn SqlWriteExecutionContext,
-    file_id: Option<String>,
+    path: Option<String>,
+    data: crate::Blob,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
+    mutation_identity: Option<MutationIdentity>,
+) -> Result<u64, LixError> {
+    execute_fast_lix_file_content_update(
+        ctx,
+        path.map(FastLixFileContentUpdateSelector::Path),
+        data,
+        None,
+        splice_provenance,
+        mutation_identity,
+    )
+    .await
+}
+
+/// Single entry point for the bound-public-write dispatcher.
+///
+/// The dispatcher awaits this one future rather than one of four
+/// selector/metadata permutations. The async future-size budget on this
+/// engine's write path is tight enough that the extra inlined state machines
+/// are themselves a regression -- see
+/// `slatedb_history_blob_survives_until_final_root_release`.
+pub(crate) async fn execute_fast_lix_file_content_update(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    selector: Option<FastLixFileContentUpdateSelector>,
+    data: crate::Blob,
+    metadata_update: Option<Option<TransactionJson>>,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
+    mutation_identity: Option<MutationIdentity>,
+) -> Result<u64, LixError> {
+    execute_fast_lix_file_content_update_impl(
+        ctx,
+        selector,
+        data,
+        metadata_update,
+        splice_provenance,
+        mutation_identity,
+    )
+    .await
+}
+
+async fn execute_fast_lix_file_content_update_impl(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    selector: Option<FastLixFileContentUpdateSelector>,
     data: crate::Blob,
     metadata_update: Option<Option<TransactionJson>>,
     splice_provenance: Option<RequestBlobSpliceProvenance>,
@@ -3271,25 +3327,56 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
                 "active branch",
             )
         })?;
-    let Some(file_id) = file_id else {
+    let Some(selector) = selector else {
         return Ok(0);
     };
     // The revisioned path index contains every visible descriptor together with
     // its already-derived path. Reuse it instead of scanning every directory
-    // descriptor just to reconstruct this one file's path.
+    // descriptor just to reconstruct this one file's path. A by-path selector
+    // resolves its descriptor out of this same index rather than issuing a
+    // second lookup, so both selectors cost exactly one path-index request.
     let index = ctx
         .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
             active_branch_id.clone(),
         ]))
         .await?;
-    let target_file_ids = BTreeSet::from([file_id.clone()]);
-    let indexed_matches = indexed_file_id_matches(index, &target_file_ids, &FilePathPredicate::All);
+    let (indexed_matches, target_file_ids) = match &selector {
+        FastLixFileContentUpdateSelector::Id(file_id) => {
+            let target_file_ids = BTreeSet::from([file_id.clone()]);
+            let matches =
+                indexed_file_id_matches(index, &target_file_ids, &FilePathPredicate::All);
+            // Deliberately no early return here: the by-id sequence still
+            // probes blob state for an id that matched no descriptor, because
+            // that probe is what validates orphaned blob refs.
+            (matches, target_file_ids)
+        }
+        FastLixFileContentUpdateSelector::Path(path) => {
+            let matches = indexed_file_matches(
+                index,
+                &FilePathPredicate::In(BTreeSet::from([path.clone()])),
+            );
+            // An UPDATE never creates a row. A path that resolves to no visible
+            // descriptor affects zero rows and stages nothing -- and there is
+            // no file id to probe blob state with.
+            if matches.is_empty() {
+                return Ok(0);
+            }
+            let target_file_ids = matches
+                .entries()
+                .map(|entry| entry.id().to_string())
+                .collect::<BTreeSet<_>>();
+            (matches, target_file_ids)
+        }
+    };
 
     // Blob references are not part of the descriptor index and can change
     // without a path-index revision.
     let mut blob_request = lix_file_scan_request(Some(&active_branch_id), None, None);
     blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
-    blob_request.filter.entity_pks = vec![file_id_entity_pk(&file_id)?];
+    blob_request.filter.entity_pks = target_file_ids
+        .iter()
+        .map(|file_id| file_id_entity_pk(file_id))
+        .collect::<Result<Vec<_>, _>>()?;
     let rows = ctx.scan_hot_state_batch(&blob_request).await?;
 
     let prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;
@@ -3303,7 +3390,7 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
     } = prepared;
     let existing = file_rows
         .into_iter()
-        .filter(|(_, file)| file.id == file_id)
+        .filter(|(_, file)| target_file_ids.contains(&file.id))
         .map(|(key, file)| {
             let blob_ref_key = file.blob_ref_key(&live_rows);
             let path = file_paths
@@ -11678,6 +11765,92 @@ mod tests {
                 operation_proof: [17; 32],
             })
         );
+    }
+
+    /// The by-path selector must resolve out of the *same* path-index request
+    /// the by-id selector already makes. A second lookup would hand back a
+    /// meaningful part of the win, so the count is asserted, not assumed.
+    #[tokio::test]
+    async fn fast_file_content_update_by_path_issues_one_path_index_request() {
+        let path_index_requests = Arc::new(AtomicUsize::new(0));
+        let scan_requests = Arc::new(Mutex::new(Vec::new()));
+        let index = Arc::new(
+            path_index_from_rows(vec![
+                live_directory_row(
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
+                ),
+                live_file_row(
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"readme.md"}"#,
+                ),
+            ])
+            .expect("filesystem path index should build"),
+        );
+        let old_data = b"old";
+        let mut write_context = IndexedFileContentUpdateWriteContext {
+            index,
+            blob_rows: vec![live_blob_ref_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000d2",
+                &BlobId::from_content(old_data).to_hex(),
+                old_data.len(),
+            )],
+            writes: Vec::new(),
+            scan_requests: Arc::clone(&scan_requests),
+            path_index_requests: Arc::clone(&path_index_requests),
+        };
+
+        let count = super::execute_fast_lix_file_content_update_by_path(
+            &mut write_context,
+            Some("/docs/readme.md".to_string()),
+            b"new".to_vec().into(),
+            None,
+            None,
+        )
+        .await
+        .expect("fast by-path data update should stage");
+
+        assert_eq!(count, 1);
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
+        {
+            let requests = scan_requests.lock().expect("scan request mutex");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].filter.entity_pks,
+                vec![uuid_pk("01920000-0000-7000-8000-0000000000d2")]
+            );
+        }
+
+        let TransactionWrite::RowsWithFileContent { file_content, .. } = &write_context.writes[0]
+        else {
+            panic!("by-path data update should stage file data");
+        };
+        assert_eq!(file_content.len(), 1);
+        assert_eq!(
+            file_content[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
+        assert_eq!(file_content[0].path.as_deref(), Some("/docs/readme.md"));
+        assert_eq!(file_content[0].content(), b"new");
+
+        // An absent path resolves to no descriptor: zero rows, nothing staged,
+        // and still exactly one path-index request.
+        let count = super::execute_fast_lix_file_content_update_by_path(
+            &mut write_context,
+            Some("/docs/absent.md".to_string()),
+            b"new".to_vec().into(),
+            None,
+            None,
+        )
+        .await
+        .expect("absent-path update should succeed");
+        assert_eq!(count, 0);
+        assert_eq!(path_index_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(write_context.writes.len(), 1);
     }
 
     #[tokio::test]
