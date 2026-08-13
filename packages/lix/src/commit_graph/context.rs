@@ -79,7 +79,8 @@ where
     // A reader is bound to one pinned storage snapshot for the duration of a
     // SQL statement. File-history shaping asks the same reader for distinct
     // schema slices of that history, so retain immutable change records here.
-    member_changes_cache: HashMap<Vec<String>, HashMap<CommitId, Vec<CommitGraphChange>>>,
+    member_changes_cache:
+        HashMap<(Vec<String>, Vec<String>), HashMap<CommitId, Vec<CommitGraphChange>>>,
 }
 
 enum LinearMergeBase {
@@ -565,7 +566,11 @@ where
         }
 
         for change in self
-            .load_member_changes(node.commit_id, &shaping.member_schema_keys)
+            .load_member_changes(
+                node.commit_id,
+                &shaping.member_schema_keys,
+                &shaping.member_file_ids,
+            )
             .await?
         {
             if !state.seen_changes.insert(history_change_identity(&change)) {
@@ -587,10 +592,12 @@ where
         &mut self,
         commit_id: CommitId,
         schema_keys: &[String],
+        file_ids: &[String],
     ) -> Result<Vec<CommitGraphChange>, LixError> {
+        let cache_key = (schema_keys.to_vec(), file_ids.to_vec());
         if let Some(changes) = self
             .member_changes_cache
-            .get(schema_keys)
+            .get(&cache_key)
             .and_then(|by_commit| by_commit.get(&commit_id))
         {
             return Ok(changes.clone());
@@ -599,6 +606,7 @@ where
             &self.store,
             commit_id,
             schema_keys,
+            file_ids,
             usize::MAX,
         )
         .await?
@@ -609,7 +617,7 @@ where
             .collect::<Vec<_>>();
         changes.sort_by_key(|change| change.id);
         self.member_changes_cache
-            .entry(schema_keys.to_vec())
+            .entry(cache_key)
             .or_default()
             .insert(commit_id, changes.clone());
         Ok(changes)
@@ -620,6 +628,15 @@ where
 /// walks the graph.
 struct HistoryShaping {
     member_schema_keys: Vec<String>,
+    /// Files the request restricts member changes to.
+    ///
+    /// `change_matches_history_request` discards any member whose `file_id` is
+    /// not in `request.file_ids`, so bounding the storage read on the same
+    /// component returns the same entries. It is only a selector when the
+    /// schema list is also known: a `schema_key | file_id` range needs both
+    /// components, and without the schema list the read visits every schema
+    /// anyway.
+    member_file_ids: Vec<String>,
     may_include_members: bool,
     may_include_commits: bool,
 }
@@ -634,6 +651,13 @@ impl HistoryShaping {
             .collect::<Vec<_>>();
         member_schema_keys.sort();
         member_schema_keys.dedup();
+        let mut member_file_ids = if member_schema_keys.is_empty() {
+            Vec::new()
+        } else {
+            request.file_ids.clone()
+        };
+        member_file_ids.sort();
+        member_file_ids.dedup();
         let may_include_members = request.schema_keys.is_empty() || !member_schema_keys.is_empty();
         let may_include_commits = request.schema_keys.is_empty()
             || request
@@ -642,6 +666,7 @@ impl HistoryShaping {
                 .any(|schema_key| schema_key == COMMIT_SCHEMA_KEY);
         Self {
             member_schema_keys,
+            member_file_ids,
             may_include_members,
             may_include_commits,
         }

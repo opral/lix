@@ -27,7 +27,8 @@ use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
     TrackedStateKeyBatchBuilder, TrackedStateMutationBatchBuilder, decode_key, decode_key_shared,
     decode_node_ref, decode_value, encode_key_ref, encode_key_ref_into, encode_leaf_node_refs,
-    encode_schema_key_prefix, encode_single_string_key_ref_into, encode_value_ref,
+    encode_schema_file_prefix, encode_schema_key_prefix, encode_single_string_key_ref_into,
+    encode_value_ref,
 };
 pub(crate) use crate::tracked_state::types::{
     CommitDeltaLifecycleSummary, CommitDeltaReplacementScope,
@@ -7803,7 +7804,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
     commit_id: CommitId,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     Ok(
-        load_commit_delta_members_with_payloads_for_schemas(store, commit_id, &[], usize::MAX)
+        load_commit_delta_members_with_payloads_for_schemas(store, commit_id, &[], &[], usize::MAX)
             .await?
             .expect("unbounded commit-delta payload scan cannot exceed its segment limit"),
     )
@@ -7818,6 +7819,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     schema_keys: &[String],
+    file_ids: &[String],
     max_segment_count: usize,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
     let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
@@ -7828,6 +7830,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
             store,
             &state,
             schema_keys,
+            file_ids,
             max_segment_count,
             true,
         )
@@ -7854,6 +7857,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         store,
         &source,
         schema_keys,
+        file_ids,
         max_segment_count.saturating_sub(local_segment_count),
         true,
     )
@@ -7889,6 +7893,7 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
     let Some((members, _)) = load_authenticated_local_commit_delta_members_for_schemas(
         store,
         &state,
+        &[],
         &[],
         usize::MAX,
         false,
@@ -8111,6 +8116,7 @@ pub(crate) async fn load_retained_commit_snapshots_for_schemas(
         store,
         commit_id,
         schema_keys,
+        &[],
         usize::MAX,
     )
     .await?
@@ -8170,6 +8176,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
+    file_ids: &[String],
     max_segment_count: usize,
     hydrate_selected_payloads: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
@@ -8198,6 +8205,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             store,
             state,
             schema_keys,
+            file_ids,
             max_segment_count,
             hydrate_selected_payloads,
         )
@@ -8270,10 +8278,68 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     )))
 }
 
+/// Builds the commit-delta key ranges a member scan should read.
+///
+/// The key codec is `schema_key | file_id | entity_pk`, so a caller that knows
+/// which files it wants can bound the scan on two components instead of one.
+///
+/// # Why narrowing cannot change the answer
+///
+/// The only caller that passes a non-empty `file_ids` is the commit-graph
+/// history read, and `change_matches_history_request` treats a non-empty
+/// `request.file_ids` as requiring a **non-null** `file_id` that is in the set —
+/// so every member this range excludes is one that caller discards anyway.
+/// Members carrying a null `file_id` are excluded by construction, which is
+/// exactly what that post-filter does to them. The retains at the end of the
+/// scan still run: a range selects segments, and a segment is decoded whole.
+///
+/// # Why it matters
+///
+/// Without the file bound, a point-routed history read decodes every entity a
+/// bulk commit wrote. Measured on this tree with the per-entry decode census:
+/// 10 170 decoded entries for a 20-row answer when one commit touched 5 000
+/// files, growing as `2 * bulk_entities`.
+///
+/// The directory router requires sorted, non-overlapping selectors and never
+/// sorts defensively. Distinct `(schema_key, file_id)` prefixes are disjoint
+/// because `write_file_id` terminates the file component, and the ranges are
+/// sorted by encoded start key here rather than relying on the encoder to
+/// preserve `BTreeSet` ordering.
+fn bounded_commit_delta_key_ranges(
+    requested_schemas: &BTreeSet<&str>,
+    requested_files: &BTreeSet<&str>,
+) -> Vec<super::mutation_directory::MutationDirectoryKeyRange> {
+    fn range_from_prefix(prefix: Vec<u8>) -> super::mutation_directory::MutationDirectoryKeyRange {
+        super::mutation_directory::MutationDirectoryKeyRange {
+            end: prefix_successor(&prefix).map(Bytes::from),
+            start: Bytes::from(prefix),
+        }
+    }
+
+    let mut ranges = if requested_files.is_empty() {
+        requested_schemas
+            .iter()
+            .map(|schema_key| range_from_prefix(encode_schema_key_prefix(schema_key)))
+            .collect::<Vec<_>>()
+    } else {
+        requested_schemas
+            .iter()
+            .flat_map(|schema_key| {
+                requested_files.iter().map(move |file_id| {
+                    range_from_prefix(encode_schema_file_prefix(schema_key, Some(file_id)))
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    ranges.sort_by(|left, right| left.start.cmp(&right.start));
+    ranges
+}
+
 async fn load_bounded_commit_delta_members_for_schemas(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
+    file_ids: &[String],
     max_segment_count: usize,
     hydrate_selected_payloads: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
@@ -8284,18 +8350,13 @@ async fn load_bounded_commit_delta_members_for_schemas(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let ranges = requested_schemas
-        .iter()
-        .map(|schema_key| {
-            let start = encode_schema_key_prefix(schema_key);
-            super::mutation_directory::MutationDirectoryKeyRange {
-                end: prefix_successor(&start).map(Bytes::from),
-                start: Bytes::from(start),
-            }
-        })
-        .collect::<Vec<_>>();
+    let requested_files = file_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let ranges = bounded_commit_delta_key_ranges(&requested_schemas, &requested_files);
     #[cfg(feature = "storage-benches")]
-    crate::storage_bench::record_commit_delta_bounded_scan(false, ranges.len());
+    crate::storage_bench::record_commit_delta_bounded_scan(
+        !requested_files.is_empty(),
+        ranges.len(),
+    );
     let runs = super::mutation_directory::load_mutation_part_read_plan(
         store,
         root,
@@ -8366,8 +8427,22 @@ async fn load_bounded_commit_delta_members_for_schemas(
         )?;
         validate_bounded_direct_row_count(root.layout, direct_row_count, members.len() - before)?;
     }
+    // Both retains survive the range narrowing and neither is redundant with
+    // it. A directory range selects *segments*, and a selected segment is
+    // decoded whole, so the first and last segment of any range routinely carry
+    // entries outside it. Dropping either would be a semantic change wearing a
+    // range-narrowing's clothes.
     if !requested_schemas.is_empty() {
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
+    }
+    if !requested_files.is_empty() {
+        members.retain(|member| {
+            member
+                .key
+                .file_id
+                .as_deref()
+                .is_some_and(|file_id| requested_files.contains(file_id))
+        });
     }
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_segment_members_kept(members.len());
@@ -10733,6 +10808,7 @@ pub(crate) async fn collect_local_commit_delta_json_refs(
     let Some((members, _)) = Box::pin(load_authenticated_local_commit_delta_members_for_schemas(
         store,
         &state,
+        &[],
         &[],
         usize::MAX,
         false,
@@ -16149,6 +16225,145 @@ mod tests {
         );
     }
 
+    /// A file-bounded member scan must return the schema-bounded answer,
+    /// restricted.
+    ///
+    /// The oracle is the **unbounded** read: a scan with no `file_ids` builds a
+    /// `schema_key`-only range and cannot execute the narrowing at all, so it is
+    /// the answer a caller got before this bound existed. Filtering it in memory
+    /// on the same component the range bounds is what the narrowed read must
+    /// reproduce, exactly — including for a file id that does not exist, and
+    /// including the exclusion of members carrying a null `file_id`, which is
+    /// what `change_matches_history_request` does to them anyway.
+    ///
+    /// The fixture deliberately interleaves two schemas, three files and a
+    /// null-file member across enough entities to span several segments, since a
+    /// selected segment is decoded whole and the retains — not the ranges — are
+    /// what make partial-segment overlap invisible.
+    #[tokio::test]
+    async fn file_bounded_commit_delta_members_match_the_unbounded_answer() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("file-bounded-delta-commit");
+        let files = ["file-a", "file-b", "file-c"];
+        let fixtures = (0..300)
+            .map(|index: usize| CommitDeltaFixture {
+                schema_key: if index % 2 == 0 {
+                    "alpha".to_string()
+                } else {
+                    "beta".to_string()
+                },
+                // Every fourth member carries no file id at all.
+                file_id: if index % 4 == 3 {
+                    None
+                } else {
+                    Some(files[index % files.len()].to_string())
+                },
+                entity_pk: EntityPk::single(format!("entity-{index:04}")),
+                change_id: ChangeId::for_test_label(&format!("file-bounded-change-{index}")),
+                deleted: index % 7 == 0,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64 + 1),
+            })
+            .collect::<Vec<_>>();
+        let deltas = commit_delta_refs(commit_id, &fixtures);
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &deltas).expect("file-bounded deltas should stage");
+        drop(deltas);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("file-bounded delta commit should publish");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("file-bounded delta read should open");
+
+        let schemas = ["alpha".to_string(), "beta".to_string()];
+        let unbounded = super::load_commit_delta_members_with_payloads_for_schemas(
+            &read, commit_id, &schemas, &[], usize::MAX,
+        )
+        .await
+        .expect("unbounded schema scan should load")
+        .expect("unbounded schema scan should be accepted");
+        assert!(
+            unbounded.len() > 200,
+            "the oracle must be a wide read, not a degenerate one: {}",
+            unbounded.len()
+        );
+
+        for requested in [
+            vec!["file-a".to_string()],
+            vec!["file-b".to_string(), "file-c".to_string()],
+            vec!["file-a".to_string(), "file-missing".to_string()],
+            vec!["file-missing".to_string()],
+        ] {
+            let expected = unbounded
+                .iter()
+                .filter(|member| {
+                    member
+                        .key
+                        .file_id
+                        .as_deref()
+                        .is_some_and(|file_id| requested.iter().any(|want| want == file_id))
+                })
+                .map(|member| (member.key.clone(), member.change.change_id))
+                .collect::<Vec<_>>();
+            let actual = super::load_commit_delta_members_with_payloads_for_schemas(
+                &read, commit_id, &schemas, &requested, usize::MAX,
+            )
+            .await
+            .expect("file-bounded scan should load")
+            .expect("file-bounded scan should be accepted")
+            .into_iter()
+            .map(|member| (member.key, member.change.change_id))
+            .collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected,
+                "the file-bounded read must equal the unbounded read restricted to {requested:?}"
+            );
+        }
+
+        // Engagement, in the same process as the assertions above. Lower bounds
+        // only: these counters are process-global, so a concurrent test in this
+        // binary can push them up but never down.
+        #[cfg(feature = "storage-benches")]
+        {
+            let _ = crate::storage_bench::take_commit_delta_member_scan_census();
+            let _ = super::load_commit_delta_members_with_payloads_for_schemas(
+                &read,
+                commit_id,
+                &schemas,
+                &["file-a".to_string()],
+                usize::MAX,
+            )
+            .await
+            .expect("file-bounded scan should load");
+            let (decoded, _kept, schema_only, file_bounded, ranges) =
+                crate::storage_bench::take_commit_delta_member_scan_census();
+            assert!(
+                file_bounded >= 1 && ranges >= 2,
+                "a scan given file ids must take the file-bounded route:                  decoded={decoded} schema_only={schema_only} file_bounded={file_bounded}                  ranges={ranges}"
+            );
+
+            let _ = crate::storage_bench::take_commit_delta_member_scan_census();
+            let _ = super::load_commit_delta_members_with_payloads_for_schemas(
+                &read,
+                commit_id,
+                &schemas,
+                &[],
+                usize::MAX,
+            )
+            .await
+            .expect("unbounded scan should load");
+            let (_decoded, _kept, schema_only, _file_bounded, _ranges) =
+                crate::storage_bench::take_commit_delta_member_scan_census();
+            assert!(
+                schema_only >= 1,
+                "a scan given no file ids must keep the schema-only route"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn packed_commit_deltas_preserve_point_and_schema_replay() {
         let storage = StorageAdapter::new(Memory::new());
@@ -16228,6 +16443,7 @@ mod tests {
             &read,
             commit_id,
             &["alpha".to_string()],
+            &[],
             usize::MAX,
         )
         .await
@@ -16249,6 +16465,7 @@ mod tests {
                 &read,
                 commit_id,
                 &["alpha".to_string()],
+                &[],
                 0,
             )
             .await
