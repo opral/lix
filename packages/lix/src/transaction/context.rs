@@ -12748,6 +12748,203 @@ mod tests {
         assert!(successor.contains(&replacement_key));
     }
 
+    /// Mechanism probe for the `lix_file` content-update scaling defect.
+    ///
+    /// A content-only update changes no descriptor -- same path, same name,
+    /// same parent -- so the visible filesystem path index is unchanged by it.
+    /// This measures how many times that index is nevertheless rebuilt from
+    /// scratch, and how many descriptor rows each rebuild reads, so the cost
+    /// can be attributed to repository size rather than inferred from timings.
+    ///
+    /// The counter lives inside `build_path_index`, the only full-rebuild site,
+    /// which is a different layer from the timing instrument that first showed
+    /// the slope.
+    #[tokio::test]
+    async fn content_updates_hit_the_path_index_cache_and_do_not_rebuild_it() {
+        async fn measure(files: usize, updates: usize) -> (usize, usize, usize, usize) {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("storage should initialize");
+            let engine = Engine::new(storage)
+                .await
+                .expect("engine should open initialized storage");
+            let session = engine.open_session().await.expect("session should open");
+
+            let values = (0..files)
+                .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            session
+                .execute(
+                    &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
+                    &[],
+                )
+                .await
+                .expect("fixture files should commit");
+
+            let rows = session
+                .execute("SELECT id FROM lix_file ORDER BY path", &[])
+                .await
+                .expect("file ids should read back");
+            let ids = rows
+                .rows()
+                .iter()
+                .map(|row| {
+                    row.get::<String>("id")
+                        .expect("file row should carry an id")
+                })
+                .collect::<Vec<_>>();
+            assert!(ids.len() >= updates, "fixture must cover every update");
+
+            crate::filesystem::reset_full_rebuild_stats();
+            for id in ids.iter().take(updates) {
+                session
+                    .execute(
+                        "UPDATE lix_file SET content = $1 WHERE id = $2",
+                        &[
+                            Value::Blob(b"byte-02".to_vec().into()),
+                            Value::Text(id.clone()),
+                        ],
+                    )
+                    .await
+                    .expect("content update should commit");
+            }
+            let (builds, rows) = crate::filesystem::full_rebuild_stats();
+            let (hits, misses) = crate::filesystem::path_index_cache_stats();
+            (builds, rows, hits, misses)
+        }
+
+        let updates = 10;
+        let (small_builds, small_rows, small_hits, small_misses) = measure(50, updates).await;
+        let (large_builds, large_rows, large_hits, large_misses) = measure(500, updates).await;
+        println!(
+            "PATHINDEX files=50 builds={small_builds} rebuilt_rows={small_rows} hits={small_hits} misses={small_misses}"
+        );
+        println!(
+            "PATHINDEX files=500 builds={large_builds} rebuilt_rows={large_rows} hits={large_hits} misses={large_misses}"
+        );
+
+        // Connectivity: the lane really is exercised, so a zero rebuild count
+        // below is a positive result and not an instrument pointed elsewhere.
+        assert!(
+            small_hits >= updates && large_hits >= updates,
+            "each content update must consult the path-index cache: {small_hits} / {large_hits}"
+        );
+
+        // The measured result: content updates HIT this cache. The visible
+        // filesystem path index is NOT rebuilt per statement, so it is not the
+        // source of the per-statement cost that scales with repository size.
+        assert_eq!(
+            small_builds, 0,
+            "50-file repository rebuilt the path index {small_builds} times"
+        );
+        assert_eq!(
+            large_builds, 0,
+            "500-file repository rebuilt the path index {large_builds} times"
+        );
+        assert_eq!(small_rows, 0, "no rebuild should read descriptor rows");
+        assert_eq!(large_rows, 0, "no rebuild should read descriptor rows");
+    }
+
+    /// Does the single-entity blob-ref probe every `lix_file` content update
+    /// issues push `entity_pks` down to a seek, or scan the branch's whole
+    /// blob-ref collection and filter in memory?
+    ///
+    /// `rows_scanned` is what the hot-state scan handed back before visibility
+    /// resolution -- what storage actually read. `rows_returned` is what the
+    /// update consumed. If the pushdown works these track each other; if not,
+    /// `rows_scanned` tracks the repository size while `rows_returned` stays 1.
+    #[tokio::test]
+    async fn content_update_blob_ref_probe_scans_only_its_own_row() {
+        async fn measure(files: usize, updates: usize) -> (usize, usize, usize) {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("storage should initialize");
+            let engine = Engine::new(storage)
+                .await
+                .expect("engine should open initialized storage");
+            let session = engine.open_session().await.expect("session should open");
+
+            let values = (0..files)
+                .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            session
+                .execute(
+                    &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
+                    &[],
+                )
+                .await
+                .expect("fixture files should commit");
+
+            let rows = session
+                .execute("SELECT id FROM lix_file ORDER BY path", &[])
+                .await
+                .expect("file ids should read back");
+            let ids = rows
+                .rows()
+                .iter()
+                .map(|row| {
+                    row.get::<String>("id")
+                        .expect("file row should carry an id")
+                })
+                .collect::<Vec<_>>();
+            assert!(ids.len() >= updates, "fixture must cover every update");
+
+            crate::hot_state::reset_blob_ref_probe_stats();
+            for id in ids.iter().take(updates) {
+                session
+                    .execute(
+                        "UPDATE lix_file SET content = $1 WHERE id = $2",
+                        &[
+                            Value::Blob(b"byte-02".to_vec().into()),
+                            Value::Text(id.clone()),
+                        ],
+                    )
+                    .await
+                    .expect("content update should commit");
+            }
+            crate::hot_state::blob_ref_probe_stats()
+        }
+
+        let updates = 10;
+        let (small_calls, small_scanned, small_returned) = measure(50, updates).await;
+        let (large_calls, large_scanned, large_returned) = measure(500, updates).await;
+        println!(
+            "BLOBPROBE files=50 calls={small_calls} scanned={small_scanned} returned={small_returned}"
+        );
+        println!(
+            "BLOBPROBE files=500 calls={large_calls} scanned={large_scanned} returned={large_returned}"
+        );
+
+        // Connectivity: the probe really is issued once per content update, so
+        // a low scanned count below means the pushdown works rather than that
+        // this counter never ran.
+        assert_eq!(
+            small_calls, updates,
+            "each content update should issue exactly one blob-ref probe"
+        );
+        assert_eq!(
+            large_calls, updates,
+            "each content update should issue exactly one blob-ref probe"
+        );
+
+        // Each probe consumes exactly its own row, at both repository sizes.
+        assert_eq!(small_returned, updates, "one blob-ref row per update");
+        assert_eq!(large_returned, updates, "one blob-ref row per update");
+
+        // The claim under test: what storage READ must not grow with the
+        // repository. A 10x larger repository must not make this probe read
+        // 10x more rows.
+        assert!(
+            large_scanned < small_scanned * 5,
+            "blob-ref probe reads scale with repository size: \
+             50 files scanned {small_scanned}, 500 files scanned {large_scanned}"
+        );
+    }
+
     #[tokio::test]
     async fn staged_descriptor_batches_advance_transaction_path_index() {
         let storage = Memory::new();

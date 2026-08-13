@@ -82,3 +82,5 @@ pub(crate) use visibility::{
     overlay_load_exact_batch, overlay_scan_batch, overlay_scan_tracked_batch,
     resolve_visible_batch,
 };
+#[cfg(test)]
+pub(crate) use visibility::{blob_ref_probe_stats, reset_blob_ref_probe_stats};
