@@ -2684,7 +2684,7 @@ async fn hydrate_lix_file_content_result(
     filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
-    plugin_host: crate::plugin::PluginRuntimeHost,
+    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     session_file_views: Option<sql2::SessionFileViews>,
     query: &mut SqlQueryResult,
     data_column_index: usize,

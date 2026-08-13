@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::binary_cas::BlobId;
 use crate::common::LixError;
-use crate::wasm::{WasmComponentFactory, WasmLimits, WasmRuntime, WasmTransitionCounters};
+use crate::{
+    plugin::runtime::{WasmComponentFactory, WasmRuntime, WasmTransitionCounters},
+    wasm::WasmLimits,
+};
 
 use super::{
     CompiledPluginCatalog, DEFAULT_MAX_LIVE_PLUGIN_STORES, InstalledPlugin, PluginActorCache,
@@ -262,7 +265,7 @@ fn component_cache_lock_error() -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wasm::UnsupportedWasmRuntime;
+    use crate::plugin::runtime::UnsupportedWasmRuntime;
 
     #[test]
     fn plugin_memory_policy_is_explicit() {

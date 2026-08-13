@@ -18,7 +18,7 @@ use crate::binary_cas::{BlobDataReader, BlobId};
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::plugin::{
+use crate::plugin::runtime::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
 };
 use crate::tracked_state::{
@@ -1903,7 +1903,7 @@ fn file_history_owner_schema_keys<'a>(
     state
         .plugin_registry
         .get(owner.plugin_key())
-        .map(crate::plugin::PluginRegistryEntry::schema_keys)
+        .map(crate::plugin::runtime::PluginRegistryEntry::schema_keys)
         .unwrap_or_else(|| owner.schema_keys())
 }
 
@@ -2406,7 +2406,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::SharedStr;
     use crate::entity_pk::EntityPk;
-    use crate::plugin::{
+    use crate::plugin::runtime::{
         PluginFileOwner, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
         plugin_storage_archive_file_id, plugin_storage_archive_path,
     };

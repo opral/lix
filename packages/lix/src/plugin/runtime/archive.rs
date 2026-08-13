@@ -150,7 +150,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     Ok(InstalledPlugin {
         key: loaded.manifest.key,
         runtime: super::PluginRuntime::WasmComponent,
-        api_version: crate::wasm::WASM_COMPONENT_API_VERSION.to_owned(),
+        api_version: crate::plugin::runtime::WASM_COMPONENT_API_VERSION.to_owned(),
         path_glob: loaded.manifest.file_match.path_glob,
         content: loaded.manifest.file_match.content,
         entry: loaded.manifest.entry,

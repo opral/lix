@@ -12,7 +12,7 @@
 #[doc(hidden)]
 pub mod api;
 
-pub(crate) mod wire;
+pub mod wire;
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 pub mod runtime;
@@ -22,9 +22,6 @@ pub mod runtime;
     all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")
 ))]
 pub use api::*;
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
-pub(crate) use runtime::*;
 
 #[cfg(any(
     not(target_arch = "wasm32"),

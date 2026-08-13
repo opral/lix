@@ -21,14 +21,14 @@ use crate::hot_state::{
     HotStateExactBatchRequest, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateExactBatch,
 };
-use crate::plugin::PluginRuntimeHost;
+use crate::plugin::runtime::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::TrackedStateScanRequest;
 use crate::transaction_types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, RawWriteBatch,
     TransactionWrite, TransactionWriteMode, TransactionWriteOutcome, TypedMutationJournalBatch,
 };
-use crate::wasm::UnsupportedWasmRuntime;
+use crate::plugin::runtime::UnsupportedWasmRuntime;
 
 use super::change_materialization::MaterializedChange;
 use super::{PublicCatalog, SessionFileViews};

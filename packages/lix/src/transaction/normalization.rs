@@ -509,7 +509,7 @@ mod tests {
     fn normalization_retains_complete_canonical_batch_rows() {
         let normalized = br#"{"id":"entity-from-batch","value":"hello"}"#.to_vec();
         let end = u32::try_from(normalized.len()).expect("fixture length");
-        let mut batch = crate::wasm::WasmCanonicalJson::from_batch_parts(
+        let mut batch = crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(
             vec![json!({"id": "entity-from-batch", "value": "hello"})],
             normalized,
             vec![(0, end)],
@@ -551,11 +551,11 @@ mod tests {
             .expect("old certificate schema");
         let normalized = br#"{"id":"entity-1","value":"old-value"}"#.to_vec();
         let end = u32::try_from(normalized.len()).expect("fixture length");
-        let certificate = crate::wasm::WasmCanonicalJsonCertificate::new(
+        let certificate = crate::plugin::runtime::WasmCanonicalJsonCertificate::new(
             EntityPk::single("entity-1"),
             old_plan.shared_fingerprint(),
         );
-        let mut batch = crate::wasm::WasmCanonicalJson::from_mixed_batch_parts(
+        let mut batch = crate::plugin::runtime::WasmCanonicalJson::from_mixed_batch_parts(
             vec![None],
             vec![Some(certificate)],
             normalized,

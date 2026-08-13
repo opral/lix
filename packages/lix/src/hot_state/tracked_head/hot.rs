@@ -15,7 +15,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use crate::wasm::WasmCreateContext;
+use crate::plugin::runtime::WasmCreateContext;
 use crate::storage_adapter::ValueSemantics;
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -26,7 +26,7 @@ use crate::storage_adapter::{
     PutBatch, PutEntry,
 };
 use crate::tracked_state::TrackedStateReadColumns;
-use crate::wasm::WasmCertifiedEntityBatch;
+use crate::plugin::runtime::WasmCertifiedEntityBatch;
 
 use super::*;
 
@@ -749,10 +749,10 @@ pub(crate) async fn stage_certified_entity_batches(
             for (page_index, page) in batch.pages.iter().enumerate() {
                 let (first_local_ref, last_local_ref) = match batch.format {
                     1 => certified_schema_row_page_local_ref_range(page)?,
-                    2 | crate::wasm::HOST_CERTIFIED_PACKET_FORMAT => {
+                    2 | crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT => {
                         certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX))
                     }
-                    crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
+                    crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
                         certified_zstd_packet_page_header(page)?.0
                     }
                     _ => (0, u32::MAX),
@@ -899,7 +899,7 @@ fn certified_schema_row_page_local_ref_range(page: &[u8]) -> Result<(u32, u32), 
             "certified schema-row entity page must contain created rows",
         ));
     }
-    let layout = crate::plugin::runtime::layout::CompiledLayout::parse(section.layout)
+    let layout = crate::plugin::wire::CompiledLayout::parse(section.layout)
         .map_err(|error| head_value_error(format!("invalid schema-row layout: {error}")))?;
     let mut rows = layout
         .rows(section.payload, section.record_count)
@@ -1042,8 +1042,8 @@ fn certified_external_page_plan(
     };
     let selected_local_refs = ((format == 1
         || format == 2
-        || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
-        || format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT)
+        || format == crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+        || format == crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT)
         && !request.filter.entity_pks.is_empty())
     .then(|| {
         let high = creates.high.to_be_bytes();
@@ -1607,8 +1607,8 @@ fn decode_certified_entity_batch_rows(
     let format = input.u16()?;
     if format != 1
         && format != 2
-        && format != crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
-        && format != crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        && format != crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+        && format != crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
     {
         return Err(head_value_error(format!(
             "unsupported certified entity batch format {format}"
@@ -1671,15 +1671,15 @@ fn decode_certified_entity_batch_rows(
         }
         let page = page.as_ref();
         let decoded_page;
-        let page = if format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT {
+        let page = if format == crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT {
             decoded_page = decode_certified_zstd_packet_page(page)?;
             decoded_page.as_slice()
         } else {
             page
         };
         if format == 2
-            || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
-            || format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+            || format == crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+            || format == crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
         {
             decoded_rows = decoded_rows.saturating_add(decode_certified_packet_rows(
                 page,
@@ -1712,7 +1712,7 @@ fn decode_certified_entity_batch_rows(
                 "certified schema-row entity page must contain created rows",
             ));
         }
-        let layout = crate::plugin::runtime::layout::CompiledLayout::parse(section.layout)
+        let layout = crate::plugin::wire::CompiledLayout::parse(section.layout)
             .map_err(|error| head_value_error(format!("invalid schema-row layout: {error}")))?;
         let mut rows = layout
             .rows(section.payload, section.record_count)
@@ -1737,7 +1737,7 @@ fn decode_certified_entity_batch_rows(
                 .map_err(|error| head_value_error(error.to_string()))?;
             let entity_pk = EntityPk::uuid_from_bytes(id);
             let snapshot = if needs_snapshot {
-                let json = crate::plugin::runtime::layout::insert_generated_id(
+                let json = crate::plugin::wire::insert_generated_id(
                     &rendered_snapshots[rendered.snapshot],
                     layout.generated_id_path(),
                     &uuid::Uuid::from_bytes(id).to_string(),
@@ -14143,7 +14143,7 @@ mod tests {
             append_batch_text(&mut value, file_id).unwrap();
             value.extend_from_slice(commit_id.as_uuid().as_bytes());
             append_batch_text(&mut value, "2026-01-01T00:00:00Z").unwrap();
-            value.extend_from_slice(&crate::wasm::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes());
+            value.extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes());
             value.extend_from_slice(&0_u64.to_le_bytes());
             value.extend_from_slice(&0_u64.to_le_bytes());
             value.extend_from_slice(&0_u32.to_le_bytes());
@@ -14254,7 +14254,7 @@ mod tests {
         let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
         append_batch_text(&mut manifest_key, "unrelated.md").unwrap();
         manifest_key
-            .extend_from_slice(&crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+            .extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
         manifest_key.extend_from_slice(
             CommitId::for_test_label("unrelated-certified-commit")
                 .as_uuid()
@@ -14338,7 +14338,7 @@ mod tests {
         let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
         append_batch_text(&mut manifest_key, FILE_ID).unwrap();
         manifest_key
-            .extend_from_slice(&crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+            .extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
         manifest_key.extend_from_slice(
             CommitId::for_test_label("matching-certified-commit")
                 .as_uuid()

@@ -1,7 +1,7 @@
 use lix::storage::Storage;
 use lix::telemetry::TelemetrySink;
-use lix::wasm::WasmRuntime;
-use lix::wasm::WasmTransitionCounters;
+use lix::plugin::runtime::WasmRuntime;
+use lix::plugin::runtime::WasmTransitionCounters;
 use lix::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteBatchStatement,
     ExecuteIdempotency, ExecuteOptions, ExecuteResult, ExecuteStatementMetadata,

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::wasm::WASM_COMPONENT_API_VERSION;
+use crate::plugin::runtime::WASM_COMPONENT_API_VERSION;
 
 static PLUGIN_MANIFEST_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::new();

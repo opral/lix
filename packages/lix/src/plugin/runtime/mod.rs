@@ -1,16 +1,17 @@
-//! Plugin subsystem root.
+//! Engine-side execution and lifecycle support for Lix plugins.
 //!
-//! Phase 1 establishes `crate::plugin::*` as the owner path for plugin-domain
-//! code under concrete plugin-owned modules instead of ownership-neutral
-//! buckets.
+//! The public Component contract lives here. General WebAssembly compute
+//! configuration remains under [`crate::wasm`], while format-neutral plugin
+//! encodings live under [`crate::plugin::wire`].
 
 #[cfg(feature = "default_wasm_runtime")]
 pub(crate) mod default;
 
-// Runtime providers are an advanced integration surface. Keeping them under
-// `lix::plugin::runtime` makes their ownership explicit without exposing the
-// engine's installation and registry implementation.
-pub use crate::wasm::*;
+mod api;
+mod contract;
+
+pub use api::*;
+pub use contract::*;
 
 mod actor;
 mod archive;
@@ -20,7 +21,6 @@ mod conflict;
 mod create_context;
 mod incremental;
 mod install;
-pub(crate) mod layout;
 mod manifest;
 mod materializer;
 mod registry;

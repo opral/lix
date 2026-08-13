@@ -4865,7 +4865,7 @@ mod tests {
     use crate::hot_state::CertifiedEntityBatchFileRef;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
-    use crate::wasm::{WasmCertifiedEntityBatch, WasmCreateContext};
+    use crate::plugin::runtime::{WasmCertifiedEntityBatch, WasmCreateContext};
 
     #[test]
     fn exact_current_state_diff_scope_requires_one_schema_and_concrete_file_lane() {

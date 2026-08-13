@@ -12,7 +12,7 @@ use crate::hot_state::HotStateContext;
 use crate::hot_state::HotStateRowRequest;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
-use crate::plugin::{
+use crate::plugin::runtime::{
     DEFAULT_MAX_LIVE_PLUGIN_STORES, DEFAULT_PLUGIN_MEMORY_BYTES, PluginRuntimeHost,
 };
 use crate::session::SessionContext;
@@ -26,8 +26,8 @@ use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
-use crate::wasm::WasmTransitionCounters;
-use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
+use crate::plugin::runtime::WasmTransitionCounters;
+use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]

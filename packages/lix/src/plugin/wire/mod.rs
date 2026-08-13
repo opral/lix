@@ -11,6 +11,12 @@
     allow(dead_code)
 )]
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+mod layout;
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+pub(crate) use layout::{CompiledLayout, insert_generated_id, validate_generated_id};
+
 const MAGIC: &[u8; 8] = b"LIXEPG01";
 const DESCRIPTOR_BYTES: usize = 16;
 const TRAILER_BYTES: usize = MAGIC.len();

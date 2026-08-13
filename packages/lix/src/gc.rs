@@ -1393,7 +1393,7 @@ where
         crate::filesystem::collect_gc_binary_blob_roots(&store, &controls, &retained_cas_root_ids)
             .await?;
     blob_roots.extend(
-        crate::plugin::collect_gc_wasm_blob_roots(&store, &controls, &retained_cas_root_ids)
+        crate::plugin::runtime::collect_gc_wasm_blob_roots(&store, &controls, &retained_cas_root_ids)
             .await?,
     );
     let upload_chunks =
@@ -4514,7 +4514,7 @@ mod tests {
             .expect("corrupt-registry repository should initialize");
         let storage = StorageAdapter::new(backend.clone());
         let corrupt_registry = serde_json::json!({
-            "key": crate::plugin::PLUGIN_REGISTRY_KEY,
+            "key": crate::plugin::runtime::PLUGIN_REGISTRY_KEY,
             "value": {
                 "version": 1,
                 "plugin_count": 1,
@@ -4538,7 +4538,7 @@ mod tests {
             .expect("workspace branch control should exist");
         let timestamp =
             LixTimestamp::expect_parse("corrupt registry timestamp", "2026-01-01T00:00:00Z");
-        let entity_pk = EntityPk::single(crate::plugin::PLUGIN_REGISTRY_KEY);
+        let entity_pk = EntityPk::single(crate::plugin::runtime::PLUGIN_REGISTRY_KEY);
         let mut writes = storage.new_write_set();
         let mut coverage = WorkingDiffIndexCoverage::default();
         TrackedHeadContext::new()

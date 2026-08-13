@@ -1,24 +1,6 @@
-use std::sync::Arc;
-
-use async_trait::async_trait;
-
-use crate::LixError;
-
-mod component;
-
-pub use component::*;
-
-/// Host-owned immutable arena primitives for Component plugins.
-///
-/// These values are independent of a Wasm Store and remain valid across branch
-/// switches, actor eviction, and cold reopen.
-pub mod v1 {
-    pub use crate::plugin::runtime::arena::{
-        Acceptance, Archive, ByteArena, ByteEdit, Digest, Error, FormatLayout, MapArena, Metrics,
-        PerformanceMeasurement, REQUIRED_V1_MEMORY_REDUCTION, REQUIRED_V1_SPEEDUP, Root,
-        StatePageLayout, Store, Transaction, compare_to_baseline,
-    };
-}
+//! General WebAssembly compute configuration for Lix.
+//!
+//! Plugin-specific component contracts live in [`crate::plugin::runtime`].
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmLimits {
@@ -40,36 +22,5 @@ impl Default for WasmLimits {
             max_fuel: None,
             timeout_ms: None,
         }
-    }
-}
-
-/// Runtime contract for the fused Component protocol.
-#[async_trait]
-pub trait WasmRuntime: Send + Sync {
-    /// Compiles a Component once so immutable machine code can be shared by
-    /// many file actors. Each actor must subsequently call
-    /// [`WasmComponentFactory::instantiate_actor`] to obtain an isolated
-    /// Store/instance; document handles never cross actor boundaries.
-    async fn compile_component(
-        &self,
-        bytes: Vec<u8>,
-        limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentFactory>, LixError>;
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct UnsupportedWasmRuntime;
-
-#[async_trait]
-impl WasmRuntime for UnsupportedWasmRuntime {
-    async fn compile_component(
-        &self,
-        _bytes: Vec<u8>,
-        _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
-        Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "plugin execution requires a configured WASM component runtime",
-        ))
     }
 }

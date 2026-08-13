@@ -18,7 +18,7 @@ use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonRef;
 use crate::hot_state::{CertifiedCurrentStatePredecessor, MaterializedHotStateRow};
 use crate::tracked_state::OrderedAddressableCommitDeltaStage;
-use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
+use crate::plugin::runtime::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;

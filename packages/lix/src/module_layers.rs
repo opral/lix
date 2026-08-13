@@ -29,7 +29,7 @@
 /// allowances. See [`UNLAYERED_MODULES`] for what is not covered yet and why.
 const MODULE_LAYERS: &[&[&str]] = &[
     // Pure encodings with no repository semantics.
-    &["compression", "storage_codec"],
+    &["compression", "plugin_wire", "storage_codec", "wasm"],
     // The physical key space and write-set mechanism everything above records
     // its bytes through.
     &["storage_adapter"],
@@ -68,10 +68,8 @@ const MODULE_LAYERS: &[&[&str]] = &[
     // `tracked_state` is the structural half of the "derived views are caches"
     // invariant: the compiler now rejects a canonical-side read of the cache.
     &["hot_state"],
-    // Entity-level overlays over the state planes. None of them is read by any
-    // module below, and none reads another: `checkpoint` and `plugin` both use
-    // `branch`, `undo_redo` only needs `changelog`.
-    &["checkpoint", "plugin", "undo_redo"],
+    // Entity-level overlays over the state planes.
+    &["checkpoint", "undo_redo"],
 ];
 
 /// Top-level modules deliberately left out of [`MODULE_LAYERS`], with the
@@ -111,6 +109,14 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("observe_coordinator", "not yet analysed"),
     ("observe_invalidation", "not yet analysed"),
     ("prepared_dml", "leaf utility, no layer semantics"),
+    (
+        "plugin",
+        "target-selecting plugin facade and guest authoring API",
+    ),
+    (
+        "plugin_runtime",
+        "plugin execution orchestration still spans state and transaction layers",
+    ),
     ("registered_spaces", "cfg-gated harness"),
     ("schema", "not yet analysed"),
     (
@@ -153,7 +159,6 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
          layering it would have to place it both above and below `hot_state`. \
          Deduplicating the `Materialized*Row` DTOs downward unblocks it",
     ),
-    ("wasm", "plugin ABI vocabulary, not yet analysed"),
 ];
 
 /// Upward references that are intentional, as
@@ -346,7 +351,24 @@ fn production_source(source: &str) -> String {
     String::from_utf8(buffer).expect("blanking preserves UTF-8")
 }
 
-/// Every `.rs` file under `src`, as `(top-level module, display path, source)`.
+fn architectural_module(relative: &std::path::Path) -> String {
+    let components = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    match components.as_slice() {
+        ["plugin", "wire.rs" | "wire", ..] => "plugin_wire".to_owned(),
+        ["plugin", "runtime", ..] => "plugin_runtime".to_owned(),
+        [first, ..] => std::path::Path::new(first)
+            .file_stem()
+            .expect("source path component has a stem")
+            .to_string_lossy()
+            .into_owned(),
+        [] => String::new(),
+    }
+}
+
+/// Every `.rs` file under `src`, as `(architectural module, display path, source)`.
 fn engine_sources() -> Vec<(String, String, String)> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut sources = Vec::new();
@@ -367,14 +389,7 @@ fn engine_sources() -> Vec<(String, String, String)> {
             let Ok(relative) = path.strip_prefix(&root) else {
                 continue;
             };
-            let Some(first) = relative.components().next() else {
-                continue;
-            };
-            let module = std::path::Path::new(first.as_os_str())
-                .file_stem()
-                .expect("source path component has a stem")
-                .to_string_lossy()
-                .into_owned();
+            let module = architectural_module(relative);
             let Ok(source) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -423,11 +438,35 @@ fn production_references(known: &std::collections::BTreeSet<String>) -> Vec<Refe
             {
                 cursor += 1;
             }
-            let target = &production[start..cursor];
-            if known.contains(target) && target != module {
+            let root_target = &production[start..cursor];
+            let mut target = root_target.to_owned();
+            if root_target == "plugin" {
+                let mut nested = cursor;
+                while bytes.get(nested).is_some_and(u8::is_ascii_whitespace) {
+                    nested += 1;
+                }
+                if bytes.get(nested..nested + 2) == Some(&b"::"[..]) {
+                    nested += 2;
+                    while bytes.get(nested).is_some_and(u8::is_ascii_whitespace) {
+                        nested += 1;
+                    }
+                    let nested_start = nested;
+                    while bytes.get(nested).is_some_and(|byte| {
+                        byte.is_ascii_alphanumeric() || *byte == b'_'
+                    }) {
+                        nested += 1;
+                    }
+                    target = match &production[nested_start..nested] {
+                        "wire" => "plugin_wire".to_owned(),
+                        "runtime" => "plugin_runtime".to_owned(),
+                        _ => target,
+                    };
+                }
+            }
+            if known.contains(&target) && target != module {
                 references.push(Reference {
                     from: module.clone(),
-                    to: target.to_owned(),
+                    to: target,
                     file: file.clone(),
                     line: bytes[..start].iter().filter(|byte| **byte == b'\n').count() + 1,
                 });

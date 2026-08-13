@@ -12,11 +12,11 @@ use crate::plugin::wire::{Operation, Page as EntityPage, Representation, encode_
 use async_trait::async_trait;
 use bytes::Bytes;
 use lix::wasm::WasmLimits;
-use lix::wasm::v1::{
+use lix::plugin::runtime::v1::{
     ByteEdit as ArenaByteEdit, Digest as ArenaDigest, Root as ArenaRoot, Store as ArenaStore,
     Transaction as ArenaTransaction,
 };
-use lix::wasm::{
+use lix::plugin::runtime::{
     PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmCertifiedCreateRange, WasmCertifiedEntityBatch,
     WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictResolutionPage,
@@ -133,8 +133,8 @@ struct EntityChangeState {
 }
 
 enum EntityChangeInputSource {
-    Entities(Box<dyn lix::wasm::WasmEntitySource>),
-    Changes(Box<dyn lix::wasm::WasmEntityChangeSource>),
+    Entities(Box<dyn lix::plugin::runtime::WasmEntitySource>),
+    Changes(Box<dyn lix::plugin::runtime::WasmEntityChangeSource>),
 }
 
 struct ResolutionState {
@@ -595,7 +595,7 @@ impl ResolutionState {
 impl EntityChangeState {
     fn from_entities(
         limits: WasmTransitionLimits,
-        source: Box<dyn lix::wasm::WasmEntitySource>,
+        source: Box<dyn lix::plugin::runtime::WasmEntitySource>,
         total_bytes: SharedByteBudget,
     ) -> Result<Self, LixError> {
         Ok(Self {
@@ -611,7 +611,7 @@ impl EntityChangeState {
 
     fn from_changes(
         limits: WasmTransitionLimits,
-        source: Box<dyn lix::wasm::WasmEntityChangeSource>,
+        source: Box<dyn lix::plugin::runtime::WasmEntityChangeSource>,
         total_bytes: SharedByteBudget,
     ) -> Result<Self, LixError> {
         Ok(Self {
@@ -2336,7 +2336,7 @@ fn host_table_error(
     bindings::lix::plugin::host::HostError::Rejected(error.to_string())
 }
 
-fn read_source_all(source: &Arc<dyn lix::wasm::WasmByteSource>) -> Result<Vec<u8>, LixError> {
+fn read_source_all(source: &Arc<dyn lix::plugin::runtime::WasmByteSource>) -> Result<Vec<u8>, LixError> {
     const CHUNK_BYTES: u32 = 1024 * 1024;
     let length = source.len();
     let mut output = Vec::with_capacity(
@@ -4375,15 +4375,15 @@ mod tests {
     }
 
     #[cfg(any())]
-    impl lix::wasm::WasmEntitySource for JsonTestEntitySource {
+    impl lix::plugin::runtime::WasmEntitySource for JsonTestEntitySource {
         fn next_page(
             &mut self,
             _max_bytes: u32,
-        ) -> Result<Option<lix::wasm::WasmEntityPage>, LixError> {
+        ) -> Result<Option<lix::plugin::runtime::WasmEntityPage>, LixError> {
             Ok(self
                 .entities
                 .take()
-                .map(|entities| lix::wasm::WasmEntityPage { entities }))
+                .map(|entities| lix::plugin::runtime::WasmEntityPage { entities }))
         }
     }
 
@@ -4891,11 +4891,11 @@ mod tests {
     #[test]
     fn entity_sources_and_transition_sinks_share_one_byte_budget() {
         struct EmptyEntitySource;
-        impl lix::wasm::WasmEntitySource for EmptyEntitySource {
+        impl lix::plugin::runtime::WasmEntitySource for EmptyEntitySource {
             fn next_page(
                 &mut self,
                 _max_bytes: u32,
-            ) -> Result<Option<lix::wasm::WasmEntityPage>, LixError> {
+            ) -> Result<Option<lix::plugin::runtime::WasmEntityPage>, LixError> {
                 Ok(None)
             }
         }
