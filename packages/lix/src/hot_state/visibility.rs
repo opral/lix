@@ -8,6 +8,45 @@ use crate::hot_state::{
     MaterializedHotStateExactBatch, MaterializedHotStateRowRef,
 };
 
+// Scanned-vs-returned accounting for the single-entity `lix_binary_blob_ref`
+// probe that every `lix_file` content update issues. `calls` exists so a zero
+// scanned count is readable as "the pushdown works" rather than as "this
+// counter never ran" -- the two are otherwise indistinguishable.
+#[cfg(test)]
+thread_local! {
+    static BLOB_REF_PROBE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BLOB_REF_PROBE_ROWS_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BLOB_REF_PROBE_ROWS_RETURNED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_blob_ref_probe_stats() {
+    BLOB_REF_PROBE_CALLS.with(|calls| calls.set(0));
+    BLOB_REF_PROBE_ROWS_SCANNED.with(|rows| rows.set(0));
+    BLOB_REF_PROBE_ROWS_RETURNED.with(|rows| rows.set(0));
+}
+
+/// `(calls, rows_scanned, rows_returned)` for single-entity blob-ref probes.
+///
+/// `rows_scanned` counts what the underlying hot-state scan handed back before
+/// visibility resolution -- i.e. what the storage layer actually read. If
+/// `entity_pks` is pushed down to a seek this tracks `rows_returned`; if it is
+/// applied as an in-memory filter it tracks the branch's blob-ref count.
+#[cfg(test)]
+pub(crate) fn blob_ref_probe_stats() -> (usize, usize, usize) {
+    (
+        BLOB_REF_PROBE_CALLS.with(std::cell::Cell::get),
+        BLOB_REF_PROBE_ROWS_SCANNED.with(std::cell::Cell::get),
+        BLOB_REF_PROBE_ROWS_RETURNED.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(test)]
+fn is_single_entity_blob_ref_probe(request: &HotStateScanRequest) -> bool {
+    request.filter.schema_keys == ["lix_binary_blob_ref"] && request.filter.entity_pks.len() == 1
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VisibilityRequest {
     pub(crate) branch_scope: VisibilityBranchScope,
@@ -148,7 +187,9 @@ where
     candidate_request.filter.branch_ids = expanded_branch_ids(&visible_branch_ids);
     let staged_rows = staged.staged_batch(&candidate_request)?;
     let rows = base.scan_batch(&candidate_request).await?;
-    Ok(resolve_visible_batch(
+    #[cfg(test)]
+    let scanned = rows.len();
+    let resolved = resolve_visible_batch(
         rows,
         staged_rows,
         &VisibilityRequest {
@@ -158,7 +199,15 @@ where
             include_tombstones: request.filter.include_tombstones,
             limit: request.limit,
         },
-    ))
+    );
+    #[cfg(test)]
+    if is_single_entity_blob_ref_probe(request) {
+        BLOB_REF_PROBE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        BLOB_REF_PROBE_ROWS_SCANNED.with(|rows| rows.set(rows.get().saturating_add(scanned)));
+        BLOB_REF_PROBE_ROWS_RETURNED
+            .with(|rows| rows.set(rows.get().saturating_add(resolved.len())));
+    }
+    Ok(resolved)
 }
 
 pub(crate) async fn overlay_scan_tracked_batch<S>(
