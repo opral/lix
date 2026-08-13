@@ -435,7 +435,7 @@ impl<'de> Deserialize<'de> for TransactionJson {
 ///
 /// SQL providers stage semantic rows, not final storage rows. INSERT providers
 /// may omit defaulted snapshot fields and leave `entity_pk` unset when the
-/// target schema has an `x-lix-primary-key`; transaction normalization applies
+/// target schema has a `primary_key`; transaction normalization applies
 /// schema defaults and derives the final identity. Typed UPDATE providers must
 /// stage full rewritten snapshots after applying column assignments to the
 /// existing row.

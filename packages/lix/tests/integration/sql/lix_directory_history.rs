@@ -329,7 +329,7 @@ simulation_test!(
                 &format!(
 					"SELECT id, path, name, lixcol_is_deleted, lixcol_source_changes, lixcol_depth \
 	                 FROM lix_directory_history('{delete_commit_id}') \
-	                   WHERE lixcol_entity_pk IN (lix_json('[\"01940000-0000-7000-8000-000000000001\"]'), lix_json('[\"01940000-0000-7000-8000-000000000002\"]')) \
+	                   WHERE lixcol_entity_pk IN (CAST('[\"01940000-0000-7000-8000-000000000001\"]' AS JSONB), CAST('[\"01940000-0000-7000-8000-000000000002\"]' AS JSONB)) \
 	                   AND lixcol_depth = 0 \
 	                 ORDER BY lixcol_entity_pk"
 				),

@@ -215,7 +215,7 @@ simulation_test!(
                     "SELECT file_id \
                      FROM lix_change \
                      WHERE schema_key = 'lix_directory_descriptor' \
-                       AND entity_pk = lix_json('[\"{directory_id}\"]') \
+                       AND entity_pk = CAST('[\"{directory_id}\"]' AS JSONB) \
                      ORDER BY created_at"
                 ),
             )
@@ -1053,7 +1053,7 @@ simulation_test!(
             .execute(
                 "SELECT schema_key \
              FROM lix_change \
-             WHERE entity_pk = lix_json('[\"66696c65-2d72-8561-846d-650000000000\"]') \
+             WHERE entity_pk = CAST('[\"66696c65-2d72-8561-846d-650000000000\"]' AS JSONB) \
                AND schema_key IN ('lix_file_descriptor', 'lix_binary_blob_ref') \
              ORDER BY schema_key",
                 &[],
@@ -1348,7 +1348,7 @@ simulation_test!(
                  VALUES (\
                    '74657874-2d66-856e-8374-696f6e2d6400',\
                    '/text-function.bin',\
-                   lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')\
+                   lix_json_get_text(CAST('{\"value\":\"hello\"}' AS JSONB), 'value')\
                  )",
             ),
         ] {
@@ -1659,7 +1659,7 @@ simulation_test!(
                 "SELECT id \
              FROM lix_change \
              WHERE schema_key = 'lix_binary_blob_ref' \
-               AND entity_pk = lix_json('[\"656d7074-792d-8461-8461-2d66696c6500\"]')",
+               AND entity_pk = CAST('[\"656d7074-792d-8461-8461-2d66696c6500\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2630,7 +2630,7 @@ simulation_test!(
             ("75706461-7465-8d74-8578-742d66696c00", "'hello'"),
             (
                 "75706461-7465-8d74-8578-742d66756e00",
-                "lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')",
+                "lix_json_get_text(CAST('{\"value\":\"hello\"}' AS JSONB), 'value')",
             ),
             ("75706461-7465-8d69-8e74-2d66696c6500", "12345"),
             ("75706461-7465-8d66-8c6f-61742d666900", "1.5"),
@@ -3075,7 +3075,7 @@ simulation_test!(
                 "SELECT id \
                  FROM lix_change \
                  WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"616c7265-6164-892d-856d-7074792d6600\"]')",
+                   AND entity_pk = CAST('[\"616c7265-6164-892d-856d-7074792d6600\"]' AS JSONB)",
                 &[],
             )
             .await

@@ -15,7 +15,7 @@ simulation_test!(lix_key_value_roundtrips_arbitrary_json, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_key_value (key, value) \
-             VALUES ('kv-json', lix_json('{\"nested\":{\"flag\":true,\"items\":[1,\"two\",null]}}'))",
+             VALUES ('kv-json', CAST('{\"nested\":{\"flag\":true,\"items\":[1,\"two\",null]}}' AS JSONB))",
             &[],
         )
         .await
@@ -57,7 +57,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global) \
                  VALUES ('kv-canonical-persisted-global', \
-                         lix_json('{ \"z\": { \"b\": 2, \"a\": 1 }, \"a\": [3, 2] }'), true)",
+                         CAST('{ \"z\": { \"b\": 2, \"a\": 1 }, \"a\": [3, 2] }' AS JSONB), true)",
                 &[],
             )
             .await
@@ -66,7 +66,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
                  VALUES ('kv-canonical-persisted-active', \
-                         lix_json('{ \"z\": { \"d\": 4, \"c\": 3 }, \"a\": [5, 4] }'))",
+                         CAST('{ \"z\": { \"d\": 4, \"c\": 3 }, \"a\": [5, 4] }' AS JSONB))",
                 &[],
             )
             .await

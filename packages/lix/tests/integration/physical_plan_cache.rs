@@ -21,7 +21,7 @@ async fn reusable_physical_read_plan_rebinds_snapshot_and_exact_parameters() {
     for schema in multi_entity_schemas() {
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await

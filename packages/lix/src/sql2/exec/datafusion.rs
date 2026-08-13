@@ -2544,6 +2544,7 @@ fn datafusion_expr_from_bound_expr(
                 BoundCastType::BigInt => DataType::Int64,
                 BoundCastType::Double => DataType::Float64,
                 BoundCastType::Boolean => DataType::Boolean,
+                BoundCastType::Jsonb => DataType::Utf8,
             };
             Ok(Expr::Cast(Cast::new(
                 Box::new(datafusion_expr_from_bound_expr(session, expr, params)?),
@@ -2601,7 +2602,10 @@ fn bound_expr_is_json(expr: &BoundExpr, schema: &Schema) -> bool {
             .find(|field| field.name() == &column.name)
             .is_some_and(|field| field_is_json(field.as_ref())),
         BoundExpr::Literal(BoundLiteral::Json(_)) => true,
-        BoundExpr::Function { name, .. } => matches!(name.as_str(), "lix_json" | "lix_json_get"),
+        BoundExpr::Function { name, .. } => matches!(
+            name.as_str(),
+            "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+        ),
         _ => false,
     }
 }
@@ -2763,7 +2767,7 @@ fn validate_json_predicate_params(
                 LixError::CODE_TYPE_MISMATCH,
                 "JSON columns can only be compared with JSON expressions",
             )
-            .with_hint("Use lix_json(...) or pass a JSON parameter value instead of bare text."));
+            .with_hint("Use CAST(... AS JSONB) or pass a JSON parameter value instead of bare text."));
         }
     }
     Ok(())
@@ -5071,7 +5075,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"aggregate_filter_test\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"integer\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"aggregate_filter_test\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"integer\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}' AS JSONB),\
                  false, false)",
                 &[],
             )
@@ -5180,7 +5184,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -5191,7 +5195,7 @@ mod tests {
             .execute(
                 "INSERT INTO test_state_schema \
 	             (lixcol_entity_pk, value, count, lixcol_metadata, lixcol_untracked) \
-	             VALUES (lix_json('[\"entity-history\"]'), 'A', 7, '{\"source\":\"history\"}', false)",
+	             VALUES (CAST('[\"entity-history\"]' AS JSONB), 'A', 7, '{\"source\":\"history\"}', false)",
                 &[],
             )
             .await?;
@@ -5239,7 +5243,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
+                 CAST('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -5424,7 +5428,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
+                 CAST('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -5555,10 +5559,10 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global) VALUES \
-                 ('local-only', lix_json('1'), false), \
-                 ('global-only', lix_json('2'), true), \
-                 ('shadowed', lix_json('3'), true), \
-                 ('shadowed', lix_json('4'), false)",
+                 ('local-only', CAST('1' AS JSONB), false), \
+                 ('global-only', CAST('2' AS JSONB), true), \
+                 ('shadowed', CAST('3' AS JSONB), true), \
+                 ('shadowed', CAST('4' AS JSONB), false)",
                 &[],
             )
             .await
@@ -5604,7 +5608,7 @@ mod tests {
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
+             CAST('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}' AS JSONB),\
              false,\
              false\
              )",
@@ -5793,7 +5797,7 @@ mod tests {
                 &format!(
                     "SELECT value, count, lixcol_entity_pk, lixcol_depth \
 	             FROM test_state_schema_history('{head_commit_id}') \
-	             WHERE lixcol_entity_pk = lix_json('[\"entity-history\"]')"
+	             WHERE lixcol_entity_pk = CAST('[\"entity-history\"]' AS JSONB)"
                 ),
                 &[],
             )
@@ -6708,7 +6712,7 @@ mod tests {
             &mut ctx,
             "INSERT INTO test_state_schema_by_branch (\
 	     lixcol_entity_pk, lixcol_branch_id, value\
-	     ) VALUES (lix_json('[\"entity-c\"]'), '01920000-0000-7000-8000-0000000000b1', 'C')",
+	     ) VALUES (CAST('[\"entity-c\"]' AS JSONB), '01920000-0000-7000-8000-0000000000b1', 'C')",
             &[],
         )
         .await
@@ -6757,7 +6761,7 @@ mod tests {
             &mut ctx,
             "INSERT INTO test_state_schema_by_branch (\
              lixcol_entity_pk, lixcol_branch_id, value\
-             ) VALUES (lix_json('[\"entity-c\"]'), $1, 'C')",
+             ) VALUES (CAST('[\"entity-c\"]' AS JSONB), $1, 'C')",
             &[Value::Text(
                 "01920000-0000-7000-8000-0000000000b1".to_string(),
             )],
@@ -6799,7 +6803,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema (lixcol_entity_pk, value) \
-	     VALUES (lix_json('[\"entity-c\"]'), 'C')",
+	     VALUES (CAST('[\"entity-c\"]' AS JSONB), 'C')",
             &[],
         )
         .await
@@ -6842,7 +6846,7 @@ mod tests {
                 "properties": {
                     "id": {
                         "type": "string",
-                        "x-lix-default": "lix_uuid_v7()"
+                        "x-lix-default": "uuidv7()"
                     },
                     "label": { "type": "string", "default": "untitled" }
                 },
@@ -6909,7 +6913,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema (lixcol_entity_pk, value) \
-             VALUES (lix_json('[\"entity-c\"]'), 'C')",
+             VALUES (CAST('[\"entity-c\"]' AS JSONB), 'C')",
             &[],
         )
         .await

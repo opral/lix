@@ -107,7 +107,7 @@ mod tests {
             .await
             .expect("engine should open");
         let session = engine
-            .open_session_at(&receipt.main_branch_id)
+            .open_session(&receipt.main_branch_id)
             .await
             .expect("main session should open");
         session
@@ -126,7 +126,7 @@ mod tests {
         let no_op = session
             .execute(
                 "UPDATE lix_registered_schema SET value = value \
-                 WHERE lixcol_entity_pk = lix_json('[\"missing-schema\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"missing-schema\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -141,7 +141,7 @@ mod tests {
         rolled_back
             .execute(
                 "INSERT INTO lix_registered_schema \
-                 (value, lixcol_global, lixcol_untracked) VALUES ($1, false, true)",
+                 (schema_key, value, lixcol_global, lixcol_untracked) VALUES ($1 ->> 'x-lix-key', $1, false, true)",
                 &[Value::Json(test_schema("rolled_back_schema", false).into())],
             )
             .await
@@ -176,7 +176,7 @@ mod tests {
         let amended = session
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"tracked_revision_probe\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"tracked_revision_probe\"]' AS JSONB)",
                 &[Value::Json(
                     test_schema("tracked_revision_probe", true).into(),
                 )],
@@ -190,7 +190,7 @@ mod tests {
         let delete_error = session
             .execute(
                 "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"tracked_revision_probe\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"tracked_revision_probe\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -213,11 +213,11 @@ mod tests {
             .await
             .expect("second engine should open");
         let session_a = engine_a
-            .open_session_at(&receipt.main_branch_id)
+            .open_session(&receipt.main_branch_id)
             .await
             .expect("first session should open");
         let session_b = engine_b
-            .open_session_at(&receipt.main_branch_id)
+            .open_session(&receipt.main_branch_id)
             .await
             .expect("second session should open");
 
@@ -287,7 +287,7 @@ mod tests {
             .await
             .expect("engine should open");
         let session = engine
-            .open_session_at(&receipt.main_branch_id)
+            .open_session(&receipt.main_branch_id)
             .await
             .expect("main session should open");
         let initial_head = engine
@@ -349,7 +349,7 @@ mod tests {
         let adapter = StorageAdapter::new(storage.clone());
         let engine = Engine::new(storage).await.expect("engine should open");
         let main = engine
-            .open_session_at(&receipt.main_branch_id)
+            .open_session(&receipt.main_branch_id)
             .await
             .expect("main session should open");
         let revision_before_branch = current_revision(&adapter).await;
@@ -362,7 +362,7 @@ mod tests {
         .expect("draft branch should be created");
         assert_ne!(current_revision(&adapter).await, revision_before_branch);
         let draft = engine
-            .open_session_at(draft_branch_id)
+            .open_session(draft_branch_id)
             .await
             .expect("draft session should open");
         if diverge_target {
@@ -423,7 +423,7 @@ mod tests {
     async fn register_schema(session: &SessionContext<Memory>, schema_key: &str, untracked: bool) {
         let sql = format!(
             "INSERT INTO lix_registered_schema \
-             (value, lixcol_global, lixcol_untracked) VALUES ($1, false, {untracked})"
+             (schema_key, value, lixcol_global, lixcol_untracked) VALUES ($1 ->> 'x-lix-key', $1, false, {untracked})"
         );
         session
             .execute(&sql, &[Value::Json(test_schema(schema_key, false).into())])

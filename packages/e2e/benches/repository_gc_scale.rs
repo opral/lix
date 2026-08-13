@@ -245,7 +245,7 @@ where
         "additionalProperties": false
     });
     main.execute(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
         &[Value::Text(schema.to_string())],
     )
     .await
@@ -280,7 +280,7 @@ where
                 .expect("repository-GC fixture row index overflow");
             transaction
                 .execute(
-                    "INSERT INTO repository_gc_fixture (path, value) VALUES ($1, lix_json($2))",
+                    "INSERT INTO repository_gc_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))",
                     &[
                         Value::Text(format!("/row/{row:08}")),
                         Value::Text(format!(r#"{{"commit":{commit_index},"row":{row}}}"#)),

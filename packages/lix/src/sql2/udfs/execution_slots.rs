@@ -8,7 +8,7 @@ use crate::functions::FunctionProviderHandle;
 /// Per-session storage for the per-statement facts the execution UDFs report.
 ///
 /// The five execution functions (`lix_active_account_id`,
-/// `lix_active_branch_id`, `lix_active_branch_commit_id`, `lix_uuid_v7`,
+/// `lix_active_branch_id`, `lix_active_branch_commit_id`, `uuidv7`,
 /// `lix_timestamp`) used to be registered and deregistered on every statement so
 /// each one could capture that statement's values in its own fields. They are
 /// now registered once, when the session is created, and read this slot at

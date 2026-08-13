@@ -208,7 +208,7 @@ and alignment contract.
 ## Identity
 
 Schemas whose `/id` primary-key string property declares both
-`"format": "uuid"` and `"x-lix-default": "lix_uuid_v7()"` permit keyless
+`"format": "uuid"` and `"x-lix-default": "uuidv7()"` permit keyless
 creates. The plugin emits a transition-local `u32` reference and an ID-free
 snapshot. The host derives the canonical UUIDv7, completes and validates the
 snapshot, and converts the create to an ordinary keyed entity before storage.

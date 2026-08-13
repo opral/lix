@@ -51,7 +51,6 @@ pub(crate) mod account;
 mod binary_cas;
 pub(crate) mod branch;
 pub(crate) mod catalog;
-pub(crate) mod cel;
 #[cfg(feature = "storage-benches")]
 pub mod changelog;
 #[cfg(not(feature = "storage-benches"))]
@@ -148,6 +147,9 @@ pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
     validate_lix_schema_definition,
 };
+
+/// PostgreSQL-derived Lix Schema v1 model and validation API.
+pub use lix_schema as schema_v1;
 
 pub use common::LixError;
 pub use common::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};

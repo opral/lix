@@ -1372,7 +1372,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata) \
-                 VALUES ('6469722d-7061-8468-8d6d-657461000000', '/path-meta', lix_json('{\"version\":1}'))",
+                 VALUES ('6469722d-7061-8468-8d6d-657461000000', '/path-meta', CAST('{\"version\":1}' AS JSONB))",
                 &[],
             )
             .await
@@ -1381,7 +1381,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_directory (path, lixcol_metadata) \
-                 VALUES ('/path-meta', lix_json('{\"version\":2}')) \
+                 VALUES ('/path-meta', CAST('{\"version\":2}' AS JSONB)) \
                  ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata",
                 &[],
             )
@@ -1569,7 +1569,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata, lixcol_global) \
-                 VALUES ('6469722d-676c-8f62-816c-2d7061746800', '/global-dir', lix_json('{\"version\":1}'), true)",
+                 VALUES ('6469722d-676c-8f62-816c-2d7061746800', '/global-dir', CAST('{\"version\":1}' AS JSONB), true)",
                 &[],
             )
             .await
@@ -1578,7 +1578,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_directory (path, lixcol_metadata) \
-                 VALUES ('/global-dir', lix_json('{\"version\":2}')) \
+                 VALUES ('/global-dir', CAST('{\"version\":2}' AS JSONB)) \
                  ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata",
                 &[],
             )

@@ -333,7 +333,7 @@ where
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES (lix_json($1), false, false)",
+             VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await
@@ -359,7 +359,7 @@ async fn seed_documents<S>(
             let document = shape.document(index, 0, &revisions[index]);
             transaction
                 .execute(
-                    "INSERT INTO expu_document (path, doc) VALUES ($1, lix_json($2))",
+                    "INSERT INTO expu_document (path, doc) VALUES ($1, CAST($2 AS JSONB))",
                     &[Value::Text(path.clone()), Value::Text(document.clone())],
                 )
                 .await
@@ -400,7 +400,7 @@ async fn edit_documents<S>(
                 let document = shape.document(index, round, &revisions[index]);
                 transaction
                     .execute(
-                        "UPDATE expu_document SET doc = lix_json($2) WHERE path = $1",
+                        "UPDATE expu_document SET doc = CAST($2 AS JSONB) WHERE path = $1",
                         &[Value::Text(path.clone()), Value::Text(document.clone())],
                     )
                     .await
@@ -439,7 +439,7 @@ async fn seed_key_values<S>(
         let payload = key_value_payload(key, 0, value_bytes, rewrite);
         transaction
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[Value::Text(name.clone()), Value::Text(payload.clone())],
             )
             .await
@@ -470,7 +470,7 @@ async fn edit_key_values<S>(
             let payload = key_value_payload(key, round, value_bytes, rewrite);
             transaction
                 .execute(
-                    "UPDATE lix_key_value SET value = lix_json($2) WHERE key = $1",
+                    "UPDATE lix_key_value SET value = CAST($2 AS JSONB) WHERE key = $1",
                     &[Value::Text(name.clone()), Value::Text(payload.clone())],
                 )
                 .await

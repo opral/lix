@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn referenced_provider_selection_registers_none_for_table_free_queries() {
         assert_eq!(
-            selection_for_sql(&["SELECT 1, lix_uuid_v7()"]),
+            selection_for_sql(&["SELECT 1, uuidv7()"]),
             ProviderSelection::Only(BTreeSet::new())
         );
     }

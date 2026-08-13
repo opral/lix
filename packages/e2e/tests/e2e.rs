@@ -6930,15 +6930,15 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(
-            r#"{"x-lix-key":"write_owner_task","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string","x-lix-default":"lix_uuid_v7()"},"title":{"type":"string"}},"required":["id","title"],"additionalProperties":false}"#.to_string(),
+            r#"{"x-lix-key":"write_owner_task","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string","x-lix-default":"uuidv7()"},"title":{"type":"string"}},"required":["id","title"],"additionalProperties":false}"#.to_string(),
         )],
     )
     .await
     .expect("register generated-default write-owner schema");
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1)), (lix_json($2))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB)), (CAST($2 AS JSONB))",
         &[
             Value::Text(
                 r#"{"x-lix-key":"write_owner_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}"#.to_string(),
@@ -7549,7 +7549,7 @@ where
         let inserted = transaction
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (lix_json($1), false, false)",
+                 VALUES (CAST($1 AS JSONB), false, false)",
                 &[Value::Text(schema.to_owned())],
             )
             .await
@@ -7578,7 +7578,7 @@ where
             transaction
                 .execute(
                     "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                     VALUES (lix_json($1), false, false)",
+                     VALUES (CAST($1 AS JSONB), false, false)",
                     &[Value::Text(schema.to_owned())],
                 )
                 .await

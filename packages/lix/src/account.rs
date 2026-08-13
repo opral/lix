@@ -159,7 +159,7 @@ mod tests {
             .expect("attributed session should open");
         session
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('token-control', lix_json('1'))",
+                "INSERT INTO lix_key_value (key, value) VALUES ('token-control', CAST('1' AS JSONB))",
                 &[],
             )
             .await
@@ -171,7 +171,7 @@ mod tests {
         );
         session
             .execute(
-                "UPDATE lix_key_value SET value = lix_json('2') WHERE key = 'token-control'",
+                "UPDATE lix_key_value SET value = CAST('2' AS JSONB) WHERE key = 'token-control'",
                 &[],
             )
             .await
@@ -210,7 +210,7 @@ mod tests {
         // is what makes it re-read and fail.
         let error = session
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('after-disable', lix_json('1'))",
+                "INSERT INTO lix_key_value (key, value) VALUES ('after-disable', CAST('1' AS JSONB))",
                 &[],
             )
             .await

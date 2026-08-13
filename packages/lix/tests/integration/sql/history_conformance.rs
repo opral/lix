@@ -19,7 +19,7 @@ simulation_test!(
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_history_table_type\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_history_table_type\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -61,7 +61,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_contract_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_history_contract_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -112,7 +112,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_conformance\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_history_conformance\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -125,7 +125,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
             .execute(
                 "INSERT INTO engine_history_conformance \
                  (lixcol_entity_pk, id, value, lixcol_untracked) \
-                 VALUES (lix_json('[\"history-conformance-entity\"]'), 'history-conformance-entity', 'one', false)",
+                 VALUES (CAST('[\"history-conformance-entity\"]' AS JSONB), 'history-conformance-entity', 'one', false)",
                 &[],
             )
             .await
@@ -134,7 +134,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
         .execute(
             "UPDATE engine_history_conformance \
                  SET value = 'two' \
-                 WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"history-conformance-entity\"]' AS JSONB)",
             &[],
         )
         .await
@@ -142,7 +142,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
     session
         .execute(
             "DELETE FROM engine_history_conformance \
-                 WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"history-conformance-entity\"]' AS JSONB)",
             &[],
         )
         .await
@@ -152,7 +152,7 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
         &session,
         "SELECT id, value, lixcol_entity_pk, lixcol_depth \
              FROM engine_history_conformance_history() \
-               WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]') \
+               WHERE lixcol_entity_pk = CAST('[\"history-conformance-entity\"]' AS JSONB) \
              ORDER BY lixcol_depth",
     )
     .await;
@@ -241,7 +241,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_composite_pk\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_history_composite_pk\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -314,7 +314,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_nested_pk\",\"x-lix-primary-key\":[\"/identity/tenant\",\"/identity/id\"],\"type\":\"object\",\"properties\":{\"identity\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"tenant\",\"id\"],\"additionalProperties\":false},\"value\":{\"type\":\"string\"}},\"required\":[\"identity\",\"value\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_history_nested_pk\",\"x-lix-primary-key\":[\"/identity/tenant\",\"/identity/id\"],\"type\":\"object\",\"properties\":{\"identity\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"tenant\",\"id\"],\"additionalProperties\":false},\"value\":{\"type\":\"string\"}},\"required\":[\"identity\",\"value\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -327,7 +327,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_history_nested_pk \
                  (identity, value, lixcol_untracked) \
-                 VALUES (lix_json('{\"tenant\":\"acme\",\"id\":\"7\"}'), 'one', false)",
+                 VALUES (CAST('{\"tenant\":\"acme\",\"id\":\"7\"}' AS JSONB), 'one', false)",
                 &[],
             )
             .await
@@ -335,7 +335,7 @@ simulation_test!(
         session
             .execute(
                 "DELETE FROM engine_history_nested_pk \
-                 WHERE lixcol_entity_pk = lix_json('[\"acme\",\"7\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"acme\",\"7\"]' AS JSONB)",
                 &[],
             )
             .await

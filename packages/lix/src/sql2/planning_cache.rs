@@ -1277,18 +1277,18 @@ mod tests {
         let cache = test_cache(8);
         let first = cache
             .auto_parameterized_update(
-                "UPDATE notes SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
+                "UPDATE notes SET value = CAST('{\"text\":\"first\"}' AS JSONB) WHERE id = 'a'",
             )
             .expect("literal update auto-parameterizes");
         let second = cache
             .auto_parameterized_update(
-                "UPDATE notes SET value = lix_json('{\"text\":\"second\"}') WHERE id = 'b'",
+                "UPDATE notes SET value = CAST('{\"text\":\"second\"}' AS JSONB) WHERE id = 'b'",
             )
             .expect("case-equivalent literal update auto-parameterizes");
 
         assert_eq!(
             first.sql.as_ref(),
-            "UPDATE notes SET value = lix_json($1) WHERE id = $2"
+            "UPDATE notes SET value = CAST($1 AS JSONB) WHERE id = $2"
         );
         assert_eq!(
             first.params,
@@ -1312,19 +1312,19 @@ mod tests {
         let cache = test_cache(8);
         let template = cache
             .auto_parameterized_update(
-                "UPDATE \"notes\" SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
+                "UPDATE \"notes\" SET value = CAST('{\"text\":\"first\"}' AS JSONB) WHERE id = 'a'",
             )
             .unwrap();
 
         assert!(cache.update_literal_shape_matches(
-            "UPDATE \"notes\" SET value = lix_json('{\"text\":\"it''''s fine\"}') WHERE id = 'b'",
+            "UPDATE \"notes\" SET value = CAST('{\"text\":\"it''''s fine\"}' AS JSONB) WHERE id = 'b'",
             &template.sql,
         ));
         for different_shape in [
-            "UPDATE \"notes\" SET value = lix_json('{}') WHERE other_id = 'b'",
-            "UPDATE notes SET value = lix_json('{}') WHERE id = 'b'",
-            "UPDATE \"notes\" SET value = lix_json('{}') WHERE id = 'b' -- comment",
-            "UPDATE \"notes\" SET value = lix_json('{}') WHERE id = $1",
+            "UPDATE \"notes\" SET value = CAST('{}' AS JSONB) WHERE other_id = 'b'",
+            "UPDATE notes SET value = CAST('{}' AS JSONB) WHERE id = 'b'",
+            "UPDATE \"notes\" SET value = CAST('{}' AS JSONB) WHERE id = 'b' -- comment",
+            "UPDATE \"notes\" SET value = CAST('{}' AS JSONB) WHERE id = $1",
         ] {
             assert!(
                 !cache.update_literal_shape_matches(different_shape, &template.sql),
@@ -1341,7 +1341,7 @@ mod tests {
         params[1].push_str("stale-id");
 
         assert!(cache.decode_certified_update_literals_into(
-            "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'b'",
+            "UPDATE notes SET value = CAST('{\"text\":\"it''s fine\"}' AS JSONB) WHERE id = 'b'",
             &mut params,
         ));
         assert_eq!(params, ["{\"text\":\"it's fine\"}", "b"]);
@@ -1356,13 +1356,13 @@ mod tests {
         let cache = test_cache(8);
         let template = cache
             .auto_parameterized_update(
-                "UPDATE notes SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
+                "UPDATE notes SET value = CAST('{\"text\":\"first\"}' AS JSONB) WHERE id = 'a'",
             )
             .unwrap();
         let mut escape_scratch = SmallVec::new();
         let borrowed = cache
             .decode_update_literals_for_shape(
-                "UPDATE notes SET value = lix_json('{\"text\":\"second\"}') WHERE id = 'b'",
+                "UPDATE notes SET value = CAST('{\"text\":\"second\"}' AS JSONB) WHERE id = 'b'",
                 &template.sql,
                 2,
                 &mut escape_scratch,
@@ -1375,7 +1375,7 @@ mod tests {
 
         let escaped = cache
             .decode_update_literals_for_shape(
-                "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'c'",
+                "UPDATE notes SET value = CAST('{\"text\":\"it''s fine\"}' AS JSONB) WHERE id = 'c'",
                 &template.sql,
                 2,
                 &mut escape_scratch,
@@ -1393,7 +1393,7 @@ mod tests {
         let allocation = escape_scratch[0].as_ptr();
         let escaped_again = cache
             .decode_update_literals_for_shape(
-                "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'd'",
+                "UPDATE notes SET value = CAST('{\"text\":\"it''s fine\"}' AS JSONB) WHERE id = 'd'",
                 &template.sql,
                 2,
                 &mut escape_scratch,

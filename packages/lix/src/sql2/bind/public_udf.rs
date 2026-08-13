@@ -54,9 +54,8 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
     let arity = function_arity(&function.args);
 
     match name {
-        "lix_json" => expect_exact_arity(name, arity, 1),
         "lix_timestamp"
-        | "lix_uuid_v7"
+        | "uuidv7"
         | "lix_active_branch_id"
         | "lix_active_branch_commit_id" => expect_exact_arity(name, arity, 0),
         _ => Ok(()),
@@ -96,7 +95,7 @@ impl Visitor for DurableRuntimeFunctionVisitor {
 
         if matches!(
             public_lix_function_name(function),
-            Some("lix_timestamp" | "lix_uuid_v7")
+            Some("lix_timestamp" | "uuidv7")
         ) {
             self.found = true;
             return ControlFlow::Break(());
@@ -153,9 +152,8 @@ fn public_lix_function_name(function: &Function) -> Option<&'static str> {
         ObjectNamePart::Function(_) => return None,
     };
     match ident.to_ascii_lowercase().as_str() {
-        "lix_json" => Some("lix_json"),
         "lix_timestamp" => Some("lix_timestamp"),
-        "lix_uuid_v7" => Some("lix_uuid_v7"),
+        "uuidv7" => Some("uuidv7"),
         "lix_active_branch_id" => Some("lix_active_branch_id"),
         "lix_active_branch_commit_id" => Some("lix_active_branch_commit_id"),
         _ => None,
@@ -202,31 +200,31 @@ mod tests {
 
     #[test]
     fn rejects_lix_udf_wrong_arity_as_public_invalid_param() {
-        let error = validate_public_udf_calls("SELECT lix_uuid_v7('extra')")
+        let error = validate_public_udf_calls("SELECT uuidv7('extra')")
             .expect_err("wrong arity should be rejected");
         assert_eq!(error.code, "LIX_INVALID_PARAM");
-        assert!(error.message.contains("lix_uuid_v7 requires no arguments"));
+        assert!(error.message.contains("uuidv7 requires no arguments"));
     }
 
     #[test]
     fn accepts_valid_public_lix_udf_calls() {
-        validate_public_udf_calls("SELECT lix_json('{\"x\":1}'), lix_timestamp()")
+        validate_public_udf_calls("SELECT '{\"x\":1}'::jsonb, lix_timestamp()")
             .expect("valid calls should pass public validation");
     }
 
     #[test]
     fn marks_direct_durable_runtime_functions() {
         assert!(statement_has_durable_runtime_function(&parse_statement(
-            "SELECT lix_uuid_v7()"
+            "SELECT uuidv7()"
         )));
         assert!(statement_has_durable_runtime_function(&parse_statement(
             "SELECT lix_timestamp()"
         )));
         assert!(!statement_has_durable_runtime_function(&parse_statement(
-            "SELECT lix_json('{\"x\":1}')"
+            "SELECT '{\"x\":1}'::jsonb"
         )));
         assert!(!statement_has_durable_runtime_function(&parse_statement(
-            "SELECT 'lix_uuid_v7()' AS literal"
+            "SELECT 'uuidv7()' AS literal"
         )));
         assert!(!statement_has_durable_runtime_function(&parse_statement(
             "SELECT 1 /* lix_timestamp() */"
@@ -236,11 +234,11 @@ mod tests {
     #[test]
     fn marks_nested_aliased_and_explained_durable_runtime_functions() {
         for sql in [
-            "WITH generated AS (SELECT lix_uuid_v7() AS value) SELECT value FROM generated",
+            "WITH generated AS (SELECT uuidv7() AS value) SELECT value FROM generated",
             "SELECT value FROM (SELECT lix_timestamp() AS value) AS generated",
-            "SELECT lix_uuid_v7() AS generated_id",
+            "SELECT uuidv7() AS generated_id",
             "SELECT CASE WHEN true THEN lix_timestamp() ELSE 'never' END AS value",
-            "EXPLAIN SELECT lix_uuid_v7()",
+            "EXPLAIN SELECT uuidv7()",
         ] {
             assert!(
                 statement_has_durable_runtime_function(&parse_statement(sql)),
