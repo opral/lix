@@ -4,6 +4,7 @@
 mod core;
 mod markdown_file;
 mod model;
+mod order_key;
 mod schemas;
 
 use core::{

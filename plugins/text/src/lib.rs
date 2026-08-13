@@ -7,6 +7,7 @@
 
 mod core;
 mod model;
+mod order_key;
 
 use core::{Document, FileEdit, LineIdentity};
 use lix::plugin as sdk;

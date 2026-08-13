@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 mod core;
+mod order_key;
 
 use core::{
     ArenaElementSpan, ChangeEffect, Document, EntityChange, EntityImportBuilder, EntityRecord,

@@ -3372,10 +3372,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lix_order_key"
-version = "0.11.0"
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4095,7 +4091,6 @@ name = "plugin_excalidraw"
 version = "0.11.0"
 dependencies = [
  "lix",
- "lix_order_key",
  "serde_json",
  "uuid",
 ]
@@ -4119,7 +4114,6 @@ dependencies = [
  "chardetng",
  "encoding_rs",
  "lix",
- "lix_order_key",
  "markdown-syntax",
  "serde",
  "serde_json",
@@ -4132,7 +4126,6 @@ version = "0.11.0"
 dependencies = [
  "base64 0.22.1",
  "lix",
- "lix_order_key",
  "serde",
  "serde_json",
  "uuid",
