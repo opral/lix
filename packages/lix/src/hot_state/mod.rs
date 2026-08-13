@@ -48,7 +48,8 @@ pub(crate) use tracked_head::stage_retire_hot_generation;
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
     BROAD_CANONICAL_CREATED_AT_HITS, BROAD_CANONICAL_CREATED_AT_KEYS,
-    BROAD_CANONICAL_CREATED_AT_LOOKUPS,
+    BROAD_CANONICAL_CREATED_AT_LOOKUPS, COMPACTED_TOMBSTONE_CANDIDATES,
+    COMPACTED_TOMBSTONE_COMPACTED, COMPACTED_TOMBSTONE_OFFERED, COMPACTED_TOMBSTONE_ROUTES,
 };
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{

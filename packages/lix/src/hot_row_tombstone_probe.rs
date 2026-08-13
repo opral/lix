@@ -1380,7 +1380,16 @@ async fn recreated_identity_created_at_after_compaction() {
          entries {}->{} tombstones {}->{}",
         before.entries, after.entries, before.tombstones, after.tombstones
     );
-    assert!(removed > 0, "the delete must have left a tombstone to remove");
+    // The engine now compacts a discharged tombstone at the checkpoint itself
+    // (`hot_compaction_mask`), so by this point there is usually nothing left
+    // for the simulation to remove. Either state is a valid entry into the
+    // question this arm asks — what a re-insert over a *missing* tombstone
+    // gets — and phase 10 pins the engine-driven route with its own test. What
+    // must hold here is that no tombstone survives into the re-insert.
+    assert_eq!(
+        after.tombstones, 0,
+        "the identity must carry no tombstone into the re-insert (removed={removed})"
+    );
 
     let session = reopen_session(&storage).await;
     let hits_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
@@ -1496,4 +1505,299 @@ async fn broad_canonical_created_at_recovery_misses_for_new_identities() {
         hits, 0,
         "a genuinely new identity has no canonical ancestor to inherit from"
     );
+}
+
+/// Compaction engagement, read from inside the route.
+///
+/// Process-global by construction, so only *deltas* and only *thresholds*
+/// scaled to a fixture no concurrent test can reach are meaningful here.
+#[derive(Clone, Copy, Debug)]
+struct CompactionCounters {
+    /// Publications that reached the mask at all.
+    routes: u64,
+    /// Deltas those publications offered it.
+    offered: u64,
+    /// Of those, tombstones eligible on shape alone.
+    candidates: u64,
+    /// Of those, tombstones every gate cleared.
+    compacted: u64,
+}
+
+fn compaction_counters() -> CompactionCounters {
+    let load = |counter: &std::sync::atomic::AtomicU64| {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    CompactionCounters {
+        routes: load(&crate::hot_state::COMPACTED_TOMBSTONE_ROUTES),
+        offered: load(&crate::hot_state::COMPACTED_TOMBSTONE_OFFERED),
+        candidates: load(&crate::hot_state::COMPACTED_TOMBSTONE_CANDIDATES),
+        compacted: load(&crate::hot_state::COMPACTED_TOMBSTONE_COMPACTED),
+    }
+}
+
+impl CompactionCounters {
+    fn since(self, before: Self) -> Self {
+        Self {
+            routes: self.routes - before.routes,
+            offered: self.offered - before.offered,
+            candidates: self.candidates - before.candidates,
+            compacted: self.compacted - before.compacted,
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionCounters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "routes={} offered={} candidates={} compacted={}",
+            self.routes, self.offered, self.candidates, self.compacted
+        )
+    }
+}
+
+/// PHASE 10 — the landed engine change: a checkpoint reclaims the tombstones
+/// it has just discharged.
+///
+/// Numbered 10 because phases 1–7 are shared, 8 is #1427's allocation census
+/// and 9 is the canonical `created_at` recovery that #1432 landed.
+///
+/// Phase 4 proved the *premise* by removing tombstones behind the engine's
+/// back. This phase asserts the engine now does it itself, at the checkpoint,
+/// through `hot_compaction_mask`. Both the hit and the refusal are asserted in
+/// non-`#[ignore]`d tests, because a design whose every gate is conservative
+/// fails silently inert, and a row-count instrument one layer up cannot tell
+/// "reclaimed nothing here" from "never ran".
+#[tokio::test]
+async fn checkpoint_compacts_discharged_branch_tombstones() {
+    const N: usize = 300;
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("cp10row")).await;
+    insert_rows(&session, "cp10row", N).await;
+    // MEASURED, and it is the shape of the whole result: a checkpoint
+    // republishes the interval's *dirty set*, and a delete only joins that set
+    // while a checkpoint interval is open. Churn before a repository's first
+    // checkpoint reaches the compaction route with `offered=2` — the route
+    // runs, the deletes are simply not in it. Compaction therefore reclaims
+    // deletes made inside an interval, which is the steady state; a
+    // never-checkpointed branch's tombstones are a separate, larger problem
+    // this change does not claim.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
+    delete_all_but_first(&session, "cp10row", N).await;
+
+    let before = row_census(&storage).await;
+    assert!(
+        before.tombstones >= N - 1,
+        "the churn must leave one tombstone per delete, saw {}",
+        before.tombstones
+    );
+
+    let counters_before = compaction_counters();
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should publish");
+    let counters = compaction_counters().since(counters_before);
+    let after = row_census(&storage).await;
+
+    println!(
+        "phase10 | compaction entries {}->{} tombstones {}->{} {counters}",
+        before.entries, after.entries, before.tombstones, after.tombstones
+    );
+
+    // Engagement first: a flat row count is ambiguous, these counts are not.
+    assert!(
+        counters.candidates >= (N - 1) as u64,
+        "every discharged tombstone must reach the compaction route, saw {}",
+        counters.candidates
+    );
+    assert!(
+        counters.compacted >= (N - 1) as u64,
+        "every gate must clear for a branch-local schema with no base, saw {}",
+        counters.compacted
+    );
+
+    // Then the effect the counters predict.
+    assert!(
+        after.tombstones * 10 < before.tombstones,
+        "the checkpoint must reclaim the tombstones it discharged, {} -> {}",
+        before.tombstones,
+        after.tombstones
+    );
+    assert!(
+        after.entries < before.entries,
+        "reclaimed tombstones must leave the serving view smaller"
+    );
+
+    // And the answer, cold, so nothing passes off a warm cache.
+    let session = reopen_session(&storage).await;
+    let survivors = session
+        .execute("SELECT id FROM cp10row", &[])
+        .await
+        .expect("collection scan should run");
+    assert_eq!(
+        survivors.len(),
+        1,
+        "compaction must not resurrect a deleted row"
+    );
+    let answer = session
+        .execute(&scan_sql("cp10row"), &[])
+        .await
+        .expect("scan should run");
+    assert_eq!(answer.len(), 1, "the surviving row must still answer");
+    assert_eq!(
+        working_diff_rows(&session, "cp10row").await,
+        0,
+        "a checkpoint discharges every delete, compacted or not"
+    );
+}
+
+/// The refusal is asserted where it can be made deterministic:
+/// `hot_state::tracked_head::hot::tests::
+/// checkpoint_compaction_keeps_only_globally_shadowed_tombstones` seeds a
+/// global-branch row and a branch tombstone in the same schema and checks the
+/// tombstone survives the checkpoint, alongside a same-publication control in
+/// a schema global has no rows in that is reclaimed.
+///
+/// It is not asserted through SQL here because there is no reachable SQL path
+/// to a global row in a probe-defined schema: a branch-registered schema is
+/// not visible to a global write, and a globally registered one is never bound
+/// as a table.
+/// The `created_at` consequence, pinned against *real* compaction.
+///
+/// Phase 9 pins the same behaviour against `drop_all_tombstones`, a simulation.
+/// This is the version that fails if the engine's own compaction and the
+/// canonical `created_at` recovery ever stop lining up — the failure mode with
+/// no other guard, because a wrong timestamp is written silently and only
+/// surfaces on a later rebuild.
+#[tokio::test]
+async fn recreated_identity_inherits_created_at_after_engine_compaction() {
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("ci10row")).await;
+    session
+        .execute(
+            "INSERT INTO ci10row (id, locale) VALUES ('row-0', 'first')",
+            &[],
+        )
+        .await
+        .expect("first insert should commit");
+    // The insert must be canonical before the delete, or the pair cancels
+    // inside one checkpoint interval and a fresh timestamp is the right answer.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
+    let first = created_at_of(&session, "ci10row", "row-0").await;
+
+    session
+        .execute("DELETE FROM ci10row WHERE id = 'row-0'", &[])
+        .await
+        .expect("delete should commit");
+    let counters_before = compaction_counters();
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should publish");
+    let counters = compaction_counters().since(counters_before);
+    assert!(
+        counters.compacted > 0,
+        "this test is about a compacted identity; nothing was compacted"
+    );
+
+    let hits_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    session
+        .execute(
+            "INSERT INTO ci10row (id, locale) VALUES ('row-0', 'second')",
+            &[],
+        )
+        .await
+        .expect("re-insert should commit");
+    let hits = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - hits_before;
+    let second = created_at_of(&session, "ci10row", "row-0").await;
+    println!(
+        "phase10 | created_at first={first} second={second} inherited={} \
+         canonical_hits={hits} compacted={}",
+        first == second,
+        counters.compacted
+    );
+
+    assert!(
+        hits > 0,
+        "the re-insert must have sourced its created_at from canonical state"
+    );
+    assert_eq!(
+        second, first,
+        "a re-insert over a compacted identity inherits its original created_at"
+    );
+
+    drop(session);
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should reopen for rebuild");
+    let branch_id = engine
+        .open_session()
+        .await
+        .expect("session should open")
+        .active_branch_id()
+        .await
+        .expect("active branch id reads");
+    engine
+        .rebuild_tracked_state_for_branch(&branch_id)
+        .await
+        .expect("a compacted branch must still rebuild");
+}
+
+/// The measurement the change exists for: what a checkpoint now costs a
+/// churned collection's scan, at three sizes so the removed term shows as a
+/// slope rather than a point.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn checkpoint_compaction_scan_cost() {
+    let sizes = sizes_from_env("LIX_TOMBSTONE_SIZES", &[100, 1_000, 10_000]);
+    let reps = reps_from_env(5);
+    println!("phase10 | n,event,row_entries,tombstones,scan_us,counters");
+    for n in sizes {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("m10row")).await;
+        insert_rows(&session, "m10row", n).await;
+        // The deletes have to fall inside an open checkpoint interval to join
+        // the dirty set the next checkpoint republishes. See
+        // `checkpoint_compacts_discharged_branch_tombstones`.
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should publish");
+        delete_all_but_first(&session, "m10row", n).await;
+
+        let census = row_census(&storage).await;
+        let scan = timed_scan(&session, &scan_sql("m10row"), 1, reps).await;
+        println!(
+            "{n},after_churn,{},{},{},-",
+            census.entries,
+            census.tombstones,
+            scan.as_micros()
+        );
+
+        let counters_before = compaction_counters();
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish");
+        let counters = compaction_counters().since(counters_before);
+        let census = row_census(&storage).await;
+        let scan = timed_scan(&session, &scan_sql("m10row"), 1, reps).await;
+        println!(
+            "{n},after_checkpoint,{},{},{},{}",
+            census.entries,
+            census.tombstones,
+            scan.as_micros(),
+            counters
+        );
+    }
 }
