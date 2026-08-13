@@ -3930,3 +3930,55 @@ mod tests {
         assert_eq!(after_first_layout, after_second_layout);
     }
 }
+
+static HOT_BLOB_REF_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_POINT_BATCH: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_FILE_PREFIX: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_ENTRIES_DECODED: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_ENTRIES_MATCHED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_hot_blob_ref_scan_call() {
+    HOT_BLOB_REF_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_point_batch() {
+    HOT_BLOB_REF_SCAN_POINT_BATCH.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_file_prefix() {
+    HOT_BLOB_REF_SCAN_FILE_PREFIX.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_fallback() {
+    HOT_BLOB_REF_SCAN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_entry(matched: bool) {
+    HOT_BLOB_REF_SCAN_ENTRIES_DECODED.fetch_add(1, Ordering::Relaxed);
+    if matched {
+        HOT_BLOB_REF_SCAN_ENTRIES_MATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Accounting for the single-entity `lix_binary_blob_ref` probe every
+/// `lix_file` content update issues:
+/// `(calls, point_batch, file_prefix, fallback, entries_decoded, entries_matched)`.
+///
+/// Counted INSIDE `hot_scan_entries`, at the iterator loop that decodes each
+/// storage key — not at `scan_batch`'s return value. Those are different
+/// numbers: `hot_scan_entries` applies `identity.matches_filter` in memory
+/// before returning, so a count taken above it reports the surviving rows and
+/// cannot distinguish a seek from a full-prefix walk. The three route counters
+/// exist so that a zero is readable as "this arm did not run" rather than as
+/// "the counter never ran".
+pub fn take_hot_blob_ref_scan_accounting() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        HOT_BLOB_REF_SCAN_CALLS.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_POINT_BATCH.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_FILE_PREFIX.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_FALLBACK.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_ENTRIES_DECODED.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_ENTRIES_MATCHED.swap(0, Ordering::Relaxed),
+    )
+}
