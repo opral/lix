@@ -10068,6 +10068,7 @@ async fn hot_compaction_mask(
     }
     .fetch_add(compacted, std::sync::atomic::Ordering::Relaxed);
     let _ = compacted;
+    let _ = kind;
     Ok(mask)
 }
 

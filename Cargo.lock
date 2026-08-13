@@ -3229,7 +3229,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-filesystem"
-version = "0.1.0"
+version = "0.11.0"
 dependencies = [
  "lix",
  "lix-storage-rocksdb",
@@ -3240,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-rocksdb"
-version = "0.1.0"
+version = "0.11.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -3252,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-slatedb"
-version = "0.1.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "blake3",
