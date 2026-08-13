@@ -7659,6 +7659,11 @@ async fn load_columnar_owned_entries(
                 .checked_add(1)
                 .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
             let change_id = change_id_from_packed_address(commit_id, packed);
+            // The columnar route establishes identity by JSON text match, not
+            // by the byte-equality assert the packed route uses. Counted here
+            // so a test can prove which of the two served a row.
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_commit_delta_columnar_row();
             output[output_index] = Some(LoadedCommitDeltaEntry {
                 value: TrackedStateIndexValue {
                     change_id,

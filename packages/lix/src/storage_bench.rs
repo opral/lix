@@ -69,6 +69,7 @@ static COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_OWNED_KEY_BUILDS: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_OWNED_KEY_BYTES: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_REVERIFY_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_COLUMNAR_ROWS: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
@@ -440,6 +441,12 @@ pub struct TrackedKeyAllocationCensus {
     /// Rows that reached the post-fetch re-verification in
     /// `materialize_index_payloads`.
     pub materialize_reverify_rows: u64,
+    /// Rows served by `load_columnar_owned_entries` — the commit-delta route
+    /// that has **no** byte-equality assert and matches identity through JSON
+    /// text instead. Counted separately from `commit_delta_rows_loaded` because
+    /// the two routes establish identity by different means, and a test about
+    /// one of them proves nothing unless it can show which one ran.
+    pub commit_delta_columnar_rows: u64,
 }
 
 pub(crate) fn record_key_decode_owned(input_bytes: usize, owned_string_bytes: usize, escaped: u32) {
@@ -474,6 +481,10 @@ pub(crate) fn record_materialize_reverify_row() {
     MATERIALIZE_REVERIFY_ROWS.fetch_add(1, Ordering::Relaxed);
 }
 
+pub(crate) fn record_commit_delta_columnar_row() {
+    COMMIT_DELTA_COLUMNAR_ROWS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn take_tracked_key_allocation_census() -> TrackedKeyAllocationCensus {
     TrackedKeyAllocationCensus {
         key_decode_calls: KEY_DECODE_OWNED_CALLS.swap(0, Ordering::Relaxed),
@@ -492,6 +503,7 @@ pub fn take_tracked_key_allocation_census() -> TrackedKeyAllocationCensus {
         materialize_owned_key_builds: MATERIALIZE_OWNED_KEY_BUILDS.swap(0, Ordering::Relaxed),
         materialize_owned_key_bytes: MATERIALIZE_OWNED_KEY_BYTES.swap(0, Ordering::Relaxed),
         materialize_reverify_rows: MATERIALIZE_REVERIFY_ROWS.swap(0, Ordering::Relaxed),
+        commit_delta_columnar_rows: COMMIT_DELTA_COLUMNAR_ROWS.swap(0, Ordering::Relaxed),
     }
 }
 
