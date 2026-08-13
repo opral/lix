@@ -10460,7 +10460,9 @@ impl HotScanString {
                     unsafe { std::str::from_utf8_unchecked(&key[range]) }
                 };
                 #[cfg(feature = "storage-benches")]
-                crate::storage_bench::record_hot_scan_key_handle_clone();
+                {
+                    crate::storage_bench::record_hot_scan_key_handle_clone();
+                }
                 SharedStr::from_utf8_slice(key.clone(), value)
                     .expect("decoded key string remains inside its retained key")
             }
@@ -12363,7 +12365,9 @@ fn decode_hot_scan_row_key_in_scope(key: Bytes, scope: &[u8]) -> Result<HotScanI
         return Err(key_codec_error("hot row key has trailing bytes"));
     }
     #[cfg(feature = "storage-benches")]
-    crate::storage_bench::record_hot_scan_row_decoded();
+    {
+        crate::storage_bench::record_hot_scan_row_decoded();
+    }
     Ok(HotScanIdentity {
         key,
         schema_key,

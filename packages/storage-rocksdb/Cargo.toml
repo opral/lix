@@ -21,6 +21,12 @@ workspace = true
 name = "storage"
 path = "tests/storage/main.rs"
 
+[features]
+# Forwards the engine's bench census so a scan-path counter can be read from a
+# dedicated test target. Off by default: the counters are atomics on the scan
+# hot path and must not be paid for in a shipping build.
+storage-benches = ["lix/storage-benches"]
+
 [dependencies]
 lix = { workspace = true }
 

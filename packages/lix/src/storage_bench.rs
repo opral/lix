@@ -3931,6 +3931,35 @@ mod tests {
     }
 }
 
+static SCAN_KEY_BUFFER_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static SCAN_KEY_BUFFER_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Records one heap buffer allocated to hold scanned key bytes.
+///
+/// **Public because the storage adapters are separate crates.** A range
+/// adapter calls this once per buffer it allocates for scan keys — once per
+/// row if it copies each key into its own allocation, once per arena if it
+/// carves them out of a shared one. The counting rule is the same either way,
+/// which is what lets the two be compared.
+pub fn record_scan_key_buffer_allocation(bytes: usize) {
+    SCAN_KEY_BUFFER_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    SCAN_KEY_BUFFER_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// Heap buffers allocated for scanned key bytes, as `(allocations, bytes)`.
+///
+/// This is the count that distinguishes a per-row key copy from a page arena.
+/// The handle-clone census cannot see the difference: arena slicing does not
+/// change how many times a key is cloned, only what each clone costs — a plain
+/// refcount increment instead of promoting a `Vec`-backed buffer into a
+/// freshly allocated control block.
+pub fn take_scan_key_buffer_census() -> (u64, u64) {
+    (
+        SCAN_KEY_BUFFER_ALLOCATIONS.swap(0, Ordering::Relaxed),
+        SCAN_KEY_BUFFER_BYTES.swap(0, Ordering::Relaxed),
+    )
+}
+
 static HOT_SCAN_ROWS_DECODED: AtomicU64 = AtomicU64::new(0);
 static HOT_SCAN_KEY_HANDLE_CLONES: AtomicU64 = AtomicU64::new(0);
 static HOT_SCAN_VALUE_HANDLE_CLONES: AtomicU64 = AtomicU64::new(0);

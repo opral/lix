@@ -1042,7 +1042,9 @@ impl MaterializedHotStateBatchBuilder {
         branch_id: &str,
     ) -> usize {
         #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_hot_scan_row_handle_clones(entity_pk.shared_handle_count());
+        {
+            crate::storage_bench::record_hot_scan_row_handle_clones(entity_pk.shared_handle_count());
+        }
         self.push_materialized_interned(
             entity_pk.clone(),
             schema_key,
@@ -1132,11 +1134,13 @@ impl MaterializedHotStateBatchBuilder {
         branch_override: Option<&str>,
     ) -> usize {
         #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_hot_scan_row_handle_clones(
-            row.entity_pk().shared_handle_count()
-                + usize::from(row.snapshot_content().is_some())
-                + usize::from(row.metadata().is_some()),
-        );
+        {
+            crate::storage_bench::record_hot_scan_row_handle_clones(
+                row.entity_pk().shared_handle_count()
+                    + usize::from(row.snapshot_content().is_some())
+                    + usize::from(row.metadata().is_some()),
+            );
+        }
         let ordinal = self.len();
         if self.singleton_capacity {
             let branch_id = branch_override.map_or_else(|| row.branch_owner(), Arc::from);

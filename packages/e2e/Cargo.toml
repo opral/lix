@@ -527,3 +527,8 @@ required-features = ["storage-benches"]
 name = "hot_scan_refcount_census"
 path = "tests/hot_scan_refcount_census.rs"
 required-features = ["storage-benches"]
+
+[[test]]
+name = "scan_key_buffer_census"
+path = "tests/scan_key_buffer_census.rs"
+required-features = ["storage-benches"]
