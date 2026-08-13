@@ -366,7 +366,6 @@ pub(crate) struct HotStateContext {
         std::sync::Arc<std::sync::Mutex<crate::hot_state::EntityColumnarShadowMaskCache>>,
     entity_decoded_column_cache: crate::hot_state::EntityDecodedColumnCache,
     global_key_value_rows: std::sync::Arc<GlobalKeyValueRowCache>,
-    root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
 }
 
 impl HotStateContext {
@@ -398,7 +397,6 @@ impl HotStateContext {
                     entity_columnar_array_budget,
                 ),
             global_key_value_rows: std::sync::Arc::new(GlobalKeyValueRowCache::default()),
-            root_base_cache: std::sync::Arc::default(),
         }
     }
 
@@ -427,7 +425,6 @@ impl HotStateContext {
             entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
             entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
             branch_head_control_cache: None,
-            root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
     }
 
@@ -449,7 +446,6 @@ impl HotStateContext {
             entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
             entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
             branch_head_control_cache: Some(branch_head_control_cache),
-            root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
     }
 
@@ -481,7 +477,6 @@ impl HotStateContext {
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
             entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
             branch_head_control_cache: None,
-            root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
     }
 
@@ -505,7 +500,6 @@ pub(crate) struct HotStateContextReader<S> {
     entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
     entity_columnar_layout_cache: std::sync::Arc<EntityColumnarLayoutCache>,
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
-    root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
 }
 
 impl<S> HotStateContextReader<S>
@@ -571,7 +565,6 @@ where
         let snapshots = self
             .tracked_head
             .reader(&self.store)
-            .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
             .scan_entity_snapshots(
                 &requested_branch_id,
                 requested_control,
@@ -601,7 +594,6 @@ where
         };
         self.tracked_head
             .reader(&self.store)
-            .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
             .scan_entity_primary_keys(
                 &branch_id,
                 control,
@@ -990,17 +982,13 @@ where
             return Ok(Some(MaterializedHotStateBatch::default()));
         }
         let tracked_request = tracked_scan_request_from_live(request);
-        let tracked_head = self
-            .branch_head_control_cache
-            .as_ref()
-            .map_or_else(
-                || self.tracked_head.reader(&self.store),
-                |cache| {
-                    self.tracked_head
-                        .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
-                },
-            )
-            .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache));
+        let tracked_head = self.branch_head_control_cache.as_ref().map_or_else(
+            || self.tracked_head.reader(&self.store),
+            |cache| {
+                self.tracked_head
+                    .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
+            },
+        );
         let rows_by_branch = tracked_head
             .scan_live_batches_for_controls(&controls, &tracked_request, request.filter.untracked)
             .await?;
@@ -1383,7 +1371,6 @@ where
                     let rows = self
                         .tracked_head
                         .reader(store)
-                        .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
                         .scan_live_batch_for_retention(
                             &branch_id,
                             control,
