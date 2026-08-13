@@ -268,7 +268,7 @@ impl Event {
     }
 }
 
-/// Stable URL prefix owned by the Lix server protocol.
+/// Stable URL prefix owned by the Lix Server Protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Current wire protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -401,7 +401,7 @@ impl ServerProtocolContext {
     }
 }
 
-/// Resource limits for one repository's remote protocol sessions.
+/// Resource limits for one repository's Lix Server Protocol sessions.
 #[derive(Clone, Copy, Debug)]
 pub struct ServerProtocolOptions {
     /// Maximum number of retained remote sessions and their per-session caches.
@@ -8233,7 +8233,7 @@ mod tests {
     #[cfg(any())]
     #[tokio::test]
     #[ignore = "manual release-mode remote commit-to-observation capacity gate"]
-    async fn remote_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95() {
+    async fn server_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95() {
         const WAVE_SIZE: usize = 5;
         let clients = capacity_env_usize("LIX_COLLAB_CLIENTS", 100);
         let operations = capacity_env_usize("LIX_COLLAB_OPERATIONS", 100);
@@ -8789,7 +8789,7 @@ mod tests {
     }
 
     #[test]
-    fn request_blob_caches_share_one_workspace_byte_budget() {
+    fn request_blob_caches_share_one_repository_byte_budget() {
         let budget = Arc::new(RequestBlobCacheBudget::new(
             MIN_REQUEST_BLOB_CACHE_BYTES * 2,
         ));

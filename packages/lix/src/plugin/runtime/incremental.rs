@@ -496,7 +496,7 @@ fn validate_transport_splice(
         .checked_add(provenance.insert().len())
         .and_then(|length| length.checked_add(suffix))
         .ok_or_else(|| invalid_input("transport splice result length overflowed"))?;
-    // This sidecar is constructed only after the remote protocol verifies the
+    // This sidecar is constructed only after the Lix Server Protocol verifies the
     // result hash and reconstructs the ordinary SQL blob. The caller has
     // separately matched the base hash to the actor's exact observed version;
     // rechecking unchanged prefix/suffix here would turn a localized edit back

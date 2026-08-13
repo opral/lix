@@ -4700,7 +4700,7 @@ fn packed_current_base_guards_match(
 /// members. The two retention modes must never own the same logical identity.
 ///
 /// This is a merge/checkpoint lifecycle fence, not a normal CRUD-path check.
-/// Point-loading only the selected identities keeps large untracked workspaces
+/// Point-loading only the selected identities keeps large untracked repositories
 /// out of the publication cost.
 async fn reject_selected_tracked_refs_with_untracked_rows(
     read: &(impl StorageAdapterRead + ?Sized),
@@ -8026,7 +8026,7 @@ mod tests {
         let session = reopened
             .open_session()
             .await
-            .expect("workspace should reopen after rootless GC");
+            .expect("repository should reopen after rootless GC");
         let main = session
             .execute("SELECT id FROM lix_branch WHERE name = 'main'", &[])
             .await
