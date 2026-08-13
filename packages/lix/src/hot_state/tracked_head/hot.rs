@@ -123,6 +123,47 @@ pub(crate) static BROAD_CANONICAL_CREATED_AT_HITS: std::sync::atomic::AtomicU64 
 /// `ROUTES` and `OFFERED` sit above both, at the mask's first line, because
 /// "the checkpoint offered no tombstone" and "the checkpoint never reached the
 /// mask" are different faults with identical readings at `CANDIDATES`.
+/// Decode census for the hot row serving-view scan loops.
+///
+/// These sit inside the **per-entry decode loop** of both scan arms
+/// (`hot_scan_entries`' wide fallback and `scan_hot_file_entries`), not at the
+/// layer that returns the answer: a post-filter count reads identically under a
+/// seek and under a full walk. `DECODED` counts every `ROW_SPACE` entry whose
+/// key this request decoded, `MATCHED` the subset that passed
+/// `matches_filter`, and `TOMBSTONE` the matched subset whose fixed header
+/// carries `HEAD_VALUE_DELETED` - rows fetched, decoded and then discarded
+/// because they are deletions.
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static HOT_SCAN_DECODED_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static HOT_SCAN_MATCHED_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static HOT_SCAN_TOMBSTONE_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Engagement counters for interval-local tombstone elision.
+///
+/// The sibling of the compaction counters below, for the route that never
+/// creates the tombstone rather than reclaiming it later. Kept separate so a
+/// publication that elides can never be mistaken for one that compacted:
+/// phase 11 measured `routes=1 offered=0` on the compaction route for exactly
+/// the workload this route exists to serve, and a shared counter would have
+/// hidden that.
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static INTERVAL_LOCAL_TOMBSTONE_ROUTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static INTERVAL_LOCAL_TOMBSTONE_OFFERED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static INTERVAL_LOCAL_TOMBSTONE_CANDIDATES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static INTERVAL_LOCAL_TOMBSTONE_ELIDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) static COMPACTED_TOMBSTONE_ROUTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -8397,11 +8438,56 @@ where
                 branch_id,
                 generation,
                 &sorted,
+                None,
+                HotTombstoneMaskKind::Checkpoint,
                 self.transaction_global_schema_keys,
             ))
             .await?
         } else {
             Vec::new()
+        };
+        // Interval-local tombstone elision, the ordinary-commit sibling of the
+        // compaction above.
+        //
+        // This is NOT "run the compaction mask on every commit". That would
+        // trip gate (c) below and fail the publication, because an ordinary
+        // commit's rows are not `(Clean, false)`. It is a second, narrower
+        // admission rule sharing gates (a) and (b): only a delete whose
+        // pre-image already carries `BeforeAbsent` for the active checkpoint,
+        // whose owed before-image is therefore absence, and whose tombstone
+        // consequently shadows nothing.
+        //
+        // Phase 11 of `hot_row_tombstone_probe` is why this exists: with
+        // deletes confined to one checkpoint interval the compaction route runs
+        // and is offered nothing (`routes=1 offered=0`), so the tombstones
+        // accumulate linearly and forever. The cheapest fix is not to create
+        // them.
+        let interval_local = match (
+            reset_working_diff_baselines,
+            working_diff_capture_checkpoint_commit_id,
+        ) {
+            (false, Some(active_checkpoint_commit_id)) => {
+                let preconditions = hot_interval_local_preconditions(
+                    &sorted,
+                    &previous_values,
+                    active_checkpoint_commit_id,
+                )?;
+                if preconditions.iter().any(|admitted| *admitted) {
+                    Box::pin(hot_compaction_mask(
+                        self.store,
+                        branch_id,
+                        generation,
+                        &sorted,
+                        Some(&preconditions),
+                        HotTombstoneMaskKind::IntervalLocal,
+                        self.transaction_global_schema_keys,
+                    ))
+                    .await?
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
         };
         let identities = encode_hot_mutation_identities(branch_id, generation, &sorted);
         let unmatched_guards = if absence_guards_validated || absence_guards.is_empty() {
@@ -8524,6 +8610,28 @@ where
                         value: BufferRange::default(),
                     });
                 }
+                let interval_local_row = interval_local.get(index).copied().unwrap_or(false);
+                if interval_local_row
+                    && (newly_dirty
+                        || !matches!(
+                            working_diff_baseline,
+                            WorkingDiffBaseline::BeforeAbsent { .. }
+                        ))
+                {
+                    // Gate (c) for the elision route, and the reason the
+                    // precondition is allowed to be computed from the
+                    // pre-image alone: this is where the cheap predicate is
+                    // reconciled against the baseline the loop actually
+                    // derived. `BeforeAbsent` with `newly_dirty == false` is
+                    // the one state whose owed before-image is absence, so it
+                    // is the one state in which no row need survive. Any other
+                    // pairing means the two disagree, and a publication that
+                    // drops a row whose before-image is still owed is worse
+                    // than a publication that fails.
+                    return Err(head_value_error(
+                        "interval-local hot tombstone is not provably net-absent at elision",
+                    ));
+                }
                 let compacted_row = compacted.get(index).copied().unwrap_or(false);
                 if compacted_row
                     && (working_diff_baseline != WorkingDiffBaseline::Clean || newly_dirty)
@@ -8539,17 +8647,19 @@ where
                         "compacted hot tombstone is not provably clean at removal",
                     ));
                 }
-                next_value_ranges.push(if delta.physically_deletes() || compacted_row {
-                    None
-                } else {
-                    let mut value = delta.value_ref(*created_at, working_diff_baseline);
-                    value.columnar_base_coordinate = next_columnar_base_coordinate(
-                        reset_working_diff_baselines,
-                        delta,
-                        previous.as_ref(),
-                    )?;
-                    Some(append_head_value(&mut next_value_bytes, &value)?)
-                });
+                next_value_ranges.push(
+                    if delta.physically_deletes() || compacted_row || interval_local_row {
+                        None
+                    } else {
+                        let mut value = delta.value_ref(*created_at, working_diff_baseline);
+                        value.columnar_base_coordinate = next_columnar_base_coordinate(
+                            reset_working_diff_baselines,
+                            delta,
+                            previous.as_ref(),
+                        )?;
+                        Some(append_head_value(&mut next_value_bytes, &value)?)
+                    },
+                );
             }
         }
         let next_value_bytes = Bytes::from(next_value_bytes);
@@ -9654,21 +9764,85 @@ async fn hot_space_prefix_has_entry(
 ///
 /// Callers must pass the deltas *after* the checkpoint retain filter, since
 /// that filter rebinds the slice and an earlier mask would misalign.
+/// Which of the two tombstone-removal routes a mask is being built for.
+///
+/// The two share every gate and differ only in *when* they run and which
+/// deltas they admit, so they share one implementation and separate counters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HotTombstoneMaskKind {
+    /// A checkpoint publication reclaiming tombstones it has just discharged.
+    Checkpoint,
+    /// An ordinary commit declining to create a tombstone for an identity that
+    /// was created and deleted inside the open checkpoint interval.
+    IntervalLocal,
+}
+
+/// Rows an interval-local elision may consider, decided from the *pre-image*
+/// alone and therefore without any store read.
+///
+/// A tracked delete is interval-local exactly when the row it replaces already
+/// carries `BeforeAbsent` for the currently active checkpoint: that baseline
+/// means "the first mutation after the checkpoint created this identity", so a
+/// delete of it is net-absent against the interval baseline. Phase 12 measured
+/// the consequence directly - `lix_working_diff` reports **nothing** for such
+/// an identity while its tombstone exists - which is what makes the tombstone
+/// owed to nobody.
+///
+/// This is deliberately the same predicate `next_hot_working_diff_baseline`
+/// uses to return `(BeforeAbsent { .. }, false)`, evaluated here from the same
+/// pre-image, and the value loop asserts the two agree before it drops a row.
+fn hot_interval_local_preconditions(
+    deltas: &[&CurrentStateDeltaRef<'_>],
+    previous_values: &[Option<CertifiedCurrentStatePredecessor>],
+    active_checkpoint_commit_id: CommitId,
+) -> Result<Vec<bool>, LixError> {
+    let mut preconditions = vec![false; deltas.len()];
+    for (index, (delta, previous)) in deltas.iter().zip(previous_values).enumerate() {
+        if !delta.deleted || delta.untracked {
+            continue;
+        }
+        let Some(previous) = previous else {
+            continue;
+        };
+        let previous = previous.view()?;
+        if previous.untracked {
+            continue;
+        }
+        preconditions[index] = matches!(
+            previous.working_diff_baseline,
+            WorkingDiffBaseline::BeforeAbsent {
+                checkpoint_commit_id,
+            } if checkpoint_commit_id == active_checkpoint_commit_id
+        );
+    }
+    Ok(preconditions)
+}
+
 async fn hot_compaction_mask(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
     deltas: &[&CurrentStateDeltaRef<'_>],
+    preconditions: Option<&[bool]>,
+    kind: HotTombstoneMaskKind,
     transaction_global_schema_keys: Option<&BTreeSet<String>>,
 ) -> Result<Vec<bool>, LixError> {
     let mask = vec![false; deltas.len()];
     #[cfg(any(test, feature = "storage-benches"))]
     {
-        COMPACTED_TOMBSTONE_ROUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        COMPACTED_TOMBSTONE_OFFERED
-            .fetch_add(deltas.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let (routes, offered) = match kind {
+            HotTombstoneMaskKind::Checkpoint => {
+                (&COMPACTED_TOMBSTONE_ROUTES, &COMPACTED_TOMBSTONE_OFFERED)
+            }
+            HotTombstoneMaskKind::IntervalLocal => (
+                &INTERVAL_LOCAL_TOMBSTONE_ROUTES,
+                &INTERVAL_LOCAL_TOMBSTONE_OFFERED,
+            ),
+        };
+        routes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        offered.fetch_add(deltas.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
-    let is_candidate = |delta: &CurrentStateDeltaRef<'_>| {
+    let is_candidate = |index: usize, delta: &CurrentStateDeltaRef<'_>| {
         delta.deleted
             && !delta.untracked
             && delta.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
@@ -9676,17 +9850,24 @@ async fn hot_compaction_mask(
             // identity digest. Leaving its tombstones alone keeps that proof
             // out of this change's blast radius for no measurable loss.
             && !scope_requires_exact_closure(branch_id, delta.schema_key, delta.file_id)
+            // Empty means "no extra precondition"; the checkpoint route passes
+            // `None`. A short slice must read as `false`, never as admitted.
+            && preconditions.is_none_or(|pre| pre.get(index).copied().unwrap_or(false))
     };
     let candidates = deltas
         .iter()
-        .filter(|delta| is_candidate(delta))
+        .enumerate()
+        .filter(|(index, delta)| is_candidate(*index, delta))
         .count();
     if candidates == 0 {
         return Ok(mask);
     }
     #[cfg(any(test, feature = "storage-benches"))]
-    COMPACTED_TOMBSTONE_CANDIDATES
-        .fetch_add(candidates as u64, std::sync::atomic::Ordering::Relaxed);
+    match kind {
+        HotTombstoneMaskKind::Checkpoint => &COMPACTED_TOMBSTONE_CANDIDATES,
+        HotTombstoneMaskKind::IntervalLocal => &INTERVAL_LOCAL_TOMBSTONE_CANDIDATES,
+    }
+    .fetch_add(candidates as u64, std::sync::atomic::Ordering::Relaxed);
 
     // Gate (a).
     if hot_generation_has_any_base(store, branch_id, generation).await? {
@@ -9721,7 +9902,7 @@ async fn hot_compaction_mask(
     // collection offers thousands of tombstones in one schema.
     let mut verdicts: BTreeMap<&str, bool> = BTreeMap::new();
     for (index, delta) in deltas.iter().enumerate() {
-        if !is_candidate(delta) {
+        if !is_candidate(index, delta) {
             continue;
         }
         let blocked = if !global_is_below {
@@ -9750,7 +9931,11 @@ async fn hot_compaction_mask(
         }
     }
     #[cfg(any(test, feature = "storage-benches"))]
-    COMPACTED_TOMBSTONE_COMPACTED.fetch_add(compacted, std::sync::atomic::Ordering::Relaxed);
+    match kind {
+        HotTombstoneMaskKind::Checkpoint => &COMPACTED_TOMBSTONE_COMPACTED,
+        HotTombstoneMaskKind::IntervalLocal => &INTERVAL_LOCAL_TOMBSTONE_ELIDED,
+    }
+    .fetch_add(compacted, std::sync::atomic::Ordering::Relaxed);
     let _ = compacted;
     Ok(mask)
 }
@@ -11767,6 +11952,10 @@ async fn hot_scan_entries<'a>(
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 let entry_matches_filter = identity.matches_filter(filter);
+                #[cfg(any(test, feature = "storage-benches"))]
+                {
+                    HOT_SCAN_DECODED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 #[cfg(feature = "storage-benches")]
                 {
                     if is_blob_ref_probe {
@@ -11781,6 +11970,15 @@ async fn hot_scan_entries<'a>(
                 if entry_matches_filter {
                     saw_file_backed_row |= identity.file_id().is_some();
                     let value = full_value_bytes(entry.value)?;
+                    #[cfg(any(test, feature = "storage-benches"))]
+                    {
+                        HOT_SCAN_MATCHED_ENTRIES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if value.len() > 1 && value[1] & 0b0000_0001 != 0 {
+                            HOT_SCAN_TOMBSTONE_ENTRIES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     retained_bytes = retained_bytes
                         .checked_add(encoded_key_bytes)
                         .and_then(|bytes| bytes.checked_add(value.len()))
@@ -12058,22 +12256,38 @@ async fn scan_hot_file_entries(
             for entry in page {
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 #[cfg(feature = "storage-benches")]
-                if filter.schema_keys.len() == 2
-                    && filter
-                        .schema_keys
-                        .iter()
-                        .any(|key| key == "lix_file_descriptor")
-                    && filter
-                        .schema_keys
-                        .iter()
-                        .any(|key| key == "lix_binary_blob_ref")
                 {
-                    crate::storage_bench::record_file_live_scan_entry(
-                        identity.matches_filter(filter),
-                    );
+                    if filter.schema_keys.len() == 2
+                        && filter
+                            .schema_keys
+                            .iter()
+                            .any(|key| key == "lix_file_descriptor")
+                        && filter
+                            .schema_keys
+                            .iter()
+                            .any(|key| key == "lix_binary_blob_ref")
+                    {
+                        crate::storage_bench::record_file_live_scan_entry(
+                            identity.matches_filter(filter),
+                        );
+                    }
+                }
+                #[cfg(any(test, feature = "storage-benches"))]
+                {
+                    HOT_SCAN_DECODED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 if identity.matches_filter(filter) {
-                    rows.push((identity, full_value_bytes(entry.value)?));
+                    let value = full_value_bytes(entry.value)?;
+                    #[cfg(any(test, feature = "storage-benches"))]
+                    {
+                        HOT_SCAN_MATCHED_ENTRIES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if value.len() > 1 && value[1] & 0b0000_0001 != 0 {
+                            HOT_SCAN_TOMBSTONE_ENTRIES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    rows.push((identity, value));
                 }
             }
             if !page_has_more {

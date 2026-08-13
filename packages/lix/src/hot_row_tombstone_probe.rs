@@ -1511,7 +1511,7 @@ async fn broad_canonical_created_at_recovery_misses_for_new_identities() {
 ///
 /// Process-global by construction, so only *deltas* and only *thresholds*
 /// scaled to a fixture no concurrent test can reach are meaningful here.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct CompactionCounters {
     /// Publications that reached the mask at all.
     routes: u64,
@@ -1799,5 +1799,1001 @@ async fn checkpoint_compaction_scan_cost() {
             scan.as_micros(),
             counters
         );
+    }
+}
+
+
+/// PHASE 7 - how much of a scan's decode work is tombstones, counted at the
+/// per-entry decode loop.
+///
+/// The counters this reads (`HOT_SCAN_DECODED_ENTRIES` and friends) sit inside
+/// the per-entry decode loop of both hot scan arms, not at the layer that
+/// returns the answer: a post-filter count reads identically under a seek and
+/// under a full walk.
+///
+/// Four arms, all answering exactly one row:
+///
+/// - `fresh` - one live row, no history. The floor.
+/// - `update_churn` - two live rows, one of them updated `n-1` times. Same
+///   order of write volume and the same number of generation rotations as
+///   `churn`, but zero tombstones. This is the arm that separates "tombstones
+///   inflate the scan" from "the plane is rematerialised per commit": if the
+///   cost were rematerialisation, this arm would track `churn`.
+/// - `churn` - `n` inserts and `n-1` deletes.
+/// - `churn_dropped` - the same fixture as `churn` with every tombstone
+///   physically removed and the engine reopened cold. Holds write history
+///   constant and varies only the tombstones.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn hot_row_tombstone_decode_census() {
+    use std::sync::atomic::Ordering;
+
+    fn reset() {
+        crate::hot_state::HOT_SCAN_DECODED_ENTRIES.store(0, Ordering::Relaxed);
+        crate::hot_state::HOT_SCAN_MATCHED_ENTRIES.store(0, Ordering::Relaxed);
+        crate::hot_state::HOT_SCAN_TOMBSTONE_ENTRIES.store(0, Ordering::Relaxed);
+    }
+    fn read() -> (u64, u64, u64) {
+        (
+            crate::hot_state::HOT_SCAN_DECODED_ENTRIES.load(Ordering::Relaxed),
+            crate::hot_state::HOT_SCAN_MATCHED_ENTRIES.load(Ordering::Relaxed),
+            crate::hot_state::HOT_SCAN_TOMBSTONE_ENTRIES.load(Ordering::Relaxed),
+        )
+    }
+
+    let sizes = sizes_from_env("LIX_TOMBSTONE_SIZES", &[1_000, 10_000]);
+    let reps = reps_from_env(5);
+    println!(
+        "phase7 | arm,n,row_entries,space_tombstones,decoded,matched,decoded_tombstones,answer_rows,scan_us"
+    );
+
+    for n in sizes {
+        {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("c7fresh")).await;
+            insert_rows(&session, "c7fresh", 1).await;
+            let census = row_census(&storage).await;
+            let _ = timed_scan(&session, &scan_sql("c7fresh"), 1, 1).await;
+            reset();
+            let rows = session
+                .execute(&scan_sql("c7fresh"), &[])
+                .await
+                .expect("scan");
+            let (decoded, matched, tombs) = read();
+            let scan = timed_scan(&session, &scan_sql("c7fresh"), 1, reps).await;
+            println!(
+                "fresh,{n},{},{},{decoded},{matched},{tombs},{},{}",
+                census.entries,
+                census.tombstones,
+                rows.len(),
+                scan.as_micros()
+            );
+        }
+
+        {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("c7upd")).await;
+            insert_rows(&session, "c7upd", 2).await;
+            for i in 0..(n - 1) {
+                session
+                    .execute(
+                        "UPDATE c7upd SET locale = $1 WHERE id = 'row-1'",
+                        &[crate::Value::Text(format!("v{i}"))],
+                    )
+                    .await
+                    .expect("update should commit");
+            }
+            let census = row_census(&storage).await;
+            let _ = timed_scan(&session, &scan_sql("c7upd"), 1, 1).await;
+            reset();
+            let rows = session.execute(&scan_sql("c7upd"), &[]).await.expect("scan");
+            let (decoded, matched, tombs) = read();
+            let scan = timed_scan(&session, &scan_sql("c7upd"), 1, reps).await;
+            println!(
+                "update_churn,{n},{},{},{decoded},{matched},{tombs},{},{}",
+                census.entries,
+                census.tombstones,
+                rows.len(),
+                scan.as_micros()
+            );
+        }
+
+        // churn_clean: a checkpoint between the insert and the delete, so the
+        // pre-images are Clean, the elision correctly refuses, and the
+        // tombstone counter has something to count. This is the arm that keeps
+        // `HOT_SCAN_TOMBSTONE_ENTRIES` honest now that ordinary churn elides.
+        {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("c7clean")).await;
+            insert_rows(&session, "c7clean", n).await;
+            session
+                .create_checkpoint()
+                .await
+                .expect("checkpoint should publish");
+            delete_all_but_first(&session, "c7clean", n).await;
+            let census = row_census(&storage).await;
+            let _ = timed_scan(&session, &scan_sql("c7clean"), 1, 1).await;
+            reset();
+            let rows = session
+                .execute(&scan_sql("c7clean"), &[])
+                .await
+                .expect("scan");
+            let (decoded, matched, tombs) = read();
+            let scan = timed_scan(&session, &scan_sql("c7clean"), 1, reps).await;
+            println!(
+                "churn_clean,{n},{},{},{decoded},{matched},{tombs},{},{}",
+                census.entries,
+                census.tombstones,
+                rows.len(),
+                scan.as_micros()
+            );
+            assert!(
+                tombs > 0,
+                "a Clean pre-image keeps its tombstones, so the tombstone census must observe them here"
+            );
+        }
+
+        {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("c7churn")).await;
+            insert_rows(&session, "c7churn", n).await;
+            delete_all_but_first(&session, "c7churn", n).await;
+            let census = row_census(&storage).await;
+            let _ = timed_scan(&session, &scan_sql("c7churn"), 1, 1).await;
+            reset();
+            let rows = session
+                .execute(&scan_sql("c7churn"), &[])
+                .await
+                .expect("scan");
+            let (decoded, matched, tombs) = read();
+            let scan = timed_scan(&session, &scan_sql("c7churn"), 1, reps).await;
+            println!(
+                "churn,{n},{},{},{decoded},{matched},{tombs},{},{}",
+                census.entries,
+                census.tombstones,
+                rows.len(),
+                scan.as_micros()
+            );
+            // Engagement, not effect. Before interval-local elision landed
+            // this arm carried `n - 1` tombstones and this assertion read
+            // `tombs > 0`. The elision drives it to zero, which is the result,
+            // so the census's own engagement is proven by the `churn_clean`
+            // arm below instead - it keeps a Clean pre-image and therefore
+            // keeps its tombstones.
+            assert!(
+                decoded > 0,
+                "the churn arm must decode something, otherwise the census does not observe this site"
+            );
+
+            let _ = drop_all_tombstones(&storage).await;
+            let session = reopen_session(&storage).await;
+            let census = row_census(&storage).await;
+            let _ = timed_scan(&session, &scan_sql("c7churn"), 1, 1).await;
+            reset();
+            let rows = session
+                .execute(&scan_sql("c7churn"), &[])
+                .await
+                .expect("scan");
+            let (decoded, matched, tombs) = read();
+            let scan = timed_scan(&session, &scan_sql("c7churn"), 1, reps).await;
+            println!(
+                "churn_dropped,{n},{},{},{decoded},{matched},{tombs},{},{}",
+                census.entries,
+                census.tombstones,
+                rows.len(),
+                scan.as_micros()
+            );
+        }
+    }
+}
+
+
+/// PHASE 11 - does a churning workload accumulate tombstones without bound?
+///
+/// `rounds` repetitions of "create `n` rows, delete all `n`", with the
+/// checkpoint cadence as the experimental variable. The live row count returns
+/// to its starting value at the end of every round, so anything that grows
+/// with `round` is tracking *writes*, not live rows.
+///
+/// - `no_checkpoint` - never checkpointed. This is the case
+///   `checkpoint_compacts_discharged_branch_tombstones` explicitly does not
+///   claim.
+/// - `checkpoint_each_round` - a checkpoint at the end of every round, which
+///   is the interval shape compaction was landed for.
+/// - `checkpoint_every_4` - a realistic middling cadence.
+///
+/// The scan answers exactly one row in every round of every arm, so `scan_us`
+/// against `round` is a growth curve at constant answer size.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn hot_row_tombstone_churn_cycles() {
+    let n = sizes_from_env("LIX_TOMBSTONE_SIZES", &[500])[0];
+    let rounds = sizes_from_env("LIX_TOMBSTONE_ROUNDS", &[8])[0];
+    let reps = reps_from_env(5);
+    println!(
+        "phase11 | cadence,round,row_entries,tombstones,live_entries,packed_bases,root_bases,answer_rows,scan_us,compaction"
+    );
+
+    // Cadence 9999 is the marker for the deferred-delete arm below: the rows
+    // created in round r are deleted in round r+1, with a checkpoint between,
+    // so every delete is against a baseline the interval already discharged.
+    for (label, cadence) in [
+        ("no_checkpoint", 0_usize),
+        ("checkpoint_each_round", 1),
+        ("checkpoint_every_4", 4),
+        ("deferred_delete_ckpt", 9999),
+    ] {
+        let (storage, session) = open_session().await;
+        let table = match cadence {
+            0 => "p11never",
+            1 => "p11each",
+            9999 => "p11defer",
+            _ => "p11four",
+        };
+        register(&session, probe_schema(table)).await;
+        // One permanent survivor so the answer is one row in every round.
+        session
+            .execute(
+                &format!("INSERT INTO {table} (id, locale) VALUES ('row-0', 'keep')"),
+                &[],
+            )
+            .await
+            .expect("survivor should insert");
+
+        if cadence == 9999 {
+            for round in 1..=rounds {
+                let ids = (0..n)
+                    .map(|i| format!("('d{round}-{i}', 'drop')"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                session
+                    .execute(
+                        &format!("INSERT INTO {table} (id, locale) VALUES {ids}"),
+                        &[],
+                    )
+                    .await
+                    .expect("round insert should commit");
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("insert checkpoint should publish");
+                let del = (0..n)
+                    .map(|i| format!("'d{round}-{i}'"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                session
+                    .execute(&format!("DELETE FROM {table} WHERE id IN ({del})"), &[])
+                    .await
+                    .expect("round delete should commit");
+                let before = compaction_counters();
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("delete checkpoint should publish");
+                let counters = compaction_counters().since(before);
+                let census = row_census(&storage).await;
+                let scan = timed_scan(&session, &scan_sql(table), 1, reps).await;
+                let live = session
+                    .execute(&format!("SELECT id FROM {table}"), &[])
+                    .await
+                    .expect("collection scan should run")
+                    .len();
+                assert_eq!(live, 1, "every round must end with exactly one live row");
+                println!(
+                    "{label},{round},{},{},{},{},{},1,{},{counters}",
+                    census.entries,
+                    census.tombstones,
+                    census.live(),
+                    census.packed_bases,
+                    census.root_bases,
+                    scan.as_micros()
+                );
+            }
+            continue;
+        }
+
+        for round in 1..=rounds {
+            let ids = (0..n)
+                .map(|i| format!("('c{round}-{i}', 'drop')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            session
+                .execute(
+                    &format!("INSERT INTO {table} (id, locale) VALUES {ids}"),
+                    &[],
+                )
+                .await
+                .expect("round insert should commit");
+            let del = (0..n)
+                .map(|i| format!("'c{round}-{i}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            session
+                .execute(
+                    &format!("DELETE FROM {table} WHERE id IN ({del})"),
+                    &[],
+                )
+                .await
+                .expect("round delete should commit");
+            let mut counters = CompactionCounters::default();
+            if cadence > 0 && round % cadence == 0 {
+                let before = compaction_counters();
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("checkpoint should publish");
+                counters = compaction_counters().since(before);
+            }
+
+            let census = row_census(&storage).await;
+            let scan = timed_scan(&session, &scan_sql(table), 1, reps).await;
+            let live = session
+                .execute(&format!("SELECT id FROM {table}"), &[])
+                .await
+                .expect("collection scan should run")
+                .len();
+            assert_eq!(live, 1, "every round must end with exactly one live row");
+            println!(
+                "{label},{round},{},{},{},{},{},1,{},{counters}",
+                census.entries,
+                census.tombstones,
+                census.live(),
+                census.packed_bases,
+                census.root_bases,
+                scan.as_micros()
+            );
+        }
+    }
+}
+
+
+/// Removes only the tombstones of identities created and deleted inside the
+/// current checkpoint interval, identified by name prefix rather than by
+/// reading the private baseline codec. Returns how many were removed.
+async fn drop_tombstones_named(storage: &Memory, needle: &str) -> usize {
+    let adapter = StorageAdapter::new(storage.clone());
+    let read = adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("read the hot row plane");
+    let entries = space_entries(&read, crate::hot_state::ROW_SPACE).await;
+    drop(read);
+    let mut writes = adapter.new_write_set();
+    let mut removed = 0_usize;
+    for (key, value) in entries {
+        let is_tombstone = value.len() > 1 && value[1] & HEAD_VALUE_DELETED_BIT != 0;
+        let names = key
+            .0
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes());
+        if is_tombstone && names {
+            writes.delete(crate::hot_state::ROW_SPACE, key);
+            removed += 1;
+        }
+    }
+    adapter
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .expect("tombstone removal should commit");
+    removed
+}
+
+/// PHASE 12 - does any reader depend on an interval-local tombstone?
+///
+/// An *interval-local* identity is one created and deleted inside the same
+/// checkpoint interval. Phase 11 showed those are the ones that accumulate
+/// forever: the checkpoint reaches the compaction route and is offered
+/// nothing, because they are net-absent against the interval baseline.
+///
+/// The proposed upstream fix is to never publish their tombstone at all. This
+/// phase costs that proposal the same way phase 4 costed the sweep - remove
+/// exactly those tombstones behind the engine's back, reopen cold, and put
+/// every reader the design could plausibly depend on the tombstone in front of
+/// the result.
+///
+/// The readers, one arm each:
+///
+/// - the collection answer and the point answer, cold;
+/// - `lix_working_diff`, before and after;
+/// - the commit graph, which is what history is derived from;
+/// - a branch forked *mid-interval*, while the identity was still alive - the
+///   case where the removed key could plausibly have been serving somebody
+///   else's read;
+/// - a merge of that fork back into the branch whose tombstone was removed;
+/// - undo.
+///
+/// Every arm states what it expects *before* the removal so a reader that is
+/// already broken cannot read as a clean pass.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn interval_local_tombstone_has_no_dependent_reader() {
+    const N: usize = 40;
+
+    // ---------- arm 1: the local readers ----------
+    {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("p12row")).await;
+        session
+            .execute(
+                "INSERT INTO p12row (id, locale) VALUES ('row-0', 'keep')",
+                &[],
+            )
+            .await
+            .expect("survivor should insert");
+        // Establish the interval baseline, then create and delete inside it.
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should publish");
+        for i in 0..N {
+            session
+                .execute(
+                    "INSERT INTO p12row (id, locale) VALUES ($1, 'drop')",
+                    &[crate::Value::Text(format!("ephem-{i}"))],
+                )
+                .await
+                .expect("ephemeral insert should commit");
+        }
+        for i in 0..N {
+            session
+                .execute(
+                    "DELETE FROM p12row WHERE id = $1",
+                    &[crate::Value::Text(format!("ephem-{i}"))],
+                )
+                .await
+                .expect("ephemeral delete should commit");
+        }
+
+        let census = row_census(&storage).await;
+        let diff_before = working_diff_rows(&session, "p12row").await;
+        let live_before = session
+            .execute("SELECT id FROM p12row", &[])
+            .await
+            .expect("collection read")
+            .len();
+        println!(
+            "phase12 | arm=local before: entries={} tombstones={} packed_bases={} root_bases={} working_diff_rows={diff_before} live={live_before}",
+            census.entries, census.tombstones, census.packed_bases, census.root_bases
+        );
+        assert_eq!(live_before, 1, "only the survivor is live before the removal");
+
+        let removed = drop_tombstones_named(&storage, "ephem-").await;
+        let session = reopen_session(&storage).await;
+        let census = row_census(&storage).await;
+        let diff_after = working_diff_rows(&session, "p12row").await;
+        let live_after = session
+            .execute("SELECT id FROM p12row", &[])
+            .await
+            .expect("collection read")
+            .len();
+        let point = session
+            .execute(
+                "SELECT id FROM p12row WHERE id = $1",
+                &[crate::Value::Text("ephem-0".to_string())],
+            )
+            .await
+            .expect("point read")
+            .len();
+        println!(
+            "phase12 | arm=local after: removed={removed} entries={} tombstones={} working_diff_rows={diff_after} live={live_after} point_hits_for_deleted={point}"
+        , census.entries, census.tombstones);
+
+        assert_eq!(removed, N, "every interval-local tombstone should be removable");
+        assert_eq!(live_after, 1, "removal must not resurrect an ephemeral row");
+        assert_eq!(point, 0, "a point read must not resurrect an ephemeral row");
+        assert_eq!(
+            diff_after, diff_before,
+            "the working diff must not move when an interval-local tombstone goes"
+        );
+
+        // The checkpoint that closes the interval must still succeed and must
+        // still report nothing for the vanished identities.
+        session
+            .create_checkpoint()
+            .await
+            .expect("closing checkpoint should publish after the removal");
+        let live_ckpt = session
+            .execute("SELECT id FROM p12row", &[])
+            .await
+            .expect("collection read")
+            .len();
+        let census = row_census(&storage).await;
+        println!(
+            "phase12 | arm=local after_closing_checkpoint: entries={} tombstones={} live={live_ckpt} working_diff_rows={}",
+            census.entries,
+            census.tombstones,
+            working_diff_rows(&session, "p12row").await
+        );
+        assert_eq!(live_ckpt, 1, "the closing checkpoint must not resurrect");
+    }
+
+    // ---------- arm 2: a branch forked mid-interval, then merged back ----------
+    // Run twice. `remove=false` is the null control: byte-identical fixture and
+    // reader sequence, with the one step that executes the change omitted. A
+    // merge verdict is only evidence if the control produces the same one.
+    for remove in [false, true] {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("p12fork")).await;
+        session
+            .execute(
+                "INSERT INTO p12fork (id, locale) VALUES ('row-0', 'keep')",
+                &[],
+            )
+            .await
+            .expect("survivor should insert");
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should publish");
+        let main_branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+
+        for i in 0..N {
+            session
+                .execute(
+                    "INSERT INTO p12fork (id, locale) VALUES ($1, 'drop')",
+                    &[crate::Value::Text(format!("ephem-{i}"))],
+                )
+                .await
+                .expect("ephemeral insert should commit");
+        }
+
+        // Fork here: on this branch the ephemeral rows are ALIVE.
+        let fork = session
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "p12-midinterval".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("branch should create");
+
+        for i in 0..N {
+            session
+                .execute(
+                    "DELETE FROM p12fork WHERE id = $1",
+                    &[crate::Value::Text(format!("ephem-{i}"))],
+                )
+                .await
+                .expect("ephemeral delete should commit");
+        }
+
+        let commits_before = session
+            .execute("SELECT id FROM lix_commit", &[])
+            .await
+            .expect("commit graph read")
+            .len();
+        let census = row_census(&storage).await;
+        println!(
+            "phase12 | arm=fork(remove={remove}) before: entries={} tombstones={} root_bases={} commits={commits_before}",
+            census.entries, census.tombstones, census.root_bases
+        );
+
+        // Only the ACTIVE branch's tombstones are removed. The fork keeps its
+        // own scope, which is the point of the arm.
+        let removed = if remove {
+            drop_tombstones_named(&storage, "ephem-").await
+        } else {
+            0
+        };
+        let session = reopen_session(&storage).await;
+
+        let live_main = session
+            .execute("SELECT id FROM p12fork", &[])
+            .await
+            .expect("collection read")
+            .len();
+        session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: fork.id.clone(),
+            })
+            .await
+            .expect("switch to the fork");
+        let live_fork = session
+            .execute("SELECT id FROM p12fork", &[])
+            .await
+            .expect("fork collection read")
+            .len();
+        let commits_after = session
+            .execute("SELECT id FROM lix_commit", &[])
+            .await
+            .expect("commit graph read")
+            .len();
+        println!(
+            "phase12 | arm=fork(remove={remove}) after: removed={removed} live_main={live_main} live_fork={live_fork} commits={commits_after}"
+        );
+        assert_eq!(
+            removed,
+            if remove { N } else { 0 },
+            "the control must remove nothing and the treatment every tombstone"
+        );
+        assert_eq!(live_main, 1, "main must still show only the survivor");
+        assert_eq!(
+            live_fork,
+            N + 1,
+            "the fork forked while the ephemeral rows were alive and must still see them"
+        );
+        assert_eq!(
+            commits_after, commits_before,
+            "removing a serving-view tombstone must not change the commit graph"
+        );
+
+        // Merge the fork (rows alive) back into main (rows deleted, tombstones
+        // gone). This is the reader with the most to lose.
+        session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: main_branch_id,
+            })
+            .await
+            .expect("switch back to main");
+        let merged = session
+            .merge_branch(crate::MergeBranchOptions {
+                source_branch_id: fork.id.clone(),
+            })
+            .await;
+        let live_merged = session
+            .execute("SELECT id FROM p12fork", &[])
+            .await
+            .expect("post-merge collection read")
+            .len();
+        println!(
+            "phase12 | arm=fork(remove={remove}) merge: ok={} live_after_merge={live_merged}",
+            merged.is_ok()
+        );
+        merged.expect("merge must not error after the tombstones are gone");
+    }
+
+    // ---------- arm 3: undo, across the removal ----------
+    for remove in [false, true] {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("p12undo")).await;
+        session
+            .execute(
+                "INSERT INTO p12undo (id, locale) VALUES ('row-0', 'keep')",
+                &[],
+            )
+            .await
+            .expect("survivor should insert");
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should publish");
+        session
+            .execute(
+                "INSERT INTO p12undo (id, locale) VALUES ('ephem-0', 'drop')",
+                &[],
+            )
+            .await
+            .expect("ephemeral insert should commit");
+        session
+            .execute("DELETE FROM p12undo WHERE id = 'ephem-0'", &[])
+            .await
+            .expect("ephemeral delete should commit");
+
+        let removed = if remove {
+            drop_tombstones_named(&storage, "ephem-").await
+        } else {
+            0
+        };
+        let session = reopen_session(&storage).await;
+        session.undo().await.expect("undo should run");
+        let live = session
+            .execute("SELECT id FROM p12undo", &[])
+            .await
+            .expect("post-undo collection read")
+            .len();
+        println!("phase12 | arm=undo(remove={remove}): removed={removed} live_after_undo={live}");
+        assert_eq!(
+            live, 2,
+            "undo of the delete must restore the ephemeral row even with its tombstone gone"
+        );
+    }
+}
+
+
+/// Engagement for the interval-local elision route, read from inside it.
+#[derive(Clone, Copy, Debug, Default)]
+struct ElisionCounters {
+    routes: u64,
+    offered: u64,
+    candidates: u64,
+    elided: u64,
+}
+
+fn elision_counters() -> ElisionCounters {
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
+    ElisionCounters {
+        routes: load(&crate::hot_state::INTERVAL_LOCAL_TOMBSTONE_ROUTES),
+        offered: load(&crate::hot_state::INTERVAL_LOCAL_TOMBSTONE_OFFERED),
+        candidates: load(&crate::hot_state::INTERVAL_LOCAL_TOMBSTONE_CANDIDATES),
+        elided: load(&crate::hot_state::INTERVAL_LOCAL_TOMBSTONE_ELIDED),
+    }
+}
+
+impl ElisionCounters {
+    fn since(self, before: Self) -> Self {
+        Self {
+            routes: self.routes - before.routes,
+            offered: self.offered - before.offered,
+            candidates: self.candidates - before.candidates,
+            elided: self.elided - before.elided,
+        }
+    }
+}
+
+impl std::fmt::Display for ElisionCounters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "routes={} offered={} candidates={} elided={}",
+            self.routes, self.offered, self.candidates, self.elided
+        )
+    }
+}
+
+/// PHASE 13 — the landed fix: an identity created and deleted inside one
+/// checkpoint interval never publishes a tombstone at all.
+///
+/// Phase 11 measured why this is needed: with deletes confined to an interval
+/// the checkpoint's compaction route runs and is offered nothing
+/// (`routes=1 offered=0`), so tombstones accumulate 1:1 with deletes forever.
+/// Phase 12 measured that no reader depends on them.
+///
+/// Engagement first, because every gate on this route is conservative and the
+/// failure mode is silent inertness.
+#[tokio::test]
+async fn interval_local_delete_publishes_no_tombstone() {
+    const N: usize = 200;
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("p13row")).await;
+    session
+        .execute(
+            "INSERT INTO p13row (id, locale) VALUES ('row-0', 'keep')",
+            &[],
+        )
+        .await
+        .expect("survivor should insert");
+    // Open an interval. Everything below is created and deleted inside it.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
+
+    let before = elision_counters();
+    insert_rows_named(&session, "p13row", "ephem", N).await;
+    let after_insert = row_census(&storage).await;
+    delete_rows_named(&session, "p13row", "ephem", N).await;
+    let counters = elision_counters().since(before);
+    let census = row_census(&storage).await;
+
+    println!(
+        "phase13 | after_insert entries={} tombstones={} | after_delete entries={} tombstones={} packed={} root={} {counters}",
+        after_insert.entries,
+        after_insert.tombstones,
+        census.entries,
+        census.tombstones,
+        census.packed_bases,
+        census.root_bases
+    );
+
+    // Both counter assertions are `>=`, the only bleed-safe direction for a
+    // process-global counter. The effect they predict is asserted immediately
+    // below from the space footprint, which is local to this fixture.
+    assert!(
+        counters.candidates >= N as u64,
+        "every interval-local delete must reach the elision route, saw {}",
+        counters.candidates
+    );
+    assert!(
+        counters.elided >= N as u64,
+        "every gate must clear for a branch-local schema with no base, saw {}",
+        counters.elided
+    );
+    assert_eq!(
+        census.tombstones, 0,
+        "an interval-local delete must publish no tombstone"
+    );
+    assert!(
+        census.entries < after_insert.entries,
+        "eliding must leave the serving view smaller than it was with the rows live"
+    );
+
+    // The answers, cold, so nothing passes off a warm cache.
+    let session = reopen_session(&storage).await;
+    let live = session
+        .execute("SELECT id FROM p13row", &[])
+        .await
+        .expect("collection scan should run");
+    assert_eq!(live.len(), 1, "eliding must not resurrect a deleted row");
+    let point = session
+        .execute(
+            "SELECT id FROM p13row WHERE id = $1",
+            &[crate::Value::Text("ephem-0".to_string())],
+        )
+        .await
+        .expect("point read should run");
+    assert_eq!(point.len(), 0, "a point read must not resurrect either");
+    assert_eq!(
+        working_diff_rows(&session, "p13row").await,
+        0,
+        "an identity created and deleted in one interval owes the working diff nothing"
+    );
+    session
+        .create_checkpoint()
+        .await
+        .expect("closing checkpoint should publish");
+    let live = session
+        .execute("SELECT id FROM p13row", &[])
+        .await
+        .expect("collection scan should run");
+    assert_eq!(live.len(), 1, "the closing checkpoint must not resurrect");
+}
+
+/// INVERSION 1 — the rule must refuse when the pre-image predates the interval.
+///
+/// Same fixture shape, one difference: the rows are checkpointed *before* they
+/// are deleted, so their pre-image carries `Clean` rather than `BeforeAbsent`.
+/// Their delete is observable against the interval baseline and the tombstone
+/// is load-bearing until the next checkpoint discharges it. A rule that
+/// admitted this case would drop a row whose before-image is still owed.
+#[tokio::test]
+async fn clean_pre_image_delete_still_publishes_a_tombstone() {
+    const N: usize = 200;
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("p13cln")).await;
+    insert_rows_named(&session, "p13cln", "keeprow", N).await;
+    // This checkpoint is what makes the pre-images `Clean`.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
+
+    let before = elision_counters();
+    delete_rows_named(&session, "p13cln", "keeprow", N).await;
+    let counters = elision_counters().since(before);
+    let census = row_census(&storage).await;
+    println!(
+        "phase13 | inversion=clean_pre_image entries={} tombstones={} working_diff_rows={} {counters}",
+        census.entries,
+        census.tombstones,
+        working_diff_rows(&session, "p13cln").await
+    );
+
+    // The refusal is asserted from the SPACE FOOTPRINT, which is local to this
+    // fixture, and never from the elision counters, which are process-global:
+    // in the parallel suite a concurrent test's publications land in them, and
+    // an `assert_eq!(elided, 0)` here read 251 for a fixture that offered 50.
+    // Only the `>=` direction of a global counter is safe, because bleed can
+    // only inflate it - and `>=` cannot express a refusal. The tombstones
+    // surviving in this collection is the refusal.
+    assert_eq!(
+        census.tombstones, N,
+        "the delete of a checkpointed row must still publish its tombstone"
+    );
+    assert_eq!(
+        working_diff_rows(&session, "p13cln").await,
+        N,
+        "and the working diff must report every one of those deletes"
+    );
+}
+
+/// INVERSION 2 — the rule must refuse when the generation has a base.
+///
+/// Gate (a) is shared with checkpoint compaction and is what keeps a tombstone
+/// that is shadowing a base row. A branch forked from a published head serves
+/// through a root current base, so its generation has one.
+#[tokio::test]
+async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
+    const N: usize = 50;
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("p13base")).await;
+    insert_rows_named(&session, "p13base", "based", N).await;
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
+    let branch = session
+        .create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "p13-based".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("branch should create");
+    session
+        .switch_branch(crate::SwitchBranchOptions {
+            branch_id: branch.id.clone(),
+        })
+        .await
+        .expect("branch should switch");
+
+    let census = row_census(&storage).await;
+    // Engagement precondition: without a base this arm proves nothing.
+    assert!(
+        census.packed_bases > 0 || census.root_bases > 0,
+        "this inversion needs a base in the generation, saw packed={} root={}",
+        census.packed_bases,
+        census.root_bases
+    );
+
+    let before = elision_counters();
+    insert_rows_named(&session, "p13base", "ephem", N).await;
+    delete_rows_named(&session, "p13base", "ephem", N).await;
+    let counters = elision_counters().since(before);
+    let census = row_census(&storage).await;
+    println!(
+        "phase13 | inversion=has_base entries={} tombstones={} packed={} root={} {counters}",
+        census.entries, census.tombstones, census.packed_bases, census.root_bases
+    );
+
+    // Engagement in the `>=` direction only - safe under counter bleed,
+    // because a concurrent test can only inflate it. It establishes that this
+    // route runs at all; what establishes that gate (a) *refused for these
+    // rows* is the fixture-local tombstone count below.
+    assert!(
+        counters.candidates >= N as u64,
+        "the deltas must reach the route, or the refusal below is vacuous, saw {}",
+        counters.candidates
+    );
+    assert_eq!(
+        census.tombstones, N,
+        "gate (a) must keep every tombstone while a base is visible"
+    );
+
+    let session = reopen_session(&storage).await;
+    let live = session
+        .execute("SELECT id FROM p13base", &[])
+        .await
+        .expect("collection scan should run");
+    assert_eq!(live.len(), N, "the based rows must survive, the ephemerals must not");
+}
+
+/// Named-row helpers, so an arm can create and delete a cohort without
+/// disturbing the survivors the assertions count.
+async fn insert_rows_named(
+    session: &SessionContext<Memory>,
+    table: &str,
+    prefix: &str,
+    count: usize,
+) {
+    let mut index = 0;
+    while index < count {
+        let end = (index + CHUNK).min(count);
+        let values = (index..end)
+            .map(|i| format!("('{prefix}-{i}', 'drop')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("INSERT INTO {table} (id, locale) VALUES {values}"),
+                &[],
+            )
+            .await
+            .expect("named rows should insert");
+        index = end;
+    }
+}
+
+async fn delete_rows_named(
+    session: &SessionContext<Memory>,
+    table: &str,
+    prefix: &str,
+    count: usize,
+) {
+    let mut index = 0;
+    while index < count {
+        let end = (index + CHUNK).min(count);
+        let ids = (index..end)
+            .map(|i| format!("'{prefix}-{i}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(&format!("DELETE FROM {table} WHERE id IN ({ids})"), &[])
+            .await
+            .expect("named bulk delete should run");
+        index = end;
     }
 }
