@@ -2,6 +2,7 @@ mod context;
 mod derived;
 mod entity_columnar_cache;
 mod entity_decoded_column_cache;
+pub(crate) mod jsonb;
 mod reader;
 mod tracked_head;
 pub(crate) mod typed_slots;

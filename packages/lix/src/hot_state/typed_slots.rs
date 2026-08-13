@@ -32,13 +32,9 @@
 //! # Scalar columns only, by design
 //!
 //! `String`, `Integer`, `Number` and `Boolean` columns get typed payloads.
-//! `Json`-declared columns keep their JSON text verbatim in a `Json` slot:
-//! `lix_key_value.value` and `json_pointer.value` are arbitrary JSON by design
-//! — a `::json` column, not a value of unknown type — and this format
-//! deliberately does not introduce a tagged any-slot to cover them. A `Json`
-//! slot is a byte range a reader can hand back or re-parse exactly as it does
-//! today; nothing about it gets worse, and nothing about it pretends to be
-//! typed.
+//! A declared PostgreSQL `jsonb` column uses the canonical JSONB cell codec.
+//! No other declared type calls that codec, and the enclosing entity row is
+//! never serialized as JSONB.
 //!
 //! # Absent keys become null slots
 //!
@@ -81,35 +77,32 @@ const TAG_I64: u8 = 4;
 const TAG_U64: u8 = 5;
 const TAG_F64: u8 = 6;
 const TAG_STR: u8 = 7;
-const TAG_JSON: u8 = 8;
+const TAG_JSONB: u8 = 8;
+const TAG_DECIMAL: u8 = 9;
 
-
-// Counted at every point on the decode path that hands bytes to a JSON
-// tokenizer, so a test can assert that reading columns out of a typed record
-// tokenized nothing rather than inspecting the code and believing it. Only a
-// `Json`-declared slot can move this counter; a scalar slot decodes to a value
-// without a parser ever seeing its bytes.
+// Counted at every JSONB codec boundary. A scalar-only schema must leave it at
+// zero; only a genuinely declared JSONB cell may move it.
 #[cfg(test)]
 thread_local! {
-    static TYPED_SLOTS_JSON_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TYPED_SLOTS_JSONB_CODEC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
-fn record_typed_slots_json_parse() {
-    TYPED_SLOTS_JSON_PARSES.with(|count| count.set(count.get() + 1));
+fn record_typed_slots_jsonb_codec_call() {
+    TYPED_SLOTS_JSONB_CODEC_CALLS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(not(test))]
-fn record_typed_slots_json_parse() {}
+fn record_typed_slots_jsonb_codec_call() {}
 
 #[cfg(test)]
-fn reset_typed_slots_json_parse_count() {
-    TYPED_SLOTS_JSON_PARSES.with(|count| count.set(0));
+fn reset_typed_slots_jsonb_codec_call_count() {
+    TYPED_SLOTS_JSONB_CODEC_CALLS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
-fn typed_slots_json_parse_count() -> usize {
-    TYPED_SLOTS_JSON_PARSES.with(std::cell::Cell::get)
+fn typed_slots_jsonb_codec_call_count() -> usize {
+    TYPED_SLOTS_JSONB_CODEC_CALLS.with(std::cell::Cell::get)
 }
 
 /// The declared type of a column, as the schema catalog resolves it.
@@ -124,13 +117,12 @@ pub(crate) enum DeclaredType {
     Integer,
     Number,
     Boolean,
-    /// Arbitrary JSON by design. Stored as verbatim JSON text.
-    Json,
+    Jsonb,
 }
 
 impl DeclaredType {
     pub(crate) fn is_scalar(self) -> bool {
-        !matches!(self, Self::Json)
+        !matches!(self, Self::Jsonb)
     }
 }
 
@@ -176,9 +168,7 @@ pub(crate) struct TypedSlotLayout {
 }
 
 impl TypedSlotLayout {
-    pub(crate) fn new(
-        columns: impl IntoIterator<Item = (String, DeclaredType)>,
-    ) -> Result<Self> {
+    pub(crate) fn new(columns: impl IntoIterator<Item = (String, DeclaredType)>) -> Result<Self> {
         let columns: Vec<(String, DeclaredType)> = columns.into_iter().collect();
         if columns.len() > usize::from(u16::MAX) {
             return Err(TypedSlotError::new(format!(
@@ -223,8 +213,7 @@ impl TypedSlotLayout {
         self.columns.get(index).map(|(_, declared)| *declared)
     }
 
-    /// True when every declared column is scalar, so no slot in this layout
-    /// carries JSON text.
+    /// True when every declared column bypasses the JSONB codec.
     pub(crate) fn is_all_scalar(&self) -> bool {
         self.columns
             .iter()
@@ -233,7 +222,7 @@ impl TypedSlotLayout {
 }
 
 /// One decoded slot. Borrowed from the record; nothing is copied or parsed.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TypedSlot<'a> {
     /// The column was present and its value was JSON `null`.
     Null,
@@ -248,13 +237,14 @@ pub(crate) enum TypedSlot<'a> {
     U64(u64),
     F64(f64),
     Str(&'a str),
-    /// Verbatim JSON text for a `Json`-declared column.
-    Json(&'a str),
+    /// Lossless spelling for a scalar JSON number outside the integer tags.
+    Decimal(&'a str),
+    Jsonb(JsonValue),
 }
 
 impl TypedSlot<'_> {
     /// Whether this slot reads as SQL `NULL` at the entity surface.
-    pub(crate) fn is_sql_null(self) -> bool {
+    pub(crate) fn is_sql_null(&self) -> bool {
         matches!(self, Self::Null | Self::Absent)
     }
 }
@@ -285,17 +275,26 @@ pub(crate) fn encode_typed_slots(
             .declared_type(index)
             .expect("index is below the layout length");
         let offset = bytes.len() - payload_start;
-        let tag = match snapshot.get(name) {
-            None => TAG_ABSENT,
-            Some(JsonValue::Null) => TAG_NULL,
-            Some(JsonValue::Bool(value)) => {
+        let tag = match (snapshot.get(name), declared) {
+            (None, _) => TAG_ABSENT,
+            (Some(value), DeclaredType::Jsonb) => {
+                record_typed_slots_jsonb_codec_call();
+                bytes.extend_from_slice(&super::jsonb::encode(value).map_err(|error| {
+                    TypedSlotError::new(format!(
+                        "column '{name}' could not be encoded as JSONB: {error}"
+                    ))
+                })?);
+                TAG_JSONB
+            }
+            (Some(JsonValue::Null), _) => TAG_NULL,
+            (Some(JsonValue::Bool(value)), _) => {
                 if *value {
                     TAG_TRUE
                 } else {
                     TAG_FALSE
                 }
             }
-            Some(JsonValue::Number(number)) => {
+            (Some(JsonValue::Number(number)), _) => {
                 // The *written* number kind is preserved, not the declared one.
                 // An `Integer` column holding `1.0` must render back as `1.0`;
                 // coercing it to the declared type would make the record's JSON
@@ -306,57 +305,22 @@ pub(crate) fn encode_typed_slots(
                 } else if let Some(value) = number.as_u64() {
                     bytes.extend_from_slice(&value.to_be_bytes());
                     TAG_U64
-                } else if let Some(value) = number.as_f64() {
-                    bytes.extend_from_slice(&value.to_be_bytes());
-                    TAG_F64
                 } else {
-                    return Err(TypedSlotError::new(format!(
-                        "column '{name}' holds a JSON number that is neither i64, u64 nor f64"
-                    )));
+                    // `serde_json/arbitrary_precision` deliberately preserves
+                    // decimal spelling. Keep that scalar contract independent
+                    // of the JSONB codec instead of coercing through f64.
+                    bytes.extend_from_slice(number.to_string().as_bytes());
+                    TAG_DECIMAL
                 }
             }
-            Some(JsonValue::String(value)) => {
+            (Some(JsonValue::String(value)), _) => {
                 bytes.extend_from_slice(value.as_bytes());
                 TAG_STR
             }
-            Some(other) => {
-                if declared.is_scalar() {
-                    return Err(TypedSlotError::new(format!(
-                        "column '{name}' is declared scalar but holds a composite JSON value"
-                    )));
-                }
-                let rendered = serde_json::to_string(other).map_err(|error| {
-                    TypedSlotError::new(format!(
-                        "column '{name}' could not be rendered as JSON text: {error}"
-                    ))
-                })?;
-                bytes.extend_from_slice(rendered.as_bytes());
-                TAG_JSON
-            }
-        };
-        // A `Json`-declared column holding a scalar still stores JSON text, so
-        // reconstruction reproduces the value without consulting the layout.
-        let tag = if declared.is_scalar() {
-            tag
-        } else {
-            match tag {
-                TAG_ABSENT | TAG_NULL => tag,
-                TAG_JSON => TAG_JSON,
-                _ => {
-                    // Rewind the scalar payload just written and re-emit it as
-                    // JSON text.
-                    bytes.truncate(payload_start + offset);
-                    let value = snapshot
-                        .get(name)
-                        .expect("a non-absent slot has a value in the map");
-                    let rendered = serde_json::to_string(value).map_err(|error| {
-                        TypedSlotError::new(format!(
-                            "column '{name}' could not be rendered as JSON text: {error}"
-                        ))
-                    })?;
-                    bytes.extend_from_slice(rendered.as_bytes());
-                    TAG_JSON
-                }
+            (Some(_), _) => {
+                return Err(TypedSlotError::new(format!(
+                    "column '{name}' is declared scalar but holds a composite JSON value"
+                )));
             }
         };
         let length = bytes.len() - payload_start - offset;
@@ -482,7 +446,8 @@ impl<'a> TypedSlotsRef<'a> {
             )));
         }
         let (tag, offset, length) = self.directory_entry(index);
-        let payload = &self.bytes[self.payload_start + offset..self.payload_start + offset + length];
+        let payload =
+            &self.bytes[self.payload_start + offset..self.payload_start + offset + length];
         Ok(match tag {
             TAG_NULL => TypedSlot::Null,
             TAG_ABSENT => TypedSlot::Absent,
@@ -492,7 +457,16 @@ impl<'a> TypedSlotsRef<'a> {
             TAG_U64 => TypedSlot::U64(u64::from_be_bytes(fixed_eight(payload, index)?)),
             TAG_F64 => TypedSlot::F64(f64::from_be_bytes(fixed_eight(payload, index)?)),
             TAG_STR => TypedSlot::Str(utf8(payload, index)?),
-            TAG_JSON => TypedSlot::Json(utf8(payload, index)?),
+            TAG_DECIMAL => TypedSlot::Decimal(utf8(payload, index)?),
+            TAG_JSONB => {
+                // Decode validates version, exact length, content identity and
+                // canonical child layout before these bytes can escape.
+                record_typed_slots_jsonb_codec_call();
+                let value = super::jsonb::decode(payload).map_err(|error| {
+                    TypedSlotError::new(format!("typed slot {index} has invalid JSONB: {error}"))
+                })?;
+                TypedSlot::Jsonb(value)
+            }
             other => {
                 return Err(TypedSlotError::new(format!(
                     "typed slot {index} carries unknown tag {other}"
@@ -541,14 +515,14 @@ impl<'a> TypedSlotsRef<'a> {
                         ))
                     })?,
                 TypedSlot::Str(value) => JsonValue::String(value.to_string()),
-                TypedSlot::Json(value) => {
-                    record_typed_slots_json_parse();
-                    serde_json::from_str(value).map_err(|error| {
+                TypedSlot::Decimal(value) => serde_json::from_str::<JsonNumber>(value)
+                    .map(JsonValue::Number)
+                    .map_err(|error| {
                         TypedSlotError::new(format!(
-                            "column '{column}' holds JSON text that did not parse: {error}"
+                            "column '{column}' holds an invalid decimal number: {error}"
                         ))
-                    })?
-                }
+                    })?,
+                TypedSlot::Jsonb(value) => value,
             };
             map.insert((*column).to_string(), value);
         }
@@ -595,14 +569,14 @@ impl<'a> TypedSlotsRef<'a> {
                         ))
                     })?,
                 TypedSlot::Str(value) => JsonValue::String(value.to_string()),
-                TypedSlot::Json(value) => {
-                    record_typed_slots_json_parse();
-                    serde_json::from_str(value).map_err(|error| {
+                TypedSlot::Decimal(value) => serde_json::from_str::<JsonNumber>(value)
+                    .map(JsonValue::Number)
+                    .map_err(|error| {
                         TypedSlotError::new(format!(
-                            "column '{name}' holds JSON text that did not parse: {error}"
+                            "column '{name}' holds an invalid decimal number: {error}"
                         ))
-                    })?
-                }
+                    })?,
+                TypedSlot::Jsonb(value) => value,
             };
             map.insert(name.to_string(), value);
         }
@@ -650,7 +624,7 @@ mod tests {
             ("ratio".to_string(), DeclaredType::Number),
             ("enabled".to_string(), DeclaredType::Boolean),
             ("label".to_string(), DeclaredType::String),
-            ("payload".to_string(), DeclaredType::Json),
+            ("payload".to_string(), DeclaredType::Jsonb),
         ])
         .expect("layout")
     }
@@ -686,17 +660,23 @@ mod tests {
         );
         let text = r#"{"count":7,"enabled":true,"id":"entity-1","label":"second","note":"a longer trailing column that a predicate on id never needs to look at","ratio":1.5}"#;
         let snapshot = object(text);
+        reset_typed_slots_jsonb_codec_call_count();
         let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
+        assert_eq!(
+            typed_slots_jsonb_codec_call_count(),
+            0,
+            "an ordinary scalar-only schema must bypass JSONB encoding"
+        );
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
 
         let wanted: BTreeSet<&str> = ["id", "count"].into_iter().collect();
 
-        reset_typed_slots_json_parse_count();
+        reset_typed_slots_jsonb_codec_call_count();
         let projected = record.filter_columns(&layout, &wanted).expect("project");
         assert_eq!(
-            typed_slots_json_parse_count(),
+            typed_slots_jsonb_codec_call_count(),
             0,
-            "an all-scalar record must reach no JSON tokenizer at all"
+            "an all-scalar record must reach no JSONB codec"
         );
         assert_eq!(projected["id"], JsonValue::String("entity-1".to_string()));
         assert_eq!(projected["count"], JsonValue::Number(JsonNumber::from(7)));
@@ -717,31 +697,31 @@ mod tests {
         assert_eq!(full["count"], projected["count"]);
     }
 
-    /// A `Json`-declared column is the one slot that still reaches a parser, and
-    /// only when the predicate actually names it. This pins that the exemption
-    /// is scoped to the column rather than to the record.
+    /// A declared JSONB column is the one slot that reaches the codec, and only
+    /// when its bytes are encoded or the predicate actually names it.
     #[test]
-    fn only_a_json_declared_column_reaches_a_parser_and_only_when_wanted() {
+    fn only_a_jsonb_declared_column_reaches_the_codec() {
         let layout = layout();
-        let snapshot =
-            object(r#"{"count":1,"enabled":false,"id":"row","label":"x","payload":{"deep":[1]},"ratio":0.5}"#);
+        let snapshot = object(
+            r#"{"count":1,"enabled":false,"id":"row","label":"x","payload":{"deep":[1]},"ratio":0.5}"#,
+        );
         let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
 
-        reset_typed_slots_json_parse_count();
+        reset_typed_slots_jsonb_codec_call_count();
         let scalars: BTreeSet<&str> = ["id", "count", "ratio", "enabled", "label"]
             .into_iter()
             .collect();
         record.filter_columns(&layout, &scalars).expect("project");
-        assert_eq!(typed_slots_json_parse_count(), 0);
+        assert_eq!(typed_slots_jsonb_codec_call_count(), 0);
 
-        reset_typed_slots_json_parse_count();
+        reset_typed_slots_jsonb_codec_call_count();
         let with_json: BTreeSet<&str> = ["id", "payload"].into_iter().collect();
         let projected = record.filter_columns(&layout, &with_json).expect("project");
         assert_eq!(
-            typed_slots_json_parse_count(),
+            typed_slots_jsonb_codec_call_count(),
             1,
-            "the arbitrary-JSON column is parsed, and it is the only one"
+            "the declared JSONB column is decoded, and it is the only one"
         );
         assert_eq!(projected["payload"]["deep"][0], JsonValue::Number(1.into()));
     }
@@ -751,8 +731,7 @@ mod tests {
     #[test]
     fn an_undeclared_predicate_column_projects_to_nothing() {
         let layout = layout();
-        let bytes =
-            encode_typed_slots(&layout, &object(r#"{"id":"row"}"#)).expect("encode");
+        let bytes = encode_typed_slots(&layout, &object(r#"{"id":"row"}"#)).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
         let wanted: BTreeSet<&str> = ["not_a_column"].into_iter().collect();
         let projected = record.filter_columns(&layout, &wanted).expect("project");
@@ -764,8 +743,9 @@ mod tests {
         // Every field carries a distinct value on purpose: a round trip with
         // colliding values cannot detect a permuted slot order.
         let layout = layout();
-        let snapshot =
-            object(r#"{"count":7,"enabled":true,"id":"entity-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#);
+        let snapshot = object(
+            r#"{"count":7,"enabled":true,"id":"entity-1","label":"second","payload":{"nested":[1,2]},"ratio":1.5}"#,
+        );
         let bytes = encode_typed_slots(&layout, &snapshot).expect("encode");
         let record = TypedSlotsRef::parse(&bytes).expect("parse");
 
@@ -784,7 +764,7 @@ mod tests {
             record
                 .slot(layout.index_of("ratio").expect("ratio"))
                 .expect("ratio"),
-            TypedSlot::F64(1.5)
+            TypedSlot::Decimal("1.5")
         );
         assert_eq!(
             record
@@ -798,12 +778,13 @@ mod tests {
                 .expect("label"),
             TypedSlot::Str("second")
         );
-        assert_eq!(
-            record
-                .slot(layout.index_of("payload").expect("payload"))
-                .expect("payload"),
-            TypedSlot::Json(r#"{"nested":[1,2]}"#)
-        );
+        let TypedSlot::Jsonb(payload) = record
+            .slot(layout.index_of("payload").expect("payload"))
+            .expect("payload")
+        else {
+            panic!("payload must be a JSONB slot")
+        };
+        assert_eq!(payload, serde_json::json!({"nested":[1,2]}));
     }
 
     /// The property the staged landing depends on: a typed record can serve a
