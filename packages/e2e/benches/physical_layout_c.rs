@@ -165,25 +165,33 @@ impl Tree {
     }
 
     fn verify_all(&self) -> Result<(), &'static str> {
-        for (id, bytes) in &self.objects {
-            if blake3::hash(bytes).as_bytes() != id {
-                return Err("object id mismatch");
-            }
-            decode_envelope(bytes)?;
+        let (store, branch_ref_id) = self.authenticated_store_for_branch(b"main");
+        let verified = verify_branch(&store, branch_ref_id)?;
+        if verified.branch_id != b"main"
+            || verified.root_id != self.root_id()
+            || verified.rows != self.rows.len()
+        {
+            return Err("authenticated branch/root summary mismatch");
         }
-        for level in &self.levels {
-            for object in level {
-                if object.first_key > object.last_key || object.rows == 0 {
-                    return Err("invalid authenticated key range");
-                }
-                if let Some(sidecar) = object.sidecar
-                    && !self.objects.contains_key(&sidecar)
-                {
-                    return Err("missing authenticated PAX sidecar");
-                }
-            }
+        if verified.visited != self.objects.keys().copied().collect() {
+            return Err("unreachable or missing authenticated page object");
         }
         Ok(())
+    }
+
+    fn root_id(&self) -> [u8; 32] {
+        self.levels.last().expect("root level")[0].id
+    }
+
+    fn authenticated_store_for_branch(
+        &self,
+        branch_id: &[u8],
+    ) -> (BTreeMap<[u8; 32], Bytes>, [u8; 32]) {
+        let mut store = self.objects.clone();
+        let branch_ref = encode_branch_ref(branch_id, self.root_id());
+        let branch_ref_id = *blake3::hash(&branch_ref).as_bytes();
+        store.insert(branch_ref_id, branch_ref);
+        (store, branch_ref_id)
     }
 
     fn profile_reads(&self) -> (ReadMetric, ReadMetric, ReadMetric, ReadMetric) {
@@ -384,9 +392,9 @@ fn encode_c1(row: &TypedRow) -> Object {
     let mut raw = Vec::with_capacity(row.key.len() + row.canonical.len() + 32);
     raw.extend_from_slice(b"LXC1");
     raw.extend_from_slice(&SCHEMA_FINGERPRINT);
-    push_u32(&mut raw, row.key.len());
+    push_bytes(&mut raw, &row.key);
+    push_bytes(&mut raw, &row.key);
     push_u32(&mut raw, row.canonical.len());
-    raw.extend_from_slice(&row.key);
     raw.extend_from_slice(&row.canonical);
     make_object(raw, row.key.clone(), row.key.clone(), 1, None)
 }
@@ -396,6 +404,8 @@ fn encode_c2(rows: &[TypedRow]) -> Object {
     let mut raw = Vec::new();
     raw.extend_from_slice(b"LXC2");
     raw.extend_from_slice(&SCHEMA_FINGERPRINT);
+    push_bytes(&mut raw, &rows.first().expect("page row").key);
+    push_bytes(&mut raw, &rows.last().expect("page row").key);
     push_u32(&mut raw, rows.len());
     push_u32(&mut raw, prefix.len());
     raw.extend_from_slice(prefix);
@@ -437,6 +447,8 @@ fn encode_c3(rows: &[TypedRow]) -> Object {
     let mut raw = Vec::new();
     raw.extend_from_slice(b"LXC3");
     raw.extend_from_slice(&SCHEMA_FINGERPRINT);
+    push_bytes(&mut raw, &rows.first().expect("page row").key);
+    push_bytes(&mut raw, &rows.last().expect("page row").key);
     raw.extend_from_slice(&sidecar_id);
     push_u32(&mut raw, rows.len());
     push_u32(&mut raw, prefix.len());
@@ -488,6 +500,9 @@ fn build_internal_level(children: &[Object], target: usize) -> Vec<Object> {
             let prefix = common_prefix(group.iter().map(|child| child.last_key.as_slice()));
             let mut raw = Vec::new();
             raw.extend_from_slice(b"LXCI");
+            raw.extend_from_slice(&SCHEMA_FINGERPRINT);
+            push_bytes(&mut raw, &group.first().expect("child").first_key);
+            push_bytes(&mut raw, &group.last().expect("child").last_key);
             push_u32(&mut raw, group.len());
             push_u32(&mut raw, prefix.len());
             raw.extend_from_slice(prefix);
@@ -647,6 +662,340 @@ fn decoded_len(bytes: &[u8]) -> Result<usize, &'static str> {
     decode_envelope(bytes).map(|raw| raw.len())
 }
 
+fn encode_branch_ref(branch_id: &[u8], root_id: [u8; 32]) -> Bytes {
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"LXBR");
+    raw.extend_from_slice(&SCHEMA_FINGERPRINT);
+    push_bytes(&mut raw, branch_id);
+    raw.extend_from_slice(&root_id);
+    encode_envelope(raw)
+}
+
+struct VerifiedBranch {
+    branch_id: Vec<u8>,
+    root_id: [u8; 32],
+    rows: usize,
+    visited: BTreeSet<[u8; 32]>,
+}
+
+#[derive(Clone)]
+struct NodeSummary {
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
+    rows: usize,
+}
+
+fn verify_branch(
+    store: &BTreeMap<[u8; 32], Bytes>,
+    branch_ref_id: [u8; 32],
+) -> Result<VerifiedBranch, &'static str> {
+    let branch_bytes = authenticated_object(store, branch_ref_id)?;
+    let raw = decode_envelope(branch_bytes)?;
+    let mut cursor = Cursor::new(&raw);
+    cursor.expect_magic(b"LXBR")?;
+    cursor.expect_fingerprint()?;
+    let branch_id = cursor.bytes()?.to_vec();
+    if branch_id.is_empty() {
+        return Err("empty authenticated branch identity");
+    }
+    let root_id = cursor.object_id()?;
+    cursor.finish()?;
+    let mut visited = BTreeSet::new();
+    let mut visiting = BTreeSet::new();
+    let summary = verify_node(store, root_id, &mut visited, &mut visiting)?;
+    Ok(VerifiedBranch {
+        branch_id,
+        root_id,
+        rows: summary.rows,
+        visited,
+    })
+}
+
+fn authenticated_object(
+    store: &BTreeMap<[u8; 32], Bytes>,
+    id: [u8; 32],
+) -> Result<&Bytes, &'static str> {
+    let bytes = store.get(&id).ok_or("missing authenticated object")?;
+    if blake3::hash(bytes).as_bytes() != &id {
+        return Err("object id mismatch");
+    }
+    Ok(bytes)
+}
+
+fn verify_node(
+    store: &BTreeMap<[u8; 32], Bytes>,
+    id: [u8; 32],
+    visited: &mut BTreeSet<[u8; 32]>,
+    visiting: &mut BTreeSet<[u8; 32]>,
+) -> Result<NodeSummary, &'static str> {
+    if !visiting.insert(id) {
+        return Err("authenticated object cycle");
+    }
+    let bytes = authenticated_object(store, id)?;
+    let raw = decode_envelope(bytes)?;
+    let summary = match raw.get(..4) {
+        Some(b"LXC1") => verify_c1(&raw)?,
+        Some(b"LXC2") => verify_c2(&raw)?,
+        Some(b"LXC3") => verify_c3(store, &raw, visited)?,
+        Some(b"LXCI") => verify_internal(store, &raw, visited, visiting)?,
+        _ => return Err("wrong authenticated object domain"),
+    };
+    visiting.remove(&id);
+    visited.insert(id);
+    Ok(summary)
+}
+
+fn read_page_header(cursor: &mut Cursor<'_>) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
+    cursor.expect_fingerprint()?;
+    let first = cursor.bytes()?.to_vec();
+    let last = cursor.bytes()?.to_vec();
+    if first.is_empty() || first > last {
+        return Err("invalid embedded page key bounds");
+    }
+    Ok((first, last))
+}
+
+fn verify_c1(raw: &[u8]) -> Result<NodeSummary, &'static str> {
+    let mut cursor = Cursor::new(raw);
+    cursor.expect_magic(b"LXC1")?;
+    let (first, last) = read_page_header(&mut cursor)?;
+    if first != last {
+        return Err("C1 bounds must identify one key");
+    }
+    let value_len = cursor.u32()?;
+    cursor.take(value_len)?;
+    cursor.finish()?;
+    Ok(NodeSummary {
+        first_key: first,
+        last_key: last,
+        rows: 1,
+    })
+}
+
+fn verify_c2(raw: &[u8]) -> Result<NodeSummary, &'static str> {
+    let mut cursor = Cursor::new(raw);
+    cursor.expect_magic(b"LXC2")?;
+    let (first, last) = read_page_header(&mut cursor)?;
+    let rows = cursor.u32()?;
+    if rows == 0 {
+        return Err("empty slotted page");
+    }
+    let prefix = cursor.bytes()?.to_vec();
+    let mut directory = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        directory.push((cursor.u32()?, cursor.u32()?, cursor.u32()?, cursor.u32()?));
+    }
+    let suffix_total = directory
+        .iter()
+        .map(|(offset, len, _, _)| offset.checked_add(*len).ok_or("suffix overflow"))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let suffixes = cursor.take(suffix_total)?;
+    let values = cursor.remaining();
+    let mut expected_suffix = 0;
+    let mut expected_value = 0;
+    let mut keys = Vec::with_capacity(rows);
+    for (suffix_offset, suffix_len, value_offset, value_len) in directory {
+        if suffix_offset != expected_suffix || value_offset != expected_value {
+            return Err("non-canonical slot directory offsets");
+        }
+        let suffix_end = suffix_offset
+            .checked_add(suffix_len)
+            .ok_or("suffix overflow")?;
+        let value_end = value_offset
+            .checked_add(value_len)
+            .ok_or("value overflow")?;
+        let suffix = suffixes
+            .get(suffix_offset..suffix_end)
+            .ok_or("slot suffix out of bounds")?;
+        values
+            .get(value_offset..value_end)
+            .ok_or("slot value out of bounds")?;
+        let mut key = prefix.clone();
+        key.extend_from_slice(suffix);
+        keys.push(key);
+        expected_suffix = suffix_end;
+        expected_value = value_end;
+    }
+    if expected_value != values.len()
+        || keys.windows(2).any(|pair| pair[0] >= pair[1])
+        || keys.first() != Some(&first)
+        || keys.last() != Some(&last)
+    {
+        return Err("slotted page ordering/bounds mismatch");
+    }
+    Ok(NodeSummary {
+        first_key: first,
+        last_key: last,
+        rows,
+    })
+}
+
+fn verify_c3(
+    store: &BTreeMap<[u8; 32], Bytes>,
+    raw: &[u8],
+    visited: &mut BTreeSet<[u8; 32]>,
+) -> Result<NodeSummary, &'static str> {
+    let mut cursor = Cursor::new(raw);
+    cursor.expect_magic(b"LXC3")?;
+    let (first, last) = read_page_header(&mut cursor)?;
+    let sidecar_id = cursor.object_id()?;
+    let rows = cursor.u32()?;
+    if rows == 0 {
+        return Err("empty PAX page");
+    }
+    let prefix = cursor.bytes()?.to_vec();
+    let mut keys = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        let suffix = cursor.bytes()?;
+        let mut key = prefix.clone();
+        key.extend_from_slice(suffix);
+        keys.push(key);
+    }
+    for _ in 0..rows {
+        let fixed_len = cursor.u32()?;
+        cursor.take(fixed_len)?;
+    }
+    cursor.finish()?;
+    if keys.windows(2).any(|pair| pair[0] >= pair[1])
+        || keys.first() != Some(&first)
+        || keys.last() != Some(&last)
+    {
+        return Err("PAX key ordering/bounds mismatch");
+    }
+    let sidecar = authenticated_object(store, sidecar_id)?;
+    let sidecar_raw = decode_envelope(sidecar)?;
+    let mut sidecar_cursor = Cursor::new(&sidecar_raw);
+    sidecar_cursor.expect_magic(b"LXCV")?;
+    sidecar_cursor.expect_fingerprint()?;
+    if sidecar_cursor.u32()? != rows {
+        return Err("PAX sidecar row-count mismatch");
+    }
+    for _ in 0..rows {
+        let len = sidecar_cursor.u32()?;
+        sidecar_cursor.take(len)?;
+    }
+    sidecar_cursor.finish()?;
+    visited.insert(sidecar_id);
+    Ok(NodeSummary {
+        first_key: first,
+        last_key: last,
+        rows,
+    })
+}
+
+fn verify_internal(
+    store: &BTreeMap<[u8; 32], Bytes>,
+    raw: &[u8],
+    visited: &mut BTreeSet<[u8; 32]>,
+    visiting: &mut BTreeSet<[u8; 32]>,
+) -> Result<NodeSummary, &'static str> {
+    let mut cursor = Cursor::new(raw);
+    cursor.expect_magic(b"LXCI")?;
+    let (first, last) = read_page_header(&mut cursor)?;
+    let children = cursor.u32()?;
+    if children == 0 {
+        return Err("empty internal page");
+    }
+    let prefix = cursor.bytes()?.to_vec();
+    let mut entries = Vec::with_capacity(children);
+    for _ in 0..children {
+        let child_id = cursor.object_id()?;
+        let suffix = cursor.bytes()?;
+        let mut separator = prefix.clone();
+        separator.extend_from_slice(suffix);
+        entries.push((child_id, separator, cursor.u32()?));
+    }
+    cursor.finish()?;
+    if entries.windows(2).any(|pair| pair[0].1 >= pair[1].1) {
+        return Err("internal separator order mismatch");
+    }
+    let mut summaries = Vec::with_capacity(children);
+    for (child_id, separator, rows) in entries {
+        let child = verify_node(store, child_id, visited, visiting)?;
+        if child.last_key != separator || child.rows != rows {
+            return Err("authenticated parent edge mismatch");
+        }
+        summaries.push(child);
+    }
+    if summaries
+        .windows(2)
+        .any(|pair| pair[0].last_key >= pair[1].first_key)
+        || summaries.first().map(|child| &child.first_key) != Some(&first)
+        || summaries.last().map(|child| &child.last_key) != Some(&last)
+    {
+        return Err("authenticated child range mismatch");
+    }
+    Ok(NodeSummary {
+        first_key: first,
+        last_key: last,
+        rows: summaries.iter().map(|child| child.rows).sum(),
+    })
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
+        let end = self.offset.checked_add(len).ok_or("cursor overflow")?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or("truncated authenticated object")?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn expect_magic(&mut self, magic: &[u8; 4]) -> Result<(), &'static str> {
+        if self.take(4)? != magic {
+            return Err("wrong authenticated object domain");
+        }
+        Ok(())
+    }
+
+    fn expect_fingerprint(&mut self) -> Result<(), &'static str> {
+        if self.take(SCHEMA_FINGERPRINT.len())? != SCHEMA_FINGERPRINT {
+            return Err("schema/layout fingerprint mismatch");
+        }
+        Ok(())
+    }
+
+    fn u32(&mut self) -> Result<usize, &'static str> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| "truncated u32")?) as usize)
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], &'static str> {
+        let len = self.u32()?;
+        self.take(len)
+    }
+
+    fn object_id(&mut self) -> Result<[u8; 32], &'static str> {
+        self.take(32)?.try_into().map_err(|_| "truncated object id")
+    }
+
+    fn remaining(&mut self) -> &'a [u8] {
+        let remaining = &self.bytes[self.offset..];
+        self.offset = self.bytes.len();
+        remaining
+    }
+
+    fn finish(self) -> Result<(), &'static str> {
+        if self.offset != self.bytes.len() {
+            return Err("trailing authenticated object bytes");
+        }
+        Ok(())
+    }
+}
+
 fn authenticate_metric(tree: &Tree, metric: &ReadMetric) -> Duration {
     let started = Instant::now();
     let mut remaining = metric.objects;
@@ -718,6 +1067,11 @@ fn push_u32(out: &mut Vec<u8>, value: usize) {
             .expect("model value fits u32")
             .to_be_bytes(),
     );
+}
+
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    push_u32(out, bytes.len());
+    out.extend_from_slice(bytes);
 }
 
 fn print_model_row(
@@ -796,11 +1150,26 @@ fn print_mutation_control(kind: &str, tree: &Tree, d: usize, mutation: MutationM
 }
 
 fn print_branch_control(tree: &Tree) {
-    let root = tree.levels.last().expect("root level")[0].id;
-    let copied_root = tree.levels.last().expect("root level")[0].id;
-    assert_eq!(root, copied_root, "branch copy reuses the canonical root");
+    let (main_store, main_ref) = tree.authenticated_store_for_branch(b"main");
+    let (branch_store, branch_ref) = tree.authenticated_store_for_branch(b"feature");
+    let main = verify_branch(&main_store, main_ref).expect("main branch authenticates");
+    let branch = verify_branch(&branch_store, branch_ref).expect("copied branch authenticates");
+    assert_eq!(main.root_id, branch.root_id);
+    assert_eq!(main.visited, branch.visited);
+
+    let mut modified_rows = tree.rows.clone();
+    modified_rows[tree.rows.len() / 2].canonical[0] ^= 0x5a;
+    let modified = Tree::build(modified_rows, tree.geometry, tree.target);
+    let old_ids = tree.objects.keys().copied().collect::<BTreeSet<_>>();
+    let changed_objects = modified
+        .objects
+        .keys()
+        .filter(|id| !old_ids.contains(*id))
+        .count();
+    let expected_path_objects = tree.levels.len() + usize::from(tree.geometry == Geometry::C3);
+    assert_eq!(changed_objects, expected_path_objects);
     println!(
-        "branch_share,-,{geometry},{target},{width},{n},0,{height},{leaves},{objects},0,{total},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-,{key_bytes},{payload_bytes}",
+        "branch_share,-,{geometry},{target},{width},{n},0,{height},{leaves},{objects},0,{total},0,0,0,0,0,0,0,0,0,0,0,{changed_objects},0,0,0,0,0,0,0,0,-,{key_bytes},{payload_bytes}",
         geometry = tree.geometry.label(),
         target = tree.target,
         width = tree.rows[0].canonical.len(),
@@ -809,6 +1178,7 @@ fn print_branch_control(tree: &Tree) {
         leaves = tree.levels[0].len(),
         objects = tree.objects.len(),
         total = tree.objects.values().map(Bytes::len).sum::<usize>(),
+        changed_objects = changed_objects,
         key_bytes = tree.rows.iter().map(|row| row.key.len()).sum::<usize>(),
         payload_bytes = tree
             .rows
@@ -856,6 +1226,7 @@ fn run_backends(tree: &Tree) {
 }
 
 async fn seed_backend<S: Storage>(storage: &S, tree: &Tree) {
+    let (store, _) = tree.authenticated_store_for_branch(b"main");
     let mut write = storage
         .begin_write(WriteOptions::default())
         .await
@@ -864,8 +1235,7 @@ async fn seed_backend<S: Storage>(storage: &S, tree: &Tree) {
         .put_many(
             OBJECT_SPACE,
             PutBatch {
-                entries: tree
-                    .objects
+                entries: store
                     .iter()
                     .map(|(id, bytes)| PutEntry {
                         key: Key(Bytes::copy_from_slice(id)),
@@ -887,27 +1257,35 @@ async fn verify_backend<S: Storage>(storage: &S, tree: &Tree) {
         .begin_read(ReadOptions::default())
         .await
         .expect("begin model read");
-    let root = tree
-        .levels
-        .last()
-        .expect("root level")
-        .first()
-        .expect("root");
+    let (expected, branch_ref_id) = tree.authenticated_store_for_branch(b"main");
+    let keys = expected
+        .keys()
+        .map(|id| Key(Bytes::copy_from_slice(id)))
+        .collect::<Vec<_>>();
     let result = read
         .get_many(&[GetManyRequest {
             space: OBJECT_SPACE,
-            keys: &[Key(Bytes::copy_from_slice(&root.id))],
+            keys: &keys,
             opts: GetOptions::default(),
         }])
         .await
-        .expect("read model root");
-    assert_eq!(result.values.len(), 1);
-    let value = result.values[0].as_ref().expect("model root exists");
-    let lix::storage::ProjectedValue::FullValue(bytes) = value else {
-        panic!("model root read returned key-only projection")
-    };
-    assert_eq!(blake3::hash(bytes).as_bytes(), &root.id);
-    decode_envelope(bytes).expect("cold model root authenticates");
+        .expect("read model closure");
+    assert_eq!(result.values.len(), keys.len());
+    let mut reopened = BTreeMap::new();
+    for (key, value) in keys.into_iter().zip(result.values) {
+        let value = value.as_ref().expect("model object exists");
+        let lix::storage::ProjectedValue::FullValue(bytes) = value else {
+            panic!("model object returned key-only projection")
+        };
+        reopened.insert(
+            key.0.as_ref().try_into().expect("ObjectId key"),
+            bytes.clone(),
+        );
+    }
+    let verified = verify_branch(&reopened, branch_ref_id).expect("cold closure authenticates");
+    assert_eq!(verified.branch_id, b"main");
+    assert_eq!(verified.root_id, tree.root_id());
+    assert_eq!(verified.rows, tree.rows.len());
 }
 
 fn print_backend_row(backend: &str, tree: &Tree, settled_bytes: u64) {
@@ -955,16 +1333,74 @@ fn directory_bytes(path: &std::path::Path) -> u64 {
 }
 
 fn run_corruption_controls() {
-    let tree = Tree::build(fixture_rows(1_000, 256), Geometry::C2, 64 << 10);
-    let (id, bytes) = tree.objects.iter().next().expect("object");
-    let mut corrupt = bytes.to_vec();
-    let last = corrupt.len() - 1;
-    corrupt[last] ^= 1;
-    assert_ne!(blake3::hash(&corrupt).as_bytes(), id);
-    assert!(tree.verify_all().is_ok());
+    let tree = Tree::build(fixture_rows(10, 256), Geometry::C2, 64 << 10);
+    tree.verify_all().expect("control tree authenticates");
+    let (store, branch_ref_id) = tree.authenticated_store_for_branch(b"main");
+    let root_id = tree.root_id();
+    let root = store.get(&root_id).expect("root object");
+
+    let mut envelope = store.clone();
+    let mut bytes = root.to_vec();
+    bytes[4] = 0xff;
+    envelope.insert(root_id, Bytes::from(bytes));
+    assert!(verify_branch(&envelope, branch_ref_id).is_err());
+
+    let raw = decode_envelope(root).expect("root envelope");
+    for mutation in ["domain", "fingerprint", "bounds", "directory"] {
+        let mut changed = raw.clone();
+        match mutation {
+            "domain" => changed[0] ^= 1,
+            "fingerprint" => changed[4] ^= 1,
+            "bounds" => changed[24] ^= 1,
+            "directory" => {
+                let directory = c2_directory_offset(&changed).expect("directory offset");
+                changed[directory + 3] = 1;
+            }
+            _ => unreachable!(),
+        }
+        assert_rehashed_root_rejected(&tree, changed);
+    }
+
+    let mut payload = store.clone();
+    let mut bytes = root.to_vec();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    payload.insert(root_id, Bytes::from(bytes));
+    assert!(verify_branch(&payload, branch_ref_id).is_err());
+
+    let mut root_link = store;
+    let branch = root_link.remove(&branch_ref_id).expect("branch ref");
+    let mut branch_raw = decode_envelope(&branch).expect("branch envelope");
+    let last = branch_raw.len() - 1;
+    branch_raw[last] ^= 1;
+    let branch = encode_envelope(branch_raw);
+    let bad_branch_id = *blake3::hash(&branch).as_bytes();
+    root_link.insert(bad_branch_id, branch);
+    assert!(verify_branch(&root_link, bad_branch_id).is_err());
     println!(
-        "control,corruption,c2_slotted,65536,256,1000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,rejected,0,0"
+        "control,corruption,c2_slotted,65536,256,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,rejected,0,0"
     );
+}
+
+fn c2_directory_offset(raw: &[u8]) -> Result<usize, &'static str> {
+    let mut cursor = Cursor::new(raw);
+    cursor.expect_magic(b"LXC2")?;
+    read_page_header(&mut cursor)?;
+    cursor.u32()?;
+    cursor.bytes()?;
+    Ok(cursor.offset)
+}
+
+fn assert_rehashed_root_rejected(tree: &Tree, changed_raw: Vec<u8>) {
+    let mut store = tree.objects.clone();
+    store.remove(&tree.root_id());
+    let changed = encode_envelope(changed_raw);
+    let changed_id = *blake3::hash(&changed).as_bytes();
+    store.insert(changed_id, changed);
+    let branch = encode_branch_ref(b"main", changed_id);
+    let branch_id = *blake3::hash(&branch).as_bytes();
+    store.insert(branch_id, branch);
+    assert!(verify_branch(&store, branch_id).is_err());
 }
 
 fn run_compression_bound_control() {
@@ -1034,24 +1470,41 @@ fn run_boundary_controls() {
     let mut deleted_rows = sequential;
     deleted_rows.remove(deleted_rows.len() / 2);
     let deleted = Tree::build(deleted_rows, Geometry::C2, TARGET);
-    let base_ids = base.levels[0]
-        .iter()
-        .map(|page| page.id)
-        .collect::<BTreeSet<_>>();
-    let inserted_shared = inserted.levels[0]
-        .iter()
-        .filter(|page| base_ids.contains(&page.id))
-        .count();
-    let deleted_shared = deleted.levels[0]
-        .iter()
-        .filter(|page| base_ids.contains(&page.id))
-        .count();
-    assert!(inserted_shared + 4 >= base.levels[0].len());
-    assert!(deleted_shared + 4 >= base.levels[0].len());
+    let inserted_shared = assert_local_page_interval(&base.levels[0], &inserted.levels[0]);
+    let deleted_shared = assert_local_page_interval(&base.levels[0], &deleted.levels[0]);
     println!(
         "boundary_stability,-,c2_slotted,{TARGET},256,10000,0,0,{base_pages},0,0,0,0,0,0,0,0,0,0,0,0,0,0,{inserted_shared},{deleted_shared},0,0,0,0,0,0,0,stable,0,0",
         base_pages = base.levels[0].len(),
     );
+}
+
+fn assert_local_page_interval(before: &[Object], after: &[Object]) -> usize {
+    let prefix = before
+        .iter()
+        .zip(after)
+        .take_while(|(left, right)| left.id == right.id)
+        .count();
+    let max_suffix = before.len().min(after.len()).saturating_sub(prefix);
+    let suffix = before
+        .iter()
+        .rev()
+        .zip(after.iter().rev())
+        .take(max_suffix)
+        .take_while(|(left, right)| left.id == right.id)
+        .count();
+    let changed_before = before.len() - prefix - suffix;
+    let changed_after = after.len() - prefix - suffix;
+    assert!(changed_before <= 4 && changed_after <= 4);
+    for (left, right) in before[..prefix].iter().zip(&after[..prefix]) {
+        assert_eq!(left.id, right.id);
+    }
+    for (left, right) in before[before.len() - suffix..]
+        .iter()
+        .zip(&after[after.len() - suffix..])
+    {
+        assert_eq!(left.id, right.id);
+    }
+    prefix + suffix
 }
 
 fn boundary_fixture(n: usize, width: usize, seek_low: bool) -> Vec<TypedRow> {
