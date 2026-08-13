@@ -12,6 +12,7 @@ readme.workspace = true
 keywords.workspace = true
 categories = ["command-line-utilities", "development-tools", "artificial-intelligence", "filesystem"]
 rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true
