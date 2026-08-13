@@ -15,8 +15,8 @@ use lix::storage::{
     GetManyRequest, GetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId,
     Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
 };
-use lix_storage_rocksdb::RocksDB;
-use lix_storage_slatedb::SlateDB;
+use lix_storage_rocksdb::{BlockFetchCounters, PerfProbe, RocksDB};
+use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 use serde_json::{Value, json};
 
 #[path = "jsonb_layout/common.rs"]
@@ -141,7 +141,9 @@ fn run() -> Result<(), String> {
 }
 
 fn container_threshold_probes(samples: usize) -> Result<(), String> {
-    for count in [1usize, 2, 4, 8, 9, 12, 16, 32, 64] {
+    for count in [
+        1usize, 2, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 32, 64,
+    ] {
         let keys = (0..count)
             .map(|index| format!("key-{index:04}"))
             .collect::<Vec<_>>();
@@ -177,9 +179,17 @@ fn container_threshold_probes(samples: usize) -> Result<(), String> {
                 "mode": "container_threshold",
                 "entry_count": count,
                 "algorithm": algorithm,
+                "warmups": WARMUPS,
+                "samples": samples,
                 "lookups_per_sample": 1024,
                 "wall_ns": stats(&measured, |sample| sample.wall),
                 "cpu_ns": stats(&measured, |sample| sample.cpu),
+                "raw_samples": measured.iter().map(|sample| json!({
+                    "wall_ns": sample.wall,
+                    "cpu_ns": sample.cpu,
+                    "allocated_bytes": sample.alloc,
+                    "rss_bytes": sample.rss
+                })).collect::<Vec<_>>(),
                 "sequential_metadata_bytes": 2 * count,
                 "indexed_metadata_bytes": 4 + 8 * (count + 1),
                 "correct": true
@@ -797,11 +807,21 @@ struct SP {
     flush: Vec<Sample>,
     cold: Vec<Sample>,
     disk: Vec<u64>,
+    wio: Vec<IoSample>,
+    hotio: Vec<IoSample>,
+    flushio: Vec<IoSample>,
+    coldio: Vec<IoSample>,
+}
+#[derive(Clone, Copy, Default)]
+struct IoSample {
+    read_calls: u64,
+    read_bytes: u64,
+    write_calls: u64,
+    write_bytes: u64,
 }
 fn storage_mode(corpus: &[Case], n: usize) -> Result<(), String> {
     let fixtures = vec![sf::<CanonicalText>(corpus)?, sf::<CompactCodec>(corpus)?];
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
@@ -950,66 +970,119 @@ where
         x,
     ))
 }
-fn single(w: Sample, h: Sample, f: Sample, c: Sample, d: u64) -> SP {
+fn single(
+    w: (Sample, IoSample),
+    h: (Sample, IoSample),
+    f: (Sample, IoSample),
+    c: (Sample, IoSample),
+    d: u64,
+) -> SP {
     SP {
-        w: vec![w],
-        hot: vec![h],
-        flush: vec![f],
-        cold: vec![c],
+        w: vec![w.0],
+        hot: vec![h.0],
+        flush: vec![f.0],
+        cold: vec![c.0],
         disk: vec![d],
+        wio: vec![w.1],
+        hotio: vec![h.1],
+        flushio: vec![f.1],
+        coldio: vec![c.1],
     }
 }
 async fn rcycle(p: &Path, f: &SF) -> Result<SP, String> {
+    let mut probe = PerfProbe::new();
     let s = RocksDB::open(p).map_err(|e| e.to_string())?;
+    probe.reset();
     let (w, _) = ma(|| put(&s, f)).await?;
+    let wio = rocks_io(probe.read());
+    probe.reset();
     let (h, _) = ma(|| get(&s, f)).await?;
+    let hio = rocks_io(probe.read());
+    probe.reset();
     let (fl, _) = ma(|| async { s.flush().map_err(|e| e.to_string()) }).await?;
+    let fio = rocks_io(probe.read());
     let d = dir(p)?;
     drop(s);
+    probe.reset();
     let (c, s) = ma(|| async {
         let s = RocksDB::open(p).map_err(|e| e.to_string())?;
         get(&s, f).await?;
         Ok(s)
     })
     .await?;
+    let cio = rocks_io(probe.read());
     drop(s);
-    Ok(single(w, h, fl, c, d))
+    Ok(single((w, wio), (h, hio), (fl, fio), (c, cio), d))
 }
 async fn scycle(p: &Path, f: &SF) -> Result<SP, String> {
-    let s = SlateDB::open(p).map_err(|e| e.to_string())?;
+    let counters = SlateDBIoCounters::default();
+    let s = SlateDB::open_with_io_counters(p, counters.clone()).map_err(|e| e.to_string())?;
+    let before = counters.snapshot();
     let (w, _) = ma(|| put(&s, f)).await?;
+    let after_write = counters.snapshot();
+    let wio = slate_io(after_write.saturating_sub(before));
     let (h, _) = ma(|| get(&s, f)).await?;
+    let after_hot = counters.snapshot();
+    let hio = slate_io(after_hot.saturating_sub(after_write));
     let (fl, _) = ma(|| async { s.flush().await.map_err(|e| e.to_string()) }).await?;
+    let after_flush = counters.snapshot();
+    let fio = slate_io(after_flush.saturating_sub(after_hot));
     let d = dir(p)?;
     drop(s);
     let (c, s) = ma(|| async {
-        let s = SlateDB::open(p).map_err(|e| e.to_string())?;
+        let s = SlateDB::open_with_io_counters(p, counters.clone()).map_err(|e| e.to_string())?;
         get(&s, f).await?;
         Ok(s)
     })
     .await?;
+    let cio = slate_io(counters.snapshot().saturating_sub(after_flush));
     drop(s);
-    Ok(single(w, h, fl, c, d))
+    Ok(single((w, wio), (h, hio), (fl, fio), (c, cio), d))
+}
+fn rocks_io(counters: BlockFetchCounters) -> IoSample {
+    IoSample {
+        read_calls: counters.block_fetches(),
+        read_bytes: counters.block_read_bytes,
+        ..IoSample::default()
+    }
+}
+fn slate_io(counters: SlateDBIoSnapshot) -> IoSample {
+    IoSample {
+        read_calls: counters.read_objects,
+        read_bytes: counters.read_bytes,
+        write_calls: counters.write_objects,
+        write_bytes: counters.write_bytes,
+    }
 }
 fn join(a: &mut SP, b: SP) {
     a.w.extend(b.w);
     a.hot.extend(b.hot);
     a.flush.extend(b.flush);
     a.cold.extend(b.cold);
-    a.disk.extend(b.disk)
+    a.disk.extend(b.disk);
+    a.wio.extend(b.wio);
+    a.hotio.extend(b.hotio);
+    a.flushio.extend(b.flushio);
+    a.coldio.extend(b.coldio);
 }
 fn out_storage(be: &str, n: usize, f: &SF, p: &SP) -> Result<(), String> {
-    for (ph, v, calls, rb, wb) in [
-        ("write", &p.w, 3, 0, f.kb + f.vb),
-        ("warm_read", &p.hot, 2, f.kb + f.vb, 0),
-        ("flush", &p.flush, 1, 0, 0),
-        ("reopen_cold_read", &p.cold, 3, f.kb + f.vb, 0),
+    for (ph, v, io, logical_calls, rb, wb) in [
+        ("write", &p.w, &p.wio, 3, 0, f.kb + f.vb),
+        ("warm_read", &p.hot, &p.hotio, 2, f.kb + f.vb, 0),
+        ("flush", &p.flush, &p.flushio, 1, 0, 0),
+        ("reopen_cold_read", &p.cold, &p.coldio, 3, f.kb + f.vb, 0),
     ] {
+        let physical_writes_measured = be == "slatedb";
         emit(
-            json!({"schema_version":1,"benchmark_id":format!("jsonb-layout-v1/storage/{be}/{}/{ph}",f.codec),"mode":"storage","backend":be,"codec":f.codec,"phase":ph,"batch_entries":f.puts.len(),"warmups":WARMUPS,"samples":n,"wall_ns":stats(v,|x|x.wall),"cpu_ns":stats(v,|x|x.cpu),"allocated_bytes":stats(v,|x|x.alloc),"rss_bytes":{"max":v.iter().map(|x|x.rss).max().unwrap_or(0)},"raw_samples":v.iter().map(|sample|json!({"wall_ns":sample.wall,"cpu_ns":sample.cpu,"allocated_bytes":sample.alloc,"rss_bytes":sample.rss})).collect::<Vec<_>>(),"logical_calls_per_sample":calls,"logical_read_bytes_per_sample":rb,"logical_write_bytes_per_sample":wb,"settled_directory_bytes":stats_u64(&p.disk),"raw_bytes":f.raw,"encoded_bytes":f.enc,"zstd_bytes":f.zstd,"flush_drop_reopen":true,"reopen_in_timed_phase":ph=="reopen_cold_read","semantic_equality_verified":true,"corruption_rejected":true,"correct":true}),
+            json!({"schema_version":1,"benchmark_id":format!("jsonb-layout-v1/storage/{be}/{}/{ph}",f.codec),"mode":"storage","backend":be,"codec":f.codec,"phase":ph,"batch_entries":f.puts.len(),"warmups":WARMUPS,"samples":n,"wall_ns":stats(v,|x|x.wall),"cpu_ns":stats(v,|x|x.cpu),"allocated_bytes":stats(v,|x|x.alloc),"rss_bytes":{"max":v.iter().map(|x|x.rss).max().unwrap_or(0)},"raw_samples":v.iter().zip(io).map(|(sample,io)|json!({"wall_ns":sample.wall,"cpu_ns":sample.cpu,"allocated_bytes":sample.alloc,"rss_bytes":sample.rss,"physical_read_calls":io.read_calls,"physical_read_bytes":io.read_bytes,"physical_write_calls":physical_writes_measured.then_some(io.write_calls),"physical_write_bytes":physical_writes_measured.then_some(io.write_bytes)})).collect::<Vec<_>>(),"logical_calls_per_sample":logical_calls,"logical_read_bytes_per_sample":rb,"logical_write_bytes_per_sample":wb,"physical_counter_scope":if physical_writes_measured{"object_store_reads_and_writes"}else{"rocksdb_block_fetch_reads_only"},"physical_read_calls":stats_io(io,|x|x.read_calls),"physical_read_bytes":stats_io(io,|x|x.read_bytes),"physical_write_calls":physical_writes_measured.then(||stats_io(io,|x|x.write_calls)),"physical_write_bytes":physical_writes_measured.then(||stats_io(io,|x|x.write_bytes)),"settled_directory_bytes":stats_u64(&p.disk),"raw_bytes":f.raw,"encoded_bytes":f.enc,"zstd_bytes":f.zstd,"flush_drop_reopen":true,"reopen_in_timed_phase":ph=="reopen_cold_read","semantic_equality_verified":true,"corruption_rejected":true,"correct":true}),
         )?
     }
     Ok(())
+}
+fn stats_io(values: &[IoSample], field: impl Fn(&IoSample) -> u64) -> Value {
+    let mut values = values.iter().map(field).collect::<Vec<_>>();
+    values.sort_unstable();
+    json!({"p50": pct(&values, 50), "p95": pct(&values, 95)})
 }
 fn dir(p: &Path) -> Result<u64, String> {
     let mut n = 0;

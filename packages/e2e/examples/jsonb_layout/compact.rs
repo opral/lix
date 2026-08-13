@@ -298,7 +298,7 @@ fn parse_indexed_array(bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
     let data = bytes
         .get(table_end..)
         .ok_or("array page table is truncated")?;
-    let pages = slices_from_offsets(bytes, 8, page_count, data, "array page")?;
+    let pages = slices_from_offsets(bytes, 8, page_count, data, "array page", false)?;
     let mut children = Vec::with_capacity(count);
     for (page_index, mut page) in pages.into_iter().enumerate() {
         let remaining = count - children.len();
@@ -375,8 +375,9 @@ fn parse_indexed_object(bytes: &[u8]) -> Result<Vec<(&[u8], &[u8])>, String> {
     let children = bytes
         .get(child_data..)
         .ok_or("object children are truncated")?;
-    let key_slices = slices_from_offsets(bytes, 4, count, keys, "object key")?;
-    let child_slices = slices_from_offsets(bytes, child_offsets, count, children, "object child")?;
+    let key_slices = slices_from_offsets(bytes, 4, count, keys, "object key", true)?;
+    let child_slices =
+        slices_from_offsets(bytes, child_offsets, count, children, "object child", false)?;
     let mut entries = Vec::with_capacity(count);
     for (key, child) in key_slices.into_iter().zip(child_slices) {
         validate_key(key, entries.last().map(|entry: &(&[u8], &[u8])| entry.0))?;
@@ -391,6 +392,7 @@ fn slices_from_offsets<'a>(
     count: usize,
     data: &'a [u8],
     context: &str,
+    allow_empty: bool,
 ) -> Result<Vec<&'a [u8]>, String> {
     let mut slices = Vec::with_capacity(count);
     let mut previous = read_u32(table, start, context)?;
@@ -399,7 +401,7 @@ fn slices_from_offsets<'a>(
     }
     for index in 0..count {
         let next = read_u32(table, start + (index + 1) * 4, context)?;
-        if next <= previous || next > data.len() {
+        if next < previous || (!allow_empty && next == previous) || next > data.len() {
             return Err(format!("{context} offsets are invalid"));
         }
         slices.push(&data[previous..next]);
@@ -664,5 +666,18 @@ mod tests {
         encoded.extend_from_slice(&content_id(&root));
         encoded.extend_from_slice(&root);
         assert!(CompactCodec::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn indexed_object_round_trips_an_empty_first_key() {
+        let mut object = Map::new();
+        object.insert(String::new(), Value::from("empty"));
+        for index in 0..12 {
+            object.insert(format!("key-{index:02}"), Value::from(index));
+        }
+        let value = Value::Object(object);
+        let encoded = CompactCodec::encode(&value).unwrap();
+        let decoded = CompactCodec::decode(&encoded).unwrap();
+        assert_eq!(CompactCodec::encode(&decoded).unwrap(), encoded);
     }
 }
