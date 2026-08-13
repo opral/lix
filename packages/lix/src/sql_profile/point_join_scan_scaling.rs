@@ -99,21 +99,21 @@ fn nested_bundle_point_lookup_preserves_left_join_null_extension() {
         // are rows the probe-key restriction must not be able to remove.
         session
             .execute(
-                "INSERT INTO bundle (id, declarations) VALUES ('bundle-lonely', lix_json('[]'))",
+                "INSERT INTO bundle (id, declarations) VALUES ('bundle-lonely', CAST('[]' AS JSONB))",
                 &[],
             )
             .await
             .expect("insert childless bundle");
         session
             .execute(
-                "INSERT INTO bundle (id, declarations) VALUES ('bundle-variantless', lix_json('[]'))",
+                "INSERT INTO bundle (id, declarations) VALUES ('bundle-variantless', CAST('[]' AS JSONB))",
                 &[],
             )
             .await
             .expect("insert variantless bundle");
         session
             .execute(
-                r#"INSERT INTO message (id, "bundleId", locale, selectors) VALUES ('message-variantless', 'bundle-variantless', 'en', lix_json('[]'))"#,
+                r#"INSERT INTO message (id, "bundleId", locale, selectors) VALUES ('message-variantless', 'bundle-variantless', 'en', CAST('[]' AS JSONB))"#,
                 &[],
             )
             .await
@@ -204,7 +204,7 @@ async fn seeded_session(bundles: usize) -> SessionContext<Memory> {
     for schema in schemas() {
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await
@@ -214,7 +214,7 @@ async fn seeded_session(bundles: usize) -> SessionContext<Memory> {
         let bundle = format!("bundle-{index}");
         session
             .execute(
-                "INSERT INTO bundle (id, declarations) VALUES ($1, lix_json('[]'))",
+                "INSERT INTO bundle (id, declarations) VALUES ($1, CAST('[]' AS JSONB))",
                 &[Value::Text(bundle.clone())],
             )
             .await
@@ -223,7 +223,7 @@ async fn seeded_session(bundles: usize) -> SessionContext<Memory> {
             let message = format!("message-{index}-{locale}");
             session
                 .execute(
-                    r#"INSERT INTO message (id, "bundleId", locale, selectors) VALUES ($1, $2, $3, lix_json('[]'))"#,
+                    r#"INSERT INTO message (id, "bundleId", locale, selectors) VALUES ($1, $2, $3, CAST('[]' AS JSONB))"#,
                     &[
                         Value::Text(message.clone()),
                         Value::Text(bundle.clone()),
@@ -234,7 +234,7 @@ async fn seeded_session(bundles: usize) -> SessionContext<Memory> {
                 .expect("insert message");
             session
                 .execute(
-                    r#"INSERT INTO variant (id, "messageId", matches, pattern) VALUES ($1, $2, lix_json('[]'), lix_json('[{"type":"text","value":"fixture"}]'))"#,
+                    r#"INSERT INTO variant (id, "messageId", matches, pattern) VALUES ($1, $2, CAST('[]' AS JSONB), CAST('[{"type":"text","value":"fixture"}]' AS JSONB))"#,
                     &[
                         Value::Text(format!("variant-{index}-{locale}")),
                         Value::Text(message),

@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use crate::cel::CelFunctionProvider;
 use crate::common::LixTimestamp;
 
 /// Restorable runtime-function state captured around an explicit SQL
@@ -80,16 +79,6 @@ impl FunctionProviderHandle {
     }
 }
 
-impl CelFunctionProvider for FunctionProviderHandle {
-    fn call_uuid_v7(&self) -> uuid::Uuid {
-        Self::call_uuid_v7(self)
-    }
-
-    fn call_timestamp(&self) -> String {
-        Self::call_timestamp(self).to_string()
-    }
-}
-
 /// Shareable function provider used across SQL planning, UDFs, and staging.
 pub(crate) struct SharedFunctionProvider<P> {
     inner: Arc<Mutex<P>>,
@@ -149,19 +138,6 @@ where
 
     pub(crate) fn restore_statement_checkpoint(&self, checkpoint: FunctionProviderCheckpoint) {
         self.with_lock_mut(|provider| provider.restore_statement_checkpoint(checkpoint));
-    }
-}
-
-impl<P> CelFunctionProvider for SharedFunctionProvider<P>
-where
-    P: FunctionProvider + Send + 'static,
-{
-    fn call_uuid_v7(&self) -> uuid::Uuid {
-        Self::call_uuid_v7(self)
-    }
-
-    fn call_timestamp(&self) -> String {
-        Self::call_timestamp(self).to_string()
     }
 }
 

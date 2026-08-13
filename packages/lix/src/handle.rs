@@ -1091,7 +1091,7 @@ mod tests {
 
         author
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('account-test', lix_json('true'))",
+                "INSERT INTO lix_key_value (key, value) VALUES ('account-test', CAST('true' AS JSONB))",
                 &[],
             )
             .await
@@ -1158,7 +1158,7 @@ mod tests {
             .expect("delete unused account");
         let error = unused
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('deleted-account', lix_json('true'))",
+                "INSERT INTO lix_key_value (key, value) VALUES ('deleted-account', CAST('true' AS JSONB))",
                 &[],
             )
             .await
@@ -1189,7 +1189,7 @@ mod tests {
             .expect("disable author");
         let error = author
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('disabled-account', lix_json('true'))",
+                "INSERT INTO lix_key_value (key, value) VALUES ('disabled-account', CAST('true' AS JSONB))",
                 &[],
             )
             .await

@@ -318,6 +318,11 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "schema_registration"
+path = "benches/schema_registration.rs"
+harness = false
+
+[[bench]]
 name = "working_diff_file_scope"
 path = "benches/working_diff_file_scope.rs"
 harness = false

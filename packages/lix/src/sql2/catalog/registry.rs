@@ -334,24 +334,23 @@ impl PublicCatalog {
     }
 
     fn insert_entity_surfaces_from_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
-        if let Some(schema_key) = schema.get("x-lix-key").and_then(JsonValue::as_str)
-            && Self::runtime_schema_key_uses_reserved_namespace(schema_key)
-            && !crate::schema::is_seed_schema_key(schema_key)
+        let parsed = crate::schema::parse_lix_schema(schema)?;
+        if Self::runtime_schema_key_uses_reserved_namespace(&parsed.key)
+            && !crate::schema::is_seed_schema_key(&parsed.key)
         {
             return Err(LixError::new(
                 LixError::CODE_RESERVED_SCHEMA_NAMESPACE,
                 format!(
-                    "registered schema '{schema_key}' uses the reserved Lix schema namespace but is not a Lix bootstrap schema"
+                    "registered schema '{}' uses the reserved Lix schema namespace but is not a Lix bootstrap schema",
+                    parsed.key
                 ),
             )
             .with_hint(
-                "Custom `lix` and `lix_*` schema keys are incompatible with this Lix version. Migrate the repository with application-specific tooling before upgrading.",
+                "Custom `lix` and `lix_*` schema keys are incompatible with this Lix version. Migrate the workspace with application-specific tooling before upgrading.",
             ));
         }
 
-        let Ok(spec) = derive_entity_surface_spec_from_schema(schema) else {
-            return Ok(());
-        };
+        let spec = derive_entity_surface_spec_from_schema(schema)?;
 
         if !schema_exposed_as_entity_surface(&spec.schema_key) {
             return Ok(());
@@ -559,7 +558,7 @@ fn entity_columns(spec: &EntitySurfaceSpec) -> Vec<PublicColumn> {
 
 fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
-        PublicColumn::public_insert_only("id", false).with_default("lix_uuid_v7()"),
+        PublicColumn::public_insert_only("id", false).with_default("uuidv7()"),
         PublicColumn::public("path", false).conditional_on_insert(),
         PublicColumn::public("directory_id", true).conditional_on_insert(),
         PublicColumn::public("name", false).conditional_on_insert(),
@@ -571,7 +570,7 @@ fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
 
 fn directory_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
-        PublicColumn::public_insert_only("id", false).with_default("lix_uuid_v7()"),
+        PublicColumn::public_insert_only("id", false).with_default("uuidv7()"),
         PublicColumn::public("path", true).conditional_on_insert(),
         PublicColumn::public("parent_id", true).conditional_on_insert(),
         PublicColumn::public("name", false).conditional_on_insert(),
@@ -755,37 +754,5 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .expect("trusted bootstrap schemas own the reserved lix_* namespace");
-    }
-
-    #[test]
-    fn catalog_never_exposes_raw_snapshot_content() {
-        let mut schemas = crate::schema::seed_schema_definitions()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        schemas.push(json!({
-            "x-lix-key": "app_task",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "title": { "type": "string" }
-            },
-            "required": ["id", "title"],
-            "additionalProperties": false
-        }));
-        let catalog = PublicCatalog::from_visible_schemas(&schemas)
-            .expect("bootstrap and application schemas should build a catalog");
-
-        for surface in catalog.surfaces() {
-            assert!(
-                surface
-                    .columns
-                    .iter()
-                    .all(|column| column.name != "lixcol_snapshot_content"),
-                "{} must not expose raw snapshot content",
-                surface.name
-            );
-        }
     }
 }

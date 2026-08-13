@@ -87,7 +87,7 @@ fn plugin_schema_rows(
             REGISTERED_SCHEMA_KEY.into(),
             None,
             Some(TransactionJson::from_value(
-                json!({ "value": schema }),
+                json!({ "schema_key": schema_key, "value": schema }),
                 "plugin install registered schema snapshot",
             )?),
             None,
@@ -117,12 +117,10 @@ mod tests {
     use super::plugin_install_plan_from_archive_path;
 
     const SCHEMA: &[u8] = br#"{
-        "x-lix-key":"plugin_test_note",
-        "x-lix-primary-key":["/id"],
-        "type":"object",
-        "properties":{"id":{"type":"string"}},
-        "required":["id"],
-        "additionalProperties":false
+        "$schema":"https://lix.dev/schema-v1.json",
+        "key":"plugin_test_note",
+        "columns":[{"name":"id","type":"text","nullable":false}],
+        "primary_key":["id"]
     }"#;
     const WASM: &[u8] = b"\0asm\x01\0\0\0";
 
@@ -154,7 +152,7 @@ mod tests {
         assert_eq!(
             schema_row
                 .snapshot
-                .expect("schema install row needs a snapshot")["value"]["x-lix-key"],
+                .expect("schema install row needs a snapshot")["value"]["key"],
             "plugin_test_note"
         );
     }

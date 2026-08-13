@@ -367,7 +367,7 @@ fn resolve_entity_pk(
             LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "write for schema '{}' requires entity_pk because the schema has no x-lix-primary-key",
+                    "write for schema '{}' requires entity_pk because the schema has no primary_key",
                     row.schema_key
                 ),
             )
@@ -384,7 +384,7 @@ fn resolve_entity_pk(
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "entity_pk '{}' does not match x-lix-primary-key derived entity_pk '{}' for schema '{}'",
+                    "entity_pk '{}' does not match primary_key-derived entity_pk '{}' for schema '{}'",
                     entity_pk.as_json_array_text()?,
                     derived.as_json_array_text()?,
                     row.schema_key
@@ -401,9 +401,9 @@ fn entity_pk_derivation_error(
     error: EntityPkError,
 ) -> LixError {
     let detail = match error {
-        EntityPkError::EmptyPrimaryKey => "empty x-lix-primary-key".to_string(),
+        EntityPkError::EmptyPrimaryKey => "empty primary_key".to_string(),
         EntityPkError::EmptyPrimaryKeyPath { index } => {
-            format!("empty x-lix-primary-key pointer at index {index}")
+            format!("empty primary_key column at index {index}")
         }
         EntityPkError::MissingPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
@@ -473,7 +473,7 @@ pub(crate) fn reject_reserved_schema_namespace(key: &SchemaKey) -> Result<(), Li
         ),
     )
     .with_hint(
-        "Choose an application-owned x-lix-key outside the reserved `lix` and `lix_*` namespace, for example `acme_task`.",
+        "Choose an application-owned schema key outside the reserved `lix` and `lix_*` namespace, for example `acme_task`.",
     ))
 }
 
@@ -1157,7 +1157,7 @@ mod tests {
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
-                "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },
+                "id": { "type": "string", "x-lix-default": "uuidv7()" },
                 "value": { "type": "string", "default": "literal-default" }
             },
             "required": ["id", "value"],

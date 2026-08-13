@@ -4650,7 +4650,7 @@ mod tests {
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
-                "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },
+                "id": { "type": "string", "x-lix-default": "uuidv7()" },
                 "body": { "type": "string" }
             }
         }))

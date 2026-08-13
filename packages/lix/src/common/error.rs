@@ -17,9 +17,9 @@ use serde_json::{Value as JsonValue, json};
 ///     "LIX_ERROR_UNSUPPORTED_WRITE_EXPRESSION",
 ///     "json(...) is not supported",
 /// )
-/// .with_hint("use lix_json('...') instead");
+/// .with_hint("cast the value with ::jsonb instead");
 ///
-/// assert_eq!(err.hint(), Some("use lix_json('...') instead"));
+/// assert_eq!(err.hint(), Some("cast the value with ::jsonb instead"));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LixError {
@@ -155,12 +155,12 @@ impl LixError {
 
     /// An `INSERT ... VALUES (...)` expression is not supported by the
     /// public write surface (e.g. `json(...)`, subqueries, arbitrary SQL
-    /// expressions). Users should wrap inline JSON with `lix_json(...)`.
+    /// expressions). Users should cast inline JSON with `::jsonb`.
     pub const CODE_UNSUPPORTED_WRITE_EXPRESSION: &'static str =
         "LIX_ERROR_UNSUPPORTED_WRITE_EXPRESSION";
 
     /// The schema JSON itself (the *definition*, not a row against it) is
-    /// malformed — a missing `x-lix-key`, a JSON-Pointer without the
+    /// malformed — a missing `key`, an invalid primary-key column, or another
     /// leading slash, a reserved-namespace collision, or any other
     /// meta-schema validation failure.
     pub const CODE_SCHEMA_DEFINITION: &'static str = "LIX_ERROR_SCHEMA_DEFINITION";

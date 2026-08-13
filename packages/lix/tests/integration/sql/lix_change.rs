@@ -27,7 +27,7 @@ simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
         .execute(
             "SELECT entity_pk, schema_key, snapshot_content \
              FROM lix_change \
-             WHERE entity_pk = lix_json('[\"change-query\"]')",
+             WHERE entity_pk = CAST('[\"change-query\"]' AS JSONB)",
             &[],
         )
         .await
@@ -93,7 +93,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_composite_message\",\"x-lix-primary-key\":[\"/key\",\"/locale\"],\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"locale\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"key\",\"locale\",\"text\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_composite_message\",\"x-lix-primary-key\":[\"/key\",\"/locale\"],\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"locale\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"key\",\"locale\",\"text\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -117,7 +117,7 @@ simulation_test!(
                         lix_json_get_text(entity_pk, 1) AS entity_locale \
                  FROM lix_change \
                  WHERE schema_key = 'engine_composite_message' \
-                   AND entity_pk = lix_json('[\"welcome.title\",\"en\"]')",
+                   AND entity_pk = CAST('[\"welcome.title\",\"en\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -151,7 +151,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_numeric_message\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"number\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_numeric_message\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"number\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",

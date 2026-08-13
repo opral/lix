@@ -18,7 +18,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"snapshot_column_absence\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
+                   CAST('{\"x-lix-key\":\"snapshot_column_absence\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -128,7 +128,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_column_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"},\"active\":{\"type\":\"boolean\"},\"metadata\":{\"type\":\"object\"}},\"required\":[\"id\",\"title\",\"count\",\"ratio\",\"active\",\"metadata\"],\"additionalProperties\":false}'),\
+                   CAST('{\"x-lix-key\":\"engine_column_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"uuidv7()\"},\"title\":{\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"},\"active\":{\"type\":\"boolean\"},\"metadata\":{\"type\":\"object\"}},\"required\":[\"id\",\"title\",\"count\",\"ratio\",\"active\",\"metadata\"],\"additionalProperties\":false}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -140,7 +140,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_no_pk_contract\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}'),\
+                   CAST('{\"x-lix-key\":\"engine_no_pk_contract\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -152,7 +152,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"columns\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"table_name\":{\"type\":\"string\"}},\"required\":[\"id\",\"table_name\"],\"additionalProperties\":false}'),\
+                   CAST('{\"x-lix-key\":\"columns\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"table_name\":{\"type\":\"string\"}},\"required\":[\"id\",\"table_name\"],\"additionalProperties\":false}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -236,7 +236,7 @@ simulation_test!(
                     Value::Text("id".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Text("lix_uuid_v7()".to_string()),
+                    Value::Text("uuidv7()".to_string()),
                     Value::Null,
                     Value::Text("DEFAULT".to_string()),
                 ],
@@ -300,7 +300,7 @@ simulation_test!(
                     Value::Text("id".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Text("lix_uuid_v7()".to_string()),
+                    Value::Text("uuidv7()".to_string()),
                     Value::Text("DEFAULT".to_string()),
                 ],
             ],
@@ -582,7 +582,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_scalar_cast_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"text_value\":{\"type\":\"string\"},\"integer_value\":{\"type\":\"integer\"},\"number_value\":{\"type\":\"number\"},\"boolean_value\":{\"type\":\"boolean\"},\"json_value\":{\"type\":\"object\"}},\"required\":[\"id\",\"text_value\",\"integer_value\",\"number_value\",\"boolean_value\",\"json_value\"],\"additionalProperties\":false}'),\
+                   CAST('{\"x-lix-key\":\"engine_scalar_cast_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"uuidv7()\"},\"text_value\":{\"type\":\"string\"},\"integer_value\":{\"type\":\"integer\"},\"number_value\":{\"type\":\"number\"},\"boolean_value\":{\"type\":\"boolean\"},\"json_value\":{\"type\":\"object\"}},\"required\":[\"id\",\"text_value\",\"integer_value\",\"number_value\",\"boolean_value\",\"json_value\"],\"additionalProperties\":false}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -1066,7 +1066,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_default_identity_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                   CAST('{\"x-lix-key\":\"engine_default_identity_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"uuidv7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -1217,7 +1217,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_excluded_typed_default\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"status\":{\"type\":\"string\",\"default\":\"fresh\"},\"mirror\":{\"type\":\"string\"},\"identity_copy\":{\"type\":\"array\"}},\"required\":[\"id\",\"status\"],\"additionalProperties\":false}'),\
+                   CAST('{\"x-lix-key\":\"engine_excluded_typed_default\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"uuidv7()\"},\"status\":{\"type\":\"string\",\"default\":\"fresh\"},\"mirror\":{\"type\":\"string\"},\"identity_copy\":{\"type\":\"array\"}},\"required\":[\"id\",\"status\"],\"additionalProperties\":false}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -1283,7 +1283,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_excluded_typed_default \
                  (id, status, lixcol_entity_pk) \
-                 VALUES ('different', 'corrupted', lix_json('[\"same\"]')) \
+                 VALUES ('different', 'corrupted', CAST('[\"same\"]' AS JSONB)) \
                  ON CONFLICT (id) DO UPDATE SET status = excluded.status",
                 &[],
             )
@@ -1390,7 +1390,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
-                 VALUES (lix_json('{\"x-lix-key\":\"engine_required_nullable_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"payload\":{\"type\":[\"object\",\"null\"]}},\"required\":[\"id\",\"payload\"],\"additionalProperties\":false}'))",
+                 VALUES (CAST('{\"x-lix-key\":\"engine_required_nullable_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"payload\":{\"type\":[\"object\",\"null\"]}},\"required\":[\"id\",\"payload\"],\"additionalProperties\":false}' AS JSONB))",
                 &[],
             )
             .await
@@ -1427,7 +1427,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_required_nullable_contract (id, payload) \
-                 VALUES ('explicit-null', lix_json('null'))",
+                 VALUES ('explicit-null', CAST('null' AS JSONB))",
                 &[],
             )
             .await
@@ -1448,7 +1448,7 @@ simulation_test!(
                 .execute(
                     "DELETE FROM engine_required_nullable_contract \
                      WHERE id = 'explicit-null' \
-                     RETURNING payload, lix_json('null')",
+                     RETURNING payload, CAST('null' AS JSONB)",
                     &[],
                 )
                 .await
@@ -1476,7 +1476,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
-                 VALUES (lix_json('{\"x-lix-key\":\"engine_bigint_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"}},\"required\":[\"id\",\"count\"],\"additionalProperties\":false}'))",
+                 VALUES (CAST('{\"x-lix-key\":\"engine_bigint_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"}},\"required\":[\"id\",\"count\"],\"additionalProperties\":false}' AS JSONB))",
                 &[],
             )
             .await
@@ -1522,7 +1522,7 @@ simulation_test!(
             session
                 .execute(
                     "SELECT count FROM engine_bigint_contract_history() \
-                       WHERE lixcol_entity_pk = lix_json('[\"integral-real\"]')",
+                       WHERE lixcol_entity_pk = CAST('[\"integral-real\"]' AS JSONB)",
                     &[],
                 )
                 .await
@@ -1680,7 +1680,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
-                 VALUES (lix_json('{\"x-lix-key\":\"engine_arithmetic_update\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"quantity\":{\"type\":[\"integer\",\"null\"]},\"order_key\":{\"type\":\"integer\"},\"line_number\":{\"type\":[\"integer\",\"null\"]}},\"required\":[\"id\",\"quantity\",\"order_key\",\"line_number\"],\"additionalProperties\":false}'))",
+                 VALUES (CAST('{\"x-lix-key\":\"engine_arithmetic_update\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"quantity\":{\"type\":[\"integer\",\"null\"]},\"order_key\":{\"type\":\"integer\"},\"line_number\":{\"type\":[\"integer\",\"null\"]}},\"required\":[\"id\",\"quantity\",\"order_key\",\"line_number\"],\"additionalProperties\":false}' AS JSONB))",
                 &[],
             )
             .await

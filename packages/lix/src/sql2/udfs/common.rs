@@ -7,6 +7,60 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::ColumnarValue;
 use serde_json::Value as JsonValue;
 
+/// Parse and normalize the subset of PostgreSQL JSONB represented by Lix.
+/// Object order and duplicate spelling are discarded by parsing, numerically
+/// integral decimal spellings compare like PostgreSQL numerics, and NUL is
+/// rejected because PostgreSQL's `jsonb` cannot represent it in text values.
+pub(crate) fn parse_jsonb(raw: &str) -> std::result::Result<JsonValue, String> {
+    let mut value = serde_json::from_str::<JsonValue>(raw).map_err(|error| error.to_string())?;
+    normalize_jsonb(&mut value)?;
+    Ok(value)
+}
+
+pub(crate) fn canonical_jsonb_text(raw: &str) -> std::result::Result<String, String> {
+    serde_json::to_string(&parse_jsonb(raw)?).map_err(|error| error.to_string())
+}
+
+fn normalize_jsonb(value: &mut JsonValue) -> std::result::Result<(), String> {
+    match value {
+        JsonValue::String(value) => reject_jsonb_nul(value)?,
+        JsonValue::Array(values) => {
+            for value in values {
+                normalize_jsonb(value)?;
+            }
+        }
+        JsonValue::Object(values) => {
+            let old = std::mem::take(values);
+            let mut entries = old.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, mut value) in entries {
+                reject_jsonb_nul(&key)?;
+                normalize_jsonb(&mut value)?;
+                values.insert(key, value);
+            }
+        }
+        JsonValue::Number(number) if !number.is_i64() && !number.is_u64() => {
+            if let Some(number) = number.as_f64()
+                && number.is_finite()
+                && number.fract() == 0.0
+                && number.abs() <= 9_007_199_254_740_992.0
+            {
+                *value = JsonValue::from(number as i64);
+            }
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn reject_jsonb_nul(value: &str) -> std::result::Result<(), String> {
+    if value.contains('\0') {
+        Err("PostgreSQL JSONB does not support the Unicode NUL escape (\\u0000)".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn scalar_inputs(args: &[ColumnarValue]) -> bool {
     args.iter()
         .all(|value| matches!(value, ColumnarValue::Scalar(_)))
@@ -16,13 +70,11 @@ pub(super) fn json_value_to_serde(array: &dyn Array, row: usize) -> Result<Optio
     let Some(raw) = text_like_value(array, row)? else {
         return Ok(None);
     };
-    serde_json::from_str::<JsonValue>(&raw)
-        .map(Some)
-        .map_err(|error| {
-            DataFusionError::Execution(format!(
-                "JSON function expected valid JSON text in its first argument, got error: {error}"
-            ))
-        })
+    parse_jsonb(&raw).map(Some).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "JSON function expected valid JSON text in its first argument, got error: {error}"
+        ))
+    })
 }
 
 pub(super) fn text_like_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
@@ -91,16 +143,36 @@ pub(super) fn extract_json_path(
         return Ok(None);
     };
 
+    if fn_name.contains("path_get") {
+        let Some(path) = text_like_value(arrays[1].as_ref(), row)? else {
+            return Ok(None);
+        };
+        for segment in postgres_text_array_path(&path)? {
+            let Some(next) = dynamic_path_get(&current, &segment) else {
+                return Ok(None);
+            };
+            current = next;
+        }
+        return Ok(Some(current));
+    }
+
     for path in &arrays[1..] {
         let Some(segment) = json_path_segment(fn_name, path.as_ref(), row)? else {
             return Ok(None);
         };
         let next = match segment {
             JsonPathSegment::Key(key) => current.get(&key).cloned(),
-            JsonPathSegment::Index(index) => current
-                .as_array()
-                .and_then(|values| values.get(index))
-                .cloned(),
+            JsonPathSegment::Index(index) => current.as_array().and_then(|values| {
+                let index = if index < 0 {
+                    i64::try_from(values.len()).ok()?.checked_add(index)?
+                } else {
+                    index
+                };
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| values.get(index))
+                    .cloned()
+            }),
         };
         let Some(value) = next else {
             return Ok(None);
@@ -123,7 +195,7 @@ pub(super) fn json_text_value(value: &JsonValue) -> Result<String> {
         JsonValue::Array(_) | JsonValue::Object(_) => {
             serde_json::to_string(value).map_err(|error| {
                 DataFusionError::Execution(format!(
-                    "lix_json_get_text() could not render JSON value: {error}"
+                    "JSONB ->> could not render JSON value: {error}"
                 ))
             })
         }
@@ -133,15 +205,47 @@ pub(super) fn json_text_value(value: &JsonValue) -> Result<String> {
 
 pub(super) fn json_json_value(value: &JsonValue) -> Result<String> {
     serde_json::to_string(value).map_err(|error| {
-        DataFusionError::Execution(format!(
-            "lix_json_get() could not render JSON value: {error}"
-        ))
+        DataFusionError::Execution(format!("JSONB -> could not render JSON value: {error}"))
     })
 }
 
 enum JsonPathSegment {
     Key(String),
-    Index(usize),
+    Index(i64),
+}
+
+fn dynamic_path_get(value: &JsonValue, segment: &str) -> Option<JsonValue> {
+    match value {
+        JsonValue::Object(value) => value.get(segment).cloned(),
+        JsonValue::Array(value) => {
+            let index = segment.parse::<i64>().ok()?;
+            let index = if index < 0 {
+                i64::try_from(value.len()).ok()?.checked_add(index)?
+            } else {
+                index
+            };
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| value.get(index))
+                .cloned()
+        }
+        _ => None,
+    }
+}
+
+fn postgres_text_array_path(value: &str) -> Result<Vec<String>> {
+    let Some(inner) = value
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return Err(DataFusionError::Execution(format!(
+            "JSONB path must use PostgreSQL text-array syntax such as '{{user,name}}', got '{value}'"
+        )));
+    };
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(inner.split(',').map(str::to_owned).collect())
 }
 
 fn json_path_segment(
@@ -172,9 +276,9 @@ fn json_path_segment(
                     return Ok(None);
                 }
                 let value = array.value(row);
-                let index = usize::try_from(value).map_err(|_| {
+                let index = i64::try_from(value).map_err(|_| {
                     DataFusionError::Execution(format!(
-                        "{fn_name}() path indexes must be non-negative integers"
+                        "{fn_name}() path index is outside the supported integer range"
                     ))
                 })?;
                 return Ok(Some(JsonPathSegment::Index(index)));
@@ -190,7 +294,7 @@ fn json_path_segment(
     index_array!(Int32Array);
     index_array!(Int64Array);
     Err(DataFusionError::Execution(format!(
-        "{fn_name}() path arguments must be strings or non-negative integers, got {:?}",
+        "{fn_name}() path arguments must be strings or integers, got {:?}",
         array.data_type()
     )))
 }

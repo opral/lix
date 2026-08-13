@@ -95,7 +95,7 @@ async fn main() {
     let mut last_bytes = 0_u64;
 
     if seed_rows > 0 {
-        let sql = "INSERT INTO e53_amp (path, value) VALUES ($1, lix_json($2))";
+        let sql = "INSERT INTO e53_amp (path, value) VALUES ($1, CAST($2 AS JSONB))";
         let statements = (0..seed_rows)
             .map(|row_index| ExecuteBatchStatement {
                 label: None,
@@ -210,7 +210,7 @@ where
     for index in 0..rows {
         transaction
             .execute(
-                "INSERT INTO e53_amp (path, value) VALUES ($1, lix_json($2))",
+                "INSERT INTO e53_amp (path, value) VALUES ($1, CAST($2 AS JSONB))",
                 &[
                     Value::Text(format!("/inc/{batch:08}/{index:08}")),
                     Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
@@ -241,7 +241,7 @@ where
     });
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
             &[Value::Text(schema.to_string())],
         )
         .await

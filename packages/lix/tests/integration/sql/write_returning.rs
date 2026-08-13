@@ -14,7 +14,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"x-lix-key\":\"returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"uuidv7()\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB))",
                 &[],
             )
             .await
@@ -467,7 +467,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"atomic_returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"x-lix-key\":\"atomic_returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB))",
                 &[],
             )
             .await
@@ -506,7 +506,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"checkpoint_after_returning_error\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"x-lix-key\":\"checkpoint_after_returning_error\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB))",
                 &[],
             )
             .await
@@ -625,7 +625,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"deterministic_returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'))",
+                 CAST('{\"x-lix-key\":\"deterministic_returning_task\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"uuidv7()\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB))",
                 &[],
             )
             .await
@@ -633,7 +633,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-                 VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
+                 VALUES ('lix_deterministic_mode', CAST('{\"enabled\":true}' AS JSONB), true, true)",
                 &[],
             )
             .await

@@ -101,7 +101,7 @@ where
     for schema in schemas() {
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
                 &[Value::Text(schema.to_string())],
             )
             .await

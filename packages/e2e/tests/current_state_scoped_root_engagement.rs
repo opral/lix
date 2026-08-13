@@ -61,7 +61,7 @@ async fn bulk_typed_insert_bootstraps_and_sustains_a_scoped_current_state_root()
         "additionalProperties": false
     });
     lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
         &[Value::Text(schema.to_string())],
     )
     .await

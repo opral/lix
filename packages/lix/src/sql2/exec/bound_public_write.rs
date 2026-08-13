@@ -1595,15 +1595,27 @@ fn direct_path_value_replacement(
     {
         return None;
     }
-    let BoundExpr::Function { name, args } = &assignment.value else {
-        return None;
-    };
-    let [BoundExpr::Param(param)] = args.as_slice() else {
-        return None;
-    };
-    (name == "lix_json").then(|| DirectPathValueReplacement {
+    let param = jsonb_parameter(&assignment.value)?;
+    Some(DirectPathValueReplacement {
         value_param_index: param.index.saturating_sub(1),
     })
+}
+
+fn jsonb_parameter(expr: &BoundExpr) -> Option<&crate::sql2::bind::expr::BoundParamRef> {
+    match expr {
+        BoundExpr::Cast {
+            expr,
+            data_type: BoundCastType::Jsonb,
+        } => match expr.as_ref() {
+            BoundExpr::Param(param) => Some(param),
+            _ => None,
+        },
+        BoundExpr::Function { name, args } if name == "__lix_jsonb" => match args.as_slice() {
+            [BoundExpr::Param(param)] => Some(param),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn append_direct_path_value_replacement_row<'a>(
@@ -1639,7 +1651,7 @@ fn append_direct_path_value_replacement_json(
         Some(_) => {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                "lix_json expects a text argument",
+                "JSONB cast expects text or a structured JSON parameter",
             ));
         }
         None => {
@@ -1671,7 +1683,7 @@ fn append_direct_path_value_replacement_json_text(
     Ok(())
 }
 
-/// Appends a `lix_json` parameter in serde_json's stable compact form.
+/// Appends a JSONB parameter in canonical compact form.
 ///
 /// Public parameters do not carry a canonical-JSON type certificate. The
 /// streaming recognizer proves already-canonical input in one allocation-free
@@ -1679,20 +1691,10 @@ fn append_direct_path_value_replacement_json_text(
 /// without the former redundant serde validation scan. Inputs outside this
 /// deliberately narrow scalar grammar retain the canonical DOM fallback.
 fn append_canonical_json_parameter(normalized: &mut Vec<u8>, raw: &str) -> Result<(), LixError> {
-    if CanonicalJsonText::recognizes(raw) {
-        normalized.extend_from_slice(raw.as_bytes());
-        return Ok(());
-    }
-    let original_len = normalized.len();
-    if CanonicalJsonText::append_normalized(raw, normalized) {
-        return Ok(());
-    }
-    normalized.truncate(original_len);
-
-    let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
+    let value = crate::sql2::udfs::common::parse_jsonb(raw).map_err(|error| {
         LixError::new(
             LixError::CODE_TYPE_MISMATCH,
-            format!("lix_json argument is not valid JSON: {error}"),
+            format!("invalid JSONB value: {error}"),
         )
     })?;
     serde_json::to_writer(normalized, &value).map_err(|error| {
@@ -1702,12 +1704,14 @@ fn append_canonical_json_parameter(normalized: &mut Vec<u8>, raw: &str) -> Resul
     })
 }
 
+#[cfg(test)]
 struct CanonicalJsonText<'a> {
     bytes: &'a [u8],
     position: usize,
     remaining_depth: u8,
 }
 
+#[cfg(test)]
 impl<'a> CanonicalJsonText<'a> {
     // serde_json's default recursion limit rejects the 128th nested container.
     const MAX_DEPTH: u8 = 127;
@@ -2505,9 +2509,9 @@ mod active_branch_commit_id_reference_tests {
     fn detects_active_branch_commit_id_in_nested_write_expressions() {
         let plan = update_plan(
             BoundPredicate::True,
-            BoundExpr::Function {
-                name: "lix_json".to_string(),
-                args: vec![active_branch_commit_id()],
+            BoundExpr::Cast {
+                expr: Box::new(active_branch_commit_id()),
+                data_type: BoundCastType::Jsonb,
             },
         );
 
@@ -5131,14 +5135,14 @@ fn certified_direct_path_value_insert_batch(
                 },
             ) if name == "path" => path_param_index = Some(param.index.saturating_sub(1)),
             (
-                BoundExpr::Function { name, args },
+                expr,
                 InsertColumnTarget::Visible {
                     name: column_name,
                     column_type: EntityColumnType::Json,
                     ..
                 },
-            ) if name == "lix_json" && column_name == "value" => {
-                let [BoundExpr::Param(param)] = args.as_slice() else {
+            ) if column_name == "value" => {
+                let Some(param) = jsonb_parameter(expr) else {
                     return Ok(None);
                 };
                 value_param_index = Some(param.index.saturating_sub(1));
@@ -5197,11 +5201,11 @@ fn certified_direct_path_value_insert_batch(
         else {
             return Ok(None);
         };
-        let value = serde_json::from_str::<JsonValue>(raw_value).map_err(|error| {
+        let value = crate::sql2::udfs::common::parse_jsonb(raw_value).map_err(|error| {
             with_parameter_batch_statement_index(
                 LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    format!("lix_json argument is not valid JSON: {error}"),
+                    format!("invalid JSONB value: {error}"),
                 ),
                 statement_index,
             )
@@ -6080,12 +6084,27 @@ fn cast_entity_eval_value(
         ));
     }
 
+    if cast_type == BoundCastType::Jsonb {
+        return match value {
+            EntityEvalValue::SqlNull => Ok(EntityEvalValue::SqlNull),
+            EntityEvalValue::Json(value) => Ok(EntityEvalValue::Json(value)),
+            EntityEvalValue::SqlText(value) => serde_json::from_str(&value)
+                .map(EntityEvalValue::Json)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        format!("CAST AS JSONB failed: {error}"),
+                    )
+                }),
+        };
+    }
     let target_type = match cast_type {
         BoundCastType::Text => DataType::Utf8,
         BoundCastType::BigInt => DataType::Int64,
         BoundCastType::Double => DataType::Float64,
         BoundCastType::Boolean => DataType::Boolean,
         BoundCastType::Binary => unreachable!("binary entity casts rejected above"),
+        BoundCastType::Jsonb => unreachable!("JSONB entity casts handled above"),
     };
     let scalar = scalar_from_entity_eval_value(value);
     let casted = scalar.cast_to(&target_type).map_err(|error| {
@@ -6192,29 +6211,7 @@ fn eval_expr_value(
             let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
             cast_entity_eval_value(value, *data_type)
         }
-        BoundExpr::Function { name, args } if name == "lix_json" && args.len() == 1 => {
-            let raw = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
-            let raw = match raw {
-                EntityEvalValue::SqlNull => return Ok(EntityEvalValue::Json(JsonValue::Null)),
-                EntityEvalValue::SqlText(value) => JsonValue::String(value),
-                EntityEvalValue::Json(value) => value,
-            };
-            let JsonValue::String(raw) = raw else {
-                return Err(LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    "lix_json expects a text argument",
-                ));
-            };
-            serde_json::from_str(&raw)
-                .map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_TYPE_MISMATCH,
-                        format!("lix_json argument is not valid JSON: {error}"),
-                    )
-                })
-                .map(EntityEvalValue::Json)
-        }
-        BoundExpr::Function { name, args } if name == "lix_uuid_v7" && args.is_empty() => Ok(
+        BoundExpr::Function { name, args } if name == "uuidv7" && args.is_empty() => Ok(
             EntityEvalValue::SqlText(ctx.functions().call_uuid_v7().to_string()),
         ),
         BoundExpr::Function { name, args } if name == "lix_timestamp" && args.is_empty() => Ok(
@@ -6230,8 +6227,44 @@ fn eval_expr_value(
                 .map(|commit_id| EntityEvalValue::SqlText(commit_id.to_string()))
                 .unwrap_or(EntityEvalValue::SqlNull))
         }
+        BoundExpr::Function { name, args } if name == "__lix_jsonb" && args.len() == 1 => {
+            let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
+            match value {
+                EntityEvalValue::SqlNull => Ok(EntityEvalValue::SqlNull),
+                EntityEvalValue::SqlText(raw) => crate::sql2::udfs::common::parse_jsonb(&raw)
+                    .map(EntityEvalValue::Json)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("invalid JSONB value: {error}"),
+                        )
+                    }),
+                EntityEvalValue::Json(value) => {
+                    let raw = serde_json::to_string(&value).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("invalid JSONB value: {error}"),
+                        )
+                    })?;
+                    crate::sql2::udfs::common::parse_jsonb(&raw)
+                        .map(EntityEvalValue::Json)
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_TYPE_MISMATCH,
+                                format!("invalid JSONB value: {error}"),
+                            )
+                        })
+                }
+            }
+        }
         BoundExpr::Function { name, args }
-            if (name == "lix_json_get" || name == "lix_json_get_text") && args.len() >= 2 =>
+            if matches!(
+                name.as_str(),
+                "__lix_json_get"
+                    | "__lix_json_get_text"
+                    | "__lix_json_path_get"
+                    | "__lix_json_path_get_text"
+            ) && args.len() >= 2 =>
         {
             let root = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let mut current = match root {
@@ -6258,7 +6291,10 @@ fn eval_expr_value(
                 };
                 current = next;
             }
-            if name == "lix_json_get_text" {
+            if matches!(
+                name.as_str(),
+                "__lix_json_get_text" | "__lix_json_path_get_text"
+            ) {
                 if current.is_null() {
                     return Ok(EntityEvalValue::SqlNull);
                 }
@@ -6737,7 +6773,7 @@ fn require_json_comparison_operand(
         LixError::CODE_TYPE_MISMATCH,
         "JSON columns can only be compared with JSON expressions",
     )
-    .with_hint("Wrap JSON text with lix_json(...), use lix_json_get(...) for JSON values, or use IS NULL for null checks."))
+    .with_hint("Cast JSON text with ::jsonb, use PostgreSQL -> or ->> for JSON access, or use IS NULL for null checks."))
 }
 
 fn is_identity_json_expr(expr: &BoundExpr) -> bool {
@@ -6765,7 +6801,10 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &EntitySurfaceSpec) -> bool {
                 || matches!(column.name.as_str(), "lixcol_entity_pk" | "lixcol_metadata")
         }
         BoundExpr::Literal(BoundLiteral::Json(_)) => true,
-        BoundExpr::Function { name, .. } => matches!(name.as_str(), "lix_json" | "lix_json_get"),
+        BoundExpr::Function { name, .. } => matches!(
+            name.as_str(),
+            "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+        ),
         _ => false,
     }
 }
@@ -6783,13 +6822,19 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         )),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
-                "lix_json" if args.len() == 1 => {}
-                "lix_uuid_v7"
+                "uuidv7"
                 | "lix_timestamp"
                 | "lix_active_branch_id"
                 | "lix_active_branch_commit_id"
                     if args.is_empty() => {}
-                "lix_json_get" | "lix_json_get_text" if args.len() >= 2 => {}
+                "__lix_json_get"
+                | "__lix_json_get_text"
+                | "__lix_json_path_get"
+                | "__lix_json_path_get_text"
+                | "__lix_json_contains"
+                | "__lix_json_exists"
+                    if args.len() == 2 => {}
+                "__lix_jsonb" if args.len() == 1 => {}
                 _ => {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
@@ -7116,7 +7161,7 @@ fn json_text_value(value: &JsonValue) -> Result<String, LixError> {
             serde_json::to_string(value).map_err(|error| {
                 LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    format!("lix_json_get_text() could not render JSON value: {error}"),
+                    format!("JSONB ->> could not render JSON value: {error}"),
                 )
             })
         }

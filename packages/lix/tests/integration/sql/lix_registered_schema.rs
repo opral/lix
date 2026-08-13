@@ -22,7 +22,7 @@ simulation_test!(
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_dummy_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_dummy_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -115,7 +115,7 @@ simulation_test!(
             "properties": {
                 "id": {
                     "type": "string",
-                    "x-lix-default": "lix_uuid_v7()",
+                    "x-lix-default": "uuidv7()",
                 },
                 "label": {
                     "type": "string",
@@ -172,7 +172,7 @@ simulation_test!(
             "properties": {
                 "id": {
                     "type": "string",
-                    "x-lix-default": "lix_uuid_v7()",
+                    "x-lix-default": "uuidv7()",
                 },
                 "label": { "type": "string" },
             },
@@ -218,7 +218,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"sql_template_snapshot_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"sql_template_snapshot_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -286,7 +286,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_untracked_only_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_untracked_only_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  true\
                  )",
@@ -514,7 +514,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_delete_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_delete_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -643,7 +643,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB)",
                 &[Value::Json(amended_schema.clone().into())],
             )
             .await
@@ -660,7 +660,7 @@ simulation_test!(
                 &format!(
                     "SELECT value, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_depth \
                      FROM lix_registered_schema_history('{second_commit_id}') \
-                       WHERE lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]') \
+                       WHERE lixcol_entity_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB) \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -704,7 +704,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_bad_pointer_schema\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_bad_pointer_schema\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -750,7 +750,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_empty_property_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{}},\"required\":[\"id\",\"kind\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_empty_property_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{}},\"required\":[\"id\",\"kind\"],\"additionalProperties\":false}' AS JSONB),\
                  true,\
                  false\
                  )",
@@ -796,7 +796,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -846,7 +846,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -890,7 +890,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -903,7 +903,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_divergent_schema\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -914,7 +914,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_divergent_schema\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -999,7 +999,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
                 &[Value::Json(main_schema.clone().into())],
             )
             .await
@@ -1010,7 +1010,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
                 &[Value::Json(draft_schema.clone().into())],
             )
             .await
@@ -1021,7 +1021,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -1032,7 +1032,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                 WHERE lixcol_entity_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -1064,7 +1064,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_fk_parent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_fk_parent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -1076,7 +1076,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -1138,7 +1138,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_default_id_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_default_id_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"uuidv7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1193,7 +1193,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_nullable_default_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_nullable_default_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1264,7 +1264,7 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              true,\
              false\
              )",
@@ -1277,7 +1277,7 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -1300,7 +1300,7 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
         .execute(
             "SELECT id, name, lixcol_branch_id, lixcol_global, lixcol_untracked \
                  FROM engine_overlay_schema_by_branch \
-                 WHERE lixcol_entity_pk = lix_json('[\"entity-global-overlay\"]') \
+                 WHERE lixcol_entity_pk = CAST('[\"entity-global-overlay\"]' AS JSONB) \
                  ORDER BY lixcol_branch_id",
             &[],
         )
@@ -1343,7 +1343,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_global_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_global_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1386,7 +1386,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_typed_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_typed_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1443,7 +1443,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_number_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_number_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1501,7 +1501,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_file_scoped_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_file_scoped_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1587,7 +1587,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_identity_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_identity_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1644,7 +1644,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_identity_in_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_identity_in_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1700,7 +1700,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_base_branch_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_base_branch_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -1751,7 +1751,7 @@ simulation_test!(
             .execute(
                 "SELECT name \
                  FROM engine_base_branch_filter_schema_by_branch \
-                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000d'",
                 &[],
             )
@@ -1776,7 +1776,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_base_insert_branch_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_base_insert_branch_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -1808,7 +1808,7 @@ simulation_test!(
             .execute(
                 "SELECT name \
                  FROM engine_base_insert_branch_schema_by_branch \
-                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000e'",
                 &[],
             )
@@ -1834,7 +1834,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_unknown_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_unknown_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1878,7 +1878,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_duplicate_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_duplicate_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1922,7 +1922,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_qualified_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_qualified_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -1964,7 +1964,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_base_branch_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_base_branch_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -2020,7 +2020,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_by_branch_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_by_branch_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -2076,7 +2076,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_delete_scope_schema_by_branch \
-                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000010') \
                  ORDER BY name",
                     sim.main_branch_id()
@@ -2116,7 +2116,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_by_branch_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_by_branch_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -2173,7 +2173,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_update_scope_schema_by_branch \
-                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000011') \
                  ORDER BY name",
                     sim.main_branch_id()
@@ -2213,7 +2213,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_by_branch_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             CAST('{\"x-lix-key\":\"engine_by_branch_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
              false,\
              false\
              )",
@@ -2284,7 +2284,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_alias_scope_schema_by_branch \
-                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = CAST('[\"row-1\"]' AS JSONB) \
                    AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-00000000000f') \
                  ORDER BY name",
                     sim.main_branch_id()
@@ -2325,7 +2325,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_duplicate_update_assignment_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_duplicate_update_assignment_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
@@ -2382,7 +2382,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   lix_json('{\"x-lix-key\":\"engine_propertyless_update_schema\",\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}'),\
+                   CAST('{\"x-lix-key\":\"engine_propertyless_update_schema\",\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -2396,8 +2396,8 @@ simulation_test!(
                 "INSERT INTO engine_propertyless_update_schema \
                  (lixcol_entity_pk, lixcol_metadata, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   lix_json('[\"propertyless-row\"]'),\
-                   lix_json('{\"phase\":\"before\"}'),\
+                   CAST('[\"propertyless-row\"]' AS JSONB),\
+                   CAST('{\"phase\":\"before\"}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -2409,8 +2409,8 @@ simulation_test!(
         session
             .execute(
                 "UPDATE engine_propertyless_update_schema \
-                 SET lixcol_metadata = lix_json('{\"phase\":\"after\"}') \
-                 WHERE lixcol_entity_pk = lix_json('[\"propertyless-row\"]')",
+                 SET lixcol_metadata = CAST('{\"phase\":\"after\"}' AS JSONB) \
+                 WHERE lixcol_entity_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -2421,7 +2421,7 @@ simulation_test!(
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM engine_propertyless_update_schema \
-                     WHERE lixcol_entity_pk = lix_json('[\"propertyless-row\"]')",
+                     WHERE lixcol_entity_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
                     &[],
                 )
                 .await
@@ -2447,7 +2447,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_optional_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
+                 CAST('{\"x-lix-key\":\"engine_optional_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}' AS JSONB),\
                  false,\
                  false\
                  )",
