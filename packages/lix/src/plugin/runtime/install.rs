@@ -7,7 +7,7 @@
 use serde_json::json;
 
 use crate::LixError;
-use crate::plugin::{
+use crate::plugin::runtime::{
     ParsedPluginArchive, parse_plugin_archive_for_install, plugin_key_from_archive_path,
     plugin_storage_archive_file_id,
 };
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(plan.plugin_key, "plugin_test");
         assert_eq!(
             plan.archive_file_id,
-            crate::plugin::plugin_storage_archive_file_id("plugin_test")
+            crate::plugin::runtime::plugin_storage_archive_file_id("plugin_test")
         );
         assert_eq!(plan.parsed.manifest.key, "plugin_test");
         assert_eq!(plan.parsed.schema_keys, ["plugin_test_note"]);
@@ -173,7 +173,7 @@ mod tests {
 
         assert_eq!(
             plan.parsed.manifest.file_match.content,
-            Some(crate::plugin::PluginContentMatcher::Text)
+            Some(crate::plugin::runtime::PluginContentMatcher::Text)
         );
     }
 
@@ -196,7 +196,7 @@ mod tests {
             assert_eq!(plan.parsed.manifest.file_match.path_glob, path_glob);
             assert_eq!(
                 plan.parsed.manifest.file_match.content,
-                Some(crate::plugin::PluginContentMatcher::Text)
+                Some(crate::plugin::runtime::PluginContentMatcher::Text)
             );
         }
     }

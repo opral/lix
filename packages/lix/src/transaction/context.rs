@@ -58,7 +58,7 @@ use crate::hot_state::{
     StagedHotStateRows, TrackedHeadContext, TrackedWorkingDiff, overlay_load_exact_batch,
     overlay_scan_batch,
 };
-use crate::plugin::{
+use crate::plugin::runtime::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
     LiveBatchEntitySource, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache,
     PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
@@ -215,7 +215,7 @@ use crate::transaction::validation::{
     prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
     validate_certified_tracked_insert_identities, validate_prepared_writes,
 };
-use crate::wasm::{
+use crate::plugin::runtime::{
     WASM_COMPONENT_API_VERSION, WasmCertifiedEntityBatch, WasmChangeEffect, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictTake,
     WasmConflictUpdate, WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
@@ -3448,7 +3448,7 @@ where
             } = plan;
             let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
                 key: plugin_key.clone(),
-                runtime: crate::plugin::PluginRuntime::WasmComponent,
+                runtime: crate::plugin::runtime::PluginRuntime::WasmComponent,
                 api_version: WASM_COMPONENT_API_VERSION.to_owned(),
                 path_glob: parsed.manifest.file_match.path_glob.clone(),
                 content: parsed.manifest.file_match.content,
@@ -4672,7 +4672,7 @@ where
                             "lix.perf.plugin_open_file_drain"
                         ))
                         .await?;
-                        crate::plugin::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
+                        crate::plugin::runtime::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
                         Ok((actor, validated))
                     });
                     PendingFreshPluginOpen {
@@ -5078,7 +5078,7 @@ where
                                         (hash, offset, delete_len, insert_len)
                                     },
                                 );
-                                let before_source: Arc<dyn crate::wasm::WasmByteSource> =
+                                let before_source: Arc<dyn crate::plugin::runtime::WasmByteSource> =
                                     Arc::new(ArcByteSource::new(before_bytes.clone()));
                                 (
                                     Some(before_source),
@@ -5778,7 +5778,7 @@ where
                     "lix.perf.plugin_open_file_drain"
                 ))
                 .await?;
-                crate::plugin::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
+                crate::plugin::runtime::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
                 let certified_row_count = validated
                     .certified_batches
                     .iter()
@@ -9671,7 +9671,7 @@ fn v2_actor_key_is_descriptor_successor(
 }
 
 #[cfg(test)]
-fn v2_create_context(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm::WasmCreateContext {
+fn v2_create_context(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::plugin::runtime::WasmCreateContext {
     BoundCreateContext::bind(local_mutation_identity(seed), actor_key)
         .expect("local mutation seeds are generated as UUIDv7")
         .creates()
@@ -10901,7 +10901,7 @@ async fn render_semantic_changes_with_lease(
         PendingPluginActorPublication,
         crate::Blob,
         Option<ValidatedSameLengthOutputSplice>,
-        crate::wasm::WasmTransitionCounters,
+        crate::plugin::runtime::WasmTransitionCounters,
     ),
     (LixError, PendingPluginActorPublication),
 > {
@@ -11901,7 +11901,7 @@ mod tests {
         StagedCommitChangeBatchBuilder, StagedCommitChangeRefs,
     };
     use crate::transaction_types::TransactionJson;
-    use crate::wasm::WasmEntity;
+    use crate::plugin::runtime::WasmEntity;
 
     fn raw_write_rows(rows: Vec<TransactionWriteRow>) -> RawWriteBatch {
         RawWriteBatch::from_test_rows(rows)
@@ -12281,7 +12281,7 @@ mod tests {
             let value = serde_json::from_slice::<JsonValue>(snapshot)
                 .expect("test snapshot must contain valid JSON");
             let normalized_len = u32::try_from(snapshot.len()).expect("test snapshot fits u32");
-            let canonical = crate::wasm::WasmCanonicalJson::from_batch_parts(
+            let canonical = crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(
                 vec![value],
                 snapshot.to_vec(),
                 vec![(0, normalized_len)],
@@ -12472,7 +12472,7 @@ mod tests {
             &mut self,
             _limits: WasmTransitionLimits,
             _input: WasmOpenFileInput,
-        ) -> Result<crate::wasm::WasmFileTransition, LixError> {
+        ) -> Result<crate::plugin::runtime::WasmFileTransition, LixError> {
             Err(unused_upgrade_actor_method())
         }
 
@@ -12480,13 +12480,13 @@ mod tests {
             &mut self,
             _limits: WasmTransitionLimits,
             input: WasmOpenEntitiesInput,
-        ) -> Result<crate::wasm::WasmEntityTransition, LixError> {
+        ) -> Result<crate::plugin::runtime::WasmEntityTransition, LixError> {
             self.accepted_len = input.accepted.as_ref().map_or(0, |accepted| accepted.len());
             match &self.behavior {
-                UpgradePreflightBehavior::Render(_) => Ok(crate::wasm::WasmEntityTransition {
-                    transition: crate::wasm::WasmTransitionHandle(1),
+                UpgradePreflightBehavior::Render(_) => Ok(crate::plugin::runtime::WasmEntityTransition {
+                    transition: crate::plugin::runtime::WasmTransitionHandle(1),
                     document: WasmDocumentHandle(2),
-                    edits: crate::wasm::WasmEditCursorHandle(3),
+                    edits: crate::plugin::runtime::WasmEditCursorHandle(3),
                 }),
                 UpgradePreflightBehavior::Trap => Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
@@ -12500,7 +12500,7 @@ mod tests {
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
             _update: WasmFileUpdate,
-        ) -> Result<crate::wasm::WasmFileTransition, LixError> {
+        ) -> Result<crate::plugin::runtime::WasmFileTransition, LixError> {
             Err(unused_upgrade_actor_method())
         }
 
@@ -12509,26 +12509,26 @@ mod tests {
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
             _update: WasmEntityUpdate,
-        ) -> Result<crate::wasm::WasmEntityTransition, LixError> {
+        ) -> Result<crate::plugin::runtime::WasmEntityTransition, LixError> {
             Err(unused_upgrade_actor_method())
         }
 
         async fn next_change_page(
             &mut self,
-            _transition: crate::wasm::WasmTransitionHandle,
-            _cursor: crate::wasm::WasmChangeCursorHandle,
+            _transition: crate::plugin::runtime::WasmTransitionHandle,
+            _cursor: crate::plugin::runtime::WasmChangeCursorHandle,
             _max_bytes: u32,
-        ) -> Result<Option<crate::wasm::WasmChangePage>, LixError> {
+        ) -> Result<Option<crate::plugin::runtime::WasmChangePage>, LixError> {
             Err(unused_upgrade_actor_method())
         }
 
         async fn next_edit_page(
             &mut self,
-            _transition: crate::wasm::WasmTransitionHandle,
-            _cursor: crate::wasm::WasmEditCursorHandle,
+            _transition: crate::plugin::runtime::WasmTransitionHandle,
+            _cursor: crate::plugin::runtime::WasmEditCursorHandle,
             _max_edits: u32,
             _max_inline_bytes: u32,
-        ) -> Result<Option<crate::wasm::WasmEditPage>, LixError> {
+        ) -> Result<Option<crate::plugin::runtime::WasmEditPage>, LixError> {
             if self.emitted {
                 return Ok(None);
             }
@@ -12536,11 +12536,11 @@ mod tests {
             let UpgradePreflightBehavior::Render(bytes) = &self.behavior else {
                 return Err(unused_upgrade_actor_method());
             };
-            Ok(Some(crate::wasm::WasmEditPage {
-                edits: vec![crate::wasm::WasmOutputSplice {
+            Ok(Some(crate::plugin::runtime::WasmEditPage {
+                edits: vec![crate::plugin::runtime::WasmOutputSplice {
                     offset: 0,
                     delete_len: self.accepted_len,
-                    insert: crate::wasm::WasmGuestBytes::Inline(bytes.clone().into()),
+                    insert: crate::plugin::runtime::WasmGuestBytes::Inline(bytes.clone().into()),
                 }],
                 outputs: None,
             }))
@@ -12548,8 +12548,8 @@ mod tests {
 
         async fn output_len(
             &mut self,
-            _transition: crate::wasm::WasmTransitionHandle,
-            _outputs: crate::wasm::WasmByteOutputsHandle,
+            _transition: crate::plugin::runtime::WasmTransitionHandle,
+            _outputs: crate::plugin::runtime::WasmByteOutputsHandle,
             _index: u32,
         ) -> Result<u64, LixError> {
             Err(unused_upgrade_actor_method())
@@ -12557,8 +12557,8 @@ mod tests {
 
         async fn read_output(
             &mut self,
-            _transition: crate::wasm::WasmTransitionHandle,
-            _outputs: crate::wasm::WasmByteOutputsHandle,
+            _transition: crate::plugin::runtime::WasmTransitionHandle,
+            _outputs: crate::plugin::runtime::WasmByteOutputsHandle,
             _index: u32,
             _offset: u64,
             _length: u32,
@@ -12568,14 +12568,14 @@ mod tests {
 
         async fn finish_transition(
             &mut self,
-            _transition: crate::wasm::WasmTransitionHandle,
-        ) -> Result<crate::wasm::WasmTransitionCounters, LixError> {
-            Ok(crate::wasm::WasmTransitionCounters::default())
+            _transition: crate::plugin::runtime::WasmTransitionHandle,
+        ) -> Result<crate::plugin::runtime::WasmTransitionCounters, LixError> {
+            Ok(crate::plugin::runtime::WasmTransitionCounters::default())
         }
 
         async fn discard_transition(
             &mut self,
-            _transition: crate::wasm::WasmTransitionHandle,
+            _transition: crate::plugin::runtime::WasmTransitionHandle,
         ) -> Result<(), LixError> {
             self.discarded = true;
             Ok(())
@@ -12643,7 +12643,7 @@ mod tests {
         let hash = std::iter::repeat_n(hash_byte, 64).collect::<String>();
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: "plugin_csv".to_string(),
-            runtime: crate::plugin::PluginRuntime::WasmComponent,
+            runtime: crate::plugin::runtime::PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
             path_glob: "*.csv".to_string(),
             content: Some(PluginContentMatcher::Text),
@@ -12651,7 +12651,7 @@ mod tests {
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
             manifest_json: r#"{"entry":"plugin.wasm","key":"plugin_csv","match":{"content":"text","path_glob":"*.csv"},"schemas":["schema/csv_row.json"]}"#.to_string(),
-            archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv"),
+            archive_file_id: crate::plugin::runtime::plugin_storage_archive_file_id("plugin_csv"),
             archive_path: "/.lix/plugins/plugin_csv.lixplugin".to_string(),
             archive_blob_hash: hash.clone(),
             wasm_blob_hash: hash,
@@ -12712,7 +12712,7 @@ mod tests {
         let prior_key =
             WasmEntityKey::from_owned_parts("csv_row".to_owned(), vec!["removed-row".to_owned()]);
         let prior = PluginEntityAuthorities::from_keys(BTreeSet::from([prior_key.clone()]));
-        let creates = crate::wasm::WasmCreateContext {
+        let creates = crate::plugin::runtime::WasmCreateContext {
             high: 0x019a_0000_0000_7000,
             low: 0x8000_0000,
         };
@@ -12725,7 +12725,7 @@ mod tests {
             schema_keys: vec!["csv_row".to_owned()],
             row_count: 1,
             creates,
-            create_ranges: vec![crate::wasm::WasmCertifiedCreateRange {
+            create_ranges: vec![crate::plugin::runtime::WasmCertifiedCreateRange {
                 schema_key: "csv_row".to_owned(),
                 first_local_ref: 7,
                 last_local_ref: 7,
@@ -13113,7 +13113,7 @@ mod tests {
             Arc::clone(&hot_state),
             Arc::clone(&tracked_state),
             Arc::clone(&binary_cas),
-            PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
+            PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             Arc::clone(&catalog_context),
             Arc::new(SqlPlanningCache::default()),
@@ -13437,7 +13437,7 @@ mod tests {
             Arc::clone(&hot_state),
             Arc::new(TrackedStateContext::new()),
             Arc::clone(&binary_cas),
-            PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
+            PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             Arc::clone(&catalog_context),
             Arc::new(SqlPlanningCache::default()),
@@ -13888,7 +13888,7 @@ mod tests {
             Arc::clone(&hot_state),
             Arc::new(TrackedStateContext::new()),
             Arc::clone(&binary_cas),
-            PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
+            PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             catalog_context,
             Arc::new(SqlPlanningCache::default()),
@@ -14174,7 +14174,7 @@ mod tests {
             offsets.push((start, end));
         }
         let canonical =
-            crate::wasm::WasmCanonicalJson::from_batch_parts(values, normalized, offsets, 3, 3)
+            crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(values, normalized, offsets, 3, 3)
                 .expect("canonical raw batch");
         let arena_probe = canonical[0].clone();
         let rows = canonical
@@ -14293,7 +14293,7 @@ mod tests {
         let mut source = VecEntityChangeSource::new(changes, limits)
             .expect("lazy semantic change should fit the packet bounds");
         let page =
-            crate::wasm::WasmEntityChangeSource::next_page(&mut source, limits.max_page_bytes)
+            crate::plugin::runtime::WasmEntityChangeSource::next_page(&mut source, limits.max_page_bytes)
                 .expect("semantic renderer packet should page")
                 .expect("one semantic change page should be emitted");
         assert_eq!(page.changes.len(), 1);

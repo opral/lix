@@ -9,14 +9,15 @@ use lix::storage_adapter::{
     StorageAdapter, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
 };
 use lix::storage_bench::{layout_space_catalog, space_inventory};
-use lix::wasm::{
+use lix::plugin::runtime::{
     WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
     WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityKey, WasmEntityPage,
     WasmEntitySource, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate, WasmHostBytes,
-    WasmHostEntity, WasmInputBytes, WasmInputSplice, WasmLimits, WasmOpenEntitiesInput,
+    WasmHostEntity, WasmInputBytes, WasmInputSplice, WasmOpenEntitiesInput,
     WasmPluginSelection, WasmRuntime, WasmSourceRange, WasmSourceSlice, WasmTransitionCounters,
     WasmTransitionLimits,
 };
+use lix::wasm::WasmLimits;
 use lix::{
     CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteStatementMetadata, Lix,
     LixError, MergeBranchOptions, MergeBranchPreviewOptions, MergeConflictChangeKind,

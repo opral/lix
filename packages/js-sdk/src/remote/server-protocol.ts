@@ -4,8 +4,8 @@ import type {
 } from "../binding-types.js";
 import type { NativeLixValue } from "../value.js";
 
-export const REMOTE_PROTOCOL_VERSION = 2;
-export const REMOTE_PROTOCOL_PATH = "/lix/v1/";
+export const SERVER_PROTOCOL_VERSION = 2;
+export const SERVER_PROTOCOL_PATH = "/lix/v1/";
 
 export type WireValue =
 	| { kind: "null"; value: null }
@@ -27,25 +27,25 @@ export type WireRequestBlobSplice = {
 
 export type WireRequestValue = WireValue | WireRequestBlobSplice;
 
-export type RemoteHandshake = {
+export type ServerProtocolHandshake = {
 	protocolVersion: number;
 	activeBranchId: string;
 	activeAccountId: string;
 	sessionId: string;
 };
 
-export type RemoteHandshakeRequest = {
+export type ServerProtocolHandshakeRequest = {
 	activeBranchId?: string;
 };
 
-export type RemoteExecuteRequest = {
+export type ServerProtocolExecuteRequest = {
 	sql: string;
 	params: WireRequestValue[];
 	options?: { originKey?: string };
 	cacheBlobs?: true;
 };
 
-export type RemoteExecuteBatchRequest = {
+export type ServerProtocolExecuteBatchRequest = {
 	statements: Array<{
 		sql: string;
 		params: WireRequestValue[];
@@ -55,37 +55,38 @@ export type RemoteExecuteBatchRequest = {
 	cacheBlobs?: true;
 };
 
-export type RemoteExecuteResponse = {
+export type ServerProtocolExecuteResponse = {
 	columns: string[];
 	rows: WireValue[][];
 	rowsAffected: number;
 	notices: Array<{ code: string; message: string; hint?: string }>;
 };
 
-export type RemoteExecuteBatchResponse = RemoteExecuteResponse & {
-	statementIndex: number;
-	label?: string;
-};
+export type ServerProtocolExecuteBatchResponse =
+	ServerProtocolExecuteResponse & {
+		statementIndex: number;
+		label?: string;
+	};
 
-export type RemoteObserveRequest = {
+export type ServerProtocolObserveRequest = {
 	sql: string;
 	params: WireValue[];
 };
 
-export type RemoteObserveSubscription = RemoteObserveRequest & {
+export type ServerProtocolObserveSubscription = ServerProtocolObserveRequest & {
 	id: string;
 };
 
-export type RemoteMultiplexObserveRequest = {
-	subscriptions: RemoteObserveSubscription[];
+export type ServerProtocolMultiplexObserveRequest = {
+	subscriptions: ServerProtocolObserveSubscription[];
 };
 
-type RemoteObserveEventBase = {
+type ServerProtocolObserveEventBase = {
 	sequence: number;
 	mutationSequence: number;
 };
 
-export type RemoteObserveBlobDelta = {
+export type ServerProtocolObserveBlobDelta = {
 	kind: "single-blob-splice";
 	baseSequence: number;
 	prefixBytes: number;
@@ -93,7 +94,7 @@ export type RemoteObserveBlobDelta = {
 	insertBase64: string;
 };
 
-type RemoteObserveRowSplice = {
+type ServerProtocolObserveRowSplice = {
 	kind: "row-splice";
 	baseSequence: number;
 	prefixRows: number;
@@ -101,51 +102,53 @@ type RemoteObserveRowSplice = {
 	insertRows: WireValue[][];
 };
 
-type RemoteObserveDelta = RemoteObserveBlobDelta | RemoteObserveRowSplice;
+type ServerProtocolObserveDelta =
+	| ServerProtocolObserveBlobDelta
+	| ServerProtocolObserveRowSplice;
 
-export type RemoteObserveEvent = RemoteObserveEventBase &
+export type ServerProtocolObserveEvent = ServerProtocolObserveEventBase &
 	(
-		| { result: RemoteExecuteResponse; delta?: never }
-		| { result?: never; delta: RemoteObserveDelta }
+		| { result: ServerProtocolExecuteResponse; delta?: never }
+		| { result?: never; delta: ServerProtocolObserveDelta }
 	);
 
-export type RemoteMultiplexObserveEvent = RemoteObserveEvent & {
+export type ServerProtocolMultiplexObserveEvent = ServerProtocolObserveEvent & {
 	subscriptionId: string;
 };
 
-export type RemoteCreateBranchRequest = {
+export type ServerProtocolCreateBranchRequest = {
 	id?: string;
 	name: string;
 	fromCommitId?: string;
 };
 
-export type RemoteCreateBranchResponse = {
+export type ServerProtocolCreateBranchResponse = {
 	id: string;
 	name: string;
 	hidden: boolean;
 	commitId: string;
 };
 
-export type RemoteCreateCheckpointResponse = {
+export type ServerProtocolCreateCheckpointResponse = {
 	commitId: string;
 };
 
-export type RemoteUndoResponse = {
+export type ServerProtocolUndoResponse = {
 	branchId: string;
 	targetCommitId: string;
 	inverseCommitId: string;
 };
 
-export type RemoteRedoResponse = {
+export type ServerProtocolRedoResponse = {
 	branchId: string;
 	targetCommitId: string;
 	replayCommitId: string;
 };
 
-export type RemoteSwitchBranchRequest = { branchId: string };
-export type RemoteSwitchBranchResponse = { branchId: string };
+export type ServerProtocolSwitchBranchRequest = { branchId: string };
+export type ServerProtocolSwitchBranchResponse = { branchId: string };
 
-export type RemoteErrorBody = {
+export type ServerProtocolErrorBody = {
 	error: {
 		code?: string;
 		message?: string;
@@ -154,13 +157,14 @@ export type RemoteErrorBody = {
 	};
 };
 
-export type RemoteObserveErrorEvent = RemoteErrorBody & {
+export type ServerProtocolObserveErrorEvent = ServerProtocolErrorBody & {
 	retryable?: boolean;
 };
 
-export type RemoteMultiplexObserveErrorEvent = RemoteObserveErrorEvent & {
-	subscriptionId?: string;
-};
+export type ServerProtocolMultiplexObserveErrorEvent =
+	ServerProtocolObserveErrorEvent & {
+		subscriptionId?: string;
+	};
 
 export function encodeWireValue(value: NativeLixValue): WireValue {
 	switch (value.kind) {
@@ -247,33 +251,39 @@ export function decodeExecuteBatchResult(value: unknown): BindingExecuteResult {
 	};
 }
 
-export function decodeHandshake(value: unknown): RemoteHandshake {
-	const handshake = record(value, "remote handshake");
-	if (handshake.protocolVersion !== REMOTE_PROTOCOL_VERSION) {
+export function decodeHandshake(value: unknown): ServerProtocolHandshake {
+	const handshake = record(value, "Lix Server Protocol handshake");
+	if (handshake.protocolVersion !== SERVER_PROTOCOL_VERSION) {
 		throw protocolError(
-			`unsupported remote protocol version: ${String(handshake.protocolVersion)}`,
+			`unsupported Lix Server Protocol version: ${String(handshake.protocolVersion)}`,
 		);
 	}
 	if (
 		typeof handshake.activeBranchId !== "string" ||
 		handshake.activeBranchId.length === 0
 	) {
-		throw protocolError("remote handshake requires activeBranchId");
+		throw protocolError(
+			"Lix Server Protocol handshake requires activeBranchId",
+		);
 	}
 	if (
 		typeof handshake.activeAccountId !== "string" ||
 		handshake.activeAccountId.length === 0
 	) {
-		throw protocolError("remote handshake requires activeAccountId");
+		throw protocolError(
+			"Lix Server Protocol handshake requires activeAccountId",
+		);
 	}
 	if (
 		typeof handshake.sessionId !== "string" ||
 		!/^[\x21-\x7e]{1,256}$/.test(handshake.sessionId)
 	) {
-		throw protocolError("remote handshake requires a valid sessionId");
+		throw protocolError(
+			"Lix Server Protocol handshake requires a valid sessionId",
+		);
 	}
 	return {
-		protocolVersion: REMOTE_PROTOCOL_VERSION,
+		protocolVersion: SERVER_PROTOCOL_VERSION,
 		activeBranchId: handshake.activeBranchId,
 		activeAccountId: handshake.activeAccountId,
 		sessionId: handshake.sessionId,
@@ -501,15 +511,15 @@ export function remoteError(
 }
 
 export function protocolError(message: string): Error & { code: string } {
-	return remoteError("LIX_REMOTE_PROTOCOL_ERROR", message);
+	return remoteError("LIX_SERVER_PROTOCOL_ERROR", message);
 }
 
 export function errorFromResponseBody(
 	value: unknown,
 	status?: number,
 ): Error & { code: string } {
-	const body = record(value, "remote error response");
-	const rawError = record(body.error, "remote error response error");
+	const body = record(value, "Lix Server Protocol error response");
+	const rawError = record(body.error, "Lix Server Protocol error response error");
 	return remoteError(
 		typeof rawError.code === "string"
 			? rawError.code

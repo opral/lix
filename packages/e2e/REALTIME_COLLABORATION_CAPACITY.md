@@ -48,7 +48,7 @@ five fresh-process repetitions. This avoids selecting the fastest sample.
 | Local / CSV | 100 | 5.484 ms | **23.108 ms** | 23.818 ms | pass |
 | Local / Markdown | 100 | 7.952 ms | **24.780 ms** | 28.850 ms | pass |
 | Local / text | 100 | 5.520 ms | **20.922 ms** | 21.276 ms | pass |
-| Server protocol / JSON | 100 | 13.787 ms | **25.977 ms** | not recorded | pass |
+| Lix Server Protocol / JSON | 100 | 13.787 ms | **25.977 ms** | not recorded | pass |
 
 The server-protocol row runs 100 independent protocol sessions and 100 SSE
 streams through the canonical Axum router. It covers wire value decoding,
@@ -104,7 +104,7 @@ subscriber when a slower capacity run needs attribution.
 Across the corrected six-run matrix, worst local service p95 was 7.952 ms and
 worst local convergence p95 was 24.780 ms. Absolute-deadline schedule-lag p95
 never exceeded 2.081 ms, proving the workload sustained five edits every 50 ms
-instead of moving arrivals after convergence. The in-process server protocol's
+instead of moving arrivals after convergence. The in-process Lix Server Protocol's
 worst service and convergence p95 values were 13.787 ms and 25.977 ms, with
 schedule-lag p95 at or below 1.768 ms. These endpoint measurements identify
 protocol processing and fan-out as the remaining larger slices; a production
@@ -150,7 +150,7 @@ cargo test -p lix_e2e \
   -- --ignored --exact --nocapture
 
 cargo test -p lix --features "server-protocol storage-benches" --release \
-  tests::remote_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95 \
+  tests::server_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95 \
   -- --ignored --exact --nocapture
 ```
 

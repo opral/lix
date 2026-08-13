@@ -17,7 +17,7 @@ use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
     StorageWrite, WriteOptions,
 };
-use lix::wasm::WasmRuntime;
+use lix::plugin::runtime::WasmRuntime;
 use lix::{LixError, LixPath, Value};
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};

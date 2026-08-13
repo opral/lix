@@ -40,7 +40,7 @@ use crate::transaction_types::{
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
     TypedMutationJournalBatch,
 };
-use crate::wasm::WasmEntityKey;
+use crate::plugin::runtime::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 use crate::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 

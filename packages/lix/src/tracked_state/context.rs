@@ -4884,7 +4884,7 @@ mod tests {
     use crate::hot_state::CertifiedEntityBatchFileRef;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
-    use crate::wasm::{WasmCertifiedEntityBatch, WasmCreateContext};
+    use crate::plugin::runtime::{WasmCertifiedEntityBatch, WasmCreateContext};
 
     #[test]
     fn exact_current_state_diff_scope_requires_one_schema_and_concrete_file_lane() {
@@ -9064,9 +9064,9 @@ mod tests {
         page.extend_from_slice(&1_u16.to_le_bytes());
         page.extend_from_slice(&5_u32.to_le_bytes());
         page.extend_from_slice(b"value");
-        let page = crate::plugin_wire::encode_single_section(
-            crate::plugin_wire::Representation::SchemaRows,
-            crate::plugin_wire::Operation::Create,
+        let page = crate::plugin::wire::encode_single_section(
+            crate::plugin::wire::Representation::SchemaRows,
+            crate::plugin::wire::Operation::Create,
             SCHEMA_KEY,
             br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
             1,
@@ -9146,7 +9146,7 @@ mod tests {
                 filter: crate::tracked_state::TrackedStateFilter {
                     schema_keys: vec![SCHEMA_KEY.to_owned()],
                     entity_pks: vec![key.entity_pk.clone()],
-                    file_ids: vec![crate::NullableKeyFilter::Value(FILE_ID.to_owned())],
+                    file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_owned())],
                     include_tombstones: true,
                 },
                 read_columns: crate::tracked_state::TrackedStateReadColumns {

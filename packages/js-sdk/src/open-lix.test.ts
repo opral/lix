@@ -797,7 +797,7 @@ test("fs storage syncAllFiles validates option shape", () => {
 	).toThrow("LocalFilesystem syncAllFiles must be a boolean");
 });
 
-test("fs storage on-demand sync imports no regular workspace files initially", async () => {
+test("fs storage on-demand sync imports no regular repository files initially", async () => {
 	const dir = tempFsDir();
 	const lixDir = tempExternalLixDir();
 	mkdirSync(dir, { recursive: true });
@@ -947,7 +947,7 @@ test("fs storage on-demand sync matches directory paths by segment boundaries", 
 	await lix.close();
 });
 
-test("fs storage with external lixDir materializes lix storage outside the workspace", async () => {
+test("fs storage with external lixDir materializes lix storage outside the repository", async () => {
 	const dir = tempFsDir();
 	const lixDir = tempExternalLixDir();
 	mkdirSync(dir, { recursive: true });

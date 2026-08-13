@@ -15,7 +15,7 @@ use tokio::sync::{
 };
 
 use super::incremental::FileBytesSha256;
-use crate::wasm::{
+use crate::plugin::runtime::{
     WasmComponentActor, WasmCreateContext, WasmDocumentCheckpoint, WasmDocumentHandle,
     WasmEntityKey,
 };
@@ -1902,7 +1902,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::wasm::{
+    use crate::plugin::runtime::{
         WasmChangeCursorHandle, WasmChangePage, WasmComponentActor, WasmEditCursorHandle,
         WasmEditPage, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
         WasmOpenEntitiesInput, WasmOpenFileInput, WasmTransitionCounters, WasmTransitionHandle,
@@ -1998,7 +1998,7 @@ mod tests {
         async fn output_len(
             &mut self,
             _transition: WasmTransitionHandle,
-            _outputs: crate::wasm::WasmByteOutputsHandle,
+            _outputs: crate::plugin::runtime::WasmByteOutputsHandle,
             _index: u32,
         ) -> Result<u64, LixError> {
             Err(unused())
@@ -2007,7 +2007,7 @@ mod tests {
         async fn read_output(
             &mut self,
             _transition: WasmTransitionHandle,
-            _outputs: crate::wasm::WasmByteOutputsHandle,
+            _outputs: crate::plugin::runtime::WasmByteOutputsHandle,
             _index: u32,
             _offset: u64,
             _length: u32,

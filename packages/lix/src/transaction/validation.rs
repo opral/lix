@@ -32,7 +32,7 @@ use crate::hot_state::{
     HotStateReadDomain, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateRowRef,
 };
-use crate::plugin::PLUGIN_OWNER_KEY;
+use crate::plugin::runtime::PLUGIN_OWNER_KEY;
 #[cfg(test)]
 use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
 use crate::schema::{

@@ -33,7 +33,7 @@ use crate::hot_state::{
 use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
-use crate::plugin::{is_plugin_storage_path, reject_normal_plugin_storage_mutation};
+use crate::plugin::runtime::{is_plugin_storage_path, reject_normal_plugin_storage_mutation};
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
     resolve_write_branch_scope,

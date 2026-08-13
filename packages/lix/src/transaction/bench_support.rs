@@ -303,7 +303,7 @@ where
             Arc::clone(&self.hot_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            crate::plugin::PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
+            crate::plugin::runtime::PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::new(crate::sql2::SqlPlanningCache::default()),

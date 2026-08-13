@@ -43,7 +43,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
 /// V66 makes the repository default branch a tracked bootstrap fact and
-/// removes the mutable workspace-branch selector. The hard cut rejects older
+/// removes the mutable repository-branch selector. The hard cut rejects older
 /// repositories instead of inferring or migrating the removed selector.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0011),

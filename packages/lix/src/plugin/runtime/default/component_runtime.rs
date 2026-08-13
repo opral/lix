@@ -8,15 +8,15 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::plugin_wire::{Operation, Page as EntityPage, Representation, encode_single_section};
+use crate::plugin::wire::{Operation, Page as EntityPage, Representation, encode_single_section};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lix::wasm::WasmLimits;
-use lix::wasm::v1::{
+use lix::plugin::runtime::v1::{
     ByteEdit as ArenaByteEdit, Digest as ArenaDigest, Root as ArenaRoot, Store as ArenaStore,
     Transaction as ArenaTransaction,
 };
-use lix::wasm::{
+use lix::plugin::runtime::{
     PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmCertifiedCreateRange, WasmCertifiedEntityBatch,
     WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictResolutionPage,
@@ -133,8 +133,8 @@ struct EntityChangeState {
 }
 
 enum EntityChangeInputSource {
-    Entities(Box<dyn lix::wasm::WasmEntitySource>),
-    Changes(Box<dyn lix::wasm::WasmEntityChangeSource>),
+    Entities(Box<dyn lix::plugin::runtime::WasmEntitySource>),
+    Changes(Box<dyn lix::plugin::runtime::WasmEntityChangeSource>),
 }
 
 struct ResolutionState {
@@ -595,7 +595,7 @@ impl ResolutionState {
 impl EntityChangeState {
     fn from_entities(
         limits: WasmTransitionLimits,
-        source: Box<dyn lix::wasm::WasmEntitySource>,
+        source: Box<dyn lix::plugin::runtime::WasmEntitySource>,
         total_bytes: SharedByteBudget,
     ) -> Result<Self, LixError> {
         Ok(Self {
@@ -611,7 +611,7 @@ impl EntityChangeState {
 
     fn from_changes(
         limits: WasmTransitionLimits,
-        source: Box<dyn lix::wasm::WasmEntityChangeSource>,
+        source: Box<dyn lix::plugin::runtime::WasmEntityChangeSource>,
         total_bytes: SharedByteBudget,
     ) -> Result<Self, LixError> {
         Ok(Self {
@@ -1349,7 +1349,7 @@ impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
         state.check_active()?;
         ensure_source_page(max_bytes, state.limits.max_page_bytes)?;
         let envelope_bytes = u32::try_from(
-            crate::plugin_wire::single_section_overhead("", &[]).expect("fixed page overhead"),
+            crate::plugin::wire::single_section_overhead("", &[]).expect("fixed page overhead"),
         )
         .expect("fixed page overhead fits u32");
         let payload_budget = max_bytes.checked_sub(envelope_bytes).ok_or_else(|| {
@@ -2336,7 +2336,7 @@ fn host_table_error(
     bindings::lix::plugin::host::HostError::Rejected(error.to_string())
 }
 
-fn read_source_all(source: &Arc<dyn lix::wasm::WasmByteSource>) -> Result<Vec<u8>, LixError> {
+fn read_source_all(source: &Arc<dyn lix::plugin::runtime::WasmByteSource>) -> Result<Vec<u8>, LixError> {
     const CHUNK_BYTES: u32 = 1024 * 1024;
     let length = source.len();
     let mut output = Vec::with_capacity(
@@ -4345,11 +4345,12 @@ fn component_transition_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lix::wasm::{WasmByteSource, WasmFileDescriptor, WasmInputSplice, WasmPluginSelection};
 
+    #[cfg(any())]
     #[derive(Clone, Debug)]
     struct JsonTestSource(Vec<u8>);
 
+    #[cfg(any())]
     impl WasmByteSource for JsonTestSource {
         fn len(&self) -> u64 {
             self.0.len() as u64
@@ -4368,22 +4369,25 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     struct JsonTestEntitySource {
         entities: Option<Vec<WasmEntity<WasmHostBytes>>>,
     }
 
-    impl lix::wasm::WasmEntitySource for JsonTestEntitySource {
+    #[cfg(any())]
+    impl lix::plugin::runtime::WasmEntitySource for JsonTestEntitySource {
         fn next_page(
             &mut self,
             _max_bytes: u32,
-        ) -> Result<Option<lix::wasm::WasmEntityPage>, LixError> {
+        ) -> Result<Option<lix::plugin::runtime::WasmEntityPage>, LixError> {
             Ok(self
                 .entities
                 .take()
-                .map(|entities| lix::wasm::WasmEntityPage { entities }))
+                .map(|entities| lix::plugin::runtime::WasmEntityPage { entities }))
         }
     }
 
+    #[cfg(any())]
     fn assert_json_full_fallback_state_only(checkpoint: &WasmDocumentCheckpoint) {
         let root = checkpoint
             .downcast_ref::<ArenaRoot>()
@@ -4408,6 +4412,9 @@ mod tests {
         assert!(!keys.iter().any(|key| key.starts_with(b"json/scalar-page/")));
     }
 
+    // Compiled-plugin behavior is covered by `lix_e2e`; keeping an artifact
+    // dependency here would create `lix -> plugin -> lix`.
+    #[cfg(any())]
     #[tokio::test]
     async fn json_cold_full_fallback_checkpoint_omits_scalar_state() {
         let wasm = std::fs::read(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"))
@@ -4884,11 +4891,11 @@ mod tests {
     #[test]
     fn entity_sources_and_transition_sinks_share_one_byte_budget() {
         struct EmptyEntitySource;
-        impl lix::wasm::WasmEntitySource for EmptyEntitySource {
+        impl lix::plugin::runtime::WasmEntitySource for EmptyEntitySource {
             fn next_page(
                 &mut self,
                 _max_bytes: u32,
-            ) -> Result<Option<lix::wasm::WasmEntityPage>, LixError> {
+            ) -> Result<Option<lix::plugin::runtime::WasmEntityPage>, LixError> {
                 Ok(None)
             }
         }

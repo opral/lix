@@ -2,12 +2,13 @@
 #![allow(dead_code)]
 
 mod core;
+mod order_key;
 
 use core::{
     ArenaElementSpan, ChangeEffect, Document, EntityChange, EntityImportBuilder, EntityRecord,
     FileEdit, IdNamespace,
 };
-use lix_plugin_api as sdk;
+use lix::plugin as sdk;
 
 struct ExcalidrawPlugin;
 
@@ -658,7 +659,7 @@ where
 }
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api::export_plugin!(ExcalidrawPlugin);
+lix::plugin::export!(ExcalidrawPlugin);
 
 #[cfg(test)]
 mod tests {

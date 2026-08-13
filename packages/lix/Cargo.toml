@@ -61,10 +61,6 @@ name = "deterministic_sequence_corruption"
 path = "tests/deterministic_sequence_corruption.rs"
 
 [[test]]
-name = "semantic_merge"
-path = "tests/semantic_merge.rs"
-
-[[test]]
 name = "send_futures"
 path = "tests/send_futures.rs"
 
@@ -125,6 +121,14 @@ name = "plugin_arena_scorecard"
 path = "tests/plugin_arena_scorecard.rs"
 
 [dependencies]
+
+[target.'cfg(any(not(target_arch = "wasm32"), all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
+wit-bindgen = "0.57"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2"))'.dependencies]
+uuid = { version = "1", features = ["std"] }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
 ahash = "0.8"
 async-trait = "0.1"
 cel = { version = "0.12.0", features = ["json"] }
@@ -177,8 +181,6 @@ paste = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 tracing-subscriber = "0.3"
-plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
-plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 wasm-encoder = "0.248"
 wit-parser = "0.247"
 
@@ -187,5 +189,5 @@ zstd = "0.13"
 notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
 tokio = { version = "1", features = ["rt", "sync"] }
 
-[target.'cfg(target_family = "wasm")'.dependencies]
+[target.'cfg(all(target_family = "wasm", not(all(target_os = "wasi", target_env = "p2"))))'.dependencies]
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }

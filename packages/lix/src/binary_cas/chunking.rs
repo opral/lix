@@ -39,7 +39,7 @@ pub(crate) const CHUNK_ANCHOR_BYTES: usize = 16 * 1024 * 1024;
 
 /// Target average chunk size. Held at the previous fixed chunk size on purpose,
 /// so manifest row count, payload row count and the seek unit the movie
-/// workspace profile qualified all stay where they were; content-defined
+/// repository profile qualified all stay where they were; content-defined
 /// boundaries are the only difference.
 pub(crate) const MEDIA_CHUNK_BYTES: usize = 1024 * 1024;
 const MIN_BINARY_CAS_CHUNK_BYTES: usize = 256 * 1024;

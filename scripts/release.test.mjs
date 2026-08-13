@@ -134,10 +134,15 @@ test("updateChangelog inserts new entries after heading", () => {
 test("updateCargoToml leaves independently released Rust packages untouched", () => {
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
 	mkdirSync(join(root, "packages", "js-sdk"), { recursive: true });
+	mkdirSync(join(root, "packages", "lix"), { recursive: true });
 	mkdirSync(join(root, "packages", "storage-rocksdb"), { recursive: true });
 	writeFileSync(
 		join(root, "Cargo.toml"),
 		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_storage_rocksdb = { path = "packages/storage-rocksdb", version = "0.6.2" }\nlix_storage_slatedb = { path = "packages/storage-slatedb", version = "0.6.2" }\nlix = { path = "packages/lix", version = "0.6.2" }\n`,
+	);
+	writeFileSync(
+		join(root, "packages", "lix", "Cargo.toml"),
+		`[package]\nname = "lix"\nversion = "0.6.2"\n`,
 	);
 	writeFileSync(
 		join(root, "packages", "js-sdk", "Cargo.toml"),
@@ -154,33 +159,10 @@ test("updateCargoToml leaves independently released Rust packages untouched", ()
 	assert.match(rootCargoToml, /\[workspace\.package\]\nversion = "0\.7\.0"/);
 	assert.match(rootCargoToml, /lix_storage_rocksdb = \{ path = "packages\/storage-rocksdb", version = "0\.6\.2"/);
 	assert.match(rootCargoToml, /lix_storage_slatedb = \{ path = "packages\/storage-slatedb", version = "0\.6\.2"/);
+	assert.match(rootCargoToml, /lix = \{ path = "packages\/lix", version = "0\.6\.2"/);
 	assert.match(readFileSync(join(root, "packages", "js-sdk", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
 	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /version = "0\.6\.2"/);
 	assert.match(readFileSync(join(root, "packages", "storage-rocksdb", "Cargo.toml"), "utf8"), /lix = \{ path = "\.\.\/lix", version = "0\.6\.2"/);
-});
-
-test("updateCargoToml updates requirements for workspace-versioned packages", () => {
-	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
-	mkdirSync(join(root, "packages", "plugin-api"), { recursive: true });
-	mkdirSync(join(root, "packages", "lix"), { recursive: true });
-	writeFileSync(
-		join(root, "Cargo.toml"),
-		`[workspace.package]\nversion = "0.6.2"\n\n[workspace.dependencies]\nlix_plugin_api = { path = "packages/plugin-api", version = "0.6.2" }\nlix = { path = "packages/lix", version = "0.6.2" }\n`,
-	);
-	writeFileSync(
-		join(root, "packages", "plugin-api", "Cargo.toml"),
-		`[package]\nname = "lix_plugin_api"\nversion.workspace = true\n`,
-	);
-	writeFileSync(
-		join(root, "packages", "lix", "Cargo.toml"),
-		`[package]\nname = "lix"\nversion = "0.6.2"\n`,
-	);
-
-	updateCargoToml(root, "0.7.0");
-
-	const rootCargoToml = readFileSync(join(root, "Cargo.toml"), "utf8");
-	assert.match(rootCargoToml, /lix_plugin_api = \{ path = "packages\/plugin-api", version = "0\.7\.0"/);
-	assert.match(rootCargoToml, /lix = \{ path = "packages\/lix", version = "0\.6\.2"/);
 });
 
 test("updatePackageVersion pins native optional dependencies", () => {

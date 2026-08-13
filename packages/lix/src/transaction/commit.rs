@@ -231,8 +231,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             batch.complete_file_state
                 && matches!(
                     batch.format,
-                    1 | crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
-                        | crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+                    1 | crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+                        | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
                 )
         }) {
             let [schema_key] = batch.schema_keys.as_slice() else {
@@ -904,10 +904,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     })
 }
 
-fn certified_batch_requires_root_expansion(batch: &crate::wasm::WasmCertifiedEntityBatch) -> bool {
+fn certified_batch_requires_root_expansion(batch: &crate::plugin::runtime::WasmCertifiedEntityBatch) -> bool {
     !matches!(
         batch.format,
-        crate::wasm::HOST_CERTIFIED_PACKET_FORMAT | crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
     )
 }
 
@@ -4700,7 +4700,7 @@ fn packed_current_base_guards_match(
 /// members. The two retention modes must never own the same logical identity.
 ///
 /// This is a merge/checkpoint lifecycle fence, not a normal CRUD-path check.
-/// Point-loading only the selected identities keeps large untracked workspaces
+/// Point-loading only the selected identities keeps large untracked repositories
 /// out of the publication cost.
 async fn reject_selected_tracked_refs_with_untracked_rows(
     read: &(impl StorageAdapterRead + ?Sized),
@@ -7002,20 +7002,20 @@ mod tests {
 
     #[test]
     fn host_dense_packets_reuse_ordinary_root_members() {
-        let batch = |format| crate::wasm::WasmCertifiedEntityBatch {
+        let batch = |format| crate::plugin::runtime::WasmCertifiedEntityBatch {
             format,
             schema_keys: vec!["test_schema".to_owned()],
             row_count: 1,
-            creates: crate::wasm::WasmCreateContext { high: 0, low: 0 },
+            creates: crate::plugin::runtime::WasmCreateContext { high: 0, low: 0 },
             create_ranges: Vec::new(),
             complete_file_state: true,
             pages: Vec::new(),
         };
         assert!(!certified_batch_requires_root_expansion(&batch(
-            crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+            crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
         )));
         assert!(!certified_batch_requires_root_expansion(&batch(
-            crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+            crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
         )));
         assert!(certified_batch_requires_root_expansion(&batch(1)));
         assert!(certified_batch_requires_root_expansion(&batch(2)));
@@ -8026,7 +8026,7 @@ mod tests {
         let session = reopened
             .open_session()
             .await
-            .expect("workspace should reopen after rootless GC");
+            .expect("repository should reopen after rootless GC");
         let main = session
             .execute("SELECT id FROM lix_branch WHERE name = 'main'", &[])
             .await

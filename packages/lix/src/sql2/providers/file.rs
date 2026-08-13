@@ -48,7 +48,7 @@ use crate::hot_state::{
     HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateBatchBuilder, MaterializedHotStateRowRef,
 };
-use crate::plugin::{
+use crate::plugin::runtime::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
     PluginRegistry, PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
     plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
@@ -6995,7 +6995,7 @@ mod tests {
         HotStateExactBatchRequest, HotStateFilter, HotStateReader, HotStateScanRequest,
         MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
     };
-    use crate::plugin::{
+    use crate::plugin::runtime::{
         PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentMatcher, PluginFileOwner,
         PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
         PluginRuntimeHost, plugin_storage_archive_file_id, plugin_storage_archive_path,
@@ -7006,7 +7006,7 @@ mod tests {
     use crate::transaction_types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
-    use crate::wasm::UnsupportedWasmRuntime;
+    use crate::plugin::runtime::UnsupportedWasmRuntime;
     use crate::{LixError, NullableKeyFilter};
 
     use super::{

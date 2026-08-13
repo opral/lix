@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::plugin::PluginObservation;
+use crate::plugin::runtime::PluginObservation;
 
 /// One session's private view of plugin-owned files.
 ///

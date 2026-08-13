@@ -7,9 +7,10 @@
 
 mod core;
 mod model;
+mod order_key;
 
 use core::{Document, FileEdit, LineIdentity};
-use lix_plugin_api as sdk;
+use lix::plugin as sdk;
 use model::{ChangeEffect, EntityChange, EntityRecord};
 
 struct TextPlugin;
@@ -425,4 +426,4 @@ pub const SCHEMAS: [(&str, &str); 1] = [(
 mod tests;
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api::export_plugin!(TextPlugin);
+lix::plugin::export!(TextPlugin);
