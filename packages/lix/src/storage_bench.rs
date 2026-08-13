@@ -3931,6 +3931,61 @@ mod tests {
     }
 }
 
+static HOT_SCAN_ROWS_DECODED: AtomicU64 = AtomicU64::new(0);
+static HOT_SCAN_KEY_HANDLE_CLONES: AtomicU64 = AtomicU64::new(0);
+static HOT_SCAN_VALUE_HANDLE_CLONES: AtomicU64 = AtomicU64::new(0);
+static HOT_SCAN_ROW_HANDLE_CLONES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_hot_scan_row_decoded() {
+    HOT_SCAN_ROWS_DECODED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_key_handle_clone() {
+    HOT_SCAN_KEY_HANDLE_CLONES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_value_handle_clone() {
+    HOT_SCAN_VALUE_HANDLE_CLONES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_row_handle_clones(count: usize) {
+    if count != 0 {
+        HOT_SCAN_ROW_HANDLE_CLONES.fetch_add(count as u64, Ordering::Relaxed);
+    }
+}
+
+/// Refcounted-buffer handle clones on the HOT scan read path, as
+/// `(rows_decoded, key_handle_clones, value_handle_clones, row_handle_clones)`.
+///
+/// **A count, not a rate.** Nanoseconds per row only travel within a host
+/// class; this number is identical on every machine, so it is the portable
+/// half of any "we stopped cloning" claim.
+///
+/// Every counter sits on the clone expression itself rather than on the
+/// function that contains it, so a site that stops cloning stops counting and
+/// a site that is merely renamed keeps counting. The buckets are:
+///
+/// * `rows_decoded` — one per HOT scan row key decoded. The denominator.
+/// * `key_handle_clones` — handles duplicated onto a row's own **physical
+///   key** buffer while decoding it (one per string or bytes primary-key
+///   component).
+/// * `value_handle_clones` — handles duplicated onto a row's **head value**
+///   buffer while materializing inline JSON.
+/// * `row_handle_clones` — handles duplicated while building or rebuilding a
+///   materialized batch (`push_ref`, `push_materialized_ref`). A batch
+///   rebuilt row by row pays these; a batch compacted in place does not.
+///
+/// These are process-global. Read them from a dedicated `[[test]]` target, or
+/// swap them immediately before the measured statement.
+pub fn take_hot_scan_refcount_census() -> (u64, u64, u64, u64) {
+    (
+        HOT_SCAN_ROWS_DECODED.swap(0, Ordering::Relaxed),
+        HOT_SCAN_KEY_HANDLE_CLONES.swap(0, Ordering::Relaxed),
+        HOT_SCAN_VALUE_HANDLE_CLONES.swap(0, Ordering::Relaxed),
+        HOT_SCAN_ROW_HANDLE_CLONES.swap(0, Ordering::Relaxed),
+    )
+}
+
 static HOT_BLOB_REF_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
 static HOT_BLOB_REF_SCAN_POINT_BATCH: AtomicU64 = AtomicU64::new(0);
 static HOT_BLOB_REF_SCAN_FILE_PREFIX: AtomicU64 = AtomicU64::new(0);

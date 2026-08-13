@@ -10459,6 +10459,8 @@ impl HotScanString {
                     // SAFETY: the decoder validated this exact range.
                     unsafe { std::str::from_utf8_unchecked(&key[range]) }
                 };
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_hot_scan_key_handle_clone();
                 SharedStr::from_utf8_slice(key.clone(), value)
                     .expect("decoded key string remains inside its retained key")
             }
@@ -12360,6 +12362,8 @@ fn decode_hot_scan_row_key_in_scope(key: Bytes, scope: &[u8]) -> Result<HotScanI
     if offset != key.len() {
         return Err(key_codec_error("hot row key has trailing bytes"));
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_hot_scan_row_decoded();
     Ok(HotScanIdentity {
         key,
         schema_key,
@@ -12551,7 +12555,11 @@ fn read_hot_scan_shared_bytes(
     *offset = part.end;
     let value = match part.value {
         // No escape: hand back a refcounted slice of the same allocation.
-        ScannedKeyValue::Verbatim(range) => bytes.slice(range),
+        ScannedKeyValue::Verbatim(range) => {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_hot_scan_key_handle_clone();
+            bytes.slice(range)
+        }
         // Embedded NULs had to be unescaped, so this case owns its buffer.
         ScannedKeyValue::Unescaped(value) => Bytes::from(value),
     };

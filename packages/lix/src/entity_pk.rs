@@ -24,6 +24,25 @@ pub(crate) struct EntityPk {
     pub(crate) components: EntityPkComponents,
 }
 
+impl EntityPk {
+    /// How many refcounted buffer handles one `clone` of this key duplicates.
+    ///
+    /// A composite key shares one `Arc` over its component slice, so it costs
+    /// exactly one handle no matter how many components it has; a single
+    /// string or bytes component costs one; a UUID or integer costs none.
+    #[cfg(feature = "storage-benches")]
+    pub(crate) fn shared_handle_count(&self) -> usize {
+        match &self.components {
+            EntityPkComponents::Empty => 0,
+            EntityPkComponents::Single(component) => match component {
+                EntityPkComponent::String(_) | EntityPkComponent::Bytes(_) => 1,
+                EntityPkComponent::Uuid(_) | EntityPkComponent::Integer(_) => 0,
+            },
+            EntityPkComponents::Shared(_) => 1,
+        }
+    }
+}
+
 /// A single primary-key component stays inline; composite tuples share one
 /// immutable component slice across every identity clone.
 ///

@@ -522,3 +522,8 @@ required-features = ["sdk-tests", "storage-benches", "slatedb"]
 name = "exppth2_txn_probe"
 path = "examples/exppth2_txn_probe.rs"
 required-features = ["storage-benches"]
+
+[[test]]
+name = "hot_scan_refcount_census"
+path = "tests/hot_scan_refcount_census.rs"
+required-features = ["storage-benches"]
