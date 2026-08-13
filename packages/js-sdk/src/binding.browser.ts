@@ -32,7 +32,7 @@ export async function openLixBinding(
 				throw error;
 			}
 		}
-		case "localFilesystem":
-			throw new Error("LocalFilesystem is only available in Node.js");
+		case "filesystem":
+			throw new Error("FilesystemStorage is only available in Node.js");
 	}
 }

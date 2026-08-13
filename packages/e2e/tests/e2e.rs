@@ -27,7 +27,7 @@ use lix::{
     MergeBranchPreviewOptions, MergeConflictChangeKind, SwitchBranchOptions,
 };
 use lix::{Value, open_lix};
-use lix_storage_filesystem::{LocalFilesystem, LocalFilesystemSync};
+use lix_storage_filesystem::{FilesystemStorage, FilesystemStorageSync};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use sha2::{Digest as _, Sha256};
@@ -6166,8 +6166,9 @@ async fn v2_csv_ids_survive_insert_edit_reorder_delete_eviction_and_cold_reopen(
 #[tokio::test]
 async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_commit() {
     let tempdir = tempfile::tempdir().unwrap();
-    let storage_a =
-        LocalFilesystem::open(tempdir.path()).expect("first shared filesystem storage opens");
+    let storage_a = FilesystemStorage::new(tempdir.path())
+        .open()
+        .expect("first shared filesystem storage opens");
     let lix_a = open_lix()
         .with_storage(storage_a.clone())
         .await
@@ -6191,8 +6192,9 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
 
     // A separately opened Lix owns a distinct plugin runtime/actor cache while
     // sharing the same durable RocksDB-backed workspace.
-    let storage_b =
-        LocalFilesystem::open(tempdir.path()).expect("second shared filesystem storage opens");
+    let storage_b = FilesystemStorage::new(tempdir.path())
+        .open()
+        .expect("second shared filesystem storage opens");
     let lix_b = open_lix()
         .with_storage(storage_b.clone())
         .await
@@ -6888,12 +6890,12 @@ fn csv_row_id(rows: &[CsvV2Row], cells: &[&str]) -> String {
 }
 
 struct SyncedFilesystemLix {
-    lix: Lix<LocalFilesystem>,
-    _sync: LocalFilesystemSync,
+    lix: Lix<FilesystemStorage>,
+    _sync: FilesystemStorageSync,
 }
 
 impl Deref for SyncedFilesystemLix {
-    type Target = Lix<LocalFilesystem>;
+    type Target = Lix<FilesystemStorage>;
 
     fn deref(&self) -> &Self::Target {
         &self.lix
@@ -6901,7 +6903,7 @@ impl Deref for SyncedFilesystemLix {
 }
 
 async fn open_filesystem_lix(path: &Path) -> SyncedFilesystemLix {
-    let storage = LocalFilesystem::open(path).unwrap();
+    let storage = FilesystemStorage::new(path).open().unwrap();
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
     let sync = storage.start_sync(&lix).await.unwrap();
     SyncedFilesystemLix { lix, _sync: sync }

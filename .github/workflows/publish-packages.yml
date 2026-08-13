@@ -184,15 +184,25 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: packages/js-sdk/package-lock.json
+          cache-dependency-path: |
+            packages/js-sdk/package-lock.json
+            packages/storage-filesystem/package-lock.json
           registry-url: https://registry.npmjs.org
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
         run: npm install
 
+      - name: Install filesystem storage dependencies
+        working-directory: packages/storage-filesystem
+        run: npm ci --legacy-peer-deps
+
       - name: Build JS SDK package
         working-directory: packages/js-sdk
+        run: npm run build
+
+      - name: Build filesystem storage package
+        working-directory: packages/storage-filesystem
         run: npm run build
 
       - name: Upload JS SDK package build
@@ -202,6 +212,13 @@ jobs:
           path: |
             packages/js-sdk/dist
             packages/js-sdk/lix_js_sdk.node
+          if-no-files-found: error
+
+      - name: Upload filesystem storage package build
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-filesystem-package-build
+          path: packages/storage-filesystem/dist
           if-no-files-found: error
 
   test-js-sdk:
@@ -222,11 +239,17 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: packages/js-sdk/package-lock.json
+          cache-dependency-path: |
+            packages/js-sdk/package-lock.json
+            packages/storage-filesystem/package-lock.json
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
         run: npm install
+
+      - name: Install filesystem storage dependencies
+        working-directory: packages/storage-filesystem
+        run: npm ci --legacy-peer-deps
 
       - name: Download JS SDK package build
         uses: actions/download-artifact@v4
@@ -234,9 +257,24 @@ jobs:
           name: js-sdk-package-build
           path: packages/js-sdk
 
+      - name: Download filesystem storage package build
+        uses: actions/download-artifact@v4
+        with:
+          name: storage-filesystem-package-build
+          path: packages/storage-filesystem/dist
+
       - name: Test JS SDK package
         working-directory: packages/js-sdk
-        run: npx vitest run
+        run: |
+          npm run typecheck
+          npx vitest run
+
+      - name: Test filesystem storage package
+        working-directory: packages/storage-filesystem
+        run: |
+          npm run typecheck
+          npm test
+          npm pack --dry-run --ignore-scripts
 
   publish-js-sdk:
     name: Publish @lix-js/sdk packages
@@ -276,6 +314,12 @@ jobs:
           name: js-sdk-package-build
           path: packages/js-sdk
 
+      - name: Download filesystem storage package build
+        uses: actions/download-artifact@v4
+        with:
+          name: storage-filesystem-package-build
+          path: packages/storage-filesystem/dist
+
       - name: Publish JS SDK packages
         env:
           EXPECTED_VERSION: ${{ needs.release-version.outputs.version }}
@@ -283,6 +327,7 @@ jobs:
           set -euo pipefail
           publish_package() {
             local package_dir="$1"
+            local expected_version="${2:-}"
             local package_json="$package_dir/package.json"
             local package_name
             local package_version
@@ -299,8 +344,8 @@ jobs:
             package_version="$(node -p 'require(process.argv[1]).version' "$package_json")"
             package_spec="${package_name}@${package_version}"
 
-            if [ "$package_version" != "$EXPECTED_VERSION" ]; then
-              echo "$package_spec does not match release version $EXPECTED_VERSION." >&2
+            if [ -n "$expected_version" ] && [ "$package_version" != "$expected_version" ]; then
+              echo "$package_spec does not match release version $expected_version." >&2
               return 1
             fi
 
@@ -342,10 +387,11 @@ jobs:
               echo "Missing native package artifact for $suffix." >&2
               exit 1
             fi
-            publish_package "$package_dir"
+            publish_package "$package_dir" "$EXPECTED_VERSION"
           done
 
-          publish_package "$GITHUB_WORKSPACE/packages/js-sdk"
+          publish_package "$GITHUB_WORKSPACE/packages/js-sdk" "$EXPECTED_VERSION"
+          publish_package "$GITHUB_WORKSPACE/packages/storage-filesystem"
 
   create-github-release:
     name: Create GitHub release

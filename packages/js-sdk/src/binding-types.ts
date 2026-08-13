@@ -15,6 +15,7 @@ import type {
 	JsonValue,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
+import type { LixStorageAdapterConfig } from "./storage-adapter.js";
 
 export type BindingExecuteResult = {
 	statementIndex?: number;
@@ -94,9 +95,4 @@ export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
 export type LixStorageConfig =
 	| { kind: "memory" }
 	| { kind: "indexedDb"; name: string }
-	| {
-			kind: "localFilesystem";
-			path: string;
-			lixDir?: string;
-			syncAllFiles: boolean;
-	  };
+	| LixStorageAdapterConfig;

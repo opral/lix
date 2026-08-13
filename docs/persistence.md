@@ -12,12 +12,12 @@ Lix has pluggable storage. A storage adapter decides where the bytes live. The L
 | ------------------ | ---------------- | ---------------------------------------------- |
 | `Memory` (default) | JavaScript, Rust | tests, demos, and ephemeral work               |
 | `IndexedDbStorage` | JavaScript       | persistent local browser repositories          |
-| `LocalFilesystem`  | JavaScript, Rust | a local directory synchronized with Lix        |
+| `FilesystemStorage`  | JavaScript, Rust | a local directory synchronized with Lix        |
 | `RocksDB`          | Rust             | native embedded persistence                    |
 | `SlateDB`          | Rust             | object storage, for example S3                 |
 | Remote server      | any client       | shared repositories; the server owns persistence |
 
-In JavaScript, `LocalFilesystem` requires Node.js. The default `Memory` storage and `IndexedDbStorage` work in browsers.
+In JavaScript, `FilesystemStorage` requires Node.js. The default `Memory` storage and `IndexedDbStorage` work in browsers.
 
 ## In-memory (default)
 
@@ -33,15 +33,14 @@ await lix.close();
 
 ## Local filesystem
 
-Persist a directory as a Lix repository with `LocalFilesystem`:
+Persist a directory as a Lix repository with `FilesystemStorage`:
 
 ```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "/var/data/repository",
-  }),
+  storage: new FilesystemStorage({ path: "/var/data/repository" }),
 });
 ```
 
@@ -52,9 +51,9 @@ repository:
 
 ```rust
 use lix::open_lix;
-use lix_storage_filesystem::LocalFilesystem;
+use lix_storage_filesystem::FilesystemStorage;
 
-let storage = LocalFilesystem::open("./repository")?;
+let storage = FilesystemStorage::new("./repository").open()?;
 let lix = open_lix().with_storage(storage.clone()).await?;
 let sync = storage.start_sync(&lix).await?;
 
@@ -65,9 +64,8 @@ Keep `sync` alive while filesystem synchronization should run. It owns a
 separate session on the existing Lix repository; the storage adapter does not
 open or configure the Lix engine.
 
-One option changes this behavior:
-
-- `lixDir` stores the repository state outside the repository. The repository does not receive a `.lix` directory.
+Pass `syncAllFiles: false` to begin with no regular repository files and import
+selected paths with `storage.importPaths(paths)`.
 
 ## IndexedDB
 

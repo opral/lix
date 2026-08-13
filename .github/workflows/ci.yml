@@ -273,11 +273,18 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: packages/js-sdk/package-lock.json
+          cache-dependency-path: |
+            packages/js-sdk/package-lock.json
+            packages/storage-filesystem/package-lock.json
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
         run: npm ci
+
+      - name: Install filesystem storage dependencies
+        if: matrix.runtime == 'native'
+        working-directory: packages/storage-filesystem
+        run: npm ci --legacy-peer-deps
 
       - name: Install Chromium
         if: matrix.runtime == 'browser'
@@ -292,6 +299,19 @@ jobs:
           npm run build:native
           npm run build:ts
           npm run build:plugins
+
+      - name: Build and check filesystem storage package
+        if: matrix.runtime == 'native'
+        working-directory: packages/storage-filesystem
+        run: |
+          npm run build
+          npm run typecheck
+          npm test
+
+      - name: Typecheck native JS SDK
+        if: matrix.runtime == 'native'
+        working-directory: packages/js-sdk
+        run: npm run typecheck
 
       - name: Run native JS SDK tests
         if: matrix.runtime == 'native'

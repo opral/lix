@@ -1,22 +1,15 @@
-import {
-	localFilesystemAlreadyOpen,
-	localFilesystemNotOpen,
-} from "./errors.js";
 import type { LixBinding } from "./binding-types.js";
 import {
 	ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
 	openClientState,
 } from "./client-state.js";
 import { Lix } from "./lix.js";
-import type {
-	IndexedDbStorageOptions,
-	LocalFilesystemOptions,
-	OpenLixOptions,
-} from "./types.js";
+import { isLixStorage, type LixStorage } from "./storage-adapter.js";
+import type { IndexedDbStorageOptions, OpenLixOptions } from "./types.js";
 
 export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
 
-const openLocalFilesystems = new WeakMap<LocalFilesystem, LixBinding | null>();
+const openStorages = new WeakSet<LixStorage>();
 const openIndexedDbStorageNames = new Set<string>();
 
 export class IndexedDbStorage {
@@ -27,65 +20,6 @@ export class IndexedDbStorage {
 			throw new TypeError("IndexedDbStorage requires a non-empty name");
 		}
 		this.name = options.name;
-	}
-}
-
-export class LocalFilesystem {
-	readonly path: string;
-	readonly lixDir: string | undefined;
-	readonly syncAllFiles: boolean;
-
-	constructor(options: LocalFilesystemOptions) {
-		if (
-			!options ||
-			typeof options.path !== "string" ||
-			options.path.length === 0
-		) {
-			throw new TypeError("LocalFilesystem requires a non-empty path");
-		}
-		if (
-			options.lixDir !== undefined &&
-			(typeof options.lixDir !== "string" || options.lixDir.length === 0)
-		) {
-			throw new TypeError("LocalFilesystem lixDir must be a non-empty string");
-		}
-		if (typeof options.syncAllFiles !== "boolean") {
-			throw new TypeError("LocalFilesystem syncAllFiles must be a boolean");
-		}
-		this.path = options.path;
-		this.lixDir = options.lixDir;
-		this.syncAllFiles = options.syncAllFiles;
-	}
-
-	async importPaths(paths: readonly string[]): Promise<void> {
-		if (!Array.isArray(paths)) {
-			throw new TypeError("importPaths() paths must be an array");
-		}
-		for (const path of paths) {
-			if (typeof path !== "string" || path.length === 0) {
-				throw new TypeError(
-					"importPaths() paths must contain non-empty strings",
-				);
-			}
-			if (path.endsWith("/")) {
-				throw new TypeError(
-					"importPaths() paths must not end with a trailing slash",
-				);
-			}
-		}
-		await this.client("importPaths").importFilesystemPaths([...paths]);
-	}
-
-	async syncDiskToLix(): Promise<void> {
-		return this.client("syncDiskToLix").syncDiskToLix();
-	}
-
-	private client(operation: string): LixBinding {
-		const client = openLocalFilesystems.get(this);
-		if (!client) {
-			throw localFilesystemNotOpen(operation);
-		}
-		return client;
 	}
 }
 
@@ -162,27 +96,32 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			),
 		);
 	}
-	if (options.storage instanceof LocalFilesystem) {
+	if (isLixStorage(options.storage)) {
 		const storage = options.storage;
-		if (openLocalFilesystems.has(storage)) {
-			throw localFilesystemAlreadyOpen();
+		if (openStorages.has(storage)) {
+			throw storageAlreadyOpen();
 		}
-		openLocalFilesystems.set(storage, null);
+		openStorages.add(storage);
+		let binding: LixBinding | undefined;
+		const disconnect = () => {
+			storage.lixStorage.connect(undefined);
+			openStorages.delete(storage);
+		};
 		try {
-			const binding = await openLixWorkerBinding(
-				{
-					kind: "localFilesystem",
-					path: storage.path,
-					lixDir: storage.lixDir,
-					syncAllFiles: storage.syncAllFiles,
-				},
-				() => openLocalFilesystems.delete(storage),
+			binding = await openLixWorkerBinding(
+				storage.lixStorage.config,
+				disconnect,
 				options.telemetry,
 			);
-			openLocalFilesystems.set(storage, binding);
+			storage.lixStorage.connect({
+				importFilesystemPaths: (paths) =>
+					binding!.importFilesystemPaths(paths),
+				syncDiskToLix: () => binding!.syncDiskToLix(),
+			});
 			return new Lix(binding);
 		} catch (error) {
-			openLocalFilesystems.delete(storage);
+			disconnect();
+			await binding?.close().catch(() => undefined);
 			throw error;
 		}
 	}
@@ -209,8 +148,17 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		}
 	}
 	throw new TypeError(
-		"openLix() requires storage to be LocalFilesystem or IndexedDbStorage",
+		"openLix() requires a Lix storage adapter or IndexedDbStorage",
 	);
+}
+
+function storageAlreadyOpen(): Error & { code: string } {
+	const error = new Error(
+		"openLix() storage is already open; close the existing Lix or create a new storage adapter",
+	) as Error & { code: string };
+	error.name = "LixError";
+	error.code = "LIX_STORAGE_IN_USE";
+	return error;
 }
 
 function assertIndexedDbStorage(value: unknown): asserts value is IndexedDbStorage {

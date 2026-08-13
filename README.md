@@ -32,16 +32,17 @@ AI products want a repository: files for agents, a SQL database for your app, an
 </p>
 
 ```bash
-npm install @lix-js/sdk
+npm install @lix-js/sdk @lix-js/storage-filesystem
 ```
 
-Run locally with `LocalFilesystem`:
+Run locally with `FilesystemStorage`:
 
 ```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({ path: "./repository", syncAllFiles: true }),
+  storage: new FilesystemStorage({ path: "./repository" }),
 });
 
 await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
@@ -117,7 +118,7 @@ Update Lix files and rows in one ACID transaction. Lix records the history autom
 
 Plugins map files to SQL rows. A paragraph, cell, or property becomes a row Lix can version.
 
-With `LocalFilesystem`, the file stays available on disk. Its entities are queryable with SQL. Lix tracks changes to both.
+With `FilesystemStorage`, the file stays available on disk. Its entities are queryable with SQL. Lix tracks changes to both.
 
 <img src="./website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
 

@@ -1,9 +1,3 @@
-export type LocalFilesystemOptions = {
-	path: string;
-	lixDir?: string;
-	syncAllFiles: boolean;
-};
-
 export type IndexedDbStorageOptions = {
 	/**
 	 * Identifies one persistent Lix database within the current origin.
@@ -40,7 +34,7 @@ export type LixTelemetryOptions = {
 export type OpenLixOptions =
 	| {
 			storage?:
-				| import("./open-lix.js").LocalFilesystem
+				| import("./storage-adapter.js").LixStorage
 				| import("./open-lix.js").IndexedDbStorage;
 			server?: never;
 			telemetry?: LixTelemetryOptions;

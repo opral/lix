@@ -35,7 +35,7 @@ File plugins map parts of a file to rows. A row can represent a Markdown block, 
 <img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
 
 Apps read and write these rows with SQL. Lix records their history. With
-`LocalFilesystem`, it also writes changes back to normal files on disk.
+`FilesystemStorage`, it also writes changes back to normal files on disk.
 
 Diffs are semantic: review the clause, cell, or row that changed, not lines of text. See [Semantic Changes](./semantic-changes.md).
 

@@ -5,14 +5,14 @@
 //     <src_dir>
 //
 // Copies <src_dir> (sans any existing .lix) into a fresh temp dir, then times
-// LocalFilesystem::open on the cold workspace. Pass --keep-workspace to preserve the
+// FilesystemStorage::new(path).open() on the cold workspace. Pass --keep-workspace to preserve the
 // copied temp workspace for inspection.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lix::{Value, open_lix};
-use lix_storage_filesystem::LocalFilesystem;
+use lix_storage_filesystem::FilesystemStorage;
 
 #[derive(Debug)]
 #[expect(clippy::struct_excessive_bools)]
@@ -116,9 +116,9 @@ fn duration_ms(duration: Duration) -> u128 {
     duration.as_micros() / 1000
 }
 
-async fn open_with_timing(path: &Path) -> (LocalFilesystem, Duration) {
+async fn open_with_timing(path: &Path) -> (FilesystemStorage, Duration) {
     let started = Instant::now();
-    let opened = LocalFilesystem::open(path).unwrap();
+    let opened = FilesystemStorage::new(path).open().unwrap();
     let elapsed = started.elapsed();
     (opened, elapsed)
 }
@@ -130,7 +130,7 @@ fn collect_profile_stats(workspace: &Path) -> ProfileStats {
     stats
 }
 
-async fn run_read_benchmark(storage: &LocalFilesystem, workspace: &Path) -> ReadBenchStats {
+async fn run_read_benchmark(storage: &FilesystemStorage, workspace: &Path) -> ReadBenchStats {
     let files = collect_bench_files(workspace);
     let largest = files.iter().take(4).collect::<Vec<_>>();
     let small_sample = select_small_sample(&files, 16);
@@ -183,7 +183,7 @@ async fn run_read_benchmark(storage: &LocalFilesystem, workspace: &Path) -> Read
     }
 }
 
-async fn time_read_paths(lix: &lix::Lix<LocalFilesystem>, files: &[&BenchFile]) -> (u128, u64) {
+async fn time_read_paths(lix: &lix::Lix<FilesystemStorage>, files: &[&BenchFile]) -> (u128, u64) {
     let started = Instant::now();
     let mut bytes = 0u64;
     for file in files {
@@ -623,7 +623,7 @@ async fn main() {
         let work_i = tmp_i.path().join("workspace");
         copy_dir(src, &work_i);
         let t = Instant::now();
-        let storage = LocalFilesystem::open(&work_i).unwrap();
+        let storage = FilesystemStorage::new(&work_i).open().unwrap();
         if i == repeat - 1 {
             let elapsed = t.elapsed();
             eprintln!("cold open (repeat {repeat}): {elapsed:?}");

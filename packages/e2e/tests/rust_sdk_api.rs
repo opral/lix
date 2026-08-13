@@ -4,7 +4,7 @@ use lix::{
     CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions,
     MergeBranchOutcome, SwitchBranchOptions, Value, open_lix,
 };
-use lix_storage_filesystem::{LocalFilesystem, LocalFilesystemOpenOptions, LocalFilesystemSync};
+use lix_storage_filesystem::{FilesystemStorage, FilesystemStorageSync};
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -728,12 +728,12 @@ async fn filesystem_initialization_wipes_legacy_root_sqlite_and_system_metadata(
 }
 
 struct SyncedFilesystemLix {
-    lix: Lix<LocalFilesystem>,
-    _sync: LocalFilesystemSync,
+    lix: Lix<FilesystemStorage>,
+    _sync: FilesystemStorageSync,
 }
 
 impl Deref for SyncedFilesystemLix {
-    type Target = Lix<LocalFilesystem>;
+    type Target = Lix<FilesystemStorage>;
 
     fn deref(&self) -> &Self::Target {
         &self.lix
@@ -741,15 +741,17 @@ impl Deref for SyncedFilesystemLix {
 }
 
 async fn open_filesystem_lix(path: &Path) -> SyncedFilesystemLix {
-    let storage = LocalFilesystem::open(path).unwrap();
+    let storage = FilesystemStorage::new(path).open().unwrap();
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
     let sync = storage.start_sync(&lix).await.unwrap();
     SyncedFilesystemLix { lix, _sync: sync }
 }
 
 async fn open_on_demand_filesystem_lix(path: &Path, file_paths: &[&str]) -> SyncedFilesystemLix {
-    let options = LocalFilesystemOpenOptions::new(path.to_path_buf(), false);
-    let storage = LocalFilesystem::open_with_options(options).unwrap();
+    let storage = FilesystemStorage::new(path)
+        .sync_all_files(false)
+        .open()
+        .unwrap();
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
     let sync = storage.start_sync(&lix).await.unwrap();
     sync.import_paths(file_paths.iter().copied()).await.unwrap();
@@ -759,8 +761,11 @@ async fn open_on_demand_filesystem_lix(path: &Path, file_paths: &[&str]) -> Sync
 #[tokio::test]
 async fn rocksdb_filesystem_storage_allows_same_process_multi_open() {
     let tempdir = tempfile::tempdir().unwrap();
-    let storage_a = LocalFilesystem::open(tempdir.path()).expect("first rocksdb fs storage opens");
-    let storage_b = LocalFilesystem::open(tempdir.path())
+    let storage_a = FilesystemStorage::new(tempdir.path())
+        .open()
+        .expect("first rocksdb fs storage opens");
+    let storage_b = FilesystemStorage::new(tempdir.path())
+        .open()
         .expect("second rocksdb fs storage reuses process-local DB");
     let lix_a = open_lix()
         .with_storage(storage_a.clone())
@@ -1289,7 +1294,7 @@ async fn filesystem_rejects_symlink_root() {
     std::fs::create_dir(tempdir.path().join("real-root")).unwrap();
     symlink("real-root", tempdir.path().join("linked-root")).unwrap();
 
-    let Err(error) = LocalFilesystem::open(tempdir.path().join("linked-root")) else {
+    let Err(error) = FilesystemStorage::new(tempdir.path().join("linked-root")).open() else {
         panic!("symlink root should fail");
     };
 
@@ -1535,7 +1540,7 @@ fn wait_for_disk_file_with_timeout(path: &Path, expected: Option<&[u8]>, timeout
     }
 }
 
-async fn wait_for_lix_file(lix: &Lix<LocalFilesystem>, path: &str, expected: Option<&[u8]>) {
+async fn wait_for_lix_file(lix: &Lix<FilesystemStorage>, path: &str, expected: Option<&[u8]>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let actual = read_file(lix, path).await.unwrap();
@@ -1550,7 +1555,7 @@ async fn wait_for_lix_file(lix: &Lix<LocalFilesystem>, path: &str, expected: Opt
     }
 }
 
-async fn wait_for_lix_directory(lix: &Lix<LocalFilesystem>, path: &str, expected: bool) {
+async fn wait_for_lix_directory(lix: &Lix<FilesystemStorage>, path: &str, expected: bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let actual = readdir(lix, path).await.unwrap().is_some();

@@ -12,9 +12,8 @@ type NativeAddon = {
 		openMemory(
 			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
-		openLocalFilesystem(
+		openFilesystemStorage(
 			path: string,
-			lixDir: string | undefined,
 			syncAllFiles: boolean,
 			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
@@ -78,18 +77,16 @@ export function openLixBinding(
 			return addon.Lix.openMemory();
 		case "indexedDb":
 			throw new Error("IndexedDbStorage is only available in browsers");
-		case "localFilesystem":
+		case "filesystem":
 			if (nativeTelemetry) {
-				return addon.Lix.openLocalFilesystem(
+				return addon.Lix.openFilesystemStorage(
 					storage.path,
-					storage.lixDir,
 					storage.syncAllFiles,
 					nativeTelemetry,
 				);
 			}
-			return addon.Lix.openLocalFilesystem(
+			return addon.Lix.openFilesystemStorage(
 				storage.path,
-				storage.lixDir,
 				storage.syncAllFiles,
 			);
 	}

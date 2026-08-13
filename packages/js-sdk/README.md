@@ -86,13 +86,11 @@ without publishing it to the live client-state facade.
 Filesystem sync uses native Node.js dependencies:
 
 ```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "./repository",
-    syncAllFiles: true,
-  }),
+  storage: new FilesystemStorage({ path: "./repository" }),
 });
 
 await lix.execute(
@@ -168,15 +166,14 @@ try {
 
 ## Notes
 
-- `openLix()` opens a fresh in-memory Lix. Pass `new LocalFilesystem({ path, syncAllFiles: true })` for a filesystem repository directory backed by `<path>/.lix/.internal/rocksdb`.
+- `openLix()` opens a fresh in-memory Lix. Install `@lix-js/storage-filesystem` and pass `new FilesystemStorage({ path })` for a filesystem repository directory backed by `<path>/.lix/.internal/rocksdb`.
 - In browsers, pass `new IndexedDbStorage({ name })` to persist a complete local Lix across reloads.
 - Only one Lix handle may open an IndexedDB storage name at a time, including across browser tabs.
-- Pass `new LocalFilesystem({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no repository `.lix` directory.
-- Pass `syncAllFiles: false` to start filesystem sync with no regular repository files, then call `storage.importPaths(["notes/today.md"])` on the `LocalFilesystem` instance to sync selected files. Imported paths are exact repository-relative file paths, not directories or globs.
+- Pass `syncAllFiles: false` to start filesystem sync with no regular repository files, then call `storage.importPaths(["notes/today.md"])` on the `FilesystemStorage` instance to sync selected files. Imported paths are exact repository-relative file paths, not directories or globs.
 - In browsers, local mode and remote mode with IndexedDB storage load the Rust
   engine as WebAssembly. In remote mode, the local engine contains only client
   state.
-- `LocalFilesystem` is Node.js-only. Constructing it is safe in
+- `FilesystemStorage` is Node.js-only. Constructing it is safe in
   shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.
 - The package uses conditional ESM imports internally: Node.js resolves the

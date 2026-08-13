@@ -4,7 +4,10 @@ description: "Reference for opening local and remote Lix instances, running SQL,
 
 # JavaScript API Reference
 
-The main JavaScript SDK exports are `openLix()`, `IndexedDbStorage`, and `LocalFilesystem` from `@lix-js/sdk`. `openLix()` returns a `Lix` instance connected to a local or remote repository.
+The main JavaScript SDK exports `openLix()` and `IndexedDbStorage` from
+`@lix-js/sdk`. Filesystem storage is provided separately by
+`@lix-js/storage-filesystem`. `openLix()` returns a `Lix` instance connected to
+a local or remote repository.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -22,7 +25,7 @@ Options:
 
 | Option      | Type                                  | Description                                                                         |
 | ----------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
-| `storage`   | `LocalFilesystem \| IndexedDbStorage` | Local storage. Omit it for memory.                                                  |
+| `storage`   | `FilesystemStorage \| IndexedDbStorage` | Local storage. Omit it for memory.                                                  |
 | `server`    | `RemoteLixServerOptions`              | Connect to a remote Lix server. When present, `storage` contains only client state. |
 | `telemetry` | `LixTelemetryOptions`                 | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only.    |
 
@@ -50,29 +53,27 @@ const lix = await openLix({
 });
 ```
 
-Use `LocalFilesystem` for a repository directory backed by RocksDB at
+Use `FilesystemStorage` for a repository directory backed by RocksDB at
 `<repository>/.lix/.internal/rocksdb`:
 
 ```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "./repository",
-  }),
+  storage: new FilesystemStorage({ path: "./repository" }),
 });
 ```
 
-Pass `lixDir` for filesystem sync with repository metadata in an external
-`.lix` directory. This does not write `<repository>/.lix`:
+Use selective synchronization when only explicit paths should be imported:
 
 ```ts
-const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "./repository",
-    lixDir: "/tmp/session/.lix",
-  }),
+const storage = new FilesystemStorage({
+  path: "./repository",
+  syncAllFiles: false,
 });
+const lix = await openLix({ storage });
+await storage.importPaths(["notes/today.md"]);
 ```
 
 Call `storage.syncDiskToLix()` to run one manual sync pass that imports pending

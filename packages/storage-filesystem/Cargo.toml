@@ -8,10 +8,11 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 documentation.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+exclude = ["js/", "package.json", "package-lock.json", "tsconfig.json", "tsconfig.test.json"]
 
 [lints]
 workspace = true
