@@ -22,15 +22,15 @@ console.log(result.rows[0]?.get("message"));
 await lix.close();
 ```
 
-## Remote workspaces
+## Remote repositories
 
-Use the same Lix client as a thin client against a hosted workspace:
+Use the same Lix client as a thin client against a hosted repository:
 
 ```ts
 const lix = await openLix({
 	server: {
 		mode: "remote",
-		url: "https://lixray.com/@namespace/workspace",
+		url: "https://lixray.com/@namespace/repository",
 		headers: async () => ({
 			Authorization: `Bearer ${await accessToken()}`,
 		}),
@@ -63,7 +63,7 @@ import { IndexedDbStorage, openLix } from "@lix-js/sdk";
 const lix = await openLix({
 	server: {
 		mode: "remote",
-		url: "https://lixray.com/@namespace/workspace",
+		url: "https://lixray.com/@namespace/repository",
 	},
 	storage: new IndexedDbStorage({ name: "lixray-client" }),
 });
@@ -74,7 +74,7 @@ await lix.clientState.set("atelier-ui", { sidebar: "history" });
 
 `lix.clientState` reads and writes through the local Lix transaction path. Its
 JSON values and the client's active branch are stored in the local IndexedDB
-database; workspace SQL continues to execute only on the server. Reopening the
+database; repository SQL continues to execute only on the server. Reopening the
 same remote URL with the same storage name restores both. Each
 remote server session is branch-pinned, so switching one client does not switch
 another client.
@@ -90,7 +90,7 @@ import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
 	storage: new LocalFilesystem({
-		path: "./workspace",
+		path: "./repository",
 		syncAllFiles: true,
 	}),
 });
@@ -167,11 +167,11 @@ try {
 
 ## Notes
 
-- `openLix()` opens a fresh in-memory Lix. Pass `new LocalFilesystem({ path, syncAllFiles: true })` for a filesystem workspace directory backed by `<path>/.lix/.internal/rocksdb`.
+- `openLix()` opens a fresh in-memory Lix. Pass `new LocalFilesystem({ path, syncAllFiles: true })` for a filesystem repository directory backed by `<path>/.lix/.internal/rocksdb`.
 - In browsers, pass `new IndexedDbStorage({ name })` to persist a complete local Lix across reloads.
 - Only one Lix handle may open an IndexedDB storage name at a time, including across browser tabs.
-- Pass `new LocalFilesystem({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no workspace `.lix` directory.
-- Pass `syncAllFiles: false` to start filesystem sync with no regular workspace files, then call `storage.importPaths(["notes/today.md"])` on the `LocalFilesystem` instance to sync selected files. Imported paths are exact workspace-relative file paths, not directories or globs.
+- Pass `new LocalFilesystem({ path, lixDir, syncAllFiles: true })` for filesystem sync with repository metadata in an external `.lix` directory and no repository `.lix` directory.
+- Pass `syncAllFiles: false` to start filesystem sync with no regular repository files, then call `storage.importPaths(["notes/today.md"])` on the `LocalFilesystem` instance to sync selected files. Imported paths are exact repository-relative file paths, not directories or globs.
 - In browsers, local mode and remote mode with IndexedDB storage load the Rust
   engine as WebAssembly. In remote mode, the local engine contains only client
   state.

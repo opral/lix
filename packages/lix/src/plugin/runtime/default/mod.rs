@@ -47,7 +47,7 @@ fn create_engine(consume_fuel: bool, epoch_interruption: bool) -> wasmtime::Resu
 
 /// Enables Wasmtime's host-local AOT cache for sandboxed plugin components.
 ///
-/// This cache is deliberately outside the workspace and its storage adapter:
+/// This cache is deliberately outside the repository and its storage adapter:
 /// native compiled artifacts are tied to the host architecture, Wasmtime
 /// version, and engine settings. Wasmtime keys and validates those artifacts
 /// itself, while the optional override makes isolated deployments and tests

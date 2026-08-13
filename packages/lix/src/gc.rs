@@ -4535,7 +4535,7 @@ mod tests {
             .expect("corrupt-registry controls should load")
             .into_iter()
             .find(|(branch_id, _)| branch_id != GLOBAL_BRANCH_ID)
-            .expect("workspace branch control should exist");
+            .expect("repository branch control should exist");
         let timestamp =
             LixTimestamp::expect_parse("corrupt registry timestamp", "2026-01-01T00:00:00Z");
         let entity_pk = EntityPk::single(crate::plugin::runtime::PLUGIN_REGISTRY_KEY);

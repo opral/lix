@@ -6,7 +6,7 @@ test("remote observe streams native Lix results", async () => {
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
+			url: "https://lixray.test/@acme/repository",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
@@ -33,7 +33,7 @@ test("remote observe streams native Lix results", async () => {
 	expect(requests[1]?.headers.get("accept")).toBe("text/event-stream");
 	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
 	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
-		"/@acme/workspace/lix/v1/observe/multiplex",
+		"/@acme/repository/lix/v1/observe/multiplex",
 	);
 	expect(await requests[1]?.json()).toEqual({
 		subscriptions: [
@@ -91,7 +91,7 @@ test("remote observe applies every blob delta before coalescing delivery", async
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
+			url: "https://lixray.test/@acme/repository",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				if (request.method === "DELETE") return closedSession();
@@ -166,7 +166,7 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
+			url: "https://lixray.test/@acme/repository",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				if (request.method === "DELETE") return closedSession();
@@ -205,7 +205,7 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
+			url: "https://lixray.test/@acme/repository",
 			headers: () => {
 				headerResolutions += 1;
 				return {};
@@ -310,7 +310,7 @@ test("hub-wide protocol failures abort a held multiplex stream without reconnect
 		const lix = await openLix({
 			server: {
 				mode: "remote",
-				url: "https://lixray.test/@acme/workspace",
+				url: "https://lixray.test/@acme/repository",
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
 					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
@@ -339,7 +339,7 @@ test("hub-wide protocol failures abort a held multiplex stream without reconnect
 
 		const events = lix.observe("SELECT value");
 		await expect(events.next()).rejects.toMatchObject({
-			code: "LIX_REMOTE_PROTOCOL_ERROR",
+			code: "LIX_SERVER_PROTOCOL_ERROR",
 		});
 		expect(liveObserveRequests).toBe(0);
 		await vi.advanceTimersByTimeAsync(10_000);
@@ -358,7 +358,7 @@ test("remote observe can continue after a semantic SSE error", async () => {
 		const lix = await openLix({
 			server: {
 				mode: "remote",
-				url: "https://lixray.test/@acme/workspace",
+				url: "https://lixray.test/@acme/repository",
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
 					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
@@ -420,7 +420,7 @@ test("remote observe treats unmarked semantic errors as terminal", async () => {
 		const lix = await openLix({
 			server: {
 				mode: "remote",
-				url: "https://lixray.test/@acme/workspace",
+				url: "https://lixray.test/@acme/repository",
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
 					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
@@ -464,7 +464,7 @@ test("a successful branch switch restarts observations on the pinned session", a
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
+			url: "https://lixray.test/@acme/repository",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
@@ -544,7 +544,7 @@ test("a local branch switch setup failure preserves a healthy observation", asyn
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
+			url: "https://lixray.test/@acme/repository",
 			headers: () => {
 				if (failHeaders) throw new Error("headers unavailable");
 				return {};
@@ -598,7 +598,7 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 		const lix = await openLix({
 			server: {
 				mode: "remote",
-				url: "https://lixray.test/@acme/workspace",
+				url: "https://lixray.test/@acme/repository",
 				headers: () => ({ Authorization: `Bearer token-${++headerCalls}` }),
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
@@ -667,7 +667,7 @@ test("closing Lix resolves pending remote observation reads", async () => {
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
+			url: "https://lixray.test/@acme/repository",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				if (request.method === "DELETE") return closedSession();
@@ -691,7 +691,7 @@ test("closing Lix stops observations before an earlier finite request settles", 
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
+			url: "https://lixray.test/@acme/repository",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;

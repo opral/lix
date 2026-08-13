@@ -13,7 +13,7 @@ use super::{
     PluginCatalogCache, PluginRegistry,
 };
 
-/// Installed plugins are untrusted workspace data. This is the absolute
+/// Installed plugins are untrusted repository data. This is the absolute
 /// per-export ceiling; a transition's tighter host budget remains authoritative
 /// for normal operations. The cold-file budget may extend up to this ceiling,
 /// but no guest call can exceed it.
