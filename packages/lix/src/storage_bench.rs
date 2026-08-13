@@ -3931,6 +3931,84 @@ mod tests {
     }
 }
 
+static HOT_SCAN_CALLS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_POINT_BATCH: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FILE_PREFIX: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FALLBACK: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FALLBACK_WITH_PKS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FALLBACK_DECODED: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FALLBACK_MATCHED: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+pub(crate) fn record_hot_scan_call() {
+    HOT_SCAN_CALLS[crud_phase()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_point_batch() {
+    HOT_SCAN_POINT_BATCH[crud_phase()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_scan_file_prefix() {
+    HOT_SCAN_FILE_PREFIX[crud_phase()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// `has_entity_pks` separates the two ways the primary-prefix arm is reached:
+/// a predicate that bound no identity at all, and a bound identity that the
+/// point-batch arm still refused (a schema with file-backed members).
+pub(crate) fn record_hot_scan_fallback(has_entity_pks: bool) {
+    let phase = crud_phase();
+    HOT_SCAN_FALLBACK[phase].fetch_add(1, Ordering::Relaxed);
+    if has_entity_pks {
+        HOT_SCAN_FALLBACK_WITH_PKS[phase].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_hot_scan_fallback_entry(matched: bool) {
+    let phase = crud_phase();
+    HOT_SCAN_FALLBACK_DECODED[phase].fetch_add(1, Ordering::Relaxed);
+    if matched {
+        HOT_SCAN_FALLBACK_MATCHED[phase].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Route accounting for every `hot_scan_entries` call, attributed to the CRUD
+/// phase that issued it. Index with `CRUD_PHASE_*`; `CRUD_PHASE_WRITE_READ`
+/// isolates the write path's pre-image read.
+///
+/// `fallback_entries_decoded` is counted INSIDE the per-entry decode loop,
+/// before `identity.matches_filter` rejects anything. A count taken above that
+/// loop -- at `scan_batch`'s return value -- is post-filter and reads
+/// identically under a seek and under a full-prefix walk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotScanRouteCensus {
+    pub calls: u64,
+    pub point_batch: u64,
+    pub file_prefix: u64,
+    pub fallback: u64,
+    pub fallback_with_entity_pks: u64,
+    pub fallback_entries_decoded: u64,
+    pub fallback_entries_matched: u64,
+}
+
+/// Drains the census. Index with `CRUD_PHASE_*`.
+pub fn take_hot_scan_route_census() -> [HotScanRouteCensus; CRUD_PHASE_COUNT] {
+    std::array::from_fn(|phase| HotScanRouteCensus {
+        calls: HOT_SCAN_CALLS[phase].swap(0, Ordering::Relaxed),
+        point_batch: HOT_SCAN_POINT_BATCH[phase].swap(0, Ordering::Relaxed),
+        file_prefix: HOT_SCAN_FILE_PREFIX[phase].swap(0, Ordering::Relaxed),
+        fallback: HOT_SCAN_FALLBACK[phase].swap(0, Ordering::Relaxed),
+        fallback_with_entity_pks: HOT_SCAN_FALLBACK_WITH_PKS[phase].swap(0, Ordering::Relaxed),
+        fallback_entries_decoded: HOT_SCAN_FALLBACK_DECODED[phase].swap(0, Ordering::Relaxed),
+        fallback_entries_matched: HOT_SCAN_FALLBACK_MATCHED[phase].swap(0, Ordering::Relaxed),
+    })
+}
+
 static HOT_BLOB_REF_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
 static HOT_BLOB_REF_SCAN_POINT_BATCH: AtomicU64 = AtomicU64::new(0);
 static HOT_BLOB_REF_SCAN_FILE_PREFIX: AtomicU64 = AtomicU64::new(0);

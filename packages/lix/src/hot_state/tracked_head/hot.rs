@@ -11655,6 +11655,8 @@ async fn hot_scan_entries<'a>(
     if is_blob_ref_probe {
         crate::storage_bench::record_hot_blob_ref_scan_call();
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_hot_scan_call();
 
     if let Some(identities) = hot_exact_identity_batches(branch_id, generation, filter) {
         let may_use_null_point_batch = !filter.file_ids.is_empty()
@@ -11665,6 +11667,8 @@ async fn hot_scan_entries<'a>(
             if is_blob_ref_probe {
                 crate::storage_bench::record_hot_blob_ref_scan_point_batch();
             }
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_hot_scan_point_batch();
             let entries = HotScanEntries::Finite(
                 hot_scan_finite_identity_batches(store, identities, limit).await?,
             );
@@ -11680,6 +11684,8 @@ async fn hot_scan_entries<'a>(
         if is_blob_ref_probe {
             crate::storage_bench::record_hot_blob_ref_scan_file_prefix();
         }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_hot_scan_file_prefix();
         let entries = HotScanEntries::Decoded(
             scan_hot_file_entries(store, branch_id, generation, prefixes, filter, limit).await?,
         );
@@ -11690,6 +11696,8 @@ async fn hot_scan_entries<'a>(
     if is_blob_ref_probe {
         crate::storage_bench::record_hot_blob_ref_scan_fallback();
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_hot_scan_fallback(!filter.entity_pks.is_empty());
     let scope = hot_scope_prefix(branch_id, generation);
     let mut prefixes = hot_row_scan_prefixes(&scope, filter);
     prefixes.sort();
@@ -11727,13 +11735,15 @@ async fn hot_scan_entries<'a>(
             for entry in page {
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                let entry_matches_filter = identity.matches_filter(filter);
                 #[cfg(feature = "storage-benches")]
-                if is_blob_ref_probe {
-                    crate::storage_bench::record_hot_blob_ref_scan_entry(
-                        identity.matches_filter(filter),
-                    );
+                {
+                    if is_blob_ref_probe {
+                        crate::storage_bench::record_hot_blob_ref_scan_entry(entry_matches_filter);
+                    }
+                    crate::storage_bench::record_hot_scan_fallback_entry(entry_matches_filter);
                 }
-                if identity.matches_filter(filter) {
+                if entry_matches_filter {
                     saw_file_backed_row |= identity.file_id().is_some();
                     let value = full_value_bytes(entry.value)?;
                     retained_bytes = retained_bytes

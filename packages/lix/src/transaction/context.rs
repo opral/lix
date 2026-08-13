@@ -12945,6 +12945,177 @@ mod tests {
         );
     }
 
+    /// Which physical route the write path's pre-image read takes, as a
+    /// function of the predicate shape, and whether the write reaches that
+    /// read at all.
+    ///
+    /// The counters asserted here are taken INSIDE `hot_scan_entries`'s
+    /// per-entry decode loop, which is the only layer that can tell a seek
+    /// from a full-prefix walk: every count taken above it is post
+    /// `matches_filter` and reports the surviving rows in both cases.
+    /// `calls` makes a zero readable as "this route did not run" rather than
+    /// "the counter did not run".
+    ///
+    /// Counters are process-global, so this test must run single-threaded and
+    /// alone; assertions are thresholds scaled to its own fixture.
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn entity_preimage_scan_route_depends_on_predicate_shape() {
+        use crate::storage_bench::{
+            CRUD_PHASE_COUNT, CRUD_PHASE_WRITE_READ, crud_phase_name, take_hot_scan_route_census,
+        };
+
+        async fn measure(
+            rows: usize,
+            statements: &[(&str, Vec<Value>)],
+        ) -> Option<[crate::storage_bench::HotScanRouteCensus; CRUD_PHASE_COUNT]> {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("storage should initialize");
+            let engine = Engine::new(storage)
+                .await
+                .expect("engine should open initialized storage");
+            let session = engine.open_session().await.expect("session should open");
+
+            let values = (0..rows)
+                .map(|index| format!("('seed-{index:06}', '\"v0\"')"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            session
+                .execute(
+                    &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
+                    &[],
+                )
+                .await
+                .expect("fixture rows should commit");
+
+            let _ = take_hot_scan_route_census();
+            let mut affected_total = 0_u64;
+            for (sql, params) in statements {
+                let result = match session.execute(sql, params.as_slice()).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        println!("PREIMAGEROUTE-SKIP sql=`{sql}` error={}", error.code);
+                        return None;
+                    }
+                };
+                affected_total += result.rows_affected();
+            }
+            let census = take_hot_scan_route_census();
+            // A statement that touched nothing is a vacuous lane, and its
+            // zero counters would be a false negative.
+            assert!(
+                affected_total > 0,
+                "probe statements must affect rows, got {affected_total}"
+            );
+            Some(census)
+        }
+
+        fn text(value: &str) -> Value {
+            Value::Text(value.to_string())
+        }
+
+        struct Shape {
+            label: &'static str,
+            sql: &'static str,
+            params: Vec<Value>,
+        }
+
+        let shapes = vec![
+            Shape {
+                label: "update_pk_eq",
+                sql: "UPDATE lix_key_value SET value = $1 WHERE key = $2",
+                params: vec![text("\"v1\""), text("seed-000000")],
+            },
+            Shape {
+                label: "update_pk_like",
+                sql: "UPDATE lix_key_value SET value = $1 WHERE key LIKE $2",
+                params: vec![text("\"v1\""), text("seed-000000")],
+            },
+            Shape {
+                label: "update_value_eq",
+                sql: "UPDATE lix_key_value SET value = $1 WHERE value = $2",
+                params: vec![text("\"v1\""), text("\"v0\"")],
+            },
+            Shape {
+                label: "update_no_where",
+                sql: "UPDATE lix_key_value SET value = $1",
+                params: vec![text("\"v1\"")],
+            },
+            Shape {
+                label: "delete_pk_eq",
+                sql: "DELETE FROM lix_key_value WHERE key = $1",
+                params: vec![text("seed-000000")],
+            },
+            Shape {
+                label: "delete_pk_like",
+                sql: "DELETE FROM lix_key_value WHERE key LIKE $1",
+                params: vec![text("seed-000000")],
+            },
+            Shape {
+                label: "delete_no_where",
+                sql: "DELETE FROM lix_key_value",
+                params: vec![],
+            },
+            Shape {
+                label: "insert_on_conflict",
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
+                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params: vec![text("seed-000000"), text("\"v1\"")],
+            },
+        ];
+
+        for shape in &shapes {
+            for rows in [50_usize, 100, 200, 400, 800, 1_600, 3_200] {
+                let Some(census) = measure(rows, &[(shape.sql, shape.params.clone())]).await
+                else {
+                    continue;
+                };
+                for phase in 0..CRUD_PHASE_COUNT {
+                    let c = census[phase];
+                    if c.calls == 0 {
+                        continue;
+                    }
+                    println!(
+                        "PREIMAGEROUTE shape={} rows={rows} phase={} calls={} point={} \
+file={} fallback={} fallback_with_pks={} decoded={} matched={}",
+                        shape.label,
+                        crud_phase_name(phase),
+                        c.calls,
+                        c.point_batch,
+                        c.file_prefix,
+                        c.fallback,
+                        c.fallback_with_entity_pks,
+                        c.fallback_entries_decoded,
+                        c.fallback_entries_matched,
+                    );
+                }
+                if census.iter().all(|c| c.calls == 0) {
+                    println!(
+                        "PREIMAGEROUTE shape={} rows={rows} phase=NONE calls=0 \
+(no hot_scan_entries call in any phase)",
+                        shape.label
+                    );
+                }
+            }
+        }
+
+        // Connectivity: the instrument is live and the primary-key write does
+        // reach the pre-image read, so a zero elsewhere means "that route did
+        // not run", not "the counter did not run".
+        let pk = measure(200, &[(
+            "UPDATE lix_key_value SET value = $1 WHERE key = $2",
+            vec![text("\"v1\""), text("seed-000000")],
+        )])
+        .await
+        .expect("the primary-key probe statement is supported")[CRUD_PHASE_WRITE_READ];
+        assert!(
+            pk.calls > 0,
+            "the primary-key update must issue a pre-image scan; instrument is dead"
+        );
+    }
+
     /// The by-id content update must reach its blob-ref row by a point read,
     /// never by walking the branch's blob-ref collection.
     ///
