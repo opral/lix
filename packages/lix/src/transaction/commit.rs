@@ -3576,6 +3576,72 @@ fn next_current_state_revision(current: u64) -> Result<u64, LixError> {
 /// Stages the hot serving plane.  Serial normal commits mutate their current
 /// generation; every lifecycle discontinuity publishes a complete fresh
 /// generation before its branch control is made visible.
+/// Every schema key this transaction publishes on the global branch, or `None`
+/// when that set cannot be enumerated completely.
+///
+/// Serving-view tombstone compaction removes a branch tombstone only once
+/// nothing beneath it can resurface, and the global branch sits beneath every
+/// other branch. `HotStateStoreReader::has_schema_rows` answers that for what
+/// is already durable, but not for what this same transaction is about to
+/// publish — and `tracked_roots_parent_first` orders roots by
+/// `parent_commit_id` alone, never consulting `branch_id`, so the global root
+/// is not guaranteed to be staged before a non-global one and a write-set
+/// consultation would be racy. Deriving the set from the transaction's
+/// prepared inputs instead makes it order-independent.
+///
+/// **Polarity.** Every value this returns *restricts* compaction: `None`
+/// disables it outright, and each schema key disables it for that schema. An
+/// omission here is therefore unsound, not merely pessimistic — anything that
+/// can publish a global row has to be enumerated below or force the `None`.
+///
+/// The sources are exactly those that reach `HotStateWriter` for a root:
+/// prepared state rows, engine rows, a root's selected change batches, and the
+/// synthesized `lix_branch_ref` row. A global root carrying a lifecycle
+/// snapshot is not enumerated at all and forces `None`.
+fn global_branch_schema_keys(
+    state_rows: &PreparedStateBatch,
+    engine_rows: &[EngineCurrentRow],
+    tracked_roots: &[PendingTrackedRoot],
+    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    tracked_snapshots: &BTreeMap<CommitId, HotTrackedSnapshot>,
+) -> Option<BTreeSet<String>> {
+    let global_root_commits = tracked_roots
+        .iter()
+        .filter(|root| root.branch_id == crate::GLOBAL_BRANCH_ID)
+        .map(|root| root.commit_id)
+        .collect::<BTreeSet<_>>();
+    if global_root_commits
+        .iter()
+        .any(|commit_id| tracked_snapshots.contains_key(commit_id))
+    {
+        return None;
+    }
+    let mut schema_keys = BTreeSet::new();
+    if !global_root_commits.is_empty() {
+        // Each publishing root synthesizes its own branch-ref row.
+        schema_keys.insert(BRANCH_REF_SCHEMA_KEY.to_string());
+    }
+    for row in state_rows.iter() {
+        if row.branch_id.as_str() == crate::GLOBAL_BRANCH_ID {
+            schema_keys.insert(row.schema_key.to_string());
+        }
+    }
+    for row in engine_rows {
+        if row.branch_id == crate::GLOBAL_BRANCH_ID {
+            schema_keys.insert(row.change.schema_key.to_string());
+        }
+    }
+    for commit_id in &global_root_commits {
+        let Some(staged) = staged_commits.get(commit_id) else {
+            continue;
+        };
+        for change_ref in selected_changes(&staged.selected_change_batches) {
+            schema_keys.insert(change_ref.schema_key().to_string());
+        }
+    }
+    Some(schema_keys)
+}
+
 async fn stage_tracked_head(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -3631,6 +3697,8 @@ async fn stage_tracked_head(
     let mut controls = BTreeMap::new();
     let mut deferred_fresh_hot_plans = Vec::new();
     let mut exclusive_certified_columnar_publication = false;
+    let transaction_global_schema_keys =
+        global_branch_schema_keys(state_rows, engine_rows, tracked_roots, staged_commits, &tracked_snapshots);
 
     for root in tracked_roots_parent_first(tracked_roots)?
         .into_iter()
@@ -4286,6 +4354,9 @@ async fn stage_tracked_head(
         let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
             && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
         let mut writer = tracked_head.writer(read, writes);
+        if let Some(schema_keys) = transaction_global_schema_keys.as_ref() {
+            writer = writer.with_transaction_global_schema_keys(schema_keys);
+        }
         let delete_generation = if exact_delete_candidate {
             writer
                 .try_stage_exact_collection_delete_current_base(

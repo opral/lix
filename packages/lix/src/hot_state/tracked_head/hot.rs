@@ -109,6 +109,32 @@ pub(crate) static BROAD_CANONICAL_CREATED_AT_KEYS: std::sync::atomic::AtomicU64 
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) static BROAD_CANONICAL_CREATED_AT_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Engagement counters for serving-view tombstone compaction.
+///
+/// Both sit *inside* `hot_compaction_mask`, the route they measure, rather than
+/// at the publication layer above it. `CANDIDATES` counts tombstones the
+/// checkpoint offered, `COMPACTED` the ones the gates actually cleared. A
+/// timing or row-count instrument one layer up cannot distinguish "compaction
+/// reclaimed nothing here" from "compaction never ran", and the second is the
+/// failure mode this design is most exposed to: every gate is conservative, so
+/// one wrong polarity makes the pass silently inert.
+///
+/// `ROUTES` and `OFFERED` sit above both, at the mask's first line, because
+/// "the checkpoint offered no tombstone" and "the checkpoint never reached the
+/// mask" are different faults with identical readings at `CANDIDATES`.
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static COMPACTED_TOMBSTONE_ROUTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static COMPACTED_TOMBSTONE_OFFERED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static COMPACTED_TOMBSTONE_CANDIDATES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static COMPACTED_TOMBSTONE_COMPACTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Generation-local immutable current-state bases.
 ///
 /// Each tiny record points at one already-authored packed commit delta. Fresh
@@ -6676,6 +6702,40 @@ impl HotTrackedSnapshot {
 pub(crate) struct HotStateWriter<'a, S: ?Sized> {
     pub(super) store: &'a S,
     pub(super) writes: &'a mut StorageWriteSet,
+    /// Schema keys this transaction publishes on the global branch, when the
+    /// caller can enumerate them completely.
+    ///
+    /// A property of the transaction rather than of any one call, which is why
+    /// it lives here instead of being threaded through the staging wrappers.
+    /// Only serving-view tombstone compaction reads it; see
+    /// [`hot_compaction_mask`].
+    ///
+    /// **Polarity.** `None` means "this caller cannot say", and it *disables*
+    /// compaction — the safe verdict. A construction site that is unsure must
+    /// leave it `None`; the factory default is `None` for exactly that reason.
+    /// Only a caller holding the transaction's complete prepared inputs may
+    /// supply a set, and a schema key present in that set likewise disables
+    /// compaction for that schema.
+    pub(super) transaction_global_schema_keys: Option<&'a BTreeSet<String>>,
+}
+
+impl<'a, S: ?Sized> HotStateWriter<'a, S> {
+    /// Declares the schema keys this transaction publishes on the global
+    /// branch, unlocking serving-view tombstone compaction for every other
+    /// schema.
+    ///
+    /// The caller must derive the set from the transaction's prepared inputs,
+    /// not from the write set: `tracked_roots_parent_first` orders roots by
+    /// `parent_commit_id` alone and never consults `branch_id`, so a global
+    /// root is not guaranteed to be staged before a non-global one and a
+    /// write-set consultation would see an incomplete picture.
+    pub(crate) fn with_transaction_global_schema_keys(
+        mut self,
+        schema_keys: &'a BTreeSet<String>,
+    ) -> Self {
+        self.transaction_global_schema_keys = Some(schema_keys);
+        self
+    }
 }
 
 impl<S> HotStateWriter<'_, S>
@@ -8322,6 +8382,27 @@ where
         } else {
             (sorted, previous_values, created_ats)
         };
+        // Serving-view tombstone compaction. Computed here rather than earlier
+        // because the retain filter above rebinds `sorted`, and a mask built
+        // against the pre-filter slice would address the wrong rows.
+        //
+        // `Box::pin` is load-bearing, not style: this is the universal commit
+        // write path, guarded by the
+        // `slatedb_history_blob_survives_until_final_root_release` stack
+        // canary, and the future's size is paid whether or not the branch is
+        // taken. The file already carries nine of these for the same reason.
+        let compacted = if reset_working_diff_baselines {
+            Box::pin(hot_compaction_mask(
+                self.store,
+                branch_id,
+                generation,
+                &sorted,
+                self.transaction_global_schema_keys,
+            ))
+            .await?
+        } else {
+            Vec::new()
+        };
         let identities = encode_hot_mutation_identities(branch_id, generation, &sorted);
         let unmatched_guards = if absence_guards_validated || absence_guards.is_empty() {
             BTreeSet::new()
@@ -8397,8 +8478,10 @@ where
                 "lix.perf.materialization.hot.values"
             )
             .entered();
-            for (delta, (created_at, previous)) in
-                sorted.iter().zip(created_ats.iter().zip(&previous_values))
+            for (index, (delta, (created_at, previous))) in sorted
+                .iter()
+                .zip(created_ats.iter().zip(&previous_values))
+                .enumerate()
             {
                 // Ordinary commits have no active checkpoint, so their baseline
                 // is always disabled. Do not decode the row a second time merely
@@ -8441,7 +8524,22 @@ where
                         value: BufferRange::default(),
                     });
                 }
-                next_value_ranges.push(if delta.physically_deletes() {
+                let compacted_row = compacted.get(index).copied().unwrap_or(false);
+                if compacted_row
+                    && (working_diff_baseline != WorkingDiffBaseline::Clean || newly_dirty)
+                {
+                    // Gate (c), asserted rather than assumed. Compaction runs
+                    // only under `reset_working_diff_baselines`, which forces
+                    // `(Clean, false)` for every tracked delta, so a compacted
+                    // row is provably clean at the moment it is removed and
+                    // "a dirty row cannot vanish" survives. If that stops
+                    // holding, fail the publication rather than drop a row
+                    // whose before-image is still owed.
+                    return Err(head_value_error(
+                        "compacted hot tombstone is not provably clean at removal",
+                    ));
+                }
+                next_value_ranges.push(if delta.physically_deletes() || compacted_row {
                     None
                 } else {
                     let mut value = delta.value_ref(*created_at, working_diff_baseline);
@@ -9453,6 +9551,208 @@ fn checked_add_hot_next_value_capacity(
                 .unwrap_or(0),
         )?;
     total.checked_add(encoded_len)
+}
+
+/// Whether the generation still has any immutable base beneath its HOT rows.
+///
+/// `ROW_SPACE` is a sparse overlay. A tombstone is what shadows a base row for
+/// the same identity, so every plane that can serve a row for this generation
+/// has to be proven empty before a tombstone can be treated as dead weight.
+/// The planes are the same four `has_schema_rows` consults, minus `ROW_SPACE`
+/// itself: the packed current base, its exclusive-schema variant, the sparse
+/// root base, and certified entity batches.
+///
+/// This is one existence probe per plane per publication, not per identity.
+async fn hot_generation_has_any_base(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+) -> Result<bool, LixError> {
+    if !packed_current_base_refs(store, branch_id, generation)
+        .await?
+        .is_empty()
+    {
+        return Ok(true);
+    }
+    if load_root_current_base_commit(store, branch_id, generation)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    if hot_space_prefix_has_entry(
+        store,
+        PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+        Bytes::from(hot_scope_prefix(branch_id, generation)),
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+    // Certified entity-batch manifests are keyed by generation alone, which is
+    // what `scan_certified_entity_batch_rows` scans when no file filter
+    // narrows it.
+    hot_space_prefix_has_entry(
+        store,
+        CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+        Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
+    )
+    .await
+}
+
+/// Key-only existence probe for one prefix in one space.
+async fn hot_space_prefix_has_entry(
+    store: &(impl StorageAdapterRead + ?Sized),
+    space: StorageSpace,
+    prefix: Bytes,
+) -> Result<bool, LixError> {
+    let range = StoragePrefix { bytes: prefix }.to_range()?;
+    let mut cursor = store
+        .begin_scan(
+            space,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    let (page, _has_more) = cursor.next_page(1).await?.into_parts();
+    Ok(!page.is_empty())
+}
+
+/// Which of `deltas` may have their serving-view tombstone removed outright
+/// rather than republished as a tombstone.
+///
+/// `ROW_SPACE` is a derived serving view, so nothing here is canonical: a
+/// removed tombstone stays recoverable from history, and `undo` replays from
+/// canonical state rather than from the serving row. The only question is
+/// whether removing it changes an *answer*, which happens exactly when
+/// something below the tombstone would resurface.
+///
+/// Two things can sit below one:
+///
+/// - **(a) a base for the same generation.** Ruled out wholesale by
+///   [`hot_generation_has_any_base`]. A checkpoint publishes no base of its
+///   own, so this is the ordinary state at a checkpoint rather than a rare one.
+/// - **(b) a global-branch row for the same identity.** The global branch sits
+///   beneath every other branch, and a branch tombstone is what hides a global
+///   row from that branch — the behaviour
+///   `main_tombstone_hides_global_row` and its four siblings pin. Ruled out
+///   per *schema key*, against both what is already durable
+///   (`has_schema_rows`, which is base-complete) and what this transaction is
+///   publishing on global (`transaction_global_schema_keys`). Per-schema
+///   granularity is not an optimization: a checkpoint always stages its own
+///   global `lix_checkpoint` row, so a transaction-wide global test would
+///   block every checkpoint and make this pass silently inert.
+///
+/// A third condition — the delete still being observable through its
+/// working-diff baseline — does not exist. `DIFF_SPACE`, not `ROW_SPACE`, is
+/// the working diff's authority; `hot_row_tombstone_probe`'s `near_miss` arm
+/// measures that and keeps an inverted assertion so a change that reintroduces
+/// the dependency fails loudly.
+///
+/// Callers must pass the deltas *after* the checkpoint retain filter, since
+/// that filter rebinds the slice and an earlier mask would misalign.
+async fn hot_compaction_mask(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    deltas: &[&CurrentStateDeltaRef<'_>],
+    transaction_global_schema_keys: Option<&BTreeSet<String>>,
+) -> Result<Vec<bool>, LixError> {
+    let mask = vec![false; deltas.len()];
+    #[cfg(any(test, feature = "storage-benches"))]
+    {
+        COMPACTED_TOMBSTONE_ROUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        COMPACTED_TOMBSTONE_OFFERED
+            .fetch_add(deltas.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    let is_candidate = |delta: &CurrentStateDeltaRef<'_>| {
+        delta.deleted
+            && !delta.untracked
+            && delta.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+            // An exact-closure scope proves its membership from a recomputed
+            // identity digest. Leaving its tombstones alone keeps that proof
+            // out of this change's blast radius for no measurable loss.
+            && !scope_requires_exact_closure(branch_id, delta.schema_key, delta.file_id)
+    };
+    let candidates = deltas
+        .iter()
+        .filter(|delta| is_candidate(delta))
+        .count();
+    if candidates == 0 {
+        return Ok(mask);
+    }
+    #[cfg(any(test, feature = "storage-benches"))]
+    COMPACTED_TOMBSTONE_CANDIDATES
+        .fetch_add(candidates as u64, std::sync::atomic::Ordering::Relaxed);
+
+    // Gate (a).
+    if hot_generation_has_any_base(store, branch_id, generation).await? {
+        return Ok(mask);
+    }
+
+    // Gate (b). Nothing sits below the global branch, so it is vacuous there
+    // and neither half of it is consulted.
+    let global_is_below = branch_id != crate::GLOBAL_BRANCH_ID;
+    if global_is_below && transaction_global_schema_keys.is_none() {
+        // The caller cannot enumerate what this transaction stages on global.
+        // That is the disabling verdict wherever global sits below.
+        return Ok(mask);
+    }
+    let global_control = if global_is_below {
+        BranchHeadControlContext::new()
+            .reader(store)
+            .load(crate::GLOBAL_BRANCH_ID)
+            .await?
+    } else {
+        None
+    };
+    let reader = HotStateStoreReader {
+        store,
+        transaction_cache: None,
+        root_base_cache: None,
+    };
+
+    let mut mask = mask;
+    let mut compacted = 0_u64;
+    // One verdict per distinct schema key, not per identity: a churned
+    // collection offers thousands of tombstones in one schema.
+    let mut verdicts: BTreeMap<&str, bool> = BTreeMap::new();
+    for (index, delta) in deltas.iter().enumerate() {
+        if !is_candidate(delta) {
+            continue;
+        }
+        let blocked = if !global_is_below {
+            false
+        } else if let Some(&verdict) = verdicts.get(delta.schema_key) {
+            verdict
+        } else {
+            let verdict = transaction_global_schema_keys
+                .is_some_and(|schema_keys| schema_keys.contains(delta.schema_key))
+                || match global_control {
+                    Some(control) => {
+                        reader
+                            .has_schema_rows(crate::GLOBAL_BRANCH_ID, control, delta.schema_key)
+                            .await?
+                    }
+                    // No global branch control means no published global
+                    // generation, so no global row can be hidden by anything.
+                    None => false,
+                };
+            verdicts.insert(delta.schema_key, verdict);
+            verdict
+        };
+        if !blocked {
+            mask[index] = true;
+            compacted += 1;
+        }
+    }
+    #[cfg(any(test, feature = "storage-benches"))]
+    COMPACTED_TOMBSTONE_COMPACTED.fetch_add(compacted, std::sync::atomic::Ordering::Relaxed);
+    let _ = compacted;
+    Ok(mask)
 }
 
 fn encoded_hot_slot_len(slot: JsonSlotRef<'_>, fingerprint_inline: bool) -> usize {
@@ -14443,6 +14743,7 @@ mod tests {
         let (_, retired) = HotStateWriter {
             store: &read,
             writes: &mut writes,
+            transaction_global_schema_keys: None,
         }
         .stage_complete_collection_replacement_current_base(
             BRANCH_ID,
@@ -14580,6 +14881,7 @@ mod tests {
         let replacement = HotStateWriter {
             store: &read,
             writes: &mut replacement_writes,
+            transaction_global_schema_keys: None,
         }
         .try_stage_exact_collection_replacement_current_base(
             BRANCH_ID,
@@ -14609,6 +14911,7 @@ mod tests {
         let deletion = HotStateWriter {
             store: &read,
             writes: &mut deletion_writes,
+            transaction_global_schema_keys: None,
         }
         .try_stage_exact_collection_delete_current_base(
             BRANCH_ID,
@@ -14721,6 +15024,7 @@ mod tests {
         HotStateWriter {
             store: &read,
             writes: &mut checkpoint_writes,
+            transaction_global_schema_keys: None,
         }
         .stage_checkpoint_current_state(
             BRANCH_ID,
@@ -17292,5 +17596,176 @@ mod tests {
                 .next()
                 .flatten();
         assert!(active_record.is_some(), "active hot record must survive GC");
+    }
+
+    /// Gate (b) of `hot_compaction_mask`, both verdicts, in one publication.
+    ///
+    /// A branch tombstone is what hides a same-identity global row from that
+    /// branch — the contract `main_tombstone_hides_global_row` and its
+    /// siblings pin — so compaction must keep it. A tombstone in a schema the
+    /// global branch has no rows in shadows nothing and must go. Both are
+    /// asserted here rather than only through a checkpoint's row count,
+    /// because a wholly inert pass and a correctly conservative one produce
+    /// the same count.
+    #[tokio::test]
+    async fn checkpoint_compaction_keeps_only_globally_shadowed_tombstones() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000e5";
+        const BRANCH_LABEL: &str = "e45e-compaction-branch";
+        const GLOBAL_LABEL: &str = "e45e-compaction-global";
+        const SHADOWED_SCHEMA: &str = "e45e_shadowed_schema";
+        const PRIVATE_SCHEMA: &str = "e45e_private_schema";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let created_at = timestamp();
+        let shadowed_pk = EntityPk::single("shadowed-row");
+        let private_pk = EntityPk::single("private-row");
+        let global_commit = CommitId::for_test_label(GLOBAL_LABEL);
+        let generation = CommitId::for_test_label(BRANCH_LABEL);
+
+        crate::test_support::seed_branch_head_with_rows(
+            storage.clone(),
+            crate::GLOBAL_BRANCH_ID,
+            GLOBAL_LABEL,
+            &[MaterializedTrackedStateRow {
+                entity_pk: shadowed_pk.clone(),
+                schema_key: SHADOWED_SCHEMA.to_owned(),
+                file_id: None,
+                snapshot_content: Some(r#"{"key":"global-row"}"#.into()),
+                metadata: None,
+                deleted: false,
+                created_at: created_at.to_string(),
+                updated_at: created_at.to_string(),
+                change_id: ChangeId::for_test_label("e45e-global-change"),
+                commit_id: global_commit,
+            }],
+        )
+        .await;
+        crate::test_support::seed_branch_head_with_rows(
+            storage.clone(),
+            BRANCH_ID,
+            BRANCH_LABEL,
+            &[
+                MaterializedTrackedStateRow {
+                    entity_pk: private_pk.clone(),
+                    schema_key: PRIVATE_SCHEMA.to_owned(),
+                    file_id: None,
+                    snapshot_content: Some(r#"{"key":"private-row"}"#.into()),
+                    metadata: None,
+                    deleted: false,
+                    created_at: created_at.to_string(),
+                    updated_at: created_at.to_string(),
+                    change_id: ChangeId::for_test_label("e45e-branch-private"),
+                    commit_id: generation,
+                },
+                MaterializedTrackedStateRow {
+                    entity_pk: shadowed_pk.clone(),
+                    schema_key: SHADOWED_SCHEMA.to_owned(),
+                    file_id: None,
+                    snapshot_content: Some(r#"{"key":"branch-row"}"#.into()),
+                    metadata: None,
+                    deleted: false,
+                    created_at: created_at.to_string(),
+                    updated_at: created_at.to_string(),
+                    change_id: ChangeId::for_test_label("e45e-branch-shadowed"),
+                    commit_id: generation,
+                },
+            ],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open compaction gate read");
+        let checkpoint_head = CommitId::for_test_label("e45e-compaction-checkpoint");
+        let deltas = [
+            CurrentStateDeltaRef {
+                schema_key: PRIVATE_SCHEMA,
+                file_id: None,
+                entity_pk: &private_pk,
+                change_id: Some(ChangeId::for_test_label("e45e-delete-private")),
+                commit_id: Some(checkpoint_head),
+                untracked: false,
+                deleted: true,
+                created_at,
+                updated_at: created_at,
+                snapshot: JsonSlotRef::None,
+                metadata: JsonSlotRef::None,
+                columnar_base_coordinate: None,
+            },
+            CurrentStateDeltaRef {
+                schema_key: SHADOWED_SCHEMA,
+                file_id: None,
+                entity_pk: &shadowed_pk,
+                change_id: Some(ChangeId::for_test_label("e45e-delete-shadowed")),
+                commit_id: Some(checkpoint_head),
+                untracked: false,
+                deleted: true,
+                created_at,
+                updated_at: created_at,
+                snapshot: JsonSlotRef::None,
+                metadata: JsonSlotRef::None,
+                columnar_base_coordinate: None,
+            },
+        ];
+        // This transaction publishes nothing on global, so the only global
+        // authority is what the seed already made durable.
+        let staged_on_global = BTreeSet::new();
+        let mut checkpoint_writes = StorageWriteSet::new();
+        let mut coverage = WorkingDiffIndexCoverage::default();
+        HotStateWriter {
+            store: &read,
+            writes: &mut checkpoint_writes,
+            transaction_global_schema_keys: Some(&staged_on_global),
+        }
+        .stage_checkpoint_current_state(
+            BRANCH_ID,
+            generation,
+            checkpoint_head,
+            &deltas,
+            &BTreeSet::new(),
+            checkpoint_head,
+            &mut coverage,
+        )
+        .await
+        .expect("checkpoint should stage");
+        drop(read);
+        storage
+            .commit_write_set(checkpoint_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit compaction checkpoint");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verify compaction gate");
+        let key = |schema_key: &str, entity_pk: &EntityPk| {
+            StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
+                branch_id: BRANCH_ID.to_owned(),
+                generation,
+                schema_key: schema_key.to_owned(),
+                entity_pk: entity_pk.clone(),
+                file_id: None,
+            })))
+        };
+        let rows = PointReadPlan::new(
+            ROW_SPACE,
+            &[
+                key(SHADOWED_SCHEMA, &shadowed_pk),
+                key(PRIVATE_SCHEMA, &private_pk),
+            ],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read compacted generation")
+        .value;
+        assert!(
+            rows[0].is_some(),
+            "a tombstone shadowing a global row must survive the checkpoint"
+        );
+        assert!(
+            rows[1].is_none(),
+            "a tombstone shadowing nothing must be reclaimed by the checkpoint"
+        );
     }
 }
