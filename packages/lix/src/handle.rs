@@ -123,6 +123,7 @@ where
 {
     lix: &'a Lix<StorageImpl>,
     account_id: Option<String>,
+    branch_id: Option<String>,
 }
 
 impl<'a, StorageImpl> OpenAnotherSessionBuilder<'a, StorageImpl>
@@ -134,6 +135,13 @@ where
     /// This selects an existing account; it does not create one.
     pub fn with_account(mut self, account_id: impl Into<String>) -> Self {
         self.account_id = Some(account_id.into());
+        self
+    }
+
+    /// Opens the additional session on `branch_id` without changing the
+    /// primary session or its persisted branch preference.
+    pub fn with_branch(mut self, branch_id: impl Into<String>) -> Self {
+        self.branch_id = Some(branch_id.into());
         self
     }
 }
@@ -152,7 +160,9 @@ where
         // higher-ranked SQL futures.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                self.lix.open_another_session_inner(self.account_id).await
+                self.lix
+                    .open_another_session_inner(self.account_id, self.branch_id)
+                    .await
             })
         })
     }
@@ -366,12 +376,14 @@ where
         OpenAnotherSessionBuilder {
             lix: self,
             account_id: None,
+            branch_id: None,
         }
     }
 
     async fn open_another_session_inner(
         &self,
         account_id: Option<String>,
+        branch_id: Option<String>,
     ) -> Result<Self, LixError> {
         if self.session.is_closed() {
             return Err(LixError::new(
@@ -379,7 +391,10 @@ where
                 "cannot open another session from a closed Lix handle",
             ));
         }
-        let active_branch_id = self.active_branch_id().await?;
+        let active_branch_id = match branch_id {
+            Some(branch_id) => branch_id,
+            None => self.active_branch_id().await?,
+        };
         let active_account_id = account_id.unwrap_or_else(|| self.active_account_id().to_owned());
         self.open_internal_session(active_branch_id, active_account_id)
             .await
@@ -1261,4 +1276,3 @@ mod assume_send_future_proofs {
         assert_sync::<Lix<S>>();
     }
 }
-

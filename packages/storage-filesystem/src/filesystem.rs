@@ -15,7 +15,7 @@ use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
     StorageWrite, WriteOptions,
 };
-use lix::{Lix, LixError, LixPath, SYSTEM_ACCOUNT_ID, SwitchBranchOptions, Value, open_lix};
+use lix::{Lix, LixError, LixPath, SYSTEM_ACCOUNT_ID, Value, open_lix};
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 use tokio::sync::oneshot;
@@ -145,6 +145,11 @@ struct FilesystemSupervisor {
 
 struct FilesystemSyncLifecycle {
     state: Mutex<FilesystemSyncState>,
+}
+
+struct FilesystemSyncStartup {
+    lifecycle: Arc<FilesystemSyncLifecycle>,
+    completed: bool,
 }
 
 enum FilesystemSyncState {
@@ -327,37 +332,10 @@ enum FilesystemEvent {
 impl FilesystemStorage {
     /// Starts bidirectional filesystem synchronization owned by this storage.
     pub async fn start_sync(&self, lix: &Lix<FilesystemStorage>) -> Result<(), LixError> {
-        {
-            let mut state = self
-                .sync_lifecycle
-                .state
-                .lock()
-                .expect("filesystem sync lifecycle lock should not poison");
-            if !matches!(*state, FilesystemSyncState::Stopped) {
-                return Err(LixError::new(
-                    "LIX_FILESYSTEM_SYNC_ALREADY_STARTED",
-                    "filesystem synchronization is already running",
-                ));
-            }
-            *state = FilesystemSyncState::Starting;
-        }
-
-        let result = self.open_supervisor(lix).await;
-        let mut state = self
-            .sync_lifecycle
-            .state
-            .lock()
-            .expect("filesystem sync lifecycle lock should not poison");
-        match result {
-            Ok(supervisor) => {
-                *state = FilesystemSyncState::Started(supervisor);
-                Ok(())
-            }
-            Err(error) => {
-                *state = FilesystemSyncState::Stopped;
-                Err(error)
-            }
-        }
+        let startup = FilesystemSyncStartup::begin(Arc::clone(&self.sync_lifecycle))?;
+        let supervisor = self.open_supervisor(lix).await?;
+        startup.complete(supervisor);
+        Ok(())
     }
 
     /// Stops synchronization and waits for its worker and internal Lix session.
@@ -417,15 +395,9 @@ impl FilesystemStorage {
         // writes from recursively requesting another filesystem sync.
         let primary = open_lix().with_storage(self.inner.clone()).await?;
         let active_branch_id = lix.active_branch_id().await?;
-        if primary.active_branch_id().await? != active_branch_id {
-            primary
-                .switch_branch(SwitchBranchOptions {
-                    branch_id: active_branch_id,
-                })
-                .await?;
-        }
         let sync_lix = primary
             .open_another_session()
+            .with_branch(active_branch_id)
             .with_account(SYSTEM_ACCOUNT_ID)
             .await?;
         primary.close().await?;
@@ -448,6 +420,54 @@ impl FilesystemStorage {
             _ => Err(filesystem_error(
                 "filesystem synchronization is not running",
             )),
+        }
+    }
+}
+
+impl FilesystemSyncStartup {
+    fn begin(lifecycle: Arc<FilesystemSyncLifecycle>) -> Result<Self, LixError> {
+        {
+            let mut state = lifecycle
+                .state
+                .lock()
+                .expect("filesystem sync lifecycle lock should not poison");
+            if !matches!(*state, FilesystemSyncState::Stopped) {
+                return Err(LixError::new(
+                    "LIX_FILESYSTEM_SYNC_ALREADY_STARTED",
+                    "filesystem synchronization is already running",
+                ));
+            }
+            *state = FilesystemSyncState::Starting;
+        }
+        Ok(Self {
+            lifecycle,
+            completed: false,
+        })
+    }
+
+    fn complete(mut self, supervisor: FilesystemSupervisor) {
+        *self
+            .lifecycle
+            .state
+            .lock()
+            .expect("filesystem sync lifecycle lock should not poison") =
+            FilesystemSyncState::Started(supervisor);
+        self.completed = true;
+    }
+}
+
+impl Drop for FilesystemSyncStartup {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .expect("filesystem sync lifecycle lock should not poison");
+        if matches!(*state, FilesystemSyncState::Starting) {
+            *state = FilesystemSyncState::Stopped;
         }
     }
 }
@@ -2913,6 +2933,65 @@ mod tests {
         storage.start_sync(&lix).await.unwrap();
         storage.stop_sync().await.unwrap();
         lix.close().await.unwrap();
+    }
+
+    #[test]
+    fn cancelled_filesystem_sync_start_restores_stopped_state() {
+        let lifecycle = Arc::new(FilesystemSyncLifecycle {
+            state: Mutex::new(FilesystemSyncState::Stopped),
+        });
+        let startup = FilesystemSyncStartup::begin(Arc::clone(&lifecycle)).unwrap();
+        assert!(matches!(
+            *lifecycle.state.lock().unwrap(),
+            FilesystemSyncState::Starting
+        ));
+
+        // Dropping this guard models cancellation while open_supervisor awaits.
+        drop(startup);
+        assert!(matches!(
+            *lifecycle.state.lock().unwrap(),
+            FilesystemSyncState::Stopped
+        ));
+
+        // A later attempt can acquire the lifecycle again.
+        drop(FilesystemSyncStartup::begin(lifecycle).unwrap());
+    }
+
+    #[tokio::test]
+    async fn filesystem_sync_on_secondary_branch_does_not_change_primary_preference() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(tempdir.path()).open().unwrap();
+        let primary = open_lix().with_storage(storage.clone()).await.unwrap();
+        let primary_branch_id = primary.active_branch_id().await.unwrap();
+        let branch = primary
+            .create_branch(lix::CreateBranchOptions {
+                id: None,
+                name: "sync-secondary".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let secondary = primary.open_another_session().await.unwrap();
+        secondary
+            .switch_branch(lix::SwitchBranchOptions {
+                branch_id: branch.id,
+            })
+            .await
+            .unwrap();
+
+        storage.start_sync(&secondary).await.unwrap();
+        storage.stop_sync().await.unwrap();
+        secondary.close().await.unwrap();
+        primary.close().await.unwrap();
+        drop(secondary);
+        drop(primary);
+
+        let reopened = open_lix().with_storage(storage).await.unwrap();
+        assert_eq!(
+            reopened.active_branch_id().await.unwrap(),
+            primary_branch_id
+        );
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]
