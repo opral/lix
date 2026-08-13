@@ -9,6 +9,10 @@ export const JS_SDK_NATIVE_PACKAGES = [
 	"@lix-js/sdk-linux-x64",
 	"@lix-js/sdk-win32-x64",
 ];
+export const PUBLIC_NPM_PACKAGE_PATHS = [
+	"packages/js-sdk",
+	"packages/storage-filesystem",
+];
 
 export function readText(root, path) {
 	return readFileSync(join(root, path), "utf8");
@@ -192,38 +196,47 @@ function updateWorkspaceVersionedDependencyRequirements(root, text, version) {
 				if (!packageSection || !/^version\.workspace\s*=\s*true\s*$/m.test(packageSection)) {
 					return line;
 				}
-				return line.replace(/(\bversion\s*=\s*")[^"]+(")/, `$1${version}$2`);
+				return line.replace(/(\bversion\s*=\s*")[^"]+(")/, `$1=${version}$2`);
 			}),
 	);
 }
 
 export function updatePackageVersion(root, version) {
-	const packageJsonPath = "packages/js-sdk/package.json";
-	const lockPath = "packages/js-sdk/package-lock.json";
-	const packageJson = readJson(root, packageJsonPath);
-	packageJson.version = version;
-	packageJson.optionalDependencies = Object.fromEntries(
-		JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
-	);
-	writeJson(root, packageJsonPath, packageJson);
+	for (const packagePath of PUBLIC_NPM_PACKAGE_PATHS) {
+		const packageJsonPath = `${packagePath}/package.json`;
+		const lockPath = `${packagePath}/package-lock.json`;
+		const packageJson = readJson(root, packageJsonPath);
+		packageJson.version = version;
 
-	const lock = readJson(root, lockPath);
-	lock.version = version;
-	if (lock.packages?.[""]) {
-		lock.packages[""].version = version;
-		lock.packages[""].optionalDependencies = Object.fromEntries(
-			JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
-		);
+		if (packageJson.name === "@lix-js/sdk") {
+			packageJson.optionalDependencies = Object.fromEntries(
+				JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
+			);
+		}
+		if (packageJson.name === "@lix-js/storage-filesystem") {
+			packageJson.peerDependencies["@lix-js/sdk"] = version;
+		}
+		writeJson(root, packageJsonPath, packageJson);
+
+		const lock = readJson(root, lockPath);
+		lock.version = version;
+		if (lock.packages?.[""]) {
+			lock.packages[""].version = version;
+			lock.packages[""].optionalDependencies = packageJson.optionalDependencies;
+			lock.packages[""].peerDependencies = packageJson.peerDependencies;
+		}
+		if (packageJson.name === "@lix-js/sdk") {
+			for (const packageName of JS_SDK_NATIVE_PACKAGES) {
+				const lockedPackage = lock.packages?.[`node_modules/${packageName}`];
+				if (!lockedPackage) continue;
+				const unscopedName = packageName.split("/").at(-1);
+				lockedPackage.version = version;
+				lockedPackage.resolved = `https://registry.npmjs.org/${packageName}/-/${unscopedName}-${version}.tgz`;
+				delete lockedPackage.integrity;
+			}
+		}
+		writeJson(root, lockPath, lock);
 	}
-	for (const packageName of JS_SDK_NATIVE_PACKAGES) {
-		const lockedPackage = lock.packages?.[`node_modules/${packageName}`];
-		if (!lockedPackage) continue;
-		const unscopedName = packageName.split("/").at(-1);
-		lockedPackage.version = version;
-		lockedPackage.resolved = `https://registry.npmjs.org/${packageName}/-/${unscopedName}-${version}.tgz`;
-		delete lockedPackage.integrity;
-	}
-	writeJson(root, lockPath, lock);
 }
 
 export function updateChangelog(root, version, date, changes) {
@@ -250,7 +263,7 @@ export function prepareRelease(root, { date = new Date().toISOString().slice(0, 
 	for (const change of changes) {
 		rmSync(join(root, change.path));
 	}
-	execFileSync("cargo", ["update", "-p", "lix_cli", "-p", "lix_js_sdk"], {
+	execFileSync("cargo", ["update", "--workspace"], {
 		cwd: root,
 		stdio: "inherit",
 	});

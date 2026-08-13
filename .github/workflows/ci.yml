@@ -50,7 +50,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate Cargo configuration and publish surface
-        run: node scripts/validate-cargo-publish-surface.mjs
+        run: |
+          node scripts/validate-publish-surface.mjs
+          node --test scripts/release.test.mjs
 
   cargo:
     name: Cargo ${{ matrix.name }}

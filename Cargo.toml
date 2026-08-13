@@ -24,10 +24,10 @@ rust-version = "1.93"
 
 [workspace.dependencies]
 lix_cli = { path = "packages/cli", version = "0.11.0" }
-lix = { path = "packages/lix", version = "0.11.0", default-features = false }
-lix_storage_filesystem = { package = "lix-storage-filesystem", path = "packages/storage-filesystem", version = "0.1.0", default-features = false }
-lix_storage_rocksdb = { package = "lix-storage-rocksdb", path = "packages/storage-rocksdb", version = "0.1.0" }
-lix_storage_slatedb = { package = "lix-storage-slatedb", path = "packages/storage-slatedb", version = "0.1.0" }
+lix = { path = "packages/lix", version = "=0.11.0", default-features = false }
+lix_storage_filesystem = { package = "lix-storage-filesystem", path = "packages/storage-filesystem", version = "=0.11.0", default-features = false }
+lix_storage_rocksdb = { package = "lix-storage-rocksdb", path = "packages/storage-rocksdb", version = "=0.11.0" }
+lix_storage_slatedb = { package = "lix-storage-slatedb", path = "packages/storage-slatedb", version = "=0.11.0" }
 lix_js_sdk = { path = "packages/js-sdk", version = "0.11.0" }
 mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
 

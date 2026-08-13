@@ -276,6 +276,48 @@ jobs:
           npm test
           npm pack --dry-run --ignore-scripts
 
+  publish-rust-crates:
+    name: Publish crates.io packages
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    needs: release-version
+    if: needs.release-version.outputs.has_release == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-version.outputs.release_sha }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang mold
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-rust-crates
+
+      - name: Publish lockstep Rust crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          EXPECTED_VERSION: ${{ needs.release-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/publish-crate.mjs lix "$EXPECTED_VERSION"
+          node scripts/publish-crate.mjs lix-storage-rocksdb "$EXPECTED_VERSION"
+          node scripts/publish-crate.mjs lix-storage-slatedb "$EXPECTED_VERSION"
+          node scripts/publish-crate.mjs lix-storage-filesystem "$EXPECTED_VERSION"
+
   publish-js-sdk:
     name: Publish @lix-js/sdk packages
     runs-on: ubuntu-latest
@@ -391,13 +433,14 @@ jobs:
           done
 
           publish_package "$GITHUB_WORKSPACE/packages/js-sdk" "$EXPECTED_VERSION"
-          publish_package "$GITHUB_WORKSPACE/packages/storage-filesystem"
+          publish_package "$GITHUB_WORKSPACE/packages/storage-filesystem" "$EXPECTED_VERSION"
 
   create-github-release:
     name: Create GitHub release
     runs-on: ubuntu-latest
     needs:
       - release-version
+      - publish-rust-crates
       - publish-js-sdk
     permissions:
       contents: write
@@ -471,6 +514,7 @@ jobs:
       - build-js-sdk-native-packages
       - build-js-sdk
       - test-js-sdk
+      - publish-rust-crates
       - publish-js-sdk
     if: ${{ always() }}
 
@@ -482,6 +526,7 @@ jobs:
           echo "build-js-sdk-native-packages: ${{ needs.build-js-sdk-native-packages.result }}"
           echo "build-js-sdk: ${{ needs.build-js-sdk.result }}"
           echo "test-js-sdk: ${{ needs.test-js-sdk.result }}"
+          echo "publish-rust-crates: ${{ needs.publish-rust-crates.result }}"
           echo "publish-js-sdk: ${{ needs.publish-js-sdk.result }}"
 
           if [ "${{ needs.release-version.result }}" != "success" ]; then
