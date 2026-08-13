@@ -80,6 +80,8 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_HITS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_CURRENT_STATE_COLUMNAR_ROOT_PUBLICATIONS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_CURRENT_STATE_PARENT_ROOT_HITS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -619,6 +621,56 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         commit_delta_direct_rows: COMMIT_DELTA_DIRECT_ROWS.swap(0, Ordering::Relaxed),
         commit_delta_generic_segments: COMMIT_DELTA_GENERIC_SEGMENTS.swap(0, Ordering::Relaxed),
         commit_delta_generic_rows: COMMIT_DELTA_GENERIC_ROWS.swap(0, Ordering::Relaxed),
+    }
+}
+
+/// Publication-side census for `current_state_scoped_ranges`, the per-scope
+/// read accelerator.
+///
+/// These are deliberately **not** the `crud_current_state_scoped_range_*`
+/// counters above: those record `attempts`/`hits` inside
+/// `resolve_rootless_index_values_at_commit`, which is the rootless replay
+/// *read* path. Nothing there observes whether a commit published a scoped
+/// root, so a test asserting on them passes whether or not the accelerator
+/// ever engaged.
+///
+/// The two fields split the accelerator's two halves, which fail
+/// independently:
+///
+/// * `columnar_root_publications` — a commit whose mutation inventory carried
+///   columnar parts bootstrapped a scoped root out of the `parent_root ==
+///   None` fixed point. Reached only by a certified typed INSERT batch of at
+///   least `TYPED_CERTIFIED_INSERT_MIN_ROWS` (32,768) rows against a
+///   user-registered entity schema.
+/// * `parent_root_hits` — a later publication found a parent scoped root and
+///   carried it forward. This is what proves the accelerator *sustains*; a
+///   regression that bootstraps and then self-extinguishes leaves
+///   `columnar_root_publications` intact and drives this to zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CertifiedCurrentStatePublicationCounters {
+    pub columnar_root_publications: u64,
+    pub parent_root_hits: u64,
+}
+
+pub(crate) fn record_certified_current_state_columnar_root_publication() {
+    CERTIFIED_CURRENT_STATE_COLUMNAR_ROOT_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_certified_current_state_parent_root_hit() {
+    CERTIFIED_CURRENT_STATE_PARENT_ROOT_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reads the cumulative scoped-root publication counters **without** resetting
+/// them. These statics are process-global and test binaries run their tests in
+/// parallel, so a `swap`-style reader would let two fixtures steal each other's
+/// counts. Subtract a pre-operation snapshot from a post-operation snapshot and
+/// assert a threshold on the delta; concurrent contributions can only inflate
+/// it, never hide a mechanism that stopped engaging.
+pub fn certified_current_state_publication_counters() -> CertifiedCurrentStatePublicationCounters {
+    CertifiedCurrentStatePublicationCounters {
+        columnar_root_publications: CERTIFIED_CURRENT_STATE_COLUMNAR_ROOT_PUBLICATIONS
+            .load(Ordering::Relaxed),
+        parent_root_hits: CERTIFIED_CURRENT_STATE_PARENT_ROOT_HITS.load(Ordering::Relaxed),
     }
 }
 
