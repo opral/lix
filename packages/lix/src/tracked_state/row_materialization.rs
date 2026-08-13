@@ -851,6 +851,9 @@ mod tests {
         }
 
         let (string_columnar, string_packed, string_rows) = run("colstr", false).await;
+        println!(
+            "columnar_identity | string_pk columnar={string_columnar} packed={string_packed} rows={string_rows}"
+        );
         assert_eq!(string_rows, 1, "the string-pk arm must answer one row");
         assert!(
             string_columnar > 0,
@@ -859,6 +862,9 @@ mod tests {
         );
 
         let (uuid_columnar, uuid_packed, uuid_rows) = run("coluuid", true).await;
+        println!(
+            "columnar_identity | uuid_pk columnar={uuid_columnar} packed={uuid_packed} rows={uuid_rows}"
+        );
         assert_eq!(
             uuid_rows, 1,
             "the uuid-pk arm must answer one row -- a rejected payload would surface here"
