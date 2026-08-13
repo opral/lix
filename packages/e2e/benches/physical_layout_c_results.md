@@ -83,6 +83,10 @@ All 36 physical RocksDB/SlateDB cells wrote the exact authenticated branch and p
 - Final combined model and physical-backend sweep: `/root/repos/lix-evidence/experiment-c-ff57/model/backend-sweep-reviewed.csv`, SHA-256 `ad2452a2df410dfbb2029ae9f3ca8af8a19b6886a302181d36c4d8d0091dc615`; stderr is empty (SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
 - Rejected intermediate sweeps remain evidence only and are not used for the decision.
 
-## Final-rebind requirement
+## Final rebind
 
-The selected C2 model must be rebound by object identity to commit `2cf539744e7864f79bf1994e002f47cfd3281dc0`, tree `89a6e9a0623483268cb7841f757446c5e29559dd`. The 64/256-byte dominant fixtures are schema-bound scalar tuples with no JSONB; the 1/4 KiB cases add one optional opaque varlen cell. The page layer carries those canonical tuple bytes and schema fingerprint opaquely; it must not parse text, uuid, int8, float8, boolean, jsonb, or timestamptz fields.
+The selected C2 model is rebound directly by object identity to commit `2cf539744e7864f79bf1994e002f47cfd3281dc0`, tree `89a6e9a0623483268cb7841f757446c5e29559dd`; no moving branch was resolved during composition. The model source commit is `9511c1f00e6e30a5392eb6d794d9e89e3d060c80` and its authentication correction is `4f1fd4a9e84391242c57348e2643545477e35941`.
+
+The exact rebind release binary SHA-256 is `80b8cdbe967f75e46ed1034e0d43500bafa80a7ce5981a0fbabe3845df4aa6f9`. Its 36-cell RocksDB/SlateDB sweep is `/root/repos/lix-evidence/experiment-c-2cf/model/backend-sweep-exact.csv`, SHA-256 `bd45e427adc1c6d13fe7ca55d38e2cfbfba2a70fcf43c36fbb0e909501070512`; stderr is empty. The public `schema_v1_seven_types_have_a_runnable_entity_surface` gate passes 2/2 (base and tracked-state rebuild), log SHA-256 `a3f615e0dc989e2b03d8d775f34cdf8de8b756362b3392a90cab345d9bf65756`.
+
+The 64/256-byte dominant fixtures are schema-bound scalar tuples with no JSONB; the 1/4 KiB cases add one optional opaque varlen cell. The page layer carries those canonical tuple bytes and schema fingerprint opaquely; it does not parse text, uuid, int8, float8, boolean, jsonb, or timestamptz fields.
