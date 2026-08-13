@@ -1,5 +1,5 @@
 use lix::open_lix;
-use lix_storage_filesystem::LocalFilesystem;
+use lix_storage_filesystem::FilesystemStorage;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::args()
@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     runtime.block_on(async move {
-        let storage = LocalFilesystem::open(&root)?;
+        let storage = FilesystemStorage::new(&root).open()?;
         let lix = open_lix().with_storage(storage.clone()).await?;
         let sync = storage.start_sync(&lix).await?;
 

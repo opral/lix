@@ -6,7 +6,7 @@ description: Give each agent an isolated branch, preview its changes, then merge
 
 Agents make fast, useful, and sometimes wrong changes. Lix gives each agent task its own branch so a human or policy can review the work before it reaches main.
 
-Agents can work through normal files with `LocalFilesystem`, through SQL, or through a hosted Lix server. All writes stay isolated on the task branch.
+Agents can work through normal files with `FilesystemStorage`, through SQL, or through a hosted Lix server. All writes stay isolated on the task branch.
 
 ## The pattern
 
@@ -41,7 +41,7 @@ if (preview.conflicts.length === 0) {
 
 ## Local file repository
 
-Use `LocalFilesystem` when the agent works with files on disk. See
+Use `FilesystemStorage` when the agent works with files on disk. See
 [Persistence and Storage](./persistence.md#local-filesystem) for setup.
 
 ## Hosted repository

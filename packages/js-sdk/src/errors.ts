@@ -36,22 +36,3 @@ export function invalidParam(
 	};
 	return error;
 }
-
-export function localFilesystemNotOpen(operation: string): LixJsError {
-	const error = new Error(
-		`LocalFilesystem.${operation}() requires the storage to be opened with openLix() first`,
-	) as LixJsError;
-	error.name = "LixError";
-	error.code = "LIX_LOCAL_FILESYSTEM_NOT_OPEN";
-	error.details = { operation };
-	return error;
-}
-
-export function localFilesystemAlreadyOpen(): LixJsError {
-	const error = new Error(
-		"openLix() LocalFilesystem is already open; close the existing Lix or create a new LocalFilesystem",
-	) as LixJsError;
-	error.name = "LixError";
-	error.code = "LIX_LOCAL_FILESYSTEM_IN_USE";
-	return error;
-}

@@ -96,13 +96,11 @@ Every step is recorded in the engine's optimization log, including two designs t
 Lix can now use a plain directory as a filesystem storage:
 
 ```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({
-    path: "./workspace",
-    syncAllFiles: true,
-  }),
+	storage: new FilesystemStorage({ path: "./repository" }),
 });
 ```
 

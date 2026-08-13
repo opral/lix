@@ -106,7 +106,7 @@ where
 /// against `Memory` alone exercise the easy case: the higher-ranked obstruction
 /// that forces `AssumeSendFuture` collapses before rustc ever gets there. The
 /// shipping RocksDB adapter is `Read<'a> = RocksDBRead<'a>`, and
-/// `LocalFilesystem` borrows in both `Read` and `Write`. This adapter
+/// `FilesystemStorage` borrows in both `Read` and `Write`. This adapter
 /// reproduces that shape over `Memory`'s storage so the `Send` proofs cover the
 /// configuration that actually ships.
 #[cfg(test)]

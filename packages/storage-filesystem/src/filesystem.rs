@@ -35,7 +35,6 @@ const FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS: usize = 4;
 struct FilesystemLayout {
     root: PathBuf,
     lix_dir: PathBuf,
-    lix_dir_is_default: bool,
 }
 
 impl FilesystemLayout {
@@ -77,21 +76,40 @@ impl FilesystemLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct LocalFilesystemOpenOptions {
-    pub root: PathBuf,
-    pub lix_dir: Option<PathBuf>,
-    pub sync_all_files: bool,
+pub struct FilesystemStorageOptions {
+    path: PathBuf,
+    sync_all_files: bool,
 }
 
-impl LocalFilesystemOpenOptions {
-    pub fn new<P>(root: P, sync_all_files: bool) -> Self
+impl FilesystemStorageOptions {
+    pub fn sync_all_files(mut self, sync_all_files: bool) -> Self {
+        self.sync_all_files = sync_all_files;
+        self
+    }
+
+    pub fn open(self) -> Result<FilesystemStorage, LixError> {
+        let layout = prepare_filesystem_layout(&self.path)?;
+        Ok(FilesystemStorage {
+            inner: open_filesystem_rocksdb(&layout)?,
+            layout,
+            sync_all_files: self.sync_all_files,
+            supervisor: Arc::new(Mutex::new(None)),
+        })
+    }
+}
+
+impl FilesystemStorage {
+    #[expect(
+        clippy::new_ret_no_self,
+        reason = "opening filesystem storage is fallible, so new configures and open performs I/O"
+    )]
+    pub fn new<P>(path: P) -> FilesystemStorageOptions
     where
         P: Into<PathBuf>,
     {
-        Self {
-            root: root.into(),
-            lix_dir: None,
-            sync_all_files,
+        FilesystemStorageOptions {
+            path: path.into(),
+            sync_all_files: true,
         }
     }
 }
@@ -103,17 +121,17 @@ struct FilesystemPathFilter {
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct LocalFilesystem {
+pub struct FilesystemStorage {
     inner: RocksDBFilesystem,
     layout: FilesystemLayout,
     sync_all_files: bool,
     supervisor: Arc<Mutex<Option<Weak<FilesystemSupervisorInner>>>>,
 }
 
-pub type LocalFilesystemRead<'a> = crate::RocksDBFilesystemRead<'a>;
+pub type FilesystemStorageRead<'a> = crate::RocksDBFilesystemRead<'a>;
 
 #[expect(missing_debug_implementations)]
-pub struct LocalFilesystemWrite {
+pub struct FilesystemStorageWrite {
     inner: crate::RocksDBFilesystemWrite,
     supervisor: Option<Weak<FilesystemSupervisorInner>>,
 }
@@ -125,7 +143,7 @@ struct FilesystemSupervisor {
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct LocalFilesystemSync {
+pub struct FilesystemStorageSync {
     supervisor: FilesystemSupervisor,
 }
 
@@ -146,7 +164,7 @@ struct FilesystemWatchPath {
 }
 
 struct FilesystemState {
-    lix: Lix<LocalFilesystem>,
+    lix: Lix<FilesystemStorage>,
     layout: FilesystemLayout,
     path_filter: Mutex<FilesystemPathFilter>,
     sync_lock: tokio::sync::Mutex<()>,
@@ -300,34 +318,13 @@ enum FilesystemEvent {
     Shutdown,
 }
 
-impl LocalFilesystem {
-    pub fn open<P>(dir: P) -> Result<Self, LixError>
-    where
-        P: AsRef<Path>,
-    {
-        Self::open_with_options(LocalFilesystemOpenOptions {
-            root: dir.as_ref().to_path_buf(),
-            lix_dir: None,
-            sync_all_files: true,
-        })
-    }
-
-    pub fn open_with_options(options: LocalFilesystemOpenOptions) -> Result<Self, LixError> {
-        let layout = prepare_filesystem_layout(&options.root, options.lix_dir.as_deref())?;
-        Ok(Self {
-            inner: open_filesystem_rocksdb(&layout)?,
-            layout,
-            sync_all_files: options.sync_all_files,
-            supervisor: Arc::new(Mutex::new(None)),
-        })
-    }
-
+impl FilesystemStorage {
     /// Starts bidirectional filesystem synchronization using another session
     /// on the supplied Lix repository.
     pub async fn start_sync(
         &self,
-        lix: &Lix<LocalFilesystem>,
-    ) -> Result<LocalFilesystemSync, LixError> {
+        lix: &Lix<FilesystemStorage>,
+    ) -> Result<FilesystemStorageSync, LixError> {
         if self
             .supervisor
             .lock()
@@ -357,11 +354,11 @@ impl LocalFilesystem {
             .lock()
             .expect("filesystem supervisor lock should not poison") =
             Some(Arc::downgrade(&supervisor.inner));
-        Ok(LocalFilesystemSync { supervisor })
+        Ok(FilesystemStorageSync { supervisor })
     }
 }
 
-impl LocalFilesystemSync {
+impl FilesystemStorageSync {
     pub async fn import_paths<I, S>(&self, paths: I) -> Result<(), LixError>
     where
         I: IntoIterator<Item = S>,
@@ -382,14 +379,14 @@ impl LocalFilesystemSync {
     }
 }
 
-impl Storage for LocalFilesystem {
+impl Storage for FilesystemStorage {
     type Read<'a>
-        = LocalFilesystemRead<'a>
+        = FilesystemStorageRead<'a>
     where
         Self: 'a;
 
     type Write<'a>
-        = LocalFilesystemWrite
+        = FilesystemStorageWrite
     where
         Self: 'a;
 
@@ -405,7 +402,7 @@ impl Storage for LocalFilesystem {
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
-            Ok(LocalFilesystemWrite {
+            Ok(FilesystemStorageWrite {
                 inner: self.inner.begin_write(opts).await?,
                 supervisor: self
                     .supervisor
@@ -417,7 +414,7 @@ impl Storage for LocalFilesystem {
     }
 }
 
-impl StorageWrite for LocalFilesystemWrite {
+impl StorageWrite for FilesystemStorageWrite {
     fn put_many(
         &mut self,
         space: StorageSpace,
@@ -462,7 +459,7 @@ impl StorageWrite for LocalFilesystemWrite {
 
 impl FilesystemSupervisor {
     async fn open(
-        lix: Lix<LocalFilesystem>,
+        lix: Lix<FilesystemStorage>,
         layout: FilesystemLayout,
         path_filter: FilesystemPathFilter,
     ) -> Result<Self, LixError> {
@@ -2092,74 +2089,15 @@ fn unsupported_materialization_entry(path: &str, local_path: &Path) -> LixError 
     )
 }
 
-fn prepare_filesystem_layout(
-    root: &Path,
-    lix_dir: Option<&Path>,
-) -> Result<FilesystemLayout, LixError> {
-    ensure_filesystem_root_directory(root)?;
-    let root = std::fs::canonicalize(root)
-        .map_err(|error| io_error("canonicalize filesystem root", root, error))?;
-    let default_lix_dir = root.join(".lix");
-    let requested_lix_dir = lix_dir.map_or_else(|| default_lix_dir.clone(), absolute_path);
-    validate_lix_directory_name(&requested_lix_dir)?;
-    let requested_lix_dir = normalize_path_lexically(&requested_lix_dir);
-    let default_lix_dir = normalize_path_lexically(&default_lix_dir);
-
-    if requested_lix_dir != default_lix_dir && requested_lix_dir.starts_with(&root) {
-        return Err(filesystem_error(format!(
-            "external filesystem .lix path {} must be outside root {}",
-            requested_lix_dir.display(),
-            root.display()
-        )));
-    }
-
-    ensure_filesystem_lix_directory(&requested_lix_dir)?;
-    let canonical_lix_dir = std::fs::canonicalize(&requested_lix_dir).map_err(|error| {
-        io_error(
-            "canonicalize filesystem .lix directory",
-            &requested_lix_dir,
-            error,
-        )
-    })?;
-    if canonical_lix_dir != default_lix_dir && canonical_lix_dir.starts_with(&root) {
-        return Err(filesystem_error(format!(
-            "external filesystem .lix path {} must be outside root {}",
-            canonical_lix_dir.display(),
-            root.display()
-        )));
-    }
-
-    Ok(FilesystemLayout {
-        root,
-        lix_dir_is_default: canonical_lix_dir == default_lix_dir,
-        lix_dir: canonical_lix_dir,
-    })
-}
-
-fn absolute_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
-}
-
-fn normalize_path_lexically(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::Normal(segment) => normalized.push(segment),
-        }
-    }
-    normalized
+fn prepare_filesystem_layout(path: &Path) -> Result<FilesystemLayout, LixError> {
+    ensure_filesystem_root_directory(path)?;
+    let root = std::fs::canonicalize(path)
+        .map_err(|error| io_error("canonicalize filesystem path", path, error))?;
+    let lix_dir = root.join(".lix");
+    ensure_filesystem_lix_directory(&lix_dir)?;
+    let lix_dir = std::fs::canonicalize(&lix_dir)
+        .map_err(|error| io_error("canonicalize filesystem .lix directory", &lix_dir, error))?;
+    Ok(FilesystemLayout { root, lix_dir })
 }
 
 fn open_filesystem_rocksdb(layout: &FilesystemLayout) -> Result<RocksDBFilesystem, LixError> {
@@ -2171,11 +2109,7 @@ fn ensure_filesystem_rocksdb_metadata_directory(
     layout: &FilesystemLayout,
 ) -> Result<PathBuf, LixError> {
     ensure_filesystem_lix_directory(&layout.lix_dir)?;
-    if layout.lix_dir_is_default {
-        remove_legacy_filesystem_root_metadata(&layout.root, &layout.lix_dir)?;
-    } else {
-        remove_legacy_filesystem_lix_metadata(&layout.lix_dir)?;
-    }
+    remove_legacy_filesystem_root_metadata(&layout.root, &layout.lix_dir)?;
     let internal_dir = layout.lix_dir.join(".internal");
     reset_legacy_filesystem_internal_directory(&internal_dir)?;
     ensure_metadata_directory(&internal_dir, "filesystem metadata directory")?;
@@ -2397,7 +2331,7 @@ mod tests {
         layout: FilesystemLayout,
         path_filter: FilesystemPathFilter,
     ) -> FilesystemState {
-        let storage = LocalFilesystem {
+        let storage = FilesystemStorage {
             inner: open_filesystem_rocksdb(&layout).unwrap(),
             layout: layout.clone(),
             sync_all_files: path_filter.is_unfiltered(),
@@ -2490,11 +2424,7 @@ mod tests {
         std::fs::create_dir_all(&lix_dir).unwrap();
         std::fs::write(root.join("target.txt"), b"target").unwrap();
         symlink("target.txt", root.join("link.txt")).unwrap();
-        let layout = FilesystemLayout {
-            root,
-            lix_dir,
-            lix_dir_is_default: true,
-        };
+        let layout = FilesystemLayout { root, lix_dir };
 
         let error = write_materialized_file(&layout, "/link.txt", b"replacement")
             .expect_err("a symlink collision must be reported");
@@ -2542,7 +2472,6 @@ mod tests {
         let layout = FilesystemLayout {
             root: std::fs::canonicalize(root).unwrap(),
             lix_dir: std::fs::canonicalize(lix_dir).unwrap(),
-            lix_dir_is_default: true,
         };
         let snapshot = collect_local_snapshot(&layout, &FilesystemPathFilter::default()).unwrap();
 
@@ -2585,7 +2514,7 @@ mod tests {
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("docs").join("note.markdown"), b"note").unwrap();
 
-        let layout = prepare_filesystem_layout(root, None).unwrap();
+        let layout = prepare_filesystem_layout(root).unwrap();
         std::fs::create_dir_all(layout.lix_dir.join("app_data")).unwrap();
         std::fs::write(
             layout.lix_dir.join("app_data").join("test.bin"),
@@ -2650,7 +2579,7 @@ mod tests {
     #[tokio::test]
     async fn disk_sync_remembers_canonical_snapshot_for_idle_skip() {
         let tempdir = tempfile::tempdir().unwrap();
-        let layout = prepare_filesystem_layout(tempdir.path(), None).unwrap();
+        let layout = prepare_filesystem_layout(tempdir.path()).unwrap();
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
         state.sync_disk_to_lix(false).await.unwrap();
@@ -2673,7 +2602,7 @@ mod tests {
     #[tokio::test]
     async fn disk_sync_does_not_reimport_unchanged_materialized_file_deleted_in_lix() {
         let tempdir = tempfile::tempdir().unwrap();
-        let layout = prepare_filesystem_layout(tempdir.path(), None).unwrap();
+        let layout = prepare_filesystem_layout(tempdir.path()).unwrap();
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
         state.sync_disk_to_lix(false).await.unwrap();
@@ -2713,7 +2642,7 @@ mod tests {
     #[tokio::test]
     async fn disk_sync_does_not_skip_lix_side_file_content_change() {
         let tempdir = tempfile::tempdir().unwrap();
-        let layout = prepare_filesystem_layout(tempdir.path(), None).unwrap();
+        let layout = prepare_filesystem_layout(tempdir.path()).unwrap();
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
         state.sync_disk_to_lix(false).await.unwrap();
@@ -2742,7 +2671,7 @@ mod tests {
     #[tokio::test]
     async fn disk_sync_materialization_preserves_file_changed_after_import() {
         let tempdir = tempfile::tempdir().unwrap();
-        let layout = prepare_filesystem_layout(tempdir.path(), None).unwrap();
+        let layout = prepare_filesystem_layout(tempdir.path()).unwrap();
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
 
         state.sync_disk_to_lix(false).await.unwrap();
@@ -2789,17 +2718,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_filesystem_sync_disk_to_lix_syncs_repository_files() {
+    async fn filesystem_storage_sync_disk_to_lix_syncs_repository_files() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"initial").unwrap();
         std::fs::write(tempdir.path().join("ignored.md"), b"ignored").unwrap();
 
-        let storage = LocalFilesystem::open_with_options(LocalFilesystemOpenOptions {
-            root: tempdir.path().to_path_buf(),
-            lix_dir: None,
-            sync_all_files: true,
-        })
-        .unwrap();
+        let storage = FilesystemStorage::new(tempdir.path()).open().unwrap();
         let lix = lix::open_lix().with_storage(storage.clone()).await.unwrap();
         let sync = storage.start_sync(&lix).await.unwrap();
 
@@ -2846,16 +2770,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_filesystem_sync_disk_to_lix_outlives_lix_session() {
+    async fn filesystem_storage_sync_disk_to_lix_outlives_lix_session() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::write(tempdir.path().join("tracked.md"), b"initial").unwrap();
 
-        let storage = LocalFilesystem::open_with_options(LocalFilesystemOpenOptions {
-            root: tempdir.path().to_path_buf(),
-            lix_dir: None,
-            sync_all_files: true,
-        })
-        .unwrap();
+        let storage = FilesystemStorage::new(tempdir.path()).open().unwrap();
         let lix = lix::open_lix().with_storage(storage.clone()).await.unwrap();
         let sync = storage.start_sync(&lix).await.unwrap();
 
@@ -2881,41 +2800,6 @@ mod tests {
                 .unwrap(),
             b"changed"
         );
-        lix.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn external_lix_dir_stores_rocksdb_and_lix_files_outside_root() {
-        let root = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
-        let lix_dir = external.path().join(".lix");
-
-        let storage = LocalFilesystem::open_with_options(LocalFilesystemOpenOptions {
-            root: root.path().to_path_buf(),
-            lix_dir: Some(lix_dir.clone()),
-            sync_all_files: true,
-        })
-        .unwrap();
-        let lix = lix::open_lix().with_storage(storage.clone()).await.unwrap();
-        let _sync = storage.start_sync(&lix).await.unwrap();
-
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-            &[
-                Value::Text("/.lix/app_data/test.bin".to_string()),
-                Value::Blob(b"plugin".to_vec().into()),
-            ],
-        )
-        .await
-        .unwrap();
-
-        assert!(lix_dir.join(".internal").join("rocksdb").is_dir());
-        assert_eq!(
-            std::fs::read(lix_dir.join("app_data").join("test.bin")).unwrap(),
-            b"plugin"
-        );
-        assert!(!root.path().join(".lix").exists());
-
         lix.close().await.unwrap();
     }
 }

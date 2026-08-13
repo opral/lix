@@ -9,7 +9,7 @@ use lix::{
     ObserveEvents as RsObserveEvents, RedoReceipt, SwitchBranchOptions as RsSwitchBranchOptions,
     SwitchBranchReceipt, UndoReceipt, Value, open_lix,
 };
-use lix_storage_filesystem::{LocalFilesystem, LocalFilesystemOpenOptions, LocalFilesystemSync};
+use lix_storage_filesystem::{FilesystemStorage, FilesystemStorageSync};
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -48,17 +48,17 @@ pub struct NativeLix {
 
 enum NativeLixInner {
     Memory(RsLix<Memory>),
-    LocalFilesystem(RsLix<LocalFilesystem>, LocalFilesystemSync),
+    FilesystemStorage(RsLix<FilesystemStorage>, FilesystemStorageSync),
 }
 
 enum NativeLixTransactionInner {
     Memory(RsLixTransaction<Memory>),
-    LocalFilesystem(RsLixTransaction<LocalFilesystem>),
+    FilesystemStorage(RsLixTransaction<FilesystemStorage>),
 }
 
 enum NativeObserveEventsInner {
     Memory(RsObserveEvents<Memory>),
-    LocalFilesystem(RsObserveEvents<LocalFilesystem>),
+    FilesystemStorage(RsObserveEvents<FilesystemStorage>),
 }
 
 #[napi(object)]
@@ -575,7 +575,7 @@ impl NativeLixInner {
                     None => execution.await,
                 }
             }
-            Self::LocalFilesystem(lix, _) => {
+            Self::FilesystemStorage(lix, _) => {
                 let execution = lix.execute(sql, params);
                 match options {
                     Some(origin_key) => execution.with_origin_key(origin_key).await,
@@ -598,7 +598,7 @@ impl NativeLixInner {
                     None => execution.await,
                 }
             }
-            Self::LocalFilesystem(lix, _) => {
+            Self::FilesystemStorage(lix, _) => {
                 let execution = lix.execute_batch(statements);
                 match options {
                     Some(origin_key) => execution.with_origin_key(origin_key).await,
@@ -613,7 +613,7 @@ impl NativeLixInner {
             Self::Memory(lix) => Ok(NativeLixTransactionInner::Memory(
                 lix.begin_transaction().await?,
             )),
-            Self::LocalFilesystem(lix, _) => Ok(NativeLixTransactionInner::LocalFilesystem(
+            Self::FilesystemStorage(lix, _) => Ok(NativeLixTransactionInner::FilesystemStorage(
                 lix.begin_transaction().await?,
             )),
         }
@@ -626,7 +626,7 @@ impl NativeLixInner {
     ) -> std::result::Result<NativeObserveEventsInner, LixError> {
         match self {
             Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
-            Self::LocalFilesystem(lix, _) => Ok(NativeObserveEventsInner::LocalFilesystem(
+            Self::FilesystemStorage(lix, _) => Ok(NativeObserveEventsInner::FilesystemStorage(
                 lix.observe(sql, params)?,
             )),
         }
@@ -635,14 +635,14 @@ impl NativeLixInner {
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
         match self {
             Self::Memory(lix) => lix.active_branch_id().await,
-            Self::LocalFilesystem(lix, _) => lix.active_branch_id().await,
+            Self::FilesystemStorage(lix, _) => lix.active_branch_id().await,
         }
     }
 
     fn active_account_id(&self) -> &str {
         match self {
             Self::Memory(lix) => lix.active_account_id(),
-            Self::LocalFilesystem(lix, _) => lix.active_account_id(),
+            Self::FilesystemStorage(lix, _) => lix.active_account_id(),
         }
     }
 
@@ -652,28 +652,28 @@ impl NativeLixInner {
     ) -> std::result::Result<CreateBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.create_branch(options).await,
-            Self::LocalFilesystem(lix, _) => lix.create_branch(options).await,
+            Self::FilesystemStorage(lix, _) => lix.create_branch(options).await,
         }
     }
 
     async fn create_checkpoint(&self) -> std::result::Result<CreateCheckpointReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.create_checkpoint().await,
-            Self::LocalFilesystem(lix, _) => lix.create_checkpoint().await,
+            Self::FilesystemStorage(lix, _) => lix.create_checkpoint().await,
         }
     }
 
     async fn undo(&self) -> std::result::Result<UndoReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.undo().await,
-            Self::LocalFilesystem(lix, _) => lix.undo().await,
+            Self::FilesystemStorage(lix, _) => lix.undo().await,
         }
     }
 
     async fn redo(&self) -> std::result::Result<RedoReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.redo().await,
-            Self::LocalFilesystem(lix, _) => lix.redo().await,
+            Self::FilesystemStorage(lix, _) => lix.redo().await,
         }
     }
 
@@ -683,7 +683,7 @@ impl NativeLixInner {
     ) -> std::result::Result<SwitchBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.switch_branch(options).await,
-            Self::LocalFilesystem(lix, _) => lix.switch_branch(options).await,
+            Self::FilesystemStorage(lix, _) => lix.switch_branch(options).await,
         }
     }
 
@@ -692,7 +692,7 @@ impl NativeLixInner {
         paths: Vec<String>,
     ) -> std::result::Result<(), LixError> {
         match self {
-            Self::LocalFilesystem(_, sync) => sync.import_paths(paths).await,
+            Self::FilesystemStorage(_, sync) => sync.import_paths(paths).await,
             Self::Memory(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_STORAGE",
                 "importFilesystemPaths requires a filesystem storage",
@@ -706,7 +706,7 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchPreview, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch_preview(options).await,
-            Self::LocalFilesystem(lix, _) => lix.merge_branch_preview(options).await,
+            Self::FilesystemStorage(lix, _) => lix.merge_branch_preview(options).await,
         }
     }
 
@@ -716,13 +716,13 @@ impl NativeLixInner {
     ) -> std::result::Result<MergeBranchReceipt, LixError> {
         match self {
             Self::Memory(lix) => lix.merge_branch(options).await,
-            Self::LocalFilesystem(lix, _) => lix.merge_branch(options).await,
+            Self::FilesystemStorage(lix, _) => lix.merge_branch(options).await,
         }
     }
 
     async fn sync_disk_to_lix(&self) -> std::result::Result<(), LixError> {
         match self {
-            Self::LocalFilesystem(_, sync) => sync.sync_disk_to_lix().await,
+            Self::FilesystemStorage(_, sync) => sync.sync_disk_to_lix().await,
             Self::Memory(_) => Err(LixError::new(
                 "LIX_UNSUPPORTED_STORAGE",
                 "syncDiskToLix requires a filesystem storage",
@@ -733,7 +733,7 @@ impl NativeLixInner {
     async fn close(&self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(lix) => lix.close().await,
-            Self::LocalFilesystem(lix, _) => lix.close().await,
+            Self::FilesystemStorage(lix, _) => lix.close().await,
         }
     }
 }
@@ -753,7 +753,7 @@ impl NativeLixTransactionInner {
                     None => execution.await,
                 }
             }
-            Self::LocalFilesystem(transaction) => {
+            Self::FilesystemStorage(transaction) => {
                 let execution = transaction.execute(sql, params);
                 match options {
                     Some(origin_key) => execution.with_origin_key(origin_key).await,
@@ -766,14 +766,14 @@ impl NativeLixTransactionInner {
     async fn commit(self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(transaction) => transaction.commit().await,
-            Self::LocalFilesystem(transaction) => transaction.commit().await,
+            Self::FilesystemStorage(transaction) => transaction.commit().await,
         }
     }
 
     async fn rollback(self) -> std::result::Result<(), LixError> {
         match self {
             Self::Memory(transaction) => transaction.rollback().await,
-            Self::LocalFilesystem(transaction) => transaction.rollback().await,
+            Self::FilesystemStorage(transaction) => transaction.rollback().await,
         }
     }
 }
@@ -782,22 +782,21 @@ impl NativeObserveEventsInner {
     async fn next(&mut self) -> std::result::Result<Option<RsObserveEvent>, LixError> {
         match self {
             Self::Memory(events) => events.next().await,
-            Self::LocalFilesystem(events) => events.next().await,
+            Self::FilesystemStorage(events) => events.next().await,
         }
     }
 
     fn close(&mut self) {
         match self {
             Self::Memory(events) => events.close(),
-            Self::LocalFilesystem(events) => events.close(),
+            Self::FilesystemStorage(events) => events.close(),
         }
     }
 }
 
 #[expect(missing_debug_implementations)]
-pub struct OpenLocalFilesystemTask {
+pub struct OpenFilesystemStorageTask {
     path: String,
-    lix_dir: Option<String>,
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 }
@@ -807,14 +806,13 @@ pub struct OpenMemoryTask {
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 }
 
-impl Task for OpenLocalFilesystemTask {
+impl Task for OpenFilesystemStorageTask {
     type Output = std::result::Result<NativeLix, LixError>;
     type JsValue = NativeLix;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        Ok(open_local_filesystem_native(
+        Ok(open_filesystem_storage_native(
             std::mem::take(&mut self.path),
-            self.lix_dir.take(),
             self.sync_all_files,
             self.telemetry_dispatch.take(),
         ))
@@ -862,9 +860,8 @@ fn open_memory_native(
     NativeLix::new(NativeLixInner::Memory(lix))
 }
 
-fn open_local_filesystem_native(
+fn open_filesystem_storage_native(
     path: String,
-    lix_dir: Option<String>,
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 ) -> std::result::Result<NativeLix, LixError> {
@@ -872,9 +869,9 @@ fn open_local_filesystem_native(
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let mut options = LocalFilesystemOpenOptions::new(path, sync_all_files);
-    options.lix_dir = lix_dir.map(Into::into);
-    let storage = LocalFilesystem::open_with_options(options)?;
+    let storage = FilesystemStorage::new(path)
+        .sync_all_files(sync_all_files)
+        .open()?;
     let lix = match telemetry_dispatch.map(telemetry_sink) {
         Some(telemetry) => rt.block_on(async {
             open_lix()
@@ -885,7 +882,7 @@ fn open_local_filesystem_native(
         None => rt.block_on(async { open_lix().with_storage(storage.clone()).await })?,
     };
     let sync = rt.block_on(storage.start_sync(&lix))?;
-    NativeLix::new(NativeLixInner::LocalFilesystem(lix, sync))
+    NativeLix::new(NativeLixInner::FilesystemStorage(lix, sync))
 }
 
 #[napi]
@@ -899,16 +896,14 @@ impl NativeLix {
         }))
     }
 
-    #[napi(js_name = "openLocalFilesystem")]
-    pub fn open_local_filesystem(
+    #[napi(js_name = "openFilesystemStorage")]
+    pub fn open_filesystem_storage(
         path: String,
-        lix_dir: Option<String>,
         sync_all_files: bool,
         telemetry_dispatch: Option<Function<'_, String, ()>>,
-    ) -> Result<AsyncTask<OpenLocalFilesystemTask>> {
-        Ok(AsyncTask::new(OpenLocalFilesystemTask {
+    ) -> Result<AsyncTask<OpenFilesystemStorageTask>> {
+        Ok(AsyncTask::new(OpenFilesystemStorageTask {
             path,
-            lix_dir,
             sync_all_files,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
         }))
