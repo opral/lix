@@ -40,7 +40,7 @@
 //! to [`InjectedFault::None`], so a normal run is unaffected.
 //!
 //! ```text
-//! for fault in state working_diff history merge reboot reclaim; do
+//! for fault in state working_diff history merge reboot reclaim gc_history; do
 //!   LIX_VC_MODEL_INJECT=$fault cargo test --profile test -p lix \
 //!     --test integration --all-features -- --test-threads=1 vc_model_
 //! done   # every one of these must fail
@@ -92,6 +92,8 @@ enum InjectedFault {
     Reboot,
     /// Assert the post-GC snapshot against a mutated expectation.
     Reclaim,
+    /// Mutate the pre-sweep history the post-sweep history is compared against.
+    GcHistory,
 }
 
 impl InjectedFault {
@@ -107,9 +109,11 @@ impl InjectedFault {
             "merge" => Self::Merge,
             "reboot" => Self::Reboot,
             "reclaim" => Self::Reclaim,
+            "gc_history" => Self::GcHistory,
             other => panic!(
                 "LIX_VC_MODEL_INJECT must be one of \
-                 none|state|working_diff|history|merge|reboot|reclaim, got {other:?}"
+                 none|state|working_diff|history|merge|reboot|reclaim|gc_history, \
+                 got {other:?}"
             ),
         }
     }
@@ -543,7 +547,7 @@ simulation_test!(
 
         assert_state(&main, prefix, &model.state, "before gc").await;
         assert_history(&main, prefix, &model, "before gc").await;
-        let history_before = read_history(&main, prefix).await;
+        let mut history_before = read_history(&main, prefix).await;
 
         // Cross the collection interval.
         for _ in 0..CHECKPOINT_GC_INTERVAL {
@@ -567,6 +571,12 @@ simulation_test!(
         // Current state must survive the sweep exactly. This is the strongest
         // reclaim property and it holds today.
         assert_state(&main, prefix, &model.state, "after gc").await;
+
+        if fault == InjectedFault::GcHistory {
+            if let Some((_, entries)) = history_before.iter_mut().next() {
+                entries.remove(0);
+            }
+        }
 
         let history_after = read_history(&main, prefix).await;
         assert_history_survived_gc(&history_before, &history_after, "after gc");
@@ -764,73 +774,50 @@ async fn assert_history(session: &SimSession, prefix: &str, model: &BranchModel,
 
 /// Asserts that a checkpoint GC sweep does not change observable history.
 ///
-/// # The defect this now guards
+/// # The defect this guards
 ///
-/// A sweep used to truncate entity history to the newest couple of
-/// checkpoints. `collect_ref_reachable_commit_ids` fed its result to the
-/// *semantic* retention only, so a graph-reachable commit kept its projection
-/// and lost its delta segments — and an entity history row is served out of the
-/// delta. `load_commit_delta_members_with_payloads_for_schemas` returns an
-/// empty member list for a commit whose replay state is gone, so the truncation
-/// raised no error: the swept commits read as commits that changed nothing.
-/// Current state was unaffected throughout, which is why nothing else caught
-/// it.
+/// A sweep used to damage entity history. `collect_ref_reachable_commit_ids`
+/// fed its result to the *semantic* retention only, so a graph-reachable commit
+/// kept its projection and lost its delta segments — and an entity history row
+/// is served out of the delta.
+/// `load_commit_delta_members_with_payloads_for_schemas` returns an empty
+/// member list for a commit whose replay state is gone, so the damage raised no
+/// error: the swept commits read as commits that changed nothing. Current state
+/// was unaffected throughout, which is why nothing else caught it.
 ///
-/// Equality is the right assertion and not an over-strong one. A sweep frees
-/// the *unreachable* interior — the intra-interval commits the checkpoint
-/// superseded — and those never contributed a history entry, because the engine
-/// collapses an un-checkpointed interval into one commit. Nothing a sweep is
-/// entitled to collect is observable here, so any change at all is a defect.
+/// # Why equality, and not "a sweep may drop the oldest entries"
 ///
-/// `LIX_VC_MODEL_GC_HISTORY=prefix` weakens this back to the pre-fix invariant
-/// (what remains must be an exact newest-first prefix, and no key that still
-/// has state may lose its history entirely). That is retained as the inversion
-/// control: it is the assertion that passed while the defect was live, so a run
-/// under it must still pass, proving the strict form is what does the work.
+/// That weaker invariant — what remains must be an exact newest-first prefix of
+/// what was there before — was the first form of this assertion, chosen to be a
+/// gate the tree could pass while the defect was open. Measuring the defect
+/// disproved it. At six checkpointed rounds the sweep truncated; at twelve it
+/// dropped entries out of the *middle*, so the surviving sequence closed up and
+/// an older value appeared at the position a newer one had occupied:
+///
+/// ```text
+/// before: [ ...7189b9e18, 1582bff8a4dd11c8 ]
+/// after:  [ ...7189b9e18, b1bba5cbd88ff978 ]   <- wrong value, same depth
+/// ```
+///
+/// So the weak form was not merely weak, it was false, and a blame query could
+/// return a wrong answer rather than a missing one.
+///
+/// Equality is also not over-strong. A sweep frees the *unreachable* interior —
+/// the intra-interval commits a checkpoint superseded — and those never
+/// contributed a history entry, because the engine collapses an
+/// un-checkpointed interval into one commit. Nothing a sweep is entitled to
+/// collect is observable here, so any change at all is a defect.
+///
+/// `LIX_VC_MODEL_INJECT=gc_history` proves this assertion can fail.
 fn assert_history_survived_gc(
     before: &BTreeMap<String, Vec<Option<JsonValue>>>,
     after: &BTreeMap<String, Vec<Option<JsonValue>>>,
     label: &str,
 ) {
-    let prefix_only = std::env::var("LIX_VC_MODEL_GC_HISTORY")
-        .map(|value| value.trim() == "prefix")
-        .unwrap_or(false);
-    if !prefix_only {
-        assert_eq!(
-            before, after,
-            "{label}: checkpoint GC changed the observable history"
-        );
-        return;
-    }
-
-    for (key, before_entries) in before {
-        let Some(after_entries) = after.get(key) else {
-            panic!("{label}: checkpoint GC removed all history for {key}");
-        };
-        assert!(
-            !after_entries.is_empty(),
-            "{label}: checkpoint GC left {key} with an empty history"
-        );
-        assert!(
-            after_entries.len() <= before_entries.len(),
-            "{label}: checkpoint GC grew the history for {key}: \
-             {} entries became {}",
-            before_entries.len(),
-            after_entries.len()
-        );
-        assert_eq!(
-            &before_entries[..after_entries.len()],
-            &after_entries[..],
-            "{label}: the history checkpoint GC kept for {key} is not a prefix of the history \
-             that was there before the sweep"
-        );
-    }
-    for key in after.keys() {
-        assert!(
-            before.contains_key(key),
-            "{label}: checkpoint GC invented history for {key}"
-        );
-    }
+    assert_eq!(
+        before, after,
+        "{label}: checkpoint GC changed the observable history"
+    );
 }
 
 async fn branch_head(engine: &lix::integration::Engine, branch_id: &str) -> String {
