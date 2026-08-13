@@ -142,24 +142,20 @@ fn canonicalize_json_text_literal(expr: Expr) -> Result<Expr, DataFusionError> {
     let canonical = match &literal {
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Some(canonical_json_text(value)?),
+        | ScalarValue::LargeUtf8(Some(value)) => Some(
+            crate::sql2::udfs::common::canonical_jsonb_text(value).map_err(|error| {
+                lix_error_to_datafusion_error(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("JSON comparison value is not valid JSON: {error}"),
+                ))
+            })?,
+        ),
         _ => None,
     };
     Ok(canonical.map_or_else(
         || Expr::Literal(literal, metadata),
         |value| Expr::Literal(ScalarValue::Utf8(Some(value)), Some(json_field_metadata())),
     ))
-}
-
-fn canonical_json_text(raw: &str) -> Result<String, DataFusionError> {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .map(|value| value.to_string())
-        .map_err(|error| {
-            lix_error_to_datafusion_error(LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("JSON comparison value is not valid JSON: {error}"),
-            ))
-        })
 }
 
 fn json_field_metadata() -> FieldMetadata {

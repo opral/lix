@@ -23,7 +23,7 @@ use crate::{GLOBAL_BRANCH_ID, LixError, LixNotice, SqlQueryResult, Value};
 use datafusion::arrow::array::{
     Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, PrimitiveArray, StringArray,
-    StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -2488,7 +2488,14 @@ fn datafusion_filter_expr_from_bound_expr(
             if identity_json_comparison_context {
                 if let ScalarValue::Utf8(Some(raw)) = &value {
                     return Ok(Expr::Literal(
-                        ScalarValue::Utf8(Some(canonical_json_text(raw)?)),
+                        ScalarValue::Utf8(Some(
+                            crate::sql2::udfs::common::canonical_jsonb_text(raw).map_err(|error| {
+                                LixError::new(
+                                    LixError::CODE_TYPE_MISMATCH,
+                                    format!("JSON comparison value is not valid JSON: {error}"),
+                                )
+                            })?,
+                        )),
                         Some(json_field_metadata()),
                     ));
                 }
@@ -2503,7 +2510,14 @@ fn datafusion_filter_expr_from_bound_expr(
             if json_comparison_context && identity_json_comparison_context =>
         {
             Ok(Expr::Literal(
-                ScalarValue::Utf8(Some(canonical_json_text(value)?)),
+                ScalarValue::Utf8(Some(
+                    crate::sql2::udfs::common::canonical_jsonb_text(value).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("JSON comparison value is not valid JSON: {error}"),
+                        )
+                    })?,
+                )),
                 Some(json_field_metadata()),
             ))
         }
@@ -2616,17 +2630,6 @@ fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
             if matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk")
     )
-}
-
-fn canonical_json_text(raw: &str) -> Result<String, LixError> {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .map(|value| value.to_string())
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("JSON comparison value is not valid JSON: {error}"),
-            )
-        })
 }
 
 fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
@@ -3020,6 +3023,11 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
             ScalarValue::Utf8(Some(value.to_string())),
             Some(json_field_metadata()),
         ),
+        Value::Timestamp(value) => ScalarValue::TimestampMicrosecond(
+            Some(*value),
+            Some("UTC".into()),
+        )
+        .into(),
         Value::Blob(value) => ScalarValue::LargeBinary(Some(value.to_vec())).into(),
     }
 }
@@ -3124,6 +3132,7 @@ enum ColumnCursor<'a> {
     Utf8View(&'a StringViewArray, TextKind),
     Binary(&'a BinaryArray),
     LargeBinary(&'a LargeBinaryArray),
+    TimestampMicrosecond(&'a TimestampMicrosecondArray),
 }
 
 /// Whether a string column carries JSON payloads, decided once per batch from
@@ -3161,6 +3170,9 @@ fn column_cursor<'a>(
         DataType::Utf8View => ColumnCursor::Utf8View(downcast_column(array)?, text_kind),
         DataType::Binary => ColumnCursor::Binary(downcast_column(array)?),
         DataType::LargeBinary => ColumnCursor::LargeBinary(downcast_column(array)?),
+        DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, _) => {
+            ColumnCursor::TimestampMicrosecond(downcast_column(array)?)
+        }
         other => {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
@@ -3276,6 +3288,15 @@ impl ColumnCursor<'_> {
                         Value::Null
                     } else {
                         Value::Blob(values.value(row_index).into())
+                    });
+                }
+            }
+            Self::TimestampMicrosecond(values) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    row.push(if values.is_null(row_index) {
+                        Value::Null
+                    } else {
+                        Value::Timestamp(values.value(row_index))
                     });
                 }
             }

@@ -5,6 +5,13 @@
 mod benchmark_metrics;
 
 use bytes::Bytes;
+use lix::plugin::runtime::{
+    WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
+    WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityKey, WasmEntityPage,
+    WasmEntitySource, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate, WasmHostBytes,
+    WasmHostEntity, WasmInputBytes, WasmInputSplice, WasmOpenEntitiesInput, WasmPluginSelection,
+    WasmRuntime, WasmSourceRange, WasmSourceSlice, WasmTransitionCounters, WasmTransitionLimits,
+};
 use lix::storage::{
     BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
     ReadOptions, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
@@ -13,14 +20,6 @@ use lix::storage_adapter::{
     StorageAdapter, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
 };
 use lix::storage_bench::{layout_space_catalog, space_inventory};
-use lix::plugin::runtime::{
-    WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
-    WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityKey, WasmEntityPage,
-    WasmEntitySource, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate, WasmHostBytes,
-    WasmHostEntity, WasmInputBytes, WasmInputSplice, WasmOpenEntitiesInput,
-    WasmPluginSelection, WasmRuntime, WasmSourceRange, WasmSourceSlice, WasmTransitionCounters,
-    WasmTransitionLimits,
-};
 use lix::wasm::WasmLimits;
 use lix::{
     CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, MergeBranchOptions,

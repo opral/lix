@@ -51,6 +51,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
     row_index: usize,
     schema_catalog: &mut TransactionCatalog,
     functions: FunctionProviderHandle,
+    default_timestamp: &mut Option<crate::common::LixTimestamp>,
 ) -> Result<NormalizedRowFacts, LixError> {
     let row = rows.row(row_index);
     validate_transaction_write_row_schema_identity(row)?;
@@ -162,7 +163,13 @@ pub(crate) fn normalize_raw_write_row_in_place(
             // result once. Complete plugin snapshots retain their batch
             // handle through the branch below.
             let mut snapshot = snapshot_object_for_mutation(snapshot, row)?;
-            apply_defaults(&mut snapshot, schema_plan, row, functions)?;
+            apply_defaults(
+                &mut snapshot,
+                schema_plan,
+                row,
+                functions,
+                default_timestamp,
+            )?;
             let snapshot = JsonValue::Object(snapshot);
             let entity_pk = resolve_entity_pk(row, schema_plan, &snapshot)?;
             *rows.entity_pk_mut(row_index) = Some(entity_pk);
@@ -351,10 +358,14 @@ fn apply_defaults(
     schema_plan: &SchemaPlan,
     row: RawWriteRowRef<'_>,
     functions: FunctionProviderHandle,
+    default_timestamp: &mut Option<crate::common::LixTimestamp>,
 ) -> Result<bool, LixError> {
+    let timestamp_functions = functions.clone();
     schema_plan
         .defaults
-        .apply(snapshot, functions, &row.schema_key)
+        .apply(snapshot, functions, &row.schema_key, || {
+            Ok(*default_timestamp.get_or_insert_with(|| timestamp_functions.call_timestamp()))
+        })
 }
 
 fn resolve_entity_pk(
@@ -1054,7 +1065,14 @@ mod tests {
     ) -> Result<TransactionWriteRow, LixError> {
         let mut rows = RawWriteBatch::with_capacity(1);
         rows.push(row);
-        normalize_raw_write_row_in_place(&mut rows, 0, catalog, functions)?;
+        let mut default_timestamp = None;
+        normalize_raw_write_row_in_place(
+            &mut rows,
+            0,
+            catalog,
+            functions,
+            &mut default_timestamp,
+        )?;
         Ok(rows.into_rows().pop().expect("single normalized test row"))
     }
 
@@ -1202,7 +1220,7 @@ mod tests {
             "type": "object",
             "properties": {
                 "id": { "type": "string" },
-                "created_at": { "type": "string", "x-lix-default": "lix_timestamp()" }
+                "created_at": { "type": "string", "x-lix-default": "CURRENT_TIMESTAMP" }
             },
             "required": ["id"],
             "additionalProperties": false

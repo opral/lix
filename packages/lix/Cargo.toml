@@ -138,7 +138,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 smallvec = "1.15"
-jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
 globset = "0.4"
 jiff = { version = "0.2.27", default-features = false, features = ["std"] }
 lru = "0.18"

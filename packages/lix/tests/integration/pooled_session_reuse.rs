@@ -139,7 +139,7 @@ async fn volatile_execution_functions_stay_fresh_on_a_reused_session() {
     let session = engine.open_session().await.expect("session should open");
 
     let sql = "SELECT uuidv7() AS first, uuidv7() AS second, \
-        lix_timestamp() AS stamp";
+        CURRENT_TIMESTAMP AS stamp";
     let mut uuids = Vec::new();
     for _ in 0..3 {
         let rows = session.execute(sql, &[]).await.expect("volatile read");
@@ -149,7 +149,10 @@ async fn volatile_execution_functions_stay_fresh_on_a_reused_session() {
             first, second,
             "two calls in one statement returned the same uuid"
         );
-        assert!(text(&rows, "stamp").is_some());
+        assert!(matches!(
+            rows.rows()[0].value("stamp"),
+            Ok(Value::Timestamp(_))
+        ));
         uuids.push(first);
         uuids.push(second);
     }

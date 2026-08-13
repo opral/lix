@@ -46,7 +46,8 @@ use futures_util::stream::{BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, UploadPart,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    UploadPart,
 };
 
 /// A link description: one round trip per request, plus transfer at a rate.

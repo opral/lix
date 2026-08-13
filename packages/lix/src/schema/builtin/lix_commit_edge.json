@@ -17,7 +17,7 @@
     },
     {
       "name": "parent_order",
-      "type": "bigint",
+      "type": "int8",
       "nullable": false,
       "description": "Zero-based position of this parent in the child commit's ordered parent list. The first parent has order 0; additional merge parents have order 1, 2, and so on.",
       "examples": [

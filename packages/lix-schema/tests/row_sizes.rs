@@ -20,18 +20,19 @@
 
 use std::collections::BTreeSet;
 
-use lix_schema::{DataType, Schema};
 use lix_schema::value_layout::{BodyColumn, BodyKind, BodyValue, encode_body};
+use lix_schema::{DataType, Schema};
 use serde_json::Value;
 
 fn kind_of(data_type: DataType) -> BodyKind {
     match data_type {
         DataType::Text => BodyKind::Text,
         DataType::Uuid => BodyKind::Uuid,
-        DataType::BigInt => BodyKind::BigInt,
-        DataType::DoublePrecision => BodyKind::DoublePrecision,
+        DataType::Int8 => BodyKind::Int8,
+        DataType::Float8 => BodyKind::Float8,
         DataType::Boolean => BodyKind::Boolean,
         DataType::Jsonb => BodyKind::Jsonb,
+        DataType::Timestamptz => BodyKind::Timestamptz,
     }
 }
 
@@ -49,8 +50,8 @@ fn synthesise(name: &str, data_type: DataType, example: Option<&Value>) -> (Body
             (BodyValue::Uuid(uuid), Value::String(uuid.to_string()))
         }
         DataType::Boolean => (BodyValue::Boolean(true), Value::Bool(true)),
-        DataType::BigInt => (BodyValue::BigInt(42), Value::from(42)),
-        DataType::DoublePrecision => (BodyValue::DoublePrecision(1.5), Value::from(1.5)),
+        DataType::Int8 => (BodyValue::Int8(42), Value::from(42)),
+        DataType::Float8 => (BodyValue::Float8(1.5), Value::from(1.5)),
         DataType::Text => {
             // Length-realistic by role: hashes and timestamps are the common
             // long text columns; everything else gets a short identifier.
@@ -77,6 +78,10 @@ fn synthesise(name: &str, data_type: DataType, example: Option<&Value>) -> (Body
             };
             (BodyValue::Jsonb(json.clone()), json)
         }
+        DataType::Timestamptz => (
+            BodyValue::Timestamptz(1_778_349_751_123_000),
+            Value::String("2026-05-08T17:42:31.123Z".to_owned()),
+        ),
     }
 }
 
@@ -84,16 +89,21 @@ fn from_json(data_type: DataType, value: &Value) -> Option<BodyValue> {
     Some(match data_type {
         DataType::Text => BodyValue::Text(value.as_str()?.to_owned()),
         DataType::Uuid => BodyValue::Uuid(uuid::Uuid::parse_str(value.as_str()?).ok()?),
-        DataType::BigInt => BodyValue::BigInt(value.as_i64()?),
-        DataType::DoublePrecision => {
+        DataType::Int8 => BodyValue::Int8(value.as_i64()?),
+        DataType::Float8 => {
             let number = value.as_f64()?;
             if !number.is_finite() {
                 return None;
             }
-            BodyValue::DoublePrecision(number)
+            BodyValue::Float8(number)
         }
         DataType::Boolean => BodyValue::Boolean(value.as_bool()?),
         DataType::Jsonb => BodyValue::Jsonb(value.clone()),
+        DataType::Timestamptz => BodyValue::Timestamptz(
+            chrono::DateTime::parse_from_rfc3339(value.as_str()?)
+                .ok()?
+                .timestamp_micros(),
+        ),
     })
 }
 
@@ -178,7 +188,10 @@ fn bytes_per_row_over_every_schema_v1_fixture() {
         ));
     }
 
-    println!("\nvlayout-8813 BYTES PER ROW (values included), {} fixtures", rows.len());
+    println!(
+        "\nvlayout-8813 BYTES PER ROW (values included), {} fixtures",
+        rows.len()
+    );
     println!(
         "{:<28} {:>4} {:>3} {:>10} {:>10} {:>8}",
         "schema", "cols", "pk", "candidate", "incumbent", "ratio"
@@ -191,7 +204,9 @@ fn bytes_per_row_over_every_schema_v1_fixture() {
     }
     println!(
         "{:<28} {:>4} {:>3} {candidate_total:>10} {incumbent_total:>10} {:>7.2}x",
-        "TOTAL", "", "",
+        "TOTAL",
+        "",
+        "",
         incumbent_total as f64 / candidate_total as f64
     );
     println!(
@@ -219,7 +234,8 @@ fn metadata_bytes_per_row_over_every_schema_v1_fixture() {
     let mut candidate_total = 0usize;
     let mut incumbent_total = 0usize;
     for path in &paths {
-        let schema: Schema = lix_schema::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let schema: Schema =
+            lix_schema::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
         let pk = schema.primary_key.iter().cloned().collect::<BTreeSet<_>>();
         let body_columns = schema
             .columns

@@ -61,7 +61,9 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
         let inserts = (0..ROW_COUNT)
             .map(|index| ExecuteBatchStatement {
                 label: None,
-                sql: format!("INSERT INTO {SCHEMA_KEY} (path, value) VALUES ($1, CAST($2 AS JSONB))"),
+                sql: format!(
+                    "INSERT INTO {SCHEMA_KEY} (path, value) VALUES ($1, CAST($2 AS JSONB))"
+                ),
                 params: vec![
                     Value::Text(format!("/{index:04}")),
                     Value::Text(format!(r#"{{"generation":0,"index":{index}}}"#)),

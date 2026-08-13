@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
@@ -28,6 +28,7 @@ pub(crate) enum EntityColumnType {
     Integer,
     Number,
     Boolean,
+    Timestamptz,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +105,7 @@ impl EntitySurfaceSpec {
                 EntityColumnType::Integer => 3,
                 EntityColumnType::Number => 4,
                 EntityColumnType::Boolean => 5,
+                EntityColumnType::Timestamptz => 6,
             }]);
             hasher.update(&[u8::from(column.read_nullable)]);
         }
@@ -149,7 +151,7 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
                 .expect("validated primary-key column must exist");
             match column.data_type {
                 lix_schema::DataType::Uuid => EntityPkComponentType::Uuid,
-                lix_schema::DataType::BigInt => EntityPkComponentType::Integer,
+                lix_schema::DataType::Int8 => EntityPkComponentType::Integer,
                 lix_schema::DataType::Text => EntityPkComponentType::String,
                 _ => unreachable!("validated Schema v1 primary-key type"),
             }
@@ -162,10 +164,11 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
             name: column.name.clone(),
             column_type: match column.data_type {
                 lix_schema::DataType::Text | lix_schema::DataType::Uuid => EntityColumnType::String,
-                lix_schema::DataType::BigInt => EntityColumnType::Integer,
-                lix_schema::DataType::DoublePrecision => EntityColumnType::Number,
+                lix_schema::DataType::Int8 => EntityColumnType::Integer,
+                lix_schema::DataType::Float8 => EntityColumnType::Number,
                 lix_schema::DataType::Boolean => EntityColumnType::Boolean,
                 lix_schema::DataType::Jsonb => EntityColumnType::Json,
+                lix_schema::DataType::Timestamptz => EntityColumnType::Timestamptz,
             },
             read_nullable: column.nullable,
             insert_required: !column.nullable
@@ -395,6 +398,9 @@ fn arrow_data_type_for_entity_column_type(column_type: EntityColumnType) -> Data
         EntityColumnType::Integer => DataType::Int64,
         EntityColumnType::Number => DataType::Float64,
         EntityColumnType::Boolean => DataType::Boolean,
+        EntityColumnType::Timestamptz => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        }
     }
 }
 

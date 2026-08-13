@@ -13,7 +13,7 @@
       "name": "created_at",
       "type": "text",
       "nullable": false,
-      "description": "ISO-8601 timestamp at which the change was recorded (set via `lix_timestamp()` at write time).",
+      "description": "ISO-8601 timestamp at which the change was recorded (set via `CURRENT_TIMESTAMP` at write time).",
       "examples": [
         "2026-05-08T17:42:31.123Z"
       ]

@@ -73,6 +73,7 @@ fn value_to_text(value: &Value) -> String {
         Value::Real(v) => v.to_string(),
         Value::Text(v) => v.clone(),
         Value::Json(v) => v.to_string(),
+        Value::Timestamp(v) => timestamp_text(*v),
         Value::Blob(bytes) => bytes_to_hex(bytes),
     }
 }
@@ -87,10 +88,17 @@ fn value_to_json(value: &Value) -> JsonValue {
             .unwrap_or(JsonValue::Null),
         Value::Text(v) => JsonValue::String(v.clone()),
         Value::Json(v) => v.to_value(),
+        Value::Timestamp(v) => JsonValue::String(timestamp_text(*v)),
         Value::Blob(bytes) => serde_json::json!({
             "$blob": base64::engine::general_purpose::STANDARD.encode(bytes),
         }),
     }
+}
+
+fn timestamp_text(microseconds: i64) -> String {
+    chrono::DateTime::from_timestamp_micros(microseconds)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        .unwrap_or_else(|| microseconds.to_string())
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {

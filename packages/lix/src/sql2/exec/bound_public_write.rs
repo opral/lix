@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray,
+    TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -20,6 +21,7 @@ use crate::hot_state::{
     HotStateFilter, HotStateProjection, HotStateRowFilter, HotStateScanRequest,
     MaterializedHotStateBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
+use crate::plugin::runtime::WasmEntityKey;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -40,7 +42,6 @@ use crate::transaction_types::{
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
     TypedMutationJournalBatch,
 };
-use crate::plugin::runtime::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 use crate::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 
@@ -1704,347 +1705,6 @@ fn append_canonical_json_parameter(normalized: &mut Vec<u8>, raw: &str) -> Resul
     })
 }
 
-#[cfg(test)]
-struct CanonicalJsonText<'a> {
-    bytes: &'a [u8],
-    position: usize,
-    remaining_depth: u8,
-}
-
-#[cfg(test)]
-impl<'a> CanonicalJsonText<'a> {
-    // serde_json's default recursion limit rejects the 128th nested container.
-    const MAX_DEPTH: u8 = 127;
-
-    fn recognizes(raw: &'a str) -> bool {
-        let mut parser = Self {
-            bytes: raw.as_bytes(),
-            position: 0,
-            remaining_depth: Self::MAX_DEPTH,
-        };
-        parser.value() && parser.position == parser.bytes.len()
-    }
-
-    fn append_normalized(raw: &'a str, output: &mut Vec<u8>) -> bool {
-        let mut parser = Self {
-            bytes: raw.as_bytes(),
-            position: 0,
-            remaining_depth: Self::MAX_DEPTH,
-        };
-        parser.write_value(output) && parser.position == parser.bytes.len()
-    }
-
-    fn value(&mut self) -> bool {
-        match self.peek() {
-            Some(b'n') => self.literal(b"null"),
-            Some(b't') => self.literal(b"true"),
-            Some(b'f') => self.literal(b"false"),
-            Some(b'"') => self.string(false).is_some(),
-            Some(b'[') => self.with_container_depth(Self::array),
-            Some(b'{') => self.with_container_depth(Self::object),
-            Some(b'-' | b'0'..=b'9') => self.integer(),
-            _ => false,
-        }
-    }
-
-    fn array(&mut self) -> bool {
-        self.position += 1;
-        if self.take(b']') {
-            return true;
-        }
-        loop {
-            if !self.value() {
-                return false;
-            }
-            if self.take(b']') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn object(&mut self) -> bool {
-        self.position += 1;
-        if self.take(b'}') {
-            return true;
-        }
-        let mut previous_key: Option<&[u8]> = None;
-        loop {
-            let Some(key) = self.string(true) else {
-                return false;
-            };
-            if previous_key.is_some_and(|previous| previous >= key) {
-                return false;
-            }
-            previous_key = Some(key);
-            if !self.take(b':') || !self.value() {
-                return false;
-            }
-            if self.take(b'}') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn write_value(&mut self, output: &mut Vec<u8>) -> bool {
-        let start = self.position;
-        match self.peek() {
-            Some(b'n') if self.literal(b"null") => output.extend_from_slice(b"null"),
-            Some(b't') if self.literal(b"true") => output.extend_from_slice(b"true"),
-            Some(b'f') if self.literal(b"false") => output.extend_from_slice(b"false"),
-            Some(b'"') if self.string(false).is_some() => {
-                output.extend_from_slice(&self.bytes[start..self.position]);
-            }
-            Some(b'[') => return self.write_array(output),
-            Some(b'{') => return self.write_object(output),
-            Some(b'-' | b'0'..=b'9') if self.integer() => {
-                output.extend_from_slice(&self.bytes[start..self.position]);
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    fn write_array(&mut self, output: &mut Vec<u8>) -> bool {
-        self.with_container_depth(|parser| parser.write_array_inner(output))
-    }
-
-    fn write_array_inner(&mut self, output: &mut Vec<u8>) -> bool {
-        self.position += 1;
-        output.push(b'[');
-        if self.take(b']') {
-            output.push(b']');
-            return true;
-        }
-        let mut first = true;
-        loop {
-            if !first {
-                output.push(b',');
-            }
-            first = false;
-            if !self.write_value(output) {
-                return false;
-            }
-            if self.take(b']') {
-                output.push(b']');
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn write_object(&mut self, output: &mut Vec<u8>) -> bool {
-        self.with_container_depth(|parser| parser.write_object_inner(output))
-    }
-
-    fn write_object_inner(&mut self, output: &mut Vec<u8>) -> bool {
-        self.position += 1;
-        if self.take(b'}') {
-            output.extend_from_slice(b"{}");
-            return true;
-        }
-        let mut members = smallvec::SmallVec::<[(&'a [u8], &'a [u8]); 8]>::new();
-        loop {
-            let Some(key) = self.string(true) else {
-                return false;
-            };
-            if !self.take(b':') {
-                return false;
-            }
-            let value_start = self.position;
-            if !self.skip_value() {
-                return false;
-            }
-            members.push((key, &self.bytes[value_start..self.position]));
-            if self.take(b'}') {
-                break;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-        members.sort_unstable_by(|left, right| left.0.cmp(right.0));
-        if members.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return false;
-        }
-
-        output.push(b'{');
-        for (index, (key, value)) in members.into_iter().enumerate() {
-            if index != 0 {
-                output.push(b',');
-            }
-            output.push(b'"');
-            output.extend_from_slice(key);
-            output.extend_from_slice(b"\":");
-            let mut value_parser = Self {
-                bytes: value,
-                position: 0,
-                remaining_depth: self.remaining_depth,
-            };
-            if !value_parser.write_value(output) || value_parser.position != value.len() {
-                return false;
-            }
-        }
-        output.push(b'}');
-        true
-    }
-
-    fn skip_value(&mut self) -> bool {
-        match self.peek() {
-            Some(b'n') => self.literal(b"null"),
-            Some(b't') => self.literal(b"true"),
-            Some(b'f') => self.literal(b"false"),
-            Some(b'"') => self.string(false).is_some(),
-            Some(b'[') => self.skip_array(),
-            Some(b'{') => self.skip_object(),
-            Some(b'-' | b'0'..=b'9') => self.integer(),
-            _ => false,
-        }
-    }
-
-    fn skip_array(&mut self) -> bool {
-        self.with_container_depth(Self::skip_array_inner)
-    }
-
-    fn skip_array_inner(&mut self) -> bool {
-        self.position += 1;
-        if self.take(b']') {
-            return true;
-        }
-        loop {
-            if !self.skip_value() {
-                return false;
-            }
-            if self.take(b']') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn skip_object(&mut self) -> bool {
-        self.with_container_depth(Self::skip_object_inner)
-    }
-
-    fn skip_object_inner(&mut self) -> bool {
-        self.position += 1;
-        if self.take(b'}') {
-            return true;
-        }
-        loop {
-            if self.string(true).is_none() || !self.take(b':') || !self.skip_value() {
-                return false;
-            }
-            if self.take(b'}') {
-                return true;
-            }
-            if !self.take(b',') {
-                return false;
-            }
-        }
-    }
-
-    fn with_container_depth(&mut self, parse: impl FnOnce(&mut Self) -> bool) -> bool {
-        let Some(remaining_depth) = self.remaining_depth.checked_sub(1) else {
-            return false;
-        };
-        self.remaining_depth = remaining_depth;
-        let result = parse(self);
-        self.remaining_depth = self.remaining_depth.saturating_add(1);
-        result
-    }
-
-    fn string(&mut self, reject_escapes: bool) -> Option<&'a [u8]> {
-        if !self.take(b'"') {
-            return None;
-        }
-        let start = self.position;
-        while let Some(byte) = self.peek() {
-            match byte {
-                b'"' => {
-                    let end = self.position;
-                    self.position += 1;
-                    return Some(&self.bytes[start..end]);
-                }
-                b'\\' => {
-                    if reject_escapes {
-                        return None;
-                    }
-                    self.position += 1;
-                    match self.peek() {
-                        Some(b'"' | b'\\' | b'b' | b'f' | b'n' | b'r' | b't') => {
-                            self.position += 1;
-                        }
-                        // `\/` and `\uXXXX` are valid but serde_json emits a
-                        // different compact spelling after decoding them.
-                        _ => return None,
-                    }
-                }
-                0x00..=0x1f => return None,
-                _ => self.position += 1,
-            }
-        }
-        None
-    }
-
-    fn integer(&mut self) -> bool {
-        let start = self.position;
-        if self.take(b'-') && !matches!(self.peek(), Some(b'1'..=b'9')) {
-            return false;
-        }
-        if self.take(b'0') {
-            if matches!(self.peek(), Some(b'0'..=b'9' | b'.' | b'e' | b'E')) {
-                return false;
-            }
-        } else {
-            let digit_start = self.position;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.position += 1;
-            }
-            if self.position == digit_start || matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
-                return false;
-            }
-        }
-        let Ok(text) = std::str::from_utf8(&self.bytes[start..self.position]) else {
-            return false;
-        };
-        if text.starts_with('-') {
-            text.parse::<i64>().is_ok()
-        } else {
-            text.parse::<u64>().is_ok()
-        }
-    }
-
-    fn literal(&mut self, literal: &[u8]) -> bool {
-        if self.bytes.get(self.position..self.position + literal.len()) != Some(literal) {
-            return false;
-        }
-        self.position += literal.len();
-        true
-    }
-
-    fn take(&mut self, expected: u8) -> bool {
-        if self.peek() != Some(expected) {
-            return false;
-        }
-        self.position += 1;
-        true
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.position).copied()
-    }
-}
-
 fn append_direct_path_value_replacement_prepared_row(
     rows: &mut RawWriteBatch,
     spec: &EntitySurfaceSpec,
@@ -2530,7 +2190,7 @@ mod active_branch_commit_id_reference_tests {
                 active_branch_commit_id(),
             ),
             BoundExpr::Function {
-                name: "lix_timestamp".to_string(),
+                name: "__lix_current_timestamp".to_string(),
                 args: Vec::new(),
             },
         );
@@ -2540,7 +2200,7 @@ mod active_branch_commit_id_reference_tests {
         let no_head_plan = update_plan(
             BoundPredicate::True,
             BoundExpr::Function {
-                name: "lix_timestamp".to_string(),
+                name: "__lix_current_timestamp".to_string(),
                 args: Vec::new(),
             },
         );
@@ -5058,6 +4718,20 @@ fn certified_direct_parameter_insert_batch(
                             }
                         })))
                     }
+                    (EntityColumnType::Timestamptz, Some(input)) => Arc::new(
+                        TimestampMicrosecondArray::from_iter((0..row_count).map(|row_index| {
+                            match parameter_batch.value(input.parameter_index, row_index) {
+                                DirectParameterValue::Null => None,
+                                DirectParameterValue::String(value) => Some(
+                                    chrono::DateTime::parse_from_rfc3339(value)
+                                        .expect("certified timestamptz parameter must be valid")
+                                        .timestamp_micros(),
+                                ),
+                                DirectParameterValue::Boolean(_) => unreachable!(),
+                            }
+                        }))
+                        .with_timezone("UTC"),
+                    ),
                     (EntityColumnType::String | EntityColumnType::Json, None) => {
                         Arc::new(StringArray::new_null(row_count))
                     }
@@ -5066,6 +4740,9 @@ fn certified_direct_parameter_insert_batch(
                     }
                     (EntityColumnType::Integer, None) => Arc::new(Int64Array::new_null(row_count)),
                     (EntityColumnType::Number, None) => Arc::new(Float64Array::new_null(row_count)),
+                    (EntityColumnType::Timestamptz, None) => Arc::new(
+                        TimestampMicrosecondArray::new_null(row_count).with_timezone("UTC"),
+                    ),
                     (
                         EntityColumnType::Json
                         | EntityColumnType::Integer
@@ -5737,8 +5414,13 @@ fn append_entity_insert_row(
         }
     }
 
-    spec.defaults
-        .apply(&mut snapshot, ctx.functions(), &layout.schema_key)?;
+    let functions = ctx.functions();
+    spec.defaults.apply(
+        &mut snapshot,
+        functions,
+        &layout.schema_key,
+        || Ok(ctx.current_timestamp()),
+    )?;
     let snapshot = JsonValue::Object(snapshot);
     if !spec.primary_key_paths.is_empty() {
         let derived_entity_pk = EntityPk::from_primary_key_plan(
@@ -6214,9 +5896,11 @@ fn eval_expr_value(
         BoundExpr::Function { name, args } if name == "uuidv7" && args.is_empty() => Ok(
             EntityEvalValue::SqlText(ctx.functions().call_uuid_v7().to_string()),
         ),
-        BoundExpr::Function { name, args } if name == "lix_timestamp" && args.is_empty() => Ok(
-            EntityEvalValue::SqlText(ctx.functions().call_timestamp().to_string()),
-        ),
+        BoundExpr::Function { name, args }
+            if name == "__lix_current_timestamp" && args.is_empty() =>
+        {
+            Ok(EntityEvalValue::SqlText(ctx.current_timestamp().to_string()))
+        }
         BoundExpr::Function { name, args } if name == "lix_active_branch_id" && args.is_empty() => {
             Ok(EntityEvalValue::SqlText(ctx.active_branch_id().to_string()))
         }
@@ -6452,9 +6136,10 @@ fn numeric_comparison_value(
                 json_double_value(Some(value), &spec.schema_key, &column.name)
                     .map(|value| value.map(NumericComparisonValue::Double))
             }
-            EntityColumnType::String | EntityColumnType::Json | EntityColumnType::Boolean => {
-                Ok(None)
-            }
+            EntityColumnType::String
+            | EntityColumnType::Json
+            | EntityColumnType::Boolean
+            | EntityColumnType::Timestamptz => Ok(None),
         };
     }
 
@@ -6544,7 +6229,7 @@ fn normalize_json_comparison_value(
     let JsonValue::String(raw) = value else {
         return Ok(value);
     };
-    serde_json::from_str(&raw).map_err(|error| {
+    crate::sql2::udfs::common::parse_jsonb(&raw).map_err(|error| {
         LixError::new(
             LixError::CODE_TYPE_MISMATCH,
             format!("JSON comparison parameter is not valid JSON: {error}"),
@@ -6823,7 +6508,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         BoundExpr::Function { name, args } => {
             match name.as_str() {
                 "uuidv7"
-                | "lix_timestamp"
+                | "__lix_current_timestamp"
                 | "lix_active_branch_id"
                 | "lix_active_branch_commit_id"
                     if args.is_empty() => {}
@@ -6905,6 +6590,20 @@ fn entity_json_value(
         }
         EntityColumnType::Number => {
             json_double_value(Some(&value), schema_key, column_name)?;
+        }
+        EntityColumnType::Timestamptz => {
+            let timestamp = value.as_str().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("{schema_key}.{column_name} expects timestamptz"),
+                )
+            })?;
+            chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("{schema_key}.{column_name} expects RFC 3339 timestamptz: {error}"),
+                )
+            })?;
         }
         EntityColumnType::String | EntityColumnType::Json | EntityColumnType::Boolean => {}
     }
@@ -7103,6 +6802,7 @@ fn value_json(value: &Value) -> JsonValue {
             .unwrap_or(JsonValue::Null),
         Value::Text(value) => JsonValue::String(value.clone()),
         Value::Json(value) => value.to_value(),
+        Value::Timestamp(value) => JsonValue::from(*value),
         Value::Blob(value) => {
             JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())
         }
@@ -7508,80 +7208,6 @@ mod primary_key_route_tests {
                 .expect("canonical string should serialize");
             assert_eq!(actual, serde_json::to_vec(value).unwrap());
         }
-    }
-
-    #[test]
-    fn streaming_json_canonicalizer_matches_serde_for_supported_text() {
-        let canonical = [
-            "null",
-            "true",
-            "false",
-            "0",
-            "18446744073709551615",
-            "-9223372036854775808",
-            r#""plain""#,
-            r#""quote\" and slash\\ and line\n""#,
-            r#"[0,true,"café",{"a":1,"b":[2,3]}]"#,
-            r#"{"a":1,"b":{"c":"value"},"z":null}"#,
-        ];
-        for raw in canonical {
-            let mut actual = Vec::new();
-            assert!(CanonicalJsonText::append_normalized(raw, &mut actual));
-            let parsed: JsonValue = serde_json::from_str(raw).unwrap();
-            assert_eq!(actual, serde_json::to_vec(&parsed).unwrap());
-        }
-
-        for raw in [
-            " 0",
-            "0 ",
-            "-0",
-            "1.0",
-            "1e2",
-            "18446744073709551616",
-            "\"literal\ncontrol\"",
-            r#""unicode \u0061""#,
-            r#""escaped\/slash""#,
-            r#"{"a":1,"a":2}"#,
-            r#"{"escaped\u0061":1}"#,
-        ] {
-            let mut actual = Vec::new();
-            assert!(!CanonicalJsonText::append_normalized(raw, &mut actual));
-        }
-    }
-
-    #[test]
-    fn streaming_json_recursion_limit_matches_serde_and_wide_canonical_objects_stay_direct() {
-        for depth in [127, 128, 129] {
-            let raw = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
-            assert_eq!(
-                CanonicalJsonText::recognizes(&raw),
-                serde_json::from_str::<JsonValue>(&raw).is_ok(),
-                "recognizer depth mismatch at {depth}"
-            );
-        }
-
-        let wide = format!(
-            "{{{}}}",
-            (0..16)
-                .map(|index| format!("\"k{index:02}\":{index}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        assert!(CanonicalJsonText::recognizes(&wide));
-        let mut actual = Vec::new();
-        append_canonical_json_parameter(&mut actual, &wide).unwrap();
-        assert_eq!(actual, wide.as_bytes());
-
-        let too_deep = format!(
-            "{}0{}",
-            "[".repeat(usize::from(CanonicalJsonText::MAX_DEPTH) + 1),
-            "]".repeat(usize::from(CanonicalJsonText::MAX_DEPTH) + 1)
-        );
-        assert!(!CanonicalJsonText::append_normalized(
-            &too_deep,
-            &mut Vec::new()
-        ));
-        assert!(append_canonical_json_parameter(&mut Vec::new(), &too_deep).is_err());
     }
 
     #[test]

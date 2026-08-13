@@ -573,6 +573,8 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
     storage: Arc<StorageAdapter<StorageImpl>>,
     functions: FunctionProviderHandle,
+    /// PostgreSQL `CURRENT_TIMESTAMP`, fixed at this implicit transaction's start.
+    current_timestamp: Option<LixTimestamp>,
     /// Tracked-state revision observed by the coherent transaction-open read.
     /// Durable tracked publication must still be based on this revision;
     /// untracked current-state writes do not invalidate the tracked snapshot.
@@ -1657,6 +1659,7 @@ where
                     opening_read,
                     storage,
                     functions,
+                    current_timestamp: None,
                     opening_tracked_mutation_revision,
                     opening_active_branch_head,
                     opening_global_branch_head,
@@ -6384,8 +6387,13 @@ where
                 .await?;
             let mut scalar_facts = PreparedScalarBatch::with_capacity(rows.len());
             for index in 0..rows.len() {
-                let normalized =
-                    normalize_raw_write_row_in_place(&mut rows, index, catalog, functions.clone())?;
+                let normalized = normalize_raw_write_row_in_place(
+                    &mut rows,
+                    index,
+                    catalog,
+                    functions.clone(),
+                    &mut default_timestamp,
+                )?;
                 scalar_facts.push(plan_prepared_row_scalars(
                     rows.row(index),
                     normalized,
@@ -6475,6 +6483,7 @@ where
                     index,
                     catalog,
                     functions.clone(),
+                    &mut default_timestamp,
                 )?);
             }
             // Preserve the historical domain-by-domain provider/error order:
@@ -9107,6 +9116,12 @@ where
 
     fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
+    }
+
+    fn current_timestamp(&mut self) -> LixTimestamp {
+        *self
+            .current_timestamp
+            .get_or_insert_with(|| self.functions.call_timestamp())
     }
 
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {

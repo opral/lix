@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
 use datafusion::common::DataFusionError;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
@@ -347,6 +349,7 @@ enum EntityProjectionColumn {
     Integer(Vec<Option<i64>>),
     Number(Vec<Option<f64>>),
     Boolean(Vec<Option<bool>>),
+    Timestamptz(Vec<Option<i64>>),
 }
 
 impl EntityProjectionColumn {
@@ -357,6 +360,7 @@ impl EntityProjectionColumn {
             EntityColumnType::Integer => Self::Integer(Vec::with_capacity(capacity)),
             EntityColumnType::Number => Self::Number(Vec::with_capacity(capacity)),
             EntityColumnType::Boolean => Self::Boolean(Vec::with_capacity(capacity)),
+            EntityColumnType::Timestamptz => Self::Timestamptz(Vec::with_capacity(capacity)),
         }
     }
 
@@ -366,6 +370,7 @@ impl EntityProjectionColumn {
             Self::Integer(values) => values.push(None),
             Self::Number(values) => values.push(None),
             Self::Boolean(values) => values.push(None),
+            Self::Timestamptz(values) => values.push(None),
         }
     }
 
@@ -405,6 +410,26 @@ impl EntityProjectionColumn {
                     .last_mut()
                     .expect("projection sink must start the row first") = raw_bool(raw);
             }
+            Self::Timestamptz(values) if field.column_type == EntityColumnType::Timestamptz => {
+                let value = raw_string_text(raw)?;
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = value
+                    .map(|value| {
+                        chrono::DateTime::parse_from_rfc3339(&value)
+                            .map(|timestamp| timestamp.timestamp_micros())
+                            .map_err(|error| {
+                                LixError::new(
+                                    LixError::CODE_TYPE_MISMATCH,
+                                    format!(
+                                        "invalid timestamptz value for {}.{}: {error}",
+                                        schema_key, field.name
+                                    ),
+                                )
+                            })
+                    })
+                    .transpose()?;
+            }
             _ => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -421,6 +446,9 @@ impl EntityProjectionColumn {
             Self::Integer(values) => Arc::new(Int64Array::from(values)),
             Self::Number(values) => Arc::new(Float64Array::from(values)),
             Self::Boolean(values) => Arc::new(BooleanArray::from(values)),
+            Self::Timestamptz(values) => {
+                Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC"))
+            }
         }
     }
 }

@@ -13,7 +13,7 @@ operators; there are no public `lix_json_*` functions.
 | `lix_active_branch_id()` | text | Active branch. |
 | `lix_active_branch_commit_id()` | text | Active branch head pinned for the statement. |
 | `uuidv7()` | uuid | Generate a UUIDv7 value using PostgreSQL 18 syntax. |
-| `lix_timestamp()` | text | Current ISO-8601 timestamp. |
+| `CURRENT_TIMESTAMP` | timestamptz | Transaction-start instant at microsecond precision. |
 
 ## JSONB
 
@@ -59,7 +59,7 @@ ORDER BY lixcol_depth;
 
 ```sql
 INSERT INTO event (id, occurred_at)
-VALUES (uuidv7(), lix_timestamp());
+VALUES (uuidv7(), CURRENT_TIMESTAMP);
 ```
 
 Bound parameters may use `?` or `$1`, `$2`, and so on, but a statement cannot

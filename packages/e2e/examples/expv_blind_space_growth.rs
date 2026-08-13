@@ -393,7 +393,6 @@ impl Fixture {
             _directory: directory,
         }
     }
-
 }
 
 fn report(scenario: &str, phase: &str, axis: u64, usage: &Usage) {

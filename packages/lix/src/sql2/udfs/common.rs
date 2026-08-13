@@ -308,3 +308,22 @@ fn validate_json_path_key_segment(fn_name: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_jsonb_text;
+
+    #[test]
+    fn canonical_jsonb_collapses_equivalent_numeric_spellings() {
+        assert_eq!(canonical_jsonb_text("[42]").unwrap(), "[42]");
+        assert_eq!(canonical_jsonb_text("[42.0]").unwrap(), "[42]");
+        assert_eq!(canonical_jsonb_text("[4.2e1]").unwrap(), "[42]");
+        assert_eq!(canonical_jsonb_text("[ 42 ]").unwrap(), "[42]");
+    }
+
+    #[test]
+    fn canonical_jsonb_rejects_nul_everywhere() {
+        assert!(canonical_jsonb_text(r#"["a\u0000b"]"#).is_err());
+        assert!(canonical_jsonb_text(r#"{"a\u0000b":1}"#).is_err());
+    }
+}

@@ -11,6 +11,7 @@ pub enum WireValue {
     Float { value: f64 },
     Text { value: String },
     Json { value: Json },
+    Timestamp { value: String },
     Blob { base64: String },
 }
 
@@ -46,6 +47,9 @@ impl WireValue {
             Value::Json(value) => Ok(Self::Json {
                 value: value.clone(),
             }),
+            Value::Timestamp(value) => Ok(Self::Timestamp {
+                value: format_timestamp(*value)?,
+            }),
             Value::Blob(value) => Ok(Self::Blob {
                 base64: base64::engine::general_purpose::STANDARD.encode(value),
             }),
@@ -71,6 +75,7 @@ impl WireValue {
             }
             Self::Text { value } => Ok(Value::Text(value)),
             Self::Json { value } => Ok(Value::Json(value)),
+            Self::Timestamp { value } => parse_timestamp(&value).map(Value::Timestamp),
             Self::Blob { base64 } => {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(base64.as_bytes())
@@ -84,6 +89,25 @@ impl WireValue {
             }
         }
     }
+}
+
+fn format_timestamp(value: i64) -> Result<String, LixError> {
+    chrono::DateTime::from_timestamp_micros(value)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        .ok_or_else(|| LixError::new(LixError::CODE_INVALID_PARAM, "timestamp is out of range"))
+}
+
+fn parse_timestamp(value: &str) -> Result<i64, LixError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("timestamp wire value is invalid: {error}"),
+            )
+        })?
+        .timestamp_micros()
+        .try_into()
+        .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "timestamp is out of range"))
 }
 
 impl WireQueryResult {

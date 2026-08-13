@@ -1,5 +1,6 @@
 pub(crate) mod common;
 pub(crate) mod execution_slots;
+mod current_timestamp;
 mod lix_active_account_id;
 mod lix_active_branch_commit_id;
 mod lix_active_branch_id;
@@ -8,7 +9,6 @@ mod lix_json_get_text;
 mod lix_json_predicate;
 mod lix_jsonb;
 mod lix_octet_length;
-mod lix_timestamp;
 mod uuidv7;
 
 use std::sync::Arc;
@@ -69,7 +69,7 @@ pub(crate) fn register_execution_sql2_functions(ctx: &SessionContext, slots: Arc
     ctx.register_udf(ScalarUDF::from(uuidv7::UuidV7 {
         slots: Arc::clone(&slots),
     }));
-    ctx.register_udf(ScalarUDF::from(lix_timestamp::LixTimestamp { slots }));
+    ctx.register_udf(ScalarUDF::from(current_timestamp::CurrentTimestamp { slots }));
 }
 
 /// Points the session's execution functions at this statement's facts.

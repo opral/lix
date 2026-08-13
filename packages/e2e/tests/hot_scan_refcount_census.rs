@@ -77,12 +77,21 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
     // materialized batch row by row.
     let result = lix
         .execute(
-            &format!("SELECT id, ordinal, lane FROM {SCHEMA_KEY} WHERE ordinal >= $1 AND ordinal < $2"),
-            &[Value::Integer(0), Value::Integer(i64::try_from(ROWS).expect("fits i64"))],
+            &format!(
+                "SELECT id, ordinal, lane FROM {SCHEMA_KEY} WHERE ordinal >= $1 AND ordinal < $2"
+            ),
+            &[
+                Value::Integer(0),
+                Value::Integer(i64::try_from(ROWS).expect("fits i64")),
+            ],
         )
         .await
         .expect("scan census rows");
-    assert_eq!(result.rows().len(), ROWS, "the census must observe a full scan");
+    assert_eq!(
+        result.rows().len(),
+        ROWS,
+        "the census must observe a full scan"
+    );
 
     let (rows_decoded, key_clones, value_clones, row_clones) = take_hot_scan_refcount_census();
 

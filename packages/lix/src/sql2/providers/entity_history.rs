@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::{DataFusionError, Result};
@@ -372,6 +374,36 @@ fn entity_history_column_array(
                 .map(|snapshot| snapshot.as_ref().and_then(JsonValue::as_bool))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
+        EntityColumnType::Timestamptz => Arc::new(
+            TimestampMicrosecondArray::from(
+                projected_values
+                    .iter()
+                    .map(|snapshot| {
+                        let Some(value) = snapshot.as_ref() else {
+                            return Ok(None);
+                        };
+                        if value.is_null() {
+                            return Ok(None);
+                        }
+                        let text = value.as_str().ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "{}.{} expected timestamptz text",
+                                spec.schema_key, column_name
+                            ))
+                        })?;
+                        chrono::DateTime::parse_from_rfc3339(text)
+                            .map(|timestamp| Some(timestamp.timestamp_micros()))
+                            .map_err(|error| {
+                                DataFusionError::Execution(format!(
+                                    "{}.{} contains invalid timestamptz: {error}",
+                                    spec.schema_key, column_name
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+            .with_timezone("UTC"),
+        ) as ArrayRef,
     })
 }
 

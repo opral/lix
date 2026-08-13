@@ -14,7 +14,8 @@ const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
 const BOUND_INSERT_ALL_SQL: &str = "INSERT INTO tracked_crud_insert (path, value) VALUES ($1, $2)";
 const BOUND_SEED_JSON_SQL: &str =
     "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))";
-const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
+const BOUND_UPDATE_ALL_SQL: &str =
+    "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
 const BOUND_OLAP_UPDATE_LANE_SQL: &str = "UPDATE olap_row SET lane = $1 WHERE id = $2";
 const BOUND_OLAP_UPDATE_SCORE_SQL: &str = "UPDATE olap_row SET score = $1 WHERE id = $2";
 const BOUND_OLAP_UPDATE_ACTIVE_SQL: &str = "UPDATE olap_row SET active = $1 WHERE id = $2";

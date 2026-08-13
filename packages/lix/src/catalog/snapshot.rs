@@ -8,8 +8,8 @@ use crate::common::format_json_pointer;
 use crate::domain::{Domain, DomainSchemaIdentity};
 use crate::entity_pk::{EntityPk, canonical_json_text};
 use crate::functions::FunctionProviderHandle;
-use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
 use crate::plugin::runtime::WasmEntityKey;
+use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
 
 #[derive(Default)]
 pub(crate) struct CatalogSnapshot {
@@ -780,9 +780,7 @@ fn primary_key_component_types(
                     )
                 })?;
             match column.data_type {
-                lix_schema::DataType::BigInt => {
-                    Ok(crate::entity_pk::EntityPkComponentType::Integer)
-                }
+                lix_schema::DataType::Int8 => Ok(crate::entity_pk::EntityPkComponentType::Integer),
                 lix_schema::DataType::Uuid => Ok(crate::entity_pk::EntityPkComponentType::Uuid),
                 lix_schema::DataType::Text => Ok(crate::entity_pk::EntityPkComponentType::String),
                 _ => Err(LixError::new(
@@ -814,23 +812,31 @@ impl FastObjectValidationPlan {
                     FastJsonTypes::STRING | if nullable { FastJsonTypes::NULL } else { 0 },
                 )),
                 lix_schema::DataType::Uuid => {
-                    let validation = FastStringValidation;
+                    let validation = FastStringValidation::Uuid;
                     if nullable {
                         FastValueValidation::StringOrNull(validation)
                     } else {
                         FastValueValidation::String(validation)
                     }
                 }
-                lix_schema::DataType::BigInt => FastValueValidation::Types(FastJsonTypes(
+                lix_schema::DataType::Int8 => FastValueValidation::Types(FastJsonTypes(
                     FastJsonTypes::INTEGER | if nullable { FastJsonTypes::NULL } else { 0 },
                 )),
-                lix_schema::DataType::DoublePrecision => FastValueValidation::Types(FastJsonTypes(
+                lix_schema::DataType::Float8 => FastValueValidation::Types(FastJsonTypes(
                     FastJsonTypes::NUMBER | if nullable { FastJsonTypes::NULL } else { 0 },
                 )),
                 lix_schema::DataType::Boolean => FastValueValidation::Types(FastJsonTypes(
                     FastJsonTypes::BOOLEAN | if nullable { FastJsonTypes::NULL } else { 0 },
                 )),
                 lix_schema::DataType::Jsonb => FastValueValidation::Types(FastJsonTypes::ANY),
+                lix_schema::DataType::Timestamptz => {
+                    let validation = FastStringValidation::Timestamptz;
+                    if nullable {
+                        FastValueValidation::StringOrNull(validation)
+                    } else {
+                        FastValueValidation::String(validation)
+                    }
+                }
             };
             if !nullable && column.default_value.is_none() && column.default_expression.is_none() {
                 required.push(column.name.clone());
@@ -938,15 +944,21 @@ fn typed_object_validation_error(schema_key: &str, message: &str) -> LixError {
 }
 
 #[derive(Debug)]
-struct FastStringValidation;
+enum FastStringValidation {
+    Uuid,
+    Timestamptz,
+}
 
 impl FastStringValidation {
     fn accepts(&self, value: &str) -> bool {
-        uuid::Uuid::parse_str(value).is_ok()
+        match self {
+            Self::Uuid => uuid::Uuid::parse_str(value).is_ok(),
+            Self::Timestamptz => chrono::DateTime::parse_from_rfc3339(value).is_ok(),
+        }
     }
 
     fn accepts_canonical(&self, value: CanonicalJsonString<'_>) -> bool {
-        uuid::Uuid::parse_str(value.encoded).is_ok()
+        self.accepts(value.encoded)
     }
 }
 
@@ -1941,6 +1953,7 @@ struct DefaultPropertyPlan {
 enum DefaultValuePlan {
     Json(JsonValue),
     UuidV7,
+    CurrentTimestamp,
 }
 
 impl DefaultPlan {
@@ -1959,6 +1972,7 @@ impl DefaultPlan {
                 if let Some(expression) = column.default_expression {
                     let default = match expression.trim() {
                         "uuidv7()" => DefaultValuePlan::UuidV7,
+                        "CURRENT_TIMESTAMP" => DefaultValuePlan::CurrentTimestamp,
                         _ => unreachable!("Schema v1 rejects unsupported default expressions"),
                     };
                     return Some(DefaultPropertyPlan {
@@ -1975,12 +1989,16 @@ impl DefaultPlan {
         Self { properties }
     }
 
-    pub(crate) fn apply(
+    pub(crate) fn apply<F>(
         &self,
         snapshot: &mut JsonMap<String, JsonValue>,
         functions: FunctionProviderHandle,
         _schema_key: &str,
-    ) -> Result<bool, LixError> {
+        mut current_timestamp: F,
+    ) -> Result<bool, LixError>
+    where
+        F: FnMut() -> Result<crate::common::LixTimestamp, LixError>,
+    {
         let mut changed = false;
         for property in &self.properties {
             if snapshot.contains_key(&property.field_name) {
@@ -1989,6 +2007,9 @@ impl DefaultPlan {
             let value = match &property.default {
                 DefaultValuePlan::Json(value) => value.clone(),
                 DefaultValuePlan::UuidV7 => JsonValue::String(functions.call_uuid_v7().to_string()),
+                DefaultValuePlan::CurrentTimestamp => {
+                    JsonValue::String(current_timestamp()?.to_string())
+                }
             };
             snapshot.insert(property.field_name.clone(), value);
             changed = true;

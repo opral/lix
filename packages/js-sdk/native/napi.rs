@@ -1822,6 +1822,24 @@ impl TryFrom<LixValue> for Value {
             "json" => Ok(Self::Json(
                 value.value.unwrap_or(serde_json::Value::Null).into(),
             )),
+            "timestamp" => {
+                let raw = value
+                    .value
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "timestamp value must be an RFC 3339 string",
+                        )
+                    })?;
+                let parsed = chrono::DateTime::parse_from_rfc3339(&raw).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("timestamp value is invalid: {error}"),
+                    )
+                })?;
+                Ok(Self::Timestamp(parsed.timestamp_micros()))
+            }
             "blob" => {
                 let bytes = value.blob.ok_or_else(|| {
                     LixError::new(
@@ -1882,6 +1900,18 @@ impl TryFrom<&Value> for LixValue {
                 value: Some(value.to_value()),
                 blob: None,
             }),
+            Value::Timestamp(value) => {
+                let value = chrono::DateTime::from_timestamp_micros(*value).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_JS_SDK_NATIVE", "timestamp is out of range")
+                })?;
+                Ok(Self {
+                    kind: "timestamp".to_string(),
+                    value: Some(serde_json::Value::String(
+                        value.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    )),
+                    blob: None,
+                })
+            }
             Value::Blob(value) => Ok(Self {
                 kind: "blob".to_string(),
                 value: None,

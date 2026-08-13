@@ -67,6 +67,7 @@ enum ParameterType {
     Real,
     Text,
     Json,
+    Timestamp,
     Blob,
 }
 
@@ -651,6 +652,7 @@ impl<CatalogKey> PhysicalReadPlanCacheKey<CatalogKey> {
                     continue;
                 }
                 Value::Blob(value) => (7, value.to_vec()),
+                Value::Timestamp(value) => (8, value.to_le_bytes().to_vec()),
             };
             parameters.push(tag);
             parameters.extend_from_slice(&bytes.len().to_le_bytes());
@@ -675,6 +677,7 @@ impl From<&Value> for ParameterType {
             Value::Text(_) => Self::Text,
             Value::Json(_) => Self::Json,
             Value::Blob(_) => Self::Blob,
+            Value::Timestamp(_) => Self::Timestamp,
         }
     }
 }

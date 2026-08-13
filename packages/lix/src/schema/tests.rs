@@ -10,7 +10,7 @@ fn schema() -> serde_json::Value {
             { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
             { "name": "title", "type": "text", "nullable": false },
             { "name": "payload", "type": "jsonb", "nullable": false },
-            { "name": "rank", "type": "bigint", "nullable": true }
+            { "name": "rank", "type": "int8", "nullable": true }
         ],
         "primary_key": ["id"],
         "unique": [["title"]]

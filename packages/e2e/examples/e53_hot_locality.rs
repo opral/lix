@@ -31,10 +31,10 @@
 //! Default checkpoints: 25 50 100 200 400 800.
 
 use lix::Value;
-use lix::{Lix, open_lix};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{hot_generation_branches, layout_accounting, probe_hot_generation_planes};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::{BlockFetchCounters, PerfProbe, RocksDB};
 
 const PROBE_REPS: usize = 3;
@@ -123,14 +123,22 @@ async fn main() {
                 for space in &per_space {
                     println!(
                         "    space=0x{:08x} rows={} pages={} open_nanos={} total_nanos={}",
-                        space.space_id, space.rows, space.pages, space.open_nanos, space.total_nanos
+                        space.space_id,
+                        space.rows,
+                        space.pages,
+                        space.open_nanos,
+                        space.total_nanos
                     );
                 }
             } else {
                 for space in &per_space {
                     println!(
                         "  L space=0x{:08x} rows={} pages={} open_nanos={} total_nanos={}",
-                        space.space_id, space.rows, space.pages, space.open_nanos, space.total_nanos
+                        space.space_id,
+                        space.rows,
+                        space.pages,
+                        space.open_nanos,
+                        space.total_nanos
                     );
                 }
             }

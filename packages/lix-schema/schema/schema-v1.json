@@ -50,13 +50,13 @@
       "properties": {
         "name": { "$ref": "#/$defs/identifier" },
         "type": {
-          "enum": ["text", "uuid", "bigint", "double precision", "boolean", "jsonb"]
+          "enum": ["text", "uuid", "int8", "float8", "boolean", "jsonb", "timestamptz"]
         },
         "nullable": { "type": "boolean", "default": true },
         "default_value": true,
         "default_expression": {
-          "const": "uuidv7()",
-          "description": "PostgreSQL-dialect default expression. Schema v1 supports only uuidv7() on uuid columns."
+          "enum": ["uuidv7()", "CURRENT_TIMESTAMP"],
+          "description": "PostgreSQL-dialect default expression: uuidv7() for uuid or CURRENT_TIMESTAMP for timestamptz."
         },
         "description": { "type": "string" },
         "examples": { "type": "array" },

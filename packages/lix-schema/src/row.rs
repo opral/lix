@@ -9,11 +9,13 @@ pub enum SqlValue {
     Null,
     Text(String),
     Uuid(uuid::Uuid),
-    BigInt(i64),
-    DoublePrecision(f64),
+    Int8(i64),
+    Float8(f64),
     Boolean(bool),
     /// JSON null is represented as `Jsonb(Value::Null)`, not `SqlValue::Null`.
     Jsonb(Value),
+    /// Signed UTC microseconds since the Unix epoch.
+    Timestamptz(i64),
 }
 
 pub type SqlRow = BTreeMap<String, SqlValue>;
@@ -134,10 +136,11 @@ fn value_matches(data_type: DataType, value: &SqlValue) -> bool {
     match (data_type, value) {
         (DataType::Text, SqlValue::Text(_))
         | (DataType::Uuid, SqlValue::Uuid(_))
-        | (DataType::BigInt, SqlValue::BigInt(_))
+        | (DataType::Int8, SqlValue::Int8(_))
         | (DataType::Boolean, SqlValue::Boolean(_))
-        | (DataType::Jsonb, SqlValue::Jsonb(_)) => true,
-        (DataType::DoublePrecision, SqlValue::DoublePrecision(value)) => value.is_finite(),
+        | (DataType::Jsonb, SqlValue::Jsonb(_))
+        | (DataType::Timestamptz, SqlValue::Timestamptz(_)) => true,
+        (DataType::Float8, SqlValue::Float8(value)) => value.is_finite(),
         _ => false,
     }
 }
@@ -151,11 +154,16 @@ fn json_value_matches(data_type: DataType, nullable: bool, value: &Value) -> boo
         DataType::Uuid => value
             .as_str()
             .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()),
-        DataType::BigInt => value.as_i64().is_some(),
-        DataType::DoublePrecision => value.as_f64().is_some_and(f64::is_finite),
+        DataType::Int8 => value.as_i64().is_some(),
+        DataType::Float8 => value.as_f64().is_some_and(f64::is_finite),
         DataType::Boolean => value.is_boolean(),
         DataType::Jsonb => true,
+        DataType::Timestamptz => value.as_str().is_some_and(is_rfc3339_timestamp),
     }
+}
+
+pub(crate) fn is_rfc3339_timestamp(value: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(value).is_ok()
 }
 
 fn row_error<T>(path: impl Into<String>, message: impl Into<String>) -> Result<T, Error> {

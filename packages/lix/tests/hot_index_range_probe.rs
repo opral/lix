@@ -140,11 +140,7 @@ async fn ordinal_range_ids(
         .collect()
 }
 
-async fn seeded_session(
-    schema_key: &str,
-    declare_unique: bool,
-    rows: usize,
-) -> Lix<Memory> {
+async fn seeded_session(schema_key: &str, declare_unique: bool, rows: usize) -> Lix<Memory> {
     let session = open_lix()
         .with_storage(Memory::default())
         .await

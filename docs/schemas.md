@@ -44,16 +44,17 @@ VALUES ('acme_section', '{
 
 Schema v1 supports:
 
-- PostgreSQL type names `text`, `uuid`, `bigint`, `double precision`,
-  `boolean`, and `jsonb`;
+- PostgreSQL type names `text`, `uuid`, `int8`, `float8`, `boolean`, `jsonb`,
+  and `timestamptz`;
 - ordered columns, a required non-empty `primary_key`, unique constraints,
   and foreign keys;
-- `nullable`, `default_value`, and the `uuidv7()` default expression; and
+- `nullable`, `default_value`, and the `uuidv7()` and `CURRENT_TIMESTAMP`
+  default expressions; and
 - `description`, `examples`, and `deprecated` annotations.
 
 Identifiers must be lowercase `snake_case` and no longer than PostgreSQL's
 63-byte identifier limit. Primary-key columns must be non-null `text`, `uuid`,
-or `bigint`. Composite keys preserve their declared order:
+or `int8`. Composite keys preserve their declared order:
 
 ```json
 "primary_key": ["order_id", "line_number"],

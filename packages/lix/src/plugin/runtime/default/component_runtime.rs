@@ -11,7 +11,6 @@ use std::time::Instant;
 use crate::plugin::wire::{Operation, Page as EntityPage, Representation, encode_single_section};
 use async_trait::async_trait;
 use bytes::Bytes;
-use lix::wasm::WasmLimits;
 use lix::plugin::runtime::v1::{
     ByteEdit as ArenaByteEdit, Digest as ArenaDigest, Root as ArenaRoot, Store as ArenaStore,
     Transaction as ArenaTransaction,
@@ -28,6 +27,7 @@ use lix::plugin::runtime::{
     WasmOpenFileInput, WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle,
     WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
 };
+use lix::wasm::WasmLimits;
 use lix::{LixError, SharedStr};
 use wasmtime::Store;
 use wasmtime::component::{Component, Linker, Resource, ResourceTable};
@@ -2336,7 +2336,9 @@ fn host_table_error(
     bindings::lix::plugin::host::HostError::Rejected(error.to_string())
 }
 
-fn read_source_all(source: &Arc<dyn lix::plugin::runtime::WasmByteSource>) -> Result<Vec<u8>, LixError> {
+fn read_source_all(
+    source: &Arc<dyn lix::plugin::runtime::WasmByteSource>,
+) -> Result<Vec<u8>, LixError> {
     const CHUNK_BYTES: u32 = 1024 * 1024;
     let length = source.len();
     let mut output = Vec::with_capacity(

@@ -172,6 +172,7 @@ fn value_to_json(value: &Value) -> Result<JsonValue, LixError> {
             }),
         Value::Text(value) => Ok(JsonValue::String(value.clone())),
         Value::Json(value) => Ok(value.to_value()),
+        Value::Timestamp(value) => Ok(JsonValue::Number((*value).into())),
         Value::Blob(_) => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "client state value was a blob instead of JSON",

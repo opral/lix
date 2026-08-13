@@ -581,6 +581,11 @@ function decodeWireValue(value: unknown): NativeLixValue {
 		case "json":
 			assertJsonValue(wire.value, "json wire value");
 			return { kind: "json", value: wire.value };
+		case "timestamp":
+			if (typeof wire.value !== "string") {
+				throw protocolError("timestamp wire value is invalid");
+			}
+			return { kind: "timestamp", value: wire.value };
 		case "blob":
 			if (typeof wire.base64 !== "string") {
 				throw protocolError("blob wire value is invalid");

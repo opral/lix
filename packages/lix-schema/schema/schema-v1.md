@@ -7,7 +7,7 @@ PostgreSQL-derived relational schema subset supported by Lix.
 
 Schema v1 uses PostgreSQL 18 semantics for:
 
-- `text`, `uuid`, `bigint`, `double precision`, `boolean`, and `jsonb`;
+- `text`, `uuid`, `int8`, `float8`, `boolean`, `jsonb`, and `timestamptz`;
 - `NULL` and `NOT NULL`;
 - literal and expression defaults;
 - ordered, composite primary keys;
@@ -35,7 +35,7 @@ The restriction avoids PostgreSQL identifier truncation and quoting ambiguity.
 | `foreign_keys[]` | `FOREIGN KEY (...) REFERENCES ... (...)` |
 
 `primary_key` is required and must contain at least one column. Primary-key
-columns must be non-null and use `text`, `uuid`, or `bigint`, the identity
+columns must be non-null and use `text`, `uuid`, or `int8`, the identity
 types Lix can encode losslessly.
 
 ## Canonicalization

@@ -108,19 +108,36 @@ pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError
             "sql2 DataFusion error: No SQL statements were provided in the query string",
         )
     })?;
-    rewrite_postgresql_json_operators(&mut statement);
+    rewrite_postgresql_expressions(&mut statement);
     Ok(statement)
 }
 
 /// DataFusion 53 parses PostgreSQL JSON operators but does not plan them yet.
 /// Lower the public PostgreSQL syntax to private execution functions before
 /// either the read planner or bound-write planner sees the statement.
-fn rewrite_postgresql_json_operators(statement: &mut DataFusionStatement) {
+fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
     struct Rewriter;
     impl VisitorMut for Rewriter {
         type Break = ();
 
         fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            if let Expr::Function(function) = expr {
+                let is_current_timestamp = function
+                    .name
+                    .0
+                    .last()
+                    .and_then(|part| match part {
+                        ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
+                        ObjectNamePart::Function(_) => None,
+                    })
+                    .is_some_and(|name| name.eq_ignore_ascii_case("current_timestamp"));
+                let no_args = matches!(function.args, FunctionArguments::None)
+                    || matches!(&function.args, FunctionArguments::List(list) if list.args.is_empty());
+                if is_current_timestamp && no_args {
+                    *expr = private_function("__lix_current_timestamp", Vec::new());
+                    return ControlFlow::Continue(());
+                }
+            }
             if let Expr::Cast {
                 expr: inner,
                 data_type: SqlDataType::JSONB,

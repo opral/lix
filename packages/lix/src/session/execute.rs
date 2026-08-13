@@ -2807,6 +2807,10 @@ fn profile_result_checksum(checksum: u64, values: &[Value]) -> Result<u64, LixEr
             Value::Blob(value) => {
                 profile_checksum_sized_bytes(checksum, 6, value.as_bytes().as_ref())
             }
+            Value::Timestamp(value) => {
+                let checksum = profile_checksum_bytes(checksum, &[7]);
+                profile_checksum_bytes(checksum, &value.to_le_bytes())
+            }
         };
     }
     Ok(checksum)
@@ -5117,7 +5121,7 @@ mod tests {
             session
                 .execute_batch_disposition(&[
                     batch_statement("SELECT 1"),
-                    batch_statement("SELECT lix_timestamp()"),
+                    batch_statement("SELECT CURRENT_TIMESTAMP"),
                 ])
                 .unwrap(),
             ExecutionDisposition::Durable

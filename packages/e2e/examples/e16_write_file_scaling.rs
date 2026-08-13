@@ -613,7 +613,9 @@ fn build_text_plugin_archive() -> Vec<u8> {
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
-        writer.start_file(path, options).expect("start archive file");
+        writer
+            .start_file(path, options)
+            .expect("start archive file");
         writer.write_all(bytes).expect("write archive file");
     }
     writer.finish().expect("finish archive").into_inner()

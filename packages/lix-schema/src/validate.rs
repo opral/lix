@@ -32,11 +32,11 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
             .unwrap();
         if !matches!(
             value.data_type,
-            DataType::Text | DataType::Uuid | DataType::BigInt
+            DataType::Text | DataType::Uuid | DataType::Int8
         ) {
             return definition(
                 "/primary_key",
-                format!("primary-key column '{column}' must use text, uuid, or bigint"),
+                format!("primary-key column '{column}' must use text, uuid, or int8"),
             );
         }
         if value.nullable {
@@ -91,10 +91,14 @@ fn validate_column(column: &Column, path: &str) -> Result<(), Error> {
         );
     }
     if let Some(expression) = &column.default_expression {
-        if expression != "uuidv7()" || column.data_type != DataType::Uuid {
+        let valid = matches!(
+            (column.data_type, expression.as_str()),
+            (DataType::Uuid, "uuidv7()") | (DataType::Timestamptz, "CURRENT_TIMESTAMP")
+        );
+        if !valid {
             return definition(
                 format!("{path}/default_expression"),
-                "Schema v1 supports only the PostgreSQL-style uuidv7() expression on uuid columns",
+                "Schema v1 supports uuidv7() on uuid columns and CURRENT_TIMESTAMP on timestamptz columns",
             );
         }
     }
@@ -119,10 +123,11 @@ fn validate_default(data_type: DataType, value: &Value, path: &str) -> Result<()
         DataType::Uuid => value
             .as_str()
             .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()),
-        DataType::BigInt => value.as_i64().is_some(),
-        DataType::DoublePrecision => value.as_f64().is_some_and(f64::is_finite),
+        DataType::Int8 => value.as_i64().is_some(),
+        DataType::Float8 => value.as_f64().is_some_and(f64::is_finite),
         DataType::Boolean => value.is_boolean(),
         DataType::Jsonb => true,
+        DataType::Timestamptz => value.as_str().is_some_and(crate::row::is_rfc3339_timestamp),
     };
     if valid {
         Ok(())

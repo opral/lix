@@ -176,13 +176,14 @@ async fn pure_reads_do_not_advance_and_durable_reads_still_persist_deterministic
     assert_eq!(first_uuid, "01920000-0000-7000-8000-000000000000");
 
     let first_timestamp = session
-        .execute("SELECT lix_timestamp() AS value", &[])
+        .execute("SELECT CURRENT_TIMESTAMP AS value", &[])
         .await
         .expect("second durable function should execute")
         .rows()[0]
-        .get::<String>("value")
-        .expect("timestamp should be text");
-    assert_eq!(first_timestamp, "1970-01-01T00:00:00.001Z");
+        .value("value")
+        .expect("timestamp should be present")
+        .clone();
+    assert_eq!(first_timestamp, Value::Timestamp(1_000));
 
     let next_uuid = session
         .execute("SELECT uuidv7() AS value", &[])

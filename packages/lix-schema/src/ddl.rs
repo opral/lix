@@ -54,13 +54,17 @@ fn postgres_literal(data_type: DataType, value: &Value) -> Result<String, Error>
             .as_str()
             .map(quote_string)
             .ok_or_else(|| ddl_error("string default became invalid after validation")),
-        DataType::BigInt | DataType::DoublePrecision => Ok(value.to_string()),
+        DataType::Int8 | DataType::Float8 => Ok(value.to_string()),
         DataType::Boolean => Ok(if value.as_bool() == Some(true) {
             "TRUE".to_string()
         } else {
             "FALSE".to_string()
         }),
         DataType::Jsonb => Ok(format!("{}::jsonb", quote_string(&value.to_string()))),
+        DataType::Timestamptz => value
+            .as_str()
+            .map(|value| format!("{}::timestamptz", quote_string(value)))
+            .ok_or_else(|| ddl_error("timestamptz default became invalid after validation")),
     }
 }
 

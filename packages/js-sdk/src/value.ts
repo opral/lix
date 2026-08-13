@@ -35,6 +35,10 @@ export class Value {
 		return new Value({ kind: "json", value });
 	}
 
+	static timestamp(value: string) {
+		return new Value({ kind: "timestamp", value });
+	}
+
 	static blob(value: Uint8Array) {
 		return new Value({ kind: "blob", value });
 	}
@@ -158,6 +162,7 @@ function unwrapValue(value: LixValue): unknown {
 		case "integer":
 		case "real":
 		case "text":
+		case "timestamp":
 		case "json":
 			return cloneJsonValue(value.value);
 		case "blob":
@@ -279,6 +284,11 @@ function validateExplicitValue(value: LixValue) {
 		case "json":
 			assertJsonSerializable(value.value, new WeakSet(), 0);
 			return;
+		case "timestamp":
+			if (typeof value.value === "string" && !Number.isNaN(Date.parse(value.value))) {
+				return;
+			}
+			break;
 		case "blob":
 			if (value.value instanceof Uint8Array) return;
 			break;

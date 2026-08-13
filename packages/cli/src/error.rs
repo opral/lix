@@ -65,8 +65,7 @@ mod tests {
 
     #[test]
     fn hint_returns_lix_hint_when_attached() {
-        let lix_err =
-            LixError::new("LIX_ERROR_FOO", "desc").with_hint("try CAST(... AS JSONB)");
+        let lix_err = LixError::new("LIX_ERROR_FOO", "desc").with_hint("try CAST(... AS JSONB)");
         let cli_err = CliError::from_lix("sql execution failed", lix_err);
         assert_eq!(cli_err.hint(), Some("try CAST(... AS JSONB)"));
     }

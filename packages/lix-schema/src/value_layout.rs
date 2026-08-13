@@ -23,9 +23,10 @@
 //! | type | body image | canonicalisation | rejected |
 //! |---|---|---|---|
 //! | `boolean` | 1 fixed byte | — | any byte other than `0x00`/`0x01` on decode |
-//! | `bigint` | 8 fixed bytes, big-endian two's complement | — | — |
-//! | `double precision` | 8 fixed bytes, big-endian IEEE-754 | `-0.0` -> `+0.0` | NaN, +/-Inf |
+//! | `int8` | 8 fixed bytes, big-endian two's complement | — | — |
+//! | `float8` | 8 fixed bytes, big-endian IEEE-754 | `-0.0` -> `+0.0` | NaN, +/-Inf |
 //! | `uuid` | 16 fixed bytes, RFC 4122 field order | textual spelling parsed away | unparseable text |
+//! | `timestamptz` | 8 fixed bytes, signed UTC microseconds, big-endian | input offset converted to UTC | out-of-range RFC 3339 input |
 //! | `text` | raw UTF-8, var area | **none** (see below) | interior NUL |
 //! | `jsonb` | canonical semantic JSON, UTF-8, var area | keys sorted, integral f64 -> i64, spelling normalised | NUL in string or key, non-finite number |
 //!
@@ -44,17 +45,19 @@ use serde_json::Value;
 pub const BODY_VERSION: u8 = 1;
 const HEADER_WIDE_OFFSETS: u8 = 0b0000_1000;
 
-/// The six Schema v1 types, in the form the body encoder consumes them.
+/// The seven Schema v1 types, in the form the body encoder consumes them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BodyValue {
     Null,
     Text(String),
     Uuid(uuid::Uuid),
-    BigInt(i64),
-    DoublePrecision(f64),
+    Int8(i64),
+    Float8(f64),
     Boolean(bool),
     /// JSON `null` is `Jsonb(Value::Null)`; SQL NULL is `BodyValue::Null`.
     Jsonb(Value),
+    /// Signed UTC microseconds since the Unix epoch.
+    Timestamptz(i64),
 }
 
 /// Per-column plan: the two things the body encoder needs from the schema.
@@ -67,11 +70,12 @@ pub struct BodyColumn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyKind {
     Boolean,
-    BigInt,
-    DoublePrecision,
+    Int8,
+    Float8,
     Uuid,
     Text,
     Jsonb,
+    Timestamptz,
 }
 
 impl BodyKind {
@@ -79,7 +83,7 @@ impl BodyKind {
     pub const fn fixed_width(self) -> Option<usize> {
         match self {
             Self::Boolean => Some(1),
-            Self::BigInt | Self::DoublePrecision => Some(8),
+            Self::Int8 | Self::Float8 | Self::Timestamptz => Some(8),
             Self::Uuid => Some(16),
             Self::Text | Self::Jsonb => None,
         }
@@ -103,7 +107,7 @@ fn err<T>(message: impl Into<String>) -> Result<T, EncodeError> {
 // Scalar canonicalisation
 // ---------------------------------------------------------------------------
 
-/// Canonical 8-byte image of a `double precision`.
+/// Canonical 8-byte image of a `float8`.
 ///
 /// `-0.0` and `+0.0` are the *same* value under IEEE-754 `==` and under Rust's
 /// `PartialEq`, but have different bit patterns. Emitting both would give one
@@ -111,10 +115,10 @@ fn err<T>(message: impl Into<String>) -> Result<T, EncodeError> {
 /// Non-finite values are rejected: `lix_schema`'s row validation already
 /// requires `f64::is_finite`, so NaN payloads and signalling bits cannot reach
 /// a conforming writer, and this is the mechanical backstop for the ones that do.
-pub fn canonical_double_bits(value: f64) -> Result<[u8; 8], EncodeError> {
+pub fn canonical_float8_bits(value: f64) -> Result<[u8; 8], EncodeError> {
     if !value.is_finite() {
         return err(format!(
-            "double precision cannot represent {value}: Schema v1 admits finite values only"
+            "float8 cannot represent {value}: Schema v1 admits finite values only"
         ));
     }
     // `+ 0.0` maps -0.0 to +0.0 and is the identity on every other finite f64.
@@ -122,12 +126,12 @@ pub fn canonical_double_bits(value: f64) -> Result<[u8; 8], EncodeError> {
     Ok(canonical.to_be_bytes())
 }
 
-/// Canonical 8-byte image of a `bigint`.
+/// Canonical 8-byte image of a `int8`.
 ///
 /// Big-endian two's complement, matching the incumbent `typed_slots`
 /// (`i64::from_be_bytes`) so the two representations agree, and so a
 /// sign-flipped fixed slot sorts by `memcmp`.
-pub const fn canonical_bigint_bits(value: i64) -> [u8; 8] {
+pub const fn canonical_int8_bits(value: i64) -> [u8; 8] {
     value.to_be_bytes()
 }
 
@@ -290,11 +294,14 @@ pub fn encode_body(
             // and `output` was cleared at entry, so no prior content survives.
             BodyValue::Null => output.resize(output.len() + width, 0),
             BodyValue::Boolean(flag) => output.push(canonical_boolean_byte(*flag)),
-            BodyValue::BigInt(number) => {
-                output.extend_from_slice(&canonical_bigint_bits(*number));
+            BodyValue::Int8(number) => {
+                output.extend_from_slice(&canonical_int8_bits(*number));
             }
-            BodyValue::DoublePrecision(number) => {
-                output.extend_from_slice(&canonical_double_bits(*number)?);
+            BodyValue::Timestamptz(micros) => {
+                output.extend_from_slice(&micros.to_be_bytes());
+            }
+            BodyValue::Float8(number) => {
+                output.extend_from_slice(&canonical_float8_bits(*number)?);
             }
             BodyValue::Uuid(value) => output.extend_from_slice(&canonical_uuid_bytes(*value)),
             _ => unreachable!("check_value_kind admits only fixed kinds here"),
@@ -324,17 +331,21 @@ fn check_value_kind(column: &BodyColumn, value: &BodyValue) -> Result<(), Encode
     let ok = match (column.kind, value) {
         (_, BodyValue::Null) => true,
         (BodyKind::Boolean, BodyValue::Boolean(_))
-        | (BodyKind::BigInt, BodyValue::BigInt(_))
-        | (BodyKind::DoublePrecision, BodyValue::DoublePrecision(_))
+        | (BodyKind::Int8, BodyValue::Int8(_))
+        | (BodyKind::Float8, BodyValue::Float8(_))
         | (BodyKind::Uuid, BodyValue::Uuid(_))
         | (BodyKind::Text, BodyValue::Text(_))
-        | (BodyKind::Jsonb, BodyValue::Jsonb(_)) => true,
+        | (BodyKind::Jsonb, BodyValue::Jsonb(_))
+        | (BodyKind::Timestamptz, BodyValue::Timestamptz(_)) => true,
         _ => false,
     };
     if ok {
         Ok(())
     } else {
-        err(format!("value {value:?} does not match column kind {:?}", column.kind))
+        err(format!(
+            "value {value:?} does not match column kind {:?}",
+            column.kind
+        ))
     }
 }
 
@@ -342,7 +353,10 @@ fn check_value_kind(column: &BodyColumn, value: &BodyValue) -> Result<(), Encode
 pub fn encode_one(kind: BodyKind, value: &BodyValue) -> Result<Vec<u8>, EncodeError> {
     let mut output = Vec::new();
     encode_body(
-        &[BodyColumn { kind, nullable: true }],
+        &[BodyColumn {
+            kind,
+            nullable: true,
+        }],
         std::slice::from_ref(value),
         &mut output,
     )?;
@@ -406,20 +420,21 @@ pub fn decode_body(plan: &[BodyColumn], body: &[u8]) -> Result<Vec<BodyValue>, E
                 1 => BodyValue::Boolean(true),
                 other => return err(format!("boolean byte {other:#04x} is not 0x00 or 0x01")),
             },
-            BodyKind::BigInt => BodyValue::BigInt(i64::from_be_bytes(slot.try_into().unwrap())),
-            BodyKind::DoublePrecision => {
+            BodyKind::Int8 => BodyValue::Int8(i64::from_be_bytes(slot.try_into().unwrap())),
+            BodyKind::Timestamptz => {
+                BodyValue::Timestamptz(i64::from_be_bytes(slot.try_into().unwrap()))
+            }
+            BodyKind::Float8 => {
                 let number = f64::from_be_bytes(slot.try_into().unwrap());
                 if !number.is_finite() {
-                    return err("double precision slot holds a non-finite value");
+                    return err("float8 slot holds a non-finite value");
                 }
                 if number == 0.0 && number.is_sign_negative() {
-                    return err("double precision slot holds -0.0, which is not canonical");
+                    return err("float8 slot holds -0.0, which is not canonical");
                 }
-                BodyValue::DoublePrecision(number)
+                BodyValue::Float8(number)
             }
-            BodyKind::Uuid => {
-                BodyValue::Uuid(uuid::Uuid::from_bytes(slot.try_into().unwrap()))
-            }
+            BodyKind::Uuid => BodyValue::Uuid(uuid::Uuid::from_bytes(slot.try_into().unwrap())),
             BodyKind::Text | BodyKind::Jsonb => unreachable!(),
         };
         fixed.insert(index, value);

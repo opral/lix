@@ -59,14 +59,16 @@ pub enum DataType {
     Text,
     #[serde(rename = "uuid")]
     Uuid,
-    #[serde(rename = "bigint")]
-    BigInt,
-    #[serde(rename = "double precision")]
-    DoublePrecision,
+    #[serde(rename = "int8")]
+    Int8,
+    #[serde(rename = "float8")]
+    Float8,
     #[serde(rename = "boolean")]
     Boolean,
     #[serde(rename = "jsonb")]
     Jsonb,
+    #[serde(rename = "timestamptz")]
+    Timestamptz,
 }
 
 impl DataType {
@@ -74,10 +76,11 @@ impl DataType {
         match self {
             Self::Text => "text",
             Self::Uuid => "uuid",
-            Self::BigInt => "bigint",
-            Self::DoublePrecision => "double precision",
+            Self::Int8 => "int8",
+            Self::Float8 => "float8",
             Self::Boolean => "boolean",
             Self::Jsonb => "jsonb",
+            Self::Timestamptz => "timestamptz",
         }
     }
 }

@@ -54,7 +54,7 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
     let arity = function_arity(&function.args);
 
     match name {
-        "lix_timestamp"
+        "current_timestamp"
         | "uuidv7"
         | "lix_active_branch_id"
         | "lix_active_branch_commit_id" => expect_exact_arity(name, arity, 0),
@@ -95,7 +95,7 @@ impl Visitor for DurableRuntimeFunctionVisitor {
 
         if matches!(
             public_lix_function_name(function),
-            Some("lix_timestamp" | "uuidv7")
+            Some("current_timestamp" | "uuidv7")
         ) {
             self.found = true;
             return ControlFlow::Break(());
@@ -152,7 +152,7 @@ fn public_lix_function_name(function: &Function) -> Option<&'static str> {
         ObjectNamePart::Function(_) => return None,
     };
     match ident.to_ascii_lowercase().as_str() {
-        "lix_timestamp" => Some("lix_timestamp"),
+        "current_timestamp" | "__lix_current_timestamp" => Some("current_timestamp"),
         "uuidv7" => Some("uuidv7"),
         "lix_active_branch_id" => Some("lix_active_branch_id"),
         "lix_active_branch_commit_id" => Some("lix_active_branch_commit_id"),
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn accepts_valid_public_lix_udf_calls() {
-        validate_public_udf_calls("SELECT '{\"x\":1}'::jsonb, lix_timestamp()")
+        validate_public_udf_calls("SELECT '{\"x\":1}'::jsonb, CURRENT_TIMESTAMP")
             .expect("valid calls should pass public validation");
     }
 
@@ -218,7 +218,7 @@ mod tests {
             "SELECT uuidv7()"
         )));
         assert!(statement_has_durable_runtime_function(&parse_statement(
-            "SELECT lix_timestamp()"
+            "SELECT CURRENT_TIMESTAMP"
         )));
         assert!(!statement_has_durable_runtime_function(&parse_statement(
             "SELECT '{\"x\":1}'::jsonb"
@@ -227,7 +227,7 @@ mod tests {
             "SELECT 'uuidv7()' AS literal"
         )));
         assert!(!statement_has_durable_runtime_function(&parse_statement(
-            "SELECT 1 /* lix_timestamp() */"
+            "SELECT 1 /* CURRENT_TIMESTAMP */"
         )));
     }
 
@@ -235,9 +235,9 @@ mod tests {
     fn marks_nested_aliased_and_explained_durable_runtime_functions() {
         for sql in [
             "WITH generated AS (SELECT uuidv7() AS value) SELECT value FROM generated",
-            "SELECT value FROM (SELECT lix_timestamp() AS value) AS generated",
+            "SELECT value FROM (SELECT CURRENT_TIMESTAMP AS value) AS generated",
             "SELECT uuidv7() AS generated_id",
-            "SELECT CASE WHEN true THEN lix_timestamp() ELSE 'never' END AS value",
+            "SELECT CASE WHEN true THEN CURRENT_TIMESTAMP ELSE TIMESTAMPTZ '1970-01-01T00:00:00Z' END AS value",
             "EXPLAIN SELECT uuidv7()",
         ] {
             assert!(

@@ -22,8 +22,6 @@
 //!
 //! Usage: `e53_write_amplification [rows_per_commit] [commits] [report_every]`
 
-use lix::{ExecuteBatchStatement, Value};
-use lix::{Lix, open_lix};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{
@@ -31,6 +29,8 @@ use lix::storage_bench::{
     probe_hot_generation_planes, take_crud_physical_write_accounting, take_hot_retire_invocations,
     take_packed_base_publication_census,
 };
+use lix::{ExecuteBatchStatement, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 #[tokio::main(flavor = "current_thread")]
@@ -107,7 +107,10 @@ async fn main() {
             })
             .collect::<Vec<_>>();
         let start = std::time::Instant::now();
-        session.execute_batch(&statements).await.expect("seed batch");
+        session
+            .execute_batch(&statements)
+            .await
+            .expect("seed batch");
         let seed_nanos = start.elapsed().as_nanos();
         let packed = take_packed_base_publication_census();
         let (retires, retired_rows) = take_hot_retire_invocations();

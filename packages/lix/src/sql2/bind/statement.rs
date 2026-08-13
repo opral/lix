@@ -1203,7 +1203,7 @@ fn reject_unsupported_function_modifiers(function: &Function) -> Result<(), LixE
 
 fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixError> {
     match name {
-        "lix_timestamp"
+        "__lix_current_timestamp"
         | "uuidv7"
         | "lix_active_branch_id"
         | "lix_active_branch_commit_id" => expect_exact_function_arity(name, actual, 0),
@@ -1246,7 +1246,7 @@ fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
         ident.value.to_ascii_lowercase()
     };
     match name.as_str() {
-        "lix_timestamp"
+        "__lix_current_timestamp"
         | "uuidv7"
         | "lix_active_branch_id"
         | "lix_active_branch_commit_id"
@@ -2011,7 +2011,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_public_values_functions() {
         let statement = parse_statement(
-            "INSERT INTO lix_file (id, path, content) VALUES (uuidv7(), lix_timestamp(), CAST('hello' AS BYTEA))",
+            "INSERT INTO lix_file (id, path, content) VALUES (uuidv7(), CURRENT_TIMESTAMP, CAST('hello' AS BYTEA))",
         );
         let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
@@ -2028,7 +2028,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             function_names,
-            BTreeSet::from(["lix_timestamp", "uuidv7"])
+            BTreeSet::from(["__lix_current_timestamp", "uuidv7"])
         );
     }
 

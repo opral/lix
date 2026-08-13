@@ -96,7 +96,11 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
         .execute(&format!("SELECT id, ordinal FROM {SCHEMA_KEY}"), &[])
         .await
         .expect("scan census rows");
-    assert_eq!(result.rows().len(), ROWS, "the census must observe a full scan");
+    assert_eq!(
+        result.rows().len(),
+        ROWS,
+        "the census must observe a full scan"
+    );
 
     let (allocations, allocated_bytes) = take_scan_key_buffer_census();
     let (rows_decoded, ..) = take_hot_scan_refcount_census();

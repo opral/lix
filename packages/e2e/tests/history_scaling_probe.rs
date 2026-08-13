@@ -229,7 +229,10 @@ async fn history_files_at_fixed_commits() {
             )
             .await;
             emit(
-                &format!("fixed_commits {label} files={files} commits={} rows={rows}", edits + 1),
+                &format!(
+                    "fixed_commits {label} files={files} commits={} rows={rows}",
+                    edits + 1
+                ),
                 &d,
             );
         }
@@ -339,7 +342,10 @@ async fn history_path_resolver_census() {
              ORDER BY lixcol_depth LIMIT {depth}"
         );
         let params = [Value::Text(head.clone()), Value::Text(probe_path.clone())];
-        let _ = lix.execute(&by_path, &params).await.expect("warm probe query");
+        let _ = lix
+            .execute(&by_path, &params)
+            .await
+            .expect("warm probe query");
         let _ = lix::storage_bench::take_path_resolver_census();
         let rows = lix
             .execute(&by_path, &params)
@@ -488,7 +494,10 @@ async fn history_commits_at_fixed_files() {
                     .iter()
                     .map(row_key)
                     .collect();
-                assert_eq!(expected, actual, "path pushdown changed the answer for {target}");
+                assert_eq!(
+                    expected, actual,
+                    "path pushdown changed the answer for {target}"
+                );
             }
             eprintln!("history_scale verify noise_commits={noise_commits} ok");
         }

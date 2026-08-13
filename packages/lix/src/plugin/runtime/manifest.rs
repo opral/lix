@@ -1,15 +1,11 @@
-use std::sync::OnceLock;
+use std::collections::BTreeSet;
 
 use globset::{GlobBuilder, GlobMatcher};
-use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
 use crate::plugin::runtime::WASM_COMPONENT_API_VERSION;
-
-static PLUGIN_MANIFEST_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
-static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -18,6 +14,7 @@ pub enum PluginRuntime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginManifest {
     pub key: String,
     #[serde(rename = "match")]
@@ -27,6 +24,7 @@ pub struct PluginManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginMatch {
     pub path_glob: String,
     #[serde(default, rename = "content")]
@@ -89,15 +87,14 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
         )
     })?;
 
-    validate_plugin_manifest_json(&manifest_json)?;
-
     let manifest: PluginManifest =
         serde_json::from_value(manifest_json.clone()).map_err(|error| {
             LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
-                format!("Plugin manifest does not match expected shape: {error}"),
+                format!("Invalid plugin manifest: {error}"),
             )
         })?;
+    validate_plugin_manifest(&manifest)?;
     compile_path_glob(&manifest.file_match.path_glob).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
@@ -141,74 +138,55 @@ fn compile_path_glob(glob: &str) -> Result<GlobMatcher, globset::Error> {
         .map(|compiled| compiled.compile_matcher())
 }
 
-fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
-    let validator = plugin_manifest_validator()?;
-    if let Err(errors) = validator.validate(manifest) {
-        let details = format_validation_errors(errors);
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            format!("Invalid plugin manifest: {details}"),
-        ));
+fn validate_plugin_manifest(manifest: &PluginManifest) -> Result<(), LixError> {
+    let valid_key = (1..=128).contains(&manifest.key.len())
+        && manifest
+            .key
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_lowercase)
+        && manifest.key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+        });
+    if !valid_key {
+        return invalid_manifest("key must match ^[a-z][a-z0-9_-]*$ and contain at most 128 bytes");
+    }
+    if !(1..=1024).contains(&manifest.file_match.path_glob.len()) {
+        return invalid_manifest("match.path_glob must contain between 1 and 1024 bytes");
+    }
+    if !(1..=512).contains(&manifest.entry.len()) {
+        return invalid_manifest("entry must contain between 1 and 512 bytes");
+    }
+    if !(1..=64).contains(&manifest.schemas.len()) {
+        return invalid_manifest("schemas must contain between 1 and 64 entries");
+    }
+    let mut schemas = BTreeSet::new();
+    for schema in &manifest.schemas {
+        if !(1..=512).contains(&schema.len()) {
+            return invalid_manifest("each schemas entry must contain between 1 and 512 bytes");
+        }
+        if !schemas.insert(schema) {
+            return invalid_manifest("schemas entries must be unique");
+        }
+    }
+    if let Some(PluginContentMatcher::PrefixExcludes { bytes, .. }) = manifest.file_match.content
+        && !(1..=16_777_216).contains(&bytes)
+    {
+        return invalid_manifest("match.content.prefix_excludes.bytes is out of range");
     }
     Ok(())
+}
+
+fn invalid_manifest<T>(message: &str) -> Result<T, LixError> {
+    Err(LixError::new(
+        LixError::CODE_INVALID_PLUGIN,
+        format!("Invalid plugin manifest: {message}"),
+    ))
 }
 
 #[cfg(test)]
 fn is_catch_all_glob(glob: &str) -> bool {
     glob == "*" || glob == "**/*" || glob == "**"
-}
-
-fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
-    let result = PLUGIN_MANIFEST_VALIDATOR.get_or_init(|| {
-        let mut options = JSONSchema::options();
-        options.with_meta_schemas();
-        if plugin_manifest_schema()
-            .get("$schema")
-            .and_then(JsonValue::as_str)
-            .is_some_and(|url| url == "https://json-schema.org/draft/2020-12/schema")
-        {
-            options.with_draft(Draft::Draft202012);
-        }
-
-        options.compile(plugin_manifest_schema()).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("Failed to compile plugin manifest schema: {error}"),
-            )
-        })
-    });
-
-    match result {
-        Ok(schema) => Ok(schema),
-        Err(error) => Err(error.clone()),
-    }
-}
-
-fn plugin_manifest_schema() -> &'static JsonValue {
-    PLUGIN_MANIFEST_SCHEMA.get_or_init(|| {
-        let raw = include_str!("plugin_manifest.json");
-        serde_json::from_str(raw).expect("plugin_manifest.json must be valid JSON")
-    })
-}
-
-fn format_validation_errors<'a>(
-    errors: impl Iterator<Item = jsonschema::ValidationError<'a>>,
-) -> String {
-    let mut parts = Vec::new();
-    for error in errors {
-        let path = error.instance_path.to_string();
-        let message = error.to_string();
-        if path.is_empty() {
-            parts.push(message);
-        } else {
-            parts.push(format!("{path} {message}"));
-        }
-    }
-    if parts.is_empty() {
-        "Unknown validation error".to_string()
-    } else {
-        parts.join("; ")
-    }
 }
 
 #[cfg(test)]

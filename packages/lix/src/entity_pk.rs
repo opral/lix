@@ -284,6 +284,14 @@ impl EntityPk {
         if components.is_empty() {
             return Err(EntityPkError::EmptyPrimaryKey);
         }
+        for (index, component) in components.iter().enumerate() {
+            if matches!(component, EntityPkComponent::String(value) if value.contains('\0')) {
+                return Err(EntityPkError::InvalidPrimaryKeyValue {
+                    index,
+                    expected: "text without Unicode NUL",
+                });
+            }
+        }
         Ok(Self {
             components: EntityPkComponents::from_smallvec(components),
         })
@@ -372,7 +380,14 @@ impl EntityPk {
                             expected: "integer",
                         })?;
                 }
-                EntityPkComponentType::String => {}
+                EntityPkComponentType::String => {
+                    if part.contains('\0') {
+                        return Err(EntityPkError::InvalidPrimaryKeyValue {
+                            index,
+                            expected: "text without Unicode NUL",
+                        });
+                    }
+                }
                 EntityPkComponentType::Bytes => {
                     base64::engine::general_purpose::STANDARD
                         .decode(part.as_bytes())

@@ -16,10 +16,10 @@
 //! Usage: `e53_hot_locality_slatedb [rows_per_commit] [checkpoint...]`
 
 use lix::Value;
-use lix::{Lix, open_lix};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{hot_generation_branches, layout_accounting, probe_hot_generation_planes};
+use lix::{Lix, open_lix};
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
 const PROBE_REPS: usize = 3;
@@ -135,12 +135,7 @@ async fn main() {
                 let delta = diff(&before, &after);
                 println!(
                     "{committed:>8} {store_rows:>12} {store_bytes:>13} {label:>8} {rep:>6} {:>8} {:>10} {:>12} {:>11} {:>10} {:>12}",
-                    probe.deleted_rows,
-                    delta.0,
-                    delta.1,
-                    delta.2,
-                    delta.3,
-                    probe.total_nanos,
+                    probe.deleted_rows, delta.0, delta.1, delta.2, delta.3, probe.total_nanos,
                 );
                 per_space = probe.spaces;
             }

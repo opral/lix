@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 #[cfg(test)]
 use datafusion::arrow::array::Array;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -24,12 +26,12 @@ use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
+use crate::hot_state::MaterializedHotStateBatch;
 #[cfg(test)]
 use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::{
     HotStateFilter, HotStateProjection, HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
-use crate::hot_state::MaterializedHotStateBatch;
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
@@ -1767,6 +1769,30 @@ fn entity_update_json_value(
                 &other,
             )),
         },
+        EntityColumnType::Timestamptz => match value {
+            ScalarValue::TimestampMicrosecond(Some(value), _) => {
+                chrono::DateTime::from_timestamp_micros(value)
+                    .map(|timestamp| {
+                        JsonValue::String(
+                            timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        entity_update_type_error(
+                            spec,
+                            column_name,
+                            "TIMESTAMPTZ",
+                            &ScalarValue::TimestampMicrosecond(Some(value), Some("UTC".into())),
+                        )
+                    })
+            }
+            other => Err(entity_update_type_error(
+                spec,
+                column_name,
+                "TIMESTAMPTZ",
+                &other,
+            )),
+        },
     }
 }
 
@@ -1945,9 +1971,7 @@ fn hot_index_value_from_filter_value(
         EntityFilterValue::String(value) => {
             Some(crate::hot_state::HotIndexValue::String(value.clone()))
         }
-        EntityFilterValue::Integer(value) => {
-            Some(crate::hot_state::HotIndexValue::Integer(*value))
-        }
+        EntityFilterValue::Integer(value) => Some(crate::hot_state::HotIndexValue::Integer(*value)),
         _ => None,
     }
 }
@@ -2550,7 +2574,7 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
                 record_filterable_column(&self.spec.schema_key, column_name, true);
                 Some(column.name.as_str())
             }
-            EntityColumnType::Json => {
+            EntityColumnType::Json | EntityColumnType::Timestamptz => {
                 #[cfg(any(test, feature = "storage-benches"))]
                 record_filterable_column(&self.spec.schema_key, column_name, false);
                 None
@@ -2584,7 +2608,11 @@ fn record_filterable_column(schema_key: &str, column_name: &str, accepted: bool)
     };
     let verdict = if accepted { "accept" } else { "refuse_json" };
     let line = format!("{verdict}\t{schema_key}\t{column_name}\n");
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -2708,7 +2736,12 @@ impl EntityRowFilter {
                     .fields
                     .iter()
                     .position(|field| field.name == *column)?;
-                entity_filter_range_in_statistics(*op, value, &group.columns[index], group.row_count)
+                entity_filter_range_in_statistics(
+                    *op,
+                    value,
+                    &group.columns[index],
+                    group.row_count,
+                )
             }
             Self::And(left, right) => match (
                 left.may_match_group(manifest, group),
@@ -2951,6 +2984,9 @@ fn entity_snapshot_value(
         }
         EntityColumnType::Boolean => value.as_bool().map(EntityFilterValue::Boolean),
         EntityColumnType::Json => None,
+        EntityColumnType::Timestamptz => value
+            .as_str()
+            .map(|value| EntityFilterValue::String(value.to_owned())),
     })
 }
 
@@ -3615,7 +3651,39 @@ fn entity_column_array(
                 .map(|value| value.and_then(JsonValue::as_bool))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
+        EntityColumnType::Timestamptz => Arc::new(
+            TimestampMicrosecondArray::from(
+                values
+                    .iter()
+                    .map(|value| entity_timestamptz_value(*value, &spec.schema_key, column_name))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+            .with_timezone("UTC"),
+        ) as ArrayRef,
     })
+}
+
+fn entity_timestamptz_value(
+    value: Option<&JsonValue>,
+    schema_key: &str,
+    column_name: &str,
+) -> Result<Option<i64>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value.as_str().ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "{schema_key}.{column_name} expected timestamptz text"
+        ))
+    })?;
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map(|timestamp| Some(timestamp.timestamp_micros()))
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "{schema_key}.{column_name} contains invalid timestamptz: {error}"
+            ))
+        })
 }
 
 /// Materialize `lixcol_*` system columns from borrowed batch rows.

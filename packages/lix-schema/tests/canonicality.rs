@@ -9,12 +9,15 @@
 //! Run nonce: vlayout-8813.
 
 use lix_schema::value_layout::{
-    BodyColumn, BodyKind, BodyValue, canonical_double_bits, decode_body, encode_body, encode_one,
+    BodyColumn, BodyKind, BodyValue, canonical_float8_bits, decode_body, encode_body, encode_one,
 };
 use serde_json::json;
 
 fn column(kind: BodyKind) -> BodyColumn {
-    BodyColumn { kind, nullable: true }
+    BodyColumn {
+        kind,
+        nullable: true,
+    }
 }
 
 /// Encode `value` through the single-column body path.
@@ -66,7 +69,10 @@ fn canonicality_boolean_has_one_image_per_value() {
 
 #[test]
 fn canonicality_boolean_admits_exactly_two_bytes() {
-    let plan = [BodyColumn { kind: BodyKind::Boolean, nullable: false }];
+    let plan = [BodyColumn {
+        kind: BodyKind::Boolean,
+        nullable: false,
+    }];
     // Header byte, no bitmap (column is NOT NULL), then the one payload byte.
     let mut body = encode_one_not_null(BodyKind::Boolean, &BodyValue::Boolean(true));
     assert_eq!(*body.last().unwrap(), 0x01);
@@ -79,13 +85,19 @@ fn canonicality_boolean_admits_exactly_two_bytes() {
         );
     }
     *body.last_mut().unwrap() = 0x00;
-    assert!(decode_body(&plan, &body).is_ok(), "0x00 must decode as false");
+    assert!(
+        decode_body(&plan, &body).is_ok(),
+        "0x00 must decode as false"
+    );
 }
 
 fn encode_one_not_null(kind: BodyKind, value: &BodyValue) -> Vec<u8> {
     let mut output = Vec::new();
     encode_body(
-        &[BodyColumn { kind, nullable: false }],
+        &[BodyColumn {
+            kind,
+            nullable: false,
+        }],
         std::slice::from_ref(value),
         &mut output,
     )
@@ -94,43 +106,76 @@ fn encode_one_not_null(kind: BodyKind, value: &BodyValue) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// bigint
+// int8
 // ---------------------------------------------------------------------------
 
 #[test]
-fn canonicality_bigint_has_one_image_per_value() {
+fn canonicality_int8_has_one_image_per_value() {
     // Path A: literal. Path B: arithmetic. Path C: JSON parse.
-    let literal = BodyValue::BigInt(-9_007_199_254_740_993);
-    let computed = BodyValue::BigInt(-9_007_199_254_740_992 - 1);
-    let parsed = BodyValue::BigInt(
+    let literal = BodyValue::Int8(-9_007_199_254_740_993);
+    let computed = BodyValue::Int8(-9_007_199_254_740_992 - 1);
+    let parsed = BodyValue::Int8(
         serde_json::from_str::<serde_json::Value>("-9007199254740993")
             .unwrap()
             .as_i64()
-            .expect("bigint must round-trip through JSON as i64"),
+            .expect("int8 must round-trip through JSON as i64"),
     );
-    assert_eq!(bytes(BodyKind::BigInt, &literal), bytes(BodyKind::BigInt, &computed));
-    assert_eq!(bytes(BodyKind::BigInt, &literal), bytes(BodyKind::BigInt, &parsed));
+    assert_eq!(
+        bytes(BodyKind::Int8, &literal),
+        bytes(BodyKind::Int8, &computed)
+    );
+    assert_eq!(
+        bytes(BodyKind::Int8, &literal),
+        bytes(BodyKind::Int8, &parsed)
+    );
 
     // Endianness is pinned, not merely self-consistent: big-endian two's
     // complement, matching `typed_slots`' `i64::from_be_bytes`.
-    let one = encode_one_not_null(BodyKind::BigInt, &BodyValue::BigInt(1));
+    let one = encode_one_not_null(BodyKind::Int8, &BodyValue::Int8(1));
     assert_eq!(&one[one.len() - 8..], &[0, 0, 0, 0, 0, 0, 0, 1]);
 
     // POSITIVE CONTROL
     assert_ne!(
-        bytes(BodyKind::BigInt, &BodyValue::BigInt(1)),
-        bytes(BodyKind::BigInt, &BodyValue::BigInt(-1)),
+        bytes(BodyKind::Int8, &BodyValue::Int8(1)),
+        bytes(BodyKind::Int8, &BodyValue::Int8(-1)),
         "positive control: 1 and -1 must encode differently"
     );
     assert_ne!(
-        bytes(BodyKind::BigInt, &BodyValue::BigInt(1)),
-        bytes(BodyKind::BigInt, &BodyValue::BigInt(1 << 56)),
+        bytes(BodyKind::Int8, &BodyValue::Int8(1)),
+        bytes(BodyKind::Int8, &BodyValue::Int8(1 << 56)),
         "positive control: a byte-swapped pair must not collide"
     );
 }
 
+#[test]
+fn canonicality_timestamptz_has_one_image_per_instant() {
+    let plan = [BodyColumn {
+        kind: BodyKind::Timestamptz,
+        nullable: false,
+    }];
+    let instant = 1_786_647_721_123_456_i64;
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    encode_body(&plan, &[BodyValue::Timestamptz(instant)], &mut first).unwrap();
+    encode_body(&plan, &[BodyValue::Timestamptz(instant)], &mut second).unwrap();
+    assert_eq!(first, second);
+
+    let mut different = Vec::new();
+    encode_body(
+        &plan,
+        &[BodyValue::Timestamptz(instant + 1)],
+        &mut different,
+    )
+    .unwrap();
+    assert_ne!(first, different);
+    assert_eq!(
+        decode_body(&plan, &first).unwrap(),
+        vec![BodyValue::Timestamptz(instant)]
+    );
+}
+
 // ---------------------------------------------------------------------------
-// double precision  --  the -0.0 and NaN questions
+// float8  --  the -0.0 and NaN questions
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -148,37 +193,37 @@ fn canonicality_double_erases_the_sign_of_zero() {
     // Path A: literal +0.0. Path B: literal -0.0. Path C: computed -1.0 * 0.0.
     // Path D: parsed from the JSON text "-0.0".
     let paths = [
-        BodyValue::DoublePrecision(0.0),
-        BodyValue::DoublePrecision(-0.0),
-        BodyValue::DoublePrecision(-1.0 * 0.0),
-        BodyValue::DoublePrecision(
+        BodyValue::Float8(0.0),
+        BodyValue::Float8(-0.0),
+        BodyValue::Float8(-1.0 * 0.0),
+        BodyValue::Float8(
             serde_json::from_str::<serde_json::Value>("-0.0")
                 .unwrap()
                 .as_f64()
                 .unwrap(),
         ),
     ];
-    let expected = bytes(BodyKind::DoublePrecision, &paths[0]);
+    let expected = bytes(BodyKind::Float8, &paths[0]);
     for path in &paths {
         assert_eq!(
-            bytes(BodyKind::DoublePrecision, path),
+            bytes(BodyKind::Float8, path),
             expected,
             "every construction path for zero must produce one byte string"
         );
     }
-    assert_eq!(canonical_double_bits(-0.0).unwrap(), [0; 8]);
+    assert_eq!(canonical_float8_bits(-0.0).unwrap(), [0; 8]);
 
     // POSITIVE CONTROL: the canonicalisation must not be a constant function.
     assert_ne!(
-        bytes(BodyKind::DoublePrecision, &BodyValue::DoublePrecision(1.0)),
-        bytes(BodyKind::DoublePrecision, &BodyValue::DoublePrecision(-1.0)),
+        bytes(BodyKind::Float8, &BodyValue::Float8(1.0)),
+        bytes(BodyKind::Float8, &BodyValue::Float8(-1.0)),
         "positive control: 1.0 and -1.0 must still differ"
     );
     assert_ne!(
-        bytes(BodyKind::DoublePrecision, &BodyValue::DoublePrecision(1.0)),
+        bytes(BodyKind::Float8, &BodyValue::Float8(1.0)),
         bytes(
-            BodyKind::DoublePrecision,
-            &BodyValue::DoublePrecision(1.000_000_000_000_000_2)
+            BodyKind::Float8,
+            &BodyValue::Float8(1.000_000_000_000_000_2)
         ),
         "positive control: adjacent doubles must differ"
     );
@@ -201,30 +246,45 @@ fn canonicality_double_cannot_carry_a_nan_payload() {
         "premise: distinct NaN payloads exist"
     );
 
-    for value in [quiet, signalling, negative, f64::INFINITY, f64::NEG_INFINITY] {
+    for value in [
+        quiet,
+        signalling,
+        negative,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
         assert!(
-            canonical_double_bits(value).is_err(),
+            canonical_float8_bits(value).is_err(),
             "{value:?} must be rejected, not encoded"
         );
         assert!(
-            encode_one(BodyKind::DoublePrecision, &BodyValue::DoublePrecision(value)).is_err(),
+            encode_one(BodyKind::Float8, &BodyValue::Float8(value)).is_err(),
             "{value:?} must not reach the body"
         );
     }
 
     // And the decoder refuses non-canonical fixed slots, so a hand-built or
     // corrupted body cannot smuggle one back in.
-    let plan = [BodyColumn { kind: BodyKind::DoublePrecision, nullable: false }];
-    let mut body = encode_one_not_null(BodyKind::DoublePrecision, &BodyValue::DoublePrecision(1.0));
+    let plan = [BodyColumn {
+        kind: BodyKind::Float8,
+        nullable: false,
+    }];
+    let mut body = encode_one_not_null(BodyKind::Float8, &BodyValue::Float8(1.0));
     let len = body.len();
     body[len - 8..].copy_from_slice(&quiet.to_be_bytes());
     assert!(decode_body(&plan, &body).is_err(), "NaN must not decode");
     body[len - 8..].copy_from_slice(&(-0.0_f64).to_be_bytes());
-    assert!(decode_body(&plan, &body).is_err(), "-0.0 must not decode: it is not canonical");
+    assert!(
+        decode_body(&plan, &body).is_err(),
+        "-0.0 must not decode: it is not canonical"
+    );
 
     // POSITIVE CONTROL: the decoder is not simply rejecting everything.
     body[len - 8..].copy_from_slice(&0.0_f64.to_be_bytes());
-    assert!(decode_body(&plan, &body).is_ok(), "positive control: +0.0 must decode");
+    assert!(
+        decode_body(&plan, &body).is_ok(),
+        "positive control: +0.0 must decode"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -262,9 +322,16 @@ fn canonicality_uuid_is_sixteen_bytes_in_one_order() {
         BodyKind::Uuid,
         &BodyValue::Uuid(uuid::Uuid::parse_str(spellings[0]).unwrap()),
     );
-    assert_eq!(body.len(), 1 + 16, "header byte plus exactly 16 payload bytes");
+    assert_eq!(
+        body.len(),
+        1 + 16,
+        "header byte plus exactly 16 payload bytes"
+    );
     assert_eq!(body[1], 0x01, "first payload byte is the leading hex octet");
-    assert_eq!(body[16], 0x0e, "last payload byte is the trailing hex octet");
+    assert_eq!(
+        body[16], 0x0e,
+        "last payload byte is the trailing hex octet"
+    );
 
     // POSITIVE CONTROL
     assert_ne!(
@@ -297,7 +364,10 @@ fn canonicality_text_has_one_image_per_string() {
             .unwrap()
             .to_owned(),
     );
-    assert_eq!(bytes(BodyKind::Text, &literal), bytes(BodyKind::Text, &built));
+    assert_eq!(
+        bytes(BodyKind::Text, &literal),
+        bytes(BodyKind::Text, &built)
+    );
     assert_eq!(
         bytes(BodyKind::Text, &literal),
         bytes(BodyKind::Text, &parsed),
@@ -425,12 +495,30 @@ fn canonicality_jsonb_rejects_nul() {
 #[test]
 fn canonicality_null_fixed_slots_are_zero_filled_even_on_a_reused_buffer() {
     let plan = [
-        BodyColumn { kind: BodyKind::BigInt, nullable: true },
-        BodyColumn { kind: BodyKind::DoublePrecision, nullable: true },
-        BodyColumn { kind: BodyKind::Uuid, nullable: true },
-        BodyColumn { kind: BodyKind::Boolean, nullable: true },
-        BodyColumn { kind: BodyKind::Text, nullable: true },
-        BodyColumn { kind: BodyKind::Jsonb, nullable: true },
+        BodyColumn {
+            kind: BodyKind::Int8,
+            nullable: true,
+        },
+        BodyColumn {
+            kind: BodyKind::Float8,
+            nullable: true,
+        },
+        BodyColumn {
+            kind: BodyKind::Uuid,
+            nullable: true,
+        },
+        BodyColumn {
+            kind: BodyKind::Boolean,
+            nullable: true,
+        },
+        BodyColumn {
+            kind: BodyKind::Text,
+            nullable: true,
+        },
+        BodyColumn {
+            kind: BodyKind::Jsonb,
+            nullable: true,
+        },
     ];
     let all_null = vec![
         BodyValue::Null,
@@ -441,8 +529,8 @@ fn canonicality_null_fixed_slots_are_zero_filled_even_on_a_reused_buffer() {
         BodyValue::Null,
     ];
     let populated = vec![
-        BodyValue::BigInt(-1),
-        BodyValue::DoublePrecision(1.5),
+        BodyValue::Int8(-1),
+        BodyValue::Float8(1.5),
         BodyValue::Uuid(uuid::Uuid::from_bytes([0xff; 16])),
         BodyValue::Boolean(true),
         BodyValue::Text("filler".to_owned()),
@@ -460,11 +548,17 @@ fn canonicality_null_fixed_slots_are_zero_filled_even_on_a_reused_buffer() {
     assert!(reused.contains(&0xff), "the poison actually got written");
     encode_body(&plan, &all_null, &mut reused).unwrap();
 
-    assert_eq!(fresh, reused, "a reused buffer must not leak stale bytes into NULL slots");
+    assert_eq!(
+        fresh, reused,
+        "a reused buffer must not leak stale bytes into NULL slots"
+    );
     // Every fixed byte after the header and bitmap must be zero.
     let bitmap_bytes = 6usize.div_ceil(8);
     let fixed = &fresh[1 + bitmap_bytes..1 + bitmap_bytes + 8 + 8 + 16 + 1];
-    assert!(fixed.iter().all(|&byte| byte == 0), "NULL fixed slots must be zero-filled");
+    assert!(
+        fixed.iter().all(|&byte| byte == 0),
+        "NULL fixed slots must be zero-filled"
+    );
 
     // POSITIVE CONTROL: an all-NULL row and a populated row must differ.
     let mut other = Vec::new();
@@ -474,14 +568,22 @@ fn canonicality_null_fixed_slots_are_zero_filled_even_on_a_reused_buffer() {
     // And NULL text is not the empty string.
     let mut null_text = Vec::new();
     let mut empty_text = Vec::new();
-    encode_body(&[column(BodyKind::Text)], &[BodyValue::Null], &mut null_text).unwrap();
+    encode_body(
+        &[column(BodyKind::Text)],
+        &[BodyValue::Null],
+        &mut null_text,
+    )
+    .unwrap();
     encode_body(
         &[column(BodyKind::Text)],
         &[BodyValue::Text(String::new())],
         &mut empty_text,
     )
     .unwrap();
-    assert_ne!(null_text, empty_text, "NULL text and '' must be distinguishable");
+    assert_ne!(
+        null_text, empty_text,
+        "NULL text and '' must be distinguishable"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -491,27 +593,49 @@ fn canonicality_null_fixed_slots_are_zero_filled_even_on_a_reused_buffer() {
 #[test]
 fn encoding_is_total_and_injective_over_a_corpus() {
     let plan = [
-        BodyColumn { kind: BodyKind::Boolean, nullable: true },
-        BodyColumn { kind: BodyKind::BigInt, nullable: true },
-        BodyColumn { kind: BodyKind::DoublePrecision, nullable: true },
-        BodyColumn { kind: BodyKind::Uuid, nullable: false },
-        BodyColumn { kind: BodyKind::Text, nullable: true },
-        BodyColumn { kind: BodyKind::Jsonb, nullable: true },
+        BodyColumn {
+            kind: BodyKind::Boolean,
+            nullable: true,
+        },
+        BodyColumn {
+            kind: BodyKind::Int8,
+            nullable: true,
+        },
+        BodyColumn {
+            kind: BodyKind::Float8,
+            nullable: true,
+        },
+        BodyColumn {
+            kind: BodyKind::Uuid,
+            nullable: false,
+        },
+        BodyColumn {
+            kind: BodyKind::Text,
+            nullable: true,
+        },
+        BodyColumn {
+            kind: BodyKind::Jsonb,
+            nullable: true,
+        },
     ];
-    let booleans = [BodyValue::Null, BodyValue::Boolean(false), BodyValue::Boolean(true)];
-    let bigints = [
+    let booleans = [
         BodyValue::Null,
-        BodyValue::BigInt(i64::MIN),
-        BodyValue::BigInt(0),
-        BodyValue::BigInt(i64::MAX),
+        BodyValue::Boolean(false),
+        BodyValue::Boolean(true),
+    ];
+    let int8s = [
+        BodyValue::Null,
+        BodyValue::Int8(i64::MIN),
+        BodyValue::Int8(0),
+        BodyValue::Int8(i64::MAX),
     ];
     let doubles = [
         BodyValue::Null,
-        BodyValue::DoublePrecision(0.0),
-        BodyValue::DoublePrecision(-0.0),
-        BodyValue::DoublePrecision(f64::MIN),
-        BodyValue::DoublePrecision(f64::MAX),
-        BodyValue::DoublePrecision(f64::MIN_POSITIVE),
+        BodyValue::Float8(0.0),
+        BodyValue::Float8(-0.0),
+        BodyValue::Float8(f64::MIN),
+        BodyValue::Float8(f64::MAX),
+        BodyValue::Float8(f64::MIN_POSITIVE),
     ];
     let texts = [
         BodyValue::Null,
@@ -531,13 +655,13 @@ fn encoding_is_total_and_injective_over_a_corpus() {
     let mut buffer = Vec::new();
     let mut rows = 0usize;
     for boolean in &booleans {
-        for bigint in &bigints {
+        for int8 in &int8s {
             for double in &doubles {
                 for text in &texts {
                     for json in &jsons {
                         let row = vec![
                             boolean.clone(),
-                            bigint.clone(),
+                            int8.clone(),
                             double.clone(),
                             uuid.clone(),
                             text.clone(),
@@ -565,7 +689,11 @@ fn encoding_is_total_and_injective_over_a_corpus() {
             }
         }
     }
-    assert_eq!(rows, 3 * 4 * 6 * 4 * 4, "the corpus must actually have been walked");
+    assert_eq!(
+        rows,
+        3 * 4 * 6 * 4 * 4,
+        "the corpus must actually have been walked"
+    );
     // -0.0 and +0.0 are ONE value, so the distinct-image count is one short of
     // the row count per remaining axis. Assert the collapse happened exactly once.
     assert_eq!(
@@ -578,8 +706,14 @@ fn encoding_is_total_and_injective_over_a_corpus() {
 #[test]
 fn wide_offsets_are_engaged_only_past_the_u16_boundary() {
     let plan = [
-        BodyColumn { kind: BodyKind::Text, nullable: false },
-        BodyColumn { kind: BodyKind::Text, nullable: false },
+        BodyColumn {
+            kind: BodyKind::Text,
+            nullable: false,
+        },
+        BodyColumn {
+            kind: BodyKind::Text,
+            nullable: false,
+        },
     ];
     let mut narrow = Vec::new();
     encode_body(

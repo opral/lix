@@ -11,7 +11,7 @@
     },
     {
       "name": "live_count",
-      "type": "bigint",
+      "type": "int8",
       "nullable": false,
       "description": "Number of live logical rows in the selected generation."
     },
