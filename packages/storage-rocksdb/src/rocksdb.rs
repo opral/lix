@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[cfg(test)]
 use bytes::Buf as _;
 use bytes::Bytes;
+use bytes::BytesMut;
 use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use lix::storage::immutable::validate_immutable_batch;
 use lix::storage::{
@@ -438,6 +439,7 @@ impl StorageRead for RocksDBRead<'_> {
                     bounds,
                     projection: opts.projection,
                     space,
+                    keys: ScanKeyArena::new(),
                 },
             )
         }
@@ -449,6 +451,80 @@ struct RocksDBScanSource<'a> {
     bounds: EncodedBounds,
     projection: CoreProjection,
     space: StorageSpace,
+    keys: ScanKeyArena,
+}
+
+/// Chunk size for [`ScanKeyArena`].
+///
+/// This constant is the whole trade. Larger chunks mean fewer allocations per
+/// page; they also mean a single retained row pins a larger buffer, because a
+/// key handed out of a chunk keeps the entire chunk alive. At 16 KiB a chunk
+/// holds roughly 270 typical HOT keys, so a full page of 4 096 rows costs
+/// about 16 allocations instead of 4 096, while the worst case — one surviving
+/// row per chunk — pins 16 KiB rather than a whole page.
+const SCAN_KEY_ARENA_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Hands out scanned keys as refcounted slices of a shared chunk instead of
+/// one heap allocation per row.
+///
+/// `Bytes::copy_from_slice` produces a `Vec`-backed buffer, and a `Vec`-backed
+/// `Bytes` cannot be cloned without first being **promoted**: the clone
+/// allocates a refcount control block and installs it with a compare-and-swap.
+/// The HOT key decoder clones every row's key onto its primary-key components,
+/// so the per-row cost was two allocations and a promotion to hand out bytes
+/// the page already had in memory.
+///
+/// Splitting one `BytesMut` gives every key in a chunk a handle on a single
+/// shared allocation, so cloning a key is a plain uncontended increment and
+/// nothing is promoted.
+///
+/// **Keys only, deliberately.** Values are unbounded — a value can be a blob —
+/// so pooling them would trade a bounded amount of time for an unbounded
+/// amount of retained memory, and would do it worst on exactly the selective
+/// scans that already materialize more than they return.
+struct ScanKeyArena {
+    chunk: BytesMut,
+}
+
+impl ScanKeyArena {
+    fn new() -> Self {
+        Self {
+            chunk: BytesMut::new(),
+        }
+    }
+
+    /// Copies `bytes` into the current chunk and returns a shared handle on it.
+    ///
+    /// Keys already frozen out of a full chunk keep that chunk alive on their
+    /// own, so starting a fresh one never invalidates them.
+    fn take(&mut self, bytes: &[u8]) -> Bytes {
+        if self.chunk.capacity() < bytes.len() {
+            let capacity = SCAN_KEY_ARENA_CHUNK_BYTES.max(bytes.len());
+            self.chunk = BytesMut::with_capacity(capacity);
+            #[cfg(feature = "storage-benches")]
+            {
+                lix::storage_bench::record_scan_key_buffer_allocation(capacity);
+            }
+        }
+        self.chunk.extend_from_slice(bytes);
+        let key = self.chunk.split_to(bytes.len()).freeze();
+        // Guards the one thing that can go wrong when keys are carved out of a
+        // shared buffer rather than copied into their own: handing back a
+        // window of the wrong width would silently mint a different logical
+        // key. Cheap — a compare against a length already in a register.
+        //
+        // The message doubles as this build's arm marker. `ScanKeyArena`
+        // inlines away in release and leaves no symbol, and a `#[used]` static
+        // is dropped by the linker, but a panic string cannot be collected, so
+        // `strings | grep lix.rocksdb.scan_key_arena.v1` answers "is the arena
+        // in this artifact?" without trusting which directory it came from.
+        assert_eq!(
+            key.len(),
+            bytes.len(),
+            "lix.rocksdb.scan_key_arena.v1 handed out a key of the wrong width"
+        );
+        key
+    }
 }
 
 impl StorageScanSource for RocksDBScanSource<'_> {
@@ -469,7 +545,7 @@ impl StorageScanSource for RocksDBScanSource<'_> {
                 if !self.bounds.before_upper(encoded_key) {
                     break;
                 }
-                let key = decode_rocksdb_scan_key(self.space, encoded_key)?;
+                let key = Key(self.keys.take(scan_key_payload(self.space, encoded_key)?));
                 let value = match self.projection {
                     CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
                     CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(
@@ -493,13 +569,16 @@ impl StorageScanSource for RocksDBScanSource<'_> {
     }
 }
 
-fn decode_rocksdb_scan_key(space: StorageSpace, encoded_key: &[u8]) -> Result<Key, StorageError> {
+fn scan_key_payload<'a>(
+    space: StorageSpace,
+    encoded_key: &'a [u8],
+) -> Result<&'a [u8], StorageError> {
     if encoded_key.len() < 4 || encoded_key[..4] != space.id.0.to_be_bytes() {
         return Err(StorageError::Corruption(
             "RocksDB scan key escaped its storage space".to_string(),
         ));
     }
-    Ok(Key(Bytes::copy_from_slice(&encoded_key[4..])))
+    Ok(&encoded_key[4..])
 }
 
 impl StorageWrite for RocksDBWrite {

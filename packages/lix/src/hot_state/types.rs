@@ -258,25 +258,71 @@ impl MaterializedHotStateBatch {
             .map_or_else(|| self.branch_ids[index].0 as usize, |_| 0)
     }
 
+    /// Drops every row rejected by `keep`, compacting the columns this batch
+    /// already owns.
+    ///
+    /// **This consumes the batch on purpose.** Filtering used to build a
+    /// second columnar owner row by row, which cloned every `SharedStr` and
+    /// every `EntityPk` component of every surviving row — one atomic
+    /// increment per shared buffer per row, plus the matching decrement when
+    /// the source batch was dropped. None of that traffic moves any bytes.
+    /// Compacting in place *moves* the same buffers instead, so a filter now
+    /// costs no refcount traffic at all.
+    ///
+    /// The string dictionary is deliberately left uncompacted. It holds one
+    /// entry per *distinct* schema key, file id and branch id rather than one
+    /// per row, so a dropped row strands no per-row allocation, and every
+    /// surviving row keeps the ordinal it was built with.
     pub(crate) fn filter(
-        &self,
+        mut self,
         mut keep: impl FnMut(MaterializedHotStateRowRef<'_>) -> bool,
         limit: Option<usize>,
     ) -> Self {
-        let capacity = limit.map_or_else(|| self.len(), |limit| limit.min(self.len()));
-        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(capacity);
-        if capacity == 0 && limit.is_some() {
-            return builder.finish();
+        if limit == Some(0) {
+            return Self::default();
         }
-        for row in self.iter() {
-            if keep(row) {
-                builder.push_ref(row, None);
-                if builder.len() == capacity && limit.is_some() {
-                    break;
-                }
-            }
+        if self.singleton.is_some() {
+            return if keep(self.row(0)) {
+                self
+            } else {
+                Self::default()
+            };
         }
-        builder.finish()
+        let limit = limit.unwrap_or(usize::MAX);
+        let mut kept = 0_usize;
+        let mut mask = Vec::with_capacity(self.len());
+        for index in 0..self.len() {
+            // Short-circuits once the limit is reached, so `keep` observes the
+            // same prefix of rows a row-by-row rebuild would have shown it.
+            let retain = kept < limit && keep(self.row(index));
+            kept += usize::from(retain);
+            mask.push(retain);
+        }
+        if kept == mask.len() {
+            return self;
+        }
+        if kept == 0 {
+            return Self::default();
+        }
+        retain_by_mask(&mut self.schema_keys, &mask);
+        retain_by_mask(&mut self.file_ids, &mask);
+        retain_by_mask(&mut self.branch_ids, &mask);
+        retain_by_mask(&mut self.entity_pks, &mask);
+        retain_by_mask(&mut self.snapshot_content, &mask);
+        retain_by_mask(&mut self.metadata, &mask);
+        retain_by_mask(&mut self.deleted, &mask);
+        retain_by_mask(&mut self.created_at, &mask);
+        retain_by_mask(&mut self.updated_at, &mask);
+        retain_by_mask(&mut self.global, &mask);
+        retain_by_mask(&mut self.change_id, &mask);
+        retain_by_mask(&mut self.commit_id, &mask);
+        retain_by_mask(&mut self.untracked, &mask);
+        retain_by_mask(&mut self.durable_predecessor, &mask);
+        if let Some(coordinates) = self.columnar_base_coordinate.as_mut() {
+            retain_by_mask(coordinates, &mask);
+        }
+        debug_assert_eq!(self.entity_pks.len(), kept);
+        self
     }
 
     #[cfg(test)]
@@ -695,6 +741,21 @@ impl MaterializedHotStateExactBatch {
     }
 }
 
+/// Keeps the elements whose `mask` entry is `true`, preserving order.
+///
+/// `Vec::retain` visits elements in their original order, so one shared mask
+/// compacts every parallel column of a batch identically. Elements are moved,
+/// never cloned, which is the whole point of filtering in place.
+fn retain_by_mask<T>(values: &mut Vec<T>, mask: &[bool]) {
+    debug_assert_eq!(values.len(), mask.len());
+    let mut index = 0_usize;
+    values.retain(|_| {
+        let retain = mask[index];
+        index += 1;
+        retain
+    });
+}
+
 fn owned_row_dictionary_capacity(rows: &[MaterializedHotStateRow]) -> (usize, usize) {
     let mut seen = HashSet::<&str, FastHashBuilder>::with_capacity_and_hasher(
         rows.len().saturating_mul(3),
@@ -980,10 +1041,57 @@ impl MaterializedHotStateBatchBuilder {
         untracked: bool,
         branch_id: &str,
     ) -> usize {
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_hot_scan_row_handle_clones(entity_pk.shared_handle_count());
+        }
+        self.push_materialized_interned(
+            entity_pk.clone(),
+            schema_key,
+            file_id,
+            snapshot_content,
+            metadata,
+            deleted,
+            created_at,
+            updated_at,
+            global,
+            change_id,
+            commit_id,
+            untracked,
+            branch_id,
+        )
+    }
+
+    /// Appends a row whose identity strings are interned from borrows but
+    /// whose primary key is **moved** into the column.
+    ///
+    /// A decoded HOT scan row already owns its `EntityPk`, and every component
+    /// of that key is a `Bytes` slice of the retained physical key. Handing it
+    /// to [`Self::push_materialized_ref`] clones each component — an atomic
+    /// increment per component per row, immediately followed by the matching
+    /// decrement when the decoded row is dropped — to produce a value the
+    /// caller was about to discard anyway. Moving it costs nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_materialized_interned(
+        &mut self,
+        entity_pk: EntityPk,
+        schema_key: &str,
+        file_id: Option<&str>,
+        snapshot_content: Option<SharedStr>,
+        metadata: Option<SharedStr>,
+        deleted: bool,
+        created_at: LixTimestamp,
+        updated_at: LixTimestamp,
+        global: bool,
+        change_id: Option<ChangeId>,
+        commit_id: Option<CommitId>,
+        untracked: bool,
+        branch_id: &str,
+    ) -> usize {
         let ordinal = self.len();
         if self.singleton_capacity {
             self.push_owned(MaterializedHotStateRow {
-                entity_pk: entity_pk.clone(),
+                entity_pk,
                 schema_key: schema_key.to_owned(),
                 file_id: file_id.map(str::to_owned),
                 snapshot_content,
@@ -1006,7 +1114,7 @@ impl MaterializedHotStateBatchBuilder {
             schema_key,
             file_id,
             branch_id,
-            entity_pk.clone(),
+            entity_pk,
             snapshot_content,
             metadata,
             deleted,
@@ -1025,6 +1133,14 @@ impl MaterializedHotStateBatchBuilder {
         row: MaterializedHotStateRowRef<'_>,
         branch_override: Option<&str>,
     ) -> usize {
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_hot_scan_row_handle_clones(
+                row.entity_pk().shared_handle_count()
+                    + usize::from(row.snapshot_content().is_some())
+                    + usize::from(row.metadata().is_some()),
+            );
+        }
         let ordinal = self.len();
         if self.singleton_capacity {
             let branch_id = branch_override.map_or_else(|| row.branch_owner(), Arc::from);
@@ -1658,18 +1774,73 @@ mod batch_tests {
         let batch = MaterializedHotStateBatch::from_rows(
             (0..10_000).map(|_| row(entity_pk.clone())).collect(),
         );
+        let dictionary_bytes_len = batch.dictionary_bytes_len();
         let filtered = batch.filter(|_| true, None);
 
         assert_eq!(filtered.len(), 10_000);
         assert_eq!(filtered.dictionary_entry_count(), 3);
-        assert_eq!(
-            filtered.dictionary_bytes_len(),
-            batch.dictionary_bytes_len()
-        );
+        assert_eq!(filtered.dictionary_bytes_len(), dictionary_bytes_len);
         assert_eq!(
             filtered.row(0).schema_key().as_ptr(),
             filtered.row(9_999).schema_key().as_ptr()
         );
+    }
+
+    #[test]
+    fn filtering_moves_surviving_rows_instead_of_cloning_their_buffers() {
+        let shared = EntityPk::single("shared_entity");
+        let batch = MaterializedHotStateBatch::from_rows(
+            (0..1_000)
+                .map(|index| {
+                    row(if index % 2 == 0 {
+                        shared.clone()
+                    } else {
+                        EntityPk::single("dropped_entity")
+                    })
+                })
+                .collect(),
+        );
+        let survivors = batch
+            .iter()
+            .filter(|row| row.entity_pk() == &shared)
+            .count();
+        assert_eq!(survivors, 500);
+        let entity_column = batch.entity_column_ptr();
+
+        let filtered = batch.filter(|row| row.entity_pk() == &shared, None);
+
+        assert_eq!(filtered.len(), 500);
+        assert!(filtered.iter().all(|row| row.entity_pk() == &shared));
+        // The surviving rows still live in the allocation they were built in.
+        // A row-by-row rebuild would have cloned every `EntityPk` component
+        // and every `SharedStr` into a second owner, which is the atomic
+        // refcount traffic this filter exists to avoid.
+        assert_eq!(filtered.entity_column_ptr(), entity_column);
+        // The dictionary is carried over rather than rebuilt, so every
+        // surviving row still points at the same interned schema key.
+        assert_eq!(
+            filtered.row(0).schema_key().as_ptr(),
+            filtered.row(499).schema_key().as_ptr()
+        );
+    }
+
+    #[test]
+    fn filtering_stops_calling_the_predicate_once_the_limit_is_reached() {
+        let batch = MaterializedHotStateBatch::from_rows(
+            (0..16).map(|_| row(EntityPk::single("row"))).collect(),
+        );
+        let mut visited = 0_usize;
+
+        let filtered = batch.filter(
+            |_| {
+                visited += 1;
+                true
+            },
+            Some(4),
+        );
+
+        assert_eq!(filtered.len(), 4);
+        assert_eq!(visited, 4);
     }
 
     #[test]

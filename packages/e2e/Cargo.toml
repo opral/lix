@@ -23,7 +23,7 @@ workspace = true
 default = ["rocksdb"]
 rocksdb = ["dep:lix_storage_rocksdb"]
 slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
-storage-benches = ["lix/storage-benches", "rocksdb"]
+storage-benches = ["lix/storage-benches", "rocksdb", "lix_storage_rocksdb/storage-benches"]
 root-replay-trace = ["lix/root-replay-trace", "storage-benches"]
 server-protocol = ["lix/server-protocol"]
 tpch = ["dep:duckdb", "dep:tpchgen"]
@@ -533,4 +533,14 @@ required-features = ["sdk-tests", "storage-benches", "slatedb"]
 [[example]]
 name = "exppth2_txn_probe"
 path = "examples/exppth2_txn_probe.rs"
+required-features = ["storage-benches"]
+
+[[test]]
+name = "hot_scan_refcount_census"
+path = "tests/hot_scan_refcount_census.rs"
+required-features = ["storage-benches"]
+
+[[test]]
+name = "scan_key_buffer_census"
+path = "tests/scan_key_buffer_census.rs"
 required-features = ["storage-benches"]

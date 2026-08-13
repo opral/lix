@@ -2302,10 +2302,14 @@ fn materialize_live_slot(
     }
     match slot {
         HeadSlotView::None => None,
-        HeadSlotView::Inline(json) | HeadSlotView::InlineFingerprinted { json, .. } => Some(
-            SharedStr::from_utf8_slice(owner.clone(), json)
-                .expect("decoded inline JSON points into its head-value buffer"),
-        ),
+        HeadSlotView::Inline(json) | HeadSlotView::InlineFingerprinted { json, .. } => {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_hot_scan_value_handle_clone();
+            Some(
+                SharedStr::from_utf8_slice(owner.clone(), json)
+                    .expect("decoded inline JSON points into its head-value buffer"),
+            )
+        }
         HeadSlotView::Ref(json_ref) => {
             json_refs.push(json_ref);
             deferred.push(DeferredJson {
