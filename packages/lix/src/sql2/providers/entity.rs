@@ -1907,7 +1907,9 @@ fn declared_column_membership(filter: &EntityRowFilter) -> Option<(&str, Vec<&En
             values.extend(right_values);
             Some((column, values))
         }
-        EntityRowFilter::And(..) => None,
+        // A range names no finite value set, so it cannot become an
+        // equality/IN probe. The index range seek is a separate access path.
+        EntityRowFilter::ColumnRange { .. } | EntityRowFilter::And(..) => None,
     }
 }
 
@@ -2360,11 +2362,66 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
     }
 
     fn analyze_binary(&self, binary_expr: &BinaryExpr) -> Option<EntityRowFilter> {
-        if binary_expr.op != Operator::Eq {
+        if binary_expr.op == Operator::Eq {
+            return self
+                .analyze_column_literal(&binary_expr.left, &binary_expr.right)
+                .or_else(|| self.analyze_column_literal(&binary_expr.right, &binary_expr.left));
+        }
+        let op = EntityRangeOp::from_operator(binary_expr.op)?;
+        self.analyze_column_literal_range(&binary_expr.left, &binary_expr.right, op)
+            .or_else(|| {
+                self.analyze_column_literal_range(
+                    &binary_expr.right,
+                    &binary_expr.left,
+                    op.reversed(),
+                )
+            })
+    }
+
+    /// A `column OP literal` range predicate, when the column can carry one.
+    ///
+    /// Restricted to `Integer` and `String`. Those are the types with a total
+    /// order, and — not coincidentally — the two the hot index can encode
+    /// order-preservingly, so this is the same admissible set a later index
+    /// range seek needs. `Number` is refused because NaN makes the order
+    /// partial; `Boolean` and `Json` have no useful range.
+    fn analyze_column_literal_range(
+        &self,
+        column_expr: &Expr,
+        literal_expr: &Expr,
+        op: EntityRangeOp,
+    ) -> Option<EntityRowFilter> {
+        let Expr::Column(column) = column_expr else {
+            return None;
+        };
+        let column_name = self.filterable_column_name(&column.name)?;
+        let column_type = self
+            .spec
+            .visible_column(column_name)
+            .expect("filterable column should exist")
+            .column_type;
+        if !matches!(
+            column_type,
+            EntityColumnType::Integer | EntityColumnType::String
+        ) {
             return None;
         }
-        self.analyze_column_literal(&binary_expr.left, &binary_expr.right)
-            .or_else(|| self.analyze_column_literal(&binary_expr.right, &binary_expr.left))
+        let value = entity_filter_value_literal(literal_expr, column_type)?;
+        // A literal that widened into another representation (an integer
+        // column compared against a float, say) has no total order against the
+        // stored value, so it must not become a range.
+        if !matches!(
+            value,
+            EntityFilterValue::Integer(_) | EntityFilterValue::String(_)
+        ) {
+            return None;
+        }
+        Some(EntityRowFilter::ColumnRange {
+            column: column_name.to_string(),
+            column_type,
+            op,
+            value,
+        })
     }
 
     fn analyze_in_list(&self, in_list: &InList) -> Option<EntityRowFilter> {
@@ -2448,8 +2505,66 @@ enum EntityRowFilter {
         column_type: EntityColumnType,
         values: Vec<EntityFilterValue>,
     },
+    /// One half-bounded comparison against a literal.
+    ///
+    /// `BETWEEN` reaches the analyzer already desugared into `>= AND <=`, so a
+    /// single bound per node composes into a closed interval through the
+    /// existing [`EntityRowFilter::And`] arm. Carrying one bound rather than
+    /// two keeps every consumer's arm total and means the interval logic lives
+    /// in exactly one place.
+    ColumnRange {
+        column: String,
+        column_type: EntityColumnType,
+        op: EntityRangeOp,
+        value: EntityFilterValue,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
+}
+
+/// The comparison a [`EntityRowFilter::ColumnRange`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntityRangeOp {
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+impl EntityRangeOp {
+    fn from_operator(op: Operator) -> Option<Self> {
+        match op {
+            Operator::Lt => Some(Self::Lt),
+            Operator::LtEq => Some(Self::LtEq),
+            Operator::Gt => Some(Self::Gt),
+            Operator::GtEq => Some(Self::GtEq),
+            _ => None,
+        }
+    }
+
+    /// The same predicate with the operands swapped.
+    ///
+    /// `5 < ordinal` and `ordinal < 5` are different predicates, so the
+    /// literal-on-the-left spelling must reverse the comparison rather than
+    /// reuse it. Reusing it silently returns the complement of the requested
+    /// rows.
+    fn reversed(self) -> Self {
+        match self {
+            Self::Lt => Self::Gt,
+            Self::LtEq => Self::GtEq,
+            Self::Gt => Self::Lt,
+            Self::GtEq => Self::LtEq,
+        }
+    }
+
+    fn matches(self, ordering: std::cmp::Ordering) -> bool {
+        match self {
+            Self::Lt => ordering.is_lt(),
+            Self::LtEq => ordering.is_le(),
+            Self::Gt => ordering.is_gt(),
+            Self::GtEq => ordering.is_ge(),
+        }
+    }
 }
 
 impl EntityRowFilter {
@@ -2481,6 +2596,15 @@ impl EntityRowFilter {
                     }
                 }
                 (!unknown).then_some(false)
+            }
+            Self::ColumnRange {
+                column, op, value, ..
+            } => {
+                let index = manifest
+                    .fields
+                    .iter()
+                    .position(|field| field.name == *column)?;
+                entity_filter_range_in_statistics(*op, value, &group.columns[index], group.row_count)
             }
             Self::And(left, right) => match (
                 left.may_match_group(manifest, group),
@@ -2524,6 +2648,16 @@ impl EntityRowFilter {
                     },
                 ),
             ),
+            Self::ColumnRange {
+                column,
+                column_type,
+                op,
+                value,
+            } => Ok(
+                entity_snapshot_value(snapshot, schema_key, column, *column_type)?
+                    .and_then(|actual| entity_filter_value_cmp(&actual, value))
+                    .is_some_and(|ordering| op.matches(ordering)),
+            ),
             Self::And(left, right) => Ok(left.matches_snapshot(snapshot, schema_key)?
                 && right.matches_snapshot(snapshot, schema_key)?),
             Self::Or(left, right) => Ok(left.matches_snapshot(snapshot, schema_key)?
@@ -2563,6 +2697,73 @@ fn entity_filter_value_in_statistics(
             RowGroupScalar::String(min),
             RowGroupScalar::String(max),
         ) => Some(min <= value && value <= max),
+        _ => None,
+    }
+}
+
+/// Whether any row of `statistics` can satisfy `op` against `value`.
+///
+/// A lower-bounded predicate can only be satisfied by a group whose **maximum**
+/// clears the bound; an upper-bounded one by a group whose **minimum** does.
+/// Comparing against the wrong end of the interval prunes groups that contain
+/// matching rows, so the pairing here is the correctness core of range pruning.
+///
+/// `None` means "cannot tell" and the group is kept — this predicate is pushed
+/// down as [`TableProviderFilterPushDown::Inexact`], so keeping too many groups
+/// costs time while dropping too few is a wrong answer.
+fn entity_filter_range_in_statistics(
+    op: EntityRangeOp,
+    value: &EntityFilterValue,
+    statistics: &crate::columnar_row_group::RowGroupColumnStatistics,
+    row_count: u32,
+) -> Option<bool> {
+    if statistics.null_count == row_count && statistics.min.is_none() && statistics.max.is_none() {
+        return Some(false);
+    }
+    let bound = match op {
+        EntityRangeOp::Gt | EntityRangeOp::GtEq => statistics.max.as_ref()?,
+        EntityRangeOp::Lt | EntityRangeOp::LtEq => statistics.min.as_ref()?,
+    };
+    Some(op.matches(entity_scalar_value_cmp(bound, value)?))
+}
+
+/// Orders a row-group statistic against a filter literal.
+///
+/// Only the two types with a total order are comparable. `Float64` is
+/// deliberately absent: NaN makes the order partial, and a partial order here
+/// would prune a group that holds matching rows.
+fn entity_scalar_value_cmp(
+    scalar: &crate::columnar_row_group::RowGroupScalar,
+    value: &EntityFilterValue,
+) -> Option<std::cmp::Ordering> {
+    use crate::columnar_row_group::RowGroupScalar;
+    match (scalar, value) {
+        (RowGroupScalar::Int64(scalar), EntityFilterValue::Integer(value)) => {
+            Some(scalar.cmp(value))
+        }
+        (RowGroupScalar::String(scalar), EntityFilterValue::String(value)) => {
+            Some(scalar.as_str().cmp(value.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// Orders a decoded snapshot value against a filter literal.
+///
+/// `None` — a missing column, a type mismatch, or a value with no total order —
+/// makes the comparison unsatisfied, matching SQL's treatment of a comparison
+/// against NULL as unknown rather than true.
+fn entity_filter_value_cmp(
+    actual: &EntityFilterValue,
+    expected: &EntityFilterValue,
+) -> Option<std::cmp::Ordering> {
+    match (actual, expected) {
+        (EntityFilterValue::Integer(actual), EntityFilterValue::Integer(expected)) => {
+            Some(actual.cmp(expected))
+        }
+        (EntityFilterValue::String(actual), EntityFilterValue::String(expected)) => {
+            Some(actual.as_str().cmp(expected.as_str()))
+        }
         _ => None,
     }
 }
