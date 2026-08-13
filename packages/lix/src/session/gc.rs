@@ -71,6 +71,7 @@ where
                     swept_commits = plan.changelog.sweep.commits.len(),
                     swept_changes = plan.changelog.sweep.changes.len(),
                     swept_tracked_roots = plan.sweep.tracked_commit_roots.len(),
+                    history_manifests_missing = plan.profile.history_manifests_missing,
                     root_discovery_us = plan.profile.root_discovery_us,
                     changelog_us = plan.profile.changelog_us,
                     tracked_root_stage_us = plan.profile.tracked_root_stage_us,

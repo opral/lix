@@ -641,6 +641,10 @@ pub(crate) struct RepositoryGcPlan {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RepositoryGcProfile {
+    /// Graph-reachable commits this sweep found with no physical manifest --
+    /// history a sweep predating the history-retention fix already reclaimed.
+    /// Reported so the condition is observable; never a retention input.
+    pub(crate) history_manifests_missing: u64,
     pub(crate) root_discovery_us: u64,
     pub(crate) changelog_us: u64,
     pub(crate) tracked_root_stage_us: u64,
@@ -830,6 +834,10 @@ struct AuthenticatedServingDependencyClosure {
     /// payload_refs_digest` pairing exists, so the walk has to carry it out.
     /// Rediscovering it later would mean re-reading the scoped-range trees.
     native_part_refs_digests: BTreeSet<[u8; 32]>,
+    /// Graph-reachable commits with no physical manifest, i.e. commits whose
+    /// history delta a pre-fix sweep already reclaimed. Counted so the
+    /// condition is observable; never a retention input.
+    history_manifests_missing: u64,
 }
 
 async fn load_authenticated_serving_dependency_closure<S>(
@@ -878,7 +886,47 @@ where
     physical_dependencies.extend(history_dependencies.iter().copied());
     let mut semantic_dependencies = serving_dependencies;
     semantic_dependencies.extend(history_dependencies.iter().copied());
-    physical_dependencies.extend(graph_reachable.iter().copied());
+    // Retain the delta of every graph-reachable commit that still has one.
+    //
+    // Tolerating absence is deliberate, and it is scoped to exactly this set.
+    // A repository swept by the code that shipped before this fix has commits
+    // that are graph-reachable and have no manifest, because that sweep deleted
+    // it; those manifests are gone and cannot be recomputed. Demanding one here
+    // would abort every future sweep on such a repository -- silently, because
+    // `collect_checkpoint_garbage_best_effort` swallows the error, so
+    // collection would simply stop forever while writes kept succeeding.
+    //
+    // Nothing else is relaxed. Serving dependencies, selected-source owners and
+    // physical authorities keep their existing hard demand, so a manifest
+    // missing from any of those classes still fails the sweep exactly as it
+    // does today. Within this set we *cannot* tell a commit swept before the
+    // fix from a manifest missing for a reason that should not happen -- after
+    // this fix no graph-reachable commit is ever swept, so absence is either
+    // legacy or corruption and nothing at hand separates them. Both are
+    // tolerated and both are counted, so the condition is observable rather
+    // than silent.
+    let graph_reachable_ids = graph_reachable.iter().copied().collect::<Vec<_>>();
+    let graph_reachable_manifests =
+        crate::tracked_state::load_commit_state_manifests(store, &graph_reachable_ids).await?;
+    let mut history_manifests_missing = 0u64;
+    for (commit_id, manifest) in graph_reachable_ids
+        .into_iter()
+        .zip(graph_reachable_manifests)
+    {
+        if manifest.is_some() {
+            physical_dependencies.insert(commit_id);
+        } else {
+            history_manifests_missing += 1;
+        }
+    }
+    if history_manifests_missing > 0 {
+        tracing::warn!(
+            history_manifests_missing,
+            "repository contains commits whose history delta was reclaimed by a garbage \
+             collection sweep predating the history-retention fix; their entity history is \
+             permanently truncated and cannot be recovered"
+        );
+    }
     semantic_dependencies.extend(graph_reachable);
     let mut cas_logical_dependencies = history_dependencies;
     let mut manifests = BTreeMap::new();
@@ -1063,6 +1111,7 @@ where
         scoped_nodes,
         native_parts,
         native_part_refs_digests,
+        history_manifests_missing,
     })
 }
 
@@ -1371,6 +1420,7 @@ where
         scoped_nodes: active_scoped_nodes,
         native_parts: active_current_parts,
         native_part_refs_digests: active_current_part_refs_digests,
+        history_manifests_missing,
     } = load_authenticated_repository_retention(&store, &controls).await?;
 
     // Retirement candidates are derived here, not read from a ledger.
@@ -1522,6 +1572,7 @@ where
             binary_cas,
         },
         profile: RepositoryGcProfile {
+            history_manifests_missing,
             root_discovery_us: elapsed_micros(started),
             changelog_us: 0,
             tracked_root_stage_us: 0,
@@ -1596,6 +1647,9 @@ where
             binary_cas: Default::default(),
         },
         profile: RepositoryGcProfile {
+            // The recovery-only rebuild path rediscovers liveness by scanning;
+            // it does not consult the graph-reachable manifest set at all.
+            history_manifests_missing: 0,
             root_discovery_us,
             changelog_us,
             tracked_root_stage_us,
@@ -2424,6 +2478,87 @@ mod tests {
         );
         assert!(reachability.serving_dependencies.is_empty());
         assert!(!reachability.chronology_roots.contains(&tracked_generation));
+    }
+
+    /// Builds `old_root -> active` with the head at `active`, optionally
+    /// omitting `old_root`'s physical manifest to model a repository already
+    /// swept by the code that shipped before the history-retention fix.
+    async fn history_retention_fixture(with_old_manifest: bool) -> super::RepositoryGcPlan {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("history retention timestamp", "2026-01-01T00:00:00Z");
+        let old_root = replay_commit_record("history-retained-old", 0, None, timestamp);
+        let active = replay_commit_record(
+            "history-retained-active",
+            1,
+            Some(old_root.commit_id),
+            timestamp,
+        );
+        let mut old_manifest =
+            test_commit_state_manifest(&old_root, CommitStateMutationInventory::default());
+        old_manifest.replay_debt = CommitStateReplayDebt::default();
+        old_manifest.snapshot_root = Some(Box::new(test_snapshot_root(old_root.commit_id)));
+        let mut active_manifest =
+            test_commit_state_manifest(&active, CommitStateMutationInventory::default());
+        active_manifest.replay_debt = CommitStateReplayDebt::default();
+        active_manifest.snapshot_root = Some(Box::new(test_snapshot_root(active.commit_id)));
+
+        let control_ref = ChangeId::for_test_label("history-retained-control");
+        let active_control = replay_branch_control(active.commit_id, control_ref, timestamp);
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(&mut writes, "main", active_control)
+            .expect("history retention control should stage");
+        let manifests = if with_old_manifest {
+            vec![old_manifest, active_manifest]
+        } else {
+            vec![active_manifest]
+        };
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[old_root.clone(), active.clone()],
+            &manifests,
+        )
+        .await;
+
+        let plan = run_ordinary_repository_gc(&storage).await;
+        assert!(
+            !plan.sweep.tracked_commit_roots.contains(&old_root.commit_id),
+            "an ancestor of the live head is what _history() reads; it must not be retired"
+        );
+        plan
+    }
+
+    /// The fix: a commit reachable from the head through parent links keeps its
+    /// physical delta, because that delta is what an entity `_history()` row is
+    /// served out of.
+    #[tokio::test]
+    async fn ordinary_gc_retains_the_delta_of_a_graph_reachable_commit() {
+        let plan = history_retention_fixture(true).await;
+        assert_eq!(
+            plan.profile.history_manifests_missing, 0,
+            "a repository with intact history reports nothing missing"
+        );
+    }
+
+    /// The tolerance, and its inversion against the test above: the same
+    /// repository with that manifest already reclaimed by a pre-fix sweep must
+    /// still complete a sweep, and must say so rather than tolerating silently.
+    ///
+    /// Demanding the manifest here would abort every future sweep on such a
+    /// repository, and `collect_checkpoint_garbage_best_effort` swallows the
+    /// error, so collection would stop permanently while writes kept
+    /// succeeding. Worse, `checkpoint_gc_due` derives its age limit from
+    /// `last_gc_sequence`, which only a *successful* sweep advances, so the
+    /// due-predicate would latch: every later checkpoint would pay for a
+    /// doomed full-repository sweep, forever.
+    #[tokio::test]
+    async fn ordinary_gc_tolerates_and_counts_history_reclaimed_before_the_fix() {
+        let plan = history_retention_fixture(false).await;
+        assert_eq!(
+            plan.profile.history_manifests_missing, 1,
+            "the commit whose delta a pre-fix sweep reclaimed must be counted, not swallowed"
+        );
     }
 
     #[tokio::test]
