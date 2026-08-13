@@ -170,7 +170,7 @@ http-body-util = "0.1"
 lix_collaboration_test_support = { path = "../collaboration-test-support" }
 paste = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tracing-subscriber = "0.3"
 wasm-encoder = "0.248"
 wit-parser = "0.247"
