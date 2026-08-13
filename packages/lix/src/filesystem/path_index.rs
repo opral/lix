@@ -53,10 +53,21 @@ thread_local! {
     static FULL_REBUILD_DESCRIPTOR_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Cache lookups are counted next to the rebuild counter so a zero rebuild
+// count can be read positively. Without these, "no rebuilds" is
+// indistinguishable from "this lane was never reached".
+#[cfg(test)]
+thread_local! {
+    static PATH_INDEX_CACHE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PATH_INDEX_CACHE_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 pub(crate) fn reset_full_rebuild_stats() {
     FULL_REBUILD_BUILDS.with(|builds| builds.set(0));
     FULL_REBUILD_DESCRIPTOR_ROWS.with(|rows| rows.set(0));
+    PATH_INDEX_CACHE_HITS.with(|hits| hits.set(0));
+    PATH_INDEX_CACHE_MISSES.with(|misses| misses.set(0));
 }
 
 #[cfg(test)]
@@ -64,6 +75,15 @@ pub(crate) fn full_rebuild_stats() -> (usize, usize) {
     (
         FULL_REBUILD_BUILDS.with(std::cell::Cell::get),
         FULL_REBUILD_DESCRIPTOR_ROWS.with(std::cell::Cell::get),
+    )
+}
+
+/// `(hits, misses)` on the filesystem path-index cache.
+#[cfg(test)]
+pub(crate) fn path_index_cache_stats() -> (usize, usize) {
+    (
+        PATH_INDEX_CACHE_HITS.with(std::cell::Cell::get),
+        PATH_INDEX_CACHE_MISSES.with(std::cell::Cell::get),
     )
 }
 
@@ -1242,7 +1262,13 @@ impl FilesystemPathIndexCache {
             .entries
             .lock()
             .expect("filesystem path cache lock poisoned");
-        let index = entries.iter().position(|candidate| candidate.key == key)?;
+        let Some(index) = entries.iter().position(|candidate| candidate.key == key) else {
+            #[cfg(test)]
+            PATH_INDEX_CACHE_MISSES.with(|misses| misses.set(misses.get().saturating_add(1)));
+            return None;
+        };
+        #[cfg(test)]
+        PATH_INDEX_CACHE_HITS.with(|hits| hits.set(hits.get().saturating_add(1)));
         let entry = entries.remove(index);
         let result = Arc::clone(&entry.index);
         entries.push(entry);

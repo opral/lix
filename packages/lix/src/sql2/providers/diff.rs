@@ -15,7 +15,6 @@ use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::encode_diff_id;
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateFilter,
 };
@@ -163,10 +162,7 @@ where
                             continue;
                         }
                         rows.push(DiffSqlRow {
-                            diff_id: encode_diff_id(
-                                entry.before.as_ref().map(|row| row.change_id),
-                                entry.after.as_ref().map(|row| row.change_id),
-                            ),
+                            diff_id: entry.diff_id(),
                             entity_pk: entry.identity.entity_pk().as_json_array_text(),
                             schema_key: entry.identity.schema_key().to_owned(),
                             file_id: entry.identity.file_id().map(str::to_owned),

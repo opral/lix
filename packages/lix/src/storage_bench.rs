@@ -50,6 +50,26 @@ static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
+static ROOT_BASE_BATCH_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static ROOT_BASE_BATCH_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_DURABLE_ROOT: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_EXACT_KEYS: AtomicU64 = AtomicU64::new(0);
+static TRACKED_SCAN_ROOTLESS_REPLAY: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_CALLS: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_STRING_BYTES: AtomicU64 = AtomicU64::new(0);
+static KEY_DECODE_OWNED_ESCAPED_STRINGS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_ROWS_LOADED: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_ROW_KEY_DECODES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_ACCOUNT_ID_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_POINT_KEY_ENCODES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_POINT_KEY_ENCODE_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_REQUEST_KEY_CLONES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZE_OWNED_KEY_BUILDS: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZE_OWNED_KEY_BYTES: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZE_REVERIFY_ROWS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_DELTA_COLUMNAR_ROWS: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
@@ -60,6 +80,8 @@ static CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_HITS: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_CURRENT_STATE_COLUMNAR_ROOT_PUBLICATIONS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_CURRENT_STATE_PARENT_ROOT_HITS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -337,6 +359,156 @@ pub struct EntityPointSnapshotCacheAccounting {
     pub misses: u64,
 }
 
+pub(crate) fn record_root_base_batch_cache_hit() {
+    ROOT_BASE_BATCH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_root_base_batch_cache_miss() {
+    ROOT_BASE_BATCH_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Hits and misses since the last call. A rotated generation that is scanned
+/// repeatedly must show hits; zero hits means the serving cache is not
+/// connected to the lane under test, which is not visible in a timing sweep.
+pub fn take_root_base_batch_cache_accounting() -> (u64, u64) {
+    (
+        ROOT_BASE_BATCH_CACHE_HITS.swap(0, Ordering::Relaxed),
+        ROOT_BASE_BATCH_CACHE_MISSES.swap(0, Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn record_tracked_scan_durable_root() {
+    TRACKED_SCAN_DURABLE_ROOT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_tracked_scan_exact_keys() {
+    TRACKED_SCAN_EXACT_KEYS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_tracked_scan_rootless_replay() {
+    TRACKED_SCAN_ROOTLESS_REPLAY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Which arm of `scan_batch_at_commit` ran, since the last call:
+/// `(durable_root, exact_keys, rootless_replay)`.
+///
+/// Symbol presence in a profile is not attribution — a claim about which arm
+/// executed has to come from the branch itself. This exists because inferring
+/// it from which symbols appeared got it exactly backwards once.
+pub fn take_tracked_scan_branch_accounting() -> (u64, u64, u64) {
+    (
+        TRACKED_SCAN_DURABLE_ROOT.swap(0, Ordering::Relaxed),
+        TRACKED_SCAN_EXACT_KEYS.swap(0, Ordering::Relaxed),
+        TRACKED_SCAN_ROOTLESS_REPLAY.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Per-row identity allocation on the commit-delta payload fetch.
+///
+/// Each field names the exact site it counts, because the question this
+/// answers is whether one identity is decoded, cloned and re-encoded once per
+/// row or once per batch — and a count taken at any layer above the payload
+/// fetch cannot tell those apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackedKeyAllocationCensus {
+    /// `codec::decode_key` calls, all callers.
+    pub key_decode_calls: u64,
+    /// Encoded key bytes handed to `codec::decode_key`.
+    pub key_decode_input_bytes: u64,
+    /// Heap bytes copied by `decode_key`'s `into_owned()` over what
+    /// `decode_key_borrowed` already produced — the ceiling on what a
+    /// borrow-based fix at that site can remove.
+    pub key_decode_owned_string_bytes: u64,
+    /// Of those, strings whose encoding contained an escape and so were
+    /// already `Cow::Owned` before `into_owned()` — unavoidable by borrowing.
+    pub key_decode_escaped_strings: u64,
+    /// `load_commit_delta_entry_at_index` calls: rows fetched from a packed
+    /// commit delta.
+    pub commit_delta_rows_loaded: u64,
+    /// `decode_key` calls made by `load_commit_delta_entry_at_index` itself.
+    pub commit_delta_row_key_decodes: u64,
+    /// Bytes allocated by the per-row `account_id.to_string()`.
+    pub commit_delta_account_id_bytes: u64,
+    /// Per-request `encode_key_ref` calls on the point-read commit-delta route.
+    pub commit_delta_point_key_encodes: u64,
+    pub commit_delta_point_key_encode_bytes: u64,
+    /// `TrackedStateKey` deep clones made by `load_commit_delta_change_records`
+    /// to build its request vector.
+    pub commit_delta_request_key_clones: u64,
+    pub commit_delta_request_key_clone_bytes: u64,
+    /// Owned `TrackedStateKey` values built by `materialize_index_payloads`
+    /// from keys it already holds borrowed.
+    pub materialize_owned_key_builds: u64,
+    pub materialize_owned_key_bytes: u64,
+    /// Rows that reached the post-fetch re-verification in
+    /// `materialize_index_payloads`.
+    pub materialize_reverify_rows: u64,
+    /// Rows served by `load_columnar_owned_entries` — the commit-delta route
+    /// that has **no** byte-equality assert and matches identity through JSON
+    /// text instead. Counted separately from `commit_delta_rows_loaded` because
+    /// the two routes establish identity by different means, and a test about
+    /// one of them proves nothing unless it can show which one ran.
+    pub commit_delta_columnar_rows: u64,
+}
+
+pub(crate) fn record_key_decode_owned(input_bytes: usize, owned_string_bytes: usize, escaped: u32) {
+    KEY_DECODE_OWNED_CALLS.fetch_add(1, Ordering::Relaxed);
+    KEY_DECODE_OWNED_INPUT_BYTES.fetch_add(input_bytes as u64, Ordering::Relaxed);
+    KEY_DECODE_OWNED_STRING_BYTES.fetch_add(owned_string_bytes as u64, Ordering::Relaxed);
+    KEY_DECODE_OWNED_ESCAPED_STRINGS.fetch_add(u64::from(escaped), Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_row_loaded(account_id_bytes: usize) {
+    COMMIT_DELTA_ROWS_LOADED.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_ROW_KEY_DECODES.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_ACCOUNT_ID_BYTES.fetch_add(account_id_bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_point_key_encode(bytes: usize) {
+    COMMIT_DELTA_POINT_KEY_ENCODES.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_POINT_KEY_ENCODE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_request_key_clone(bytes: usize) {
+    COMMIT_DELTA_REQUEST_KEY_CLONES.fetch_add(1, Ordering::Relaxed);
+    COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_materialize_owned_key(bytes: usize) {
+    MATERIALIZE_OWNED_KEY_BUILDS.fetch_add(1, Ordering::Relaxed);
+    MATERIALIZE_OWNED_KEY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_materialize_reverify_row() {
+    MATERIALIZE_REVERIFY_ROWS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_commit_delta_columnar_row() {
+    COMMIT_DELTA_COLUMNAR_ROWS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn take_tracked_key_allocation_census() -> TrackedKeyAllocationCensus {
+    TrackedKeyAllocationCensus {
+        key_decode_calls: KEY_DECODE_OWNED_CALLS.swap(0, Ordering::Relaxed),
+        key_decode_input_bytes: KEY_DECODE_OWNED_INPUT_BYTES.swap(0, Ordering::Relaxed),
+        key_decode_owned_string_bytes: KEY_DECODE_OWNED_STRING_BYTES.swap(0, Ordering::Relaxed),
+        key_decode_escaped_strings: KEY_DECODE_OWNED_ESCAPED_STRINGS.swap(0, Ordering::Relaxed),
+        commit_delta_rows_loaded: COMMIT_DELTA_ROWS_LOADED.swap(0, Ordering::Relaxed),
+        commit_delta_row_key_decodes: COMMIT_DELTA_ROW_KEY_DECODES.swap(0, Ordering::Relaxed),
+        commit_delta_account_id_bytes: COMMIT_DELTA_ACCOUNT_ID_BYTES.swap(0, Ordering::Relaxed),
+        commit_delta_point_key_encodes: COMMIT_DELTA_POINT_KEY_ENCODES.swap(0, Ordering::Relaxed),
+        commit_delta_point_key_encode_bytes: COMMIT_DELTA_POINT_KEY_ENCODE_BYTES
+            .swap(0, Ordering::Relaxed),
+        commit_delta_request_key_clones: COMMIT_DELTA_REQUEST_KEY_CLONES.swap(0, Ordering::Relaxed),
+        commit_delta_request_key_clone_bytes: COMMIT_DELTA_REQUEST_KEY_CLONE_BYTES
+            .swap(0, Ordering::Relaxed),
+        materialize_owned_key_builds: MATERIALIZE_OWNED_KEY_BUILDS.swap(0, Ordering::Relaxed),
+        materialize_owned_key_bytes: MATERIALIZE_OWNED_KEY_BYTES.swap(0, Ordering::Relaxed),
+        materialize_reverify_rows: MATERIALIZE_REVERIFY_ROWS.swap(0, Ordering::Relaxed),
+        commit_delta_columnar_rows: COMMIT_DELTA_COLUMNAR_ROWS.swap(0, Ordering::Relaxed),
+    }
+}
+
 pub(crate) fn record_entity_point_snapshot_cache_hit() {
     ENTITY_POINT_SNAPSHOT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
 }
@@ -449,6 +621,56 @@ pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScop
         commit_delta_direct_rows: COMMIT_DELTA_DIRECT_ROWS.swap(0, Ordering::Relaxed),
         commit_delta_generic_segments: COMMIT_DELTA_GENERIC_SEGMENTS.swap(0, Ordering::Relaxed),
         commit_delta_generic_rows: COMMIT_DELTA_GENERIC_ROWS.swap(0, Ordering::Relaxed),
+    }
+}
+
+/// Publication-side census for `current_state_scoped_ranges`, the per-scope
+/// read accelerator.
+///
+/// These are deliberately **not** the `crud_current_state_scoped_range_*`
+/// counters above: those record `attempts`/`hits` inside
+/// `resolve_rootless_index_values_at_commit`, which is the rootless replay
+/// *read* path. Nothing there observes whether a commit published a scoped
+/// root, so a test asserting on them passes whether or not the accelerator
+/// ever engaged.
+///
+/// The two fields split the accelerator's two halves, which fail
+/// independently:
+///
+/// * `columnar_root_publications` — a commit whose mutation inventory carried
+///   columnar parts bootstrapped a scoped root out of the `parent_root ==
+///   None` fixed point. Reached only by a certified typed INSERT batch of at
+///   least `TYPED_CERTIFIED_INSERT_MIN_ROWS` (32,768) rows against a
+///   user-registered entity schema.
+/// * `parent_root_hits` — a later publication found a parent scoped root and
+///   carried it forward. This is what proves the accelerator *sustains*; a
+///   regression that bootstraps and then self-extinguishes leaves
+///   `columnar_root_publications` intact and drives this to zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CertifiedCurrentStatePublicationCounters {
+    pub columnar_root_publications: u64,
+    pub parent_root_hits: u64,
+}
+
+pub(crate) fn record_certified_current_state_columnar_root_publication() {
+    CERTIFIED_CURRENT_STATE_COLUMNAR_ROOT_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_certified_current_state_parent_root_hit() {
+    CERTIFIED_CURRENT_STATE_PARENT_ROOT_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reads the cumulative scoped-root publication counters **without** resetting
+/// them. These statics are process-global and test binaries run their tests in
+/// parallel, so a `swap`-style reader would let two fixtures steal each other's
+/// counts. Subtract a pre-operation snapshot from a post-operation snapshot and
+/// assert a threshold on the delta; concurrent contributions can only inflate
+/// it, never hide a mechanism that stopped engaging.
+pub fn certified_current_state_publication_counters() -> CertifiedCurrentStatePublicationCounters {
+    CertifiedCurrentStatePublicationCounters {
+        columnar_root_publications: CERTIFIED_CURRENT_STATE_COLUMNAR_ROOT_PUBLICATIONS
+            .load(Ordering::Relaxed),
+        parent_root_hits: CERTIFIED_CURRENT_STATE_PARENT_ROOT_HITS.load(Ordering::Relaxed),
     }
 }
 
@@ -3707,4 +3929,56 @@ mod tests {
         assert_eq!(before_layout, after_first_layout);
         assert_eq!(after_first_layout, after_second_layout);
     }
+}
+
+static HOT_BLOB_REF_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_POINT_BATCH: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_FILE_PREFIX: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_ENTRIES_DECODED: AtomicU64 = AtomicU64::new(0);
+static HOT_BLOB_REF_SCAN_ENTRIES_MATCHED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_hot_blob_ref_scan_call() {
+    HOT_BLOB_REF_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_point_batch() {
+    HOT_BLOB_REF_SCAN_POINT_BATCH.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_file_prefix() {
+    HOT_BLOB_REF_SCAN_FILE_PREFIX.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_fallback() {
+    HOT_BLOB_REF_SCAN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_blob_ref_scan_entry(matched: bool) {
+    HOT_BLOB_REF_SCAN_ENTRIES_DECODED.fetch_add(1, Ordering::Relaxed);
+    if matched {
+        HOT_BLOB_REF_SCAN_ENTRIES_MATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Accounting for the single-entity `lix_binary_blob_ref` probe every
+/// `lix_file` content update issues:
+/// `(calls, point_batch, file_prefix, fallback, entries_decoded, entries_matched)`.
+///
+/// Counted INSIDE `hot_scan_entries`, at the iterator loop that decodes each
+/// storage key — not at `scan_batch`'s return value. Those are different
+/// numbers: `hot_scan_entries` applies `identity.matches_filter` in memory
+/// before returning, so a count taken above it reports the surviving rows and
+/// cannot distinguish a seek from a full-prefix walk. The three route counters
+/// exist so that a zero is readable as "this arm did not run" rather than as
+/// "the counter never ran".
+pub fn take_hot_blob_ref_scan_accounting() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        HOT_BLOB_REF_SCAN_CALLS.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_POINT_BATCH.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_FILE_PREFIX.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_FALLBACK.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_ENTRIES_DECODED.swap(0, Ordering::Relaxed),
+        HOT_BLOB_REF_SCAN_ENTRIES_MATCHED.swap(0, Ordering::Relaxed),
+    )
 }

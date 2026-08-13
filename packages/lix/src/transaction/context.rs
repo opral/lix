@@ -516,7 +516,17 @@ fn record_transaction_path_index_build(descriptor_rows: usize) {
 /// that may write. Write-relevant reads must be exposed from this transaction,
 /// after the storage write transaction has begun, rather than from session-level
 /// helpers.
+/// Retires the write-context revocation token so any `SqlWriteContext` that
+/// outlives this transaction fails deterministically instead of dereferencing
+/// freed memory. See `sql2::WriteContextLiveness`.
+impl<StorageImpl: Storage + 'static> Drop for Transaction<StorageImpl> {
+    fn drop(&mut self) {
+        self.write_context_liveness.retire();
+    }
+}
+
 pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
+    write_context_liveness: crate::sql2::WriteContextLiveness,
     active_branch_id: String,
     active_account_id: String,
     hot_state: Arc<HotStateContext>,
@@ -1535,7 +1545,8 @@ where
         let read = opening_read.clone();
         let setup_result = async {
             let active_branch_id = session_branch.get()?;
-            let runtime_functions = FunctionContext::prepare(&read).await?;
+            let runtime_functions =
+                FunctionContext::prepare(&read, Some(hot_state.global_key_value_rows())).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
             // Transaction open needs the catalog revision and the tracked
@@ -1619,6 +1630,7 @@ where
         Ok((
             OpenTransaction {
                 transaction: Self {
+                    write_context_liveness: crate::sql2::WriteContextLiveness::new(),
                     active_branch_id,
                     active_account_id,
                     hot_state,
@@ -8107,10 +8119,7 @@ where
             entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
                 && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
         }) {
-            let diff_id = crate::tracked_state::encode_diff_id(
-                entry.before.as_ref().map(|row| row.change_id),
-                entry.after.as_ref().map(|row| row.change_id),
-            )?;
+            let diff_id = entry.diff_id()?;
             let target = entry.after.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -9074,6 +9083,10 @@ impl<StorageImpl> SqlWriteExecutionContext for Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+
+    fn write_context_liveness(&self) -> crate::sql2::WriteContextLiveness {
+        self.write_context_liveness.clone()
+    }
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
     }
@@ -12755,6 +12768,463 @@ mod tests {
 
         assert!(!successor.contains(&prior_key));
         assert!(successor.contains(&replacement_key));
+    }
+
+    /// Mechanism probe for the `lix_file` content-update scaling defect.
+    ///
+    /// A content-only update changes no descriptor -- same path, same name,
+    /// same parent -- so the visible filesystem path index is unchanged by it.
+    /// This measures how many times that index is nevertheless rebuilt from
+    /// scratch, and how many descriptor rows each rebuild reads, so the cost
+    /// can be attributed to repository size rather than inferred from timings.
+    ///
+    /// The counter lives inside `build_path_index`, the only full-rebuild site,
+    /// which is a different layer from the timing instrument that first showed
+    /// the slope.
+    #[tokio::test]
+    async fn content_updates_hit_the_path_index_cache_and_do_not_rebuild_it() {
+        async fn measure(files: usize, updates: usize) -> (usize, usize, usize, usize) {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("storage should initialize");
+            let engine = Engine::new(storage)
+                .await
+                .expect("engine should open initialized storage");
+            let session = engine.open_session().await.expect("session should open");
+
+            let values = (0..files)
+                .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            session
+                .execute(
+                    &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
+                    &[],
+                )
+                .await
+                .expect("fixture files should commit");
+
+            let rows = session
+                .execute("SELECT id FROM lix_file ORDER BY path", &[])
+                .await
+                .expect("file ids should read back");
+            let ids = rows
+                .rows()
+                .iter()
+                .map(|row| {
+                    row.get::<String>("id")
+                        .expect("file row should carry an id")
+                })
+                .collect::<Vec<_>>();
+            assert!(ids.len() >= updates, "fixture must cover every update");
+
+            crate::filesystem::reset_full_rebuild_stats();
+            for id in ids.iter().take(updates) {
+                session
+                    .execute(
+                        "UPDATE lix_file SET content = $1 WHERE id = $2",
+                        &[
+                            Value::Blob(b"byte-02".to_vec().into()),
+                            Value::Text(id.clone()),
+                        ],
+                    )
+                    .await
+                    .expect("content update should commit");
+            }
+            let (builds, rows) = crate::filesystem::full_rebuild_stats();
+            let (hits, misses) = crate::filesystem::path_index_cache_stats();
+            (builds, rows, hits, misses)
+        }
+
+        let updates = 10;
+        let (small_builds, small_rows, small_hits, small_misses) = measure(50, updates).await;
+        let (large_builds, large_rows, large_hits, large_misses) = measure(500, updates).await;
+        println!(
+            "PATHINDEX files=50 builds={small_builds} rebuilt_rows={small_rows} hits={small_hits} misses={small_misses}"
+        );
+        println!(
+            "PATHINDEX files=500 builds={large_builds} rebuilt_rows={large_rows} hits={large_hits} misses={large_misses}"
+        );
+
+        // Connectivity: the lane really is exercised, so a zero rebuild count
+        // below is a positive result and not an instrument pointed elsewhere.
+        assert!(
+            small_hits >= updates && large_hits >= updates,
+            "each content update must consult the path-index cache: {small_hits} / {large_hits}"
+        );
+
+        // The measured result: content updates HIT this cache. The visible
+        // filesystem path index is NOT rebuilt per statement, so it is not the
+        // source of the per-statement cost that scales with repository size.
+        assert_eq!(
+            small_builds, 0,
+            "50-file repository rebuilt the path index {small_builds} times"
+        );
+        assert_eq!(
+            large_builds, 0,
+            "500-file repository rebuilt the path index {large_builds} times"
+        );
+        assert_eq!(small_rows, 0, "no rebuild should read descriptor rows");
+        assert_eq!(large_rows, 0, "no rebuild should read descriptor rows");
+    }
+
+    /// Does the single-entity blob-ref probe every `lix_file` content update
+    /// issues push `entity_pks` down to a seek, or scan the branch's whole
+    /// blob-ref collection and filter in memory?
+    ///
+    /// `rows_scanned` is what the hot-state scan handed back before visibility
+    /// resolution -- what storage actually read. `rows_returned` is what the
+    /// update consumed. If the pushdown works these track each other; if not,
+    /// `rows_scanned` tracks the repository size while `rows_returned` stays 1.
+    #[tokio::test]
+    async fn content_update_blob_ref_probe_scans_only_its_own_row() {
+        async fn measure(files: usize, updates: usize) -> (usize, usize, usize) {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("storage should initialize");
+            let engine = Engine::new(storage)
+                .await
+                .expect("engine should open initialized storage");
+            let session = engine.open_session().await.expect("session should open");
+
+            let values = (0..files)
+                .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            session
+                .execute(
+                    &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
+                    &[],
+                )
+                .await
+                .expect("fixture files should commit");
+
+            let rows = session
+                .execute("SELECT id FROM lix_file ORDER BY path", &[])
+                .await
+                .expect("file ids should read back");
+            let ids = rows
+                .rows()
+                .iter()
+                .map(|row| {
+                    row.get::<String>("id")
+                        .expect("file row should carry an id")
+                })
+                .collect::<Vec<_>>();
+            assert!(ids.len() >= updates, "fixture must cover every update");
+
+            crate::hot_state::reset_blob_ref_probe_stats();
+            for id in ids.iter().take(updates) {
+                session
+                    .execute(
+                        "UPDATE lix_file SET content = $1 WHERE id = $2",
+                        &[
+                            Value::Blob(b"byte-02".to_vec().into()),
+                            Value::Text(id.clone()),
+                        ],
+                    )
+                    .await
+                    .expect("content update should commit");
+            }
+            crate::hot_state::blob_ref_probe_stats()
+        }
+
+        let updates = 10;
+        let (small_calls, small_scanned, small_returned) = measure(50, updates).await;
+        let (large_calls, large_scanned, large_returned) = measure(500, updates).await;
+        println!(
+            "BLOBPROBE files=50 calls={small_calls} scanned={small_scanned} returned={small_returned}"
+        );
+        println!(
+            "BLOBPROBE files=500 calls={large_calls} scanned={large_scanned} returned={large_returned}"
+        );
+
+        // Connectivity: the probe really is issued once per content update, so
+        // a low scanned count below means the pushdown works rather than that
+        // this counter never ran.
+        assert_eq!(
+            small_calls, updates,
+            "each content update should issue exactly one blob-ref probe"
+        );
+        assert_eq!(
+            large_calls, updates,
+            "each content update should issue exactly one blob-ref probe"
+        );
+
+        // Each probe consumes exactly its own row, at both repository sizes.
+        assert_eq!(small_returned, updates, "one blob-ref row per update");
+        assert_eq!(large_returned, updates, "one blob-ref row per update");
+
+        // The claim under test: what storage READ must not grow with the
+        // repository. A 10x larger repository must not make this probe read
+        // 10x more rows.
+        assert!(
+            large_scanned < small_scanned * 5,
+            "blob-ref probe reads scale with repository size: \
+             50 files scanned {small_scanned}, 500 files scanned {large_scanned}"
+        );
+    }
+
+    /// The by-id content update must reach its blob-ref row by a point read,
+    /// never by walking the branch's blob-ref collection.
+    ///
+    /// This asserts on counters taken INSIDE `hot_scan_entries`, at the loop
+    /// that decodes each storage key. The predecessor of this test counted
+    /// `scan_batch`'s return value instead, which is already post
+    /// `matches_filter` and therefore reads identically under a seek and under
+    /// a full-prefix walk -- it reported "already a seek" for what was a walk
+    /// over every file in the branch. `entries_decoded` is the number that can
+    /// tell those apart, and `calls` makes a zero readable as "this arm did not
+    /// run" rather than "the counter did not run".
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn content_update_blob_ref_probe_takes_the_point_route() {
+        async fn measure(files: usize, updates: usize) -> (u64, u64, u64, u64, u64) {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("storage should initialize");
+            let engine = Engine::new(storage)
+                .await
+                .expect("engine should open initialized storage");
+            let session = engine.open_session().await.expect("session should open");
+
+            let values = (0..files)
+                .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            session
+                .execute(
+                    &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
+                    &[],
+                )
+                .await
+                .expect("fixture files should commit");
+
+            let rows = session
+                .execute("SELECT id FROM lix_file ORDER BY path", &[])
+                .await
+                .expect("file ids should read back");
+            let ids = rows
+                .rows()
+                .iter()
+                .map(|row| {
+                    row.get::<String>("id")
+                        .expect("file row should carry an id")
+                })
+                .collect::<Vec<_>>();
+            assert!(ids.len() >= updates, "fixture must cover every update");
+
+            let _ = crate::storage_bench::take_hot_blob_ref_scan_accounting();
+            for id in ids.iter().take(updates) {
+                session
+                    .execute(
+                        "UPDATE lix_file SET content = $1 WHERE id = $2",
+                        &[
+                            Value::Blob(b"byte-02".to_vec().into()),
+                            Value::Text(id.clone()),
+                        ],
+                    )
+                    .await
+                    .expect("content update should commit");
+            }
+            let (calls, point_batch, file_prefix, fallback, decoded, matched) =
+                crate::storage_bench::take_hot_blob_ref_scan_accounting();
+
+            // The update must actually have landed, or a cheap route would be
+            // cheap for the wrong reason.
+            for id in ids.iter().take(updates) {
+                let read = session
+                    .execute("SELECT content FROM lix_file WHERE id = $1", &[
+                        Value::Text(id.clone()),
+                    ])
+                    .await
+                    .expect("content should read back");
+                let row = read.rows().first().expect("updated file should be visible");
+                let content = read
+                    .get(row, "content")
+                    .expect("content column should be present");
+                assert!(
+                    matches!(content, Value::Blob(bytes) if bytes.as_ref() == b"byte-02"),
+                    "content update must be visible after the pinned probe"
+                );
+            }
+            let _ = crate::storage_bench::take_hot_blob_ref_scan_accounting();
+            let _ = (file_prefix, matched);
+            (calls, point_batch, fallback, decoded, matched)
+        }
+
+        let updates = 10;
+        let (small_calls, small_point, small_fallback, small_decoded, _) =
+            measure(50, updates).await;
+        let (large_calls, large_point, large_fallback, large_decoded, _) =
+            measure(500, updates).await;
+        println!(
+            "BLOBROUTE files=50 calls={small_calls} point={small_point} \
+fallback={small_fallback} decoded={small_decoded}"
+        );
+        println!(
+            "BLOBROUTE files=500 calls={large_calls} point={large_point} \
+fallback={large_fallback} decoded={large_decoded}"
+        );
+
+        // Connectivity: the probe really is issued, so the zeros below are
+        // readable as "that arm did not run".
+        assert!(
+            small_calls >= updates as u64 && large_calls >= updates as u64,
+            "every content update should issue a blob-ref probe: \
+             50 files {small_calls} calls, 500 files {large_calls} calls"
+        );
+
+        // The claim under test: the point route runs and the walk does not.
+        assert_eq!(small_fallback, 0, "50-file update must not walk the branch");
+        assert_eq!(large_fallback, 0, "500-file update must not walk the branch");
+        assert!(
+            small_point >= updates as u64 && large_point >= updates as u64,
+            "the point route must serve every probe"
+        );
+
+        // The number that distinguishes a seek from a walk, at both sizes. A
+        // 10x larger repository must not decode 10x more keys.
+        assert_eq!(
+            small_decoded, 0,
+            "a pinned probe decodes no scanned keys at 50 files"
+        );
+        assert_eq!(
+            large_decoded, 0,
+            "a pinned probe decodes no scanned keys at 500 files"
+        );
+    }
+
+    /// A blob-ref tombstone must not be mistaken for the live row, and must not
+    /// hide it.
+    ///
+    /// `append_blob_ref_tombstone_row` (reached here by deleting the file)
+    /// writes the tombstone with its `file_id` set from the same value as its
+    /// entity PK, so pinning the file id cannot change which rows are visible.
+    /// A filter that missed the live row would look like a large speedup rather
+    /// than a bug, so this is asserted rather than argued: the file is deleted,
+    /// recreated under the SAME id so a tombstone and a live blob ref share one
+    /// file id, and then updated through the pinned by-id route.
+    #[tokio::test]
+    async fn content_update_after_blob_ref_tombstone_still_resolves() {
+        const ID: &str = "01920000-0000-7000-8000-0000000004a1";
+        const OTHER: &str = "01920000-0000-7000-8000-0000000004a2";
+
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("engine should open initialized storage");
+        let session = engine.open_session().await.expect("session should open");
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, content) VALUES \
+                     ('{ID}', '/a.md', CAST('one' AS BYTEA)), \
+                     ('{OTHER}', '/b.md', CAST('keep' AS BYTEA))"
+                ),
+                &[],
+            )
+            .await
+            .expect("fixture should commit");
+
+        // Deleting the file tombstones its blob ref.
+        session
+            .execute(
+                &format!("DELETE FROM lix_file WHERE id = '{ID}'"),
+                &[],
+            )
+            .await
+            .expect("delete should commit");
+
+        // Recreate under the same id, so one file id now owns both a blob-ref
+        // tombstone and a live blob ref.
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, content) VALUES \
+                     ('{ID}', '/a.md', CAST('two' AS BYTEA))"
+                ),
+                &[],
+            )
+            .await
+            .expect("recreate should commit");
+
+        let affected = session
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE id = $2",
+                &[
+                    Value::Blob(b"three".to_vec().into()),
+                    Value::Text(ID.to_string()),
+                ],
+            )
+            .await
+            .expect("content rewrite should commit");
+        assert_eq!(
+            affected.rows_affected(),
+            1,
+            "the pinned probe must still resolve a file whose id also owns a tombstone"
+        );
+
+        let read = session
+            .execute(
+                "SELECT content FROM lix_file WHERE id = $1",
+                &[Value::Text(ID.to_string())],
+            )
+            .await
+            .expect("content should read back");
+        let row = read.rows().first().expect("file should be visible");
+        let content = read
+            .get(row, "content")
+            .expect("content column should be present");
+        assert!(
+            matches!(content, Value::Blob(bytes) if bytes.as_ref() == b"three"),
+            "a rewrite over a tombstoned blob ref must resolve through the pinned probe, got {content:?}"
+        );
+
+        // The untouched sibling must be unaffected by pinning another file id.
+        let other = session
+            .execute("SELECT content FROM lix_file WHERE path = '/b.md'", &[])
+            .await
+            .expect("sibling should read back");
+        let other_row = other.rows().first().expect("sibling should be visible");
+        let other_content = other
+            .get(other_row, "content")
+            .expect("sibling content should be present");
+        assert!(
+            matches!(other_content, Value::Blob(bytes) if bytes.as_ref() == b"keep"),
+            "pinning one file id must not disturb another file"
+        );
+
+        // A file that is only tombstoned must match nothing, not a stale row.
+        session
+            .execute(
+                &format!("DELETE FROM lix_file WHERE id = '{OTHER}'"),
+                &[],
+            )
+            .await
+            .expect("second delete should commit");
+        let missing = session
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE id = $2",
+                &[
+                    Value::Blob(b"nope".to_vec().into()),
+                    Value::Text(OTHER.to_string()),
+                ],
+            )
+            .await
+            .expect("update against a deleted file should not error");
+        assert_eq!(
+            missing.rows_affected(),
+            0,
+            "a deleted file must not be resurrected by the pinned probe"
+        );
     }
 
     #[tokio::test]

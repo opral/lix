@@ -1,4 +1,4 @@
-use lix::{GLOBAL_BRANCH_ID, Memory, Value, open_lix};
+use lix::{CreateBranchOptions, GLOBAL_BRANCH_ID, Memory, SwitchBranchOptions, Value, open_lix};
 use serde_json::{Value as JsonValue, json};
 
 #[tokio::test]
@@ -170,4 +170,72 @@ async fn client_state_survives_memory_snapshot_reopen() {
     );
 
     restored.close().await.expect("restored memory Lix closes");
+}
+
+/// `open_lix` restores the primary-session branch through a point read on the
+/// hot-state context, while `ClientState::set` writes it through SQL. This
+/// pins that the two routes agree across a reopen: a value written by the SQL
+/// writer must be seen by the point reader, with the same branch and
+/// untracked-global scope.
+#[tokio::test]
+async fn primary_session_branch_is_restored_by_the_point_read() {
+    let storage = Memory::new();
+    let branch_id = {
+        let lix = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("first open");
+        let receipt = lix
+            .create_branch(CreateBranchOptions {
+                id: None,
+                name: "restored".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("branch creates");
+        lix.switch_branch(SwitchBranchOptions {
+            branch_id: receipt.id.clone(),
+        })
+        .await
+        .expect("branch switches");
+        assert_eq!(
+            lix.active_branch_id().await.expect("active branch reads"),
+            receipt.id
+        );
+        lix.close().await.expect("first handle closes");
+        receipt.id
+    };
+
+    let reopened = open_lix()
+        .with_storage(storage)
+        .await
+        .expect("reopen restores the primary session");
+    assert_eq!(
+        reopened
+            .active_branch_id()
+            .await
+            .expect("restored branch reads"),
+        branch_id,
+        "the point read must resolve the branch the SQL writer stored"
+    );
+}
+
+/// The open-time writeback is observable through public API, so a repository
+/// that has never switched branches still reports the key.
+#[tokio::test]
+async fn open_records_the_primary_session_branch_for_a_fresh_repository() {
+    let lix = open_lix().await.expect("memory Lix opens");
+    let active = lix.active_branch_id().await.expect("active branch reads");
+    let entries = lix
+        .client_state()
+        .entries()
+        .await
+        .expect("client state entries read");
+    assert!(
+        entries.contains(&(
+            "lix_primary_session_branch_id".to_string(),
+            serde_json::Value::String(active)
+        )),
+        "a fresh open must record its primary-session branch: {entries:?}"
+    );
 }

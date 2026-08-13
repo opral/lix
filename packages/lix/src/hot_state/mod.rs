@@ -18,7 +18,9 @@ pub(crate) use crate::entity_columnar::{
     EntityColumnarWriteSets, entity_row_group_set_id,
 };
 #[allow(unused_imports)]
-pub(crate) use context::{BranchHeadControlCache, HotStateContext, HotStateContextReader};
+pub(crate) use context::{
+    BranchHeadControlCache, GlobalKeyValueRowCache, HotStateContext, HotStateContextReader,
+};
 pub(crate) use entity_columnar_cache::{
     EntityColumnarArrayBudget, EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey,
 };
@@ -36,6 +38,19 @@ pub(crate) use tracked_head::hot_generation_scope_prefix;
 #[cfg(test)]
 pub(crate) use tracked_head::stage_collect_stale_working_diff_indexes;
 pub(crate) use tracked_head::stage_retire_hot_generation;
+// Read only by `#[cfg(test)]` probes, so a features-on *library* build compiles
+// the counters and re-exports them without any in-crate reader. `cargo test`
+// cannot see that — under `--profile test` the probe module exists and the
+// imports are used — so this surfaces only as a `clippy --all-targets` failure
+// on the non-test lib. Matches the `#[allow(unused_imports)]` on the re-export
+// block directly below, which exists for the same reason.
+#[cfg(any(test, feature = "storage-benches"))]
+#[allow(unused_imports)]
+pub(crate) use tracked_head::{
+    BROAD_CANONICAL_CREATED_AT_HITS, BROAD_CANONICAL_CREATED_AT_KEYS,
+    BROAD_CANONICAL_CREATED_AT_LOOKUPS, COMPACTED_TOMBSTONE_CANDIDATES,
+    COMPACTED_TOMBSTONE_COMPACTED, COMPACTED_TOMBSTONE_OFFERED, COMPACTED_TOMBSTONE_ROUTES,
+};
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
@@ -65,3 +80,5 @@ pub(crate) use visibility::{
     overlay_load_exact_batch, overlay_scan_batch, overlay_scan_tracked_batch,
     resolve_visible_batch,
 };
+#[cfg(test)]
+pub(crate) use visibility::{blob_ref_probe_stats, reset_blob_ref_probe_stats};

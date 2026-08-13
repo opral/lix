@@ -250,6 +250,22 @@ where
 ///
 /// Clones share the active branch, transaction exclusion, file-view state,
 /// and close lifecycle.
+///
+/// # Spawning a query onto a runtime
+///
+/// `tokio::spawn` on a future that contains [`Lix::execute`] can fail to
+/// compile with `overflow evaluating the requirement ...: Send`. The query
+/// futures nest deeply enough that proving the `Send` obligation exceeds
+/// rustc's default recursion limit. This is a compile-time limit, not a
+/// soundness problem, and the limit is per-crate — so it has to be raised in
+/// **your** crate, at the top of its root module:
+///
+/// ```ignore
+/// #![recursion_limit = "2048"]
+/// ```
+///
+/// Awaiting the query directly, or driving it with `futures::join!`, does not
+/// hit this.
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct Lix<StorageImpl = Memory>
@@ -276,9 +292,13 @@ where
         session: Arc::new(session),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
     };
+    // A point read on the same context `load_branch_head_commit_id` uses.
+    // Opening must not build a SQL context to answer one key.
     let stored_branch_id = lix
-        .client_state()
-        .get(crate::client_state::PRIMARY_SESSION_BRANCH_KEY)
+        .engine
+        .load_untracked_global_key_value(
+            &crate::client_state::primary_session_branch_physical_key(),
+        )
         .await?
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|value| !value.is_empty());
@@ -296,6 +316,11 @@ where
             })
             .await?;
     }
+    // The writeback stays on the open path. It only runs when the stored key
+    // does not already name the active branch, so it costs nothing after the
+    // first open -- and `ClientState::entries`/`get` are public API, so making
+    // the key appear only after an explicit switch would change observable
+    // output for a repository that has never switched.
     let active_branch_id = lix.active_branch_id().await?;
     if stored_branch_id.as_deref() != Some(active_branch_id.as_str()) {
         lix.client_state()
@@ -1185,3 +1210,55 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     }
 }
+
+
+/// See `session::execute::assume_send_future_proofs`.
+#[cfg(test)]
+mod assume_send_future_proofs {
+    use super::*;
+
+    fn is_send<T: Send>(_: &T) {}
+
+    // handle.rs -- OpenLixBuilder::into_future
+    #[allow(dead_code)]
+    fn open_lix_inner_is_send(
+        storage: Memory,
+        wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+        telemetry: Option<Arc<dyn TelemetrySink>>,
+    ) {
+        is_send(&open_lix_inner(storage, wasm_runtime, telemetry));
+    }
+
+    // handle.rs -- Lix::switch_branch (body mirrored verbatim)
+    #[allow(dead_code)]
+    fn switch_branch_body_is_send(lix: &Lix<Memory>, options: SwitchBranchOptions) {
+        is_send(&async move {
+            let _primary_switch_guard = match &lix.primary_switch_gate {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
+            let receipt = lix.session.switch_branch(options).await?;
+            if lix.primary_switch_gate.is_some() {
+                lix.client_state()
+                    .set(
+                        crate::client_state::PRIMARY_SESSION_BRANCH_KEY,
+                        serde_json::Value::String(receipt.branch_id.clone()),
+                    )
+                    .await?;
+            }
+            Ok::<_, LixError>(receipt)
+        });
+    }
+
+    #[allow(dead_code)]
+    fn lix_handle_is_send_for_every_storage<S>()
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<Lix<S>>();
+        assert_sync::<Lix<S>>();
+    }
+}
+

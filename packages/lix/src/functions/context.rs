@@ -5,6 +5,7 @@ use crate::functions::{
     DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
     SystemFunctionProvider, state,
 };
+use crate::hot_state::GlobalKeyValueRowCache;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 
 /// Execution-scoped runtime function context.
@@ -36,16 +37,22 @@ impl FunctionContext {
     ///
     /// If deterministic mode is absent or disabled, the context uses system
     /// functions. If enabled, it starts from the persisted sequence + 1.
+    ///
+    /// `cache` memoizes the deterministic-state rows against the global
+    /// branch-head control they were resolved under. Pass `None` from a caller
+    /// that has no engine-lifetime cache to hand; the read is then always
+    /// canonical.
     #[expect(trivial_casts)]
     pub(crate) async fn prepare(
         read: &(impl StorageAdapterRead + ?Sized),
+        cache: Option<&GlobalKeyValueRowCache>,
     ) -> Result<Self, LixError> {
-        let mode = state::load_mode(read).await?;
+        let mode = state::load_mode(read, cache).await?;
         if !mode.enabled {
             return Ok(Self::system_for_function_free_read());
         }
 
-        let sequence = state::load_sequence(read).await?;
+        let sequence = state::load_sequence(read, cache).await?;
         // Deterministic mode must produce byte-identical state across runs;
         // bookkeeping rows (sequence persistence) take a timestamp derived
         // from the persisted sequence instead of the system clock, without
@@ -149,7 +156,7 @@ mod tests {
             .await
             .expect("read should open");
 
-        let context = FunctionContext::prepare(&read)
+        let context = FunctionContext::prepare(&read, None)
             .await
             .expect("runtime context should prepare");
 
@@ -178,7 +185,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let context = FunctionContext::prepare(&read)
+        let context = FunctionContext::prepare(&read, None)
             .await
             .expect("runtime context should prepare");
         let functions = context.provider();
@@ -222,7 +229,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let context = FunctionContext::prepare(&read)
+        let context = FunctionContext::prepare(&read, None)
             .await
             .expect("runtime context should prepare");
         let functions = context.provider();
@@ -258,7 +265,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("read should open");
-            FunctionContext::prepare(&read)
+            FunctionContext::prepare(&read, None)
                 .await
                 .expect("runtime context should prepare")
         };
@@ -282,7 +289,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let sequence = load_sequence(&read).await.expect("sequence should load");
+        let sequence = load_sequence(&read, None).await.expect("sequence should load");
         assert_eq!(sequence, DeterministicSequence { highest_seen: 0 });
 
         // Deterministic mode must stamp the bookkeeping row from the
@@ -314,7 +321,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let context = FunctionContext::prepare(&read)
+        let context = FunctionContext::prepare(&read, None)
             .await
             .expect("runtime context should prepare");
 
@@ -333,7 +340,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let sequence = load_sequence(&read)
+        let sequence = load_sequence(&read, None)
             .await
             .expect("missing sequence should load");
         assert_eq!(sequence, DeterministicSequence::uninitialized());

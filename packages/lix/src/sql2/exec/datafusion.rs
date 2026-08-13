@@ -4599,6 +4599,39 @@ mod tests {
         }
     }
 
+    /// The revocation guard refuses a retired write context instead of
+    /// dereferencing a pointer into a destroyed `Transaction`.
+    ///
+    /// The first half is load-bearing: it proves the guard is *reached* on this
+    /// path. Without it a green result could mean "never checked" rather than
+    /// "checked and live", which is exactly how a null instrument result lies.
+    #[tokio::test]
+    async fn retired_write_context_is_refused_instead_of_dereferenced() {
+        const BRANCH: &str = "01920000-0000-7000-8000-0000000000a1";
+        const REFUSAL: &str = "refusing to dereference a retired context";
+
+        let (mut ctx, _staged, _scans) = counting_write_context(vec![]);
+        let write_ctx = crate::sql2::SqlWriteContext::new(&mut ctx);
+
+        let live = write_ctx.load_branch_head(BRANCH).await;
+        assert!(
+            !format!("{live:?}").contains(REFUSAL),
+            "guard must not fire while the borrowed context is live: {live:?}"
+        );
+
+        // Exactly what `Transaction::drop` does.
+        write_ctx.liveness_for_test().retire();
+
+        let error = write_ctx
+            .load_branch_head(BRANCH)
+            .await
+            .expect_err("a retired write context must be refused");
+        assert!(
+            format!("{error:?}").contains(REFUSAL),
+            "retired context produced the wrong failure: {error:?}"
+        );
+    }
+
     fn counting_write_context(
         rows: Vec<MaterializedHotStateRow>,
     ) -> (
@@ -5993,6 +6026,276 @@ mod tests {
                 "{projection} must never hit the pre-digest fallback: {by_projection:?}"
             );
         }
+    }
+
+    /// The pinned descriptor/blob route must not narrow the answer.
+    ///
+    /// Pinning `file_ids` makes `change_matches_history_request` require a
+    /// non-null `file_id`, so a descriptor or blob-ref change carrying a null
+    /// or divergent one would silently vanish from file history — a
+    /// correctness bug wearing a performance win's clothes.
+    ///
+    /// The oracle is the **unfiltered** read. A `lix_file_history` query with
+    /// no `id`/`path` predicate resolves no lookup IDs at all, so it never
+    /// constructs the descriptor/blob route and cannot execute the pin; it is
+    /// the answer a completely unpruned traversal produces. Every filtered read
+    /// must equal that answer restricted to the same file.
+    ///
+    /// The shapes are the ones that could plausibly carry a null or divergent
+    /// `file_id`: a file inserted with **no explicit id**, where the planner
+    /// really does emit a descriptor row with `file_id: None` and only
+    /// `canonicalize_descriptor_file_id` fills it in; a rename, which rewrites
+    /// the descriptor without touching content; a content clear, which
+    /// tombstones the blob ref while the descriptor survives; a delete, which
+    /// tombstones both through the snapshot-less row builder; and a recreation
+    /// at the same path under a **different** id, so a path lookup resolves two
+    /// IDs and the per-file discrimination has to be exact rather than
+    /// vacuous.
+    #[tokio::test]
+    async fn pinned_file_history_route_returns_the_unfiltered_answer() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        // Inserted with no explicit id: the engine mints one, and the planner
+        // stages the descriptor row with `file_id: None`.
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) \
+                 VALUES ('/docs/minted.md', CAST('v0' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("id-less file insert should succeed");
+        let minted_id = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/docs/minted.md'",
+                &[],
+            )
+            .await
+            .expect("minted file id should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(minted_id) = minted_id else {
+            panic!("file id should be text");
+        };
+
+        for statement in [
+            // Content revisions: blob-ref rows.
+            "UPDATE lix_file SET content = CAST('v1' AS BYTEA) WHERE path = '/docs/minted.md'",
+            "UPDATE lix_file SET content = CAST('v2' AS BYTEA) WHERE path = '/docs/minted.md'",
+            // Rename: a descriptor rewrite with no content change.
+            "UPDATE lix_file SET path = '/docs/renamed.md' WHERE path = '/docs/minted.md'",
+            // Clear the content: blob-ref tombstone, descriptor survives.
+            "UPDATE lix_file SET content = CAST('' AS BYTEA) WHERE path = '/docs/renamed.md'",
+            // Content on the fixture's own file, so the oracle is not trivially
+            // a single-file history.
+            "UPDATE lix_file SET content = CAST('hello2' AS BYTEA) \
+             WHERE id = '01920000-0000-7000-8000-0000000000a2'",
+            // Delete: descriptor and blob-ref tombstones for the same file.
+            "DELETE FROM lix_file WHERE path = '/docs/renamed.md'",
+            // Recreate at a path the deleted file once occupied, under a
+            // different id.
+            "INSERT INTO lix_file (id, path, content) \
+             VALUES ('01920000-0000-7000-8000-0000000000c4', '/docs/minted.md', \
+             CAST('w0' AS BYTEA))",
+            "UPDATE lix_file SET content = CAST('w1' AS BYTEA) WHERE path = '/docs/minted.md'",
+        ] {
+            session
+                .execute(statement, &[])
+                .await
+                .unwrap_or_else(|error| panic!("fixture statement failed: {statement}: {error}"));
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let projection = format!(
+            "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
+             FROM lix_file_history('{head_commit_id}')"
+        );
+        let key = |row: &Vec<Value>| format!("{:?}", row);
+        let unfiltered = rows_from_execute_result(
+            session
+                .execute(&projection, &[])
+                .await
+                .expect("unfiltered history should execute"),
+        )
+        .1;
+        assert!(
+            !unfiltered.is_empty(),
+            "the unfiltered oracle must produce rows"
+        );
+
+        for (id, path) in [
+            (
+                minted_id.as_str(),
+                // The minted file's last path before it was deleted.
+                "/docs/renamed.md",
+            ),
+            (
+                "01920000-0000-7000-8000-0000000000c4",
+                "/docs/minted.md",
+            ),
+            (
+                "01920000-0000-7000-8000-0000000000a2",
+                "/docs/readme.md",
+            ),
+        ] {
+            let expected_by_id: BTreeSet<String> = unfiltered
+                .iter()
+                .filter(|row| row[0] == Value::Text(id.to_string()))
+                .map(key)
+                .collect();
+            assert!(
+                !expected_by_id.is_empty(),
+                "the oracle must carry history for {id}"
+            );
+            let actual_by_id: BTreeSet<String> = rows_from_execute_result(
+                session
+                    .execute(&format!("{projection} WHERE id = '{id}'"), &[])
+                    .await
+                    .expect("id-filtered history should execute"),
+            )
+            .1
+            .iter()
+            .map(key)
+            .collect();
+            assert_eq!(
+                expected_by_id, actual_by_id,
+                "pinning file_ids changed the id-filtered answer for {id}"
+            );
+
+            let expected_by_path: BTreeSet<String> = unfiltered
+                .iter()
+                .filter(|row| row[1] == Value::Text(path.to_string()))
+                .map(key)
+                .collect();
+            assert!(
+                !expected_by_path.is_empty(),
+                "the oracle must carry history for {path}"
+            );
+            let actual_by_path: BTreeSet<String> = rows_from_execute_result(
+                session
+                    .execute(&format!("{projection} WHERE path = '{path}'"), &[])
+                    .await
+                    .expect("path-filtered history should execute"),
+            )
+            .1
+            .iter()
+            .map(key)
+            .collect();
+            assert_eq!(
+                expected_by_path, actual_by_path,
+                "pinning file_ids changed the path-filtered answer for {path}"
+            );
+        }
+    }
+
+    /// Number of commits that touch a file the query never asks about.
+    ///
+    /// The assertion below is a **threshold** scaled to this fixture, not an
+    /// exact value: the projection census is process-global, so concurrent
+    /// tests in this binary can only ever push the count up.
+    const DESCRIPTOR_BLOB_PRUNE_NOISE_COMMITS: u64 = 32;
+
+    /// Engagement check for pinning `file_ids` on the descriptor + blob-ref
+    /// route.
+    ///
+    /// `lix_binary_blob_ref` is touched by every content commit, so the
+    /// digest's schema-family test cannot prune this projection: without a
+    /// pinned `file_id` the membership test answers `LoadedPresent` for every
+    /// content commit in the repository and the traversal loads one commit
+    /// delta each. Pinning lets the same already-shipped digest answer the
+    /// sharper `(schema_key, file_id)` pair question instead.
+    ///
+    /// This counts inside the membership test itself, one layer below the SQL
+    /// timing instrument, and fails on a tree without the pin — the whole point
+    /// is that a flat timing result and "the changed code never ran" are
+    /// otherwise indistinguishable.
+    #[tokio::test]
+    async fn file_history_by_path_prunes_content_commits_for_other_files() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('01920000-0000-7000-8000-0000000000b8', '/docs/noise.md', CAST('n0' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("noise file should insert");
+        for revision in 0..DESCRIPTOR_BLOB_PRUNE_NOISE_COMMITS {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = CAST('n{revision}' AS BYTEA) \
+                         WHERE id = '01920000-0000-7000-8000-0000000000b8'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("noise commit should apply");
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let _ = crate::commit_graph::scope_digest_census::by_projection::take();
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT id, path, lixcol_depth FROM lix_file_history('{head_commit_id}') \
+                     WHERE path = '/docs/readme.md' ORDER BY lixcol_depth"
+                ),
+                &[],
+            )
+            .await
+            .expect("by-path history should execute");
+        let by_projection = crate::commit_graph::scope_digest_census::by_projection::take();
+        for (projection, buckets) in &by_projection {
+            eprintln!("descriptor_blob_prune_projection {projection} {buckets:?}");
+        }
+
+        assert!(
+            !result.rows().is_empty(),
+            "the queried path must still have history rows"
+        );
+        let projection = "lix_binary_blob_ref+lix_file_descriptor";
+        let buckets = by_projection.get(projection).unwrap_or_else(|| {
+            panic!("by-path history should traverse {projection}: {by_projection:?}")
+        });
+        assert!(
+            buckets.get("pruned").copied().unwrap_or(0)
+                >= DESCRIPTOR_BLOB_PRUNE_NOISE_COMMITS,
+            "{projection} must prune every content commit that belongs to another \
+             file; without a pinned file_id the membership test answers \
+             LoadedPresent for all of them: {by_projection:?}"
+        );
+        assert_eq!(
+            buckets.get("loaded_absent").copied().unwrap_or(0),
+            0,
+            "{projection} must never hit the pre-digest fallback: {by_projection:?}"
+        );
     }
 
     #[tokio::test]

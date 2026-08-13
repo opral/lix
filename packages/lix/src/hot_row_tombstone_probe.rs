@@ -745,3 +745,1056 @@ async fn hot_row_tombstone_compaction_premise() {
         );
     }
 }
+
+/// PHASE 5 — is the rotated-generation read cost proportional to the base, or
+/// is it a fixed setup cost?
+///
+/// Phase 3 measured a 3.9x penalty on a *churned* collection, which confounds
+/// two things: the accumulated tombstones and the root-backed serving path. This
+/// phase removes the churn entirely — every arm inserts `n` rows and deletes
+/// none, so there are zero tombstones — and varies only `n`, holding the answer
+/// at exactly one row.
+///
+/// - `live_main` serves the answer from the branch's own hot generation.
+/// - `live_rot` creates a branch over that head and switches to it, so the same
+///   answer is served by a sparse generation over a root current base.
+///
+/// If the penalty is a fixed setup cost it is the same number of microseconds at
+/// n = 1 and at n = 10 000. If it is proportional to the base it grows with `n`
+/// while the answer stays at one row.
+///
+/// The point lane (`WHERE id = 'row-0'`, equality on the declared primary key)
+/// is measured in the same arms because it is the lane that has an exact
+/// root-base route (`load_root_current_base_exact`) available to it; the
+/// collection lane does not.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn rotated_generation_read_scaling() {
+    let sizes = sizes_from_env("LIX_TOMBSTONE_SIZES", &[1, 100, 1_000, 10_000]);
+    let reps = reps_from_env(5);
+    println!(
+        "phase5 | arm,n,row_entries,tombstones,live_entries,packed_bases,root_bases,scan_us,point_us"
+    );
+    let point_sql = "SELECT id FROM liverow WHERE id = 'row-0'";
+    for n in sizes {
+        for rotate in [false, true] {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("liverow")).await;
+            insert_rows(&session, "liverow", n).await;
+            if rotate {
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e51-rotation".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id.clone(),
+                    })
+                    .await
+                    .expect("branch should switch");
+            }
+            let census = row_census(&storage).await;
+            let scan = timed_scan(&session, &scan_sql("liverow"), 1, reps).await;
+            let point = timed_scan(&session, point_sql, 1, reps).await;
+            println!(
+                "{},{n},{},{},{},{},{},{},{}",
+                if rotate { "live_rot" } else { "live_main" },
+                census.entries,
+                census.tombstones,
+                census.live(),
+                census.packed_bases,
+                census.root_bases,
+                scan.as_micros(),
+                point.as_micros()
+            );
+        }
+    }
+}
+
+/// Connectivity guard for the root-base serving cache.
+///
+/// A serving cache that is built but never reached is invisible to a timing
+/// sweep: the numbers simply do not move, which reads as "the change did not
+/// help" rather than "the change is not wired up". That happened once while
+/// building this cache — three plausible reader-construction sites were wired
+/// and the lane that actually serves a SQL collection scan
+/// (`HotStateContextReader::scan_hot_branch_rows`) was not among them, and the
+/// A/B came back flat. This asserts engagement directly instead.
+///
+/// Note the counters are process-global, so under a parallel test run another
+/// test could contribute hits. That can only make this pass spuriously, never
+/// fail spuriously; it is a connectivity guard, not an exact accounting test.
+#[cfg(feature = "storage-benches")]
+#[tokio::test]
+async fn rotated_generation_serving_view_is_cached_after_the_first_read() {
+    let (_storage, session) = open_session().await;
+    register(&session, probe_schema("cachedrow")).await;
+    insert_rows(&session, "cachedrow", 50).await;
+    let branch = session
+        .create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "e51-cache-guard".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("branch should create");
+    session
+        .switch_branch(crate::SwitchBranchOptions {
+            branch_id: branch.id.clone(),
+        })
+        .await
+        .expect("branch should switch");
+
+    // Discard whatever branch creation and the switch themselves recorded.
+    let _ = crate::storage_bench::take_root_base_batch_cache_accounting();
+
+    for _ in 0..5 {
+        let rows = session
+            .execute(&scan_sql("cachedrow"), &[])
+            .await
+            .expect("rotated scan should run");
+        assert_eq!(rows.len(), 1, "the rotated generation must serve one row");
+    }
+    let (hits, misses) = crate::storage_bench::take_root_base_batch_cache_accounting();
+    assert!(
+        misses > 0,
+        "the first rotated read must materialize the serving view (hits={hits} misses={misses})"
+    );
+    assert!(
+        hits > 0,
+        "later rotated reads must be served from the materialized view, \
+         not re-derived from canonical records (hits={hits} misses={misses})"
+    );
+}
+
+/// PHASE 6 — write-path question 2: undo/redo must replay from canonical
+/// changes, demonstrated rather than argued.
+///
+/// The code answer is that `session/undo_redo.rs` reads only through
+/// `tracked_state_reader()` — `commit_delta_values_for_schemas` and
+/// `load_projected_batch_at_commit` — both canonical tracked state at a commit,
+/// and never touches `ROW_SPACE`. This is the experiment that shows it.
+///
+/// Delete a row, physically remove its tombstone, reopen the engine cold, then
+/// undo. If undo depended on the `ROW_SPACE` tombstone in any way, the row
+/// could not come back.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn undo_restores_a_row_whose_tombstone_was_removed() {
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("undorow")).await;
+    insert_rows(&session, "undorow", 3).await;
+    let before = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+
+    session
+        .execute("DELETE FROM undorow WHERE id = 'row-1'", &[])
+        .await
+        .expect("delete should commit");
+    let census_after_delete = row_census(&storage).await;
+    let after_delete = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+
+    let removed = drop_all_tombstones(&storage).await;
+    let session = reopen_session(&storage).await;
+    let census_after_drop = row_census(&storage).await;
+    let after_drop = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+
+    session.undo().await.expect("undo should publish");
+    let after_undo = session
+        .execute("SELECT id FROM undorow", &[])
+        .await
+        .expect("collection reads")
+        .len();
+    let restored = session
+        .execute("SELECT id, locale FROM undorow WHERE id = 'row-1'", &[])
+        .await
+        .expect("restored row reads");
+
+    println!(
+        "phase6 | before={before} after_delete={after_delete} tombstones_after_delete={} \
+         removed={removed} after_drop={after_drop} tombstones_after_drop={} after_undo={after_undo} \
+         restored_rows={}",
+        census_after_delete.tombstones,
+        census_after_drop.tombstones,
+        restored.len()
+    );
+
+    assert_eq!(before, 3, "fixture should start with three rows");
+    assert_eq!(after_delete, 2, "the delete should be visible");
+    assert_eq!(removed, 1, "the delete should have left exactly one tombstone");
+    assert_eq!(
+        after_drop, 2,
+        "removing the tombstone must not resurrect the row"
+    );
+    assert_eq!(
+        after_undo, 3,
+        "undo must restore the deleted row with its tombstone already gone; \
+         if this fails, undo depends on the ROW_SPACE tombstone and the \
+         never-write design is unsafe"
+    );
+    assert_eq!(restored.len(), 1, "the restored row must be readable");
+}
+
+/// PHASE 7 — is `reject_retention_change` an invariant, or an artefact of
+/// tombstone lifetime?
+///
+/// The fence refuses an untracked INSERT over a tracked-deleted identity, and
+/// it refuses it *because the tombstone is physically present* — `existing` is
+/// the predecessor row. `absence_guards` does not cover this case: those are
+/// pure "must not be live" assertions, so an absent identity and a tombstone
+/// pass identically.
+///
+/// So if any supported operation on `main` already clears that tombstone, the
+/// fence is not durable and the hole is open today — compaction would change
+/// *when* it stops fencing, not *whether*. If nothing clears it, the fence is
+/// real and compaction would breach it.
+///
+/// This tries every route to the no-tombstone state and reports which, if any,
+/// reaches it. Nothing here compacts anything.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn retention_fence_durability_across_supported_operations() {
+    async fn untracked_insert(
+        session: &SessionContext<Memory>,
+        table: &str,
+    ) -> Result<(), String> {
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (id, locale, lixcol_untracked) VALUES ('row-0', 'u', TRUE)"
+                ),
+                &[],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    println!("phase6 | route,tombstones,untracked_insert_result");
+
+    // Each route gets a fresh fixture so the routes cannot contaminate one
+    // another. `base` is the control: no route applied.
+    for route in [
+        "base",
+        "checkpoint",
+        "branch_roundtrip",
+        "on_new_branch",
+        "tombstone_dropped",
+    ] {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("fencerow")).await;
+        session
+            .execute(
+                "INSERT INTO fencerow (id, locale) VALUES ('row-0', 'keep')",
+                &[],
+            )
+            .await
+            .expect("tracked insert should commit");
+        session
+            .execute("DELETE FROM fencerow WHERE id = 'row-0'", &[])
+            .await
+            .expect("tracked delete should commit");
+
+        let mut session = session;
+        match route {
+            "base" => {}
+            "checkpoint" => {
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("checkpoint should publish");
+            }
+            "branch_roundtrip" => {
+                let main_branch_id = session
+                    .active_branch_id()
+                    .await
+                    .expect("active branch resolves");
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e45-fence-roundtrip".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id,
+                    })
+                    .await
+                    .expect("switch to branch");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: main_branch_id,
+                    })
+                    .await
+                    .expect("switch back to main");
+            }
+            "on_new_branch" => {
+                // The interesting one: a fresh branch's generation is sparse
+                // over a root base and owns no HOT_ROW tombstone of its own.
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e45-fence-newbranch".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id,
+                    })
+                    .await
+                    .expect("switch to branch");
+            }
+            // The state compaction would create, reached here by removing the
+            // tombstone directly rather than by compacting. No supported
+            // operation reaches this state today; compaction would be the
+            // first. If the fence stops holding here, that is the hole
+            // compaction opens, and it is what PR 1 exists to close.
+            "tombstone_dropped" => {
+                let removed = drop_all_tombstones(&storage).await;
+                assert_eq!(removed, 1, "the tracked delete should leave one tombstone");
+                session = reopen_session(&storage).await;
+            }
+            _ => unreachable!(),
+        }
+
+        let census = row_census(&storage).await;
+        let result = untracked_insert(&session, "fencerow").await;
+        // Every route, including the one that removes the tombstone the fence
+        // used to ride on, must refuse. Before the narrowed fence landed,
+        // `tombstone_dropped` SUCCEEDED here while the other four refused —
+        // that gap is what the fence closes, and this assertion is what proves
+        // it rather than restating it.
+        assert!(
+            result.is_err(),
+            "route '{route}' let an untracked row take a tracked-deleted identity; \
+             the retention fence does not survive this state"
+        );
+        let verdict = match &result {
+            Ok(()) => "SUCCEEDED".to_string(),
+            Err(message) => format!("refused: {}", message.replace(',', ";")),
+        };
+        println!("{route},{},{verdict}", census.tombstones);
+
+        // If the untracked insert got in, the identity is now untracked while a
+        // tracked delete of the same identity sits in canonical history. Undo
+        // replays that delete from canonical history (phase 5). If undo brings
+        // the tracked row back, the identity is simultaneously tracked and
+        // untracked.
+        if result.is_ok() {
+            let undo = session.undo().await;
+            match undo {
+                Ok(_) => {
+                    let rows = session
+                        .execute(
+                            "SELECT id, lixcol_untracked FROM fencerow WHERE id = 'row-0'",
+                            &[],
+                        )
+                        .await
+                        .expect("identity reads after undo");
+                    println!(
+                        "{route},POST_UNDO,rows_for_identity={} <- 2 means tracked+untracked \
+                         coexist",
+                        rows.len()
+                    );
+                }
+                Err(error) => println!(
+                    "{route},POST_UNDO,undo_refused: {}",
+                    error.to_string().replace(',', ";")
+                ),
+            }
+        }
+        drop(session);
+    }
+}
+
+/// PHASE 8 — the allocation census, and the decision point for whether the
+/// per-row identity work on the payload fetch is worth removing.
+///
+/// The retained profile that motivated this attributed ~6.6% of a rotated
+/// collection scan to `load_commit_delta_entry_at_index` and ~6.7% to
+/// `codec::decode_key`. That profile was recorded at `49a4bf45a`, which is
+/// **before** the root-base serving cache landed. The cache changes the
+/// question from "what does one read cost" to "how many reads pay it at all",
+/// and no percentage from that profile can answer the second question.
+///
+/// So this counts, per scan, at the sites themselves:
+///
+/// - `rows` — `load_commit_delta_entry_at_index` calls, the per-row payload fetch.
+/// - `decodes` / `dec_in_b` — `codec::decode_key` calls and the encoded bytes
+///   they consumed, all callers.
+/// - `own_b` / `esc` — the bytes `into_owned()` copies over what
+///   `decode_key_borrowed` already produced, and how many of those strings were
+///   escaped and so allocate regardless. `own_b` is the ceiling on what a
+///   borrow-based fix at that site can remove; it is not the cost of the decode.
+/// - `acct_b` — the per-row `account_id.to_string()`.
+/// - `enc` / `enc_b` — per-row `encode_key_ref` reaching the binary search.
+/// - `clones` / `clone_b` — the deep key clone `load_commit_delta_change_records`
+///   makes to build its request vector.
+/// - `matkey` / `matkey_b` — owned `TrackedStateKey` values
+///   `materialize_index_payloads` builds from keys it already holds borrowed.
+/// - `reverify` — rows reaching the post-fetch identity re-check.
+/// - `hit` / `miss` — root-base serving cache, and `dur`/`exa`/`rep` the
+///   `scan_batch_at_commit` arm, so a zero census is never ambiguous between
+///   "no allocation" and "the lane never ran".
+///
+/// `cold` is the first read of the rotated generation; `warm` aggregates the
+/// next `reps` reads. Per-scan numbers are `warm / reps`.
+#[cfg(feature = "storage-benches")]
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn rotated_generation_key_allocation_census() {
+    let sizes = sizes_from_env("LIX_TOMBSTONE_SIZES", &[100, 1_000, 10_000]);
+    let reps = reps_from_env(5);
+    println!(
+        "phase8 | arm,n,phase,scans,rows,decodes,dec_in_b,own_b,esc,acct_b,enc,enc_b,\
+clones,clone_b,matkey,matkey_b,reverify,hit,miss,dur,exa,rep,us"
+    );
+    for n in sizes {
+        for rotate in [false, true] {
+            let (_storage, session) = open_session().await;
+            register(&session, probe_schema("censusrow")).await;
+            insert_rows(&session, "censusrow", n).await;
+            if rotate {
+                let branch = session
+                    .create_branch(crate::CreateBranchOptions {
+                        id: None,
+                        name: "e52-census".to_string(),
+                        from_commit_id: None,
+                    })
+                    .await
+                    .expect("branch should create");
+                session
+                    .switch_branch(crate::SwitchBranchOptions {
+                        branch_id: branch.id.clone(),
+                    })
+                    .await
+                    .expect("branch should switch");
+            }
+            let scan = scan_sql("censusrow");
+            let arm = if rotate { "rot" } else { "main" };
+
+            // Discard everything setup recorded, so the cold line is the cold
+            // read and nothing else.
+            let _ = crate::storage_bench::take_tracked_key_allocation_census();
+            let _ = crate::storage_bench::take_root_base_batch_cache_accounting();
+            let _ = crate::storage_bench::take_tracked_scan_branch_accounting();
+
+            let started = Instant::now();
+            let rows = session.execute(&scan, &[]).await.expect("cold scan");
+            let cold_us = started.elapsed().as_micros();
+            assert_eq!(rows.len(), 1, "the cold scan must answer exactly one row");
+            print_census_line(arm, n, "cold", 1, cold_us);
+
+            let started = Instant::now();
+            for _ in 0..reps {
+                let rows = session.execute(&scan, &[]).await.expect("warm scan");
+                assert_eq!(rows.len(), 1, "the warm scan must answer exactly one row");
+            }
+            let warm_us = started.elapsed().as_micros();
+            print_census_line(arm, n, "warm", reps, warm_us);
+        }
+    }
+}
+
+/// Drains every census counter and prints one CSV line. Draining is what makes
+/// the next phase's line attributable to that phase alone.
+#[cfg(feature = "storage-benches")]
+fn print_census_line(arm: &str, n: usize, phase: &str, scans: usize, us: u128) {
+    let c = crate::storage_bench::take_tracked_key_allocation_census();
+    let (hit, miss) = crate::storage_bench::take_root_base_batch_cache_accounting();
+    let (dur, exa, rep) = crate::storage_bench::take_tracked_scan_branch_accounting();
+    println!(
+        "{arm},{n},{phase},{scans},{},{},{},{},{},{},{},{},{},{},{},{},{},{hit},{miss},{dur},{exa},{rep},{us}",
+        c.commit_delta_rows_loaded,
+        c.key_decode_calls,
+        c.key_decode_input_bytes,
+        c.key_decode_owned_string_bytes,
+        c.key_decode_escaped_strings,
+        c.commit_delta_account_id_bytes,
+        c.commit_delta_point_key_encodes,
+        c.commit_delta_point_key_encode_bytes,
+        c.commit_delta_request_key_clones,
+        c.commit_delta_request_key_clone_bytes,
+        c.materialize_owned_key_builds,
+        c.materialize_owned_key_bytes,
+        c.materialize_reverify_rows,
+    );
+}
+
+/// Reads back the `created_at` the engine currently reports for one identity.
+async fn created_at_of(session: &SessionContext<Memory>, table: &str, id: &str) -> String {
+    let result = session
+        .execute(
+            &format!("SELECT lixcol_created_at AS created_at FROM {table} WHERE id = '{id}'"),
+            &[],
+        )
+        .await
+        .expect("created_at reads");
+    result.rows()[0]
+        .get::<String>("created_at")
+        .expect("created_at is text")
+}
+
+/// PHASE 9 — the `created_at` consequence of compaction, and who rejects it.
+///
+/// Numbered 9 because #1427 landed its own PHASE 8 (the allocation census)
+/// on the integration branch while this work was in flight.
+///
+/// Phase 4 established that removing an already-checkpointed delete's tombstone
+/// is safe for *serving*. This phase asks the separate write-path question the
+/// compaction design turns on: once the tombstone is gone, what `created_at`
+/// does a later re-insert of that identity receive, and does anything reject
+/// the result?
+///
+/// Today `created_at` reaches a re-inserted row by a two-hop chain — a delete
+/// copies the live row's `created_at` into the tombstone, and a re-insert
+/// copies the tombstone's forward. Compaction removes the middle hop.
+/// Canonical tracked state still retains the original `created_at` for the
+/// deleted identity, on a plane compaction never touches, so the value is
+/// recoverable. The question is whether the engine recovers it unaided.
+///
+/// The control arm runs the same sequence with the tombstone left in place, so
+/// any difference is attributable to its removal and nothing else.
+#[tokio::test]
+async fn recreated_identity_created_at_without_compaction() {
+    let (_storage, session) = open_session().await;
+    register(&session, probe_schema("c8row")).await;
+
+    session
+        .execute("INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')", &[])
+        .await
+        .expect("first insert should commit");
+    // Mirrors the compacted arm's shape exactly, so the only difference
+    // between the two is whether the tombstone survives.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
+    let first = created_at_of(&session, "c8row", "row-0").await;
+
+    session
+        .execute("DELETE FROM c8row WHERE id = 'row-0'", &[])
+        .await
+        .expect("delete should commit");
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should publish");
+    session
+        .execute(
+            "INSERT INTO c8row (id, locale) VALUES ('row-0', 'second')",
+            &[],
+        )
+        .await
+        .expect("re-insert should commit");
+    let second = created_at_of(&session, "c8row", "row-0").await;
+
+    println!(
+        "phase8 | arm=control first_created_at={first} second_created_at={second} \
+         inherited={}",
+        first == second
+    );
+
+    // This is the behaviour compaction must preserve. It is asserted rather
+    // than merely printed because it is the regression guard for the
+    // canonical-sourced `created_at` that compaction requires: if that
+    // sourcing silently stops firing, this is the assertion that catches it.
+    assert_eq!(
+        second, first,
+        "a re-inserted identity inherits its deleted predecessor's created_at"
+    );
+}
+
+/// The compaction arm of phase 8. Simulates compaction with the same physical
+/// tombstone removal phases 4 and 7 use, then re-inserts and asks the engine
+/// what it thinks the identity's `created_at` is — and whether a commit-root
+/// rebuild, which is where `validate_diff_row_created_at` runs in production,
+/// still accepts the result.
+#[tokio::test]
+async fn recreated_identity_created_at_after_compaction() {
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("c8row")).await;
+    let branch_id = session
+        .active_branch_id()
+        .await
+        .expect("active branch id reads");
+
+    session
+        .execute("INSERT INTO c8row (id, locale) VALUES ('row-0', 'first')", &[])
+        .await
+        .expect("first insert should commit");
+    // The insert has to be checkpointed before the delete, or the two cancel
+    // within one checkpoint interval and canonical records the identity as
+    // never having existed. In that case a fresh `created_at` on re-insert is
+    // the correct answer and there is nothing to recover — measured: the
+    // lookup fires with the right key and canonical returns nothing. The
+    // interesting case, and the one compaction actually creates, is a delete
+    // whose *insert* is already canonical.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
+    let first = created_at_of(&session, "c8row", "row-0").await;
+
+    session
+        .execute("DELETE FROM c8row WHERE id = 'row-0'", &[])
+        .await
+        .expect("delete should commit");
+    // Compaction is a checkpoint-time operation, and the checkpoint is what
+    // discharges the delete's working-diff obligation and commits it to
+    // canonical state. Removing the tombstone before that point would be
+    // testing an operation the design never performs.
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should publish");
+    drop(session);
+
+    let before = row_census(&storage).await;
+    let removed = drop_all_tombstones(&storage).await;
+    let after = row_census(&storage).await;
+    println!(
+        "phase8 | arm=compacted tombstones_removed={removed} \
+         entries {}->{} tombstones {}->{}",
+        before.entries, after.entries, before.tombstones, after.tombstones
+    );
+    // The engine now compacts a discharged tombstone at the checkpoint itself
+    // (`hot_compaction_mask`), so by this point there is usually nothing left
+    // for the simulation to remove. Either state is a valid entry into the
+    // question this arm asks — what a re-insert over a *missing* tombstone
+    // gets — and phase 10 pins the engine-driven route with its own test. What
+    // must hold here is that no tombstone survives into the re-insert.
+    assert_eq!(
+        after.tombstones, 0,
+        "the identity must carry no tombstone into the re-insert (removed={removed})"
+    );
+
+    let session = reopen_session(&storage).await;
+    let hits_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let keys_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_KEYS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let lookups_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_LOOKUPS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    session
+        .execute(
+            "INSERT INTO c8row (id, locale) VALUES ('row-0', 'second')",
+            &[],
+        )
+        .await
+        .expect("re-insert should commit");
+    let hits = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - hits_before;
+    let keys = crate::hot_state::BROAD_CANONICAL_CREATED_AT_KEYS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - keys_before;
+    let lookups = crate::hot_state::BROAD_CANONICAL_CREATED_AT_LOOKUPS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - lookups_before;
+    let second = created_at_of(&session, "c8row", "row-0").await;
+    println!(
+        "phase8 | arm=compacted first_created_at={first} second_created_at={second} \
+         inherited={} lookups={lookups} keys={keys} hits={hits}",
+        first == second
+    );
+    drop(session);
+
+    // Engagement, counted inside the route rather than inferred from a timing
+    // result. A hit proves the recovery fired; the run below proves it can
+    // also miss, so the route is not trivially returning a constant.
+    assert!(lookups > 0, "the canonical lookup must have run");
+    assert!(
+        hits > 0,
+        "the re-insert over a compacted identity must have inherited from canonical"
+    );
+    assert_eq!(
+        second, first,
+        "canonical must supply the created_at the compacted tombstone used to carry"
+    );
+
+    // `validate_diff_row_created_at` derives its expectation from the parent
+    // commit's canonical tracked-state index value and never inspects
+    // `deleted`, so a tombstoned ancestor still supplies a `created_at` it
+    // will insist on. In production that validator runs behind
+    // `Engine::rebuild_tracked_state_for_branch`, which means a mismatch is
+    // latent: it is written silently and only surfaces when a rebuild or
+    // repair is performed.
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should reopen for rebuild");
+    // An instrument that never executes reports exactly what a clean pass
+    // reports. Count the validator's entries across the rebuild so "accepted"
+    // cannot be confused with "never reached".
+    let validations_before = crate::tracked_state::DIFF_ROW_CREATED_AT_VALIDATIONS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let rebuild = engine.rebuild_tracked_state_for_branch(&branch_id).await;
+    let validations = crate::tracked_state::DIFF_ROW_CREATED_AT_VALIDATIONS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - validations_before;
+    match &rebuild {
+        Ok(()) => println!("phase8 | arm=compacted rebuild=accepted"),
+        Err(error) => println!(
+            "phase8 | arm=compacted rebuild=REJECTED {}",
+            error.to_string().replace('\n', " ")
+        ),
+    }
+
+    println!(
+        "phase8 | verdict inherited={} rebuild_ok={} created_at_validations={validations}",
+        first == second,
+        rebuild.is_ok()
+    );
+}
+
+/// The miss side of the same route. A commit that introduces genuinely new
+/// identities submits keys to the canonical lookup and must come back empty —
+/// a route that only ever hits would be inheriting timestamps for rows that
+/// have no canonical ancestor, which is the failure this pairs against.
+#[tokio::test]
+async fn broad_canonical_created_at_recovery_misses_for_new_identities() {
+    let (_storage, session) = open_session().await;
+    register(&session, probe_schema("c8new")).await;
+
+    let keys_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_KEYS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let hits_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    session
+        .execute(
+            "INSERT INTO c8new (id, locale) VALUES ('new-0', 'a'), ('new-1', 'b')",
+            &[],
+        )
+        .await
+        .expect("new rows should commit");
+    let keys = crate::hot_state::BROAD_CANONICAL_CREATED_AT_KEYS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - keys_before;
+    let hits = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - hits_before;
+
+    println!("phase8 | arm=new_identities keys={keys} hits={hits}");
+    assert!(
+        keys >= 2,
+        "both new identities must reach the canonical lookup"
+    );
+    assert_eq!(
+        hits, 0,
+        "a genuinely new identity has no canonical ancestor to inherit from"
+    );
+}
+
+/// Compaction engagement, read from inside the route.
+///
+/// Process-global by construction, so only *deltas* and only *thresholds*
+/// scaled to a fixture no concurrent test can reach are meaningful here.
+#[derive(Clone, Copy, Debug)]
+struct CompactionCounters {
+    /// Publications that reached the mask at all.
+    routes: u64,
+    /// Deltas those publications offered it.
+    offered: u64,
+    /// Of those, tombstones eligible on shape alone.
+    candidates: u64,
+    /// Of those, tombstones every gate cleared.
+    compacted: u64,
+}
+
+fn compaction_counters() -> CompactionCounters {
+    let load = |counter: &std::sync::atomic::AtomicU64| {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    CompactionCounters {
+        routes: load(&crate::hot_state::COMPACTED_TOMBSTONE_ROUTES),
+        offered: load(&crate::hot_state::COMPACTED_TOMBSTONE_OFFERED),
+        candidates: load(&crate::hot_state::COMPACTED_TOMBSTONE_CANDIDATES),
+        compacted: load(&crate::hot_state::COMPACTED_TOMBSTONE_COMPACTED),
+    }
+}
+
+impl CompactionCounters {
+    fn since(self, before: Self) -> Self {
+        Self {
+            routes: self.routes - before.routes,
+            offered: self.offered - before.offered,
+            candidates: self.candidates - before.candidates,
+            compacted: self.compacted - before.compacted,
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionCounters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "routes={} offered={} candidates={} compacted={}",
+            self.routes, self.offered, self.candidates, self.compacted
+        )
+    }
+}
+
+/// PHASE 10 — the landed engine change: a checkpoint reclaims the tombstones
+/// it has just discharged.
+///
+/// Numbered 10 because phases 1–7 are shared, 8 is #1427's allocation census
+/// and 9 is the canonical `created_at` recovery that #1432 landed.
+///
+/// Phase 4 proved the *premise* by removing tombstones behind the engine's
+/// back. This phase asserts the engine now does it itself, at the checkpoint,
+/// through `hot_compaction_mask`. Both the hit and the refusal are asserted in
+/// non-`#[ignore]`d tests, because a design whose every gate is conservative
+/// fails silently inert, and a row-count instrument one layer up cannot tell
+/// "reclaimed nothing here" from "never ran".
+#[tokio::test]
+async fn checkpoint_compacts_discharged_branch_tombstones() {
+    const N: usize = 300;
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("cp10row")).await;
+    insert_rows(&session, "cp10row", N).await;
+    // MEASURED, and it is the shape of the whole result: a checkpoint
+    // republishes the interval's *dirty set*, and a delete only joins that set
+    // while a checkpoint interval is open. Churn before a repository's first
+    // checkpoint reaches the compaction route with `offered=2` — the route
+    // runs, the deletes are simply not in it. Compaction therefore reclaims
+    // deletes made inside an interval, which is the steady state; a
+    // never-checkpointed branch's tombstones are a separate, larger problem
+    // this change does not claim.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
+    delete_all_but_first(&session, "cp10row", N).await;
+
+    let before = row_census(&storage).await;
+    assert!(
+        before.tombstones >= N - 1,
+        "the churn must leave one tombstone per delete, saw {}",
+        before.tombstones
+    );
+
+    let counters_before = compaction_counters();
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should publish");
+    let counters = compaction_counters().since(counters_before);
+    let after = row_census(&storage).await;
+
+    println!(
+        "phase10 | compaction entries {}->{} tombstones {}->{} {counters}",
+        before.entries, after.entries, before.tombstones, after.tombstones
+    );
+
+    // Engagement first: a flat row count is ambiguous, these counts are not.
+    assert!(
+        counters.candidates >= (N - 1) as u64,
+        "every discharged tombstone must reach the compaction route, saw {}",
+        counters.candidates
+    );
+    assert!(
+        counters.compacted >= (N - 1) as u64,
+        "every gate must clear for a branch-local schema with no base, saw {}",
+        counters.compacted
+    );
+
+    // Then the effect the counters predict.
+    assert!(
+        after.tombstones * 10 < before.tombstones,
+        "the checkpoint must reclaim the tombstones it discharged, {} -> {}",
+        before.tombstones,
+        after.tombstones
+    );
+    assert!(
+        after.entries < before.entries,
+        "reclaimed tombstones must leave the serving view smaller"
+    );
+
+    // And the answer, cold, so nothing passes off a warm cache.
+    let session = reopen_session(&storage).await;
+    let survivors = session
+        .execute("SELECT id FROM cp10row", &[])
+        .await
+        .expect("collection scan should run");
+    assert_eq!(
+        survivors.len(),
+        1,
+        "compaction must not resurrect a deleted row"
+    );
+    let answer = session
+        .execute(&scan_sql("cp10row"), &[])
+        .await
+        .expect("scan should run");
+    assert_eq!(answer.len(), 1, "the surviving row must still answer");
+    assert_eq!(
+        working_diff_rows(&session, "cp10row").await,
+        0,
+        "a checkpoint discharges every delete, compacted or not"
+    );
+}
+
+/// The refusal is asserted where it can be made deterministic:
+/// `hot_state::tracked_head::hot::tests::
+/// checkpoint_compaction_keeps_only_globally_shadowed_tombstones` seeds a
+/// global-branch row and a branch tombstone in the same schema and checks the
+/// tombstone survives the checkpoint, alongside a same-publication control in
+/// a schema global has no rows in that is reclaimed.
+///
+/// It is not asserted through SQL here because there is no reachable SQL path
+/// to a global row in a probe-defined schema: a branch-registered schema is
+/// not visible to a global write, and a globally registered one is never bound
+/// as a table.
+/// The `created_at` consequence, pinned against *real* compaction.
+///
+/// Phase 9 pins the same behaviour against `drop_all_tombstones`, a simulation.
+/// This is the version that fails if the engine's own compaction and the
+/// canonical `created_at` recovery ever stop lining up — the failure mode with
+/// no other guard, because a wrong timestamp is written silently and only
+/// surfaces on a later rebuild.
+#[tokio::test]
+async fn recreated_identity_inherits_created_at_after_engine_compaction() {
+    let (storage, session) = open_session().await;
+    register(&session, probe_schema("ci10row")).await;
+    session
+        .execute(
+            "INSERT INTO ci10row (id, locale) VALUES ('row-0', 'first')",
+            &[],
+        )
+        .await
+        .expect("first insert should commit");
+    // The insert must be canonical before the delete, or the pair cancels
+    // inside one checkpoint interval and a fresh timestamp is the right answer.
+    session
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should publish");
+    let first = created_at_of(&session, "ci10row", "row-0").await;
+
+    session
+        .execute("DELETE FROM ci10row WHERE id = 'row-0'", &[])
+        .await
+        .expect("delete should commit");
+    let counters_before = compaction_counters();
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should publish");
+    let counters = compaction_counters().since(counters_before);
+    assert!(
+        counters.compacted > 0,
+        "this test is about a compacted identity; nothing was compacted"
+    );
+
+    let hits_before = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    session
+        .execute(
+            "INSERT INTO ci10row (id, locale) VALUES ('row-0', 'second')",
+            &[],
+        )
+        .await
+        .expect("re-insert should commit");
+    let hits = crate::hot_state::BROAD_CANONICAL_CREATED_AT_HITS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - hits_before;
+    let second = created_at_of(&session, "ci10row", "row-0").await;
+    println!(
+        "phase10 | created_at first={first} second={second} inherited={} \
+         canonical_hits={hits} compacted={}",
+        first == second,
+        counters.compacted
+    );
+
+    assert!(
+        hits > 0,
+        "the re-insert must have sourced its created_at from canonical state"
+    );
+    assert_eq!(
+        second, first,
+        "a re-insert over a compacted identity inherits its original created_at"
+    );
+
+    drop(session);
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should reopen for rebuild");
+    let branch_id = engine
+        .open_session()
+        .await
+        .expect("session should open")
+        .active_branch_id()
+        .await
+        .expect("active branch id reads");
+    engine
+        .rebuild_tracked_state_for_branch(&branch_id)
+        .await
+        .expect("a compacted branch must still rebuild");
+}
+
+/// The measurement the change exists for: what a checkpoint now costs a
+/// churned collection's scan, at three sizes so the removed term shows as a
+/// slope rather than a point.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn checkpoint_compaction_scan_cost() {
+    let sizes = sizes_from_env("LIX_TOMBSTONE_SIZES", &[100, 1_000, 10_000]);
+    let reps = reps_from_env(5);
+    println!("phase10 | n,event,row_entries,tombstones,scan_us,counters");
+    for n in sizes {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("m10row")).await;
+        insert_rows(&session, "m10row", n).await;
+        // The deletes have to fall inside an open checkpoint interval to join
+        // the dirty set the next checkpoint republishes. See
+        // `checkpoint_compacts_discharged_branch_tombstones`.
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should publish");
+        delete_all_but_first(&session, "m10row", n).await;
+
+        let census = row_census(&storage).await;
+        let scan = timed_scan(&session, &scan_sql("m10row"), 1, reps).await;
+        println!(
+            "{n},after_churn,{},{},{},-",
+            census.entries,
+            census.tombstones,
+            scan.as_micros()
+        );
+
+        let counters_before = compaction_counters();
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish");
+        let counters = compaction_counters().since(counters_before);
+        let census = row_census(&storage).await;
+        let scan = timed_scan(&session, &scan_sql("m10row"), 1, reps).await;
+        println!(
+            "{n},after_checkpoint,{},{},{},{}",
+            census.entries,
+            census.tombstones,
+            scan.as_micros(),
+            counters
+        );
+    }
+}

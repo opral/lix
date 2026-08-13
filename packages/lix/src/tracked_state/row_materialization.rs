@@ -386,6 +386,10 @@ where
 {
     let mut by_commit = BTreeMap::<CommitId, Vec<(TrackedStateKey, ChangeId, LixTimestamp)>>::new();
     for (key, value) in entries.filter(|(_, value)| !value.deleted) {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_materialize_owned_key(
+            key.schema_key.len() + key.file_id.map_or(0, str::len),
+        );
         by_commit.entry(value.commit_id).or_default().push((
             TrackedStateKey {
                 schema_key: key.schema_key.to_owned(),
@@ -414,6 +418,8 @@ where
                     ),
                 )
             })?;
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_materialize_reverify_row();
             if record.change_id != change_id
                 || record.schema_key != key.schema_key
                 || record.file_id != key.file_id
@@ -590,6 +596,130 @@ mod tests {
             .expect("one integer is a valid entity primary key")
     }
 
+    /// Which `EntityPk` shapes survive the JSON identity round trip that the
+    /// **columnar** commit-delta route uses to match a row.
+    ///
+    /// `materialize_index_payloads` re-checks `schema_key`/`file_id`/`entity_pk`
+    /// on every fetched row. On the packed route that check is
+    /// `decode(encode(K)) == K`, guaranteed by the byte-equality assert in
+    /// `find_commit_delta_entry_index`. The columnar route
+    /// (`load_columnar_owned_entries`) has no such assert: it matches on
+    /// `as_json_array_text` and rebuilds the identity with
+    /// `from_json_array_text`, and `untyped_component_from_json_value` maps
+    /// every JSON string back to `EntityPkComponent::String`.
+    ///
+    /// So `Uuid` and `Bytes` components do **not** survive, and on a route that
+    /// admitted them the re-check would reject a correctly-fetched row. This
+    /// test pins exactly where that boundary is; the companion test below pins
+    /// the gate that keeps those shapes off the columnar route entirely.
+    #[test]
+    fn only_string_and_integer_entity_pk_components_survive_the_json_identity_round_trip() {
+        fn round_trips(entity_pk: &EntityPk) -> bool {
+            let text = entity_pk
+                .as_json_array_text()
+                .expect("identity should encode as JSON");
+            let decoded =
+                EntityPk::from_json_array_text(&text).expect("identity should decode from JSON");
+            decoded == *entity_pk
+        }
+
+        let string_pk =
+            EntityPk::from_components(smallvec::smallvec![EntityPkComponent::String("row-0".into())])
+                .expect("one string is a valid entity primary key");
+        assert!(
+            round_trips(&string_pk),
+            "a single-string identity must survive; it is the only shape the columnar \
+             staging gate admits"
+        );
+
+        assert!(
+            round_trips(&integer_entity_pk(42)),
+            "an integer identity survives as a JSON number"
+        );
+
+        let composite = EntityPk::from_components(smallvec::smallvec![
+            EntityPkComponent::String("left".into()),
+            EntityPkComponent::String("right".into())
+        ])
+        .expect("two strings are a valid entity primary key");
+        assert!(round_trips(&composite), "composite strings survive");
+
+        let uuid_pk = EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Uuid(
+            *uuid::Uuid::from_u128(7).as_bytes()
+        )])
+        .expect("one uuid is a valid entity primary key");
+        assert!(
+            !round_trips(&uuid_pk),
+            "a uuid identity must NOT survive the JSON round trip -- it returns as a \
+             String component. If this ever starts passing, the columnar identity \
+             re-check stops being load-bearing and this test should be re-read, not deleted."
+        );
+
+        let bytes_pk = EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Bytes(
+            bytes::Bytes::from_static(&[1, 2, 3])
+        )])
+        .expect("one byte string is a valid entity primary key");
+        assert!(
+            !round_trips(&bytes_pk),
+            "a bytes identity must NOT survive the JSON round trip -- it returns as a \
+             base64 String component"
+        );
+    }
+
+    /// The gate that makes the above safe.
+    ///
+    /// `try_stage_lossless_columnar_mutations` refuses to stage a commit
+    /// columnar unless **every** row's identity passes
+    /// `EntityPk::as_single_string()`, which accepts exactly one
+    /// `EntityPkComponent::String`. That is the same predicate, asserted
+    /// directly: the shapes the JSON round trip loses are precisely the shapes
+    /// that can never reach the columnar route.
+    #[test]
+    fn the_columnar_staging_gate_rejects_every_identity_shape_the_json_round_trip_loses() {
+        let string_pk =
+            EntityPk::from_components(smallvec::smallvec![EntityPkComponent::String("row-0".into())])
+                .expect("one string is a valid entity primary key");
+        assert_eq!(
+            string_pk
+                .as_single_string()
+                .expect("a single string identity is columnar-eligible"),
+            "row-0"
+        );
+
+        let uuid_pk = EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Uuid(
+            *uuid::Uuid::from_u128(7).as_bytes()
+        )])
+        .expect("one uuid is a valid entity primary key");
+        assert!(
+            uuid_pk.as_single_string().is_err(),
+            "a uuid identity must be refused by the columnar staging gate"
+        );
+
+        let bytes_pk = EntityPk::from_components(smallvec::smallvec![EntityPkComponent::Bytes(
+            bytes::Bytes::from_static(&[1, 2, 3])
+        )])
+        .expect("one byte string is a valid entity primary key");
+        assert!(
+            bytes_pk.as_single_string().is_err(),
+            "a bytes identity must be refused by the columnar staging gate"
+        );
+
+        assert!(
+            integer_entity_pk(42).as_single_string().is_err(),
+            "an integer identity is refused too, so the columnar route never sees one"
+        );
+
+        let composite = EntityPk::from_components(smallvec::smallvec![
+            EntityPkComponent::String("left".into()),
+            EntityPkComponent::String("right".into())
+        ])
+        .expect("two strings are a valid entity primary key");
+        assert!(
+            composite.as_single_string().is_err(),
+            "a composite identity is refused"
+        );
+    }
+
     fn index_value(index: usize) -> TrackedStateIndexValue {
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(1_700_000_000_000);
         TrackedStateIndexValue {
@@ -601,6 +731,162 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
         }
+    }
+
+    /// The constructed case for the columnar identity round trip.
+    ///
+    /// Arm A uses a single-string primary key, which the staging gate admits,
+    /// and asserts the columnar route actually served the rows. Without that
+    /// assertion arm B proves nothing: "no columnar rows" would be
+    /// indistinguishable from "the test never built a columnar commit".
+    ///
+    /// Arm B declares the same schema with `"format": "uuid"` on the primary
+    /// key, which makes the identity an `EntityPkComponent::Uuid` — the shape
+    /// that does not survive the JSON round trip. It must read back correctly
+    /// **and** never take the columnar route. If a future change widens the
+    /// staging gate, arm B's rows would be fetched through a JSON identity
+    /// match, the re-check in `materialize_index_payloads` would reject them,
+    /// and this test fails instead of the read failing in production.
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn a_uuid_primary_key_never_reaches_the_columnar_commit_delta_route() {
+        use crate::engine::Engine;
+        use crate::storage_adapter::Memory;
+        use serde_json::json;
+
+        // The dense columnar lane is only taken by a *certified parameter
+        // batch* of at least `TYPED_CERTIFIED_INSERT_MIN_ROWS` (32,768) rows;
+        // below that `certified_entity_insert_parameter_batch` falls to the raw
+        // lane, which carries no encoded row groups, and
+        // `try_stage_lossless_columnar_mutations` then sees no dense write set.
+        // A smaller fixture silently produces no columnar commit at all, which
+        // is why arm A asserts engagement rather than assuming it.
+        const ROWS: usize = 32 * 1024;
+
+        // The census counters are process-global and the CI suite runs tests in
+        // parallel, so these assertions are thresholds against this test's own
+        // row count rather than equalities. Measured: inside the full suite the
+        // uuid arm read `columnar=2` from a concurrent test, which failed an
+        // `== 0` assertion while the isolated run read 0. A stray handful of
+        // rows cannot reach 32,768, so the thresholds stay decisive without
+        // being flaky.
+
+        async fn run(schema_key: &str, uuid_pk: bool) -> (u64, u64, usize) {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("engine should initialize");
+            let engine = Engine::new(storage.clone())
+                .await
+                .expect("engine should open");
+            let session = engine.open_session().await.expect("session should open");
+
+            let mut id_property = json!({ "type": "string" });
+            if uuid_pk {
+                id_property["format"] = json!("uuid");
+            }
+            let schema = json!({
+                "x-lix-key": schema_key,
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": { "id": id_property, "locale": { "type": "string" } },
+                "required": ["id", "locale"],
+                "additionalProperties": false
+            });
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema should register");
+
+            let sql = format!("INSERT INTO {schema_key} (id, locale) VALUES ($1, $2)");
+            let statements = (0..ROWS)
+                .map(|index| crate::session::ExecuteBatchStatement {
+                    label: None,
+                    sql: sql.clone(),
+                    params: vec![
+                        crate::Value::Text(if uuid_pk {
+                            uuid::Uuid::from_u128(index as u128 + 1).to_string()
+                        } else {
+                            format!("row-{index:07}")
+                        }),
+                        // Distinct per row: `derive_entity_row_groups` refuses
+                        // the columnar layout when a non-key string column has
+                        // 2..=64 distinct values, so a flag column here would
+                        // also silently defeat the fixture.
+                        crate::Value::Text(format!("loc-{index:07}")),
+                    ],
+                })
+                .collect::<Vec<_>>();
+            session
+                .execute_batch(&statements)
+                .await
+                .expect("the certified parameter batch should insert");
+
+            // Rotate onto a branch so the read is served from a root current
+            // base and must fetch payloads from the owning commit delta.
+            let branch = session
+                .create_branch(crate::CreateBranchOptions {
+                    id: None,
+                    name: format!("e52-columnar-{schema_key}"),
+                    from_commit_id: None,
+                })
+                .await
+                .expect("branch should create");
+            session
+                .switch_branch(crate::SwitchBranchOptions {
+                    branch_id: branch.id.clone(),
+                })
+                .await
+                .expect("branch should switch");
+
+            let _ = crate::storage_bench::take_tracked_key_allocation_census();
+            let rows = session
+                .execute(
+                    &format!("SELECT id FROM {schema_key} WHERE locale = 'loc-0000000'"),
+                    &[],
+                )
+                .await
+                .expect("the rotated scan must succeed, not reject its own payload");
+            let census = crate::storage_bench::take_tracked_key_allocation_census();
+            (
+                census.commit_delta_columnar_rows,
+                census.commit_delta_rows_loaded,
+                rows.len(),
+            )
+        }
+
+        let (string_columnar, string_packed, string_rows) = run("colstr", false).await;
+        println!(
+            "columnar_identity | string_pk columnar={string_columnar} packed={string_packed} rows={string_rows}"
+        );
+        assert_eq!(string_rows, 1, "the string-pk arm must answer one row");
+        assert!(
+            string_columnar >= ROWS as u64,
+            "arm A must actually reach the columnar route, otherwise arm B proves nothing \
+             (columnar={string_columnar} packed={string_packed})"
+        );
+
+        let (uuid_columnar, uuid_packed, uuid_rows) = run("coluuid", true).await;
+        println!(
+            "columnar_identity | uuid_pk columnar={uuid_columnar} packed={uuid_packed} rows={uuid_rows}"
+        );
+        assert_eq!(
+            uuid_rows, 1,
+            "the uuid-pk arm must answer one row -- a rejected payload would surface here"
+        );
+        assert!(
+            uuid_packed >= ROWS as u64,
+            "every row of the uuid arm must be fetched through the packed route \
+             (columnar={uuid_columnar} packed={uuid_packed})"
+        );
+        assert!(
+            uuid_columnar < ROWS as u64,
+            "a uuid primary key must never be served by the columnar route, whose identity \
+             match cannot round-trip it (columnar={uuid_columnar} packed={uuid_packed})"
+        );
     }
 
     #[test]

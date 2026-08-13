@@ -26,6 +26,7 @@ mod tree;
 mod types;
 
 pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
+pub(crate) use storage::load_commit_state_authority_ids;
 pub(crate) use commit_root_rebuild::{
     load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
     try_stage_collapsed_rebuild_plans_with_writer,
@@ -33,6 +34,8 @@ pub(crate) use commit_root_rebuild::{
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
+#[cfg(test)]
+pub(crate) use context::DIFF_ROW_CREATED_AT_VALIDATIONS;
 pub(crate) use current_state_data_part::{
     CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE,
     decode_current_state_data_part_commit_ids, decode_current_state_data_part_refs,
@@ -44,7 +47,7 @@ pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStatePayloadRef,
 };
-pub(crate) use diff_id::{decode_diff_id, encode_diff_id};
+pub(crate) use diff_id::decode_diff_id;
 pub(crate) use merge::{
     TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,
     merge_payload_fallback_ids, plan_merge,

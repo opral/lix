@@ -12,11 +12,18 @@ mod hot;
 pub(crate) use hot::hot_decode_entity_pk_probe;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use hot::{
+    BROAD_CANONICAL_CREATED_AT_HITS, BROAD_CANONICAL_CREATED_AT_KEYS,
+    BROAD_CANONICAL_CREATED_AT_LOOKUPS, COMPACTED_TOMBSTONE_CANDIDATES,
+    COMPACTED_TOMBSTONE_COMPACTED, COMPACTED_TOMBSTONE_OFFERED, COMPACTED_TOMBSTONE_ROUTES,
+};
 #[cfg(test)]
 pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
 pub(crate) use hot::hot_generation_scope_prefix;
 pub(crate) use hot::{
+    RootBaseBatchCache,
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, COLLECTION_CONTROL_SPACE, CertifiedEntityBatchFileRef,
     DIFF_SPACE, DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows,
@@ -500,6 +507,7 @@ impl TrackedHeadContext {
         hot::HotStateStoreReader {
             store,
             transaction_cache: None,
+            root_base_cache: None,
         }
     }
 
@@ -515,6 +523,7 @@ impl TrackedHeadContext {
         hot::HotStateStoreReader {
             store,
             transaction_cache: Some(cache),
+            root_base_cache: None,
         }
     }
 
@@ -527,7 +536,15 @@ impl TrackedHeadContext {
     where
         S: StorageAdapterRead + ?Sized,
     {
-        hot::HotStateWriter { store, writes }
+        // `transaction_global_schema_keys: None` is the safe default: it
+        // disables serving-view tombstone compaction. Only a caller holding
+        // the transaction's complete prepared inputs may relax it, through
+        // `HotStateWriter::with_transaction_global_schema_keys`.
+        hot::HotStateWriter {
+            store,
+            writes,
+            transaction_global_schema_keys: None,
+        }
     }
 }
 

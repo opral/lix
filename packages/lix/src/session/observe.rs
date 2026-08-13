@@ -296,3 +296,27 @@ where
         )
     }
 }
+
+
+/// See `session::execute::assume_send_future_proofs`.
+#[cfg(test)]
+mod assume_send_future_proofs {
+    use super::*;
+
+    // session/observe.rs -- ObserveEvents::next
+    #[allow(dead_code)]
+    fn next_inner_is_send(events: &mut ObserveEvents<Memory>) {
+        fn is_send<T: Send>(_: &T) {}
+        is_send(&events.next_inner());
+    }
+
+    #[allow(dead_code)]
+    fn observe_events_is_send_for_every_storage<S>()
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        fn assert_send<T: Send>() {}
+        assert_send::<ObserveEvents<S>>();
+    }
+}
+

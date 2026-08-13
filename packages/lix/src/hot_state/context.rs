@@ -55,6 +55,64 @@ pub(crate) struct BranchHeadControlCache {
     hot_state: std::sync::Arc<HotStateTransactionCache>,
 }
 
+/// Engine bookkeeping rows that live in the global branch's untracked
+/// `lix_key_value` plane and are consulted on **every** transaction open.
+///
+/// Resolving one costs a projected live batch read plus — on the expected
+/// miss, because the row is absent in a repository that never enabled the
+/// feature — a full `validate_exact_collection_closure` scan of the global
+/// `lix_key_value` collection. Both are functions of the global branch-head
+/// control's generation and current-state revision, and every write to that
+/// plane republishes the control under a CAS with a bumped
+/// `current_state_revision`. An unchanged control therefore proves the
+/// resolved row, and the closure validated alongside it, unchanged.
+///
+/// Disposable cache: tagged with the exact control it was resolved under,
+/// rebuilt from canonical records on any change, never an authority.
+#[derive(Debug, Default)]
+pub(crate) struct GlobalKeyValueRowCache {
+    entries: StdMutex<Vec<(BranchHeadControl, String, Option<MaterializedHotStateRow>)>>,
+}
+
+const GLOBAL_KEY_VALUE_ROW_CACHE_MAX_ENTRIES: usize = 8;
+
+impl GlobalKeyValueRowCache {
+    pub(crate) fn get(
+        &self,
+        control: BranchHeadControl,
+        key: &str,
+    ) -> Option<Option<MaterializedHotStateRow>> {
+        let entries = self
+            .entries
+            .lock()
+            .expect("global key-value row cache lock should not be poisoned");
+        entries
+            .iter()
+            .find(|(entry_control, entry_key, _)| *entry_control == control && entry_key == key)
+            .map(|(_, _, row)| row.clone())
+    }
+
+    pub(crate) fn insert(
+        &self,
+        control: BranchHeadControl,
+        key: &str,
+        row: Option<MaterializedHotStateRow>,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("global key-value row cache lock should not be poisoned");
+        // A control change retires every entry: they were all resolved under
+        // the previous one and none of them can be reused.
+        entries
+            .retain(|(entry_control, entry_key, _)| *entry_control == control && entry_key != key);
+        if entries.len() >= GLOBAL_KEY_VALUE_ROW_CACHE_MAX_ENTRIES {
+            entries.remove(0);
+        }
+        entries.push((control, key.to_string(), row));
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct EntityPointSnapshotCacheKey {
     branch_id: String,
@@ -307,9 +365,17 @@ pub(crate) struct HotStateContext {
     entity_columnar_scan_cache:
         std::sync::Arc<std::sync::Mutex<crate::hot_state::EntityColumnarShadowMaskCache>>,
     entity_decoded_column_cache: crate::hot_state::EntityDecodedColumnCache,
+    global_key_value_rows: std::sync::Arc<GlobalKeyValueRowCache>,
+    root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
 }
 
 impl HotStateContext {
+    /// Engine-lifetime cache for the global untracked `lix_key_value` rows read
+    /// at every transaction open, fenced by the global branch-head control.
+    pub(crate) fn global_key_value_rows(&self) -> &GlobalKeyValueRowCache {
+        &self.global_key_value_rows
+    }
+
     pub(crate) fn new(
         _tracked_state: TrackedStateContext,
         commit_graph: CommitGraphContext,
@@ -331,6 +397,8 @@ impl HotStateContext {
                 crate::hot_state::EntityDecodedColumnCache::with_array_budget(
                     entity_columnar_array_budget,
                 ),
+            global_key_value_rows: std::sync::Arc::new(GlobalKeyValueRowCache::default()),
+            root_base_cache: std::sync::Arc::default(),
         }
     }
 
@@ -357,6 +425,7 @@ impl HotStateContext {
             entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
             entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
             branch_head_control_cache: None,
+            root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
     }
 
@@ -378,6 +447,7 @@ impl HotStateContext {
             entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
             entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
             branch_head_control_cache: Some(branch_head_control_cache),
+            root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
     }
 
@@ -409,6 +479,7 @@ impl HotStateContext {
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
             entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
             branch_head_control_cache: None,
+            root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
     }
 
@@ -432,6 +503,7 @@ pub(crate) struct HotStateContextReader<S> {
     entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
     entity_columnar_layout_cache: std::sync::Arc<EntityColumnarLayoutCache>,
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
+    root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
 }
 
 impl<S> HotStateContextReader<S>
@@ -497,6 +569,7 @@ where
         let snapshots = self
             .tracked_head
             .reader(&self.store)
+            .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
             .scan_entity_snapshots(
                 &requested_branch_id,
                 requested_control,
@@ -526,6 +599,7 @@ where
         };
         self.tracked_head
             .reader(&self.store)
+            .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
             .scan_entity_primary_keys(
                 &branch_id,
                 control,
@@ -914,13 +988,17 @@ where
             return Ok(Some(MaterializedHotStateBatch::default()));
         }
         let tracked_request = tracked_scan_request_from_live(request);
-        let tracked_head = self.branch_head_control_cache.as_ref().map_or_else(
-            || self.tracked_head.reader(&self.store),
-            |cache| {
-                self.tracked_head
-                    .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
-            },
-        );
+        let tracked_head = self
+            .branch_head_control_cache
+            .as_ref()
+            .map_or_else(
+                || self.tracked_head.reader(&self.store),
+                |cache| {
+                    self.tracked_head
+                        .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
+                },
+            )
+            .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache));
         let rows_by_branch = tracked_head
             .scan_live_batches_for_controls(&controls, &tracked_request, request.filter.untracked)
             .await?;
@@ -1303,6 +1381,7 @@ where
                     let rows = self
                         .tracked_head
                         .reader(store)
+                        .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
                         .scan_live_batch_for_retention(
                             &branch_id,
                             control,

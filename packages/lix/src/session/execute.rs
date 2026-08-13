@@ -869,7 +869,7 @@ where
                 .storage
                 .begin_read(StorageReadOptions::default())
                 .await?;
-            with_static_session_sql_read::<StorageImpl, _, _>(
+            with_static_session_sql_read::<StorageImpl, _, _, _>(
                 read_scope,
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                     let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
@@ -1132,10 +1132,7 @@ where
         path: String,
         requested_range: Option<Range<u64>>,
     ) -> impl Future<Output = Result<Option<FileRead>, LixError>> + Send + '_ {
-        // SAFETY: the read future owns its path/range and retains only shared
-        // references to this Sync session. Rustc cannot prove the Send bound
-        // through the higher-ranked scoped SQL-read closure.
-        unsafe { super::AssumeSendFuture::new(self.read_file_content_inner(path, requested_range)) }
+        self.read_file_content_inner(path, requested_range)
     }
 
     async fn read_file_content_inner(
@@ -1155,7 +1152,7 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (content, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
+        let (content, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
@@ -1341,7 +1338,7 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let read_result = with_static_session_sql_read::<StorageImpl, _, _>(
+        let read_result = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 self.execute_read_statement_with_store(
@@ -1969,7 +1966,7 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (results, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
+        let (results, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let file_view_collector =
@@ -2092,7 +2089,7 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (batch, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
+        let (batch, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let file_view_collector =
@@ -2401,7 +2398,7 @@ where
         let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
             Arc::new(self.hot_state.reader(read_store.clone()));
         let runtime_functions = if has_durable_runtime_function {
-            Some(FunctionContext::prepare(&read_store).await?)
+            Some(FunctionContext::prepare(&read_store, None).await?)
         } else {
             None
         };
@@ -2837,13 +2834,14 @@ fn profile_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
 /// storage implementations such as RocksDB naturally expose borrowed read snapshots. Keep
 /// the lifetime erasure private to session SQL execution so callers cannot
 /// receive the widened read as a general crate capability.
-async fn with_static_session_sql_read<StorageImpl, F, T>(
+async fn with_static_session_sql_read<StorageImpl, F, Fut, T>(
     read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
     f: F,
 ) -> Result<T, LixError>
 where
     StorageImpl: Storage + 'static,
-    F: AsyncFnOnce(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Result<T, LixError>,
+    F: FnOnce(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Fut,
+    Fut: Future<Output = Result<T, LixError>>,
 {
     // SAFETY: the widened read is wrapped immediately in `SharedStorageAdapterRead`,
     // only passed into this private SQL execution closure, and explicitly
@@ -11061,5 +11059,189 @@ mod tests {
             uncached.rows()[0].values(),
             "cached templates must match a fresh DataFusion plan"
         );
+    }
+}
+
+
+/// Compile-time proofs for the `AssumeSendFuture` safety obligation.
+///
+/// `AssumeSendFuture` asserts `Send` unconditionally, so its soundness rests on
+/// each call site's wrapped future genuinely holding only `Send` values across
+/// its suspension points. Nothing in the type system re-checks that after the
+/// wrapper is applied, which makes the obligation silently rot-prone.
+///
+/// `Memory::Read<'a> = MemoryRead` is lifetime-independent, so instantiating the
+/// wrapped futures at `Memory` collapses the higher-ranked obstruction that
+/// forces the wrapper in the generic case and lets rustc perform the full
+/// auto-trait walk over the entire suspension state. A future change that parks
+/// an `Rc`, a `RefCell` borrow guard, or any other `!Send` value across an
+/// `.await` on these paths fails to compile here instead of becoming undefined
+/// behaviour behind the wrapper.
+#[cfg(test)]
+mod assume_send_future_proofs {
+    use super::*;
+    use crate::storage_adapter::Memory;
+
+    fn is_send<T: Send>(_: &T) {}
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    // session/execute.rs -- SessionContext::read_file_content
+    #[allow(dead_code)]
+    fn read_file_content_inner_is_send(session: &SessionContext<Memory>) {
+        is_send(&session.read_file_content_inner(String::new(), None));
+    }
+
+    // session/execute.rs -- execute_with_idempotency_and_options_and_metadata
+    #[allow(dead_code)]
+    fn execute_with_kind_is_send(
+        session: &SessionContext<Memory>,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
+    ) {
+        is_send(&session.execute_with_kind(sql, params, options, metadata, "execute", None, true));
+    }
+
+    // session/execute.rs -- execute_batch_with_idempotency_and_options_and_metadata
+    #[allow(dead_code)]
+    fn execute_batch_inner_is_send(
+        session: &SessionContext<Memory>,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+        metadata: Vec<ExecuteStatementMetadata>,
+    ) {
+        is_send(&session.execute_batch_with_options_and_metadata_inner(
+            statements, options, metadata, None, true,
+        ));
+    }
+
+    // session/execute.rs -- SessionTransaction::execute_with_options
+    #[allow(dead_code)]
+    fn transaction_execute_inner_is_send(
+        transaction: &mut SessionTransaction<Memory>,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) {
+        is_send(&transaction.execute_with_options_inner(sql, params, options));
+    }
+
+    /// The values the wrapped futures retain are `Send`/`Sync` for *every*
+    /// legal `StorageImpl`, not just `Memory`. Storage-supplied handles are
+    /// covered by the `Storage`/`StorageRead`/`StorageWrite` trait contract
+    /// alone, so no adapter can introduce a non-`Send` value into these paths.
+    #[allow(dead_code)]
+    fn retained_values_are_send_for_every_storage<S>()
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        assert_send::<SessionContext<S>>();
+        assert_sync::<SessionContext<S>>();
+        assert_send::<SessionTransaction<S>>();
+        assert_send::<ExecuteResult>();
+        assert_sync::<ExecuteResult>();
+        assert_send::<Value>();
+        assert_sync::<Value>();
+        assert_send::<ExecuteBatchStatement>();
+        assert_sync::<ExecuteBatchStatement>();
+        assert_send::<ExecuteOptions>();
+        assert_send::<ExecuteStatementMetadata>();
+        assert_send::<S::Read<'static>>();
+        assert_sync::<S::Read<'static>>();
+        assert_send::<S::Write<'static>>();
+    }
+
+    /// Adapter-independent concrete types that cross suspensions on these paths.
+    #[allow(dead_code)]
+    fn storage_cursor_types_are_send() {
+        assert_send::<crate::storage::ScanCursor<'static>>();
+        assert_send::<crate::storage::GetManyResult>();
+    }
+}
+
+
+/// Borrowing-adapter half of the `AssumeSendFuture` proofs.
+///
+/// # What this covers, and the limit
+///
+/// `assume_send_future_proofs` instantiates the wrapped futures at `Memory`,
+/// where `Read<'a> = MemoryRead` is lifetime-independent. That collapses the
+/// higher-ranked obstruction and lets rustc walk the *complete* suspension
+/// state. The shipping RocksDB adapter is `Read<'a> = RocksDBRead<'a>`, so that
+/// proof covers the easy case.
+///
+/// **A whole-future proof at a lifetime-dependent `Read<'a>` is not achievable,
+/// even for a fully concrete adapter.** Measured against `BorrowingStorage`
+/// below: five of the six remaining wrapper sites fail with the same
+/// `implementation of 'Send' is not general enough` diagnostic that forces the
+/// wrapper generically. The borrowing shape *is* the obstruction; making the
+/// adapter concrete does not remove it. That is a rustc limitation on
+/// higher-ranked auto-trait obligations, not a property of this code.
+///
+/// So the borrowing case is covered in two pieces instead:
+///
+/// 1. `read_file_content_inner` — which carries no wrapper since its
+///    `with_static_session_sql_read` bound was relaxed — is proven `Send`
+///    against the borrowing adapter directly, and generically for every
+///    `StorageImpl` by its own `+ Send` signature.
+/// 2. Every type rustc names in the remaining obstructions is proven `Sync`
+///    below, **universally quantified over the lifetime**. `&'x T: Send` holds
+///    exactly when `T: Sync`, so these discharge the named obligations for all
+///    lifetimes; rustc simply cannot assemble them inside a generator. Combined
+///    with the `Memory` walk — which enumerates the complete suspension state,
+///    and finds no `Rc`, `RefCell` guard, or raw pointer anywhere — this is the
+///    tightest statement the type system supports.
+#[cfg(test)]
+mod assume_send_future_proofs_borrowing {
+    use super::*;
+    use crate::session::borrowing_proof_storage::{BorrowingRead, BorrowingStorage};
+
+    fn is_send<T: Send>(_: &T) {}
+    fn assert_send<T: Send + ?Sized>() {}
+    fn assert_sync<T: Sync + ?Sized>() {}
+
+    /// Whole-future proof, borrowing adapter. This site has no wrapper.
+    #[allow(dead_code)]
+    fn read_file_content_inner_is_send(session: &SessionContext<BorrowingStorage>) {
+        is_send(&session.read_file_content_inner(String::new(), None));
+    }
+
+    /// The shared read wrapper is `Send + Sync` for every storage adapter and
+    /// **every lifetime** — `'a` is a free parameter here, so this is a genuine
+    /// `for<'a>` proof of the obligation rustc reports as "not general enough".
+    #[allow(dead_code)]
+    fn shared_read_is_send_for_every_storage_and_lifetime<'a, S>()
+    where
+        S: Storage + Clone + Send + Sync + 'a,
+    {
+        assert_send::<SharedStorageAdapterRead<S::Read<'a>>>();
+        assert_sync::<SharedStorageAdapterRead<S::Read<'a>>>();
+        assert_send::<S::Read<'a>>();
+        assert_sync::<S::Read<'a>>();
+    }
+
+    /// The same, pinned at the concrete borrowing adapter.
+    #[allow(dead_code)]
+    fn shared_read_is_send_for_borrowing_adapter<'a>() {
+        assert_send::<SharedStorageAdapterRead<BorrowingRead<'a>>>();
+        assert_sync::<SharedStorageAdapterRead<BorrowingRead<'a>>>();
+    }
+
+    /// Every remaining type named by a "not general enough" obstruction, proven
+    /// `Sync` — which is exactly `for<'x> &'x T: Send`.
+    #[allow(dead_code)]
+    fn obstruction_pointees_are_sync<S>()
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        assert_sync::<str>();
+        assert_sync::<[Value]>();
+        assert_sync::<[ExecuteBatchStatement]>();
+        assert_sync::<SessionContext<S>>();
+        assert_sync::<crate::Lix<S>>();
+        assert_sync::<crate::storage_adapter::Memory>();
+        assert_sync::<tokio::sync::Mutex<()>>();
     }
 }
