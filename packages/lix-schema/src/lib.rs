@@ -10,6 +10,7 @@ mod error;
 mod model;
 mod row;
 mod validate;
+pub mod value_layout;
 
 pub use amendment::validate_amendment;
 pub use ddl::to_postgres_ddl;
