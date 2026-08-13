@@ -8294,6 +8294,8 @@ async fn load_bounded_commit_delta_members_for_schemas(
             }
         })
         .collect::<Vec<_>>();
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_bounded_scan(false, ranges.len());
     let runs = super::mutation_directory::load_mutation_part_read_plan(
         store,
         root,
@@ -8367,6 +8369,8 @@ async fn load_bounded_commit_delta_members_for_schemas(
     if !requested_schemas.is_empty() {
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_commit_delta_segment_members_kept(members.len());
     if hydrate_selected_payloads {
         hydrate_selected_members(store, &mut members).await?;
     }
@@ -11031,6 +11035,11 @@ fn collect_strict_commit_delta_members(
     let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
     visit_commit_delta_leaf(&leaf, expected_commit_id, |_, _, _| Ok(()))?;
     for entry_index in 0..leaf.len() {
+        // The per-entry decode loop. A selected segment is decoded whole, so
+        // this is the only layer at which "how much did this scan read" and
+        // "how much did it return" are distinguishable.
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_commit_delta_segment_entry_decoded();
         let entry = leaf.entry(entry_index)?.ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,

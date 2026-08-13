@@ -237,6 +237,83 @@ async fn history_files_at_fixed_commits() {
     }
 }
 
+/// Decoded commit-delta entries per answer row, swept over file count.
+///
+/// A timing sweep cannot tell "the read is bounded" from "the read is wide but
+/// cheap on this fixture". This reads the census counted inside
+/// `collect_strict_commit_delta_members`' per-entry decode loop, one layer below
+/// the member vector the scan returns, and reports it against the number of rows
+/// the query actually answered with.
+///
+/// The route counters are printed alongside deliberately: a flat
+/// `entries_decoded` with `file_bounded=0` means the narrowed route never ran,
+/// which is a different finding from "the narrowing did not help".
+#[tokio::test]
+#[ignore = "manual history-scaling probe"]
+async fn history_member_scan_census() {
+    let file_bytes = env_usize("LIX_HISTORY_SCALE_FILE_BYTES", 4 * 1024);
+    let edits = env_usize("LIX_HISTORY_SCALE_EDITS", 20);
+    let depth = env_usize("LIX_HISTORY_SCALE_DEPTH", 20);
+
+    for files in env_list("LIX_HISTORY_SCALE_FILES", "50,500,5000") {
+        let dir = tempfile::tempdir().expect("probe tempdir");
+        let lix = open_at(dir.path()).await;
+        let probe_path = "/probe/f00000.bin".to_string();
+        seed(&lix, files, file_bytes, files, edits, &probe_path).await;
+
+        let head = active_commit(&lix).await;
+        let file_id: String = lix
+            .execute(
+                "SELECT id FROM lix_file WHERE path = $1",
+                &[Value::Text(probe_path.clone())],
+            )
+            .await
+            .expect("probe file id")
+            .rows()[0]
+            .get("id")
+            .expect("id text");
+
+        let by_path = format!(
+            "SELECT lixcol_depth FROM lix_file_history($1) WHERE path = $2 \
+             ORDER BY lixcol_depth LIMIT {depth}"
+        );
+        let by_id = format!(
+            "SELECT lixcol_depth FROM lix_file_history($1) WHERE id = $2 \
+             ORDER BY lixcol_depth LIMIT {depth}"
+        );
+
+        for (label, sql, arg) in [
+            ("by_path", &by_path, probe_path.clone()),
+            ("by_id", &by_id, file_id.clone()),
+        ] {
+            // Warm the caches, then clear the census so the reported numbers
+            // belong to one steady-state read.
+            let _ = lix
+                .execute(sql, &[Value::Text(head.clone()), Value::Text(arg.clone())])
+                .await
+                .expect("warm probe query");
+            let _ = lix::storage_bench::take_commit_delta_member_scan_census();
+            let rows = lix
+                .execute(sql, &[Value::Text(head.clone()), Value::Text(arg.clone())])
+                .await
+                .expect("probe query")
+                .rows()
+                .len();
+            let (decoded, kept, schema_only, file_bounded, ranges) =
+                lix::storage_bench::take_commit_delta_member_scan_census();
+            eprintln!(
+                "member_scan_census {label} files={files} commits={} rows={rows} \
+                 entries_decoded={decoded} members_kept={kept} \
+                 scans_schema_only={schema_only} scans_file_bounded={file_bounded} \
+                 ranges={ranges} decoded_per_row={:.1}",
+                edits + 1,
+                decoded as f64 / rows.max(1) as f64,
+            );
+        }
+        lix.close().await.expect("close probe");
+    }
+}
+
 /// Vary the number of reachable commits with file count AND answer size held
 /// constant.
 ///
