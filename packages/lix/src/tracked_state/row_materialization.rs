@@ -763,6 +763,14 @@ mod tests {
         // is why arm A asserts engagement rather than assuming it.
         const ROWS: usize = 32 * 1024;
 
+        // The census counters are process-global and the CI suite runs tests in
+        // parallel, so these assertions are thresholds against this test's own
+        // row count rather than equalities. Measured: inside the full suite the
+        // uuid arm read `columnar=2` from a concurrent test, which failed an
+        // `== 0` assertion while the isolated run read 0. A stray handful of
+        // rows cannot reach 32,768, so the thresholds stay decisive without
+        // being flaky.
+
         async fn run(schema_key: &str, uuid_pk: bool) -> (u64, u64, usize) {
             let storage = Memory::new();
             Engine::initialize(storage.clone())
@@ -856,9 +864,9 @@ mod tests {
         );
         assert_eq!(string_rows, 1, "the string-pk arm must answer one row");
         assert!(
-            string_columnar > 0,
-            "arm A must actually reach the columnar route, otherwise arm B's zero \
-             proves nothing (columnar={string_columnar} packed={string_packed})"
+            string_columnar >= ROWS as u64,
+            "arm A must actually reach the columnar route, otherwise arm B proves nothing \
+             (columnar={string_columnar} packed={string_packed})"
         );
 
         let (uuid_columnar, uuid_packed, uuid_rows) = run("coluuid", true).await;
@@ -869,14 +877,15 @@ mod tests {
             uuid_rows, 1,
             "the uuid-pk arm must answer one row -- a rejected payload would surface here"
         );
-        assert_eq!(
-            uuid_columnar, 0,
-            "a uuid primary key must never be served by the columnar route, whose \
-             identity match cannot round-trip it (columnar={uuid_columnar} packed={uuid_packed})"
+        assert!(
+            uuid_packed >= ROWS as u64,
+            "every row of the uuid arm must be fetched through the packed route \
+             (columnar={uuid_columnar} packed={uuid_packed})"
         );
         assert!(
-            uuid_packed > 0,
-            "the uuid arm must still have fetched payloads, through the packed route"
+            uuid_columnar < ROWS as u64,
+            "a uuid primary key must never be served by the columnar route, whose identity \
+             match cannot round-trip it (columnar={uuid_columnar} packed={uuid_packed})"
         );
     }
 
