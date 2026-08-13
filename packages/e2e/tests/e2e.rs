@@ -1,3 +1,7 @@
+// Several benchmark/profiling helpers remain useful to ignored and ad-hoc
+// probes even when their former public-SDK tests are not compiled.
+#![allow(dead_code, unused_imports)]
+
 mod benchmark_metrics;
 
 use bytes::Bytes;

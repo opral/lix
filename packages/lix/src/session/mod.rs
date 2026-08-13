@@ -34,13 +34,16 @@ pub(crate) use merge::{MergeCommitsForBench, analyze_merge_for_bench};
 // which is compiled in every configuration.
 pub(crate) use media_upload::{UPLOAD_MANIFEST_LEAF_SPACE, UPLOAD_STATE_SPACE};
 
-pub(crate) use crate::common::{ExecuteStatementMetadata, VerifiedRequestBlob};
+pub(crate) use crate::common::ExecuteStatementMetadata;
+#[cfg(feature = "server-protocol")]
+pub(crate) use crate::common::VerifiedRequestBlob;
 pub use checkpoint::CreateCheckpointReceipt;
 pub(crate) use context::SessionBranch;
 pub use context::SessionContext;
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
-    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Row, RowRef, TryFromValue,
+    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Row, RowRef,
+    TryFromValue,
 };
 pub(crate) use execute::{ExecutionDisposition, FileRead};
 pub(crate) use idempotency::ExecuteIdempotency;

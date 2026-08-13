@@ -31,7 +31,6 @@ use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
-#[expect(missing_debug_implementations)]
 pub(crate) struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
     tracked_state: Arc<TrackedStateContext>,
@@ -49,7 +48,6 @@ pub(crate) struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter
     telemetry: Option<Arc<dyn TelemetrySink>>,
 }
 
-#[expect(missing_debug_implementations)]
 pub(crate) struct EngineOptions {
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
@@ -134,6 +132,7 @@ where
     }
 
     /// Creates an engine with a WASM component runtime for installed plugins.
+    #[allow(dead_code)]
     pub(crate) async fn new_with_wasm_runtime(
         storage: StorageImpl,
         wasm_runtime: Arc<dyn WasmRuntime>,
@@ -293,6 +292,7 @@ where
     /// Returns process-local work accumulated by completed v2 transitions on
     /// this engine. The snapshot is shared by every session cloned from it.
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub(crate) fn plugin_transition_counters(&self) -> WasmTransitionCounters {
         self.plugin_host.transition_counters()
     }
@@ -300,6 +300,7 @@ where
     /// Resets the process-local v2 transition aggregate used by profiling and
     /// invariant tests. This does not mutate durable repository state.
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub(crate) fn reset_plugin_transition_counters(&self) {
         self.plugin_host.reset_transition_counters();
     }

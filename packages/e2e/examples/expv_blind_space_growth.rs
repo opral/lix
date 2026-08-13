@@ -394,26 +394,6 @@ impl Fixture {
         }
     }
 
-    fn flush(&self) {
-        self.storage.flush().expect("flush RocksDB");
-    }
-}
-
-/// splitmix64 fill. Deterministic per seed, and statistically incompressible,
-/// which is what a physical byte measurement of a payload plane requires.
-fn pseudo_random_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        let take = (len - out.len()).min(8);
-        out.extend_from_slice(&z.to_le_bytes()[..take]);
-    }
-    out
 }
 
 fn report(scenario: &str, phase: &str, axis: u64, usage: &Usage) {

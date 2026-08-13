@@ -1,3 +1,7 @@
+// The hard-cut keeps a small set of crate-internal transport and profiling
+// helpers that no longer have enabled in-crate callers.
+#![cfg_attr(test, allow(dead_code))]
+
 use lix::plugin::runtime::WasmRuntime;
 use lix::plugin::runtime::WasmTransitionCounters;
 use lix::storage::Storage;
@@ -17,7 +21,7 @@ use std::{
 
 use crate::client_state::ClientState;
 use crate::engine::{Engine, EngineOptions};
-use crate::session::ExecuteOptions;
+use crate::session::{CoherentReadBatch, ExecuteOptions};
 use crate::session::SessionContext;
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
@@ -528,6 +532,16 @@ where
             statements: statements.to_vec(),
             options: ExecuteOptions::default(),
         }
+    }
+
+    /// Executes read statements against one coherent storage snapshot and
+    /// returns the snapshot metadata required by official storage adapters.
+    #[doc(hidden)]
+    pub async fn execute_coherent_read_batch(
+        &self,
+        statements: &[(&str, &[Value])],
+    ) -> Result<CoherentReadBatch, LixError> {
+        self.session.execute_coherent_read_batch(statements).await
     }
 
     /// Executes one prepared DML statement shape for a rectangular parameter

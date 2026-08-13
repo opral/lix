@@ -15,7 +15,7 @@ use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
     StorageWrite, WriteOptions,
 };
-use lix::{ExecuteBatchStatement, Lix, LixError, LixPath, SYSTEM_ACCOUNT_ID, Value};
+use lix::{Lix, LixError, LixPath, SYSTEM_ACCOUNT_ID, Value};
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 use tokio::sync::oneshot;
@@ -446,10 +446,8 @@ impl StorageWrite for LocalFilesystemWrite {
         async move {
             let result = self.inner.commit().await?;
             if let Some(inner) = self.supervisor.and_then(|inner| inner.upgrade()) {
-                let supervisor = FilesystemSupervisor { inner };
-                if thread::current().name() == Some("lix-sdk-filesystem-sync") {
-                    supervisor.notify_sync_from_lix()?;
-                } else {
+                if thread::current().name() != Some("lix-sdk-filesystem-sync") {
+                    let supervisor = FilesystemSupervisor { inner };
                     supervisor.sync_from_lix().await?;
                 }
             }
@@ -564,18 +562,6 @@ impl FilesystemSupervisor {
         }
     }
 
-    fn notify_sync_from_lix(&self) -> Result<(), StorageError> {
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        self.inner
-            .event_tx
-            .send(FilesystemEvent::SyncFromLix { reply_tx })
-            .map_err(|error| {
-                StorageError::Io(format!(
-                    "filesystem sync failed: filesystem worker stopped: {error}"
-                ))
-            })
-    }
-
     async fn import_paths(&self, paths: Vec<String>) -> Result<(), LixError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
@@ -609,14 +595,6 @@ impl FilesystemSupervisorInner {
                 let _ = worker.join();
             }
         }
-    }
-}
-
-fn batch_read(sql: &str) -> ExecuteBatchStatement {
-    ExecuteBatchStatement {
-        sql: sql.to_string(),
-        params: Vec::new(),
-        label: None,
     }
 }
 
@@ -747,23 +725,20 @@ impl FilesystemState {
     async fn collect_lix_snapshot_read(&self) -> Result<LixSnapshotRead, LixError> {
         let mut snapshot = Snapshot::default();
         snapshot.directories.insert("/".to_string());
-        let statements = [
-            batch_read("SELECT lix_active_branch_id() AS branch_id"),
-            batch_read("SELECT lix_active_branch_commit_id() AS commit_id"),
-            batch_read("SELECT path FROM lix_directory ORDER BY path"),
-            batch_read("SELECT path, content FROM lix_file ORDER BY path"),
+        let statements: [(&str, &[Value]); 2] = [
+            ("SELECT path FROM lix_directory ORDER BY path", &[]),
+            ("SELECT path, content FROM lix_file ORDER BY path", &[]),
         ];
-        let results = self.lix.execute_batch(&statements).await?;
-        let [branch, commit, directories, files] =
-            results.try_into().map_err(|results: Vec<_>| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "coherent filesystem snapshot read returned {} result sets",
-                        results.len()
-                    ),
-                )
-            })?;
+        let batch = self.lix.execute_coherent_read_batch(&statements).await?;
+        let [directories, files] = batch.results.try_into().map_err(|results: Vec<_>| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "coherent filesystem snapshot read returned {} result sets",
+                    results.len()
+                ),
+            )
+        })?;
         for row in directories.rows() {
             snapshot.directories.insert(row.get::<String>("path")?);
         }
@@ -776,32 +751,19 @@ impl FilesystemState {
         Ok(LixSnapshotRead {
             snapshot,
             revision: LixRevision {
-                active_branch_id: branch.rows()[0].get::<String>("branch_id")?,
-                active_branch_commit_id: commit.rows()[0].get::<String>("commit_id")?,
-                storage_mutation_revision: None,
+                active_branch_id: batch.active_branch_id,
+                active_branch_commit_id: batch.active_branch_commit_id,
+                storage_mutation_revision: batch.storage_mutation_revision,
             },
         })
     }
 
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
-        let statements = [
-            batch_read("SELECT lix_active_branch_id() AS branch_id"),
-            batch_read("SELECT lix_active_branch_commit_id() AS commit_id"),
-        ];
-        let results = self.lix.execute_batch(&statements).await?;
-        let [branch, commit] = results.try_into().map_err(|results: Vec<_>| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "coherent filesystem revision read returned {} result sets",
-                    results.len()
-                ),
-            )
-        })?;
+        let batch = self.lix.execute_coherent_read_batch(&[]).await?;
         Ok(LixRevision {
-            active_branch_id: branch.rows()[0].get::<String>("branch_id")?,
-            active_branch_commit_id: commit.rows()[0].get::<String>("commit_id")?,
-            storage_mutation_revision: None,
+            active_branch_id: batch.active_branch_id,
+            active_branch_commit_id: batch.active_branch_commit_id,
+            storage_mutation_revision: batch.storage_mutation_revision,
         })
     }
 
@@ -2696,6 +2658,10 @@ mod tests {
         let path_filter = state.path_filter();
         let local = collect_local_snapshot(&state.layout, &path_filter).unwrap();
         let lix_revision = state.collect_lix_revision().await.unwrap();
+        assert!(
+            lix_revision.storage_mutation_revision.is_some(),
+            "idle synchronization needs a storage revision to skip a full file snapshot"
+        );
         assert!(
             state.is_last_materialized(&local, &lix_revision),
             "an unchanged filesystem should be recognized as already materialized"

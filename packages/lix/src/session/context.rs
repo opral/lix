@@ -151,7 +151,6 @@ impl SessionBranch {
 /// commit or rollback, so all SQL during that window must run through the
 /// transaction handle.
 #[derive(Clone)]
-#[expect(missing_debug_implementations)]
 pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) branch: SessionBranch,
     pub(super) active_account_id: Arc<str>,

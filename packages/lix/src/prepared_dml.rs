@@ -62,6 +62,7 @@ impl PreparedDmlParameterBatch {
 
     /// Returns and resets page executions and rows. This is an observability
     /// certificate for real production callers, not a routing switch.
+    #[allow(dead_code)]
     pub(crate) fn take_execution_counters() -> (u64, u64) {
         (
             PREPARED_DML_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed),

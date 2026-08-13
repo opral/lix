@@ -1,4 +1,8 @@
 #![recursion_limit = "256"]
+// The hard-cut Rust SDK keeps implementation-only subsystems available inside
+// the crate while intentionally no longer exporting them. Some are exercised
+// only by feature-gated integrations and maintenance tooling.
+#![cfg_attr(not(test), allow(dead_code, unused_imports))]
 
 //! Rust SDK for Lix.
 //!
@@ -155,10 +159,14 @@ pub use session::{
 pub use session::{
     ExecuteBatchStatement, ExecuteResult, ObserveEvent, ObserveEvents, Row, RowRef, TryFromValue,
 };
+#[doc(hidden)]
+pub use session::CoherentReadBatch;
 pub(crate) use session::{
     ExecuteIdempotency, ExecuteStatementMetadata, ExecutionDisposition, FileRead,
-    FileUploadProgress, VerifiedRequestBlob,
+    FileUploadProgress,
 };
+#[cfg(feature = "server-protocol")]
+pub(crate) use session::VerifiedRequestBlob;
 #[cfg(feature = "storage-benches")]
 pub(crate) use sql_profile::SqlReadProfile;
 pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
