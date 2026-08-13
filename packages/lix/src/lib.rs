@@ -71,6 +71,8 @@ mod handle;
 mod hot_index_aging_probe;
 #[cfg(test)]
 mod hot_row_tombstone_probe;
+#[cfg(test)]
+mod json_predicate_pushdown_probe;
 pub(crate) mod init;
 pub(crate) mod json_store;
 pub(crate) mod hot_state;

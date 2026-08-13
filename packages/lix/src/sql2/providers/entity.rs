@@ -2422,9 +2422,47 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
             EntityColumnType::String
             | EntityColumnType::Boolean
             | EntityColumnType::Integer
-            | EntityColumnType::Number => Some(column.name.as_str()),
-            EntityColumnType::Json => None,
+            | EntityColumnType::Number => {
+                #[cfg(any(test, feature = "storage-benches"))]
+                record_filterable_column(&self.spec.schema_key, column_name, true);
+                Some(column.name.as_str())
+            }
+            EntityColumnType::Json => {
+                #[cfg(any(test, feature = "storage-benches"))]
+                record_filterable_column(&self.spec.schema_key, column_name, false);
+                None
+            }
         }
+    }
+}
+
+/// Census of `filterable_column_name`, at the refusal itself.
+///
+/// Question being answered: how often does a real query shape ask to push a
+/// predicate on a JSON column? A counter cannot say *which* schema and column,
+/// and the shape is the whole point, so each decision is appended as one line
+/// and aggregated afterwards.
+///
+/// Inert unless `LIX_FILTERABLE_CENSUS` names a file, so it costs nothing in
+/// an ordinary test run and cannot perturb a timing measurement.
+///
+/// One `write_all` of a complete line, in append mode: short appends to the
+/// same fd from several threads and processes do not interleave on Linux, and
+/// the aggregate only needs line counts per key.
+#[cfg(any(test, feature = "storage-benches"))]
+fn record_filterable_column(schema_key: &str, column_name: &str, accepted: bool) {
+    use std::io::Write as _;
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var("LIX_FILTERABLE_CENSUS").ok())
+        .as_deref()
+    else {
+        return;
+    };
+    let verdict = if accepted { "accept" } else { "refuse_json" };
+    let line = format!("{verdict}\t{schema_key}\t{column_name}\n");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
