@@ -142,10 +142,14 @@ mod tests {
     use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions};
     use crate::{LixError, Value};
 
-    /// Checkpoints a fresh repository must accumulate before a sweep is due.
-    /// Mirrors `CHECKPOINT_GC_MIN_AGE` in `session::checkpoint`, which is
-    /// private to that module.
-    const CHECKPOINT_GC_MIN_AGE: usize = 64;
+    /// Checkpoints a fresh repository must accumulate before the staleness
+    /// backstop makes a sweep due. Mirrors `RECLAIM_MAX_STALENESS` in
+    /// `session::checkpoint`, which is private to that module.
+    ///
+    /// The yield ratio can make a sweep due *earlier* than this; the backstop
+    /// is the bound that holds when debt is sparse, which is the case these
+    /// fixtures build (empty padding checkpoints accrue no debt at all).
+    const RECLAIM_MAX_STALENESS: usize = 64;
 
     /// Checkpointed rounds of writes built before the repository is made
     /// legacy. Each round after the first contributes one interior commit the
@@ -187,6 +191,102 @@ mod tests {
             }
         }
         present
+    }
+
+
+    /// End-to-end engagement for the ratio trigger's two estimates.
+    ///
+    /// Both are produced by the sweep and written in its write set, so
+    /// asserting them off the returned plan is *not* an end-to-end check:
+    /// staging, preparing and committing all sit between the plan and
+    /// persistence. This reads them back out of committed storage, the same
+    /// bar the history-retention fix set for the un-latch.
+    #[tokio::test]
+    async fn reclaim_trigger_persists_its_estimates_to_committed_storage() {
+        let (_engine, session) = open().await;
+
+        for round in 0..ROUNDS {
+            for write in 0..WRITES_PER_ROUND {
+                session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
+                         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                        &[
+                            Value::Text(format!("gc-estimate-k{write}")),
+                            Value::Json(json!({ "round": round, "write": write }).into()),
+                        ],
+                    )
+                    .await
+                    .expect("write commits");
+            }
+            session
+                .create_checkpoint()
+                .await
+                .expect("round checkpoint succeeds");
+        }
+
+        async fn committed_state(
+            session: &SessionContext<Memory>,
+        ) -> crate::gc::CheckpointGcState {
+            let read = SharedStorageAdapterRead::new(
+                session
+                    .storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("gc state read opens"),
+            );
+            let state = load_checkpoint_gc_state(&read)
+                .await
+                .expect("checkpoint gc state loads");
+            drop(read);
+            state
+        }
+
+        // Non-vacuity: both estimates must start unset, or the assertions
+        // below could pass against a default-constructed state.
+        let before = committed_state(&session).await;
+        assert_eq!(
+            (before.live_manifest_estimate, before.yield_per_interval_estimate),
+            (0, 0),
+            "estimates must be unset before any sweep, or this proves nothing"
+        );
+
+        // Empty padding accrues no debt, so the staleness backstop is what
+        // makes this due -- deliberately the harder path for the estimates.
+        for _ in 0..RECLAIM_MAX_STALENESS {
+            session
+                .create_checkpoint()
+                .await
+                .expect("padding checkpoint succeeds");
+        }
+
+        let plan = session
+            .collect_checkpoint_garbage()
+            .await
+            .expect("the sweep must succeed")
+            .expect("the sweep must have been due, or nothing below is measured");
+        assert!(
+            plan.sweep.live_manifest_count > 0,
+            "the sweep must have scanned a real inventory to report one"
+        );
+
+        let after = committed_state(&session).await;
+        assert!(
+            after.last_gc_sequence > 0,
+            "`mark_collected` must have persisted, not merely been staged"
+        );
+        assert_eq!(
+            after.live_manifest_estimate, plan.sweep.live_manifest_count,
+            "the persisted inventory estimate must be exactly what the sweep observed"
+        );
+        assert_eq!(
+            after.consecutive_reclaim_failures, 0,
+            "a successful sweep must clear the failure damping"
+        );
+        assert!(
+            !checkpoint_gc_due(after).expect("due predicate evaluates"),
+            "a successful sweep must un-latch the trigger, not re-arm it"
+        );
     }
 
     /// Deletes one commit's physical delta the way the sweep that shipped
@@ -301,7 +401,7 @@ mod tests {
             .expect("the pre-fix reclaim stages and commits");
 
         // Cross the collection interval.
-        for _ in 0..CHECKPOINT_GC_MIN_AGE {
+        for _ in 0..RECLAIM_MAX_STALENESS {
             session
                 .create_checkpoint()
                 .await
