@@ -322,6 +322,7 @@ jobs:
   publish-js-sdk:
     name: Publish @lix-js/sdk packages
     runs-on: ubuntu-latest
+    environment: production
     needs:
       - release-version
       - build-js-sdk-native-packages

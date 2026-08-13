@@ -26,9 +26,46 @@ if (cargoPackage.version !== expectedVersion) {
 	);
 }
 
-execFileSync("cargo", ["package", "--locked", "-p", crateName], {
-	stdio: "inherit",
-});
+const workspacePackageNames = new Set(
+	metadata.packages.map((candidate) => candidate.name),
+);
+const waitsForLockstepDependency = cargoPackage.dependencies.some(
+	(dependency) =>
+		dependency.path !== null &&
+		workspacePackageNames.has(dependency.name) &&
+		dependency.req === `=${expectedVersion}`,
+);
+
+let packaged = false;
+const packageAttempts = waitsForLockstepDependency ? 36 : 1;
+for (let attempt = 1; attempt <= packageAttempts; attempt += 1) {
+	const packageResult = spawnSync(
+		"cargo",
+		["package", "--locked", "-p", crateName],
+		{ encoding: "utf8" },
+	);
+	if (packageResult.error) throw packageResult.error;
+	if (packageResult.status === 0) {
+		process.stdout.write(packageResult.stdout);
+		process.stderr.write(packageResult.stderr);
+		packaged = true;
+		break;
+	}
+
+	if (attempt === packageAttempts) {
+		process.stdout.write(packageResult.stdout);
+		process.stderr.write(packageResult.stderr);
+		throw new Error(
+			`cargo package failed for ${crateName}@${expectedVersion} with status ${packageResult.status}`,
+		);
+	}
+
+	console.warn(
+		`${crateName}@${expectedVersion} is not packageable through Cargo's registry index yet; retrying in 5 seconds (${attempt}/${packageAttempts})`,
+	);
+	await delay(5_000);
+}
+if (!packaged) throw new Error(`cargo package did not run for ${crateName}`);
 
 const cratePath = join(
 	metadata.target_directory,
