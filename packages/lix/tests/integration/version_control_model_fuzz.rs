@@ -46,12 +46,11 @@
 //! done   # every one of these must fail
 //! ```
 //!
-//! # Open finding
+//! # A defect this found
 //!
-//! [`assert_history_survived_gc`] documents a divergence this harness found on
-//! its first green run: a checkpoint GC sweep truncates entity history that
-//! `gc.rs` documents as load-bearing. `LIX_VC_MODEL_GC_HISTORY=strict` is the
-//! reproducer.
+//! On its first green run this harness found a checkpoint GC sweep truncating
+//! entity history that `gc.rs` documents as load-bearing. That is fixed;
+//! [`assert_history_survived_gc`] is now the guard, and asserts equality.
 
 use std::collections::BTreeMap;
 
@@ -763,42 +762,40 @@ async fn assert_history(session: &SimSession, prefix: &str, model: &BranchModel,
     assert_eq!(actual, expected, "{label}: history diverged from the model");
 }
 
-/// Asserts what a checkpoint GC sweep is allowed to do to observable history.
+/// Asserts that a checkpoint GC sweep does not change observable history.
 ///
-/// # The finding this encodes
+/// # The defect this now guards
 ///
-/// A sweep today truncates entity history: with six checkpointed rounds of
-/// writes followed by padding checkpoints, every key's history stays at six
-/// entries through 56 padding checkpoints and collapses to one at the padding
-/// checkpoint where the live commit count drops — that is, at the sweep. It is
-/// the sweep and not checkpoint compaction: compaction would truncate as
-/// checkpoints accumulate, and history is flat across all of them until the
-/// commit count falls.
+/// A sweep used to truncate entity history to the newest couple of
+/// checkpoints. `collect_ref_reachable_commit_ids` fed its result to the
+/// *semantic* retention only, so a graph-reachable commit kept its projection
+/// and lost its delta segments — and an entity history row is served out of the
+/// delta. `load_commit_delta_members_with_payloads_for_schemas` returns an
+/// empty member list for a commit whose replay state is gone, so the truncation
+/// raised no error: the swept commits read as commits that changed nothing.
+/// Current state was unaffected throughout, which is why nothing else caught
+/// it.
 ///
-/// `gc.rs::collect_ref_reachable_commit_ids` documents the opposite intent:
-/// *"a `_history()` query walks the commit graph, so a projection on that chain
-/// is load-bearing no matter how far below the serving checkpoint it sits."*
+/// Equality is the right assertion and not an over-strong one. A sweep frees
+/// the *unreachable* interior — the intra-interval commits the checkpoint
+/// superseded — and those never contributed a history entry, because the engine
+/// collapses an un-checkpointed interval into one commit. Nothing a sweep is
+/// entitled to collect is observable here, so any change at all is a defect.
 ///
-/// Until that is resolved — either as a bug fix or as a stated retention
-/// policy — this asserts the invariant that does hold and is still worth
-/// guarding: a sweep may drop the **oldest** history entries, but what remains
-/// must be an exact newest-first prefix of what was there before, and no key
-/// that still has state may lose its history entirely. That catches a sweep
-/// that returns wrong, reordered, or resurrected history, which is the failure
-/// mode a physical-layout break would produce.
-///
-/// `LIX_VC_MODEL_GC_HISTORY=strict` upgrades this to full equality, which is
-/// the reproducer for the finding above. It is not the default because the
-/// default must be a gate the tree can pass.
+/// `LIX_VC_MODEL_GC_HISTORY=prefix` weakens this back to the pre-fix invariant
+/// (what remains must be an exact newest-first prefix, and no key that still
+/// has state may lose its history entirely). That is retained as the inversion
+/// control: it is the assertion that passed while the defect was live, so a run
+/// under it must still pass, proving the strict form is what does the work.
 fn assert_history_survived_gc(
     before: &BTreeMap<String, Vec<Option<JsonValue>>>,
     after: &BTreeMap<String, Vec<Option<JsonValue>>>,
     label: &str,
 ) {
-    let strict = std::env::var("LIX_VC_MODEL_GC_HISTORY")
-        .map(|value| value.trim() == "strict")
+    let prefix_only = std::env::var("LIX_VC_MODEL_GC_HISTORY")
+        .map(|value| value.trim() == "prefix")
         .unwrap_or(false);
-    if strict {
+    if !prefix_only {
         assert_eq!(
             before, after,
             "{label}: checkpoint GC changed the observable history"

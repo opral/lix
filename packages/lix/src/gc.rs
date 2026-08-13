@@ -837,10 +837,24 @@ async fn load_authenticated_serving_dependency_closure<S>(
     chronology_roots: BTreeSet<CommitId>,
     serving_dependencies: BTreeSet<CommitId>,
     history_dependencies: BTreeSet<CommitId>,
-    // Commits reachable from the roots through canonical parent links. This
-    // retains the *semantic* plane only: the public history surfaces walk the
-    // commit graph, so their projections are load-bearing, while their physical
-    // delta segments are exactly what compaction is supposed to free.
+    // Commits reachable from the roots through canonical parent links.
+    //
+    // These retain **both** planes. It is tempting to retain only the semantic
+    // projection here and let the physical delta segments go, on the grounds
+    // that compaction is supposed to free them — that is what this code did,
+    // and it silently truncated entity history. An entity `_history()` row is
+    // served out of the per-commit delta, not out of the projection:
+    // `CommitGraphContext::change_history_from_commit` walks the graph and then
+    // calls `load_member_changes`, which reads
+    // `load_commit_delta_members_with_payloads_for_schemas`. That function
+    // returns an empty member list for a commit whose replay state is gone, so
+    // a commit whose delta was retired is indistinguishable from a commit that
+    // changed nothing, and the history rows disappear without an error.
+    //
+    // What compaction frees is the *unreachable* interior: an intra-interval
+    // commit stops being on the canonical parent chain once the checkpoint
+    // supersedes it, so it never enters this set and is still retired. The set
+    // retained here is the checkpoint chain, which compaction shortens.
     graph_reachable: BTreeSet<CommitId>,
 ) -> Result<AuthenticatedServingDependencyClosure, LixError>
 where
@@ -864,6 +878,7 @@ where
     physical_dependencies.extend(history_dependencies.iter().copied());
     let mut semantic_dependencies = serving_dependencies;
     semantic_dependencies.extend(history_dependencies.iter().copied());
+    physical_dependencies.extend(graph_reachable.iter().copied());
     semantic_dependencies.extend(graph_reachable);
     let mut cas_logical_dependencies = history_dependencies;
     let mut manifests = BTreeMap::new();
@@ -1086,8 +1101,12 @@ where
 /// links.
 ///
 /// This is the reachability the public history surfaces actually read: a
-/// `_history()` query walks the commit graph, so a projection on that chain is
-/// load-bearing no matter how far below the serving checkpoint it sits. The
+/// `_history()` query walks the commit graph, so a commit on that chain is
+/// load-bearing no matter how far below the serving checkpoint it sits — and
+/// load-bearing in **both** planes, because an entity history row is served out
+/// of the commit delta while only the commit metadata comes from the
+/// projection. Retaining the projection alone leaves the walk finding the
+/// commit and reading zero members from it, which is silent truncation. The
 /// ledger expressed the same retention by pinning every checkpoint commit it
 /// had ever seen, forever, in a row it could never consume. Walking refs states
 /// it directly, costs one commit-record read per reachable commit, and shrinks
