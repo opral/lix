@@ -11,6 +11,7 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::json_store::JsonSlot;
 use crate::tracked_state::codec::DecodedTrackedStateKeyShared;
+use crate::tracked_state::diff_id::encode_diff_id;
 use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef, TrackedStateTreeScanRequest,
 };
@@ -1202,7 +1203,6 @@ impl TrackedStateDiffEntry {
         self.visible_after().is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn visible_before(&self) -> Option<&TrackedStateDiffRow> {
         self.before.as_ref().filter(|row| !row.deleted)
     }
@@ -1210,6 +1210,29 @@ impl TrackedStateDiffEntry {
     #[cfg(test)]
     pub(crate) fn visible_after(&self) -> Option<&TrackedStateDiffRow> {
         self.after.as_ref().filter(|row| !row.deleted)
+    }
+
+    /// Stable `diff_id` for this entry.
+    ///
+    /// The before side is the **visible** before row, so a checkpointed delete
+    /// (which leaves a tombstone in the left root) encodes identically to an
+    /// identity that was never present. Both describe the same change — "this
+    /// row is not there, and now it is" — and every other consumer of the
+    /// before side already normalizes them: `classify_hot_working_diff_entry`
+    /// filters deleted before rows before choosing the kind, and the
+    /// apply/revert precondition treats `None` as "absent or tombstoned".
+    /// Encoding the raw tombstone here would make the id depend on whether a
+    /// tombstone happens to be retained, which is a storage-layer detail.
+    ///
+    /// The after side stays **raw** on purpose. A `Removed` entry's after row
+    /// *is* the tombstone, and merge relies on it to apply deletes without
+    /// reloading the source root. Do not "fix" this asymmetry — the two sides
+    /// answer different questions.
+    pub(crate) fn diff_id(&self) -> Result<String, LixError> {
+        encode_diff_id(
+            self.visible_before().map(|row| row.change_id),
+            self.after.as_ref().map(|row| row.change_id),
+        )
     }
 }
 
@@ -1255,6 +1278,128 @@ mod tests {
         crate::tracked_state::storage::stage_resealed_commit_state_manifest_for_test(
             writes, &manifest,
         )
+    }
+
+    /// A checkpointed delete leaves a tombstone in the left root, so the same
+    /// logical history ("this identity is not here, and now it is") reaches the
+    /// diff surface with either `before = None` or `before = Some(tombstone)`.
+    /// The `diff_id` must not be able to tell those apart, otherwise physically
+    /// compacting tombstones away would silently renumber every
+    /// delete-then-reinsert diff.
+    #[test]
+    fn diff_id_is_blind_to_a_tombstoned_before_row() {
+        let created_at = ts("2024-01-01T00:00:00.000Z");
+        let updated_at = ts("2024-01-02T00:00:00.000Z");
+        let after_change_id = ChangeId::for_test_label("reinserted-after");
+        let commit_id = CommitId::for_test_label("diff-id-commit");
+        let key = || DecodedTrackedStateKeyShared {
+            schema_key: SharedStr::from_static("test_schema"),
+            file_id: None,
+            entity_pk: EntityPk::single("entity-0"),
+        };
+        let value = |change_id: ChangeId, deleted: bool| TrackedStateIndexValue {
+            change_id,
+            commit_id,
+            deleted,
+            created_at,
+            updated_at,
+        };
+        let after = value(after_change_id, false);
+
+        let entry = |before: Option<TrackedStateIndexValue>| {
+            let mut batch = TrackedStateTreeDiffBatchBuilder::with_row_capacity(1);
+            batch.push_shared(key(), before, Some(after));
+            let batch = batch.finish().expect("tree batch should seal");
+            classify_tree_diff_batch(batch, &TrackedStatePayloadBatch::default())
+                .expect("rows should classify")
+                .pop()
+                .expect("one entry")
+        };
+
+        let never_present = entry(None);
+        let tombstoned =
+            entry(Some(value(ChangeId::for_test_label("checkpointed-delete"), true)));
+
+        // The fixture is only meaningful if the tombstone actually survives on
+        // the entry — otherwise this would pass vacuously against a before-image
+        // that was already dropped upstream.
+        assert!(
+            tombstoned
+                .before
+                .as_ref()
+                .is_some_and(|row| row.deleted),
+            "fixture must carry a tombstoned before row"
+        );
+        assert!(never_present.before.is_none());
+        assert_eq!(never_present.kind, TrackedStateDiffKind::Added);
+        assert_eq!(tombstoned.kind, TrackedStateDiffKind::Added);
+
+        assert_eq!(
+            tombstoned.diff_id().expect("tombstoned diff id"),
+            never_present.diff_id().expect("absent diff id"),
+            "a retained tombstone must not change the diff_id"
+        );
+
+        // Guard the other direction: normalization must not swallow a *live*
+        // before row, which is a genuinely different change.
+        let modified = entry(Some(value(
+            ChangeId::for_test_label("live-before"),
+            false,
+        )));
+        assert_eq!(modified.kind, TrackedStateDiffKind::Modified);
+        assert_ne!(
+            modified.diff_id().expect("modified diff id"),
+            never_present.diff_id().expect("absent diff id"),
+            "a live before row must still contribute to the diff_id"
+        );
+    }
+
+    /// The after side must stay raw: a `Removed` entry's after row *is* the
+    /// tombstone, and merge relies on it. If normalization ever leaks across to
+    /// `after`, every delete would encode as a sideless diff and fail to encode
+    /// at all.
+    #[test]
+    fn diff_id_keeps_a_tombstoned_after_row() {
+        let created_at = ts("2024-01-01T00:00:00.000Z");
+        let updated_at = ts("2024-01-02T00:00:00.000Z");
+        let commit_id = CommitId::for_test_label("diff-id-commit");
+        let mut batch = TrackedStateTreeDiffBatchBuilder::with_row_capacity(1);
+        batch.push_shared(
+            DecodedTrackedStateKeyShared {
+                schema_key: SharedStr::from_static("test_schema"),
+                file_id: None,
+                entity_pk: EntityPk::single("entity-0"),
+            },
+            Some(TrackedStateIndexValue {
+                change_id: ChangeId::for_test_label("live-before"),
+                commit_id,
+                deleted: false,
+                created_at,
+                updated_at,
+            }),
+            Some(TrackedStateIndexValue {
+                change_id: ChangeId::for_test_label("delete-after"),
+                commit_id,
+                deleted: true,
+                created_at,
+                updated_at,
+            }),
+        );
+        let batch = batch.finish().expect("tree batch should seal");
+        let entry = classify_tree_diff_batch(batch, &TrackedStatePayloadBatch::default())
+            .expect("rows should classify")
+            .pop()
+            .expect("one entry");
+        assert_eq!(entry.kind, TrackedStateDiffKind::Removed);
+        assert!(entry.after.as_ref().is_some_and(|row| row.deleted));
+        let sides = crate::tracked_state::decode_diff_id(&entry.diff_id().expect("removed diff id"))
+            .expect("removed diff id should decode");
+        assert_eq!(
+            sides.after,
+            Some(ChangeId::for_test_label("delete-after")),
+            "the after tombstone must survive into the diff_id"
+        );
+        assert_eq!(sides.before, Some(ChangeId::for_test_label("live-before")));
     }
 
     #[test]

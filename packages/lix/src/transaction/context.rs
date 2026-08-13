@@ -8102,10 +8102,7 @@ where
             entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
                 && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
         }) {
-            let diff_id = crate::tracked_state::encode_diff_id(
-                entry.before.as_ref().map(|row| row.change_id),
-                entry.after.as_ref().map(|row| row.change_id),
-            )?;
+            let diff_id = entry.diff_id()?;
             let target = entry.after.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
