@@ -5309,6 +5309,7 @@ mod tests {
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
         let commits = [
             CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: source_commit,
                 generation: 0,
@@ -5319,6 +5320,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: alias_commit,
                 generation: 0,
@@ -5329,6 +5331,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: authority_commit,
                 generation: 0,
@@ -5339,6 +5342,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: live_head,
                 generation: 1,
@@ -5556,6 +5560,7 @@ mod tests {
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
         let commits = vec![
             CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: live_parent,
                 generation: 0,
@@ -5566,6 +5571,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: live_head,
                 generation: 1,
@@ -5576,6 +5582,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: dead_commit,
                 generation: 0,
@@ -5875,6 +5882,7 @@ mod tests {
     fn gc_authority_record(label: &str) -> CommitRecord {
         let commit_id = CommitId::for_test_label(label);
         CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
             generation: 0,
@@ -5900,6 +5908,7 @@ mod tests {
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             parent.map_or((commit_id, 0), |parent| (parent, 1));
         CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
             generation,

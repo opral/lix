@@ -1077,6 +1077,7 @@ mod tests {
             }
             Ok(Arc::from([ReachableCommitGraphNode {
                 commit: CommitGraphNode {
+                    touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     commit_id: self.start_commit_id,
                     change_id: ChangeId::for_test_label("commit-change"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
@@ -1099,6 +1100,7 @@ mod tests {
                 .include_reachable_commit
                 .then(|| ReachableCommitGraphNode {
                     commit: CommitGraphNode {
+                        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                         commit_id: self.start_commit_id,
                         change_id: ChangeId::for_test_label("commit-change"),
                         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),

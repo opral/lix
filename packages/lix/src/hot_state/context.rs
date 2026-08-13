@@ -2899,6 +2899,7 @@ mod tests {
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
             let record = crate::changelog::CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: CommitId::for_test_label(&commit_id_text),
                 generation: 0,
@@ -3137,6 +3138,7 @@ mod tests {
                 .copied()
                 .map_or((commit_id, 0), |parent| (parent, 1));
             append.commits.push(crate::changelog::CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id,
                 generation,
@@ -3315,6 +3317,7 @@ mod tests {
                 .map(|id| CommitId::for_test_label(id))
                 .collect::<Vec<_>>();
             let record = crate::changelog::CommitRecord {
+                touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 commit_id: CommitId::for_test_label(&commit_id),
                 generation,

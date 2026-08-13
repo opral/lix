@@ -811,6 +811,81 @@ pub(crate) fn commit_state_inventory_exact_local_touched_scopes(
     Ok(Some(scopes.into_iter().collect()))
 }
 
+/// Returns the exact collection scopes this commit's delta has **members** in.
+///
+/// This is deliberately a different question from
+/// [`commit_state_inventory_exact_touched_scopes`], which fails closed on file
+/// descriptors because an *implicit cascade* changes the current state of rows
+/// that are not members of this delta. History only ever reports members, so a
+/// row that this commit did not physically carry cannot produce a history entry
+/// and must not force the scope set to be discarded.
+///
+/// `None` means the member scopes are not enumerable from the inventory alone
+/// and no absence may be proven:
+///
+/// * a selected source supplies members from another commit's delta, and
+/// * a part whose first and last key straddle two scopes may contain members in
+///   scopes neither bound names.
+pub(crate) fn commit_delta_member_scopes(
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<Option<Vec<crate::changelog::CommitScopeKey>>, LixError> {
+    if inventory.selected_source_commit_id.is_some() {
+        return Ok(None);
+    }
+    if inventory.member_count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if let Some(parts) = inventory.columnar_parts.as_ref() {
+        let scope = CommitDeltaReplacementScope {
+            schema_key: parts.schema_key.clone(),
+            file_id: None,
+        };
+        if inventory.single_partition.as_ref() != Some(&scope) {
+            return Ok(None);
+        }
+        return Ok(Some(vec![member_scope(scope)]));
+    }
+    if !inventory.replacement_part_digests.is_empty() {
+        return Ok(inventory
+            .single_partition
+            .clone()
+            .map(|scope| vec![member_scope(scope)]));
+    }
+
+    let mut scopes = BTreeSet::new();
+    for part in &inventory.parts {
+        let first = decode_key(&part.first_key)?;
+        let last = decode_key(&part.last_key)?;
+        if first.schema_key != last.schema_key || first.file_id != last.file_id {
+            return Ok(None);
+        }
+        scopes.insert(CommitDeltaReplacementScope {
+            schema_key: first.schema_key,
+            file_id: first.file_id,
+        });
+    }
+    if !inventory.inline_part.is_empty() {
+        let leaf = decode_commit_delta_segment(&inventory.inline_part, None, commit_id)?;
+        visit_commit_delta_leaf(&leaf, commit_id, |_, encoded_key, _| {
+            let key = decode_key(encoded_key)?;
+            scopes.insert(CommitDeltaReplacementScope {
+                schema_key: key.schema_key,
+                file_id: key.file_id,
+            });
+            Ok(())
+        })?;
+    }
+    Ok(Some(scopes.into_iter().map(member_scope).collect()))
+}
+
+fn member_scope(scope: CommitDeltaReplacementScope) -> crate::changelog::CommitScopeKey {
+    crate::changelog::CommitScopeKey {
+        schema_key: scope.schema_key,
+        file_id: scope.file_id,
+    }
+}
+
 async fn expanded_commit_delta_manifest_from_commit_state(
     store: &(impl StorageAdapterRead + ?Sized),
     manifest: &CommitStateManifest,
@@ -13973,6 +14048,7 @@ mod tests {
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
         let record = CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 3,
             commit_id,
             generation: 0,

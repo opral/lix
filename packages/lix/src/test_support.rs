@@ -707,6 +707,7 @@ async fn stage_test_changelog_commit(
         .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
         .unwrap_or_else(test_timestamp);
     let record = CommitRecord {
+        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
         format_version: 4,
         commit_id: typed_commit_id,
         generation,

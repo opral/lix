@@ -119,6 +119,7 @@ where
                     first_parent_jump_commit_id: record.first_parent_jump_commit_id,
                     first_parent_jump_span: record.first_parent_jump_span,
                     created_at: record.created_at,
+                    touched_scope_digest: record.touched_scope_digest,
                 },
             );
         }

@@ -136,6 +136,7 @@ mod tests {
         let commit_id = CommitId::for_test_label("codec-segment-commit");
         let base_commit_id = CommitId::for_test_label("codec-segment-base");
         let record = CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
             generation: 70,
