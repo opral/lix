@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 pub(crate) struct ProjectionRow {
     /// Scope digest already proved absence — no delta load.
     pub(crate) pruned_scope: u64,
@@ -35,6 +35,14 @@ pub(crate) struct ProjectionRow {
     pub(crate) members_loaded: u64,
     /// Distinct entity pks seen across those members (per commit, summed).
     pub(crate) distinct_entities_loaded: u64,
+    /// Members of the loaded deltas keyed by `schema_key/file_id_present`.
+    ///
+    /// Decides whether the *existing* `(schema_key, file_id)` scope token could
+    /// have served this projection had the route pinned `file_ids` — i.e.
+    /// whether a per-entity artifact is needed at all.
+    pub(crate) members_by_schema: BTreeMap<String, u64>,
+    /// Loaded commits carrying at least one member of the given schema key.
+    pub(crate) commits_with_schema: BTreeMap<String, u64>,
 }
 
 type Table = BTreeMap<String, ProjectionRow>;
@@ -149,6 +157,28 @@ pub(crate) fn drain_and_print(tag: &str) {
             row.unconstrained,
             row.members_loaded,
             row.distinct_entities_loaded,
+        );
+        let mut members = row
+            .members_by_schema
+            .iter()
+            .map(|(key, count)| format!("{key}={count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if members.is_empty() {
+            members.push_str("<none>");
+        }
+        let mut commits = row
+            .commits_with_schema
+            .iter()
+            .map(|(key, count)| format!("{key}={count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if commits.is_empty() {
+            commits.push_str("<none>");
+        }
+        eprintln!(
+            "expek_members tag={tag} projection={projection} members_by_schema[{members}] \
+             commits_with_schema[{commits}]"
         );
     }
 }

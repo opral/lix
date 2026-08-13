@@ -586,6 +586,19 @@ where
                 .map(|change| (&change.schema_key, &change.entity_pk))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len() as u64;
+            let mut by_schema = std::collections::BTreeMap::<String, u64>::new();
+            for change in &members {
+                let bucket = format!(
+                    "{}/{}",
+                    change.schema_key,
+                    if change.file_id.is_some() {
+                        "file_id"
+                    } else {
+                        "null_file_id"
+                    }
+                );
+                *by_schema.entry(bucket).or_default() += 1;
+            }
             crate::commit_graph::expek_probe::with_row(&shaping.member_schema_keys, |row| {
                 row.loaded += 1;
                 row.members_loaded += members.len() as u64;
@@ -596,6 +609,10 @@ where
                     row.loaded_entity_present += 1;
                 } else {
                     row.loaded_entity_absent += 1;
+                }
+                for (bucket, count) in &by_schema {
+                    *row.members_by_schema.entry(bucket.clone()).or_default() += count;
+                    *row.commits_with_schema.entry(bucket.clone()).or_default() += 1;
                 }
             });
         }
