@@ -6298,6 +6298,181 @@ mod tests {
         );
     }
 
+    /// Number of content commits on a file the depth-bounded query never asks
+    /// about.
+    const DEPTH_BOUNDED_CONTEXT_NOISE_COMMITS: u64 = 12;
+
+    /// Depth-bounded file history by path: engagement, then the answer.
+    ///
+    /// `HistoryRoute::anchors_only` drops the depth bounds by construction, so
+    /// a depth predicate is the **only** shape in which the event route and the
+    /// context route differ — and therefore the only shape that loads context
+    /// descriptors separately at all. Every other file-history test in this
+    /// suite compares the two routes equal and takes the reuse branch, so
+    /// without this test the separate context load is never executed and a
+    /// regression in it would gate green.
+    ///
+    /// The census is thread-local and counts inside
+    /// `load_file_history_filesystem_context` itself, one layer below the SQL
+    /// surface, and asserts a hit *and* a miss: the depth-bounded read must take
+    /// the separate load, the unbounded read must take the reuse branch.
+    ///
+    /// The oracle is the unfiltered read. A `lix_file_history` query with no
+    /// `id`/`path` predicate resolves no lookup IDs and never builds either
+    /// pinned route, so it is the answer a completely unpruned traversal
+    /// produces; the depth-bounded path answer must equal it restricted to the
+    /// same path and depth.
+    #[tokio::test]
+    async fn depth_bounded_file_history_by_path_matches_the_unfiltered_answer() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        for statement in [
+            "INSERT INTO lix_file (id, path, content) \
+             VALUES ('01920000-0000-7000-8000-0000000000d1', '/docs/moved.md', CAST('m0' AS BYTEA))",
+            "UPDATE lix_file SET content = CAST('m1' AS BYTEA) WHERE path = '/docs/moved.md'",
+            // A rename: the descriptor changes without any content change, and
+            // it is the shape the context descriptors exist to resolve.
+            "UPDATE lix_file SET path = '/docs/moved-again.md' WHERE path = '/docs/moved.md'",
+            "UPDATE lix_file SET content = CAST('m2' AS BYTEA) WHERE path = '/docs/moved-again.md'",
+            "INSERT INTO lix_file (id, path, content) \
+             VALUES ('01920000-0000-7000-8000-0000000000d2', '/docs/noise2.md', CAST('n0' AS BYTEA))",
+        ] {
+            session
+                .execute(statement, &[])
+                .await
+                .unwrap_or_else(|error| panic!("fixture statement failed: {statement}: {error}"));
+        }
+        for revision in 0..DEPTH_BOUNDED_CONTEXT_NOISE_COMMITS {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = CAST('n{revision}' AS BYTEA) \
+                         WHERE id = '01920000-0000-7000-8000-0000000000d2'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("noise commit should apply");
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let projection = format!(
+            "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
+             FROM lix_file_history('{head_commit_id}')"
+        );
+        let key = |row: &Vec<Value>| format!("{row:?}");
+        let unfiltered = rows_from_execute_result(
+            session
+                .execute(&projection, &[])
+                .await
+                .expect("unfiltered history should execute"),
+        )
+        .1;
+        assert!(
+            !unfiltered.is_empty(),
+            "the unfiltered oracle must produce rows"
+        );
+
+        // Miss: no depth predicate, so the routes compare equal and the context
+        // descriptors are reused from the event set.
+        crate::sql2::providers::reset_file_history_context_census();
+        let _ = session
+            .execute(
+                &format!("{projection} WHERE path = '/docs/moved-again.md'"),
+                &[],
+            )
+            .await
+            .expect("unbounded path history should execute");
+        let (loads, reuses) = crate::sql2::providers::file_history_context_census();
+        assert_eq!(
+            (loads, reuses),
+            (0, 1),
+            "a depth-unbounded path read must reuse the event descriptors"
+        );
+
+        // The depths this path actually has rows at, plus depth 0, which the
+        // noise commits made empty for it -- an empty answer that must stay
+        // empty is the negative case of the same comparison.
+        let mut probe_depths = unfiltered
+            .iter()
+            .filter(|row| row[1] == Value::Text("/docs/moved-again.md".to_string()))
+            .filter_map(|row| match row[2] {
+                Value::Integer(depth) => Some(depth),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            probe_depths.len() >= 2,
+            "the fixture must put rows for this path at more than one depth, or \
+             the comparison is vacuous: {probe_depths:?}"
+        );
+        probe_depths.insert(0);
+
+        let mut covered_depths = 0_usize;
+        for depth in probe_depths {
+            let expected: BTreeSet<String> = unfiltered
+                .iter()
+                .filter(|row| {
+                    row[1] == Value::Text("/docs/moved-again.md".to_string())
+                        && row[2] == Value::Integer(depth)
+                })
+                .map(key)
+                .collect();
+
+            // Hit: the depth predicate makes the event route and the anchor
+            // route differ, which is the only shape that loads the context
+            // descriptors separately.
+            crate::sql2::providers::reset_file_history_context_census();
+            let actual: BTreeSet<String> = rows_from_execute_result(
+                session
+                    .execute(
+                        &format!(
+                            "{projection} WHERE path = '/docs/moved-again.md' \
+                             AND lixcol_depth = {depth}"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("depth-bounded path history should execute"),
+            )
+            .1
+            .iter()
+            .map(key)
+            .collect();
+            let (loads, reuses) = crate::sql2::providers::file_history_context_census();
+            assert_eq!(
+                (loads, reuses),
+                (1, 0),
+                "a depth-bounded path read must load the context descriptors separately"
+            );
+
+            assert_eq!(
+                expected, actual,
+                "the depth-bounded answer at depth {depth} must equal the \
+                 unfiltered oracle restricted to the same path and depth"
+            );
+            if !expected.is_empty() {
+                covered_depths += 1;
+            }
+        }
+        assert!(
+            covered_depths >= 2,
+            "the non-empty depths must have been compared, not skipped"
+        );
+    }
+
     #[tokio::test]
     async fn execute_sql_rejects_writes_to_history_views_before_planning() {
         for sql in [
