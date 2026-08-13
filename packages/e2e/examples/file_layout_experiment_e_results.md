@@ -14,15 +14,17 @@ the production-layout control.
 
 ## Layouts
 
-- Current: JSON file-descriptor and BlobRef rows plus the shipping manifest,
-  manifest-chunk, and chunk spaces.
+- Current comparator: JSON file-descriptor and BlobRef rows plus the shipping
+  manifest, manifest-chunk, and chunk spaces. This is measured legacy state,
+  not an accepted representation in the candidate.
 - E1: native typed metadata and an authenticated chunk descriptor embedded in
   the row. Payload bytes remain external content-addressed chunks.
-- E2: native typed metadata and a fixed 32-byte pointer to an independently
-  authenticated, shared descriptor object. Payload bytes remain external
-  content-addressed chunks.
-- E3: payload bytes embedded in the typed row below a threshold. This is
-  rejected because it amplifies copy-on-write carrier pages.
+- E2: native typed metadata and a fixed descriptor ID/length cell pointing to
+  an independently authenticated, shared descriptor object. Payload bytes
+  remain external content-addressed chunks.
+- Selected: the canonical tagged E1/E2 union below. The earlier E3 row-inline
+  payload experiment is rejected because it amplifies copy-on-write carrier
+  pages; its decoder tag is now explicitly forbidden.
 
 All E encodings are canonical binary values and every descriptor/chunk read is
 BLAKE3-256 authenticated. There is no raw-hash read, fallback decoder, second
@@ -35,26 +37,35 @@ Use one explicit canonical descriptor union:
 ```text
 ContentDescriptorV1 =
   Inline { descriptor_id: ObjectId, bytes: <= 128 bytes }
-  External { descriptor_id: ObjectId }
+  External { descriptor_id: ObjectId, canonical_len: u32 (> 128) }
 ```
 
 The tag is decoded directly; readers never probe another representation. The
 descriptor ID authenticates the same canonical descriptor bytes in both cases
 and can be retained independently by history. Payload bytes are never stored
-in the typed row.
+in the typed row. File metadata is decomposed into native scalar columns; this
+typed binary descriptor cell is not JSON/JSONB. JSONB remains available only
+when it is the user's declared metadata-column type.
+
+Codec validation rejects an 80-byte descriptor encoded as `External`, a
+152-byte descriptor encoded as `Inline`, a mismatched inline descriptor ID,
+and the retired row-inline payload tag. External reads authenticate both the
+descriptor ID and declared canonical length before decoding chunk references;
+there is no representation probe or fallback.
 
 The 128-byte boundary is based only on immutable encoded descriptor size. With
 the current CDC policy it admits at most three `(length, chunk_id)` entries:
-`4 + 36*N <= 128`. Measured base descriptors were 76 bytes at 1 MiB, 148 bytes
-at 4 MiB, 472 bytes at 16 MiB, and 1,840 bytes at 64 MiB.
+`8 + 36*N <= 128`. Measured base descriptors were 80 bytes at 1 MiB, 152 bytes
+at 4 MiB, 476 bytes at 16 MiB, and 1,844 bytes at 64 MiB. (The earlier report
+omitted the canonical four-byte reference-count field from these figures.)
 
 Sensitivity:
 
 - one retained row: E1 avoids the external-object overhead;
-- five retained rows: E2 reaches physical parity around the 4 MiB/148-byte
+- five retained rows: E2 reaches physical parity around the 4 MiB/152-byte
   descriptor and wins clearly by 16 MiB;
 - 64 shared references: E2 wins at 4 MiB on RocksDB and by 16 MiB on both
-  adapters, while its fixed row pointer avoids about 2.26 MiB of modeled
+  adapters, while its fixed row descriptor cell avoids about 2.26 MiB of modeled
   64-row carrier rewrites at 16 MiB.
 
 At 1 KiB on SlateDB, E1 used about 16.9 KiB settled versus 32.1 KiB for the
@@ -91,3 +102,44 @@ history/branch amplification rather than a claim of broad latency gains.
 - exact-main 256 MiB current layout: SHA-256
   `95e02fece812f72ce408a7b7a86c2195e2637d0d4cd6e48f348680394e6cffc4`
 
+## Pinned PostgreSQL-schema-v1 rebind
+
+The model/codec candidate was rebound without following a branch name to
+commit `2cf539744e7864f79bf1994e002f47cfd3281dc0`, tree
+`89a6e9a0623483268cb7841f757446c5e29559dd`. Its public canonical scalar
+types are `text`, `uuid`, `int8`, `float8`, `boolean`, `jsonb`, and
+`timestamptz`. File identity/path/size metadata therefore remains native scalar
+columns. `ContentDescriptorV1` is a typed binary cell; it is not JSONB.
+
+The final model codec uses one tag and the same canonical descriptor content
+ID for both classes. The inline tag carries the ID and descriptor bytes; the
+external tag carries the ID and canonical length and resolves exactly that
+content-addressed object. Unit gates are 3/3 green for the 128-byte class,
+noncanonical tags, and content-ID substitution.
+
+Required representative cells are green, including chunk corruption rejection
+and cold reopen:
+
+- 1 MiB / 80-byte inline descriptor, RocksDB and SlateDB, no shared copies:
+  log SHA-256
+  `6dfa76d10ebe43299e7ab32a95ddd596fa526eb3d22ccc4a357b53b2fb267e56`.
+  After GC the selected layout has zero external descriptor objects and zero
+  row-inline payload bytes.
+- 16 MiB / 548-byte external descriptor, RocksDB and SlateDB, 64 additional
+  shared references (67 retained rows after version operations): log SHA-256
+  `84aa8af744f26c8f7a1f571f583d0cfb07d1495643d10007bd71cce9bb8bd4a6`.
+  After GC both adapters retain one 548-byte authenticated descriptor object,
+  15 unique chunks, and 67x logical sharing; row-inline payload bytes remain
+  zero.
+- release benchmark binary SHA-256
+  `ff65acc9b3177b6dabc90ef5e4c5814873a8762abd3701284f3d5e3a7eae07c2`.
+
+This child changes only benchmark/report paths. The cells above qualify the
+format model and real RocksDB/SlateDB storage behavior; they do **not** prove
+that public `lix_file` SQL currently exercises this carrier. A baseline public
+test target compiled, but the exact attempted filter selected zero tests; a
+second legacy plugin-runtime file test fails in an inherited fixture while
+reading plugin schema metadata. Neither result is claimed as E1/E2 public-path
+coverage. Production cutover still requires replacing the current file-row
+content reference with this tagged binary cell as the sole authority, followed
+by public SQL, corruption, GC, and reopen qualification.
