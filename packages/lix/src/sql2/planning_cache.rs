@@ -323,11 +323,7 @@ where
                     // for a foreign schema provider reaching the pool.
                     for table in public.table_names() {
                         let _ = session.context.deregister_table(
-                            datafusion::common::TableReference::full(
-                                "datafusion",
-                                "public",
-                                table,
-                            ),
+                            datafusion::common::TableReference::full("datafusion", "public", table),
                         );
                     }
                 }

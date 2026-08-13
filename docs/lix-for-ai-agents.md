@@ -39,30 +39,15 @@ if (preview.conflicts.length === 0) {
 }
 ```
 
-## Local file workspace
+## Local file repository
 
-Use `LocalFilesystem` when the agent works with files on disk:
+Use `LocalFilesystem` when the agent works with files on disk. See
+[Persistence and Storage](./persistence.md#local-filesystem) for setup.
 
-```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
+## Hosted repository
 
-const lix = await openLix({
-  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
-});
-```
-
-## Hosted workspace
-
-Use remote mode when the workspace runs on a server:
-
-```ts
-const lix = await openLix({
-  server: {
-    mode: "remote",
-    url: "https://example.com/workspaces/acme",
-  },
-});
-```
+Use remote mode when the repository runs on a server. See
+[Persistence and Storage](./persistence.md#remote-server) for setup.
 
 ## Why branches matter
 
@@ -84,7 +69,7 @@ ORDER BY id;
 
 Pass the task branch id as `$1`. Note that `<schema>_history()` anchors to the active branch head, so run from main it does not show the agent's unmerged work.
 
-Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole workspace. It is not limited to the active branch.
+Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole repository. It is not limited to the active branch.
 
 ## Conflicts
 

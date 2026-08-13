@@ -11,7 +11,7 @@ use crate::{Blob, LixError, Value};
 /// backing arcs, so callers can retain a reusable batch without retaining one
 /// allocation per parameter row.
 #[derive(Clone, Debug)]
-pub struct PreparedDmlParameterBatch {
+pub(crate) struct PreparedDmlParameterBatch {
     row_count: usize,
     column_count: usize,
     cells: Arc<[PreparedDmlCell]>,
@@ -44,7 +44,7 @@ struct PreparedDmlCell {
 
 /// A borrowed value view into a [`PreparedDmlParameterBatch`].
 #[derive(Clone, Copy, Debug)]
-pub enum PreparedDmlValueRef<'a> {
+pub(crate) enum PreparedDmlValueRef<'a> {
     Null,
     Boolean(bool),
     Integer(i64),
@@ -62,7 +62,7 @@ impl PreparedDmlParameterBatch {
 
     /// Returns and resets page executions and rows. This is an observability
     /// certificate for real production callers, not a routing switch.
-    pub fn take_execution_counters() -> (u64, u64) {
+    pub(crate) fn take_execution_counters() -> (u64, u64) {
         (
             PREPARED_DML_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed),
             PREPARED_DML_BATCH_ROWS.swap(0, Ordering::Relaxed),
@@ -70,7 +70,7 @@ impl PreparedDmlParameterBatch {
     }
 
     /// Packs owned parameter rows into one compact arena.
-    pub fn from_rows(rows: impl IntoIterator<Item = Vec<Value>>) -> Result<Self, LixError> {
+    pub(crate) fn from_rows(rows: impl IntoIterator<Item = Vec<Value>>) -> Result<Self, LixError> {
         let mut row_count = 0usize;
         let mut column_count = None;
         let mut cells = Vec::new();
@@ -101,20 +101,24 @@ impl PreparedDmlParameterBatch {
         })
     }
 
-    pub fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
         self.row_count
     }
 
-    pub fn column_count(&self) -> usize {
+    pub(crate) fn column_count(&self) -> usize {
         self.column_count
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.row_count == 0
     }
 
     /// Returns a borrowed cell view with fail-closed bounds and encoding checks.
-    pub fn get(&self, row: usize, column: usize) -> Result<PreparedDmlValueRef<'_>, LixError> {
+    pub(crate) fn get(
+        &self,
+        row: usize,
+        column: usize,
+    ) -> Result<PreparedDmlValueRef<'_>, LixError> {
         if row >= self.row_count || column >= self.column_count {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -172,7 +176,7 @@ impl PreparedDmlParameterBatch {
     /// Materializes one row for certified generic write paths. This is
     /// bounded to one row and never recreates the public row-Arc ownership
     /// model.
-    pub fn row_values(&self, row: usize) -> Result<Vec<Value>, LixError> {
+    pub(crate) fn row_values(&self, row: usize) -> Result<Vec<Value>, LixError> {
         if row >= self.row_count {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,

@@ -23,13 +23,13 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
-use crate::json_store::{
-    JSON_INLINE_MAX_BYTES, JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
-};
 use crate::hot_state::{
-    HotTrackedSnapshot, HotStateContext, HotStateRowRequest, MaterializedHotStateRow,
+    HotStateContext, HotStateRowRequest, HotTrackedSnapshot, MaterializedHotStateRow,
     TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
+};
+use crate::json_store::{
+    JSON_INLINE_MAX_BYTES, JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 #[cfg(test)]
@@ -309,7 +309,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     // account row in this commit). Both cases rotate the token; ordinary CRUD
     // does not, which is the whole point.
     let account_view_changed = prepared_writes.state_rows.iter().any(|row| {
-        matches!(row.schema_key.as_str(), ACCOUNT_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY)
+        matches!(
+            row.schema_key.as_str(),
+            ACCOUNT_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY
+        )
     }) || prepared_writes
         .commit_change_refs_by_branch
         .values()
@@ -1978,7 +1981,10 @@ fn hot_index_writes_for_commit(
     state_rows: &PreparedStateBatch,
     branch_id: &str,
     parent_control: Option<&BranchHeadControl>,
-) -> (Vec<crate::hot_state::HotIndexEntry>, BTreeSet<(String, u16)>) {
+) -> (
+    Vec<crate::hot_state::HotIndexEntry>,
+    BTreeSet<(String, u16)>,
+) {
     let staged = state_rows.staged_index_values();
     let mut entries = Vec::new();
     let mut witnesses = staged.registered_collections.clone();
@@ -5025,8 +5031,7 @@ async fn stage_root_backed_branch_publication(
     let generation = match reused_generation {
         Some(generation) => generation,
         None => {
-            let generation =
-                lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
+            let generation = lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
             tracked_head.writer(read, writes).stage_root_current_base(
                 branch_id,
                 generation,
@@ -5285,7 +5290,8 @@ async fn stage_branch_head_control_publications(
                 crate::hot_state::stage_retire_hot_generation(read, writes, branch_id, generation)
                     .await?;
             }
-            if desired.is_none_or(|new_control| new_control.ref_change_id != old_control.ref_change_id)
+            if desired
+                .is_none_or(|new_control| new_control.ref_change_id != old_control.ref_change_id)
             {
                 crate::changelog::stage_delete_standalone_change(
                     read,
@@ -5302,10 +5308,8 @@ async fn stage_branch_head_control_publications(
                 crate::gc::stage_delete_recovery_ref(writes, branch_id)?;
                 // A deleted branch must not keep its derived plugin-checkpoint
                 // prefix alive; a recreated branch republishes it.
-                crate::transaction::stage_delete_branch_plugin_checkpoints(
-                    read, writes, branch_id,
-                )
-                .await?;
+                crate::transaction::stage_delete_branch_plugin_checkpoints(read, writes, branch_id)
+                    .await?;
             }
         }
     }
@@ -6679,8 +6683,8 @@ mod tests {
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
     use crate::hot_state::{
-        ROW_SPACE, HotStateContext, HotStateExactBatchRequest, HotStateExactRowRequest,
-        HotStateProjection, HotStateRowRequest, PACKED_CURRENT_BASE_SPACE,
+        HotStateContext, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateProjection,
+        HotStateRowRequest, PACKED_CURRENT_BASE_SPACE, ROW_SPACE,
     };
     use crate::storage::{
         BeginScanOptions, CommitResult, GetManyResult, KeyRange, PutBatch, ScanCursor, SpaceId,
@@ -7586,7 +7590,10 @@ mod tests {
         let Some(record) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(record.change_id(), commit_id("test-uuid-1").commit_change_id());
+        assert_eq!(
+            record.change_id(),
+            commit_id("test-uuid-1").commit_change_id()
+        );
         let membership_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -8071,11 +8078,7 @@ mod tests {
             ],
             commit_change_refs_by_branch: BTreeMap::from([(
                 GLOBAL_BRANCH_ID.to_string(),
-                change_refs_with(
-                    [row_change],
-                    target_commit,
-                    "same-write-global-ref-change",
-                ),
+                change_refs_with([row_change], target_commit, "same-write-global-ref-change"),
             )]),
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
@@ -8885,11 +8888,7 @@ mod tests {
             .await
             .expect("normal rootless commit should persist");
 
-        let mut fence_refs = change_refs_with(
-            [],
-            "fence-commit",
-            "fence-branch-ref-change",
-        );
+        let mut fence_refs = change_refs_with([], "fence-commit", "fence-branch-ref-change");
         fence_refs.add_selected_change_batch(selected_change_batch_from(
             "fence-normal-change",
             "entity-1",
@@ -10098,7 +10097,10 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id(), commit_id("test-uuid-1").commit_change_id());
+        assert_eq!(
+            commit.change_id(),
+            commit_id("test-uuid-1").commit_change_id()
+        );
         let packed_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -10238,7 +10240,10 @@ mod tests {
         let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.change_id(), commit_id("test-uuid-1").commit_change_id());
+        assert_eq!(
+            commit.change_id(),
+            commit_id("test-uuid-1").commit_change_id()
+        );
         assert_eq!(
             commit.parent_commit_ids,
             vec![CommitId::for_test_label(
@@ -10497,11 +10502,7 @@ mod tests {
             state_rows: prepared_rows![tracked_global_row(row_change_label)],
             commit_change_refs_by_branch: BTreeMap::from([(
                 GLOBAL_BRANCH_ID.to_string(),
-                change_refs_with(
-                    [row_change_label],
-                    commit_label,
-                    branch_ref_change_label,
-                ),
+                change_refs_with([row_change_label], commit_label, branch_ref_change_label),
             )]),
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
@@ -10539,11 +10540,7 @@ mod tests {
             state_rows: prepared_rows![row],
             commit_change_refs_by_branch: BTreeMap::from([(
                 GLOBAL_BRANCH_ID.to_string(),
-                change_refs_with(
-                    [row_change_label],
-                    commit_label,
-                    branch_ref_change_label,
-                ),
+                change_refs_with([row_change_label], commit_label, branch_ref_change_label),
             )]),
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),

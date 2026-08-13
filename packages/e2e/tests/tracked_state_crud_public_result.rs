@@ -174,13 +174,13 @@ async fn validate_post_update_olap_shapes() {
 }
 
 #[test]
-fn insert_benchmark_hits_certified_parameter_batch_on_every_adapter() {
-    run_on_sized_stack("certified-parameter-batch", || async {
-        validate_certified_parameter_batch().await;
+fn insert_benchmark_uses_public_batch_on_every_adapter() {
+    run_on_sized_stack("public-parameter-batch", || async {
+        validate_public_parameter_batch().await;
     });
 }
 
-async fn validate_certified_parameter_batch() {
+async fn validate_public_parameter_batch() {
     let _test_guard = serialized_public_result_test().await;
     let rows = [
         WorkloadRow {
@@ -203,13 +203,13 @@ async fn validate_certified_parameter_batch() {
 }
 
 #[test]
-fn certified_insert_counter_deltas_are_isolated_across_sequential_fixtures() {
-    run_on_sized_stack("sequential-counter-isolation", || async {
-        validate_sequential_counter_isolation().await;
+fn public_insert_batches_work_across_sequential_fixtures() {
+    run_on_sized_stack("sequential-public-batches", || async {
+        validate_sequential_public_batches().await;
     });
 }
 
-async fn validate_sequential_counter_isolation() {
+async fn validate_sequential_public_batches() {
     let _test_guard = serialized_public_result_test().await;
     let rows = [WorkloadRow {
         path: "/sequential".to_string(),
@@ -235,13 +235,13 @@ async fn validate_sequential_counter_isolation() {
 }
 
 #[test]
-fn certified_insert_counter_deltas_are_isolated_for_concurrent_fixtures() {
-    run_on_sized_stack("concurrent-counter-isolation", || async {
-        validate_concurrent_counter_isolation().await;
+fn public_insert_batches_work_for_concurrent_fixtures() {
+    run_on_sized_stack("concurrent-public-batches", || async {
+        validate_concurrent_public_batches().await;
     });
 }
 
-async fn validate_concurrent_counter_isolation() {
+async fn validate_concurrent_public_batches() {
     let rows = [WorkloadRow {
         path: "/concurrent".to_string(),
         value_json: r#"{"enabled":true}"#.to_string(),
@@ -260,10 +260,7 @@ async fn insert_one_counter_fixture(
     profile: storage::StorageProfile,
     rows: &[WorkloadRow],
 ) -> usize {
-    // The futures are intentionally joined concurrently. Each fixture owns
-    // the process-global counter snapshot through the entire operation, so
-    // their exact certification=1/execution=1 deltas cannot overlap.
-    let _counter_guard = serialized_public_result_test().await;
+    let _test_guard = serialized_public_result_test().await;
     let fixture =
         sql_session::empty_fixture_with_read_many_pk_count(profile, rows, rows.len()).await;
     fixture.insert_all().await

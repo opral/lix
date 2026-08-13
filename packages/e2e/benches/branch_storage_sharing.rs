@@ -28,11 +28,11 @@ use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{ReadOptions, Storage};
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{collect_repository_gc_for_bench, layout_accounting};
 use lix::{CreateBranchOptions, MergeBranchOptions, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -203,14 +203,16 @@ async fn run_case<S>(
 ) where
     S: BenchBackend,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize branch-sharing repository");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open branch-sharing engine");
-    let main = engine
-        .open_session()
+        .expect("open branch-sharing lix");
+    let main = lix
+        .open_another_session()
         .await
         .expect("open branch-sharing session");
     register_schema(&main).await;
@@ -221,7 +223,7 @@ async fn run_case<S>(
     let base = snapshot(&storage, directory, settle_ms).await;
 
     let scenario_started = Instant::now();
-    let branches = apply_scenario(&engine, &main, &storage, scenario, rows).await;
+    let branches = apply_scenario(&lix, &main, &storage, scenario, rows).await;
     let scenario_elapsed = scenario_started.elapsed();
 
     let after = snapshot(&storage, directory, settle_ms).await;
@@ -310,8 +312,8 @@ fn scenario_changed_rows(scenario: &str, rows: usize) -> usize {
 }
 
 async fn apply_scenario<S>(
-    engine: &Engine<S>,
-    main: &SessionContext<S>,
+    lix: &Lix<S>,
+    main: &Lix<S>,
     storage: &S,
     scenario: &str,
     rows: usize,
@@ -329,17 +331,17 @@ where
         }
         "branch_1row" => {
             let branch = create_branch(main, "branch-0").await;
-            modify_rows(engine, &branch, 0, 1).await;
+            modify_rows(lix, &branch, 0, 1).await;
             1
         }
         "branch_1pct" => {
             let branch = create_branch(main, "branch-0").await;
-            modify_rows(engine, &branch, 0, one_percent).await;
+            modify_rows(lix, &branch, 0, one_percent).await;
             1
         }
         "branch_10pct" => {
             let branch = create_branch(main, "branch-0").await;
-            modify_rows(engine, &branch, 0, ten_percent).await;
+            modify_rows(lix, &branch, 0, ten_percent).await;
             1
         }
         "branches_10" => {
@@ -357,16 +359,16 @@ where
         "branches_10_1row" => {
             for index in 0..10 {
                 let branch = create_branch(main, &format!("branch-{index}")).await;
-                modify_rows(engine, &branch, index * 7, 1).await;
+                modify_rows(lix, &branch, index * 7, 1).await;
             }
             10
         }
         // Two branches, disjoint 1% windows: an honest two-diff price.
         "branches_2_disjoint_1pct" => {
             let first = create_branch(main, "branch-0").await;
-            modify_rows(engine, &first, 0, one_percent).await;
+            modify_rows(lix, &first, 0, one_percent).await;
             let second = create_branch(main, "branch-1").await;
-            modify_rows(engine, &second, one_percent, one_percent).await;
+            modify_rows(lix, &second, one_percent, one_percent).await;
             2
         }
         // Two branches making byte-identical edits to the same 1% window. If
@@ -374,14 +376,14 @@ where
         // materially less than the disjoint case.
         "branches_2_identical_1pct" => {
             let first = create_branch(main, "branch-0").await;
-            modify_rows(engine, &first, 0, one_percent).await;
+            modify_rows(lix, &first, 0, one_percent).await;
             let second = create_branch(main, "branch-1").await;
-            modify_rows(engine, &second, 0, one_percent).await;
+            modify_rows(lix, &second, 0, one_percent).await;
             2
         }
         "merge_1pct" => {
             let branch = create_branch(main, "branch-0").await;
-            modify_rows(engine, &branch, 0, one_percent).await;
+            modify_rows(lix, &branch, 0, one_percent).await;
             main.merge_branch(MergeBranchOptions {
                 source_branch_id: branch.clone(),
             })
@@ -391,7 +393,7 @@ where
         }
         "delete_gc_1pct" => {
             let branch = create_branch(main, "branch-0").await;
-            modify_rows(engine, &branch, 0, one_percent).await;
+            modify_rows(lix, &branch, 0, one_percent).await;
             main.execute(
                 "DELETE FROM lix_branch WHERE id = $1",
                 &[Value::Text(branch.clone())],
@@ -408,7 +410,7 @@ where
     }
 }
 
-async fn create_branch<S>(main: &SessionContext<S>, name: &str) -> String
+async fn create_branch<S>(main: &Lix<S>, name: &str) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -426,14 +428,20 @@ where
 /// value depends only on the row index, so two branches given the same window
 /// produce byte-identical content — which is what makes cross-branch content
 /// dedup observable.
-async fn modify_rows<S>(engine: &Engine<S>, branch: &str, start: usize, count: usize)
+async fn modify_rows<S>(lix: &Lix<S>, branch: &str, start: usize, count: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let session = engine
-        .open_session_at(branch.to_owned())
+    let session = lix
+        .open_another_session()
         .await
         .expect("open branch-sharing branch session");
+    session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: (branch.to_owned()).to_string(),
+        })
+        .await
+        .expect("switch session branch");
     let mut written = 0usize;
     while written < count {
         let batch = (count - written).min(SEED_BATCH_ROWS);
@@ -468,7 +476,7 @@ fn row_path(index: usize) -> String {
     format!("/branch/fixture/{index:09}")
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -495,7 +503,7 @@ where
         .expect("register branch-sharing schema");
 }
 
-async fn seed_rows<S>(session: &SessionContext<S>, rows: usize)
+async fn seed_rows<S>(session: &Lix<S>, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

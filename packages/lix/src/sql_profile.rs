@@ -1,5 +1,8 @@
 //! Benchmark-only SQL phase and scan diagnostics.
 
+#[cfg(test)]
+mod point_join_scan_scaling;
+
 use std::cell::RefCell;
 use std::future::Future;
 use std::time::Duration;
@@ -16,18 +19,18 @@ tokio::task_local! {
 /// can overlap physical execution and therefore is diagnostic rather than a
 /// fifth wall-clock phase.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SqlReadProfile {
-    pub total: Duration,
-    pub logical_planning: Duration,
-    pub physical_planning: Duration,
-    pub arrow_execution: Duration,
-    pub public_result_materialization: Duration,
-    pub scan_elapsed: Duration,
-    pub scan_rows: u64,
-    pub scan_batches: u64,
+pub(crate) struct SqlReadProfile {
+    pub(crate) total: Duration,
+    pub(crate) logical_planning: Duration,
+    pub(crate) physical_planning: Duration,
+    pub(crate) arrow_execution: Duration,
+    pub(crate) public_result_materialization: Duration,
+    pub(crate) scan_elapsed: Duration,
+    pub(crate) scan_rows: u64,
+    pub(crate) scan_batches: u64,
     /// Sum of Arrow's in-memory array sizes at the scan output boundary.
     /// This is not the number of bytes read from the storage backend.
-    pub scan_arrow_bytes: u64,
+    pub(crate) scan_arrow_bytes: u64,
     /// Number of stored rows a provider had to look at to produce its scan
     /// output, counted *before* the provider applies its own row filters.
     ///
@@ -45,29 +48,29 @@ pub struct SqlReadProfile {
     /// whole scanned batch before `EntityRowFilter`s run, and the columnar
     /// route examines the rows of the row groups that survived manifest
     /// pruning plus its overlay rows.
-    pub provider_rows_examined: u64,
+    pub(crate) provider_rows_examined: u64,
     /// Number of rows retained by the benchmark-only result ceiling probe.
     /// A nonzero value means result conversion was intentionally bypassed;
     /// it is never set by the production result path.
-    pub result_count_only_rows: u64,
-    pub result_count_only_batches: u64,
+    pub(crate) result_count_only_rows: u64,
+    pub(crate) result_count_only_batches: u64,
     /// Number of public rows consumed while the profile scope was active.
-    pub result_rows_consumed: u64,
+    pub(crate) result_rows_consumed: u64,
     /// Number of rows materialized into the public `Vec<Row>` representation
     /// or an owned benchmark scalar row while the profile scope was active.
-    pub result_rows_materialized: u64,
+    pub(crate) result_rows_materialized: u64,
     /// Number of owned rows retained through the end of result consumption.
     /// Cursor modes materialize one scalar row at a time but retain none.
-    pub result_rows_retained: u64,
+    pub(crate) result_rows_retained: u64,
     /// Checksum of consumed scalar values. This is a benchmark-only
     /// correctness witness, not a public result API.
-    pub result_checksum: u64,
+    pub(crate) result_checksum: u64,
 }
 
 impl SqlReadProfile {
     /// Time inside the public call outside the four instrumented phases, such
     /// as snapshot acquisition, provider registration, and statement routing.
-    pub fn unattributed_overhead(&self) -> Duration {
+    pub(crate) fn unattributed_overhead(&self) -> Duration {
         self.total.saturating_sub(
             self.logical_planning
                 + self.physical_planning

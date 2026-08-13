@@ -18,14 +18,13 @@ pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 pub(crate) use hot::hot_generation_scope_prefix;
 pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
-    CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
-    DeferredFreshHotRowRef, DeferredFreshHotRows, EntityColumnarOverlayRow,
-    COLLECTION_CONTROL_SPACE, DIFF_SPACE, FILE_SPACE, INDEX_SPACE,
-    ROW_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
-    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, load_certified_rows_at_commit,
-    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
-    stage_hot_index_entries,
+    CERTIFIED_ENTITY_BATCH_SPACE, COLLECTION_CONTROL_SPACE, CertifiedEntityBatchFileRef,
+    DIFF_SPACE, DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows,
+    EntityColumnarOverlayRow, FILE_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache,
+    HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
+    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
+    ROW_SPACE, load_certified_rows_at_commit, materialize_certified_root_rows,
+    scan_certified_history_rows, stage_certified_entity_batches, stage_hot_index_entries,
     stage_retire_hot_generation,
 };
 
@@ -56,12 +55,12 @@ use crate::branch::{BranchHeadControl, BranchHeadControlContext, BranchHeadTrack
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
-use crate::json_store::{
-    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
-};
 use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
     MaterializedHotStateRow, MaterializedHotStateRowRef,
+};
+use crate::json_store::{
+    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
 };
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
@@ -861,7 +860,8 @@ where
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let key: BranchRefKey = match storage_codec::decode(
                 "tracked working-diff marker key",
@@ -969,7 +969,6 @@ fn read_generation(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixErro
     *offset = end;
     Ok(CommitId::new(uuid::Uuid::from_bytes(uuid)))
 }
-
 
 /// Test-only shim so the shared codec's three-way differential can drive this
 /// plane's decoder. See `crate::order_preserving_key::tests`.
@@ -2318,10 +2317,7 @@ mod tests {
             .begin_scan(space, range, StorageBeginScanOptions::default())
             .await
             .expect("begin test scan");
-        cursor
-            .collect_all()
-            .await
-            .expect("read test scan page")
+        cursor.collect_all().await.expect("read test scan page")
     }
 
     fn ts(value: &str) -> LixTimestamp {
@@ -3954,8 +3950,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open file schema marker verification read");
-        let projection_rows = scan_test_space(&projection_read, FILE_SPACE)
-            .await;
+        let projection_rows = scan_test_space(&projection_read, FILE_SPACE).await;
         assert_eq!(
             projection_rows.len(),
             1,

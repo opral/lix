@@ -18,11 +18,11 @@ use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::JsonStoreContext;
 use crate::hot_state::{
     HotStateContext, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateProjection,
     HotStateReader,
 };
+use crate::json_store::JsonStoreContext;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::runtime::PluginRuntimeHost;
@@ -855,12 +855,7 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized storage should create engine");
-        std::sync::Arc::new(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
-        )
+        std::sync::Arc::new(engine.open_session().await.expect("session should open"))
     }
 
     async fn open_blocking_read_session() -> (
@@ -876,12 +871,7 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         (
-            std::sync::Arc::new(
-                engine
-                    .open_session()
-                    .await
-                    .expect("session should open"),
-            ),
+            std::sync::Arc::new(engine.open_session().await.expect("session should open")),
             gate,
         )
     }
@@ -899,12 +889,7 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         (
-            std::sync::Arc::new(
-                engine
-                    .open_session()
-                    .await
-                    .expect("session should open"),
-            ),
+            std::sync::Arc::new(engine.open_session().await.expect("session should open")),
             gate,
         )
     }

@@ -1,22 +1,19 @@
-use std::time::{Duration, Instant};
+use std::{
+    future::IntoFuture,
+    time::{Duration, Instant},
+};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use lix::integration::{Engine, SessionContext};
-use lix::{Blob, ExecuteBatchStatement, Memory};
+use lix::{ExecuteBatchStatement, Memory, Value};
+use lix::{Lix, open_lix};
 
 fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Vec<u8> {
     runtime.block_on(async move {
         let storage = Memory::new();
-        Engine::initialize(storage.clone())
+        let session = open_lix()
+            .with_storage(storage.clone())
             .await
-            .expect("benchmark storage initializes");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("benchmark engine opens");
-        let session = engine
-            .open_session()
-            .await
-            .expect("benchmark session opens");
+            .expect("benchmark lix opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('bench-key', '0')",
@@ -42,16 +39,10 @@ fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Ve
 fn seeded_sparse_gap_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Vec<u8> {
     runtime.block_on(async move {
         let storage = Memory::new();
-        Engine::initialize(storage.clone())
+        let session = open_lix()
+            .with_storage(storage.clone())
             .await
-            .expect("benchmark storage initializes");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("benchmark engine opens");
-        let session = engine
-            .open_session()
-            .await
-            .expect("benchmark session opens");
+            .expect("benchmark lix opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('target-key', 'before'), ('noise-key', '0')",
@@ -86,16 +77,10 @@ fn seeded_sparse_gap_storage(runtime: &tokio::runtime::Runtime, history_depth: u
 fn seeded_wide_parent_storage(runtime: &tokio::runtime::Runtime, parent_width: usize) -> Vec<u8> {
     runtime.block_on(async move {
         let storage = Memory::new();
-        Engine::initialize(storage.clone())
+        let session = open_lix()
+            .with_storage(storage.clone())
             .await
-            .expect("benchmark storage initializes");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("benchmark engine opens");
-        let session = engine
-            .open_session()
-            .await
-            .expect("benchmark session opens");
+            .expect("benchmark lix opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('target-key', 'before')",
@@ -133,16 +118,10 @@ fn seeded_wide_transition_storage(
 ) -> Vec<u8> {
     runtime.block_on(async move {
         let storage = Memory::new();
-        Engine::initialize(storage.clone())
+        let session = open_lix()
+            .with_storage(storage.clone())
             .await
-            .expect("benchmark storage initializes");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("benchmark engine opens");
-        let session = engine
-            .open_session()
-            .await
-            .expect("benchmark session opens");
+            .expect("benchmark lix opens");
         let before = "b".repeat(256);
         let values = (0..transition_width)
             .map(|index| format!("('transition-{index}', '{before}')"))
@@ -181,20 +160,17 @@ fn seeded_descriptor_unrelated_width_storage(
 ) -> Vec<u8> {
     runtime.block_on(async move {
         let storage = Memory::new();
-        Engine::initialize(storage.clone())
+        let session = open_lix()
+            .with_storage(storage.clone())
             .await
-            .expect("benchmark storage initializes");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("benchmark engine opens");
-        let session = engine
-            .open_session()
-            .await
-            .expect("benchmark session opens");
+            .expect("benchmark lix opens");
         session
-            .upsert_file_content(
-                "/descriptor-target.txt".into(),
-                Blob::from("target".as_bytes()),
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text("/descriptor-target.txt".to_owned()),
+                    Value::Blob(b"target".as_slice().into()),
+                ],
             )
             .await
             .expect("target file creates");
@@ -222,14 +198,12 @@ fn seeded_descriptor_unrelated_width_storage(
     })
 }
 
-fn open_session(runtime: &tokio::runtime::Runtime, storage: Memory) -> SessionContext<Memory> {
+fn open_session(runtime: &tokio::runtime::Runtime, storage: Memory) -> Lix<Memory> {
     runtime.block_on(async move {
-        Engine::new(storage)
+        open_lix()
+            .with_storage(storage)
             .await
-            .expect("benchmark engine opens")
-            .open_session()
-            .await
-            .expect("benchmark session opens")
+            .expect("benchmark lix opens")
     })
 }
 
@@ -255,10 +229,14 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                         );
                         let started = Instant::now();
                         runtime
-                            .block_on(session.execute(
-                                "UPDATE lix_key_value SET value = 'next' WHERE key = 'bench-key'",
-                                &[],
-                            ))
+                            .block_on(
+                                session
+                                    .execute(
+                                        "UPDATE lix_key_value SET value = 'next' WHERE key = 'bench-key'",
+                                        &[],
+                                    )
+                                    .into_future(),
+                            )
                             .expect("benchmarked ordinary update succeeds");
                         elapsed += started.elapsed();
                     }

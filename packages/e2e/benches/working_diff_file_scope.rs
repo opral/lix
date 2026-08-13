@@ -38,9 +38,9 @@ use std::time::{Duration, Instant};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::{ExecuteBatchStatement, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -78,7 +78,8 @@ fn main() {
         runtime.block_on(async {
             match backend {
                 "rocksdb" => {
-                    let storage = RocksDB::open(&dir).expect("open working-diff file-scope RocksDB");
+                    let storage =
+                        RocksDB::open(&dir).expect("open working-diff file-scope RocksDB");
                     run(
                         storage.clone(),
                         backend,
@@ -92,7 +93,8 @@ fn main() {
                     storage.flush().expect("flush RocksDB");
                 }
                 "slatedb" => {
-                    let storage = SlateDB::open(&dir).expect("open working-diff file-scope SlateDB");
+                    let storage =
+                        SlateDB::open(&dir).expect("open working-diff file-scope SlateDB");
                     run(
                         storage.clone(),
                         backend,
@@ -137,14 +139,16 @@ async fn run<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize working-diff file-scope storage");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open working-diff file-scope engine");
-    let session = engine
-        .open_session()
+        .expect("open working-diff file-scope lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open working-diff file-scope session");
 
@@ -265,11 +269,11 @@ async fn run<StorageImpl>(
         millis(entity_scan.2),
     );
     drop(session);
-    drop(engine);
+    drop(lix);
 }
 
 async fn sample<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
+    session: &Lix<StorageImpl>,
     sql: &str,
     params: &[Value],
     reps: usize,
@@ -291,11 +295,7 @@ where
     )
 }
 
-async fn rows<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
-    sql: &str,
-    params: &[Value],
-) -> usize
+async fn rows<StorageImpl>(session: &Lix<StorageImpl>, sql: &str, params: &[Value]) -> usize
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -306,7 +306,7 @@ where
         .len()
 }
 
-async fn register_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
+async fn register_schema<StorageImpl>(session: &Lix<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -331,7 +331,7 @@ where
         .expect("register working-diff file-scope schema");
 }
 
-async fn seed_files<StorageImpl>(session: &SessionContext<StorageImpl>, file_ids: &[String])
+async fn seed_files<StorageImpl>(session: &Lix<StorageImpl>, file_ids: &[String])
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -371,7 +371,7 @@ where
 }
 
 async fn seed_rows<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
+    session: &Lix<StorageImpl>,
     file_ids: &[String],
     rows_per_file: usize,
 ) where
@@ -384,8 +384,7 @@ async fn seed_rows<StorageImpl>(
             .expect("begin row seed transaction");
         for start in (0..rows_per_file).step_by(INSERT_BATCH_SIZE) {
             let end = (start + INSERT_BATCH_SIZE).min(rows_per_file);
-            let mut sql =
-                format!("INSERT INTO {SCHEMA_KEY} (id, value, lixcol_file_id) VALUES ");
+            let mut sql = format!("INSERT INTO {SCHEMA_KEY} (id, value, lixcol_file_id) VALUES ");
             let mut params = Vec::with_capacity((end - start) * 3);
             for (offset, row_index) in (start..end).enumerate() {
                 if offset > 0 {
@@ -420,7 +419,7 @@ async fn seed_rows<StorageImpl>(
 /// statements into one commit so the HOT_DIFF packing threshold is exercised
 /// the same way an ordinary bulk edit would exercise it.
 async fn dirty_rows<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
+    session: &Lix<StorageImpl>,
     plan: &[(usize, usize)],
     changes_per_commit: usize,
     rows_per_file: usize,
@@ -450,10 +449,8 @@ async fn dirty_rows<StorageImpl>(
     flush(session, &mut pending).await;
 }
 
-async fn flush<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
-    pending: &mut Vec<ExecuteBatchStatement>,
-) where
+async fn flush<StorageImpl>(session: &Lix<StorageImpl>, pending: &mut Vec<ExecuteBatchStatement>)
+where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     if pending.is_empty() {

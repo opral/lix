@@ -30,7 +30,6 @@
 
 use std::time::{Duration, Instant};
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
@@ -38,6 +37,7 @@ use lix::storage_bench::{
     plan_load_trace_enabled, take_plan_load_attribution, take_root_replay_accounting,
 };
 use lix::{CreateBranchOptions, MergeBranchOptions, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -73,14 +73,15 @@ async fn run<S>(storage: S, backend: &str, commits: usize, rows_per_commit: usiz
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize repository");
-    let engine = Engine::new(storage.clone()).await.expect("open engine");
-    let session = engine
-        .open_session()
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open workspace");
+        .expect("open lix");
+    let session = lix.open_another_session().await.expect("open workspace");
     register_schema(&session).await;
 
     // Discard setup accounting so the reported numbers cover only the measured
@@ -152,7 +153,10 @@ where
         .expect("checkpoint should publish");
     let checkpoint_wall = checkpoint_start.elapsed();
     let checkpoint = take_plan_load_attribution();
-    println!("op checkpoint wall_ms {:.1}", checkpoint_wall.as_secs_f64() * 1000.0);
+    println!(
+        "op checkpoint wall_ms {:.1}",
+        checkpoint_wall.as_secs_f64() * 1000.0
+    );
     report("checkpoint", &checkpoint);
 
     for (label, sql) in [
@@ -195,10 +199,16 @@ where
         .await
         .expect("create branch")
         .id;
-    let branch_session = engine
-        .open_session_at(branch.clone())
+    let branch_session = lix
+        .open_another_session()
         .await
         .expect("open branch session");
+    branch_session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: (branch.clone()).to_string(),
+        })
+        .await
+        .expect("switch session branch");
     for index in 0..8 {
         commit_batch(&branch_session, commits + index, rows_per_commit).await;
     }
@@ -318,7 +328,7 @@ fn report(label: &str, attribution: &PlanLoadAttribution) {
     }
 }
 
-async fn commit_batch<S>(session: &SessionContext<S>, batch: usize, rows: usize)
+async fn commit_batch<S>(session: &Lix<S>, batch: usize, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -338,7 +348,7 @@ where
     transaction.commit().await.expect("commit batch");
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

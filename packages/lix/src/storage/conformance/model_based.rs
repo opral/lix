@@ -203,7 +203,8 @@ where
         let (chunk, chunk_has_more) = cursor
             .next_page(usize::MAX)
             .await
-            .map_err(|error| format!("{label}: full scan in {space:?} failed: {error}"))?.into_parts();
+            .map_err(|error| format!("{label}: full scan in {space:?} failed: {error}"))?
+            .into_parts();
         let actual = chunk_entries(&chunk);
         let expected = model
             .iter()
@@ -283,7 +284,8 @@ where
     let (chunk, chunk_has_more) = cursor
         .next_page(limit_rows)
         .await
-        .map_err(|error| format!("{label}: randomized scan failed: {error}"))?.into_parts();
+        .map_err(|error| format!("{label}: randomized scan failed: {error}"))?
+        .into_parts();
     let eligible = scan_model
         .iter()
         .filter(|(key, _)| {

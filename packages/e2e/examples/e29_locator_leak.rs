@@ -25,7 +25,6 @@
 #![allow(clippy::large_futures)]
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::registered_spaces::{
     CHANGE_SPACE, TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
     TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
@@ -33,8 +32,9 @@ use lix::registered_spaces::{
 use lix::storage::Storage;
 use lix::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{collect_repository_gc_for_bench, space_inventory};
+use lix::{Lix, open_lix};
 
-/// Hyphenated lowercase UUID from 16 raw bytes, matching how the engine
+/// Hyphenated lowercase UUID from 16 raw bytes, matching how Lix
 /// renders a `ChangeId` on the public surface.
 fn format_uuid(bytes: &[u8]) -> Option<String> {
     if bytes.len() != 16 {
@@ -54,7 +54,7 @@ fn format_uuid(bytes: &[u8]) -> Option<String> {
     ))
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -121,14 +121,16 @@ async fn main() {
 
     for rewrites in counts {
         let memory = Memory::new();
-        Engine::initialize(memory.clone())
+        open_lix()
+            .with_storage(memory.clone())
             .await
             .expect("initialize locator repository");
-        let engine = Engine::new(memory.clone())
+        let lix = open_lix()
+            .with_storage(memory.clone())
             .await
-            .expect("open locator engine");
-        let session = engine
-            .open_session()
+            .expect("open locator lix");
+        let session = lix
+            .open_another_session()
             .await
             .expect("open locator workspace");
         register_schema(&session).await;
@@ -263,9 +265,10 @@ async fn main() {
         // What does a read that follows a dangling locator do?
         for id in dangling.iter().take(3) {
             let outcome = match session
-                .execute("SELECT id FROM lix_change WHERE id = $1", &[
-                    Value::Text(id.clone()),
-                ])
+                .execute(
+                    "SELECT id FROM lix_change WHERE id = $1",
+                    &[Value::Text(id.clone())],
+                )
                 .await
             {
                 Ok(rows) if rows.rows().is_empty() => "clean_miss".to_owned(),

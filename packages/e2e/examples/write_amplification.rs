@@ -42,13 +42,12 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
-use lix::integration::Engine;
+use lix::open_lix;
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{layout_accounting, space_inventory};
-use lix::{PreparedDmlParameterBatch, Value};
+use lix::{ExecuteBatchStatement, Value};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -149,16 +148,15 @@ async fn main() {
 }
 
 async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize repository");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open engine over initialized repository");
-    let session = engine
-        .open_session()
-        .await
-        .expect("open session");
+        .expect("open lix over initialized repository");
+    let session = lix.open_another_session().await.expect("open session");
 
     let schema = serde_json::json!({
         "x-lix-key": "json_pointer",
@@ -185,20 +183,20 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
     let mut inserted = 0_usize;
     while inserted < rows {
         let chunk = seed_width.max(1).min(rows - inserted);
-        let parameter_rows = (inserted..inserted + chunk).map(|index| {
-            vec![
-                Value::Text(format!("/fixture/path/{index:08}")),
-                Value::Text(format!(
-                    "{{\"ordinal\":{index},\"payload\":\"row-{index:08}\"}}"
-                )),
-            ]
-        });
+        let statements = (inserted..inserted + chunk)
+            .map(|index| ExecuteBatchStatement {
+                label: None,
+                sql: SEED_SQL.to_owned(),
+                params: vec![
+                    Value::Text(format!("/fixture/path/{index:08}")),
+                    Value::Text(format!(
+                        "{{\"ordinal\":{index},\"payload\":\"row-{index:08}\"}}"
+                    )),
+                ],
+            })
+            .collect::<Vec<_>>();
         let affected = session
-            .execute_prepared_dml_batch(
-                Arc::from(SEED_SQL),
-                PreparedDmlParameterBatch::from_rows(parameter_rows)
-                    .expect("seed parameter batch is rectangular"),
-            )
+            .execute_batch(&statements)
             .await
             .expect("insert seed chunk")
             .iter()
@@ -209,14 +207,14 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
     }
 
     drop(session);
-    drop(engine);
+    drop(lix);
     storage.settle().await;
     println!("SEEDED\trows={rows}\tseed_width={seed_width}");
 }
 
 /// Applies `updates` row updates in `updates / width` commits.
 ///
-/// One `execute_prepared_dml_batch` is one commit, so `width` is exactly the
+/// One `execute_batch` is one commit, so `width` is exactly the
 /// number of rows a commit carries. Holding `updates` fixed and varying `width`
 /// separates per-commit fixed cost from per-row marginal cost.
 async fn update<S: BenchStorage>(storage: S, updates: usize, width: usize, distinct: usize) {
@@ -225,36 +223,36 @@ async fn update<S: BenchStorage>(storage: S, updates: usize, width: usize, disti
         updates % width == 0,
         "updates must be a whole number of commits"
     );
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open engine over initialized repository");
-    let session = engine
-        .open_session()
-        .await
-        .expect("open session");
+        .expect("open lix over initialized repository");
+    let session = lix.open_another_session().await.expect("open session");
 
     let mut applied = 0_usize;
     while applied < updates {
-        let parameter_rows = (applied..applied + width).map(|index| {
-            let target = index % distinct;
-            vec![
-                Value::Text(format!("{{\"ordinal\":{target},\"revision\":{index}}}")),
-                Value::Text(format!("/fixture/path/{target:08}")),
-            ]
-        });
+        let statements = (applied..applied + width)
+            .map(|index| {
+                let target = index % distinct;
+                ExecuteBatchStatement {
+                    label: None,
+                    sql: UPDATE_SQL.to_owned(),
+                    params: vec![
+                        Value::Text(format!("{{\"ordinal\":{target},\"revision\":{index}}}")),
+                        Value::Text(format!("/fixture/path/{target:08}")),
+                    ],
+                }
+            })
+            .collect::<Vec<_>>();
         session
-            .execute_prepared_dml_batch(
-                Arc::from(UPDATE_SQL),
-                PreparedDmlParameterBatch::from_rows(parameter_rows)
-                    .expect("update parameter batch is rectangular"),
-            )
+            .execute_batch(&statements)
             .await
             .expect("apply update commit");
         applied += width;
     }
 
     drop(session);
-    drop(engine);
+    drop(lix);
     storage.settle().await;
     println!(
         "UPDATED\tupdates={updates}\twidth={width}\tdistinct={distinct}\tcommits={}",
@@ -267,13 +265,11 @@ async fn update<S: BenchStorage>(storage: S, updates: usize, width: usize, disti
 /// This is the read half of a single-row `UPDATE` in isolation: no transaction,
 /// no commit, just "find the current value of this row".
 async fn read_rows<S: BenchStorage>(storage: S, reads: usize, distinct: usize) {
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open engine over initialized repository");
-    let session = engine
-        .open_session()
-        .await
-        .expect("open session");
+        .expect("open lix over initialized repository");
+    let session = lix.open_another_session().await.expect("open session");
 
     // Warm the plan cache so the measurement is the read, not planning.
     for index in 0..distinct.min(16) {
@@ -300,7 +296,10 @@ async fn read_rows<S: BenchStorage>(storage: S, reads: usize, distinct: usize) {
         rows_seen += result.len() as u64;
     }
     let elapsed = start.elapsed();
-    assert_eq!(rows_seen as usize, reads, "every point read must find its row");
+    assert_eq!(
+        rows_seen as usize, reads,
+        "every point read must find its row"
+    );
     println!(
         "READ\treads={reads}\tdistinct={distinct}\ttotal_us={}\tus_per_read={:.2}",
         elapsed.as_micros(),

@@ -10,11 +10,11 @@ use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
-use crate::json_store::{
-    JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
-};
 use crate::hot_state::{
     CurrentStateDeltaRef, HotStateReadDomain, MaterializedHotStateRow, TrackedHeadContext,
+};
+use crate::json_store::{
+    JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{TrackedStateKey, TrackedStateKeyRef};

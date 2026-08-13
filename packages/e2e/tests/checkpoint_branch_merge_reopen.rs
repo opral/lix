@@ -101,9 +101,15 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
         assert_eq!(branch.commit_id, fork_commit_id);
 
         let source = main
-            .open_session_at(SOURCE_BRANCH_ID)
+            .open_another_session()
             .await
             .expect("open source branch");
+        source
+            .switch_branch(lix::SwitchBranchOptions {
+                branch_id: SOURCE_BRANCH_ID.to_owned(),
+            })
+            .await
+            .expect("switch session branch");
         source
             .execute(
                 "UPDATE lix_key_value SET value = 'source' WHERE key = $1",

@@ -48,11 +48,11 @@
 #![allow(clippy::large_futures)]
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::registered_spaces::{JSON_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE};
 use lix::storage::Storage;
 use lix::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{collect_repository_gc_for_bench, space_inventory};
+use lix::{Lix, open_lix};
 
 /// A snapshot whose normalized JSON is comfortably past the 1 KiB inline
 /// threshold, and distinct for every `revision`.
@@ -65,7 +65,7 @@ fn payload(revision: usize) -> String {
     serde_json::json!({ "revision": revision, "body": body }).to_string()
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -122,14 +122,16 @@ fn list_from_env(var: &str, default: &[usize]) -> Vec<usize> {
 /// `cadence` edits, then one shipping sweep.
 async fn run_cell(shape: &str, cadence: usize, edits: usize) {
     let memory = Memory::new();
-    Engine::initialize(memory.clone())
+    open_lix()
+        .with_storage(memory.clone())
         .await
         .expect("initialize leak repository");
-    let engine = Engine::new(memory.clone())
+    let lix = open_lix()
+        .with_storage(memory.clone())
         .await
-        .expect("open leak engine");
-    let session = engine
-        .open_session()
+        .expect("open leak lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open leak workspace");
     register_schema(&session).await;

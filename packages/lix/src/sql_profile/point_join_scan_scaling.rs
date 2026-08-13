@@ -15,8 +15,9 @@
 
 use std::future::Future;
 
-use lix::integration::{Engine, SessionContext};
-use lix::{Memory, Value};
+use crate::engine::Engine;
+use crate::session::SessionContext;
+use crate::{Memory, Value};
 
 /// See the identical note in `e2e`'s `tracked_state_crud_public_result`:
 /// building and optimizing real DataFusion plans recurses per plan node and
@@ -199,10 +200,7 @@ async fn seeded_session(bundles: usize) -> SessionContext<Memory> {
         .await
         .expect("initialize fixture");
     let engine = Engine::new(storage).await.expect("open engine");
-    let session = engine
-        .open_session()
-        .await
-        .expect("open session");
+    let session = engine.open_session().await.expect("open session");
     for schema in schemas() {
         session
             .execute(

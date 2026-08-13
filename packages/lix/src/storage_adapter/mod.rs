@@ -46,10 +46,10 @@ pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUnique
 pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
 pub(crate) use spaces::{
-    REVISION_KEY_ACCOUNT, REVISION_KEY_BINARY_CAS_PUBLICATION,
-    REVISION_KEY_BINARY_CAS_RECLAMATION, REVISION_KEY_CATALOG, REVISION_KEY_FILESYSTEM_PATH,
-    REVISION_KEY_JSON_STORE_PUBLICATION, REVISION_KEY_JSON_STORE_RECLAMATION,
-    REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE, load_revision, load_revisions, revision_key,
+    REVISION_KEY_ACCOUNT, REVISION_KEY_BINARY_CAS_PUBLICATION, REVISION_KEY_BINARY_CAS_RECLAMATION,
+    REVISION_KEY_CATALOG, REVISION_KEY_FILESYSTEM_PATH, REVISION_KEY_JSON_STORE_PUBLICATION,
+    REVISION_KEY_JSON_STORE_RECLAMATION, REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE,
+    load_revision, load_revisions, revision_key,
 };
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,

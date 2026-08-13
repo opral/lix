@@ -184,13 +184,11 @@ async fn prefix_scan_lowers_to_storage_range() -> StorageConformanceResult {
     let (chunk, _chunk_has_more) = cursor
         .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
         .await
-        .map_err(|error| format!("scan_prefix failed: {error}"))?.into_parts();
+        .map_err(|error| format!("scan_prefix failed: {error}"))?
+        .into_parts();
 
     assert_eq!(
-        chunk
-            .into_iter()
-            .map(|entry| entry.key)
-            .collect::<Vec<_>>(),
+        chunk.into_iter().map(|entry| entry.key).collect::<Vec<_>>(),
         vec![key("aa"), key("ab")]
     );
 
@@ -238,7 +236,8 @@ async fn cursor_drains_chunked_pages() -> StorageConformanceResult {
         let (result, result_has_more) = cursor
             .next_page(2)
             .await
-            .map_err(|error| format!("scan cursor page failed: {error}"))?.into_parts();
+            .map_err(|error| format!("scan cursor page failed: {error}"))?
+            .into_parts();
 
         if result
             .iter()
@@ -292,7 +291,8 @@ async fn read_scope_pins_snapshot() -> StorageConformanceResult {
     let (chunk, _chunk_has_more) = cursor
         .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
         .await
-        .map_err(|error| format!("scan_range failed: {error}"))?.into_parts();
+        .map_err(|error| format!("scan_range failed: {error}"))?
+        .into_parts();
 
     assert_eq!(
         chunk

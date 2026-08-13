@@ -6,7 +6,8 @@
 mod filesystem;
 
 pub use filesystem::{
-    LocalFilesystem, LocalFilesystemOpenOptions, LocalFilesystemRead, LocalFilesystemWrite,
+    LocalFilesystem, LocalFilesystemOpenOptions, LocalFilesystemRead, LocalFilesystemSync,
+    LocalFilesystemWrite,
 };
 pub use lix_storage_rocksdb::{
     RocksDB as RocksDBFilesystem, RocksDBRead as RocksDBFilesystemRead,

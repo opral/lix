@@ -1,10 +1,11 @@
 use lix::storage::Storage;
 use lix::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryValue};
 use lix::{
-    Blob, CreateBranchOptions, ExecuteBatchStatement, GLOBAL_BRANCH_ID, Lix, LixError, Memory,
-    MergeBranchOptions, MergeBranchOutcome, SwitchBranchOptions, Value, open_lix,
+    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions,
+    MergeBranchOutcome, SwitchBranchOptions, Value, open_lix,
 };
-use lix_storage_filesystem::{LocalFilesystem, LocalFilesystemOpenOptions};
+use lix_storage_filesystem::{LocalFilesystem, LocalFilesystemOpenOptions, LocalFilesystemSync};
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,251 +50,6 @@ async fn rs_sdk_telemetry_is_explicit_and_redacts_sql_literals() {
         .expect("query telemetry includes sanitized SQL");
     assert_eq!(query_text, "SELECT ? AS value, ? AS number");
     assert!(span.end.duration_ns > 0);
-}
-
-#[tokio::test]
-async fn rs_sdk_native_file_upsert_creates_updates_and_keeps_empty_file() {
-    let lix = open_lix().await.expect("open Lix");
-
-    assert_eq!(
-        lix.upsert_file_content("/native/file.bin", b"first".as_slice())
-            .await
-            .expect("create native file"),
-        1
-    );
-    assert_eq!(
-        lix.upsert_file_content("/native/file.bin", b"second".as_slice())
-            .await
-            .expect("update native file"),
-        1
-    );
-    assert_eq!(
-        read_file(&lix, "/native/file.bin")
-            .await
-            .expect("read native file"),
-        Some(b"second".to_vec())
-    );
-
-    assert_eq!(
-        lix.upsert_file_content("/native/file.bin", Vec::<u8>::new())
-            .await
-            .expect("write empty native file"),
-        1
-    );
-    assert_eq!(
-        read_file(&lix, "/native/file.bin")
-            .await
-            .expect("read empty native file"),
-        Some(Vec::new())
-    );
-
-    let error = lix
-        .upsert_file_content("relative.bin", b"invalid".as_slice())
-        .await
-        .expect_err("relative native file path should be rejected");
-    assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
-
-    let error = lix
-        .upsert_file_content("/nul\0name.bin", b"invalid".as_slice())
-        .await
-        .expect_err("NUL in a native file path should be rejected by the engine");
-    assert_eq!(error.code, "LIX_ERROR_PATH_NUL");
-}
-
-#[tokio::test]
-async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays() {
-    let lix = open_lix().await.expect("open Lix");
-
-    lix.upsert_file_content("/native/batch/one.bin", b"before".as_slice())
-        .await
-        .expect("seed native file batch update");
-    let fast_batch_parent = active_branch_commit_id(&lix).await;
-    assert_eq!(
-        lix.upsert_file_content_batch(native_file_writes(&[
-            ("/native/batch/one.bin", b"one"),
-            ("/native/batch/two.bin", b"two"),
-            ("/native/batch/empty.bin", b""),
-        ]))
-        .await
-        .expect("create native file batch"),
-        3
-    );
-    assert_active_branch_head_parent(&lix, &fast_batch_parent).await;
-    assert_eq!(
-        read_file(&lix, "/native/batch/one.bin").await.unwrap(),
-        Some(b"one".to_vec())
-    );
-    assert_eq!(
-        read_file(&lix, "/native/batch/two.bin").await.unwrap(),
-        Some(b"two".to_vec())
-    );
-    assert_eq!(
-        read_file(&lix, "/native/batch/empty.bin").await.unwrap(),
-        Some(Vec::new())
-    );
-
-    let fast_batch_update_parent = active_branch_commit_id(&lix).await;
-    assert_eq!(
-        lix.upsert_file_content_batch(native_file_writes(&[
-            ("/native/batch/one.bin", b"updated-one"),
-            ("/native/batch/two.bin", b""),
-            ("/native/batch/empty.bin", b"updated-empty"),
-        ]))
-        .await
-        .expect("update native file batch"),
-        3
-    );
-    assert_active_branch_head_parent(&lix, &fast_batch_update_parent).await;
-    assert_eq!(
-        read_file(&lix, "/native/batch/one.bin").await.unwrap(),
-        Some(b"updated-one".to_vec())
-    );
-    assert_eq!(
-        read_file(&lix, "/native/batch/two.bin").await.unwrap(),
-        Some(Vec::new())
-    );
-    assert_eq!(
-        read_file(&lix, "/native/batch/empty.bin").await.unwrap(),
-        Some(b"updated-empty".to_vec())
-    );
-
-    let head_before_prevalidation_errors = active_branch_commit_id(&lix).await;
-    let empty_error = lix
-        .upsert_file_content_batch(Vec::new())
-        .await
-        .expect_err("empty native file batch should be rejected");
-    assert_eq!(empty_error.code, LixError::CODE_INVALID_PARAM);
-
-    let duplicate_error = lix
-        .upsert_file_content_batch(native_file_writes(&[
-            ("/native/batch/duplicate.bin", b"first"),
-            ("/native/batch/duplicate.bin", b"second"),
-        ]))
-        .await
-        .expect_err("duplicate native file batch path should be rejected");
-    assert_eq!(duplicate_error.code, LixError::CODE_INVALID_PARAM);
-    assert_eq!(
-        read_file(&lix, "/native/batch/duplicate.bin")
-            .await
-            .unwrap(),
-        None
-    );
-
-    let path_error = lix
-        .upsert_file_content_batch(native_file_writes(&[
-            ("/native/batch/must-not-write.bin", b"first"),
-            ("relative.bin", b"invalid"),
-        ]))
-        .await
-        .expect_err("invalid file path should reject the complete batch");
-    assert_eq!(path_error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
-    assert_eq!(
-        read_file(&lix, "/native/batch/must-not-write.bin")
-            .await
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        active_branch_commit_id(&lix).await,
-        head_before_prevalidation_errors,
-        "prevalidation failures must not create a partial batch commit"
-    );
-
-    let active_branch_id = lix.active_branch_id().await.expect("resolve active branch");
-    lix.execute(
-        "INSERT INTO lix_file_by_branch \
-         (id, path, content, lixcol_global, lixcol_branch_id) \
-         VALUES ($1, $2, $3, true, $4)",
-        &[
-            Value::Text("01920000-0000-7000-8000-000000000301".to_string()),
-            Value::Text("/native/overlap.bin".to_string()),
-            Value::Blob(b"g".to_vec().into()),
-            Value::Text(GLOBAL_BRANCH_ID.to_string()),
-        ],
-    )
-    .await
-    .expect("insert global overlap fixture");
-    lix.execute(
-        "INSERT INTO lix_file_by_branch \
-         (id, path, content, lixcol_branch_id) \
-         VALUES ($1, $2, $3, $4)",
-        &[
-            Value::Text("01920000-0000-7000-8000-000000000301".to_string()),
-            Value::Text("/native/overlap.bin".to_string()),
-            Value::Blob(b"l".to_vec().into()),
-            Value::Text(active_branch_id.clone()),
-        ],
-    )
-    .await
-    .expect("insert active overlap fixture");
-
-    let overlay_batch_parent = active_branch_commit_id(&lix).await;
-    assert_eq!(
-        lix.upsert_file_content_batch(native_file_writes(&[
-            ("/native/overlap.bin", b"updated"),
-            ("/native/batch/overlay-companion.bin", b"companion"),
-        ]))
-        .await
-        .expect("native file batch should update the active overlay"),
-        2
-    );
-    assert_active_branch_head_parent(&lix, &overlay_batch_parent).await;
-    assert_eq!(
-        read_file_by_branch(
-            &lix,
-            "01920000-0000-7000-8000-000000000301",
-            &active_branch_id,
-        )
-        .await
-        .unwrap(),
-        Some(b"updated".to_vec())
-    );
-    assert_eq!(
-        read_file_by_branch(
-            &lix,
-            "01920000-0000-7000-8000-000000000301",
-            GLOBAL_BRANCH_ID,
-        )
-        .await
-        .unwrap(),
-        Some(b"g".to_vec())
-    );
-    assert_eq!(
-        read_file(&lix, "/native/batch/overlay-companion.bin")
-            .await
-            .unwrap(),
-        Some(b"companion".to_vec())
-    );
-}
-
-#[tokio::test]
-async fn rs_sdk_native_file_read_distinguishes_missing_and_empty_files() {
-    let lix = open_lix().await.expect("open Lix");
-
-    assert_eq!(
-        lix.read_file_content("/native/missing.bin", None)
-            .await
-            .expect("read missing native file")
-            .map(|read| read.into_content().to_vec()),
-        None
-    );
-
-    lix.upsert_file_content("/native/empty.bin", Vec::<u8>::new())
-        .await
-        .expect("create empty native file");
-    assert_eq!(
-        lix.read_file_content("/native/empty.bin", None)
-            .await
-            .expect("read empty native file")
-            .map(|read| read.into_content().to_vec()),
-        Some(Vec::new())
-    );
-
-    let error = lix
-        .read_file_content("relative.bin", None)
-        .await
-        .expect_err("relative native file path should be rejected");
-    assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
 }
 
 #[tokio::test]
@@ -971,39 +727,57 @@ async fn filesystem_initialization_wipes_legacy_root_sqlite_and_system_metadata(
     lix.close().await.unwrap();
 }
 
-async fn open_filesystem_lix(path: &Path) -> Lix<LocalFilesystem> {
-    let storage = LocalFilesystem::open(path).await.unwrap();
-    open_lix().with_storage(storage).await.unwrap()
+struct SyncedFilesystemLix {
+    lix: Lix<LocalFilesystem>,
+    _sync: LocalFilesystemSync,
 }
 
-async fn open_on_demand_filesystem_lix(path: &Path, file_paths: &[&str]) -> Lix<LocalFilesystem> {
-    let options = LocalFilesystemOpenOptions::new(path.to_path_buf(), false);
-    let storage = LocalFilesystem::open_with_options(options).await.unwrap();
+impl Deref for SyncedFilesystemLix {
+    type Target = Lix<LocalFilesystem>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lix
+    }
+}
+
+async fn open_filesystem_lix(path: &Path) -> SyncedFilesystemLix {
+    let storage = LocalFilesystem::open(path).unwrap();
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
-    storage
-        .import_paths(file_paths.iter().copied())
-        .await
-        .unwrap();
-    lix
+    let sync = storage.start_sync(&lix).await.unwrap();
+    SyncedFilesystemLix { lix, _sync: sync }
+}
+
+async fn open_on_demand_filesystem_lix(path: &Path, file_paths: &[&str]) -> SyncedFilesystemLix {
+    let options = LocalFilesystemOpenOptions::new(path.to_path_buf(), false);
+    let storage = LocalFilesystem::open_with_options(options).unwrap();
+    let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+    let sync = storage.start_sync(&lix).await.unwrap();
+    sync.import_paths(file_paths.iter().copied()).await.unwrap();
+    SyncedFilesystemLix { lix, _sync: sync }
 }
 
 #[tokio::test]
 async fn rocksdb_filesystem_storage_allows_same_process_multi_open() {
     let tempdir = tempfile::tempdir().unwrap();
-    let storage_a = LocalFilesystem::open(tempdir.path())
-        .await
-        .expect("first rocksdb fs storage opens");
+    let storage_a = LocalFilesystem::open(tempdir.path()).expect("first rocksdb fs storage opens");
     let storage_b = LocalFilesystem::open(tempdir.path())
-        .await
         .expect("second rocksdb fs storage reuses process-local DB");
     let lix_a = open_lix()
-        .with_storage(storage_a)
+        .with_storage(storage_a.clone())
         .await
         .expect("first lix opens");
     let lix_b = open_lix()
-        .with_storage(storage_b)
+        .with_storage(storage_b.clone())
         .await
         .expect("second lix opens");
+    let _sync_a = storage_a
+        .start_sync(&lix_a)
+        .await
+        .expect("first sync starts");
+    let _sync_b = storage_b
+        .start_sync(&lix_b)
+        .await
+        .expect("second sync starts");
 
     write_file(&lix_a, "/from-a.txt", b"a".to_vec())
         .await
@@ -1036,78 +810,6 @@ where
         .execute(
             "SELECT content FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
-        )
-        .await?;
-    result
-        .rows()
-        .first()
-        .map(|row| row.get::<Vec<u8>>("content"))
-        .transpose()
-}
-
-fn native_file_writes(files: &[(&str, &[u8])]) -> Vec<(String, Blob)> {
-    files
-        .iter()
-        .map(|(path, data)| ((*path).to_string(), (*data).to_vec().into()))
-        .collect()
-}
-
-async fn active_branch_commit_id<StorageImpl>(lix: &Lix<StorageImpl>) -> String
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    lix.execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
-        .await
-        .expect("read active branch commit id")
-        .rows()
-        .first()
-        .expect("active branch commit id should have one row")
-        .get::<String>("commit_id")
-        .expect("active branch commit id should decode")
-}
-
-async fn assert_active_branch_head_parent<StorageImpl>(
-    lix: &Lix<StorageImpl>,
-    expected_parent: &str,
-) where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    let head = active_branch_commit_id(lix).await;
-    let result = lix
-        .execute(
-            "SELECT parent_id FROM lix_commit_edge WHERE child_id = $1",
-            &[Value::Text(head)],
-        )
-        .await
-        .expect("read active branch commit edge");
-    assert_eq!(
-        result.rows().len(),
-        1,
-        "a native file batch should create exactly one single-parent commit"
-    );
-    assert_eq!(
-        result.rows()[0]
-            .get::<String>("parent_id")
-            .expect("active branch parent id should decode"),
-        expected_parent
-    );
-}
-
-async fn read_file_by_branch<StorageImpl>(
-    lix: &Lix<StorageImpl>,
-    id: &str,
-    branch_id: &str,
-) -> Result<Option<Vec<u8>>, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    let result = lix
-        .execute(
-            "SELECT content FROM lix_file_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
-            &[
-                Value::Text(id.to_string()),
-                Value::Text(branch_id.to_string()),
-            ],
         )
         .await?;
     result
@@ -1587,7 +1289,7 @@ async fn filesystem_rejects_symlink_root() {
     std::fs::create_dir(tempdir.path().join("real-root")).unwrap();
     symlink("real-root", tempdir.path().join("linked-root")).unwrap();
 
-    let Err(error) = LocalFilesystem::open(tempdir.path().join("linked-root")).await else {
+    let Err(error) = LocalFilesystem::open(tempdir.path().join("linked-root")) else {
         panic!("symlink root should fail");
     };
 

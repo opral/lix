@@ -2171,6 +2171,7 @@ fn is_allowed_raw_execute_boundary_path(relative_path: &str) -> bool {
     is_owner_local_storage_path(relative_path)
         || relative_path.starts_with("sql")
         || relative_path.starts_with("execution")
+        || relative_path == "server_protocol/mod.rs"
         || relative_path == "transaction/buffered_write_transaction.rs"
 }
 

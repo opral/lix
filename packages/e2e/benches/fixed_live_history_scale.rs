@@ -6,10 +6,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::tracked_state::bench::seed_packed_history;
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
@@ -57,9 +57,9 @@ impl Display for Operation {
 
 struct Fixture<S>
 where
-    S: Storage + 'static,
+    S: Storage + Clone + Send + Sync + 'static,
 {
-    session: SessionContext<S>,
+    session: Lix<S>,
     live_rows: usize,
     sequence: usize,
     delete_paths: Vec<String>,
@@ -178,14 +178,15 @@ where
         history: usize,
         width: usize,
     ) -> (Self, SeedStats) {
-        Engine::initialize(storage.clone())
+        open_lix()
+            .with_storage(storage.clone())
             .await
             .expect("initialize repository");
-        let engine = Engine::new(storage.clone()).await.expect("open engine");
-        let session = engine
-            .open_session()
+        let lix = open_lix()
+            .with_storage(storage.clone())
             .await
-            .expect("open workspace");
+            .expect("open lix");
+        let session = lix.open_another_session().await.expect("open workspace");
         register_schema(&session).await;
         seed_live_rows(&session, live_rows).await;
 
@@ -378,7 +379,7 @@ async fn run_case<S>(
     }
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -404,7 +405,7 @@ where
         .expect("register schema");
 }
 
-async fn seed_live_rows<S>(session: &SessionContext<S>, live_rows: usize)
+async fn seed_live_rows<S>(session: &Lix<S>, live_rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

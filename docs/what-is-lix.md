@@ -14,7 +14,7 @@ Unlike Git, Lix tracks the entities inside files, not lines of text. See [How Li
 
 ## Prime use cases
 
-### Safe workspaces for agents
+### Safe repositories for agents
 
 Give each agent task its own branch. The agent can edit files and SQL rows without changing the main branch. Preview the result, then merge or discard it.
 
@@ -34,7 +34,8 @@ File plugins map parts of a file to rows. A row can represent a Markdown block, 
 
 <img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with entity, field, and value columns" width="760" />
 
-Apps read and write these rows with SQL. Lix records their history and writes changes back to normal files on disk.
+Apps read and write these rows with SQL. Lix records their history. With
+`LocalFilesystem`, it also writes changes back to normal files on disk.
 
 Diffs are semantic: review the clause, cell, or row that changed, not lines of text. See [Semantic Changes](./semantic-changes.md).
 
@@ -50,30 +51,13 @@ Storage is pluggable. Run Lix in memory, on the local filesystem, or against a s
 
 ## Local and remote
 
-Lix supports local and remote repositories with the same API.
+Lix supports local and remote repositories with the same API. Run it in your
+process for a local repository or connect to a Lix server for a shared
+repository. See [Persistence and Storage](./persistence.md) for setup examples.
 
-Run Lix on top of a local filesystem:
-
-```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
-});
-```
-
-Or connect to a Lix server:
-
-```ts
-const lix = await openLix({
-  server: {
-    mode: "remote",
-    url: "https://example.com/workspaces/acme",
-  },
-});
-```
-
-Remote clients get the same API: files, SQL, branches, and live queries. Clients on the same server see each other's changes live with `lix.observe()`.
+Remote clients use the same files, SQL, branches, and live queries. Clients on
+the same server see changes through `lix.observe()`. See
+[Real-time Collaboration](./realtime-collaboration.md) for a two-client example.
 
 ## Permissions (in development)
 
@@ -81,8 +65,10 @@ Permissions are on the roadmap. They will live inside the repository: per file, 
 
 ## Next
 
-- [Getting Started](./getting-started.md): open Lix, write data, create a branch, and merge it.
+- [Getting Started](./getting-started.md): choose the JavaScript or Rust quickstart.
 - [How Lix compares to Git](./comparison-to-git.md): files, databases, and version control side by side.
 - [Schemas](./schemas.md): define app rows and plugin entities.
 - [Semantic Changes](./semantic-changes.md): track changes inside files.
+- [Files and Media](./files-and-media.md): store text, binary files, and large media.
+- [Real-time Collaboration](./realtime-collaboration.md): connect two clients to one repository.
 - [Persistence](./persistence.md): choose a local or remote setup.

@@ -355,18 +355,24 @@ simulation_test!(
             rows,
             vec![
                 vec![
-                    Value::Json(serde_json::json!({
-                        "tenant": "acme",
-                        "id": "7"
-                    }).into()),
+                    Value::Json(
+                        serde_json::json!({
+                            "tenant": "acme",
+                            "id": "7"
+                        })
+                        .into()
+                    ),
                     Value::Null,
                     Value::Integer(0),
                 ],
                 vec![
-                    Value::Json(serde_json::json!({
-                        "tenant": "acme",
-                        "id": "7"
-                    }).into()),
+                    Value::Json(
+                        serde_json::json!({
+                            "tenant": "acme",
+                            "id": "7"
+                        })
+                        .into()
+                    ),
                     Value::Text("one".to_string()),
                     Value::Integer(1),
                 ],

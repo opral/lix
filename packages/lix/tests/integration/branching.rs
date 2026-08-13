@@ -1,6 +1,6 @@
 use crate::support;
 use lix::Value;
-use lix::integration::Engine;
+use lix::engine::Engine;
 use lix::{
     CreateBranchOptions, LixError, MergeBranchOptions, MergeBranchOutcome,
     MergeBranchPreviewOptions, MergeChangeStats, SwitchBranchOptions,
@@ -250,10 +250,7 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
 
@@ -348,7 +345,9 @@ simulation_test!(cannot_delete_repository_default_branch, |sim| async move {
         .expect_err("repository default branch deletion should fail");
 
     assert!(
-        error.message.contains("cannot delete repository default branch"),
+        error
+            .message
+            .contains("cannot delete repository default branch"),
         "unexpected error: {error:?}"
     );
 });
@@ -489,10 +488,7 @@ simulation_test!(
             .expect("draft head should load");
 
         let session_a = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         let session_b = sim.wrap_session(
@@ -582,10 +578,7 @@ simulation_test!(
             .expect("draft write should succeed");
 
         let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("session should open"),
+            engine.open_session().await.expect("session should open"),
             &engine,
         );
         session
@@ -900,9 +893,10 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[0].values(),
             &[
-                Value::Json(JsonValue::Array(vec![JsonValue::String(
-                    "draft-merge-source".to_string()
-                )]).into()),
+                Value::Json(
+                    JsonValue::Array(vec![JsonValue::String("draft-merge-source".to_string())])
+                        .into()
+                ),
                 Value::Text("added".to_string()),
             ],
             "the selected source delta must remain visible against the target checkpoint"
@@ -910,9 +904,10 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[1].values(),
             &[
-                Value::Json(JsonValue::Array(vec![JsonValue::String(
-                    "main-merge-target".to_string()
-                )]).into()),
+                Value::Json(
+                    JsonValue::Array(vec![JsonValue::String("main-merge-target".to_string())])
+                        .into()
+                ),
                 Value::Text("added".to_string()),
             ],
             "the target delta must remain visible against the target checkpoint"
@@ -1974,7 +1969,10 @@ async fn assert_key_value(
             assert_eq!(rows.len(), 1);
             let expected_json = serde_json::from_str::<JsonValue>(value)
                 .expect("expected key-value should be valid JSON");
-            assert_eq!(rows.rows()[0].values(), &[Value::Json(expected_json.into())]);
+            assert_eq!(
+                rows.rows()[0].values(),
+                &[Value::Json(expected_json.into())]
+            );
         }
         None => assert_eq!(rows.len(), 0),
     }
@@ -2213,7 +2211,11 @@ simulation_test!(
             )
             .await
             .expect("working diff should load");
-        assert_eq!(rows.len(), 1, "the edited row must appear in the working diff");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the edited row must appear in the working diff"
+        );
         let values = rows.rows()[0].values().to_vec();
         assert!(
             matches!(&values[1], Value::Text(_)),
@@ -2325,7 +2327,11 @@ simulation_test!(
             )
             .await
             .expect("working diff should load");
-        assert_eq!(rows.len(), 1, "the edited row must appear in the working diff");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the edited row must appear in the working diff"
+        );
         let values = rows.rows()[0].values().to_vec();
         assert!(
             matches!(&values[1], Value::Text(_)),
@@ -2396,7 +2402,11 @@ simulation_test!(
             broad.len(),
             1,
             "the deleted row must also appear in the unfiltered working diff, got {:?}",
-            broad.rows().iter().map(|row| row.values().to_vec()).collect::<Vec<_>>()
+            broad
+                .rows()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
         );
     }
 );
@@ -2475,24 +2485,24 @@ simulation_test!(
             actual,
             vec![
                 vec![
-                    Value::Json(JsonValue::Array(vec![JsonValue::String(
-                        "branch-broad-a".to_string()
-                    )])
-                    .into()),
+                    Value::Json(
+                        JsonValue::Array(vec![JsonValue::String("branch-broad-a".to_string())])
+                            .into()
+                    ),
                     Value::Text("modified".to_string()),
                 ],
                 vec![
-                    Value::Json(JsonValue::Array(vec![JsonValue::String(
-                        "branch-broad-b".to_string()
-                    )])
-                    .into()),
+                    Value::Json(
+                        JsonValue::Array(vec![JsonValue::String("branch-broad-b".to_string())])
+                            .into()
+                    ),
                     Value::Text("modified".to_string()),
                 ],
                 vec![
-                    Value::Json(JsonValue::Array(vec![JsonValue::String(
-                        "branch-broad-new".to_string()
-                    )])
-                    .into()),
+                    Value::Json(
+                        JsonValue::Array(vec![JsonValue::String("branch-broad-new".to_string())])
+                            .into()
+                    ),
                     Value::Text("added".to_string()),
                 ],
             ],
@@ -2554,7 +2564,10 @@ simulation_test!(
             rows.len(),
             0,
             "restoring the checkpoint payload must be net empty, got {:?}",
-            rows.rows().iter().map(|row| row.values().to_vec()).collect::<Vec<_>>()
+            rows.rows()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
         );
     }
 );
@@ -2656,7 +2669,11 @@ simulation_test!(
             )
             .await
             .expect("working diff should load");
-        assert_eq!(rows.len(), 0, "a fresh checkpoint has an empty working diff");
+        assert_eq!(
+            rows.len(),
+            0,
+            "a fresh checkpoint has an empty working diff"
+        );
     }
 );
 

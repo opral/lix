@@ -20,7 +20,7 @@ mod create_branch;
 mod execute;
 mod gc;
 pub(crate) mod idempotency;
-mod media_upload;
+pub(crate) mod media_upload;
 mod merge;
 pub(crate) mod observe;
 mod switch_branch;
@@ -34,22 +34,20 @@ pub(crate) use merge::{MergeCommitsForBench, analyze_merge_for_bench};
 // which is compiled in every configuration.
 pub(crate) use media_upload::{UPLOAD_MANIFEST_LEAF_SPACE, UPLOAD_STATE_SPACE};
 
-pub use crate::common::{
-    ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance, VerifiedRequestBlob,
-};
+pub(crate) use crate::common::{ExecuteStatementMetadata, VerifiedRequestBlob};
 pub use checkpoint::CreateCheckpointReceipt;
-pub use context::SessionContext;
 pub(crate) use context::SessionBranch;
+pub use context::SessionContext;
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
-    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecutionDisposition,
-    FileRead, Row, RowRef, TryFromValue,
+    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Row, RowRef, TryFromValue,
 };
-pub use idempotency::ExecuteIdempotency;
+pub(crate) use execute::{ExecutionDisposition, FileRead};
+pub(crate) use idempotency::ExecuteIdempotency;
 pub(crate) use idempotency::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotencyReceipt, encode_receipt,
 };
-pub use media_upload::{FILE_UPLOAD_PART_BYTES, FileUploadProgress};
+pub(crate) use media_upload::FileUploadProgress;
 pub use merge::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
     MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,

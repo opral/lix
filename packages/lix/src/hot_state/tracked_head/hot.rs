@@ -160,8 +160,7 @@ pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace:
     ValueSemantics::Mutable,
 );
 const DEFERRED_FRESH_HOT_ROWS_PER_PAGE: usize = 4_096;
-const DEFERRED_FRESH_HOT_SPACES: [StorageSpace; 3] =
-    [ROW_SPACE, FILE_SPACE, DIFF_SPACE];
+const DEFERRED_FRESH_HOT_SPACES: [StorageSpace; 3] = [ROW_SPACE, FILE_SPACE, DIFF_SPACE];
 
 pub(crate) struct DeferredFreshHotRowRef<'a> {
     pub(crate) branch_id: &'a str,
@@ -864,7 +863,9 @@ fn certified_manifest_content_offset(
         }
     }
     if offset > value.len() {
-        return Err(head_value_error("certified manifest content key is truncated"));
+        return Err(head_value_error(
+            "certified manifest content key is truncated",
+        ));
     }
     Ok(matched.then_some(offset))
 }
@@ -1305,7 +1306,8 @@ pub(crate) async fn scan_certified_history_rows(
         loop {
             let (page, has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?.into_parts();
+                .await?
+                .into_parts();
             for entry in page {
                 let value = full_value_bytes(entry.value)?;
                 if certified_batch_commit_id(&value)? != *commit_id {
@@ -3181,7 +3183,8 @@ async fn packed_exclusive_schema_base_refs(
     loop {
         let (page, has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
@@ -3256,7 +3259,8 @@ async fn packed_current_base_refs(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let bytes = entry.key.0.as_ref();
             if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
@@ -3327,7 +3331,8 @@ async fn stage_retire_packed_current_bases(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             writes.delete(PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, entry.key);
         }
@@ -4929,7 +4934,8 @@ where
         loop {
             let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?.into_parts();
+                .await?
+                .into_parts();
             for entry in page {
                 let raw_key = entry.key.0;
                 let raw_value = full_value_bytes(entry.value)?;
@@ -5096,10 +5102,7 @@ where
             return Ok(None);
         }
         let witness = StorageKey(Bytes::from(encode_hot_index_witness_key(
-            branch_id,
-            generation,
-            schema_key,
-            ordinal,
+            branch_id, generation, schema_key, ordinal,
         )));
         let present = PointReadPlan::new(INDEX_SPACE, &[witness])
             .materialize(&self.store, StorageGetOptions::default())
@@ -5121,21 +5124,13 @@ where
         for value in values {
             let range = StoragePrefix {
                 bytes: Bytes::from(hot_index_value_prefix(
-                    branch_id,
-                    generation,
-                    schema_key,
-                    ordinal,
-                    value,
+                    branch_id, generation, schema_key, ordinal, value,
                 )),
             }
             .to_range()?;
             let mut cursor = self
                 .store
-                .begin_scan(
-                    INDEX_SPACE,
-                    range,
-                    StorageBeginScanOptions::default(),
-                )
+                .begin_scan(INDEX_SPACE, range, StorageBeginScanOptions::default())
                 .await?;
             loop {
                 // Never read more than one entry past the budget: the extra
@@ -6223,7 +6218,8 @@ where
         controls: &[(String, BranchHeadControl)],
     ) -> Result<Vec<JsonRef>, LixError> {
         let mut refs = BTreeSet::new();
-        self.collect_hot_json_refs(controls, true, &mut refs).await?;
+        self.collect_hot_json_refs(controls, true, &mut refs)
+            .await?;
         Ok(refs.into_iter().map(JsonRef::from_hash_bytes).collect())
     }
 
@@ -8058,9 +8054,10 @@ where
         // the one affected control from its pre-image plus the values staged
         // here. Bounded by that scope, not by the branch's untracked
         // population.
-        if sorted.iter().any(|delta| {
-            scope_requires_exact_closure(branch_id, delta.schema_key, delta.file_id)
-        }) {
+        if sorted
+            .iter()
+            .any(|delta| scope_requires_exact_closure(branch_id, delta.schema_key, delta.file_id))
+        {
             let staged = sorted
                 .iter()
                 .zip(&next_value_ranges)
@@ -8074,7 +8071,9 @@ where
                             entity_pk: delta.entity_pk.clone(),
                             file_id: delta.file_id.map(str::to_owned),
                         },
-                        range.as_ref().map(|range| next_value_bytes.slice(range.clone())),
+                        range
+                            .as_ref()
+                            .map(|range| next_value_bytes.slice(range.clone())),
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
@@ -10151,7 +10150,8 @@ async fn hot_load_file_scope_identities(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let row = decode_hot_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
             if !row
@@ -10425,7 +10425,8 @@ async fn hot_working_diff_entries(
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let Ok(bytes) = full_value_bytes(entry.value) else {
                 return Ok(None);
@@ -11271,7 +11272,8 @@ async fn scan_hot_file_entries(
         loop {
             let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?.into_parts();
+                .await?
+                .into_parts();
             for entry in page {
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
@@ -11618,7 +11620,6 @@ fn decode_hot_scan_row_key_in_scope(key: Bytes, scope: &[u8]) -> Result<HotScanI
     })
 }
 
-
 /// Test-only shim; see `crate::order_preserving_key::tests`.
 #[cfg(test)]
 pub(crate) fn hot_decode_entity_pk_probe(bytes: &[u8]) -> Option<(EntityPk, usize)> {
@@ -11900,7 +11901,9 @@ pub(crate) async fn stage_hot_index_entries(
             .or_default() += 1;
     }
     for collection in witnessed_collections {
-        published_by_collection.entry(collection.clone()).or_default();
+        published_by_collection
+            .entry(collection.clone())
+            .or_default();
     }
     if published_by_collection.is_empty() {
         return Ok(());
@@ -11912,10 +11915,7 @@ pub(crate) async fn stage_hot_index_entries(
         .keys()
         .map(|(schema_key, ordinal)| {
             StorageKey(Bytes::from(encode_hot_index_witness_key(
-                branch_id,
-                generation,
-                schema_key,
-                *ordinal,
+                branch_id, generation, schema_key, *ordinal,
             )))
         })
         .collect::<Vec<_>>();
@@ -12326,7 +12326,8 @@ where
         loop {
             let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-                .await?.into_parts();
+                .await?
+                .into_parts();
             for entry in page {
                 if declared.contains(entry.key.0.as_ref()) {
                     continue;
@@ -12361,7 +12362,8 @@ where
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
+            .await?
+            .into_parts();
         for entry in page {
             let keep = match full_value_bytes(entry.value) {
                 Ok(bytes) if bytes.is_empty() => decode_hot_diff_key(entry.key.0.as_ref())
@@ -12437,11 +12439,9 @@ where
     loop {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?.into_parts();
-        writes.delete_batch(
-            DIFF_SPACE,
-            page.into_iter().map(|entry| entry.key),
-        );
+            .await?
+            .into_parts();
+        writes.delete_batch(DIFF_SPACE, page.into_iter().map(|entry| entry.key));
         if !page_has_more {
             break;
         }
@@ -13126,7 +13126,10 @@ mod tests {
                 encoded_test_hot_value(old_generation, false, false),
             ),
             // History-free: the fence cannot speak about it.
-            (untracked.clone(), encoded_test_hot_value(generation, true, false)),
+            (
+                untracked.clone(),
+                encoded_test_hot_value(generation, true, false),
+            ),
             (marker, encoded_test_hot_value(fence_commit, false, false)),
         ]);
 
@@ -13934,7 +13937,7 @@ mod tests {
         assert_eq!(deletion_writes.stats().staged_deletes, 0);
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn checkpoint_retires_materialized_packed_bases_in_active_generation() {
         const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000c9";
         const COMMIT_LABEL: &str = "checkpoint-packed-base";
@@ -15711,7 +15714,8 @@ mod tests {
         let (page, page_has_more) = cursor
             .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
             .await
-            .expect("scan segmented hot diff").into_parts();
+            .expect("scan segmented hot diff")
+            .into_parts();
         assert!(!page_has_more);
 
         let mut actual_coverage = WorkingDiffIndexCoverage::default();
@@ -16135,7 +16139,10 @@ mod tests {
         assert_eq!(hot_index_candidate_budget(20_000), 10_000);
         // The guard must not overflow into a permissive budget on a plane
         // whose count is nonsense.
-        assert_eq!(hot_index_candidate_budget(u64::MAX), (u64::MAX / 2) as usize);
+        assert_eq!(
+            hot_index_candidate_budget(u64::MAX),
+            (u64::MAX / 2) as usize
+        );
     }
 
     /// Every arm of the measurement that motivated the guard, classified by the
@@ -16146,7 +16153,8 @@ mod tests {
     fn the_budget_refuses_exactly_the_buckets_that_lost_to_the_scan() {
         for (entries_published, bucket, expected_served) in [
             // arm            plane    bucket  index route beat the scan?
-            /* fresh      */ (1_u64, 1_usize, true),
+            /* fresh      */
+            (1_u64, 1_usize, true),
             /* write 10   */ (11, 10, true),
             /* write 100  */ (101, 100, false),
             /* write 1000 */ (1_001, 1_000, false),
@@ -16168,7 +16176,10 @@ mod tests {
 
     #[test]
     fn a_witness_round_trips_its_published_count() {
-        assert_eq!(decode_hot_index_witness(&encode_hot_index_witness(0)), Some(0));
+        assert_eq!(
+            decode_hot_index_witness(&encode_hot_index_witness(0)),
+            Some(0)
+        );
         assert_eq!(
             decode_hot_index_witness(&encode_hot_index_witness(7_919)),
             Some(7_919)
@@ -16590,15 +16601,14 @@ mod tests {
             assert!(record.is_none(), "inactive hot record must be reclaimed");
         }
 
-        let active_record =
-            PointReadPlan::new(DIFF_SPACE, &[StorageKey(Bytes::from(active_key))])
-                .materialize(&read, StorageGetOptions::default())
-                .await
-                .expect("read active hot record")
-                .value
-                .into_iter()
-                .next()
-                .flatten();
+        let active_record = PointReadPlan::new(DIFF_SPACE, &[StorageKey(Bytes::from(active_key))])
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("read active hot record")
+            .value
+            .into_iter()
+            .next()
+            .flatten();
         assert!(active_record.is_some(), "active hot record must survive GC");
     }
 }

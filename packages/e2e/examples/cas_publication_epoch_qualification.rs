@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_bench::{
     binary_cas_write_accounting, reset_binary_cas_write_accounting,
     take_crud_physical_write_accounting,
 };
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
@@ -211,16 +211,10 @@ async fn run<S>(
 ) where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let initialized = Engine::initialize(storage.clone())
-        .await
-        .expect("initialize publication repository");
-    let engine = Engine::new(storage)
+    let session = open_lix()
+        .with_storage(storage)
         .await
         .expect("open publication repository");
-    let session = engine
-        .open_session_at(initialized.main_branch_id)
-        .await
-        .expect("open publication session");
     let stable_1k = deterministic_bytes(KIB, 1);
     let stable_64m = deterministic_bytes(64 * MIB, 2);
     publish(&session, "/epoch-seed-1k.bin", stable_1k.clone()).await;
@@ -290,7 +284,7 @@ async fn run<S>(
     }
 }
 
-async fn publish<S>(session: &SessionContext<S>, path: &str, payload: Vec<u8>)
+async fn publish<S>(session: &Lix<S>, path: &str, payload: Vec<u8>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

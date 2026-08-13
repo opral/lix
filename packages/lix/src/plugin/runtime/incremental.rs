@@ -3741,6 +3741,14 @@ mod tests {
         .expect("cross-file provenance is only an optimization miss");
         assert!(!fallback.used_transport_provenance);
         assert_eq!(fallback.after_sha256, None);
+        assert_eq!(
+            fallback.edits,
+            vec![WasmInputSplice {
+                offset: 0,
+                delete_len: before.len() as u64,
+                insert: WasmInputBytes::Inline(after.to_vec()),
+            }]
+        );
     }
 
     #[test]

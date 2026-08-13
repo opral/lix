@@ -120,7 +120,6 @@ pub struct CapacityReport {
     pub wave_p95_ms: f64,
     pub schedule_lag_p95_ms: f64,
     pub total_ms: f64,
-    pub resolver_calls: u64,
     pub resources: CapacityResourceCounters,
     pub backend_resources: BTreeMap<String, u64>,
 }
@@ -151,8 +150,6 @@ pub trait CollaborationCapacityBackend {
     async fn await_convergence(&mut self, marker: &[u8], wave_started: Instant) -> Vec<Duration>;
 
     async fn assert_final_state(&self, expected_tokens: &[String]);
-
-    fn resolver_calls(&self) -> u64;
 
     fn resource_counters(&self) -> BTreeMap<String, u64> {
         BTreeMap::new()
@@ -225,11 +222,6 @@ where
     }
 
     backend.assert_final_state(&expected_tokens).await;
-    let resolver_calls = backend.resolver_calls();
-    assert!(
-        resolver_calls > 0,
-        "overlap workload must invoke the plugin resolver"
-    );
     service_latencies.sort_unstable();
     convergence_latencies.sort_unstable();
     wave_latencies.sort_unstable();
@@ -261,7 +253,6 @@ where
         wave_p95_ms: millis(percentile(&wave_latencies, 95)),
         schedule_lag_p95_ms: millis(percentile(&schedule_lags, 95)),
         total_ms: millis(run_started.elapsed()),
-        resolver_calls,
         resources,
         backend_resources: backend.resource_counters(),
     }

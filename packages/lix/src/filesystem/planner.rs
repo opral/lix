@@ -1592,41 +1592,42 @@ pub(crate) fn directory_path_resolvers_for_paths<'a>(
     let mut files = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
     let mut seen_paths = BTreeSet::<String>::new();
 
-    let absorb = |entry: &super::path_index::FilesystemPathEntry,
-                      seeds: &mut BTreeMap<String, BTreeMap<String, DirectoryDescriptorSeed>>,
-                      files: &mut BTreeMap<String, Vec<(Option<String>, String, String)>>| {
-        let key = &entry.key;
-        let storage_branch_id = if key.global() {
-            GLOBAL_BRANCH_ID
-        } else {
-            key.branch_id()
+    let absorb =
+        |entry: &super::path_index::FilesystemPathEntry,
+         seeds: &mut BTreeMap<String, BTreeMap<String, DirectoryDescriptorSeed>>,
+         files: &mut BTreeMap<String, Vec<(Option<String>, String, String)>>| {
+            let key = &entry.key;
+            let storage_branch_id = if key.global() {
+                GLOBAL_BRANCH_ID
+            } else {
+                key.branch_id()
+            };
+            let resolver_key = filesystem_storage_scope_key(
+                storage_branch_id,
+                key.global(),
+                key.is_untracked(),
+                key.file_id(),
+            );
+            match entry.kind {
+                super::path_index::FilesystemPathKind::Directory => {
+                    seeds.entry(resolver_key).or_default().insert(
+                        entry.id().to_string(),
+                        DirectoryDescriptorSeed {
+                            id: entry.id().to_string(),
+                            parent_id: entry.parent_id.clone(),
+                            name: entry.name.clone(),
+                        },
+                    );
+                }
+                super::path_index::FilesystemPathKind::File => {
+                    files.entry(resolver_key).or_default().push((
+                        entry.parent_id.clone(),
+                        entry.name.clone(),
+                        entry.id().to_string(),
+                    ));
+                }
+            }
         };
-        let resolver_key = filesystem_storage_scope_key(
-            storage_branch_id,
-            key.global(),
-            key.is_untracked(),
-            key.file_id(),
-        );
-        match entry.kind {
-            super::path_index::FilesystemPathKind::Directory => {
-                seeds.entry(resolver_key).or_default().insert(
-                    entry.id().to_string(),
-                    DirectoryDescriptorSeed {
-                        id: entry.id().to_string(),
-                        parent_id: entry.parent_id.clone(),
-                        name: entry.name.clone(),
-                    },
-                );
-            }
-            super::path_index::FilesystemPathKind::File => {
-                files.entry(resolver_key).or_default().push((
-                    entry.parent_id.clone(),
-                    entry.name.clone(),
-                    entry.id().to_string(),
-                ));
-            }
-        }
-    };
 
     for path in paths {
         let segments = path.segments().map(ToOwned::to_owned).collect::<Vec<_>>();

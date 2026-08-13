@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::{fmt::Write as _, ops::Range};
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, ExecuteResult, PreparedDmlParameterBatch, Value};
+use lix::{ExecuteBatchStatement, ExecuteResult, LixError, Value};
+use lix::{Lix, open_lix};
 
 #[cfg(feature = "slatedb")]
 use crate::storage::SlateDB;
@@ -27,7 +27,58 @@ const GENERAL_FILTER_SORT_SQL: &str =
     "SELECT path, value FROM json_pointer WHERE path IS NOT NULL ORDER BY value, path";
 const GENERAL_AGGREGATE_SQL: &str = "SELECT COUNT(*) AS rows, MIN(path) AS first_path, MAX(path) AS last_path \
     FROM json_pointer WHERE path IS NOT NULL";
-type SharedParameterBatch = PreparedDmlParameterBatch;
+#[derive(Clone, Default)]
+struct SharedParameterBatch {
+    rows: Arc<[Vec<Value>]>,
+}
+
+impl SharedParameterBatch {
+    fn from_rows(rows: impl IntoIterator<Item = Vec<Value>>) -> Result<Self, LixError> {
+        let rows = rows.into_iter().collect::<Vec<_>>();
+        if let Some(width) = rows.first().map(Vec::len)
+            && rows.iter().any(|row| row.len() != width)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "SQL parameter batch must be rectangular",
+            ));
+        }
+        Ok(Self { rows: rows.into() })
+    }
+
+    fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row_values(&self, index: usize) -> Result<Vec<Value>, LixError> {
+        self.rows.get(index).cloned().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("SQL parameter row {index} is out of bounds"),
+            )
+        })
+    }
+}
+
+async fn execute_parameter_batch<S>(
+    lix: &Lix<S>,
+    sql: Arc<str>,
+    parameters: SharedParameterBatch,
+) -> Result<Vec<ExecuteResult>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let statements = parameters
+        .rows
+        .iter()
+        .map(|params| ExecuteBatchStatement {
+            label: None,
+            sql: sql.to_string(),
+            params: params.clone(),
+        })
+        .collect::<Vec<_>>();
+    lix.execute_batch(&statements).await
+}
 
 /// Folds one public cell into an accumulator, reading the whole payload.
 ///
@@ -57,7 +108,7 @@ fn fold_value(accumulator: u64, value: &Value) -> u64 {
 }
 
 fn empty_parameter_batch() -> SharedParameterBatch {
-    PreparedDmlParameterBatch::from_rows(std::iter::empty::<Vec<Value>>())
+    SharedParameterBatch::from_rows(std::iter::empty::<Vec<Value>>())
         .expect("empty prepared parameter batch is valid")
 }
 
@@ -219,8 +270,8 @@ pub(crate) enum SqlFixture {
     SlateDB(GenericSqlFixture<SlateDB>),
 }
 
-pub(crate) struct GenericSqlFixture<StorageImpl: Storage + 'static> {
-    session: SessionContext<StorageImpl>,
+pub(crate) struct GenericSqlFixture<StorageImpl: Storage + Clone + Send + Sync + 'static> {
+    session: Lix<StorageImpl>,
     /// Number of tracked fixture rows. In mixed mode the untracked probe
     /// replaces one of the requested rows rather than adding a 10,001st row.
     row_count: usize,
@@ -524,20 +575,6 @@ impl SqlFixture {
         }
     }
 
-    /// Executes one typed OLAP query through the profiled public session path.
-    /// In the count-only ceiling mode the engine intentionally returns no
-    /// public rows, so the profile's retained Arrow row count is the result.
-    pub(crate) async fn read_olap_profiled(
-        &self,
-        shape: OlapReadShape,
-    ) -> (usize, lix::SqlReadProfile) {
-        match self {
-            Self::RocksDB(fixture) => fixture.read_olap_profiled(shape).await,
-            #[cfg(feature = "slatedb")]
-            Self::SlateDB(fixture) => fixture.read_olap_profiled(shape).await,
-        }
-    }
-
     async fn read_olap_timed(&self, shape: OlapReadShape) -> usize {
         match self {
             Self::RocksDB(fixture) => fixture.read_olap_timed(shape).await,
@@ -680,7 +717,7 @@ where
     }
 
     fn install_bound_seed_batch(&mut self, rows: Vec<WorkloadRow>) {
-        self.bound_seed_json_batch = PreparedDmlParameterBatch::from_rows(
+        self.bound_seed_json_batch = SharedParameterBatch::from_rows(
             rows.into_iter()
                 .take(self.row_count)
                 .map(|row| vec![Value::Text(row.path), Value::Text(row.value_json)]),
@@ -689,7 +726,7 @@ where
     }
 
     fn install_bound_update_batch(&mut self, rows: Vec<UpdateWorkloadRow>) {
-        self.bound_update_all_batch = PreparedDmlParameterBatch::from_rows(
+        self.bound_update_all_batch = SharedParameterBatch::from_rows(
             rows.into_iter()
                 .take(self.row_count)
                 .map(|row| vec![Value::Text(row.updated_value_json), Value::Text(row.path)]),
@@ -699,30 +736,17 @@ where
 
     #[expect(clippy::cast_possible_truncation)]
     async fn insert_all(&self) -> usize {
-        let before = lix::storage_bench::certified_entity_insert_parameter_batch_counters();
-        let affected = self
-            .session
-            .execute_prepared_dml_batch(
-                Arc::from(BOUND_INSERT_ALL_SQL),
-                self.bound_insert_all_batch.clone(),
-            )
-            .await
-            .expect("execute tracked-state CRUD bound insert batch")
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
+        let affected = execute_parameter_batch(
+            &self.session,
+            Arc::from(BOUND_INSERT_ALL_SQL),
+            self.bound_insert_all_batch.clone(),
+        )
+        .await
+        .expect("execute tracked-state CRUD bound insert batch")
+        .iter()
+        .map(ExecuteResult::rows_affected)
+        .sum::<u64>();
         assert_eq!(affected as usize, self.row_count);
-        let after = lix::storage_bench::certified_entity_insert_parameter_batch_counters();
-        assert_eq!(
-            after.certifications.saturating_sub(before.certifications),
-            1,
-            "tracked-state CRUD insert benchmark must certify one parameter batch per fixture"
-        );
-        assert_eq!(
-            after.executions.saturating_sub(before.executions),
-            1,
-            "tracked-state CRUD insert benchmark must physically execute one certified parameter batch per fixture"
-        );
         affected as usize
     }
 
@@ -775,17 +799,16 @@ where
             self.seed_olap_rows().await;
             return;
         }
-        let affected = self
-            .session
-            .execute_prepared_dml_batch(
-                Arc::from(BOUND_SEED_JSON_SQL),
-                self.bound_seed_json_batch.clone(),
-            )
-            .await
-            .expect("execute tracked-state CRUD generated JSON seed batch")
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
+        let affected = execute_parameter_batch(
+            &self.session,
+            Arc::from(BOUND_SEED_JSON_SQL),
+            self.bound_seed_json_batch.clone(),
+        )
+        .await
+        .expect("execute tracked-state CRUD generated JSON seed batch")
+        .iter()
+        .map(ExecuteResult::rows_affected)
+        .sum::<u64>();
         assert_eq!(affected as usize, self.row_count);
     }
 
@@ -861,20 +884,17 @@ where
                 mutation_count(self.row_count, 1, stride),
             ),
         ] {
-            let affected = self
-                .session
-                .execute_prepared_dml_batch(
-                    Arc::from(sql),
-                    PreparedDmlParameterBatch::from_rows(parameter_rows)
-                        .expect("OLAP parameter batch is rectangular"),
-                )
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("execute typed OLAP mutation batch '{sql}': {error:?}")
-                })
-                .iter()
-                .map(ExecuteResult::rows_affected)
-                .sum::<u64>();
+            let affected = execute_parameter_batch(
+                &self.session,
+                Arc::from(sql),
+                SharedParameterBatch::from_rows(parameter_rows)
+                    .expect("OLAP parameter batch is rectangular"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("execute typed OLAP mutation batch '{sql}': {error:?}"))
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
             assert_eq!(
                 usize::try_from(affected).expect("OLAP mutation count fits usize"),
                 expected_affected
@@ -979,40 +999,6 @@ where
             OlapReadShape::Join => assert_olap_join(&result, expected),
         }
         result.len()
-    }
-
-    async fn read_olap_profiled(&self, shape: OlapReadShape) -> (usize, lix::SqlReadProfile) {
-        let expected = self
-            .olap_expected
-            .as_ref()
-            .expect("typed OLAP query requires a typed OLAP fixture");
-        let (result, profile) = self
-            .session
-            .execute_profiled(shape.sql(), &[])
-            .await
-            .expect("profile typed OLAP query");
-        let expected_len = match shape {
-            OlapReadShape::Scan => expected.visible_rows,
-            OlapReadShape::Filter => expected.filtered_rows,
-            OlapReadShape::Sort => 10_000.min(expected.active_rows as usize),
-            OlapReadShape::Group => expected.groups.len(),
-            OlapReadShape::Aggregate => 1,
-            OlapReadShape::Join => expected.active_rows as usize,
-        };
-        if profile.result_count_only_rows > 0 {
-            assert_eq!(profile.result_count_only_rows as usize, expected_len);
-            (expected_len, profile)
-        } else {
-            match shape {
-                OlapReadShape::Scan => assert_olap_scan(&result, expected),
-                OlapReadShape::Filter => assert_olap_filter(&result, expected),
-                OlapReadShape::Sort => assert_olap_sort(&result, expected),
-                OlapReadShape::Group => assert_olap_group(&result, expected),
-                OlapReadShape::Aggregate => assert_olap_aggregate(&result, expected),
-                OlapReadShape::Join => assert_olap_join(&result, expected),
-            }
-            (result.len(), profile)
-        }
     }
 
     async fn read_olap_timed(&self, shape: OlapReadShape) -> usize {
@@ -1125,14 +1111,16 @@ where
                 .into_iter()
                 .map(|result| result.rows_affected())
                 .sum(),
-            UpdateWorkload::PreparedDml(parameter_rows) => self
-                .session
-                .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows.clone())
-                .await
-                .expect("execute tracked-state CRUD prepared DML batch")
-                .into_iter()
-                .map(|result| result.rows_affected())
-                .sum(),
+            UpdateWorkload::PreparedDml(parameter_rows) => execute_parameter_batch(
+                &self.session,
+                Arc::from(BOUND_UPDATE_ALL_SQL),
+                parameter_rows.clone(),
+            )
+            .await
+            .expect("execute tracked-state CRUD SQL parameter batch")
+            .into_iter()
+            .map(|result| result.rows_affected())
+            .sum(),
         };
         assert_eq!(affected as usize, expected_rows);
         affected as usize
@@ -1152,16 +1140,18 @@ where
         let parameter_batch = if row_count == self.bound_update_all_batch.row_count() {
             self.bound_update_all_batch.clone()
         } else {
-            PreparedDmlParameterBatch::from_rows(
+            SharedParameterBatch::from_rows(
                 (0..row_count).map(|row| self.bound_update_all_batch.row_values(row).unwrap()),
             )
             .expect("bounded update parameter batch is rectangular")
         };
-        let results = self
-            .session
-            .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_batch)
-            .await
-            .expect("execute tracked-state CRUD bound update batch");
+        let results = execute_parameter_batch(
+            &self.session,
+            Arc::from(BOUND_UPDATE_ALL_SQL),
+            parameter_batch,
+        )
+        .await
+        .expect("execute tracked-state CRUD bound update batch");
         let affected = results
             .iter()
             .map(ExecuteResult::rows_affected)
@@ -1185,17 +1175,19 @@ where
                 .map(|index| index * last / (row_count - 1))
                 .collect::<Vec<_>>()
         };
-        let parameter_batch = PreparedDmlParameterBatch::from_rows(
+        let parameter_batch = SharedParameterBatch::from_rows(
             indices
                 .into_iter()
                 .map(|row| self.bound_update_all_batch.row_values(row).unwrap()),
         )
         .expect("spread update parameter batch is rectangular");
-        let results = self
-            .session
-            .execute_prepared_dml_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_batch)
-            .await
-            .expect("execute spread tracked-state CRUD bound update batch");
+        let results = execute_parameter_batch(
+            &self.session,
+            Arc::from(BOUND_UPDATE_ALL_SQL),
+            parameter_batch,
+        )
+        .await
+        .expect("execute spread tracked-state CRUD bound update batch");
         let affected = results
             .iter()
             .map(ExecuteResult::rows_affected)
@@ -1233,7 +1225,7 @@ where
 }
 
 fn fixture_for_session<StorageImpl>(
-    session: SessionContext<StorageImpl>,
+    session: Lix<StorageImpl>,
     rows: &[WorkloadRow],
     read_many_by_pk_count: usize,
     untracked_fixture: UntrackedFixture,
@@ -1241,7 +1233,7 @@ fn fixture_for_session<StorageImpl>(
     dir: tempfile::TempDir,
 ) -> GenericSqlFixture<StorageImpl>
 where
-    StorageImpl: Storage,
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let tracked_rows = if untracked_fixture == UntrackedFixture::OneReadManyMember {
         // The untracked probe occupies one selected identity, so keep the
@@ -1266,7 +1258,7 @@ where
         untracked_fixture,
         read_many_by_pk_count,
         bound_insert_all_batch: if matches!(shape, FixtureShape::FullCrud) {
-            PreparedDmlParameterBatch::from_rows(tracked_rows.iter().map(|row| {
+            SharedParameterBatch::from_rows(tracked_rows.iter().map(|row| {
                 vec![
                     Value::Text(row.path.clone()),
                     Value::Text(row.value_json.clone()),
@@ -1277,7 +1269,7 @@ where
             empty_parameter_batch()
         },
         bound_seed_json_batch: if matches!(shape, FixtureShape::FullCrud) {
-            PreparedDmlParameterBatch::from_rows(tracked_rows.iter().map(|row| {
+            SharedParameterBatch::from_rows(tracked_rows.iter().map(|row| {
                 vec![
                     Value::Text(row.path.clone()),
                     Value::Text(row.value_json.clone()),
@@ -1298,7 +1290,7 @@ where
         update_one_by_pk_sql: update_row_sql(&tracked_rows[mid]),
         update_all_workload: update_workload(shape, tracked_rows),
         bound_update_all_batch: if matches!(shape, FixtureShape::FullCrud) {
-            PreparedDmlParameterBatch::from_rows(tracked_rows.iter().map(|row| {
+            SharedParameterBatch::from_rows(tracked_rows.iter().map(|row| {
                 vec![
                     Value::Text(row.updated_value_json.clone()),
                     Value::Text(row.path.clone()),
@@ -1726,7 +1718,7 @@ fn update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> UpdateWorkload 
 }
 
 fn prepared_update_rows(rows: &[WorkloadRow]) -> SharedParameterBatch {
-    PreparedDmlParameterBatch::from_rows(rows.iter().map(|row| {
+    SharedParameterBatch::from_rows(rows.iter().map(|row| {
         vec![
             Value::Text(row.updated_value_json.clone()),
             Value::Text(row.path.clone()),
@@ -1792,18 +1784,20 @@ pub(crate) fn selected_olap_mutation_profile() -> OlapMutationProfile {
     }
 }
 
-async fn prepare_session<StorageImpl>(storage: StorageImpl) -> SessionContext<StorageImpl>
+async fn prepare_session<StorageImpl>(storage: StorageImpl) -> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize tracked-state crud storage");
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("open tracked-state crud engine");
-    let session = engine
-        .open_session()
+        .expect("open tracked-state crud lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open tracked-state crud session");
     register_json_pointer_schema(&session).await;
@@ -1812,7 +1806,7 @@ where
     session
 }
 
-async fn register_json_pointer_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
+async fn register_json_pointer_schema<StorageImpl>(session: &Lix<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -1840,7 +1834,7 @@ where
     assert_eq!(affected, 1);
 }
 
-async fn register_bulk_insert_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
+async fn register_bulk_insert_schema<StorageImpl>(session: &Lix<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -1866,7 +1860,7 @@ where
     assert_eq!(affected, 1);
 }
 
-async fn register_olap_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
+async fn register_olap_schema<StorageImpl>(session: &Lix<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -1895,7 +1889,7 @@ where
     assert_eq!(affected, 1);
 }
 
-async fn execute<StorageImpl>(session: &SessionContext<StorageImpl>, sql: &str) -> ExecuteResult
+async fn execute<StorageImpl>(session: &Lix<StorageImpl>, sql: &str) -> ExecuteResult
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {

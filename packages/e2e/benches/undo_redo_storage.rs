@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
@@ -28,6 +27,7 @@ use lix::storage_bench::{
     take_crud_physical_write_accounting,
 };
 use lix::{ExecuteBatchStatement, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
@@ -431,14 +431,16 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let started = Instant::now();
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize undo/redo storage");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open undo/redo setup engine");
-    let session = engine
-        .open_session()
+        .expect("open undo/redo setup lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open undo/redo setup session");
     register_schema(&session).await;
@@ -471,7 +473,7 @@ where
     );
 }
 
-async fn register_schema<S>(session: &SessionContext<S>)
+async fn register_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -496,7 +498,7 @@ where
     assert_eq!(result.rows_affected(), 1);
 }
 
-async fn seed_rows<S>(session: &SessionContext<S>, rows: usize)
+async fn seed_rows<S>(session: &Lix<S>, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -531,7 +533,7 @@ where
         .expect("commit undo benchmark rows");
 }
 
-async fn stage_transition<S>(session: &SessionContext<S>, rows: usize, width: usize)
+async fn stage_transition<S>(session: &Lix<S>, rows: usize, width: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -572,11 +574,12 @@ async fn measure<S>(
 ) where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open measured undo/redo engine");
-    let session = engine
-        .open_session()
+        .expect("open measured undo/redo lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open measured undo/redo session");
     let rows = count_rows(&session).await;
@@ -697,14 +700,14 @@ async fn measure<S>(
     );
 }
 
-async fn count_rows<S>(session: &SessionContext<S>) -> usize
+async fn count_rows<S>(session: &Lix<S>) -> usize
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     count_query(session, "SELECT COUNT(*) AS count FROM undo_bench_row").await
 }
 
-async fn current_head_commit_id<S>(session: &SessionContext<S>) -> String
+async fn current_head_commit_id<S>(session: &Lix<S>) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -717,7 +720,7 @@ where
         .expect("decode main branch head")
 }
 
-async fn count_value<S>(session: &SessionContext<S>, value: &str) -> usize
+async fn count_value<S>(session: &Lix<S>, value: &str) -> usize
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -728,7 +731,7 @@ where
     .await
 }
 
-async fn count_query<S>(session: &SessionContext<S>, sql: &str) -> usize
+async fn count_query<S>(session: &Lix<S>, sql: &str) -> usize
 where
     S: Storage + Clone + Send + Sync + 'static,
 {

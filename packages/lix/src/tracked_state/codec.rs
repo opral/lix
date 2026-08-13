@@ -848,7 +848,6 @@ fn read_entity_pk_part_shared(
     }
 }
 
-
 /// Test-only shim; see `crate::order_preserving_key::tests`.
 #[cfg(test)]
 pub(crate) fn tree_decode_entity_pk_probe(

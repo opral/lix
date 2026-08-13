@@ -89,13 +89,10 @@ where
     .await?;
     let mut values = result.values.into_iter();
     Ok(std::array::from_fn(|_| {
-        values
-            .next()
-            .flatten()
-            .and_then(|value| match value {
-                ProjectedValue::FullValue(bytes) => Some(bytes),
-                ProjectedValue::KeyOnly => None,
-            })
+        values.next().flatten().and_then(|value| match value {
+            ProjectedValue::FullValue(bytes) => Some(bytes),
+            ProjectedValue::KeyOnly => None,
+        })
     }))
 }
 

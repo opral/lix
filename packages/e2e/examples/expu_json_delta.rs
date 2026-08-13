@@ -27,7 +27,7 @@
 //!
 //! Every corpus is seeded through `SessionContext` SQL, so the write log is
 //! exactly the payload stream an ordinary commit stages. The oracle never
-//! touches engine internals: it replays the store's own encoder rule
+//! touches lix internals: it replays the store's own encoder rule
 //! (`>= 512` bytes, zstd level 1, keep raw unless it saves `>= 128` bytes,
 //! plus a 20-byte envelope) so "bytes today" is the real stored size.
 
@@ -37,14 +37,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use lix::integration::{Engine, SessionContext};
+use lix::Value;
 use lix::registered_spaces::JSON_SPACE;
 use lix::storage::Storage;
 use lix::storage_adapter::{
     PointReadPlan, StorageAdapter, StorageGetOptions, StorageKey, StorageReadOptions,
 };
 use lix::storage_bench::{space_inventory, storage_space_by_name};
-use lix::Value;
+use lix::{Lix, open_lix};
 use lix_storage_slatedb::SlateDB;
 
 /// Mirrors `json_store::store`: magic + codec byte + u64 uncompressed length.
@@ -63,8 +63,7 @@ const DELTA_BASE_REF_BYTES: usize = 32;
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
-    let usage =
-        "usage: expu_json_delta (build <corpus> <dir> <writelog> | oracle <writelog> | store <dir>)";
+    let usage = "usage: expu_json_delta (build <corpus> <dir> <writelog> | oracle <writelog> | store <dir>)";
     let mode = args.get(1).map(String::as_str).expect(usage);
     match mode {
         "build" => {
@@ -143,8 +142,7 @@ impl WriteLog {
 }
 
 fn read_write_log(path: &Path) -> Vec<(String, Vec<u8>)> {
-    let mut file =
-        std::io::BufReader::new(std::fs::File::open(path).expect("open expU write log"));
+    let mut file = std::io::BufReader::new(std::fs::File::open(path).expect("open expU write log"));
     let mut entries = Vec::new();
     let mut length = [0_u8; 4];
     loop {
@@ -240,14 +238,16 @@ async fn build(corpus: &str, dir: &Path, log_path: &Path) {
         dir.display()
     );
     let storage = SlateDB::open(dir).expect("open SlateDB corpus");
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
         .expect("initialize corpus repository");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open corpus engine");
-    let session = engine
-        .open_session()
+        .expect("open corpus lix");
+    let session = lix
+        .open_another_session()
         .await
         .expect("open corpus workspace");
     let mut log = WriteLog::create(log_path);
@@ -305,7 +305,7 @@ async fn build(corpus: &str, dir: &Path, log_path: &Path) {
 
     log.finish();
     drop(session);
-    drop(engine);
+    drop(lix);
     storage.flush().await.expect("flush SlateDB WAL");
     storage
         .flush_memtable_for_diagnostics()
@@ -315,7 +315,7 @@ async fn build(corpus: &str, dir: &Path, log_path: &Path) {
     println!("BUILT\tcorpus={corpus}\tdir={}", dir.display());
 }
 
-async fn register_document_schema<S>(session: &SessionContext<S>)
+async fn register_document_schema<S>(session: &Lix<S>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -341,7 +341,7 @@ where
 }
 
 async fn seed_documents<S>(
-    session: &SessionContext<S>,
+    session: &Lix<S>,
     shape: &DocShape,
     revisions: &[Vec<usize>],
     commit_rows: usize,
@@ -372,7 +372,7 @@ async fn seed_documents<S>(
 }
 
 async fn edit_documents<S>(
-    session: &SessionContext<S>,
+    session: &Lix<S>,
     shape: &DocShape,
     corpus: &str,
     revisions: &mut [Vec<usize>],
@@ -425,7 +425,7 @@ fn key_value_payload(key: usize, revision: usize, bytes: usize, rewrite: bool) -
 }
 
 async fn seed_key_values<S>(
-    session: &SessionContext<S>,
+    session: &Lix<S>,
     keys: usize,
     value_bytes: usize,
     rewrite: bool,
@@ -454,7 +454,7 @@ async fn seed_key_values<S>(
 }
 
 async fn edit_key_values<S>(
-    session: &SessionContext<S>,
+    session: &Lix<S>,
     keys: usize,
     rounds: usize,
     value_bytes: usize,
@@ -516,7 +516,7 @@ fn stored_len_today(raw: &[u8]) -> usize {
 
 /// Decodes one settled `json_store.json` row back to its JSON text.
 ///
-/// The envelope is replayed here rather than reached for through the engine so
+/// The envelope is replayed here rather than reached for through Lix so
 /// this tool stays a pure observer of the format it is measuring, exactly like
 /// `stored_len_at_level` replays the encoder side.
 fn decode_stored_json(value: &[u8]) -> Vec<u8> {
@@ -767,10 +767,7 @@ fn oracle(log_path: &Path) {
         println!(
             "DEPTH\tsnapshot_every={label}\tbytes={}\tsaving_vs_today_pct={:.2}",
             bounded_bytes[slot],
-            percent(
-                today_bytes.saturating_sub(bounded_bytes[slot]),
-                today_bytes
-            ),
+            percent(today_bytes.saturating_sub(bounded_bytes[slot]), today_bytes),
         );
     }
     println!(
@@ -873,7 +870,11 @@ fn reconstruction_latency(order: &[String], by_entity: &HashMap<String, Vec<Vec<
         let mut compressor =
             zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, &versions[index - 1])
                 .expect("dictionary compressor");
-        frames.push(compressor.compress(&versions[index]).expect("delta compress"));
+        frames.push(
+            compressor
+                .compress(&versions[index])
+                .expect("delta compress"),
+        );
     }
 
     let iterations = env_usize("LIX_EXPU_RECONSTRUCT_ITERS", 2_000);
@@ -1026,7 +1027,9 @@ async fn read_cost(dir: &Path) {
         let mut chased = Vec::with_capacity(reps);
         let mut widened = Vec::with_capacity(reps);
         for rep in 0..reps {
-            let rounds = (0..=depth).map(|round| pick(round, rep)).collect::<Vec<_>>();
+            let rounds = (0..=depth)
+                .map(|round| pick(round, rep))
+                .collect::<Vec<_>>();
             let wide = rounds.concat();
             // Alternate which arm goes first so neither one systematically
             // warms the other.

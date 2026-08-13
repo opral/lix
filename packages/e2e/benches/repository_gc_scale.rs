@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use lix::integration::Engine;
+use lix::open_lix;
 use lix::storage::Storage;
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
@@ -92,7 +92,8 @@ async fn run() {
             match backend {
                 Backend::RocksDB => {
                     let storage = RocksDB::open(path).expect("open repository-GC RocksDB");
-                    Engine::initialize(storage.clone())
+                    open_lix()
+                        .with_storage(storage.clone())
                         .await
                         .expect("initialize repository-GC RocksDB fixture");
                     let seed = seed_unreachable_commits(
@@ -119,7 +120,8 @@ async fn run() {
                     let storage = SlateDB::open_with_io_counters(path, counters.clone())
                         .expect("open repository-GC SlateDB");
                     let before = counters.snapshot();
-                    Engine::initialize(storage.clone())
+                    open_lix()
+                        .with_storage(storage.clone())
                         .await
                         .expect("initialize repository-GC SlateDB fixture");
                     let seed = seed_unreachable_commits(
@@ -223,11 +225,12 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let started = Instant::now();
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("open repository-GC engine");
-    let main = engine
-        .open_session()
+        .expect("open repository-GC lix");
+    let main = lix
+        .open_another_session()
         .await
         .expect("open repository-GC main session");
     let schema = serde_json::json!({
@@ -255,10 +258,16 @@ where
         })
         .await
         .expect("create repository-GC disposable branch");
-    let branch_session = engine
-        .open_session_at(branch.id.clone())
+    let branch_session = lix
+        .open_another_session()
         .await
         .expect("open repository-GC disposable branch");
+    branch_session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: (branch.id.clone()).to_string(),
+        })
+        .await
+        .expect("switch session branch");
     for commit_index in 0..commit_count {
         let mut transaction = branch_session
             .begin_transaction()

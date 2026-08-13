@@ -123,9 +123,7 @@ fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
 #[cfg(test)]
 mod tests {
     use crate::GLOBAL_BRANCH_ID;
-    use crate::branch::{
-        BranchHeadControlContext, stage_branch_head_control,
-    };
+    use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
     use crate::entity_pk::EntityPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};

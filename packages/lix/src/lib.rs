@@ -71,9 +71,9 @@ mod handle;
 mod hot_index_aging_probe;
 #[cfg(test)]
 mod hot_row_tombstone_probe;
+pub(crate) mod hot_state;
 pub(crate) mod init;
 pub(crate) mod json_store;
-pub(crate) mod hot_state;
 /// The declared module layer order and the test that enforces it. Test-only:
 /// it contains no engine code, just the layering artifact and its guard.
 #[cfg(test)]
@@ -125,23 +125,14 @@ pub(crate) mod transaction_types;
 pub(crate) mod undo_redo;
 pub mod wasm;
 
-/// Advanced integration APIs for storage adapters and host runtimes.
-///
-/// Most applications should use [`open_lix`] and [`Lix`] instead. This module
-/// is intentionally separate so the everyday SDK surface stays focused on a
-/// repository handle, while storage adapters can still compose with the
-/// initialized engine they need to provide host behavior.
-pub mod integration {
-    pub use crate::engine::{Engine, EngineOptions};
-    pub use crate::init::InitReceipt;
-    pub use crate::session::SessionContext;
-}
-
 pub use client_state::ClientState;
 #[cfg(feature = "default_wasm_runtime")]
 #[doc(hidden)]
 pub use plugin::runtime::default::runtime as default_wasm_runtime;
-pub use handle::{Lix, LixTransaction, OpenLixBuilder, open_lix};
+pub use handle::{
+    ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction, OpenAnotherSessionBuilder,
+    OpenLixBuilder, TransactionExecuteBuilder, open_lix,
+};
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
@@ -154,21 +145,22 @@ pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, Fil
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
-pub use prepared_dml::{PreparedDmlParameterBatch, PreparedDmlValueRef};
-pub use session::{
-    CoherentReadBatch, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
-    ExecuteStatementMetadata, ExecutionDisposition, FILE_UPLOAD_PART_BYTES, FileRead,
-    FileUploadProgress, MutationIdentity, ObserveEvent, ObserveEvents, RequestBlobSpliceProvenance,
-    Row, RowRef, TryFromValue, VerifiedRequestBlob,
-};
+pub(crate) use prepared_dml::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, MergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
+pub use session::{
+    ExecuteBatchStatement, ExecuteResult, ObserveEvent, ObserveEvents, Row, RowRef, TryFromValue,
+};
+pub(crate) use session::{
+    ExecuteIdempotency, ExecuteStatementMetadata, ExecutionDisposition, FileRead,
+    FileUploadProgress, VerifiedRequestBlob,
+};
 #[cfg(feature = "storage-benches")]
-pub use sql_profile::SqlReadProfile;
+pub(crate) use sql_profile::SqlReadProfile;
 pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 pub use storage::Memory;
 
@@ -180,4 +172,14 @@ pub const SYSTEM_ACCOUNT_ID: &str = "00000000-0000-7000-8000-000000000001";
 
 /// Fixed author used when a host opens a session without an authenticated account.
 pub const ANONYMOUS_ACCOUNT_ID: &str = "00000000-0000-7000-8000-000000000002";
+
+// Keep engine-level verification inside the crate. These tests deliberately
+// exercise implementation details that are not part of the Rust SDK.
+#[cfg(test)]
+#[macro_use]
+#[path = "../tests/integration/support/mod.rs"]
+mod support;
+#[cfg(test)]
+#[path = "../tests/integration/main.rs"]
+mod integration_tests;
 }

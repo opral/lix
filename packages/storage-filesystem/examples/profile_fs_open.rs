@@ -118,7 +118,7 @@ fn duration_ms(duration: Duration) -> u128 {
 
 async fn open_with_timing(path: &Path) -> (LocalFilesystem, Duration) {
     let started = Instant::now();
-    let opened = LocalFilesystem::open(path).await.unwrap();
+    let opened = LocalFilesystem::open(path).unwrap();
     let elapsed = started.elapsed();
     (opened, elapsed)
 }
@@ -623,7 +623,7 @@ async fn main() {
         let work_i = tmp_i.path().join("workspace");
         copy_dir(src, &work_i);
         let t = Instant::now();
-        let storage = LocalFilesystem::open(&work_i).await.unwrap();
+        let storage = LocalFilesystem::open(&work_i).unwrap();
         if i == repeat - 1 {
             let elapsed = t.elapsed();
             eprintln!("cold open (repeat {repeat}): {elapsed:?}");

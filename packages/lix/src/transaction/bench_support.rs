@@ -14,8 +14,8 @@ use crate::changelog::{
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::hot_state::{
-    CurrentStateDeltaRef, HotStateContext, HotStateFilter, HotStateProjection,
-    HotStateRowRequest, HotStateScanRequest, TrackedHeadContext, WorkingDiffIndexCoverage,
+    CurrentStateDeltaRef, HotStateContext, HotStateFilter, HotStateProjection, HotStateRowRequest,
+    HotStateScanRequest, TrackedHeadContext, WorkingDiffIndexCoverage,
 };
 use crate::session::SessionBranch;
 use crate::storage_adapter::Storage;
