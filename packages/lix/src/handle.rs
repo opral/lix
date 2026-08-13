@@ -164,7 +164,11 @@ where
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|value| !value.is_empty());
     if let Some(branch_id) = stored_branch_id.as_deref()
-        && lix.engine.load_branch_head_commit_id(branch_id).await?.is_some()
+        && lix
+            .engine
+            .load_branch_head_commit_id(branch_id)
+            .await?
+            .is_some()
         && branch_id != lix.active_branch_id().await?
     {
         lix.session
@@ -494,12 +498,12 @@ where
     /// Creates an active global account if it does not exist. Existing mutable
     /// account fields are deliberately left unchanged.
     pub async fn ensure_account(&self, id: &str, name: &str, kind: &str) -> Result<(), LixError> {
-        let branch_id = self.active_branch_id().await?;
-        let system = self
-            .open_session_at_with_account(branch_id, lix::SYSTEM_ACCOUNT_ID)
-            .await?;
-        system
-            .execute(
+        let branch_id = Box::pin(self.active_branch_id()).await?;
+        let system = Box::pin(
+            self.open_session_at_with_account(branch_id, lix::SYSTEM_ACCOUNT_ID),
+        )
+        .await?;
+        Box::pin(system.execute(
                 "INSERT INTO lix_account_by_branch \
                  (id, name, kind, status, lixcol_branch_id, lixcol_global, lixcol_untracked) \
                  VALUES ($1, $2, $3, 'active', $4, true, false) \
@@ -511,9 +515,9 @@ where
                     Value::Text(kind.to_string()),
                     Value::Text(lix::GLOBAL_BRANCH_ID.to_string()),
                 ],
-            )
-            .await?;
-        system.close().await
+            ))
+        .await?;
+        Box::pin(system.close()).await
     }
 
     pub async fn create_branch(
@@ -726,10 +730,7 @@ mod tests {
     #[tokio::test]
     async fn sessions_share_one_engine_but_have_independent_lifecycles() {
         let root = open_lix().await.expect("open root Lix");
-        let first = root
-            .open_session()
-            .await
-            .expect("open first child session");
+        let first = root.open_session().await.expect("open first child session");
         let second = root
             .open_session()
             .await
@@ -816,7 +817,10 @@ mod tests {
             })
             .await
             .expect("switch primary session");
-        let secondary = primary.open_session().await.expect("open secondary session");
+        let secondary = primary
+            .open_session()
+            .await
+            .expect("open secondary session");
         secondary
             .switch_branch(SwitchBranchOptions {
                 branch_id: main_branch_id.clone(),
@@ -849,7 +853,10 @@ mod tests {
             )
             .await
             .expect("non-default draft should delete");
-        reopened.close().await.expect("close restored primary session");
+        reopened
+            .close()
+            .await
+            .expect("close restored primary session");
         repository_default
             .close()
             .await

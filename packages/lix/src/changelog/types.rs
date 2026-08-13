@@ -341,12 +341,19 @@ pub(crate) struct ChangelogAppend {
     pub(crate) changes: Vec<ChangeRecord>,
 }
 
+/// Current on-disk shape of [`CommitRecord`].
+pub(crate) const COMMIT_RECORD_FORMAT_VERSION: u32 = 5;
+
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitRecord {
     /// Version 3 adds the authenticated first-parent jump certified below.
     /// Version 4 drops the stored `change_id`: it is now derived from
     /// `commit_id` by [`CommitRecord::change_id`].
+    /// Version 5 adds `touched_scope_digest`, the per-commit membership test
+    /// that lets history traversal skip loading a commit's replay-state
+    /// authority. This is a breaking on-disk change: the record codec is
+    /// packed, so v4 bytes do not decode as v5.
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     /// Longest-path distance from a graph root. Every parent has a strictly
@@ -361,6 +368,13 @@ pub(crate) struct CommitRecord {
     pub(crate) first_parent_jump_span: u64,
     pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
+    /// Collection scopes this commit's delta has members in.
+    ///
+    /// Published here rather than on the commit-state manifest precisely
+    /// because graph traversal already loads this record to find parents: the
+    /// history membership test then costs no extra point read. See
+    /// [`crate::changelog::CommitTouchedScopeDigest`].
+    pub(crate) touched_scope_digest: super::CommitTouchedScopeDigest,
 }
 
 impl CommitRecord {
@@ -609,6 +623,7 @@ mod topology_tests {
     fn record(depth: u64, parent: Option<CommitId>, jump: Option<(CommitId, u64)>) -> CommitRecord {
         let commit_id = id(depth);
         CommitRecord {
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
             generation: depth,

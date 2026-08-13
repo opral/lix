@@ -12,10 +12,12 @@ use crate::branch::{
     BranchHeadControlObservation, BranchRefReader, branch_head_control_precondition,
     stage_branch_head_control, stage_delete_branch_head_control,
 };
+use crate::changelog::COMMIT_RECORD_FORMAT_VERSION;
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
     ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
-    CommitRecord, CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
+    CommitRecord, CommitScanRequest, CommitTouchedScopeDigest, TransactionChangeRecordRef,
+    TransactionChangelogAppend,
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -1242,6 +1244,7 @@ async fn stage_changelog_commits(
     let mut generations = BTreeMap::new();
     let mut first_parent_jumps = BTreeMap::new();
     let mut topology_records = BTreeMap::new();
+    let mut touched_scope_digests = BTreeMap::<CommitId, CommitTouchedScopeDigest>::new();
     let mut rootless_depths = BTreeMap::new();
     let mut rootless_rows = BTreeMap::new();
     let mut rootless_bytes = BTreeMap::new();
@@ -1494,10 +1497,26 @@ async fn stage_changelog_commits(
         rootless_bytes.insert(commit_id, cumulative_rootless_bytes);
         generations.insert(commit_id, generation);
         first_parent_jumps.insert(commit_id, first_parent_jump);
+        // The membership test history reads is published here, from the same
+        // certified inventory the commit already staged. Deriving it costs one
+        // walk of the inventory's own bounds; publishing it saves history one
+        // replay-state point-read pair per reached commit.
+        let touched_scope_digest = match mutation_inventories.get(&commit_id) {
+            Some(inventory) => {
+                match crate::tracked_state::commit_delta_member_scopes(commit_id, inventory)? {
+                    Some(scopes) => CommitTouchedScopeDigest::exact(scopes.iter()),
+                    None => CommitTouchedScopeDigest::opaque(),
+                }
+            }
+            // A staged commit with no mutation inventory has no delta members,
+            // so nothing a history read asks for can be found in it.
+            None => CommitTouchedScopeDigest::exact(std::iter::empty()),
+        };
+        touched_scope_digests.insert(commit_id, touched_scope_digest.clone());
         topology_records.insert(
             commit_id,
             CommitRecord {
-                format_version: 3,
+                format_version: COMMIT_RECORD_FORMAT_VERSION,
                 commit_id,
                 generation,
                 parent_commit_ids: commit.parent_commit_ids.clone(),
@@ -1505,6 +1524,7 @@ async fn stage_changelog_commits(
                 first_parent_jump_span: first_parent_jump.1,
                 account_id: active_account_id.to_string(),
                 created_at: commit.created_at,
+                touched_scope_digest,
             },
         );
         for child in children.get(&commit_id).into_iter().flatten() {
@@ -1565,7 +1585,7 @@ async fn stage_changelog_commits(
             })?;
         }
         let record = CommitRecord {
-            format_version: 3,
+            format_version: COMMIT_RECORD_FORMAT_VERSION,
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
@@ -1573,6 +1593,7 @@ async fn stage_changelog_commits(
             first_parent_jump_span: first_parent_jumps[&commit_row.commit_id].1,
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
+            touched_scope_digest: touched_scope_digests[&commit_row.commit_id].clone(),
         };
         commits.push(record.clone());
         let change_count = state_row_indices.len()

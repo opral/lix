@@ -5916,6 +5916,118 @@ mod tests {
         );
     }
 
+    /// Connectivity check for the per-commit touched-scope digest.
+    ///
+    /// This asserts the *route*, not the timing: that the digest is consulted
+    /// once per reached commit, that it actually prunes commits the query
+    /// cannot need, and that it never falls back to the pre-digest path on a
+    /// repository this build wrote. Four optimizations in earlier rounds
+    /// measured flat because the changed code never ran; a timing sweep cannot
+    /// tell that apart from "the optimization does not help".
+    #[tokio::test]
+    async fn file_history_consults_the_touched_scope_digest_per_commit() {
+        let (session, _) = setup_engine_history_fixture()
+            .await
+            .expect("history fixture should initialize");
+
+        // Commits that touch a different file. A history read for
+        // `/docs/readme.md` still reaches every one of them, but none can
+        // contribute a row.
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('01920000-0000-7000-8000-0000000000b7', '/docs/noise.md', CAST('n0' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("noise file should insert");
+        for revision in 0..8 {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_file SET content = CAST('n{revision}' AS BYTEA) \
+                         WHERE id = '01920000-0000-7000-8000-0000000000b7'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("noise commit should apply");
+        }
+
+        let head_commit_id = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("active commit should resolve")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let Value::Text(head_commit_id) = head_commit_id else {
+            panic!("active branch commit id should be text");
+        };
+
+        let before = crate::commit_graph::scope_digest_census();
+        let _ = crate::commit_graph::scope_digest_census::by_projection::take();
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT id, path, lixcol_depth FROM lix_file_history('{head_commit_id}') \
+                     WHERE path = '/docs/readme.md' ORDER BY lixcol_depth"
+                ),
+                &[],
+            )
+            .await
+            .expect("by-path history should execute");
+        let census = crate::commit_graph::scope_digest_census().since(&before);
+        let by_projection = crate::commit_graph::scope_digest_census::by_projection::take();
+        eprintln!("scope_digest_census {census:?}");
+        for (projection, buckets) in &by_projection {
+            eprintln!("scope_digest_projection {projection} {buckets:?}");
+        }
+
+        assert!(
+            !result.rows().is_empty(),
+            "the queried path must still have history rows"
+        );
+        assert!(
+            census.probed() > 0,
+            "the digest must be consulted at least once per history read: {census:?}"
+        );
+        assert!(
+            census.pruned > 0,
+            "the digest must skip commits that cannot contribute rows: {census:?}"
+        );
+        assert!(
+            census.loaded_present > 0 || census.loaded_opaque > 0,
+            "commits that can contribute must still be loaded: {census:?}"
+        );
+        assert_eq!(
+            census.loaded_absent, 0,
+            "a repository written by this build must carry a digest on every commit: {census:?}"
+        );
+
+        // Requirement: the digest must serve every projection of history-by-path,
+        // not just the one a benchmark happens to exercise. Each of these is a
+        // separate commit-graph traversal with its own schema-key set.
+        for projection in [
+            "lix_binary_blob_ref+lix_file_descriptor",
+            "lix_directory_descriptor",
+            "lix_key_value",
+        ] {
+            let buckets = by_projection.get(projection).unwrap_or_else(|| {
+                panic!("by-path history should traverse {projection}: {by_projection:?}")
+            });
+            assert!(
+                buckets.get("pruned").copied().unwrap_or(0) > 0,
+                "{projection} must be able to prune commits: {by_projection:?}"
+            );
+            assert_eq!(
+                buckets.get("loaded_absent").copied().unwrap_or(0),
+                0,
+                "{projection} must never hit the pre-digest fallback: {by_projection:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn execute_sql_rejects_writes_to_history_views_before_planning() {
         for sql in [
