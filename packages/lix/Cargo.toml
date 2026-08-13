@@ -41,6 +41,10 @@ name = "integration"
 path = "tests/integration/main.rs"
 
 [[test]]
+name = "preimage_route_census"
+path = "tests/preimage_route_census.rs"
+
+[[test]]
 name = "execute_result_allocations"
 path = "tests/execute_result_allocations.rs"
 
