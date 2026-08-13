@@ -12061,6 +12061,8 @@ async fn hot_schema_has_file_member(
     generation: CommitId,
     schema_key: &str,
 ) -> Result<bool, LixError> {
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_hot_scan_file_member_guard_read();
     let scope = hot_scope_prefix(branch_id, generation);
     let key = StorageKey(Bytes::from(encode_hot_file_schema_key(&scope, schema_key)));
     let values = PointReadPlan::new(FILE_SPACE, &[key])

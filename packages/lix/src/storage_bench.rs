@@ -3945,6 +3945,8 @@ static HOT_SCAN_FALLBACK_DECODED: [AtomicU64; CRUD_PHASE_COUNT] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static HOT_SCAN_FALLBACK_MATCHED: [AtomicU64; CRUD_PHASE_COUNT] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HOT_SCAN_FILE_MEMBER_GUARD_READS: [AtomicU64; CRUD_PHASE_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 pub(crate) fn record_hot_scan_call() {
     HOT_SCAN_CALLS[crud_phase()].fetch_add(1, Ordering::Relaxed);
@@ -3967,6 +3969,14 @@ pub(crate) fn record_hot_scan_fallback(has_entity_pks: bool) {
     if has_entity_pks {
         HOT_SCAN_FALLBACK_WITH_PKS[phase].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// One `FILE_SPACE` point read issued by the point-batch arm's guard, which
+/// asks whether this schema has any file-backed member before it is willing to
+/// serve the scan from a null-file point batch. The guard is uncached, so this
+/// counts once per scan, not once per schema.
+pub(crate) fn record_hot_scan_file_member_guard_read() {
+    HOT_SCAN_FILE_MEMBER_GUARD_READS[crud_phase()].fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_hot_scan_fallback_entry(matched: bool) {
@@ -3994,6 +4004,8 @@ pub struct HotScanRouteCensus {
     pub fallback_with_entity_pks: u64,
     pub fallback_entries_decoded: u64,
     pub fallback_entries_matched: u64,
+    /// `FILE_SPACE` point reads issued by the point-batch arm's guard.
+    pub file_member_guard_reads: u64,
 }
 
 /// Drains the census. Index with `CRUD_PHASE_*`.
@@ -4006,6 +4018,8 @@ pub fn take_hot_scan_route_census() -> [HotScanRouteCensus; CRUD_PHASE_COUNT] {
         fallback_with_entity_pks: HOT_SCAN_FALLBACK_WITH_PKS[phase].swap(0, Ordering::Relaxed),
         fallback_entries_decoded: HOT_SCAN_FALLBACK_DECODED[phase].swap(0, Ordering::Relaxed),
         fallback_entries_matched: HOT_SCAN_FALLBACK_MATCHED[phase].swap(0, Ordering::Relaxed),
+        file_member_guard_reads: HOT_SCAN_FILE_MEMBER_GUARD_READS[phase]
+            .swap(0, Ordering::Relaxed),
     })
 }
 
