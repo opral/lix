@@ -17,7 +17,7 @@
 
 use lix::storage_bench::{take_hot_scan_refcount_census, take_scan_key_buffer_census};
 use lix::{Value, open_lix};
-use lix_storage_rocksdb::RocksDB;
+use lix_storage_rocksdb::{RocksDB, SCAN_KEY_BUFFER_CENSUS_ENABLED};
 
 const ROWS: usize = 20_000;
 const SCHEMA_KEY: &str = "scan_key_buffer_census_probe";
@@ -30,6 +30,17 @@ const MAX_ALLOCATIONS_PER_ROW: f64 = 0.125;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
+    // Checked first, and separately from the count. A compiled-out census
+    // reports zero, and so does a scan route that never ran; without this the
+    // failure below blames the routing for what is actually a build-wiring
+    // problem one crate away.
+    assert!(
+        SCAN_KEY_BUFFER_CENSUS_ENABLED,
+        "the RocksDB adapter was built without its `storage-benches` feature, so the key-buffer \
+         census is compiled out and reports zero no matter what the scan did; this crate's \
+         `storage-benches` feature must forward `lix_storage_rocksdb/storage-benches`"
+    );
+
     let dir = tempfile::TempDir::new().expect("create census tempdir");
     let storage = RocksDB::open(dir.path().join("census.rocksdb")).expect("open census storage");
     let lix = open_lix()
@@ -97,7 +108,8 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
     );
     assert!(
         allocations > 0,
-        "no key buffer allocation was recorded; the RocksDB scan source was not the one exercised"
+        "no key buffer allocation was recorded, and the census is compiled in, so the RocksDB \
+         scan source genuinely did not serve this scan"
     );
 
     let per_row = allocations as f64 / rows_decoded as f64;
