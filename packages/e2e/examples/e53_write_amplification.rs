@@ -22,7 +22,7 @@
 //!
 //! Usage: `e53_write_amplification [rows_per_commit] [commits] [report_every]`
 
-use lix::Value;
+use lix::{ExecuteBatchStatement, Value};
 use lix::integration::{Engine, SessionContext};
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
@@ -48,6 +48,15 @@ async fn main() {
         .next()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(50);
+    // Seeded via execute_batch in ONE commit. PACKED_CURRENT_BASE_MIN_ROWS is a
+    // floor on rows staged by a single transaction, so this is the knob that
+    // decides whether a packed base exists before the incremental lane starts.
+    // 500 is the `untracked_state_crud` chunk size -- deliberately just under
+    // 512 -- and is the trap this argument exists to make visible.
+    let seed_rows = args
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
 
     let directory = tempfile::tempdir().expect("create RocksDB directory");
     let storage = RocksDB::open(directory.path()).expect("open RocksDB");
@@ -60,7 +69,8 @@ async fn main() {
 
     println!(
         "e53_write_amplification rows_per_commit={rows_per_commit} commits={commits} \
-         packed_min_rows={PACKED_CURRENT_BASE_MIN_ROWS_VALUE} backend=rocksdb checkpoints=none"
+         seed_rows={seed_rows} packed_min_rows={PACKED_CURRENT_BASE_MIN_ROWS_VALUE} \
+         backend=rocksdb checkpoints=none"
     );
     println!(
         "{:>8} {:>12} {:>12} {:>10} {:>10} {:>10} {:>12} {:>8} {:>12} {:>8} {:>8} {:>8} {:>12}",
@@ -84,6 +94,32 @@ async fn main() {
     let _ = take_hot_retire_invocations();
     let _ = take_packed_base_publication_census();
     let mut last_bytes = 0_u64;
+
+    if seed_rows > 0 {
+        let sql = "INSERT INTO e53_amp (path, value) VALUES ($1, lix_json($2))";
+        let statements = (0..seed_rows)
+            .map(|row_index| ExecuteBatchStatement {
+                label: None,
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text(format!("/seed/{row_index:08}")),
+                    Value::Text(format!(r#"{{"seed":{row_index}}}"#)),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let start = std::time::Instant::now();
+        session.execute_batch(&statements).await.expect("seed batch");
+        let seed_nanos = start.elapsed().as_nanos();
+        let packed = take_packed_base_publication_census();
+        let (retires, retired_rows) = take_hot_retire_invocations();
+        let (rows, bytes) = store_rows(&storage).await;
+        last_bytes = bytes;
+        println!(
+            "SEED rows={seed_rows} store_rows={rows} store_bytes={bytes} nanos={seed_nanos} \
+             retires={retires} retired_rows={retired_rows} pk_ord={} pk_col={} pk_rep={}",
+            packed.ordered, packed.certified_columnar, packed.complete_replacement
+        );
+    }
 
     for index in 0..commits {
         let start = std::time::Instant::now();
@@ -177,7 +213,7 @@ where
             .execute(
                 "INSERT INTO e53_amp (path, value) VALUES ($1, lix_json($2))",
                 &[
-                    Value::Text(format!("/row/{batch:08}/{index:08}")),
+                    Value::Text(format!("/inc/{batch:08}/{index:08}")),
                     Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
                 ],
             )
