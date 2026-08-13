@@ -94,6 +94,169 @@ static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
 static IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Lifetime counts of real `stage_retire_hot_generation` invocations.
+///
+/// Separate from `HOT_RETIRE_CENSUS`, which a probe resets. A commit lane whose
+/// branch never rotates its tracked generation performs **zero** retires, so
+/// this is what distinguishes "every commit rewrites the plane" from "the plane
+/// is generation-keyed and the generation rarely moves".
+static HOT_RETIRE_CALLS: AtomicU64 = AtomicU64::new(0);
+static HOT_RETIRE_DELETED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_hot_retire_call() {
+    HOT_RETIRE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_hot_retire_deleted(rows: u64) {
+    HOT_RETIRE_DELETED_ROWS.fetch_add(rows, Ordering::Relaxed);
+}
+
+/// `(calls, deleted_rows)` since the last take.
+pub fn take_hot_retire_invocations() -> (u64, u64) {
+    (
+        HOT_RETIRE_CALLS.swap(0, Ordering::Relaxed),
+        HOT_RETIRE_DELETED_ROWS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Which packed-current-base publication route fired, if any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PackedBasePublicationCensus {
+    pub ordered: usize,
+    pub certified_columnar: usize,
+    pub complete_replacement: usize,
+}
+
+/// The single-transaction row count a commit must stage before any packed
+/// current base is eligible. Mirrors `PACKED_CURRENT_BASE_MIN_ROWS`.
+pub const PACKED_CURRENT_BASE_MIN_ROWS_VALUE: usize = 512;
+
+pub fn take_packed_base_publication_census() -> PackedBasePublicationCensus {
+    PackedBasePublicationCensus {
+        ordered: crate::transaction::take_ordered_packed_current_base_publications(),
+        certified_columnar: crate::transaction::take_certified_columnar_current_base_publications(),
+        complete_replacement:
+            crate::transaction::take_complete_replacement_packed_current_base_publications(),
+    }
+}
+
+/// Per-space census of one `stage_retire_hot_generation` call.
+///
+/// One row per entry in `GENERATION_SCOPED_SPACES`, in the order the retire
+/// visits them. `rows` is incremented inside the per-entry decode loop, so it
+/// counts entries the scan actually materialized, not entries it returned.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HotRetireSpaceCensus {
+    pub space_id: u32,
+    pub rows: u64,
+    pub pages: u64,
+    /// Wall time from entering the space to the `begin_scan` future resolving,
+    /// i.e. the seek that positions the iterator at the generation prefix.
+    pub open_nanos: u64,
+    pub total_nanos: u64,
+}
+
+static HOT_RETIRE_CENSUS: std::sync::Mutex<Vec<HotRetireSpaceCensus>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn record_hot_retire_space(
+    space_id: u32,
+    rows: u64,
+    pages: u64,
+    open_nanos: u64,
+    total_nanos: u64,
+) {
+    if let Ok(mut census) = HOT_RETIRE_CENSUS.lock() {
+        census.push(HotRetireSpaceCensus {
+            space_id,
+            rows,
+            pages,
+            open_nanos,
+            total_nanos,
+        });
+    }
+}
+
+pub fn begin_hot_retire_census() {
+    if let Ok(mut census) = HOT_RETIRE_CENSUS.lock() {
+        census.clear();
+    }
+}
+
+pub fn take_hot_retire_census() -> Vec<HotRetireSpaceCensus> {
+    HOT_RETIRE_CENSUS
+        .lock()
+        .map(|mut census| std::mem::take(&mut *census))
+        .unwrap_or_default()
+}
+
+/// Every branch id with a durable branch-head control, in branch-id order.
+pub async fn hot_generation_branches<R>(read: &R) -> Result<Vec<String>, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    Ok(crate::branch::BranchHeadControlContext::new()
+        .reader(read)
+        .scan()
+        .await?
+        .into_iter()
+        .map(|(branch_id, _)| branch_id)
+        .collect())
+}
+
+/// One `stage_retire_hot_generation` invocation, measured.
+#[derive(Clone, Debug, Default)]
+pub struct HotGenerationProbe {
+    pub deleted_rows: u64,
+    pub total_nanos: u64,
+    pub spaces: Vec<HotRetireSpaceCensus>,
+}
+
+/// Replays the production retire scan for one branch's live generation.
+///
+/// This calls `stage_retire_hot_generation` itself -- the same eight prefix
+/// scans a real publication performs -- and throws the resulting write set
+/// away, so the probe is read-only. With `phantom` the generation is a uuid no
+/// row can carry, which makes the garbage exactly zero by construction: every
+/// byte the storage engine touches is the fixed cost of positioning eight
+/// iterators in eight regions of one keyspace.
+pub async fn probe_hot_generation_planes<R>(
+    read: &R,
+    branch_id: &str,
+    phantom: bool,
+) -> Result<HotGenerationProbe, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    let generation = if phantom {
+        crate::changelog::CommitId::new(uuid::Uuid::from_u128(0x0e53_0e53_0e53_0e53_0e53_0e53_0e53_0e53))
+    } else {
+        crate::branch::BranchHeadControlContext::new()
+            .reader(read)
+            .load(branch_id)
+            .await?
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("no branch-head control for '{branch_id}'"),
+                )
+            })?
+            .tracked_generation
+    };
+    let mut writes = StorageWriteSet::new();
+    begin_hot_retire_census();
+    let start = std::time::Instant::now();
+    let deleted =
+        crate::hot_state::stage_retire_hot_generation(read, &mut writes, branch_id, generation)
+            .await?;
+    let total_nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    Ok(HotGenerationProbe {
+        deleted_rows: deleted,
+        total_nanos,
+        spaces: take_hot_retire_census(),
+    })
+}
+
 /// Matched transaction ownership counters used by the CRUD profile.  These
 /// counters are deliberately disabled unless the profile enables them, so the
 /// common instrumentation does not perturb normal engine execution.

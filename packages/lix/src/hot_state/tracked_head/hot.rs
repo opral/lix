@@ -13107,11 +13107,18 @@ where
     let prefix = StoragePrefix {
         bytes: Bytes::from(encode_scope_prefix(branch_id, generation)),
     };
+    // Counted at the top of the real function, so a commit lane that never
+    // rotates its generation reads as zero calls rather than as "the symbol
+    // exists, therefore the branch ran".
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_hot_retire_call();
     let mut deleted = 0_u64;
     for space in GENERATION_SCOPED_SPACES {
         // A publication that supersedes this generation stages its own
         // lifecycle mutations first. Restating one of those keys here is a
         // duplicate mutation, not an idempotent delete.
+        #[cfg(feature = "storage-benches")]
+        let space_start = std::time::Instant::now();
         let declared = writes.declared_keys(*space);
         let mut cursor = store
             .begin_scan(
@@ -13123,11 +13130,28 @@ where
                 },
             )
             .await?;
+        #[cfg(feature = "storage-benches")]
+        let open_nanos = u64::try_from(space_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        #[cfg(feature = "storage-benches")]
+        let mut space_rows = 0_u64;
+        #[cfg(feature = "storage-benches")]
+        let mut space_pages = 0_u64;
         loop {
             let (page, page_has_more) = cursor
                 .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
                 .await?.into_parts();
+            #[cfg(feature = "storage-benches")]
+            {
+                space_pages = space_pages.saturating_add(1);
+            }
             for entry in page {
+                // Counted here, inside the per-entry decode loop that does the
+                // work, not at the layer that returns the answer: a post-filter
+                // count cannot distinguish a seek from a full-prefix walk.
+                #[cfg(feature = "storage-benches")]
+                {
+                    space_rows = space_rows.saturating_add(1);
+                }
                 if declared.contains(entry.key.0.as_ref()) {
                     continue;
                 }
@@ -13138,7 +13162,17 @@ where
                 break;
             }
         }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_hot_retire_space(
+            space.id.0,
+            space_rows,
+            space_pages,
+            open_nanos,
+            u64::try_from(space_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_hot_retire_deleted(deleted);
     Ok(deleted)
 }
 

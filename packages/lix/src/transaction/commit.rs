@@ -84,7 +84,7 @@ fn compare_certified_predecessors(
         .then_with(|| left.file_id.cmp(&right.file_id))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 std::thread_local! {
     static ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -103,17 +103,17 @@ static DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS: std::sync::LazyLock<
     std::sync::Mutex<BTreeMap<String, usize>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn take_ordered_packed_current_base_publications() -> usize {
     ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| publications.replace(0))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn take_certified_columnar_current_base_publications() -> usize {
     CERTIFIED_COLUMNAR_CURRENT_BASE_PUBLICATIONS.with(|publications| publications.replace(0))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn take_complete_replacement_packed_current_base_publications() -> usize {
     COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS
         .with(|publications| publications.replace(0))
@@ -3979,7 +3979,7 @@ async fn stage_tracked_head(
                     "immutable replacement journal entered an incompatible HOT publication lane",
                 ));
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "storage-benches"))]
             COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
                 publications.set(publications.get().saturating_add(1));
             });
@@ -4027,7 +4027,7 @@ async fn stage_tracked_head(
             continue;
         }
         if can_publish_ordered_packed_current_base {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "storage-benches"))]
             ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
                 publications.set(publications.get().saturating_add(1));
             });
@@ -4042,7 +4042,7 @@ async fn stage_tracked_head(
                 certified_columnar_parts,
                 inventory.lifecycle_summary.as_ref(),
             ) {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "storage-benches"))]
                 CERTIFIED_COLUMNAR_CURRENT_BASE_PUBLICATIONS.with(|publications| {
                     publications.set(publications.get().saturating_add(1));
                 });
@@ -4120,7 +4120,7 @@ async fn stage_tracked_head(
             continue;
         }
         if let Some(schema_key) = complete_replacement_schema {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "storage-benches"))]
             COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
                 publications.set(publications.get().saturating_add(1));
             });
