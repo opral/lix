@@ -126,24 +126,26 @@ and cold reopen:
 
 - 1 MiB / 80-byte inline descriptor, RocksDB and SlateDB, no shared copies:
   log SHA-256
-  `199290f8aaa408df4c62b0d727ae60239689150c57468b9e48bea0e4165a75ca`.
+  `a1ab00ce9deb9720294b5ccea3c6c10d913673a35d317abd49079df0287ec948`.
   After GC the selected layout has zero external descriptor objects and zero
   row-inline payload bytes.
 - 16 MiB / 548-byte external descriptor, RocksDB and SlateDB, 64 additional
   shared references (67 retained rows after version operations): log SHA-256
-  `c3cb0adcef5ed96624b68fd9d4558e7dc6e2ee104f577c156a76140f02237c7d`.
+  `c3bf9eda674d6673ba0d4369f30e583a886cb64182a9e9ec95a059b72bb75b5e`.
   After GC both adapters retain one 548-byte authenticated descriptor object,
   15 unique chunks, and 67x logical sharing; row-inline payload bytes remain
   zero.
 - release benchmark binary SHA-256
-  `cadbc417a0e0c170eb2af0ff70f8a3a53e249f3870fcc2ad526c007eef0ddb9f`.
+  `9af78928d7df7befa879bf67d496e9342a4361077f8af132cf94b35e562d80cb`.
 
 Each representative cell additionally rereads the retained payload after GC.
-The corruption gate covers missing and same-size substituted chunks, plus
-external descriptor ID/bytes and declared-length substitution. When an adapter
-refuses immutable same-ID replacement before serving (SlateDB), that rejection
-is itself fail-closed; RocksDB accepts the physically replaced test object and
-the model's digest check rejects it on read.
+The corruption gate covers missing chunks and external declared-length
+substitution. A separate deterministic fixture uses previously unused object
+IDs to seed same-size wrong chunk bytes and wrong external-descriptor bytes
+under their expected digest keys before a selected row points at them. It
+asserts the raw stored bytes differ from the authenticated content and then
+requires typed reads to fail before returning payload on both adapters; it does
+not depend on immutable overwrite behavior.
 
 This child changes only benchmark/report paths. The cells above qualify the
 format model and real RocksDB/SlateDB storage behavior; they do **not** prove

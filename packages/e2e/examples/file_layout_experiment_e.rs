@@ -680,6 +680,17 @@ async fn run_reopened<S: BenchStorage>(
     })
     .await;
 
+    if layout == Layout::E3 {
+        measured(&context, "seeded_substitution_corruption", async {
+            exercise_seeded_substitution_corruption(&storage).await;
+            database
+                .settle()
+                .await
+                .expect("settle seeded corruption cleanup");
+        })
+        .await;
+    }
+
     measured(&context, "delete_gc", async {
         delete_keys(&storage, ROW_SPACE, &[row_key(0, 0), row_key(0, 1)]).await;
         collect_garbage(&storage).await;
@@ -1070,30 +1081,6 @@ async fn exercise_corruption<S: Storage>(storage: &S, row_key: &Key) {
         encoded_len,
     } = &row.representation
     {
-        let descriptor = get_one(storage, DESCRIPTOR_SPACE, &descriptor_id.key())
-            .await
-            .expect("read external descriptor for corruption");
-        delete_keys(storage, DESCRIPTOR_SPACE, &[descriptor_id.key()]).await;
-        let mut substituted = descriptor.clone();
-        substituted[0] ^= 1;
-        let substituted_published = try_put_rows(
-            storage,
-            DESCRIPTOR_SPACE,
-            vec![(descriptor_id.key(), substituted)],
-        )
-        .await
-        .is_ok();
-        assert!(read_payload(storage, row_key, None).await.is_err());
-        if substituted_published {
-            delete_keys(storage, DESCRIPTOR_SPACE, &[descriptor_id.key()]).await;
-        }
-        put_rows(
-            storage,
-            DESCRIPTOR_SPACE,
-            vec![(descriptor_id.key(), descriptor)],
-        )
-        .await;
-
         let mut wrong_length_row = row.clone();
         wrong_length_row.representation = Representation::SharedDescriptor {
             descriptor_id: *descriptor_id,
@@ -1130,17 +1117,95 @@ async fn exercise_corruption<S: Storage>(storage: &S, row_key: &Key) {
         .expect("read corruption target");
     delete_keys(storage, CHUNK_SPACE, &[target.key()]).await;
     assert!(read_payload(storage, row_key, None).await.is_err());
-    let mut substituted = original.clone();
-    substituted[0] ^= 1;
-    let substituted_published =
-        try_put_rows(storage, CHUNK_SPACE, vec![(target.key(), substituted)])
-            .await
-            .is_ok();
-    assert!(read_payload(storage, row_key, None).await.is_err());
-    if substituted_published {
-        delete_keys(storage, CHUNK_SPACE, &[target.key()]).await;
-    }
     put_rows(storage, CHUNK_SPACE, vec![(target.key(), original)]).await;
+}
+
+async fn exercise_seeded_substitution_corruption<S: Storage>(storage: &S) {
+    let expected_chunk = vec![0x11; 4_096];
+    let wrong_chunk = vec![0x22; expected_chunk.len()];
+    let expected_chunk_id = Digest::of(&expected_chunk);
+    assert_ne!(Digest::of(&wrong_chunk), expected_chunk_id);
+    put_rows(
+        storage,
+        CHUNK_SPACE,
+        vec![(expected_chunk_id.key(), wrong_chunk.clone())],
+    )
+    .await;
+    assert_eq!(
+        get_one(storage, CHUNK_SPACE, &expected_chunk_id.key())
+            .await
+            .expect("raw seeded chunk"),
+        wrong_chunk
+    );
+    let bad_chunk_key = row_key(u32::MAX, 1);
+    let bad_chunk_row = Row {
+        layout: Layout::E3,
+        payload_len: expected_chunk.len() as u64,
+        whole_hash: expected_chunk_id,
+        metadata: NativeFileMetadata::for_width(8),
+        representation: Representation::InlineDescriptor(vec![ChunkRef {
+            len: expected_chunk.len() as u32,
+            hash: expected_chunk_id,
+        }]),
+    };
+    put_rows(
+        storage,
+        ROW_SPACE,
+        vec![(bad_chunk_key.clone(), encode_row(&bad_chunk_row))],
+    )
+    .await;
+    assert!(read_payload(storage, &bad_chunk_key, None).await.is_err());
+
+    let refs = (0..4)
+        .map(|index| ChunkRef {
+            len: 1,
+            hash: Digest::of(&[index]),
+        })
+        .collect::<Vec<_>>();
+    let descriptor = encode_leaf(&refs);
+    assert!(descriptor.len() > CANONICAL_INLINE_DESCRIPTOR_MAX_BYTES);
+    let descriptor_id = Digest::of(&descriptor);
+    let mut wrong_descriptor = descriptor.clone();
+    wrong_descriptor[0] ^= 1;
+    assert_ne!(Digest::of(&wrong_descriptor), descriptor_id);
+    put_rows(
+        storage,
+        DESCRIPTOR_SPACE,
+        vec![(descriptor_id.key(), wrong_descriptor.clone())],
+    )
+    .await;
+    assert_eq!(
+        get_one(storage, DESCRIPTOR_SPACE, &descriptor_id.key())
+            .await
+            .expect("raw seeded descriptor"),
+        wrong_descriptor
+    );
+    let bad_descriptor_key = row_key(u32::MAX, 2);
+    let bad_descriptor_row = Row {
+        layout: Layout::E3,
+        payload_len: 4,
+        whole_hash: Digest::of(&[0, 1, 2, 3]),
+        metadata: NativeFileMetadata::for_width(8),
+        representation: Representation::SharedDescriptor {
+            descriptor_id,
+            encoded_len: descriptor.len() as u32,
+        },
+    };
+    put_rows(
+        storage,
+        ROW_SPACE,
+        vec![(bad_descriptor_key.clone(), encode_row(&bad_descriptor_row))],
+    )
+    .await;
+    assert!(
+        read_payload(storage, &bad_descriptor_key, None)
+            .await
+            .is_err()
+    );
+
+    delete_keys(storage, ROW_SPACE, &[bad_chunk_key, bad_descriptor_key]).await;
+    delete_keys(storage, CHUNK_SPACE, &[expected_chunk_id.key()]).await;
+    delete_keys(storage, DESCRIPTOR_SPACE, &[descriptor_id.key()]).await;
 }
 
 async fn descriptor_refs<S: Storage>(storage: &S, row: &Row) -> Result<Vec<ChunkRef>, String> {
