@@ -145,7 +145,7 @@ where
                 )
             })?;
         if let Some(expected) = manifest.snapshot_root.as_ref()
-            && !expected.has_same_authoritative_layout(&snapshot_root)
+            && **expected != snapshot_root
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,

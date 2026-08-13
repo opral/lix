@@ -1020,21 +1020,22 @@ where
         for part in reachable.parts {
             let descriptor =
                 crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
-            match descriptor.source_kind {
-                0 | 2 => {
+            match descriptor.source {
+                crate::tracked_state::CurrentStatePartSource::Replacement(source) => {
                     physical_authorities.insert(CommitId::new(uuid::Uuid::from_bytes(
-                        descriptor.owner_commit_id,
+                        source.owner_commit_id,
                     )));
                 }
-                1 => {
-                    native_parts.insert(descriptor.content_digest);
-                    native_part_refs_digests.insert(descriptor.payload_refs_digest);
+                crate::tracked_state::CurrentStatePartSource::ColumnarPage(source) => {
+                    physical_authorities.insert(CommitId::new(uuid::Uuid::from_bytes(
+                        source.owner_commit_id,
+                    )));
                 }
-                _ => {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "active current-state scoped range has an unknown source kind",
-                    ));
+                crate::tracked_state::CurrentStatePartSource::NativeDataPart {
+                    payload_refs_digest,
+                } => {
+                    native_parts.insert(descriptor.content_digest);
+                    native_part_refs_digests.insert(payload_refs_digest);
                 }
             }
         }
@@ -1906,9 +1907,9 @@ where
     for part in reachable.parts {
         let descriptor =
             crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
-        match descriptor.source_kind {
-            0 => {
-                let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+        match descriptor.source {
+            crate::tracked_state::CurrentStatePartSource::Replacement(source) => {
+                let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
                 if !packed.commits.contains_key(&owner) {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -1919,11 +1920,13 @@ where
                 }
                 retained_authority_commits.insert(owner);
             }
-            1 => {
+            crate::tracked_state::CurrentStatePartSource::NativeDataPart {
+                payload_refs_digest,
+            } => {
                 live_current_state_data_parts.insert(descriptor.content_digest);
                 if let Some(previous) = live_current_state_ref_summaries
-                    .insert(descriptor.content_digest, descriptor.payload_refs_digest)
-                    && previous != descriptor.payload_refs_digest
+                    .insert(descriptor.content_digest, payload_refs_digest)
+                    && previous != payload_refs_digest
                 {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -1931,26 +1934,16 @@ where
                     ));
                 }
             }
-            2 => {
-                let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+            crate::tracked_state::CurrentStatePartSource::ColumnarPage(source) => {
+                let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
                 if !packed.commits.contains_key(&owner) {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("live scoped range references missing columnar owner '{owner}'"),
                     ));
                 }
-                live_columnar_sources.insert((
-                    owner,
-                    descriptor.source_id,
-                    descriptor.content_digest,
-                ));
+                live_columnar_sources.insert((owner, source.source_id, descriptor.content_digest));
                 retained_authority_commits.insert(owner);
-            }
-            _ => {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "live scoped range contains an unknown part source",
-                ));
             }
         }
     }
@@ -3368,17 +3361,17 @@ mod tests {
             first_key: encoded_key.clone(),
             last_key: encoded_key,
             content_digest: owner_inventory.replacement_part_digests[0],
-            payload_refs_digest: [0; 32],
-            source_kind: 0,
-            source_id: [0; 16],
-            owner_commit_id: *owner.commit_id.as_uuid().as_bytes(),
-            part_index: 0,
-            source_page_index: 0,
+            source: crate::tracked_state::CurrentStatePartSource::Replacement(
+                crate::tracked_state::ReplacementPartSource {
+                    owner_commit_id: *owner.commit_id.as_uuid().as_bytes(),
+                    part_index: 0,
+                    uniform_created_at: timestamp,
+                    uniform_updated_at: timestamp,
+                },
+            ),
             source_row_offset: 0,
             row_count: 1,
             fragmented: false,
-            uniform_created_at: timestamp,
-            uniform_updated_at: timestamp,
         };
         let part = crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor(
             &scope,
@@ -3539,17 +3532,12 @@ mod tests {
             first_key: encoded.first_key.clone(),
             last_key: encoded.last_key.clone(),
             content_digest: encoded.digest,
-            payload_refs_digest: encoded.refs_digest,
-            source_kind: 1,
-            source_id: [0; 16],
-            owner_commit_id: [0; 16],
-            part_index: 0,
-            source_page_index: 0,
+            source: crate::tracked_state::CurrentStatePartSource::NativeDataPart {
+                payload_refs_digest: encoded.refs_digest,
+            },
             source_row_offset: 0,
             row_count: encoded.row_count,
             fragmented: false,
-            uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
         };
         let part = crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor(
             &scope,
@@ -3822,8 +3810,6 @@ mod tests {
                 changed_key_count: 0,
                 row_count_estimate: 0,
                 tree_height: 1,
-                primary_chunk_count: 1,
-                primary_chunk_bytes: root_bytes.len() as u64,
             })),
         };
         let control = BranchHeadControl {
@@ -3929,8 +3915,6 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
-            primary_chunk_count: 1,
-            primary_chunk_bytes: owner_bytes.len() as u64,
         };
         let active_root = TrackedStateCommitRoot {
             commit_id: active,
@@ -3942,8 +3926,6 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
-            primary_chunk_count: 1,
-            primary_chunk_bytes: active_bytes.len() as u64,
         };
         let manifest = |commit_id, snapshot_root| CommitStateManifest {
             commit_id,
@@ -6919,7 +6901,7 @@ mod tests {
     }
 
     fn test_snapshot_root(commit_id: CommitId) -> TrackedStateCommitRoot {
-        let (root_hash, root_bytes) = test_snapshot_chunk(commit_id);
+        let (root_hash, _root_bytes) = test_snapshot_chunk(commit_id);
         TrackedStateCommitRoot {
             commit_id,
             root_id: TrackedStateRootId::new(root_hash),
@@ -6927,8 +6909,6 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
-            primary_chunk_count: 1,
-            primary_chunk_bytes: root_bytes.len() as u64,
         }
     }
 

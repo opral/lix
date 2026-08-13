@@ -2158,8 +2158,6 @@ mod tests {
                     changed_key_count: 1,
                     row_count_estimate: result.row_count as u64,
                     tree_height: result.tree_height as u32,
-                    primary_chunk_count: result.chunk_count as u64,
-                    primary_chunk_bytes: result.chunk_bytes as u64,
                 },
             )
             .await
@@ -2363,8 +2361,6 @@ mod tests {
                     changed_key_count: 1,
                     row_count_estimate: result.row_count as u64,
                     tree_height: result.tree_height as u32,
-                    primary_chunk_count: result.chunk_count as u64,
-                    primary_chunk_bytes: result.chunk_bytes as u64,
                 },
             )
             .await
@@ -3550,8 +3546,6 @@ mod tests {
                 changed_key_count,
                 row_count_estimate: result.row_count as u64,
                 tree_height: result.tree_height as u32,
-                primary_chunk_count: result.chunk_count as u64,
-                primary_chunk_bytes: result.chunk_bytes as u64,
             },
         )
         .await

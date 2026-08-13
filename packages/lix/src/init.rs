@@ -59,7 +59,14 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// open, where `unsupported_repository_protocol_error` tells the operator to
 /// recreate the repository. Every hard cut to a persisted record shape has to
 /// move this value with it.
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v69";
+///
+/// `v68` is a single bump covering both of this round's format changes:
+/// the `CurrentStatePartSource` enum with `LOCATOR_PAYLOAD_VERSION` 3 -> 4,
+/// and `StoredCheckpointGcState` 3 -> 6 fields with
+/// `CHECKPOINT_GC_STATE_FORMAT_VERSION` 1 -> 2. Every record is
+/// `#[musli(packed)]`, so one bump carries any number of shape changes at no
+/// extra cost to the user, who recreates the repository once either way.
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v68";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

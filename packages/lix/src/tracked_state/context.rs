@@ -3946,8 +3946,6 @@ where
                 changed_key_count: 0,
                 row_count_estimate: parent_metadata.row_count_estimate,
                 tree_height: parent_metadata.tree_height,
-                primary_chunk_count: 0,
-                primary_chunk_bytes: 0,
             };
             self.staged_roots.insert(commit_id.to_string(), metadata);
             return Ok(TrackedStateWriteReport {
@@ -4236,18 +4234,6 @@ where
                     "tracked_state commit_root tree height exceeds u32",
                 )
             })?,
-            primary_chunk_count: u64::try_from(result.chunk_count).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_root chunk count exceeds u64",
-                )
-            })?,
-            primary_chunk_bytes: u64::try_from(result.chunk_bytes).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_root chunk bytes exceeds u64",
-                )
-            })?,
         };
         self.staged_roots.insert(commit_id.to_string(), metadata);
 
@@ -4436,18 +4422,6 @@ where
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "tracked_state commit_root tree height exceeds u32",
-                )
-            })?,
-            primary_chunk_count: u64::try_from(result.chunk_count).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_root chunk count exceeds u64",
-                )
-            })?,
-            primary_chunk_bytes: u64::try_from(result.chunk_bytes).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_root chunk bytes exceeds u64",
                 )
             })?,
         };
@@ -5184,8 +5158,6 @@ mod tests {
         assert_eq!(metadata.changed_key_count, 2);
         assert_eq!(metadata.row_count_estimate, 2);
         assert!(metadata.tree_height >= 1);
-        assert!(metadata.primary_chunk_count >= 1);
-        assert!(metadata.primary_chunk_bytes > 0);
     }
 
     #[tokio::test]
@@ -6582,8 +6554,6 @@ mod tests {
             parent_metadata.row_count_estimate
         );
         assert_eq!(child_metadata.tree_height, parent_metadata.tree_height);
-        assert_eq!(child_metadata.primary_chunk_count, 0);
-        assert_eq!(child_metadata.primary_chunk_bytes, 0);
         assert_eq!(child_metadata.parent_roots.len(), 1);
         assert_eq!(child_metadata.parent_roots[0].commit_id, "parent");
         assert_eq!(
@@ -9773,8 +9743,6 @@ mod tests {
             changed_key_count: rows.len() as u64,
             row_count_estimate: result.row_count as u64,
             tree_height: result.tree_height as u32,
-            primary_chunk_count: result.chunk_count as u64,
-            primary_chunk_bytes: result.chunk_bytes as u64,
         };
         let published = storage::load_published_commit_state_manifest(&read, typed_commit_id)
             .await
