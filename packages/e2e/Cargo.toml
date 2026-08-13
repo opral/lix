@@ -101,6 +101,11 @@ path = "examples/expaa_replay_scope.rs"
 required-features = ["storage-benches"]
 
 [[example]]
+name = "expb_scan_baseline"
+path = "examples/expb_scan_baseline.rs"
+required-features = ["storage-benches"]
+
+[[example]]
 name = "expab_plan_load"
 path = "examples/expab_plan_load.rs"
 required-features = ["storage-benches", "slatedb"]

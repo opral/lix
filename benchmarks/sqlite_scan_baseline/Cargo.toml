@@ -1,0 +1,23 @@
+# Deliberately its own workspace root, and additionally listed in the root
+# manifest's `exclude`. This crate compiles SQLite from C via
+# `rusqlite/bundled`, which must never enter the lix workspace build graph:
+# the point of a reference baseline is that it is reproducible from a clean
+# checkout, not that it is paid for on every CI run.
+#
+# Build and run it explicitly:
+#   cd benchmarks/sqlite_scan_baseline && cargo run --release -- 10000 9
+[workspace]
+
+[package]
+name = "sqlite_scan_baseline"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
+tempfile = "3"
+
+[profile.release]
+debug = "line-tables-only"

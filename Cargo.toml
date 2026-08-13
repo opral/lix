@@ -8,6 +8,12 @@ members = [
   "vendor/markdown-syntax",
 ]
 
+# Reference baselines that must never join the workspace build graph. They are
+# committed so the numbers stay reproducible from a clean checkout, and
+# excluded so no CI lane pays to compile them. Run them explicitly from their
+# own directory.
+exclude = ["benchmarks/sqlite_scan_baseline"]
+
 [workspace.package]
 version = "0.11.0"
 authors = ["Opral"]
