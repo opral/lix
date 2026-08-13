@@ -2568,13 +2568,35 @@ mod tests {
             "rootless serving generation timestamp",
             "2026-01-01T00:00:00Z",
         );
-        let old_root = replay_commit_record("rootless-serving-old", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `old_root`, which is what compaction actually produces: `old_root` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `old_root` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `old_root` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // entity `_history()` row is served out of. The release under test here
+        // is a rootless tracked serving generation, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("rootless-serving-base", 0, None, timestamp);
+        let old_root = replay_commit_record(
+            "rootless-serving-old",
+            1,
+            Some(base.commit_id),
+            timestamp,
+        );
         let active = replay_commit_record(
             "rootless-serving-active",
             1,
-            Some(old_root.commit_id),
+            Some(base.commit_id),
             timestamp,
         );
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
         let mut old_manifest =
             test_commit_state_manifest(&old_root, CommitStateMutationInventory::default());
         old_manifest.replay_debt = CommitStateReplayDebt::default();
@@ -2596,8 +2618,8 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[old_root.clone(), active.clone()],
-            &[old_manifest, active_manifest],
+            &[base.clone(), old_root.clone(), active.clone()],
+            &[base_manifest, old_manifest, active_manifest],
         )
         .await;
 
@@ -2624,6 +2646,14 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&serving_generation)
+        );
+        // The interval base is still on the head's first-parent chain, so it is
+        // what `_history()` reads and must survive the same sweep. Without this
+        // the fixture would pass just as well against a collector that retires
+        // the whole chain.
+        assert!(
+            !plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            "a commit reachable from the live head owns entity history and must not be retired"
         );
     }
 
@@ -3030,17 +3060,46 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("selected owner timestamp", "2026-01-01T00:00:00Z");
-        let owner = replay_commit_record("selected-owner-source", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `owner`, which is what compaction actually produces: `owner` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `owner` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `owner` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // entity `_history()` row is served out of. The release under test here
+        // is the finite selected-source owner pin, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("selected-owner-base", 0, None, timestamp);
+        let owner = replay_commit_record(
+            "selected-owner-source",
+            1,
+            Some(base.commit_id),
+            timestamp,
+        );
         let checkpoint = replay_commit_record(
             "selected-owner-checkpoint",
             1,
-            Some(owner.commit_id),
+            Some(base.commit_id),
             timestamp,
         );
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
+        // `released` parents onto the interval base too, because the commit
+        // holding the selection is itself interior. A commit that is still
+        // graph-reachable keeps its delta, and that delta is what names the
+        // selected source -- so while the selecting commit is on the chain the
+        // owner is correctly pinned by it, and the release under test could
+        // never be reached. Superseding the selector is the event that
+        // releases the owner, which is exactly what this test is named for.
         let released = replay_commit_record(
             "selected-owner-released",
-            2,
-            Some(checkpoint.commit_id),
+            1,
+            Some(base.commit_id),
             timestamp,
         );
         let selected_change = packed_change(
@@ -3091,8 +3150,13 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest],
+            &[
+                base.clone(),
+                owner.clone(),
+                checkpoint.clone(),
+                released.clone(),
+            ],
+            &[base_manifest, owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3152,6 +3216,10 @@ mod tests {
                 .tracked_commit_roots
                 .contains(&owner.commit_id)
         );
+        assert!(
+            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            "the interval base stays on the head's first-parent chain and owns entity history"
+        );
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3189,13 +3257,35 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("scoped owner timestamp", "2026-01-01T00:00:00Z");
-        let owner = replay_commit_record("scoped-part-owner", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `owner`, which is what compaction actually produces: `owner` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `owner` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `owner` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // entity `_history()` row is served out of. The release under test here
+        // is the scoped-descriptor owner pin, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("scoped-part-base", 0, None, timestamp);
+        let owner = replay_commit_record(
+            "scoped-part-owner",
+            1,
+            Some(base.commit_id),
+            timestamp,
+        );
         let checkpoint = replay_commit_record(
             "scoped-part-checkpoint",
             1,
-            Some(owner.commit_id),
+            Some(base.commit_id),
             timestamp,
         );
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
         let released = replay_commit_record(
             "scoped-part-released",
             2,
@@ -3285,8 +3375,13 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest],
+            &[
+                base.clone(),
+                owner.clone(),
+                checkpoint.clone(),
+                released.clone(),
+            ],
+            &[base_manifest, owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3320,6 +3415,10 @@ mod tests {
                 .tracked_commit_roots
                 .contains(&owner.commit_id)
         );
+        assert!(
+            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            "the interval base stays on the head's first-parent chain and owns entity history"
+        );
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3337,9 +3436,26 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("native row owner timestamp", "2026-01-01T00:00:00Z");
-        let owner = replay_commit_record("native-row-owner", 0, None, timestamp);
+        // The checkpoint parents onto a fresh interval base rather than onto
+        // `owner`, which is what compaction actually produces: `owner` is an
+        // interior commit of the interval the checkpoint closes, so the
+        // checkpoint supersedes it and it leaves the first-parent chain.
+        //
+        // This fixture used to parent the checkpoint directly onto `owner` --
+        // a raw parent chain no real checkpoint ever produces. That kept
+        // `owner` reachable from the live head forever, and a commit reachable
+        // from the head now keeps its delta because that delta is what an
+        // entity `_history()` row is served out of. The release under test here
+        // is the native-row owner pin, not graph reachability, so the fixture models the
+        // compaction instead of contradicting it.
+        let base = replay_commit_record("native-row-base", 0, None, timestamp);
+        let owner = replay_commit_record("native-row-owner", 1, Some(base.commit_id), timestamp);
         let checkpoint =
-            replay_commit_record("native-row-checkpoint", 1, Some(owner.commit_id), timestamp);
+            replay_commit_record("native-row-checkpoint", 1, Some(base.commit_id), timestamp);
+        let mut base_manifest =
+            test_commit_state_manifest(&base, CommitStateMutationInventory::default());
+        base_manifest.replay_debt = CommitStateReplayDebt::default();
+        base_manifest.snapshot_root = Some(Box::new(test_snapshot_root(base.commit_id)));
         let released = replay_commit_record(
             "native-row-released",
             2,
@@ -3487,8 +3603,13 @@ mod tests {
         persist_replay_closure_fixture(
             &storage,
             writes,
-            &[owner.clone(), checkpoint.clone(), released.clone()],
-            &[owner_manifest, checkpoint_manifest],
+            &[
+                base.clone(),
+                owner.clone(),
+                checkpoint.clone(),
+                released.clone(),
+            ],
+            &[base_manifest, owner_manifest, checkpoint_manifest],
         )
         .await;
 
@@ -3601,6 +3722,10 @@ mod tests {
                 .sweep
                 .tracked_commit_roots
                 .contains(&owner.commit_id)
+        );
+        assert!(
+            !released_plan.sweep.tracked_commit_roots.contains(&base.commit_id),
+            "the interval base stays on the head's first-parent chain and owns entity history"
         );
         let read = storage
             .begin_read(StorageReadOptions::default())
