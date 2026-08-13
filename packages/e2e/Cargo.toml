@@ -24,6 +24,8 @@ default = ["rocksdb"]
 rocksdb = ["dep:lix_storage_rocksdb"]
 slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
 storage-benches = ["lix/storage-benches", "rocksdb"]
+# EXPERIMENT E1 ONLY -- deliberately incorrect commit path, unreadable store.
+floor-unreadable = ["lix/floor-unreadable"]
 root-replay-trace = ["lix/root-replay-trace", "storage-benches"]
 server-protocol = ["lix/server-protocol"]
 tpch = ["dep:duckdb", "dep:tpchgen"]

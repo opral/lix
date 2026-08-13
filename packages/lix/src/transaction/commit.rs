@@ -3667,6 +3667,38 @@ async fn stage_tracked_head(
     replacement_generation_commits: &BTreeSet<CommitId>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
 ) -> Result<StagedHotHeads, LixError> {
+    #[cfg(feature = "floor-unreadable")]
+    if crate::floor_experiment::skip_derived(crate::floor_experiment::PHASE_TRACKED_HEAD) {
+        crate::floor_experiment::note_skip(crate::floor_experiment::PHASE_TRACKED_HEAD);
+        // Publish only the branch-head control the CAS fence needs. Every
+        // serving row, index entry, working-diff epoch and snapshot is skipped.
+        let mut controls = BTreeMap::new();
+        for root in tracked_roots_parent_first(tracked_roots)?
+            .into_iter()
+            .filter(|root| root.publish_head)
+        {
+            let parent_control = observations
+                .get(&root.branch_id)
+                .and_then(|observation| observation.control);
+            // The serving generation deliberately does NOT advance: no hot
+            // rows were staged for a new one, so pinning it keeps every
+            // subsequent statement pre-image read doing its full real work
+            // against the seeded snapshot. current_state_revision still
+            // advances, so the branch-head CAS write and its fence are real.
+            let pinned_generation = parent_control
+                .map(|control| control.tracked_generation)
+                .unwrap_or(root.commit_id);
+            let control =
+                normal_branch_head_control(root, parent_control, pinned_generation, None)?;
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+        }
+        return Ok(StagedHotHeads {
+            controls,
+            deferred_fresh_hot_plans: Vec::new(),
+        });
+    }
+    #[cfg(feature = "floor-unreadable")]
+    crate::floor_experiment::note_body(crate::floor_experiment::PHASE_TRACKED_HEAD);
     let lifecycle_ids = lifecycle_snapshot_commit_ids(
         tracked_roots,
         staged_commits,
@@ -5770,6 +5802,13 @@ async fn stage_tracked_roots(
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
     certified_replacement_markers_by_commit: &BTreeMap<CommitId, BTreeSet<TrackedStateKey>>,
 ) -> Result<BTreeMap<CommitId, TrackedStateCommitRoot>, LixError> {
+    #[cfg(feature = "floor-unreadable")]
+    if crate::floor_experiment::skip_derived(crate::floor_experiment::PHASE_TRACKED_ROOTS) {
+        crate::floor_experiment::note_skip(crate::floor_experiment::PHASE_TRACKED_ROOTS);
+        return Ok(BTreeMap::new());
+    }
+    #[cfg(feature = "floor-unreadable")]
+    crate::floor_experiment::note_body(crate::floor_experiment::PHASE_TRACKED_ROOTS);
     let root_fence_ids = tracked_root_fence_ids(tracked_roots);
     if root_fence_ids.is_empty() {
         return Ok(BTreeMap::new());
@@ -5999,6 +6038,19 @@ where
     S: StorageAdapterRead + ?Sized + 'a,
 {
     Box::pin(async move {
+        #[cfg(feature = "floor-unreadable")]
+        if crate::floor_experiment::skip_derived(
+            crate::floor_experiment::PHASE_COMMIT_STATE_MANIFESTS,
+        ) {
+            crate::floor_experiment::note_skip(
+                crate::floor_experiment::PHASE_COMMIT_STATE_MANIFESTS,
+            );
+            return Ok(());
+        }
+        #[cfg(feature = "floor-unreadable")]
+        crate::floor_experiment::note_body(
+            crate::floor_experiment::PHASE_COMMIT_STATE_MANIFESTS,
+        );
         let mut published_manifests =
             BTreeMap::<CommitId, crate::tracked_state::StagedCommitStateManifest>::new();
         if staged_commits.len() != commit_rows.len()

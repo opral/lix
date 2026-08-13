@@ -619,6 +619,8 @@ fn profile_hot_sql_session_operations(
         read_many_pk_count,
     ));
     let _ = lix::storage_bench::take_entity_point_snapshot_cache_accounting();
+    #[cfg(feature = "floor-unreadable")]
+    lix::floor_experiment::arm();
     if sql_session::selected_olap_read_shape().is_some() {
         // Full semantic validation is intentionally outside the samples. This
         // keeps Rust-vs-JavaScript assertion work out of the engine ratio while
@@ -666,6 +668,8 @@ fn profile_hot_sql_session_operations(
         repeats,
         elapsed / repeats_u32,
     );
+    #[cfg(feature = "floor-unreadable")]
+    println!("{}", lix::floor_experiment::engagement_report());
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_READ_AFTER_HOT_UPDATES").is_some()
         && matches!(operation, TransactionBenchOp::UpdateOneByPk)
     {

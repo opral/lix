@@ -21,6 +21,10 @@ workspace = true
 [features]
 default = ["default_wasm_runtime"]
 all-simulations = []
+# EXPERIMENT E1 ONLY. Compiles in a deliberately incorrect commit path that
+# skips the derived staging phases when LIX_FLOOR_UNREADABLE is set. The
+# repository it produces cannot be read back. Never enable in a shipped build.
+floor-unreadable = []
 storage-benches = []
 # Per-node cost attribution for commit-root replay (experiment AA). Kept out of
 # `storage-benches` so timing A/B runs never pay for the inline `Instant::now()`.
