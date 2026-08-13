@@ -107,7 +107,7 @@ mod tests {
             .await
             .expect("engine should open");
         let session = engine
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("main session should open");
         session
@@ -213,11 +213,11 @@ mod tests {
             .await
             .expect("second engine should open");
         let session_a = engine_a
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("first session should open");
         let session_b = engine_b
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("second session should open");
 
@@ -287,7 +287,7 @@ mod tests {
             .await
             .expect("engine should open");
         let session = engine
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("main session should open");
         let initial_head = engine
@@ -349,7 +349,7 @@ mod tests {
         let adapter = StorageAdapter::new(storage.clone());
         let engine = Engine::new(storage).await.expect("engine should open");
         let main = engine
-            .open_session(&receipt.main_branch_id)
+            .open_session_at(&receipt.main_branch_id)
             .await
             .expect("main session should open");
         let revision_before_branch = current_revision(&adapter).await;
@@ -362,7 +362,7 @@ mod tests {
         .expect("draft branch should be created");
         assert_ne!(current_revision(&adapter).await, revision_before_branch);
         let draft = engine
-            .open_session(draft_branch_id)
+            .open_session_at(draft_branch_id)
             .await
             .expect("draft session should open");
         if diverge_target {

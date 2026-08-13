@@ -3,9 +3,8 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use lix::Value;
-use lix::integration::{Engine, SessionContext};
 use lix::storage::Memory;
+use lix::{Lix, Value, open_lix};
 use serde_json::json;
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -15,16 +14,12 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("create benchmark runtime")
 }
 
-fn fixture(runtime: &tokio::runtime::Runtime) -> SessionContext<Memory> {
+fn fixture(runtime: &tokio::runtime::Runtime) -> Lix<Memory> {
     runtime.block_on(async {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone()).await.unwrap();
-        Engine::new(storage)
+        open_lix()
+            .with_storage(Memory::new())
             .await
-            .unwrap()
-            .open_workspace_session()
-            .await
-            .unwrap()
+            .expect("open in-memory lix")
     })
 }
 
@@ -51,13 +46,16 @@ fn schema_registration(c: &mut Criterion) {
     group.bench_function("single", |b| {
         b.iter_batched_ref(
             || fixture(&runtime),
-            |session| {
+            |lix| {
                 black_box(
                     runtime
-                        .block_on(session.execute(
-                            "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1 ->> 'key', $1)",
-                            &[schema_v1()],
-                        ))
+                        .block_on(async {
+                            lix.execute(
+                                "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1 ->> 'key', $1)",
+                                &[schema_v1()],
+                            )
+                            .await
+                        })
                         .unwrap(),
                 );
             },

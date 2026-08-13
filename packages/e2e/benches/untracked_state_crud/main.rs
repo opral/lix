@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
     PutBatch, ReadOptions, ScanChunk, ScanCursor, SpaceId, Storage, StorageError, StorageRead,
@@ -28,7 +27,8 @@ use lix::storage_adapter::{
     StorageCoreProjection, StorageGetOptions, StoragePrefix, StorageReadOptions, StorageSpace,
     StorageValue, StorageWriteOptions,
 };
-use lix::{PreparedDmlParameterBatch, Value};
+use lix::{ExecuteBatchStatement, Value};
+use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
 use lix_storage_slatedb::SlateDB;
@@ -364,21 +364,17 @@ impl StorageScanSource for CountingScanSource<'_> {
         limit_rows: usize,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
         Box::pin(async move {
-            let chunk = self.inner.next_page(limit_rows).await?;
+            let (chunk, chunk_has_more) = self.inner.next_page(limit_rows).await?.into_parts();
             let mut stats = self.stats.lock().expect("io stats mutex");
-            stats.scan_entries += chunk.entries.len();
-            stats.scan_entry_key_bytes += chunk
-                .entries
-                .iter()
-                .map(|entry| entry.key.0.len())
-                .sum::<usize>();
+            stats.scan_entries += chunk.len();
+            stats.scan_entry_key_bytes +=
+                chunk.iter().map(|entry| entry.key.0.len()).sum::<usize>();
             stats.scan_entry_value_bytes += chunk
-                .entries
                 .iter()
                 .map(|entry| projected_value_len(&entry.value))
                 .sum::<usize>();
             drop(stats);
-            Ok(chunk)
+            Ok(ScanChunk::new(chunk, chunk_has_more))
         })
     }
 }
@@ -1001,11 +997,12 @@ where
         )
         .await
         .expect("begin row scan");
-    let page = cursor
+    let (page, _page_has_more) = cursor
         .next_page(expected_rows + 1)
         .await
-        .expect("scan rows");
-    assert_eq!(page.entries.len(), expected_rows);
+        .expect("scan rows")
+        .into_parts();
+    assert_eq!(page.len(), expected_rows);
     expected_rows
 }
 
@@ -1051,9 +1048,9 @@ enum ProfileStorage {
 }
 
 enum ProfileSession {
-    RocksDB(SessionContext<TempStorage<RocksDB>>),
+    RocksDB(Lix<TempStorage<RocksDB>>),
     #[cfg(feature = "slatedb")]
-    SlateDB(SessionContext<TempStorage<SlateDB>>),
+    SlateDB(Lix<TempStorage<SlateDB>>),
 }
 
 async fn prepare_profile_session_empty(profile: LixStorageProfile) -> ProfileSession {
@@ -1068,26 +1065,29 @@ async fn prepare_profile_session_empty(profile: LixStorageProfile) -> ProfileSes
     }
 }
 
-async fn prepare_session_empty<StorageImpl>(storage: StorageImpl) -> SessionContext<StorageImpl>
+async fn prepare_session_empty<StorageImpl>(storage: StorageImpl) -> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    Engine::initialize(storage.clone())
+    open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("initialize benchmark engine");
-    let engine = Engine::new(storage).await.expect("open in-memory engine");
-    let setup = engine
-        .open_workspace_session()
+        .expect("initialize benchmark lix");
+    let lix = open_lix()
+        .with_storage(storage)
+        .await
+        .expect("open in-memory lix");
+    let setup = lix
+        .open_another_session()
         .await
         .expect("open benchmark setup session");
     register_json_pointer_schema(&setup).await;
-    engine
-        .open_workspace_session()
+    lix.open_another_session()
         .await
         .expect("open benchmark session")
 }
 
-async fn register_json_pointer_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
+async fn register_json_pointer_schema<StorageImpl>(session: &Lix<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -1106,7 +1106,7 @@ where
 
 #[expect(clippy::cast_possible_truncation)]
 async fn insert_untracked_json_pointer_rows<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
+    session: &Lix<StorageImpl>,
     rows: &[PointerRow],
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -1128,33 +1128,32 @@ async fn insert_untracked_json_pointer_rows<StorageImpl>(
 }
 
 async fn insert_untracked_json_pointer_rows_homogeneous<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
+    session: &Lix<StorageImpl>,
     rows: &[PointerRow],
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let parameter_batch = PreparedDmlParameterBatch::from_rows(rows.iter().map(|row| {
-        vec![
-            Value::Text(row.path.clone()),
-            Value::Text(row.value_json.clone()),
-        ]
-    }))
-    .expect("untracked parameter batch is rectangular");
+    let statements = rows
+        .iter()
+        .map(|row| ExecuteBatchStatement {
+            label: None,
+            sql: "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ($1, CAST($2 AS JSONB), true)".to_owned(),
+            params: vec![
+                Value::Text(row.path.clone()),
+                Value::Text(row.value_json.clone()),
+            ],
+        })
+        .collect::<Vec<_>>();
     let results = session
-        .execute_prepared_dml_batch(
-            Arc::<str>::from(
-                "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ($1, CAST($2 AS JSONB), true)",
-            ),
-            parameter_batch,
-        )
+        .execute_batch(&statements)
         .await
-        .expect("homogeneous insert untracked json_pointer rows");
+        .expect("batch insert untracked json_pointer rows");
     assert_eq!(results.len(), rows.len());
     assert!(results.iter().all(|result| result.rows_affected() == 1));
 }
 
 async fn update_untracked_json_pointer_rows<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
+    session: &Lix<StorageImpl>,
     rows: &[PointerRow],
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -1168,9 +1167,7 @@ async fn update_untracked_json_pointer_rows<StorageImpl>(
     assert_eq!(affected as usize, rows.len());
 }
 
-async fn delete_untracked_json_pointer_rows<StorageImpl>(
-    session: &SessionContext<StorageImpl>,
-) -> usize
+async fn delete_untracked_json_pointer_rows<StorageImpl>(session: &Lix<StorageImpl>) -> usize
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
