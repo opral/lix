@@ -306,6 +306,12 @@ harness = false
 required-features = ["storage-benches"]
 
 [[bench]]
+name = "physical_layout_c"
+path = "benches/physical_layout_c.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "current_state_scope_sharing"
 path = "benches/current_state_scope_sharing.rs"
 harness = false
