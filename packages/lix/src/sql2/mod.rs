@@ -46,6 +46,7 @@ pub(crate) use catalog::{
     entity_visible_fields,
 };
 pub(crate) use change_materialization::MaterializedChange;
+pub(crate) use context::WriteContextLiveness;
 pub(crate) use context::{
     CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
     DiffCommandOutcome, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,

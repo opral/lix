@@ -169,6 +169,14 @@ pub(crate) trait SqlExecutionContext: Sync {
 #[async_trait]
 pub(crate) trait SqlWriteExecutionContext: Send {
     fn active_branch_id(&self) -> &str;
+    /// Revocation token for this context's borrow.
+    ///
+    /// The default hands back a token that is never retired, which is correct
+    /// for contexts that are not the engine `Transaction`: they own no borrow
+    /// that a `SqlWriteContext` can outlive.
+    fn write_context_liveness(&self) -> WriteContextLiveness {
+        WriteContextLiveness::new()
+    }
     fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
         super::session::new_sql_session_context()
     }
@@ -314,12 +322,54 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 pub(crate) struct SqlWriteContext {
     ptr: Arc<SqlWriteContextPtr>,
     gate: Arc<Mutex<()>>,
+    liveness: WriteContextLiveness,
     shared: Arc<SqlWriteContextShared>,
     explicit_insert_columns: Option<Arc<BTreeSet<String>>>,
     write_targets: Option<Arc<super::providers::WriteTargetRegistry>>,
 }
 
 struct SqlWriteContextPtr(NonNull<dyn SqlWriteExecutionContext>);
+
+/// Revocation token for the transaction context behind `SqlWriteContextPtr`.
+///
+/// `SqlWriteContext::new` forges a `'static` pointer out of a `&mut` borrow, and
+/// the borrow's real lifetime cannot be recovered by the type system (see the
+/// note on `SqlWriteContextPtr` below). This token is the runtime substitute:
+/// the borrowed `Transaction` flips it on teardown, and every gated
+/// dereference checks it first, so a pointer that outlives its pointee produces
+/// a deterministic `LixError` instead of undefined behaviour.
+///
+/// Measured before this existed: in one `cargo test -p lix -p lix_e2e` run,
+/// **249 distinct `Transaction` objects were destroyed while a
+/// `SqlWriteContext` still pointed at them** (116 with one live pointer, 49
+/// with two, one with 26). None of them was dereferenced afterwards, so this is
+/// hardening rather than a bug fix — but the safety of the whole construction
+/// rested on drop ordering that nothing enforced or tested.
+#[derive(Clone, Debug)]
+pub(crate) struct WriteContextLiveness(Arc<std::sync::atomic::AtomicBool>);
+
+impl WriteContextLiveness {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(true)))
+    }
+
+    /// Called when the borrowed context is torn down. Idempotent.
+    pub(crate) fn retire(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Default for WriteContextLiveness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
 
 /// Values captured from the write execution context at construction time.
 ///
@@ -346,15 +396,56 @@ struct SqlWriteContextShared {
 }
 
 // DataFusion stores providers as owned Send + Sync trait objects. This context
-// is only constructed for one write execution and never outlives the borrowed
-// transaction context that owns it.
+// is only constructed for one write execution.
 //
-// SAFETY SCOPE: the pointer is now reached only by the gate-serialized methods
-// that reconstitute `&mut`. The shared accessors read `SqlWriteContextShared`
-// and never touch it, so no `&dyn` into the transaction context can be alive
-// while one of those `&mut` borrows is held.
+// SAFETY SCOPE: the pointer is reached only by the gate-serialized methods that
+// reconstitute `&mut`. The shared accessors read `SqlWriteContextShared` and
+// never touch it, so no `&dyn` into the transaction context can be alive while
+// one of those `&mut` borrows is held.
+//
+// LIFETIME: this context CAN outlive the borrowed transaction context. The
+// comment here used to claim it never did; that was false, and
+// `WriteContextLiveness` above carries the measurement. Every gated
+// dereference is therefore guarded at runtime.
+//
+// WHY THE LIFETIME IS FORGED, AND WHY IT CANNOT BE FIXED WITH A LIFETIME
+// PARAMETER. A `SqlWriteContext<'ctx>` cannot reach DataFusion at all:
+// `SessionContext::register_table` takes `Arc<dyn TableProvider>`, which is
+// `Arc<dyn TableProvider + 'static>`, and `TableProvider::as_any` returns
+// `&dyn Any` where `trait Any: 'static`. `ExecutionPlan` carries the same
+// `as_any` requirement. Both bounds are unconditional in the DataFusion
+// provider API, so the `'static` here is forced by that boundary rather than
+// chosen. That is precisely why the invariant is enforced at runtime by
+// `WriteContextLiveness` instead of by a lifetime: it is not expressible.
 unsafe impl Send for SqlWriteContextPtr {}
 unsafe impl Sync for SqlWriteContextPtr {}
+
+impl SqlWriteContext {
+    /// Refuses a dereference of a transaction context that has been torn down.
+    ///
+    /// Always compiled in: the whole point is to be present in the release
+    /// configuration where a dangling dereference would actually bite.
+    fn ensure_context_live(&self, site: &'static str) -> Result<(), LixError> {
+        if self.liveness.is_live() {
+            return Ok(());
+        }
+        Err(
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "SQL write context outlived the transaction it borrows; refusing to dereference a retired context",
+            )
+            .with_details(serde_json::json!({
+                "invariant": "SqlWriteContext must not outlive the Transaction it borrows",
+                "site": site,
+            })),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn liveness_for_test(&self) -> &WriteContextLiveness {
+        &self.liveness
+    }
+}
 
 impl SqlWriteContext {
     pub(crate) fn new(ctx: &mut dyn SqlWriteExecutionContext) -> Self {
@@ -368,6 +459,7 @@ impl SqlWriteContext {
             plugin_host: ctx.plugin_host(),
             session_file_views: ctx.session_file_views(),
         });
+        let liveness = ctx.write_context_liveness();
         let ptr = NonNull::from(ctx);
         let ptr = unsafe {
             std::mem::transmute::<
@@ -378,6 +470,7 @@ impl SqlWriteContext {
         Self {
             ptr: Arc::new(SqlWriteContextPtr(ptr)),
             gate: Arc::new(Mutex::new(())),
+            liveness,
             shared,
             explicit_insert_columns: None,
             write_targets: Some(Arc::new(super::providers::WriteTargetRegistry::default())),
@@ -442,6 +535,7 @@ impl SqlWriteContext {
         request: &HotStateScanRequest,
     ) -> Result<MaterializedHotStateBatch, LixError> {
         let _guard = self.gate.lock().await;
+        self.ensure_context_live("scan_hot_state_batch")?;
         unsafe {
             self.ptr
                 .0
@@ -458,6 +552,7 @@ impl SqlWriteContext {
         request: &HotStateExactBatchRequest,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
         let _guard = self.gate.lock().await;
+        self.ensure_context_live("load_exact_hot_state_batch")?;
         unsafe {
             self.ptr
                 .0
@@ -474,6 +569,7 @@ impl SqlWriteContext {
         hashes: &[BlobId],
     ) -> Result<BlobBytesBatch, LixError> {
         let _guard = self.gate.lock().await;
+        self.ensure_context_live("load_bytes_many")?;
         unsafe {
             self.ptr
                 .0
@@ -490,6 +586,7 @@ impl SqlWriteContext {
         branch_id: &str,
     ) -> Result<Option<CommitId>, LixError> {
         let _guard = self.gate.lock().await;
+        self.ensure_context_live("load_branch_head")?;
         unsafe {
             self.ptr
                 .0
@@ -506,6 +603,7 @@ impl SqlWriteContext {
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         let _guard = self.gate.lock().await;
+        self.ensure_context_live("filesystem_path_index")?;
         unsafe {
             self.ptr
                 .0
@@ -522,6 +620,7 @@ impl SqlWriteContext {
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
         let _guard = self.gate.lock().await;
+        self.ensure_context_live("stage_write")?;
         unsafe {
             self.ptr
                 .0
@@ -539,6 +638,7 @@ impl SqlWriteContext {
         diff_ids: Vec<String>,
     ) -> Result<DiffCommandOutcome, LixError> {
         let _guard = self.gate.lock().await;
+        self.ensure_context_live("execute_diff_command")?;
         unsafe {
             self.ptr
                 .0

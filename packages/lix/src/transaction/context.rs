@@ -517,7 +517,17 @@ fn record_transaction_path_index_build(descriptor_rows: usize) {
 /// that may write. Write-relevant reads must be exposed from this transaction,
 /// after the storage write transaction has begun, rather than from session-level
 /// helpers.
+/// Retires the write-context revocation token so any `SqlWriteContext` that
+/// outlives this transaction fails deterministically instead of dereferencing
+/// freed memory. See `sql2::WriteContextLiveness`.
+impl<StorageImpl: Storage + 'static> Drop for Transaction<StorageImpl> {
+    fn drop(&mut self) {
+        self.write_context_liveness.retire();
+    }
+}
+
 pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
+    write_context_liveness: crate::sql2::WriteContextLiveness,
     active_branch_id: String,
     active_account_id: String,
     hot_state: Arc<HotStateContext>,
@@ -1623,6 +1633,7 @@ where
         Ok((
             OpenTransaction {
                 transaction: Self {
+                    write_context_liveness: crate::sql2::WriteContextLiveness::new(),
                     active_branch_id,
                     active_account_id,
                     hot_state,
@@ -9058,6 +9069,10 @@ impl<StorageImpl> SqlWriteExecutionContext for Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+
+    fn write_context_liveness(&self) -> crate::sql2::WriteContextLiveness {
+        self.write_context_liveness.clone()
+    }
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
     }
