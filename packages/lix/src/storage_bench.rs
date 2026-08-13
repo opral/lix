@@ -508,6 +508,53 @@ pub fn take_commit_delta_member_scan_census() -> (u64, u64, u64, u64, u64) {
     )
 }
 
+static PATH_RESOLVER_DESCRIPTORS_SEEN: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_DESCRIPTORS_PARSED: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_DESCRIPTORS_PREFILTERED: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_METADATA_SLOTS_PRESENT: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_PREFILTER_ENABLED: AtomicU64 = AtomicU64::new(0);
+static PATH_RESOLVER_PREFILTER_DISABLED: AtomicU64 = AtomicU64::new(0);
+
+/// Counted at the per-descriptor loop in
+/// `resolve_file_history_path_lookup_ids`, at the `serde_json::from_str` the
+/// prefilter is meant to avoid -- not at the resolved id set, which is the same
+/// set either way and therefore cannot tell a skipped parse from a performed
+/// one.
+pub(crate) fn record_path_resolver_descriptor(parsed: bool, metadata_present: bool) {
+    PATH_RESOLVER_DESCRIPTORS_SEEN.fetch_add(1, Ordering::Relaxed);
+    if parsed {
+        PATH_RESOLVER_DESCRIPTORS_PARSED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PATH_RESOLVER_DESCRIPTORS_PREFILTERED.fetch_add(1, Ordering::Relaxed);
+    }
+    if metadata_present {
+        PATH_RESOLVER_METADATA_SLOTS_PRESENT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Route counter. A prefiltered count of zero is otherwise unreadable: it means
+/// either "every descriptor matched" or "the prefilter refused this query's
+/// names", and those are different findings.
+pub(crate) fn record_path_resolver_prefilter(enabled: bool) {
+    if enabled {
+        PATH_RESOLVER_PREFILTER_ENABLED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PATH_RESOLVER_PREFILTER_DISABLED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(seen, parsed, prefiltered, metadata_slots_present, prefilter_on, prefilter_off)`.
+pub fn take_path_resolver_census() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        PATH_RESOLVER_DESCRIPTORS_SEEN.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_DESCRIPTORS_PARSED.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_DESCRIPTORS_PREFILTERED.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_METADATA_SLOTS_PRESENT.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_PREFILTER_ENABLED.swap(0, Ordering::Relaxed),
+        PATH_RESOLVER_PREFILTER_DISABLED.swap(0, Ordering::Relaxed),
+    )
+}
+
 pub(crate) fn record_commit_delta_row_loaded(account_id_bytes: usize) {
     COMMIT_DELTA_ROWS_LOADED.fetch_add(1, Ordering::Relaxed);
     COMMIT_DELTA_ROW_KEY_DECODES.fetch_add(1, Ordering::Relaxed);

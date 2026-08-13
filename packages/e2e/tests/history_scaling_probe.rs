@@ -314,6 +314,51 @@ async fn history_member_scan_census() {
     }
 }
 
+/// Descriptor snapshots parsed by path resolution, swept over file count.
+///
+/// Counted at the `serde_json::from_str` the prefilter is meant to avoid, not
+/// at the resolved id set -- that set is the same either way and cannot tell a
+/// skipped parse from a performed one. `prefilter_on/off` is printed so a zero
+/// `prefiltered` is readable: it means either "every descriptor matched" or
+/// "the prefilter refused these names", which are different findings.
+#[tokio::test]
+#[ignore = "manual history-scaling probe"]
+async fn history_path_resolver_census() {
+    let file_bytes = env_usize("LIX_HISTORY_SCALE_FILE_BYTES", 4 * 1024);
+    let edits = env_usize("LIX_HISTORY_SCALE_EDITS", 20);
+    let depth = env_usize("LIX_HISTORY_SCALE_DEPTH", 20);
+
+    for files in env_list("LIX_HISTORY_SCALE_FILES", "500,5000") {
+        let dir = tempfile::tempdir().expect("probe tempdir");
+        let lix = open_at(dir.path()).await;
+        let probe_path = "/probe/f00000.bin".to_string();
+        seed(&lix, files, file_bytes, files, edits, &probe_path).await;
+        let head = active_commit(&lix).await;
+        let by_path = format!(
+            "SELECT lixcol_depth FROM lix_file_history($1) WHERE path = $2 \
+             ORDER BY lixcol_depth LIMIT {depth}"
+        );
+        let params = [Value::Text(head.clone()), Value::Text(probe_path.clone())];
+        let _ = lix.execute(&by_path, &params).await.expect("warm probe query");
+        let _ = lix::storage_bench::take_path_resolver_census();
+        let rows = lix
+            .execute(&by_path, &params)
+            .await
+            .expect("probe query")
+            .rows()
+            .len();
+        let (seen, parsed, prefiltered, metadata_present, prefilter_on, prefilter_off) =
+            lix::storage_bench::take_path_resolver_census();
+        eprintln!(
+            "path_resolver_census files={files} commits={} rows={rows} seen={seen} \
+             parsed={parsed} prefiltered={prefiltered} metadata_slots={metadata_present} \
+             prefilter_on={prefilter_on} prefilter_off={prefilter_off}",
+            edits + 1,
+        );
+        lix.close().await.expect("close probe");
+    }
+}
+
 /// Vary the number of reachable commits with file count AND answer size held
 /// constant.
 ///

@@ -477,6 +477,20 @@ struct FileDescriptorSnapshot {
     name: String,
 }
 
+/// The two fields path resolution reads, borrowed from the snapshot text.
+///
+/// `Cow` rather than `&str` on purpose: a borrowed `&str` deserialize *fails*
+/// on any string containing a JSON escape, which would turn a legally named
+/// file into a query error. `Cow` borrows when it can and allocates when it
+/// must, so the fast path allocates nothing and the escaped path still decodes.
+#[derive(Debug, Deserialize)]
+struct FileDescriptorNameSnapshot<'a> {
+    #[serde(borrow)]
+    id: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    name: std::borrow::Cow<'a, str>,
+}
+
 #[derive(Debug, Deserialize)]
 struct DirectoryDescriptorSnapshot {
     id: String,
@@ -1048,6 +1062,10 @@ where
     )
     .await?;
 
+    let needles = descriptor_name_needles(&names);
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_path_resolver_prefilter(needles.is_some());
+
     let mut file_ids = BTreeSet::new();
     for entry in &entries {
         // A tombstone carries no name, and the name it retired was written by
@@ -1055,14 +1073,42 @@ where
         let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
             continue;
         };
-        let snapshot: FileDescriptorSnapshot =
-            serde_json::from_str(snapshot_content).map_err(|error| {
+        // This is NOT a filter, and it is worth being precise about the
+        // difference: a filter decides the answer, and deciding this answer
+        // genuinely requires the parse -- that is why "filter earlier so fewer
+        // rows are parsed" does not work in `apply_entity_batch_filters`. This
+        // is a *necessary condition* on the raw bytes, evaluated before the
+        // parse and never instead of it. A snapshot whose decoded `name` equals
+        // one of the queried names must contain that name's JSON string token
+        // verbatim, because `descriptor_name_needles` refuses any name whose
+        // encoding is not byte-identical to its source text. Failing the test
+        // therefore proves the parse could not have matched; passing it proves
+        // nothing and still parses.
+        if let Some(needles) = needles.as_deref()
+            && !needles
+                .iter()
+                .any(|needle| snapshot_content.contains(needle.as_str()))
+        {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_path_resolver_descriptor(
+                false,
+                !matches!(entry.change.metadata, None),
+            );
+            continue;
+        }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_path_resolver_descriptor(
+            true,
+            !matches!(entry.change.metadata, None),
+        );
+        let snapshot: FileDescriptorNameSnapshot<'_> = serde_json::from_str(snapshot_content)
+            .map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!("invalid lix_file_descriptor history snapshot JSON: {error}"),
                 )
             })?;
-        if !names.contains(&snapshot.name) {
+        if !names.contains(snapshot.name.as_ref()) {
             continue;
         }
         if EntityPk::uuid_from_canonical(&snapshot.id).is_err() {
@@ -1070,9 +1116,35 @@ where
             // one cannot be routed, so keep the complete traversal.
             return Ok(None);
         }
-        file_ids.insert(snapshot.id);
+        file_ids.insert(snapshot.id.into_owned());
     }
     Ok(Some(FileHistoryLookupIds(file_ids)))
+}
+
+/// The JSON string tokens a matching descriptor snapshot must contain verbatim.
+///
+/// Returns `None` when any queried name cannot be reduced to such a token, in
+/// which case the caller parses every snapshot exactly as it did before. The
+/// accepted set is deliberately narrow -- printable ASCII, no `"` and no `\` --
+/// because those are exactly the names `serde_json` writes back byte-identical
+/// to their source text. A name outside it may be written with an escape
+/// (`\u0041`, `\"`), and a byte test for the unescaped form would then miss a
+/// real match and silently drop history rows. Narrowing here is free: the test
+/// is an accelerator, and refusing it costs only the parse that already
+/// happened before.
+fn descriptor_name_needles(names: &BTreeSet<String>) -> Option<Vec<String>> {
+    let mut needles = Vec::with_capacity(names.len());
+    for name in names {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| (byte.is_ascii_graphic() || byte == b' ') && byte != b'"' && byte != b'\\')
+        {
+            return None;
+        }
+        needles.push(format!("\"{name}\""));
+    }
+    Some(needles)
 }
 
 async fn load_file_history_filesystem_context<S>(
