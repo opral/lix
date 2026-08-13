@@ -294,18 +294,18 @@ simulation_test!(
     }
 );
 
-/// The bound-exactness differential.
-///
-/// `StoragePrefix::to_range` yields a half-open `[lo, hi)`, so an inclusive
-/// upper bound is the one place a range access path silently loses rows: every
-/// row equal to `hi` vanishes and the answer is still plausibly shaped. This
-/// sweeps every `(lo, hi)` pair over a fixture that brackets the data on both
-/// sides and compares against the set computed directly from the fixture, so a
-/// bound error at either end fails here rather than in a benchmark.
-///
-/// The ordinals deliberately span zero and negatives: the order-preserving
-/// integer key encoding is `value ^ (1 << 63)`, and a naive encoder that skips
-/// the sign flip orders every negative above every positive.
+// The bound-exactness differential.
+//
+// `StoragePrefix::to_range` yields a half-open `[lo, hi)`, so an inclusive
+// upper bound is the one place a range access path silently loses rows: every
+// row equal to `hi` vanishes and the answer is still plausibly shaped. This
+// sweeps every `(lo, hi)` pair over a fixture that brackets the data on both
+// sides and compares against the set computed directly from the fixture, so a
+// bound error at either end fails here rather than in a benchmark.
+//
+// The ordinals deliberately span zero and negatives: the order-preserving
+// integer key encoding is `value ^ (1 << 63)`, and a naive encoder that skips
+// the sign flip orders every negative above every positive.
 simulation_test!(
     entity_range_pushdown_matches_full_scan_at_every_bound,
     |sim| async move {
@@ -349,13 +349,13 @@ simulation_test!(
     }
 );
 
-/// The same differential for each half-bounded operator, in both operand
-/// orders.
-///
-/// `5 < ordinal` is `ordinal > 5`, so the literal-on-the-left spelling has to
-/// reverse the comparison. Reusing the operator returns the complement of the
-/// requested rows — an error that a one-sided test with the column always on
-/// the left cannot see.
+// The same differential for each half-bounded operator, in both operand
+// orders.
+//
+// `5 < ordinal` is `ordinal > 5`, so the literal-on-the-left spelling has to
+// reverse the comparison. Reusing the operator returns the complement of the
+// requested rows — an error that a one-sided test with the column always on
+// the left cannot see.
 simulation_test!(
     entity_range_pushdown_matches_full_scan_for_each_operator,
     |sim| async move {
@@ -375,14 +375,13 @@ simulation_test!(
         }
 
         for bound in -5_i64..=8 {
-            for (operator, reversed, matches) in [
-                ("<", ">", &(|ordinal: i64, bound: i64| ordinal < bound) as &dyn Fn(i64, i64) -> bool),
-                ("<=", ">=", &|ordinal: i64, bound: i64| ordinal <= bound),
-                (">", "<", &|ordinal: i64, bound: i64| ordinal > bound),
-                (">=", "<=", &|ordinal: i64, bound: i64| ordinal >= bound),
-            ] {
-                let expected =
-                    expected_range_note_ids(&ordinals, |ordinal| matches(ordinal, bound));
+            for (operator, reversed) in [("<", ">"), ("<=", ">="), (">", "<"), (">=", "<=")] {
+                let expected = expected_range_note_ids(&ordinals, |ordinal| match operator {
+                    "<" => ordinal < bound,
+                    "<=" => ordinal <= bound,
+                    ">" => ordinal > bound,
+                    _ => ordinal >= bound,
+                });
 
                 let column_first = session
                     .execute(
@@ -419,13 +418,13 @@ simulation_test!(
     }
 );
 
-/// Engagement, asserted at the plan.
-///
-/// Before this change a range predicate was `Unsupported`: the provider never
-/// saw it, so it could not reach row-group pruning or any index. `Exact` would
-/// be wrong — the hot index returns a candidate superset and the open/closed
-/// bound distinction is enforced by the residual — so the predicate must appear
-/// as a *partial* filter, meaning pushed down **and** still re-checked above.
+// Engagement, asserted at the plan.
+//
+// Before this change a range predicate was `Unsupported`: the provider never
+// saw it, so it could not reach row-group pruning or any index. `Exact` would
+// be wrong — the hot index returns a candidate superset and the open/closed
+// bound distinction is enforced by the residual — so the predicate must appear
+// as a *partial* filter, meaning pushed down **and** still re-checked above.
 simulation_test!(
     entity_range_pushdown_reaches_the_table_scan_inexactly,
     |sim| async move {
@@ -462,12 +461,12 @@ simulation_test!(
     }
 );
 
-/// The rejection cases, asserted as hard as the acceptance cases.
-///
-/// A `Number` column has no total order (NaN), and `Boolean`/`Json` have no
-/// useful range, so none of them may become a pushed range. Over-claiming here
-/// is a wrong answer rather than a slow one, which is why this is asserted
-/// rather than left to the residual.
+// The rejection cases, asserted as hard as the acceptance cases.
+//
+// A `Number` column has no total order (NaN), and `Boolean`/`Json` have no
+// useful range, so none of them may become a pushed range. Over-claiming here
+// is a wrong answer rather than a slow one, which is why this is asserted
+// rather than left to the residual.
 simulation_test!(
     entity_range_pushdown_refuses_columns_without_a_total_order,
     |sim| async move {
