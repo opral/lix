@@ -5502,42 +5502,44 @@ where
         let budget = hot_index_candidate_budget(entries_published);
 
         let column_prefix = hot_index_column_prefix(branch_id, generation, schema_key, ordinal);
-        let lower_bound = match lower {
+        let value_prefix = |value: &HotIndexValue| {
+            hot_index_value_prefix(branch_id, generation, schema_key, ordinal, value)
+        };
+        let lower_key = match lower {
             // `>= v` starts at the value prefix, which sorts below every entry
             // carrying that value.
-            Some((value, true)) => std::ops::Bound::Included(StorageKey(Bytes::from(hot_index_value_prefix(
-                branch_id, generation, schema_key, ordinal, value,
-            )))),
-            // `> v` must clear every entry of `v`, so it starts one successor up.
-            Some((value, false)) => {
-                let prefix =
-                    hot_index_value_prefix(branch_id, generation, schema_key, ordinal, value);
-                match hot_index_key_successor(&prefix) {
-                    Some(successor) => std::ops::Bound::Included(StorageKey(Bytes::from(successor))),
-                    None => return Ok(Some(Vec::new())),
-                }
-            }
-            None => std::ops::Bound::Included(StorageKey(Bytes::from(column_prefix.clone()))),
+            Some((value, true)) => value_prefix(value),
+            // `> v` must clear every entry of `v`, so it starts one successor
+            // up. No successor means no key can exceed `v`, so nothing matches.
+            Some((value, false)) => match hot_index_key_successor(&value_prefix(value)) {
+                Some(successor) => successor,
+                None => return Ok(Some(Vec::new())),
+            },
+            None => column_prefix.clone(),
         };
-        let upper_bound = match upper {
+        let upper_key = match upper {
             // `<= v` must retain every entry of `v`, which all sort above the
             // value prefix — so the bound is the successor, not the prefix.
-            Some((value, true)) => {
-                let prefix =
-                    hot_index_value_prefix(branch_id, generation, schema_key, ordinal, value);
-                match hot_index_key_successor(&prefix) {
-                    Some(successor) => std::ops::Bound::Excluded(StorageKey(Bytes::from(successor))),
-                    None => std::ops::Bound::Unbounded,
-                }
-            }
+            // This is the inclusive-upper trap: bounding at the prefix drops
+            // every row equal to `v` and still returns a plausible answer.
+            Some((value, true)) => hot_index_key_successor(&value_prefix(value)),
             // `< v` excludes them, and the value prefix sorts below them all.
-            Some((value, false)) => std::ops::Bound::Excluded(StorageKey(Bytes::from(hot_index_value_prefix(
-                branch_id, generation, schema_key, ordinal, value,
-            )))),
-            None => match hot_index_key_successor(&column_prefix) {
-                Some(successor) => std::ops::Bound::Excluded(StorageKey(Bytes::from(successor))),
-                None => std::ops::Bound::Unbounded,
-            },
+            Some((value, false)) => Some(value_prefix(value)),
+            None => hot_index_key_successor(&column_prefix),
+        };
+        // An inverted or empty interval — `BETWEEN 8 AND -5`, or two bounds
+        // that meet — names no rows. The store rejects a cursor whose lower
+        // bound does not sort below its upper, so this has to be answered
+        // without opening one rather than by scanning and finding nothing.
+        if let Some(upper_key) = upper_key.as_ref()
+            && lower_key >= *upper_key
+        {
+            return Ok(Some(Vec::new()));
+        }
+        let lower_bound = std::ops::Bound::Included(StorageKey(Bytes::from(lower_key)));
+        let upper_bound = match upper_key {
+            Some(upper_key) => std::ops::Bound::Excluded(StorageKey(Bytes::from(upper_key))),
+            None => std::ops::Bound::Unbounded,
         };
 
         let mut candidates = Vec::new();
