@@ -1508,7 +1508,6 @@ fn file_history_descriptor_blob_route(
 ) -> Result<HistoryRoute, LixError> {
     let mut route = route.clone();
     route.entity_pks = lookup_ids.entity_pks()?;
-    route.file_ids = lookup_ids.0.iter().cloned().collect();
     route.resolved_entity_pks = lookup_ids
         .0
         .iter()
