@@ -1511,7 +1511,7 @@ async fn broad_canonical_created_at_recovery_misses_for_new_identities() {
 ///
 /// Process-global by construction, so only *deltas* and only *thresholds*
 /// scaled to a fixture no concurrent test can reach are meaningful here.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct CompactionCounters {
     /// Publications that reached the mask at all.
     routes: u64,
@@ -1799,5 +1799,309 @@ async fn checkpoint_compaction_scan_cost() {
             scan.as_micros(),
             counters
         );
+    }
+}
+
+
+/// PHASE 7 - how much of a scan's decode work is tombstones, counted at the
+/// per-entry decode loop.
+///
+/// The counters this reads (`HOT_SCAN_DECODED_ENTRIES` and friends) sit inside
+/// the per-entry decode loop of both hot scan arms, not at the layer that
+/// returns the answer: a post-filter count reads identically under a seek and
+/// under a full walk.
+///
+/// Four arms, all answering exactly one row:
+///
+/// - `fresh` - one live row, no history. The floor.
+/// - `update_churn` - two live rows, one of them updated `n-1` times. Same
+///   order of write volume and the same number of generation rotations as
+///   `churn`, but zero tombstones. This is the arm that separates "tombstones
+///   inflate the scan" from "the plane is rematerialised per commit": if the
+///   cost were rematerialisation, this arm would track `churn`.
+/// - `churn` - `n` inserts and `n-1` deletes.
+/// - `churn_dropped` - the same fixture as `churn` with every tombstone
+///   physically removed and the engine reopened cold. Holds write history
+///   constant and varies only the tombstones.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn hot_row_tombstone_decode_census() {
+    use std::sync::atomic::Ordering;
+
+    fn reset() {
+        crate::hot_state::HOT_SCAN_DECODED_ENTRIES.store(0, Ordering::Relaxed);
+        crate::hot_state::HOT_SCAN_MATCHED_ENTRIES.store(0, Ordering::Relaxed);
+        crate::hot_state::HOT_SCAN_TOMBSTONE_ENTRIES.store(0, Ordering::Relaxed);
+    }
+    fn read() -> (u64, u64, u64) {
+        (
+            crate::hot_state::HOT_SCAN_DECODED_ENTRIES.load(Ordering::Relaxed),
+            crate::hot_state::HOT_SCAN_MATCHED_ENTRIES.load(Ordering::Relaxed),
+            crate::hot_state::HOT_SCAN_TOMBSTONE_ENTRIES.load(Ordering::Relaxed),
+        )
+    }
+
+    let sizes = sizes_from_env("LIX_TOMBSTONE_SIZES", &[1_000, 10_000]);
+    let reps = reps_from_env(5);
+    println!(
+        "phase7 | arm,n,row_entries,space_tombstones,decoded,matched,decoded_tombstones,answer_rows,scan_us"
+    );
+
+    for n in sizes {
+        {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("c7fresh")).await;
+            insert_rows(&session, "c7fresh", 1).await;
+            let census = row_census(&storage).await;
+            let _ = timed_scan(&session, &scan_sql("c7fresh"), 1, 1).await;
+            reset();
+            let rows = session
+                .execute(&scan_sql("c7fresh"), &[])
+                .await
+                .expect("scan");
+            let (decoded, matched, tombs) = read();
+            let scan = timed_scan(&session, &scan_sql("c7fresh"), 1, reps).await;
+            println!(
+                "fresh,{n},{},{},{decoded},{matched},{tombs},{},{}",
+                census.entries,
+                census.tombstones,
+                rows.len(),
+                scan.as_micros()
+            );
+        }
+
+        {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("c7upd")).await;
+            insert_rows(&session, "c7upd", 2).await;
+            for i in 0..(n - 1) {
+                session
+                    .execute(
+                        "UPDATE c7upd SET locale = $1 WHERE id = 'row-1'",
+                        &[crate::Value::Text(format!("v{i}"))],
+                    )
+                    .await
+                    .expect("update should commit");
+            }
+            let census = row_census(&storage).await;
+            let _ = timed_scan(&session, &scan_sql("c7upd"), 1, 1).await;
+            reset();
+            let rows = session.execute(&scan_sql("c7upd"), &[]).await.expect("scan");
+            let (decoded, matched, tombs) = read();
+            let scan = timed_scan(&session, &scan_sql("c7upd"), 1, reps).await;
+            println!(
+                "update_churn,{n},{},{},{decoded},{matched},{tombs},{},{}",
+                census.entries,
+                census.tombstones,
+                rows.len(),
+                scan.as_micros()
+            );
+        }
+
+        {
+            let (storage, session) = open_session().await;
+            register(&session, probe_schema("c7churn")).await;
+            insert_rows(&session, "c7churn", n).await;
+            delete_all_but_first(&session, "c7churn", n).await;
+            let census = row_census(&storage).await;
+            let _ = timed_scan(&session, &scan_sql("c7churn"), 1, 1).await;
+            reset();
+            let rows = session
+                .execute(&scan_sql("c7churn"), &[])
+                .await
+                .expect("scan");
+            let (decoded, matched, tombs) = read();
+            let scan = timed_scan(&session, &scan_sql("c7churn"), 1, reps).await;
+            println!(
+                "churn,{n},{},{},{decoded},{matched},{tombs},{},{}",
+                census.entries,
+                census.tombstones,
+                rows.len(),
+                scan.as_micros()
+            );
+            assert!(
+                tombs > 0,
+                "the churn arm must decode tombstones, otherwise the census does not observe this site"
+            );
+
+            let removed = drop_all_tombstones(&storage).await;
+            assert_eq!(removed, n - 1);
+            let session = reopen_session(&storage).await;
+            let census = row_census(&storage).await;
+            let _ = timed_scan(&session, &scan_sql("c7churn"), 1, 1).await;
+            reset();
+            let rows = session
+                .execute(&scan_sql("c7churn"), &[])
+                .await
+                .expect("scan");
+            let (decoded, matched, tombs) = read();
+            let scan = timed_scan(&session, &scan_sql("c7churn"), 1, reps).await;
+            println!(
+                "churn_dropped,{n},{},{},{decoded},{matched},{tombs},{},{}",
+                census.entries,
+                census.tombstones,
+                rows.len(),
+                scan.as_micros()
+            );
+        }
+    }
+}
+
+
+/// PHASE 11 - does a churning workload accumulate tombstones without bound?
+///
+/// `rounds` repetitions of "create `n` rows, delete all `n`", with the
+/// checkpoint cadence as the experimental variable. The live row count returns
+/// to its starting value at the end of every round, so anything that grows
+/// with `round` is tracking *writes*, not live rows.
+///
+/// - `no_checkpoint` - never checkpointed. This is the case
+///   `checkpoint_compacts_discharged_branch_tombstones` explicitly does not
+///   claim.
+/// - `checkpoint_each_round` - a checkpoint at the end of every round, which
+///   is the interval shape compaction was landed for.
+/// - `checkpoint_every_4` - a realistic middling cadence.
+///
+/// The scan answers exactly one row in every round of every arm, so `scan_us`
+/// against `round` is a growth curve at constant answer size.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn hot_row_tombstone_churn_cycles() {
+    let n = sizes_from_env("LIX_TOMBSTONE_SIZES", &[500])[0];
+    let rounds = sizes_from_env("LIX_TOMBSTONE_ROUNDS", &[8])[0];
+    let reps = reps_from_env(5);
+    println!(
+        "phase11 | cadence,round,row_entries,tombstones,live_entries,packed_bases,root_bases,answer_rows,scan_us,compaction"
+    );
+
+    // Cadence 9999 is the marker for the deferred-delete arm below: the rows
+    // created in round r are deleted in round r+1, with a checkpoint between,
+    // so every delete is against a baseline the interval already discharged.
+    for (label, cadence) in [
+        ("no_checkpoint", 0_usize),
+        ("checkpoint_each_round", 1),
+        ("checkpoint_every_4", 4),
+        ("deferred_delete_ckpt", 9999),
+    ] {
+        let (storage, session) = open_session().await;
+        let table = match cadence {
+            0 => "p11never",
+            1 => "p11each",
+            9999 => "p11defer",
+            _ => "p11four",
+        };
+        register(&session, probe_schema(table)).await;
+        // One permanent survivor so the answer is one row in every round.
+        session
+            .execute(
+                &format!("INSERT INTO {table} (id, locale) VALUES ('row-0', 'keep')"),
+                &[],
+            )
+            .await
+            .expect("survivor should insert");
+
+        if cadence == 9999 {
+            for round in 1..=rounds {
+                let ids = (0..n)
+                    .map(|i| format!("('d{round}-{i}', 'drop')"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                session
+                    .execute(
+                        &format!("INSERT INTO {table} (id, locale) VALUES {ids}"),
+                        &[],
+                    )
+                    .await
+                    .expect("round insert should commit");
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("insert checkpoint should publish");
+                let del = (0..n)
+                    .map(|i| format!("'d{round}-{i}'"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                session
+                    .execute(&format!("DELETE FROM {table} WHERE id IN ({del})"), &[])
+                    .await
+                    .expect("round delete should commit");
+                let before = compaction_counters();
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("delete checkpoint should publish");
+                let counters = compaction_counters().since(before);
+                let census = row_census(&storage).await;
+                let scan = timed_scan(&session, &scan_sql(table), 1, reps).await;
+                let live = session
+                    .execute(&format!("SELECT id FROM {table}"), &[])
+                    .await
+                    .expect("collection scan should run")
+                    .len();
+                assert_eq!(live, 1, "every round must end with exactly one live row");
+                println!(
+                    "{label},{round},{},{},{},{},{},1,{},{counters}",
+                    census.entries,
+                    census.tombstones,
+                    census.live(),
+                    census.packed_bases,
+                    census.root_bases,
+                    scan.as_micros()
+                );
+            }
+            continue;
+        }
+
+        for round in 1..=rounds {
+            let ids = (0..n)
+                .map(|i| format!("('c{round}-{i}', 'drop')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            session
+                .execute(
+                    &format!("INSERT INTO {table} (id, locale) VALUES {ids}"),
+                    &[],
+                )
+                .await
+                .expect("round insert should commit");
+            let del = (0..n)
+                .map(|i| format!("'c{round}-{i}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            session
+                .execute(
+                    &format!("DELETE FROM {table} WHERE id IN ({del})"),
+                    &[],
+                )
+                .await
+                .expect("round delete should commit");
+            let mut counters = CompactionCounters::default();
+            if cadence > 0 && round % cadence == 0 {
+                let before = compaction_counters();
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("checkpoint should publish");
+                counters = compaction_counters().since(before);
+            }
+
+            let census = row_census(&storage).await;
+            let scan = timed_scan(&session, &scan_sql(table), 1, reps).await;
+            let live = session
+                .execute(&format!("SELECT id FROM {table}"), &[])
+                .await
+                .expect("collection scan should run")
+                .len();
+            assert_eq!(live, 1, "every round must end with exactly one live row");
+            println!(
+                "{label},{round},{},{},{},{},{},1,{},{counters}",
+                census.entries,
+                census.tombstones,
+                census.live(),
+                census.packed_bases,
+                census.root_bases,
+                scan.as_micros()
+            );
+        }
     }
 }

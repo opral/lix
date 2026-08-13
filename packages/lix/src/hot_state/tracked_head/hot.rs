@@ -123,6 +123,26 @@ pub(crate) static BROAD_CANONICAL_CREATED_AT_HITS: std::sync::atomic::AtomicU64 
 /// `ROUTES` and `OFFERED` sit above both, at the mask's first line, because
 /// "the checkpoint offered no tombstone" and "the checkpoint never reached the
 /// mask" are different faults with identical readings at `CANDIDATES`.
+/// Decode census for the hot row serving-view scan loops.
+///
+/// These sit inside the **per-entry decode loop** of both scan arms
+/// (`hot_scan_entries`' wide fallback and `scan_hot_file_entries`), not at the
+/// layer that returns the answer: a post-filter count reads identically under a
+/// seek and under a full walk. `DECODED` counts every `ROW_SPACE` entry whose
+/// key this request decoded, `MATCHED` the subset that passed
+/// `matches_filter`, and `TOMBSTONE` the matched subset whose fixed header
+/// carries `HEAD_VALUE_DELETED` - rows fetched, decoded and then discarded
+/// because they are deletions.
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static HOT_SCAN_DECODED_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static HOT_SCAN_MATCHED_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static HOT_SCAN_TOMBSTONE_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) static COMPACTED_TOMBSTONE_ROUTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -11727,6 +11747,8 @@ async fn hot_scan_entries<'a>(
             for entry in page {
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                #[cfg(any(test, feature = "storage-benches"))]
+                HOT_SCAN_DECODED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 #[cfg(feature = "storage-benches")]
                 if is_blob_ref_probe {
                     crate::storage_bench::record_hot_blob_ref_scan_entry(
@@ -11736,6 +11758,15 @@ async fn hot_scan_entries<'a>(
                 if identity.matches_filter(filter) {
                     saw_file_backed_row |= identity.file_id().is_some();
                     let value = full_value_bytes(entry.value)?;
+                    #[cfg(any(test, feature = "storage-benches"))]
+                    {
+                        HOT_SCAN_MATCHED_ENTRIES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if value.len() > 1 && value[1] & 0b0000_0001 != 0 {
+                            HOT_SCAN_TOMBSTONE_ENTRIES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     retained_bytes = retained_bytes
                         .checked_add(encoded_key_bytes)
                         .and_then(|bytes| bytes.checked_add(value.len()))
@@ -12012,8 +12043,20 @@ async fn scan_hot_file_entries(
                 .await?.into_parts();
             for entry in page {
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                #[cfg(any(test, feature = "storage-benches"))]
+                HOT_SCAN_DECODED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if identity.matches_filter(filter) {
-                    rows.push((identity, full_value_bytes(entry.value)?));
+                    let value = full_value_bytes(entry.value)?;
+                    #[cfg(any(test, feature = "storage-benches"))]
+                    {
+                        HOT_SCAN_MATCHED_ENTRIES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if value.len() > 1 && value[1] & 0b0000_0001 != 0 {
+                            HOT_SCAN_TOMBSTONE_ENTRIES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    rows.push((identity, value));
                 }
             }
             if !page_has_more {
