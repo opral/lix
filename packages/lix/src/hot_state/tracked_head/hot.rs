@@ -8134,9 +8134,12 @@ where
         //
         // Consulting canonical state at the branch head restores the fence
         // where the serving view cannot carry it, and keeps the refusal on the
-        // insert. Cost is bounded to commits that actually contain an
-        // untracked write with an unresolvable predecessor; every other commit
-        // builds an empty key list and performs no additional I/O.
+        // insert.
+        //
+        // This block's key list used to be untracked-only, which left it empty
+        // on every ordinary commit. It no longer is — see the note below on
+        // the second question the same batch now answers, and the cost that
+        // widening carries.
         // The same batch answers a second question. A tracked insert whose
         // predecessor is absent is either a genuinely new identity — canonical
         // holds nothing, the lookup misses, and `delta.created_at` stands — or
