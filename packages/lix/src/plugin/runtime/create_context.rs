@@ -17,7 +17,7 @@ use crate::common::MutationIdentity;
 use crate::entity_pk::EntityPk;
 use crate::hot_state::{MaterializedHotStateExactBatch, MaterializedHotStateRow};
 use crate::transaction_types::{TransactionJson, TransactionWriteRow};
-use crate::wasm::{
+use crate::plugin::runtime::{
     WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityChanges,
     WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,
 };
@@ -511,8 +511,8 @@ fn invalid_id(message: impl Into<String>) -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::{PluginRegistryEntryInput, PluginRuntime};
-    use crate::wasm::{WasmCanonicalJson, WasmChangeEffect, WasmEntity, WasmHostBytes};
+    use crate::plugin::runtime::{PluginRegistryEntryInput, PluginRuntime};
+    use crate::plugin::runtime::{WasmCanonicalJson, WasmChangeEffect, WasmEntity, WasmHostBytes};
 
     fn actor_key() -> PluginActorKey {
         PluginActorKey {
@@ -547,7 +547,7 @@ mod tests {
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
             manifest_json: r#"{"entry":"plugin.wasm","key":"plugin_csv","match":{"path_glob":"*.csv"},"schemas":["schema/csv_row.json"]}"#.to_string(),
-            archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv"),
+            archive_file_id: crate::plugin::runtime::plugin_storage_archive_file_id("plugin_csv"),
             archive_path: "/.lix/plugins/plugin_csv.lixplugin".to_string(),
             archive_blob_hash: "a".repeat(64),
             wasm_blob_hash: "b".repeat(64),

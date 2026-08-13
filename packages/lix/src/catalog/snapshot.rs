@@ -10,7 +10,7 @@ use crate::domain::{Domain, DomainSchemaIdentity};
 use crate::entity_pk::{EntityPk, canonical_json_text};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
-use crate::wasm::WasmEntityKey;
+use crate::plugin::runtime::WasmEntityKey;
 
 #[derive(Default)]
 pub(crate) struct CatalogSnapshot {

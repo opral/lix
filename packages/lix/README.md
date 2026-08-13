@@ -8,6 +8,10 @@ let lix = lix::open_lix().await?;
 branches, transactions, and Wasmtime plugin runtime without pulling in a
 persistent backend.
 
+Plugin authors also depend directly on `lix` and use the target-selected
+[`lix::plugin`](PLUGIN.md) authoring API. No separate plugin SDK crate is
+required.
+
 For persistence, add an adapter crate and configure it before awaiting:
 
 ```rust,no_run
@@ -15,7 +19,7 @@ use lix::open_lix;
 use lix_storage_rocksdb::RocksDB;
 
 # async fn example() -> Result<(), lix::LixError> {
-let storage = RocksDB::open("./workspace.rocksdb")?;
+let storage = RocksDB::open("./repository.rocksdb")?;
 let lix = open_lix().with_storage(storage).await?;
 # Ok(())
 # }

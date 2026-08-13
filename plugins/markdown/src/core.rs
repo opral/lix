@@ -6,8 +6,8 @@ use crate::model::{
     InlineContent, InlineNode, NodeKind, NodeSnapshot, NodeTree, Projection, parse_inline_payload,
     replace_column_ids, semantic_payload,
 };
+use crate::order_key::OrderKey;
 use base64::Engine;
-use lix_order_key::OrderKey;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;

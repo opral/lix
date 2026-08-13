@@ -1,7 +1,7 @@
 use lix::storage::Storage;
 use lix::telemetry::TelemetrySink;
-use lix::wasm::WasmRuntime;
-use lix::wasm::WasmTransitionCounters;
+use lix::plugin::runtime::WasmRuntime;
+use lix::plugin::runtime::WasmTransitionCounters;
 use lix::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteBatchStatement,
     ExecuteIdempotency, ExecuteOptions, ExecuteResult, ExecuteStatementMetadata,
@@ -683,7 +683,7 @@ where
     #[cfg(feature = "default_wasm_runtime")]
     let wasm_runtime = match wasm_runtime {
         Some(wasm_runtime) => Some(wasm_runtime),
-        None => Some(crate::default_wasm_runtime::runtime()?),
+        None => Some(crate::plugin::runtime::default::runtime()?),
     };
     let mut options = EngineOptions::new();
     if let Some(wasm_runtime) = wasm_runtime {

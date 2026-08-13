@@ -19,7 +19,7 @@ use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanFingerprint};
 use crate::common::{RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
 use crate::hot_state::MaterializedHotStateBatch;
-use crate::wasm::{
+use crate::plugin::runtime::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedEntityBatch,
     WasmChangeDrainValidator, WasmChangePage, WasmComponentActor, WasmConflictResolution,
@@ -169,7 +169,7 @@ pub(crate) fn host_entity_with_lazy_snapshot(
 pub(crate) fn host_entity_change_with_lazy_snapshot(
     key: WasmEntityKey,
     snapshot: Bytes,
-    effect: crate::wasm::WasmChangeEffect,
+    effect: crate::plugin::runtime::WasmChangeEffect,
     limits: WasmTransitionLimits,
 ) -> Result<WasmEntityChange<WasmHostBytes>, LixError> {
     let limits = limits.validate()?;
@@ -206,7 +206,7 @@ fn lazy_source_from_inline(bytes: WasmHostBytes) -> WasmHostBytes {
         return bytes;
     };
     let length = bytes.len() as u64;
-    WasmHostBytes::Source(crate::wasm::WasmSourceSlice {
+    WasmHostBytes::Source(crate::plugin::runtime::WasmSourceSlice {
         source: Arc::new(ArcByteSource::new(bytes.into())),
         range: WasmSourceRange { offset: 0, length },
     })
@@ -1909,7 +1909,7 @@ const HOST_CERTIFIED_PACKET_MIN_ROWS: usize = 64;
 /// second expanded HOT row per line.
 pub(crate) fn certify_dense_fresh_file(
     transition: &mut ValidatedFileTransition,
-    creates: crate::wasm::WasmCreateContext,
+    creates: crate::plugin::runtime::WasmCreateContext,
     schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     if !transition.certified_batches.is_empty()
@@ -1982,7 +1982,7 @@ pub(crate) fn certify_dense_fresh_file(
         };
         let schema_bytes = schema_key.as_bytes();
         let id = creates.component(*local_ref)?;
-        let snapshot_bytes = crate::plugin_layout::insert_generated_id(
+        let snapshot_bytes = crate::plugin::wire::insert_generated_id(
             snapshot.normalized().as_bytes(),
             primary_key_path,
             &id,
@@ -2060,9 +2060,9 @@ pub(crate) fn certify_dense_fresh_file(
         // codec. Guest batches are validated before this synthesis point and
         // the guest-facing validator intentionally rejects both formats.
         format: if compressed_pages {
-            crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+            crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
         } else {
-            crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+            crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
         },
         schema_keys: vec![schema_key.to_owned()],
         row_count: transition.changes.changes.len() as u64,
@@ -2410,7 +2410,7 @@ impl<'a> CertifiedPacketReader<'a> {
 pub(crate) async fn drain_file_transition_changes(
     actor: &mut dyn WasmComponentActor,
     transition: WasmFileTransition,
-    creates: crate::wasm::WasmCreateContext,
+    creates: crate::plugin::runtime::WasmCreateContext,
     schemas: &SchemaAllowlist,
     limits: WasmTransitionLimits,
 ) -> Result<ValidatedFileTransition, LixError> {
@@ -2424,7 +2424,7 @@ pub(crate) async fn drain_file_transition_changes(
 async fn drain_file_transition_changes_inner(
     actor: &mut dyn WasmComponentActor,
     transition: WasmFileTransition,
-    creates: crate::wasm::WasmCreateContext,
+    creates: crate::plugin::runtime::WasmCreateContext,
     schemas: &SchemaAllowlist,
     limits: WasmTransitionLimits,
 ) -> Result<ValidatedFileTransition, LixError> {
@@ -2513,7 +2513,7 @@ async fn drain_file_transition_changes_inner(
                                     ));
                                 };
                                 let id = creates.component(local_ref)?;
-                                crate::plugin_layout::validate_generated_id(
+                                crate::plugin::wire::validate_generated_id(
                                     &snapshot,
                                     primary_key_path,
                                     &id,
@@ -3546,7 +3546,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::wasm::{
+    use crate::plugin::runtime::{
         WasmChangeCursorHandle, WasmChangeEffect, WasmCreateContext, WasmEditCursorHandle,
         WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputSplice,
     };
@@ -3934,9 +3934,10 @@ mod tests {
 
     #[test]
     fn certified_plugin_rows_retain_source_buffers_without_an_arena() {
-        let schema =
-            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
-                .expect("CSV row schema");
+        let schema = serde_json::from_str(include_str!(
+            "../../../../../plugins/csv/schema/csv_row.json"
+        ))
+        .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
@@ -4016,9 +4017,10 @@ mod tests {
 
     #[test]
     fn canonical_plugin_rows_skip_dom_and_share_the_normalized_arena() {
-        let schema =
-            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
-                .expect("CSV row schema");
+        let schema = serde_json::from_str(include_str!(
+            "../../../../../plugins/csv/schema/csv_row.json"
+        ))
+        .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
@@ -4073,9 +4075,10 @@ mod tests {
 
     #[test]
     fn plugin_row_parser_counts_one_pass_for_canonical_compatibility_and_invalid_rows() {
-        let schema =
-            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
-                .expect("CSV row schema");
+        let schema = serde_json::from_str(include_str!(
+            "../../../../../plugins/csv/schema/csv_row.json"
+        ))
+        .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
@@ -4146,11 +4149,12 @@ mod tests {
 
     #[test]
     fn streaming_plugin_parser_matches_dom_canonicalization_for_compatibility_corpus() {
-        let row_schema =
-            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
-                .expect("CSV row schema");
+        let row_schema = serde_json::from_str(include_str!(
+            "../../../../../plugins/csv/schema/csv_row.json"
+        ))
+        .expect("CSV row schema");
         let table_schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv/schema/csv_table.json"
+            "../../../../../plugins/csv/schema/csv_table.json"
         ))
         .expect("CSV table schema");
         let catalog = CatalogSnapshot::from_schema_facts(&[
@@ -4396,7 +4400,7 @@ mod tests {
             &mut self,
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
-            _update: crate::wasm::WasmFileUpdate,
+            _update: crate::plugin::runtime::WasmFileUpdate,
         ) -> Result<WasmFileTransition, LixError> {
             Err(unused())
         }
@@ -4405,7 +4409,7 @@ mod tests {
             &mut self,
             _document: WasmDocumentHandle,
             _limits: WasmTransitionLimits,
-            _update: crate::wasm::WasmEntityUpdate,
+            _update: crate::plugin::runtime::WasmEntityUpdate,
         ) -> Result<WasmEntityTransition, LixError> {
             Err(unused())
         }
@@ -4422,7 +4426,7 @@ mod tests {
         async fn next_resolution_page(
             &mut self,
             _transition: WasmTransitionHandle,
-            _cursor: crate::wasm::WasmResolutionCursorHandle,
+            _cursor: crate::plugin::runtime::WasmResolutionCursorHandle,
             _max_bytes: u32,
         ) -> Result<Option<WasmConflictResolutionPage>, LixError> {
             Ok(self.resolution_pages.pop_front())
@@ -4508,13 +4512,13 @@ mod tests {
     async fn conflict_drain_requires_contiguous_host_ordinals() {
         let transition = WasmConflictTransition {
             transition: WasmTransitionHandle(41),
-            resolutions: crate::wasm::WasmResolutionCursorHandle(42),
+            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(42),
         };
         let page = WasmConflictResolutionPage {
             format_version: PACKET_FORMAT_V1,
             ordinals: vec![1],
             resolutions: vec![WasmConflictResolution::Take(
-                crate::wasm::WasmConflictTake::B,
+                crate::plugin::runtime::WasmConflictTake::B,
             )],
             outputs: None,
         };
@@ -4540,13 +4544,13 @@ mod tests {
     async fn conflict_drain_preserves_take_without_snapshot_output() {
         let transition = WasmConflictTransition {
             transition: WasmTransitionHandle(51),
-            resolutions: crate::wasm::WasmResolutionCursorHandle(52),
+            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(52),
         };
         let page = WasmConflictResolutionPage {
             format_version: PACKET_FORMAT_V1,
             ordinals: vec![0, 1],
             resolutions: vec![
-                WasmConflictResolution::Take(crate::wasm::WasmConflictTake::B),
+                WasmConflictResolution::Take(crate::plugin::runtime::WasmConflictTake::B),
                 WasmConflictResolution::Delete,
             ],
             outputs: None,
@@ -4575,7 +4579,7 @@ mod tests {
     async fn conflict_replacements_share_one_canonical_batch() {
         let transition = WasmConflictTransition {
             transition: WasmTransitionHandle(56),
-            resolutions: crate::wasm::WasmResolutionCursorHandle(57),
+            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(57),
         };
         let page = WasmConflictResolutionPage {
             format_version: PACKET_FORMAT_V1,
@@ -4630,7 +4634,7 @@ mod tests {
     async fn conflict_drain_patches_replacements_without_reordering_other_results() {
         let transition = WasmConflictTransition {
             transition: WasmTransitionHandle(58),
-            resolutions: crate::wasm::WasmResolutionCursorHandle(59),
+            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(59),
         };
         let page = WasmConflictResolutionPage {
             format_version: PACKET_FORMAT_V1,
@@ -4640,7 +4644,7 @@ mod tests {
                     snapshot_content: WasmGuestBytes::Inline(br#"{"id":"a"}"#.to_vec().into()),
                     effect: WasmChangeEffect::Content,
                 },
-                WasmConflictResolution::Take(crate::wasm::WasmConflictTake::B),
+                WasmConflictResolution::Take(crate::plugin::runtime::WasmConflictTake::B),
                 WasmConflictResolution::Delete,
                 WasmConflictResolution::Replace {
                     snapshot_content: WasmGuestBytes::Inline(br#"{"id":"b"}"#.to_vec().into()),
@@ -4672,7 +4676,7 @@ mod tests {
         };
         assert!(matches!(
             drained.resolutions[1],
-            WasmConflictResolution::Take(crate::wasm::WasmConflictTake::B)
+            WasmConflictResolution::Take(crate::plugin::runtime::WasmConflictTake::B)
         ));
         assert!(matches!(
             drained.resolutions[2],
@@ -4694,7 +4698,7 @@ mod tests {
     async fn conflict_drain_rejects_oversized_replacement_before_output_read() {
         let transition = WasmConflictTransition {
             transition: WasmTransitionHandle(61),
-            resolutions: crate::wasm::WasmResolutionCursorHandle(62),
+            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(62),
         };
         let limits = WasmTransitionLimits::default();
         let page = WasmConflictResolutionPage {

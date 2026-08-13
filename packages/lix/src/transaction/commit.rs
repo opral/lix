@@ -231,8 +231,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             batch.complete_file_state
                 && matches!(
                     batch.format,
-                    1 | crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
-                        | crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+                    1 | crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+                        | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
                 )
         }) {
             let [schema_key] = batch.schema_keys.as_slice() else {
@@ -904,10 +904,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     })
 }
 
-fn certified_batch_requires_root_expansion(batch: &crate::wasm::WasmCertifiedEntityBatch) -> bool {
+fn certified_batch_requires_root_expansion(batch: &crate::plugin::runtime::WasmCertifiedEntityBatch) -> bool {
     !matches!(
         batch.format,
-        crate::wasm::HOST_CERTIFIED_PACKET_FORMAT | crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT | crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
     )
 }
 
@@ -7002,20 +7002,20 @@ mod tests {
 
     #[test]
     fn host_dense_packets_reuse_ordinary_root_members() {
-        let batch = |format| crate::wasm::WasmCertifiedEntityBatch {
+        let batch = |format| crate::plugin::runtime::WasmCertifiedEntityBatch {
             format,
             schema_keys: vec!["test_schema".to_owned()],
             row_count: 1,
-            creates: crate::wasm::WasmCreateContext { high: 0, low: 0 },
+            creates: crate::plugin::runtime::WasmCreateContext { high: 0, low: 0 },
             create_ranges: Vec::new(),
             complete_file_state: true,
             pages: Vec::new(),
         };
         assert!(!certified_batch_requires_root_expansion(&batch(
-            crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+            crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
         )));
         assert!(!certified_batch_requires_root_expansion(&batch(
-            crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+            crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
         )));
         assert!(certified_batch_requires_root_expansion(&batch(1)));
         assert!(certified_batch_requires_root_expansion(&batch(2)));

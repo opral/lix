@@ -3501,7 +3501,7 @@ mod tests {
             .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
+                entity_pk: EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -4507,7 +4507,7 @@ mod tests {
             .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
+                entity_pk: EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -4528,7 +4528,7 @@ mod tests {
             .load_row(&HotStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: branch_id.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
+                entity_pk: EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -4550,7 +4550,7 @@ mod tests {
             .scan_batch(&HotStateScanRequest {
                 filter: HotStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
-                    entity_pks: vec![crate::entity_pk::EntityPk::single("selected-tab")],
+                    entity_pks: vec![EntityPk::single("selected-tab")],
                     branch_ids: vec![branch_id.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones,

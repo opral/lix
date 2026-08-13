@@ -3205,8 +3205,6 @@ dependencies = [
  "notify-debouncer-full",
  "parking_lot",
  "paste",
- "plugin_csv",
- "plugin_json",
  "ruzstd",
  "serde",
  "serde_json",
@@ -3222,6 +3220,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "web-time",
+ "wit-bindgen 0.57.1",
  "wit-parser 0.247.0",
  "xxhash-rust",
  "zip 8.6.0",
@@ -3370,18 +3369,6 @@ dependencies = [
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
-]
-
-[[package]]
-name = "lix_order_key"
-version = "0.11.0"
-
-[[package]]
-name = "lix_plugin_api"
-version = "0.11.0"
-dependencies = [
- "uuid",
- "wit-bindgen 0.57.1",
 ]
 
 [[package]]
@@ -4094,7 +4081,7 @@ name = "plugin_csv"
 version = "0.11.0"
 dependencies = [
  "base64 0.22.1",
- "lix_plugin_api",
+ "lix",
  "serde_json",
  "uuid",
 ]
@@ -4103,8 +4090,7 @@ dependencies = [
 name = "plugin_excalidraw"
 version = "0.11.0"
 dependencies = [
- "lix_order_key",
- "lix_plugin_api",
+ "lix",
  "serde_json",
  "uuid",
 ]
@@ -4115,7 +4101,7 @@ version = "0.11.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
- "lix_plugin_api",
+ "lix",
  "serde_json",
  "uuid",
 ]
@@ -4127,8 +4113,7 @@ dependencies = [
  "base64 0.22.1",
  "chardetng",
  "encoding_rs",
- "lix_order_key",
- "lix_plugin_api",
+ "lix",
  "markdown-syntax",
  "serde",
  "serde_json",
@@ -4140,8 +4125,7 @@ name = "plugin_text"
 version = "0.11.0"
 dependencies = [
  "base64 0.22.1",
- "lix_order_key",
- "lix_plugin_api",
+ "lix",
  "serde",
  "serde_json",
  "uuid",

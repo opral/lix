@@ -4,9 +4,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::model as lix;
+use crate::order_key::OrderKey;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use lix_order_key::OrderKey;
 use serde::Deserialize;
 
 pub(crate) const LINE_SCHEMA_KEY: &str = "text_line";

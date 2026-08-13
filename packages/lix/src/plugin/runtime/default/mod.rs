@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lix::LixError;
-use lix::wasm::{WasmLimits, WasmRuntime};
+use lix::{plugin::runtime::WasmRuntime, wasm::WasmLimits};
 use lru::LruCache;
 use wasmtime::component::Component;
 #[cfg(test)]
@@ -398,7 +398,7 @@ impl WasmRuntime for WasmtimePluginRuntime {
         &self,
         bytes: Vec<u8>,
         limits: WasmLimits,
-    ) -> Result<Arc<dyn lix::wasm::WasmComponentFactory>, LixError> {
+    ) -> Result<Arc<dyn lix::plugin::runtime::WasmComponentFactory>, LixError> {
         component_runtime::compile_component(self, bytes, limits).await
     }
 }
