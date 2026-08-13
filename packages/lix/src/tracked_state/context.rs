@@ -3497,7 +3497,7 @@ where
             root_id,
             rootless,
             replacement_generation,
-            state_manifest: Arc::new(manifest),
+            state_manifest: manifest,
         };
         self.point_replay_commits
             .insert(commit_id, replay_commit.clone());

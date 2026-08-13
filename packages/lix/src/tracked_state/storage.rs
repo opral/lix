@@ -1735,7 +1735,6 @@ impl CommitDeltaLiveMembershipCursor {
                     else {
                         return Ok(None);
                     };
-                    let state = Arc::new(state);
                     cache.remember_authority(Arc::clone(&state))?;
                     state
                 }
@@ -3733,7 +3732,7 @@ pub(crate) async fn load_published_commit_state_topology(
 pub(crate) async fn load_point_replay_commit_state(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
-) -> Result<Option<AuthenticatedReplayCommitStateManifest>, LixError> {
+) -> Result<Option<Arc<AuthenticatedReplayCommitStateManifest>>, LixError> {
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_crud_replay_manifest_load();
     let header_keys = [StorageKey(Bytes::from(commit_state_manifest_key(
@@ -3773,7 +3772,7 @@ pub(crate) async fn load_commit_record_and_point_replay_state(
 ) -> Result<
     (
         Option<CommitRecord>,
-        Option<AuthenticatedReplayCommitStateManifest>,
+        Option<Arc<AuthenticatedReplayCommitStateManifest>>,
     ),
     LixError,
 > {
@@ -3808,7 +3807,7 @@ pub(crate) async fn load_commit_record_and_point_replay_state(
         .next()
         .flatten()
         .and_then(full_value_bytes)
-        .map(|bytes| storage_codec::decode::<CommitRecord>("commit record", &bytes))
+        .map(|bytes| replay_authority_cache::decode_commit_record(commit_id, &bytes))
         .transpose()?;
     if let Some(record) = record.as_ref()
         && record.commit_id != commit_id
@@ -3837,7 +3836,7 @@ fn decode_point_replay_commit_state_values(
     commit_id: CommitId,
     header: Option<StorageProjectedValue>,
     inventory: Option<StorageProjectedValue>,
-) -> Result<Option<AuthenticatedReplayCommitStateManifest>, LixError> {
+) -> Result<Option<Arc<AuthenticatedReplayCommitStateManifest>>, LixError> {
     let header = header.and_then(full_value_bytes);
     let inventory = inventory.and_then(full_value_bytes);
     let (header, inventory) = match (header, inventory) {
@@ -3852,7 +3851,30 @@ fn decode_point_replay_commit_state_values(
             ));
         }
     };
-    let (stored, stored_inventory) = decode_stored_commit_state_authority(&header, &inventory)?;
+    if let Some(hit) = replay_authority_cache::get(commit_id, &header, &inventory) {
+        return Ok(Some(hit));
+    }
+    let authenticated = Arc::new(authenticate_point_replay_commit_state_values(
+        commit_id, &header, &inventory,
+    )?);
+    replay_authority_cache::insert(commit_id, &header, &inventory, &authenticated);
+    Ok(Some(authenticated))
+}
+
+/// The uncached decode-and-authenticate path for one commit's split physical
+/// authority.
+///
+/// Split out of [`decode_point_replay_commit_state_values`] so that
+/// `replay_authority_cache` sits in front of a named function rather than
+/// inside one, which is what lets
+/// `point_replay_authority_cache_cannot_launder_a_rejected_manifest` compare
+/// the cached and uncached paths directly instead of toggling a global.
+fn authenticate_point_replay_commit_state_values(
+    commit_id: CommitId,
+    header: &Bytes,
+    inventory: &Bytes,
+) -> Result<AuthenticatedReplayCommitStateManifest, LixError> {
+    let (stored, stored_inventory) = decode_stored_commit_state_authority(header, inventory)?;
     let mutation_directory_root = stored_inventory.directory_root.clone();
     let state = assemble_shallow_commit_state_manifest(stored, stored_inventory)?;
     if state.commit_id != commit_id {
@@ -3864,10 +3886,10 @@ fn decode_point_replay_commit_state_values(
             ),
         ));
     }
-    Ok(Some(AuthenticatedReplayCommitStateManifest {
+    Ok(AuthenticatedReplayCommitStateManifest {
         manifest: state,
         mutation_directory_root,
-    }))
+    })
 }
 
 /// Bulk-loads commit authorities in request order.
@@ -5782,7 +5804,7 @@ async fn load_direct_change_authority(
         ));
     }
     if candidate {
-        Ok(DirectChangeAuthority::Candidate(Arc::new(state)))
+        Ok(DirectChangeAuthority::Candidate(state))
     } else if state.mutation_directory_root.is_some() {
         #[cfg(any(test, feature = "storage-benches"))]
         super::mutation_directory::record_direct_route_not_owned(
@@ -6479,7 +6501,7 @@ async fn load_explicit_change_records_at_locators_selected(
         .iter()
         .map(|locator| locator.commit_id)
         .collect::<BTreeSet<_>>();
-    let mut states = BTreeMap::<CommitId, AuthenticatedReplayCommitStateManifest>::new();
+    let mut states = BTreeMap::<CommitId, Arc<AuthenticatedReplayCommitStateManifest>>::new();
     for commit_id in commit_ids {
         let state = load_point_replay_commit_state(store, commit_id)
             .await?
@@ -7321,16 +7343,14 @@ pub(crate) async fn load_commit_delta_values_encoded_from_replay_manifest(
     let source = match point_cache.authority(source_commit_id)? {
         Some(source) => source,
         None => {
-            let source = Arc::new(
-                load_point_replay_commit_state(store, source_commit_id)
-                    .await?
-                    .ok_or_else(|| {
-                        replacement_payload_error(&format!(
-                            "selected-source commit '{}' references missing authority '{source_commit_id}'",
-                            state.commit_id
-                        ))
-                    })?,
-            );
+            let source = load_point_replay_commit_state(store, source_commit_id)
+                .await?
+                .ok_or_else(|| {
+                    replacement_payload_error(&format!(
+                        "selected-source commit '{}' references missing authority '{source_commit_id}'",
+                        state.commit_id
+                    ))
+                })?;
             point_cache.remember_authority(Arc::clone(&source))?;
             source
         }
@@ -9027,7 +9047,6 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
                 return Ok((0..keys.len()).map(|_| None).collect());
             };
-            let state = Arc::new(state);
             if let Some(point_cache) = point_cache {
                 point_cache.remember_authority(Arc::clone(&state))?;
             }
@@ -9489,7 +9508,7 @@ pub(crate) async fn scan_commit_delta_values(
         ),
         None => None,
     };
-    scan_commit_delta_values_from_authenticated_states(store, &state, source.as_ref(), schema_keys)
+    scan_commit_delta_values_from_authenticated_states(store, &state, source.as_deref(), schema_keys)
         .await
 }
 
@@ -13829,7 +13848,8 @@ mod tests {
     };
 
     use super::{
-        COMMIT_DELTA_FORMAT_MAGIC, COMMIT_STATE_MANIFEST_FORMAT_MAGIC, CommitDeltaChangeLocator,
+        AuthenticatedReplayCommitStateManifest, COMMIT_DELTA_FORMAT_MAGIC,
+        COMMIT_STATE_MANIFEST_FORMAT_MAGIC, CommitDeltaChangeLocator,
         CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
         DecodedCommitDeltaCache, DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
         TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TrackedStateChunkOverlay,
@@ -17482,7 +17502,7 @@ mod tests {
         assert_eq!(inventory_requests.load(Ordering::Relaxed), 1);
         assert_eq!(directory_requests.load(Ordering::Relaxed), 0);
 
-        let mut mismatched_state = state.clone();
+        let mut mismatched_state = (*state).clone();
         mismatched_state
             .manifest
             .change_account_id
@@ -17662,10 +17682,11 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("bounded membership read should open");
-        let mut state = super::load_point_replay_commit_state(&read, commit_id)
+        let loaded = super::load_point_replay_commit_state(&read, commit_id)
             .await
             .expect("bounded authority should load")
             .expect("bounded authority should exist");
+        let mut state = (*loaded).clone();
         state
             .mutation_directory_root
             .as_mut()
@@ -18150,6 +18171,178 @@ mod tests {
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
+        }
+    }
+
+    /// The point-replay authority cache must never return a manifest the
+    /// uncached path would have rejected.
+    ///
+    /// `AuthenticatedReplayCommitStateManifest` exists so that a freely
+    /// constructed manifest cannot claim authoritative catalog coverage, and
+    /// `replay_authority_cache` short-circuits exactly the function where the
+    /// inventory-digest check, the header validation and the commit-id
+    /// cross-check live. That makes "a hit only ever replays a previously
+    /// authenticated value" a property to pin, not to argue.
+    ///
+    /// The test drives the two REAL code paths against each other -
+    /// `decode_point_replay_commit_state_values` (cached) versus
+    /// `authenticate_point_replay_commit_state_values` (uncached) - so there is
+    /// no global switch to flip and nothing for a concurrently running test to
+    /// observe.
+    #[test]
+    fn point_replay_authority_cache_cannot_launder_a_rejected_manifest() {
+        let manifest_a = external_commit_state_manifest_fixture("replay-authority-a", 1);
+        let manifest_b = external_commit_state_manifest_fixture("replay-authority-b", 2);
+        assert_ne!(
+            manifest_a.commit_id, manifest_b.commit_id,
+            "the fixtures must be distinct commits for the swap cases to mean anything"
+        );
+        let a = encode_commit_state_manifest(&manifest_a).expect("fixture A encodes");
+        let b = encode_commit_state_manifest(&manifest_b).expect("fixture B encodes");
+
+        let mut tampered_header = a.header.clone();
+        *tampered_header.last_mut().expect("header is non-empty") ^= 1;
+        let mut tampered_inventory = a.mutation_inventory.clone();
+        *tampered_inventory.last_mut().expect("inventory is non-empty") ^= 1;
+
+        // (label, must_be_accepted, commit id, header bytes, inventory bytes)
+        let cases: Vec<(&str, bool, CommitId, Vec<u8>, Vec<u8>)> = vec![
+            (
+                "legitimate_a",
+                true,
+                manifest_a.commit_id,
+                a.header.clone(),
+                a.mutation_inventory.clone(),
+            ),
+            (
+                "legitimate_b",
+                true,
+                manifest_b.commit_id,
+                b.header.clone(),
+                b.mutation_inventory.clone(),
+            ),
+            // B's whole authority served under A's address: the exact confusion
+            // the `Authenticated` wrapper exists to stop.
+            (
+                "identity_swap",
+                false,
+                manifest_a.commit_id,
+                b.header.clone(),
+                b.mutation_inventory.clone(),
+            ),
+            // A's header paired with B's inventory: fails the digest binding.
+            (
+                "mismatched_pair",
+                false,
+                manifest_a.commit_id,
+                a.header.clone(),
+                b.mutation_inventory.clone(),
+            ),
+            // Right address, right pairing, one flipped byte in each payload.
+            (
+                "tampered_header",
+                false,
+                manifest_a.commit_id,
+                tampered_header,
+                a.mutation_inventory.clone(),
+            ),
+            (
+                "tampered_inventory",
+                false,
+                manifest_a.commit_id,
+                a.header.clone(),
+                tampered_inventory,
+            ),
+        ];
+
+        let projected = |bytes: &[u8]| {
+            Some(super::StorageProjectedValue::FullValue(
+                Bytes::copy_from_slice(bytes),
+            ))
+        };
+
+        // 1. Reference outcomes from the uncached authenticate path.
+        //    Non-vacuity: every adversarial case must actually be REJECTED
+        //    here, or the test proves nothing about laundering.
+        let mut reference: Vec<Result<AuthenticatedReplayCommitStateManifest, LixError>> =
+            Vec::new();
+        for (label, accepted, commit_id, header, inventory) in &cases {
+            let outcome = super::authenticate_point_replay_commit_state_values(
+                *commit_id,
+                &Bytes::copy_from_slice(header),
+                &Bytes::copy_from_slice(inventory),
+            );
+            assert_eq!(
+                outcome.is_ok(),
+                *accepted,
+                "{label}: uncached path did not behave as the case requires; \
+                 the laundering check below would be vacuous"
+            );
+            reference.push(outcome);
+        }
+
+        // 2. Warm the cache through the public path with the legitimate
+        //    triples only. The adversarial triples are never inserted.
+        for (label, accepted, commit_id, header, inventory) in &cases {
+            if *accepted {
+                super::decode_point_replay_commit_state_values(
+                    *commit_id,
+                    projected(header),
+                    projected(inventory),
+                )
+                .unwrap_or_else(|error| panic!("{label} must cache cleanly: {error:?}"))
+                .expect("a legitimate triple yields an authority");
+            }
+        }
+
+        // 3. Positive control: the cache must actually be engaged. Without
+        //    this, "the adversarial cases are still rejected" is consistent
+        //    with the cache never being consulted at all.
+        let (hits_before, _, _, _) = super::replay_authority_cache::counters();
+        for (label, accepted, commit_id, header, inventory) in &cases {
+            if *accepted {
+                super::decode_point_replay_commit_state_values(
+                    *commit_id,
+                    projected(header),
+                    projected(inventory),
+                )
+                .unwrap_or_else(|error| panic!("{label} must still be accepted: {error:?}"))
+                .expect("a legitimate triple yields an authority");
+            }
+        }
+        let (hits_after, _, _, _) = super::replay_authority_cache::counters();
+        assert!(
+            hits_after >= hits_before + 2,
+            "the cache was not consulted, so the laundering check is vacuous: \
+             {hits_before} -> {hits_after}"
+        );
+
+        // 4. The property: with the cache warm, every case - legitimate and
+        //    adversarial alike - reaches the same accept/reject decision, and
+        //    the same value, as the uncached path.
+        for ((label, _, commit_id, header, inventory), expected) in cases.iter().zip(&reference) {
+            let cached = super::decode_point_replay_commit_state_values(
+                *commit_id,
+                projected(header),
+                projected(inventory),
+            );
+            match (expected, &cached) {
+                (Ok(expected), Ok(Some(cached))) => assert_eq!(
+                    expected,
+                    &**cached,
+                    "{label}: the cache returned a different authority"
+                ),
+                (Err(expected), Err(cached)) => assert_eq!(
+                    expected.message, cached.message,
+                    "{label}: the cache rejected for a different reason"
+                ),
+                _ => panic!(
+                    "{label}: the cache changed the accept/reject decision \
+                     (uncached ok={}, cached ok={})",
+                    expected.is_ok(),
+                    cached.is_ok()
+                ),
+            }
         }
     }
 
@@ -18715,5 +18908,199 @@ mod tests {
         }
 
         lines
+    }
+}
+
+
+/// Process-wide, content-keyed cache for the point-replay authority.
+///
+/// # Why this exists
+///
+/// One single-row INSERT walks the first-parent replay chain and decodes ~11
+/// commit-state manifests, ~11 mutation inventories and ~11 commit records.
+/// Within a single write those really are distinct records, so the
+/// transaction-scoped [`CommitDeltaPointReadCache`] cannot see any reuse. The
+/// reuse is *across* transactions: over 50 consecutive single-row writes the
+/// manifest is decoded 1265 times from 66 distinct payloads (19.2x), the
+/// inventory 1049 times from 66 (15.9x), and the commit record 1154 from 68
+/// (17.0x). This cache is scoped to match where the reuse actually is.
+///
+/// # Why it is safe
+///
+/// An entry is only returned when the commit id **and** both payloads compare
+/// byte-for-byte equal to the ones that produced it. Those exact bytes were
+/// authenticated by
+/// [`authenticate_point_replay_commit_state_values`] on insert - the
+/// inventory-digest check, the header validation and the commit-id cross-check
+/// all ran over them. A hit therefore cannot return anything the uncached path
+/// would have rejected, and cannot cross repositories or observe a rewritten
+/// value at the same address. `point_replay_authority_cache_cannot_launder_a_
+/// rejected_manifest` pins that property against the adversarial cases the
+/// `Authenticated` wrapper exists to stop.
+///
+/// The commit id is the hash bucket only; it is never the authority. This
+/// mirrors [`DecodedCommitDeltaCache`], which keys on a digest and still
+/// compares the encoded bytes before returning a hit.
+pub(crate) mod replay_authority_cache {
+    use super::{
+        AuthenticatedReplayCommitStateManifest, Arc, Bytes, CommitId, CommitRecord, LixError,
+        storage_codec,
+    };
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Entries per cache. Two caches, so the ceiling is 2 x this many decoded
+    /// records plus their encoded payloads.
+    const CAPACITY: usize = 4096;
+
+    /// Unconditional so that a test can prove the cache was consulted rather
+    /// than assume it. Two relaxed atomics on a path that otherwise decodes
+    /// and validates a record.
+    pub(crate) static AUTHORITY_HITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static AUTHORITY_MISSES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMMIT_RECORD_HITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMMIT_RECORD_MISSES: AtomicU64 = AtomicU64::new(0);
+
+    /// (authority hits, authority misses, commit-record hits, commit-record misses)
+    pub(crate) fn counters() -> (u64, u64, u64, u64) {
+        (
+            AUTHORITY_HITS.load(Ordering::Relaxed),
+            AUTHORITY_MISSES.load(Ordering::Relaxed),
+            COMMIT_RECORD_HITS.load(Ordering::Relaxed),
+            COMMIT_RECORD_MISSES.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Bucket key only. Never the authority for a hit - see the module docs.
+    fn bucket(commit_id: CommitId) -> u64 {
+        let bytes = commit_id.as_uuid().as_bytes();
+        let mut lo = [0u8; 8];
+        let mut hi = [0u8; 8];
+        lo.copy_from_slice(&bytes[..8]);
+        hi.copy_from_slice(&bytes[8..]);
+        u64::from_le_bytes(lo) ^ u64::from_le_bytes(hi).rotate_left(17)
+    }
+
+    struct Slot<T> {
+        commit_id: CommitId,
+        first: Bytes,
+        second: Option<Bytes>,
+        value: T,
+    }
+
+    struct Lru<T> {
+        buckets: HashMap<u64, Vec<Slot<T>>>,
+        order: VecDeque<u64>,
+    }
+
+    impl<T> Default for Lru<T> {
+        fn default() -> Self {
+            Self {
+                buckets: HashMap::new(),
+                order: VecDeque::new(),
+            }
+        }
+    }
+
+    impl<T: Clone> Lru<T> {
+        fn get(&self, commit_id: CommitId, first: &Bytes, second: Option<&Bytes>) -> Option<T> {
+            self.buckets.get(&bucket(commit_id))?.iter().find_map(|slot| {
+                (slot.commit_id == commit_id
+                    && slot.first.as_ref() == first.as_ref()
+                    && slot.second.as_deref() == second.map(Bytes::as_ref))
+                .then(|| slot.value.clone())
+            })
+        }
+
+        fn insert(&mut self, commit_id: CommitId, first: &Bytes, second: Option<&Bytes>, value: &T) {
+            let key = bucket(commit_id);
+            self.buckets.entry(key).or_default().push(Slot {
+                commit_id,
+                first: first.clone(),
+                second: second.cloned(),
+                value: value.clone(),
+            });
+            self.order.push_back(key);
+            while self.order.len() > CAPACITY {
+                let Some(evicted) = self.order.pop_front() else {
+                    break;
+                };
+                if let Some(slots) = self.buckets.get_mut(&evicted) {
+                    if !slots.is_empty() {
+                        slots.remove(0);
+                    }
+                    if slots.is_empty() {
+                        self.buckets.remove(&evicted);
+                    }
+                }
+            }
+        }
+    }
+
+    fn authorities() -> &'static Mutex<Lru<Arc<AuthenticatedReplayCommitStateManifest>>> {
+        static CACHE: OnceLock<Mutex<Lru<Arc<AuthenticatedReplayCommitStateManifest>>>> =
+            OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(Lru::default()))
+    }
+
+    fn commit_records() -> &'static Mutex<Lru<CommitRecord>> {
+        static CACHE: OnceLock<Mutex<Lru<CommitRecord>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(Lru::default()))
+    }
+
+    pub(super) fn get(
+        commit_id: CommitId,
+        header: &Bytes,
+        inventory: &Bytes,
+    ) -> Option<Arc<AuthenticatedReplayCommitStateManifest>> {
+        let hit = authorities()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(commit_id, header, Some(inventory)));
+        if hit.is_some() {
+            AUTHORITY_HITS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            AUTHORITY_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
+        hit
+    }
+
+    pub(super) fn insert(
+        commit_id: CommitId,
+        header: &Bytes,
+        inventory: &Bytes,
+        value: &Arc<AuthenticatedReplayCommitStateManifest>,
+    ) {
+        if let Ok(mut guard) = authorities().lock() {
+            guard.insert(commit_id, header, Some(inventory), value);
+        }
+    }
+
+    /// Commit records are decoded on the same replay step as the authority and
+    /// are re-decoded at the same rate, so they share this cache's scope.
+    pub(super) fn decode_commit_record(
+        commit_id: CommitId,
+        bytes: &Bytes,
+    ) -> Result<CommitRecord, LixError> {
+        if let Some(hit) = commit_records()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(commit_id, bytes, None))
+        {
+            COMMIT_RECORD_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(hit);
+        }
+        COMMIT_RECORD_MISSES.fetch_add(1, Ordering::Relaxed);
+        let value = storage_codec::decode::<CommitRecord>("commit record", bytes)?;
+        // The caller cross-checks `record.commit_id` against `commit_id`
+        // immediately after this returns, so a record cached under a mismatched
+        // address is rejected on the miss path before it can ever be inserted.
+        if value.commit_id == commit_id
+            && let Ok(mut guard) = commit_records().lock()
+        {
+            guard.insert(commit_id, bytes, None, &value);
+        }
+        Ok(value)
     }
 }
