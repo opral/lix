@@ -3290,6 +3290,22 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
     let mut blob_request = lix_file_scan_request(Some(&active_branch_id), None, None);
     blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
     blob_request.filter.entity_pks = vec![file_id_entity_pk(&file_id)?];
+    // Pin the file id too. The hot index key is file-first, so an entity PK on
+    // its own cannot form a point key: `hot_scan_entries` refuses the MultiGet
+    // route for any schema with file-backed members -- a null-file point key
+    // would miss the real row -- and `hot_file_scan_prefixes` requires a file
+    // id. Without this the request fell through to walking every
+    // `lix_binary_blob_ref` row in the branch and filtering in memory, which is
+    // O(files) *per statement* and cost ~0.20 us per file in the branch.
+    //
+    // The pin cannot reject the row it is looking for, because for this schema
+    // the file id and the entity PK are the same value by construction: both
+    // producers in `filesystem::planner` (`BlobRefRowInput::append_to` and
+    // `append_blob_ref_tombstone_row`, tombstones included) set the row's
+    // entity PK and its `file_id` from one variable, and `lix_binary_blob_ref`
+    // is a read-only public surface, so no caller can supply a divergent pair.
+    // The exact-batch route below already pairs them the same way.
+    blob_request.filter.file_ids = vec![crate::NullableKeyFilter::Value(file_id.clone())];
     let rows = ctx.scan_hot_state_batch(&blob_request).await?;
 
     let prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;

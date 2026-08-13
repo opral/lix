@@ -30,15 +30,47 @@ async fn main() {
     let reps: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(3);
     let payload: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(4096);
 
-    let orders = [
-        ["by_id_per_stmt", "by_id_one_txn", "by_path_per_stmt"],
-        ["by_id_one_txn", "by_path_per_stmt", "by_id_per_stmt"],
-        ["by_path_per_stmt", "by_id_per_stmt", "by_id_one_txn"],
+    if let Ok(loops) = std::env::var("EXPPTH2_PROFILE_LOOPS") {
+        let loops: usize = loops.parse().unwrap_or(1);
+        run_profile(files, updates, payload, loops).await;
+        return;
+    }
+
+    let all_arms = [
+        "by_id_per_stmt",
+        "by_id_one_txn",
+        "by_path_per_stmt",
+        "native_per_stmt",
     ];
+    // Only arms named here run, so a control can be re-measured without paying
+    // for every fixture again.
+    let selected = std::env::var("EXPPTH2_ARMS").unwrap_or_default();
+    let selected = if selected.is_empty() {
+        all_arms.to_vec()
+    } else {
+        selected
+            .split(',')
+            .map(str::trim)
+            .filter(|arm| !arm.is_empty())
+            .map(|arm| {
+                all_arms
+                    .into_iter()
+                    .find(|candidate| *candidate == arm)
+                    .unwrap_or_else(|| panic!("unknown arm {arm}"))
+            })
+            .collect::<Vec<_>>()
+    };
+    let orders = (0..selected.len().max(1))
+        .map(|offset| {
+            let mut rotated = selected.clone();
+            rotated.rotate_left(offset % selected.len().max(1));
+            rotated
+        })
+        .collect::<Vec<_>>();
 
     let mut samples: Vec<(String, f64)> = Vec::new();
     for rep in 0..reps {
-        for arm in orders[rep % orders.len()] {
+        for arm in orders[rep % orders.len()].iter().copied() {
             let ms = run_arm(arm, files, updates, payload).await;
             println!(
                 "EXPPTH2 files={files} rep={rep} arm={arm} total_ms={ms:.3} per_op_us={:.2}",
@@ -49,7 +81,7 @@ async fn main() {
     }
 
     println!();
-    for arm in ["by_id_per_stmt", "by_id_one_txn", "by_path_per_stmt"] {
+    for arm in selected.iter().copied() {
         let mut arm_samples: Vec<f64> = samples
             .iter()
             .filter(|(name, _)| name == arm)
@@ -66,6 +98,100 @@ async fn main() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+/// Single-arm `by_id_per_stmt` driver with the fixture build gated OUT of the
+/// profiling window, and the update phase repeated so a short measured region
+/// still yields enough samples. Per-loop timings are printed so drift caused by
+/// the growing commit history can be ruled out rather than assumed away.
+async fn run_profile(files: usize, updates: usize, payload: usize, loops: usize) {
+    use std::io::Write as _;
+
+    let root = tempfile::Builder::new()
+        .prefix("expPTH2p-")
+        .tempdir()
+        .expect("create dir");
+    let storage = RocksDB::open(&root.path().join("db")).expect("open RocksDB");
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+
+    let seed: Vec<u8> = vec![b'a'; payload];
+    let mut transaction = lix.begin_transaction().await.expect("begin seed");
+    for index in 0..files {
+        transaction
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text(format!("/exppth2-{index:06}.bin")),
+                    Value::Blob(seed.clone().into()),
+                ],
+            )
+            .await
+            .expect("seed insert");
+    }
+    transaction.commit().await.expect("commit seed");
+
+    let rows = lix
+        .execute("SELECT id FROM lix_file ORDER BY path", &[])
+        .await
+        .expect("read ids back");
+    let ids = rows
+        .rows()
+        .iter()
+        .map(|row| match rows.get(row, "id").expect("file id") {
+            Value::Text(text) => text.clone(),
+            other => panic!("unexpected id value {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert!(ids.len() >= updates, "fixture must cover every update");
+
+    let gate = std::env::var("EXPPTH2_GATE").unwrap_or_default();
+    println!(
+        "EXPPTH2_READY pid={} files={files} updates={updates} loops={loops}",
+        std::process::id()
+    );
+    std::io::stdout().flush().ok();
+    if !gate.is_empty() {
+        while !std::path::Path::new(&gate).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    for loop_index in 0..loops {
+        let payload_byte = if loop_index % 2 == 0 { b'b' } else { b'c' };
+        let updated: Vec<u8> = vec![payload_byte; payload];
+        let started = Instant::now();
+        for id in ids.iter().take(updates) {
+            lix.execute(
+                "UPDATE lix_file SET content = $1 WHERE id = $2",
+                &[
+                    Value::Blob(updated.clone().into()),
+                    Value::Text(id.clone()),
+                ],
+            )
+            .await
+            .expect("update by id");
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let (calls, point_batch, file_prefix, fallback, decoded, matched) =
+            lix::storage_bench::take_hot_blob_ref_scan_accounting();
+        println!(
+            "EXPPTH2_LOOP files={files} loop={loop_index} total_ms={ms:.3} per_op_us={:.2} \
+blob_ref_calls={calls} point_batch={point_batch} file_prefix={file_prefix} fallback={fallback} \
+entries_decoded={decoded} entries_matched={matched} decoded_per_update={:.1}",
+            ms * 1000.0 / updates as f64,
+            decoded as f64 / updates as f64
+        );
+        std::io::stdout().flush().ok();
+    }
+    storage.flush().ok();
+    println!("EXPPTH2_PROFILE_DONE");
+}
+
+fn crate_blob(bytes: &[u8]) -> lix::Blob {
+    lix::Blob::from(bytes.to_vec())
 }
 
 async fn run_arm(arm: &str, files: usize, updates: usize, payload: usize) -> f64 {
@@ -154,6 +280,16 @@ async fn run_arm(arm: &str, files: usize, updates: usize, payload: usize) -> f64
                 )
                 .await
                 .expect("update by path");
+            }
+        }
+        "native_per_stmt" => {
+            for index in 0..updates {
+                lix.upsert_file_content(
+                    format!("/exppth2-{index:06}.bin"),
+                    crate_blob(&updated),
+                )
+                .await
+                .expect("native upsert");
             }
         }
         other => panic!("unknown arm {other}"),

@@ -11647,11 +11647,24 @@ async fn hot_scan_entries<'a>(
     // single MultiGet only when this schema has no file-backed members; if it
     // does, fall through to the complete primary-prefix route so UPDATE and
     // DELETE still see every candidate member.
+    #[cfg(feature = "storage-benches")]
+    let is_blob_ref_probe = filter.schema_keys.len() == 1
+        && filter.schema_keys[0] == "lix_binary_blob_ref"
+        && !filter.entity_pks.is_empty();
+    #[cfg(feature = "storage-benches")]
+    if is_blob_ref_probe {
+        crate::storage_bench::record_hot_blob_ref_scan_call();
+    }
+
     if let Some(identities) = hot_exact_identity_batches(branch_id, generation, filter) {
         let may_use_null_point_batch = !filter.file_ids.is_empty()
             || !hot_schema_has_file_members(store, branch_id, generation, &filter.schema_keys)
                 .await?;
         if may_use_null_point_batch {
+            #[cfg(feature = "storage-benches")]
+            if is_blob_ref_probe {
+                crate::storage_bench::record_hot_blob_ref_scan_point_batch();
+            }
             let entries = HotScanEntries::Finite(
                 hot_scan_finite_identity_batches(store, identities, limit).await?,
             );
@@ -11663,12 +11676,20 @@ async fn hot_scan_entries<'a>(
     // `WHERE file_id = $1` read one contiguous hydrated range without a second
     // value projection or random point-read hydration.
     if let Some(prefixes) = hot_file_scan_prefixes(branch_id, generation, filter) {
+        #[cfg(feature = "storage-benches")]
+        if is_blob_ref_probe {
+            crate::storage_bench::record_hot_blob_ref_scan_file_prefix();
+        }
         let entries = HotScanEntries::Decoded(
             scan_hot_file_entries(store, branch_id, generation, prefixes, filter, limit).await?,
         );
         return Ok(hot_scan_entries_fit_budget(entries, retained_byte_budget));
     }
 
+    #[cfg(feature = "storage-benches")]
+    if is_blob_ref_probe {
+        crate::storage_bench::record_hot_blob_ref_scan_fallback();
+    }
     let scope = hot_scope_prefix(branch_id, generation);
     let mut prefixes = hot_row_scan_prefixes(&scope, filter);
     prefixes.sort();
@@ -11706,6 +11727,12 @@ async fn hot_scan_entries<'a>(
             for entry in page {
                 let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                #[cfg(feature = "storage-benches")]
+                if is_blob_ref_probe {
+                    crate::storage_bench::record_hot_blob_ref_scan_entry(
+                        identity.matches_filter(filter),
+                    );
+                }
                 if identity.matches_filter(filter) {
                     saw_file_backed_row |= identity.file_id().is_some();
                     let value = full_value_bytes(entry.value)?;
