@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lix::wasm::{
+use lix::plugin::runtime::{
     WasmByteOutputsHandle, WasmChangeCursorHandle, WasmChangePage, WasmComponentActor,
     WasmComponentFactory, WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage,
-    WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate, WasmLimits,
+    WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
     WasmOpenEntitiesInput, WasmOpenFileInput, WasmRuntime, WasmTransitionHandle,
     WasmTransitionLimits,
 };
+use lix::wasm::WasmLimits;
 use lix::{LixError, open_lix};
 
 struct EmbeddingRuntime;
@@ -34,7 +35,7 @@ impl WasmComponentFactory for EmbeddingFactory {
     }
 }
 
-// Keep the complete actor method boundary reachable from `lix::wasm`.
+// Keep the complete actor method boundary reachable from `lix::plugin::runtime`.
 #[allow(dead_code)]
 fn actor_contract_types_are_public(
     _: WasmTransitionLimits,

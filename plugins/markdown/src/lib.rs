@@ -4,13 +4,14 @@
 mod core;
 mod markdown_file;
 mod model;
+mod order_key;
 mod schemas;
 
 use core::{
     ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, EntityRecord, FileEdit, IdNamespace,
     NODE_SCHEMA_KEY, PluginError,
 };
-use lix_plugin_api as sdk;
+use lix::plugin as sdk;
 use serde_json::Value;
 
 struct MarkdownPlugin;
@@ -792,7 +793,7 @@ fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
 }
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api::export_plugin!(MarkdownPlugin);
+lix::plugin::export!(MarkdownPlugin);
 
 #[cfg(test)]
 mod tests {

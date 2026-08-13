@@ -3,14 +3,17 @@ use std::sync::{Arc, Mutex};
 
 use crate::binary_cas::BlobId;
 use crate::common::LixError;
-use crate::wasm::{WasmComponentFactory, WasmLimits, WasmRuntime, WasmTransitionCounters};
+use crate::{
+    plugin::runtime::{WasmComponentFactory, WasmRuntime, WasmTransitionCounters},
+    wasm::WasmLimits,
+};
 
 use super::{
     CompiledPluginCatalog, DEFAULT_MAX_LIVE_PLUGIN_STORES, InstalledPlugin, PluginActorCache,
     PluginCatalogCache, PluginRegistry,
 };
 
-/// Installed plugins are untrusted workspace data. This is the absolute
+/// Installed plugins are untrusted repository data. This is the absolute
 /// per-export ceiling; a transition's tighter host budget remains authoritative
 /// for normal operations. The cold-file budget may extend up to this ceiling,
 /// but no guest call can exceed it.
@@ -262,7 +265,7 @@ fn component_cache_lock_error() -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wasm::UnsupportedWasmRuntime;
+    use crate::plugin::runtime::UnsupportedWasmRuntime;
 
     #[test]
     fn plugin_memory_policy_is_explicit() {

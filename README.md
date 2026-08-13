@@ -41,7 +41,7 @@ Run locally with `LocalFilesystem`:
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
+  storage: new LocalFilesystem({ path: "./repository", syncAllFiles: true }),
 });
 
 await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
@@ -56,7 +56,7 @@ Or against a server:
 const lix = await openLix({
   server: {
     mode: "remote",
-    url: "https://example.com/workspaces/acme",
+    url: "https://example.com/repositories/acme",
   },
 });
 ```

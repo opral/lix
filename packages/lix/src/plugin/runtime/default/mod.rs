@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lix::LixError;
-use lix::wasm::{WasmLimits, WasmRuntime};
+use lix::{plugin::runtime::WasmRuntime, wasm::WasmLimits};
 use lru::LruCache;
 use wasmtime::component::Component;
 #[cfg(test)]
@@ -47,7 +47,7 @@ fn create_engine(consume_fuel: bool, epoch_interruption: bool) -> wasmtime::Resu
 
 /// Enables Wasmtime's host-local AOT cache for sandboxed plugin components.
 ///
-/// This cache is deliberately outside the workspace and its storage adapter:
+/// This cache is deliberately outside the repository and its storage adapter:
 /// native compiled artifacts are tied to the host architecture, Wasmtime
 /// version, and engine settings. Wasmtime keys and validates those artifacts
 /// itself, while the optional override makes isolated deployments and tests
@@ -398,7 +398,7 @@ impl WasmRuntime for WasmtimePluginRuntime {
         &self,
         bytes: Vec<u8>,
         limits: WasmLimits,
-    ) -> Result<Arc<dyn lix::wasm::WasmComponentFactory>, LixError> {
+    ) -> Result<Arc<dyn lix::plugin::runtime::WasmComponentFactory>, LixError> {
         component_runtime::compile_component(self, bytes, limits).await
     }
 }

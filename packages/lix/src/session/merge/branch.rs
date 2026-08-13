@@ -9,7 +9,7 @@ use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::changelog::ChangeRecordProjection;
 use crate::entity_pk::EntityPk;
-use crate::plugin::{
+use crate::plugin::runtime::{
     ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
     load_plugin_registry_at_commit,
 };
@@ -35,7 +35,7 @@ use crate::common::{SharedStr, compose_directory_path, compose_file_path};
 use crate::session::context::SessionContext;
 use crate::tracked_state::TrackedStateMergePick;
 use crate::transaction::StagedCommitChangeBatchBuilder;
-use crate::wasm::{
+use crate::plugin::runtime::{
     WasmByteSource, WasmChangeEffect, WasmConflictResolution, WasmConflictTake, WasmEntityConflict,
     WasmEntityKey, WasmFileDescriptor, WasmHostBytes, WasmPluginSelection, WasmSourceRange,
     WasmSourceSlice,
@@ -2215,7 +2215,7 @@ mod tests {
             b: None,
         };
         let normalized = br#"{"id":"row-a"}"#;
-        let canonical = crate::wasm::WasmCanonicalJson::from_batch_parts(
+        let canonical = crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(
             vec![json!({"id": "row-a"})],
             normalized.to_vec(),
             vec![(0, normalized.len() as u32)],

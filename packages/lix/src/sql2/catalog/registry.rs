@@ -345,7 +345,7 @@ impl PublicCatalog {
                 ),
             )
             .with_hint(
-                "Custom `lix` and `lix_*` schema keys are incompatible with this Lix version. Migrate the workspace with application-specific tooling before upgrading.",
+                "Custom `lix` and `lix_*` schema keys are incompatible with this Lix version. Migrate the repository with application-specific tooling before upgrading.",
             ));
         }
 

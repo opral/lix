@@ -12,7 +12,7 @@ use crate::hot_state::HotStateContext;
 use crate::hot_state::HotStateRowRequest;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
-use crate::plugin::{
+use crate::plugin::runtime::{
     DEFAULT_MAX_LIVE_PLUGIN_STORES, DEFAULT_PLUGIN_MEMORY_BYTES, PluginRuntimeHost,
 };
 use crate::session::SessionContext;
@@ -26,8 +26,8 @@ use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
-use crate::wasm::WasmTransitionCounters;
-use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
+use crate::plugin::runtime::WasmTransitionCounters;
+use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
@@ -2125,22 +2125,22 @@ mod tests {
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
-                 VALUES ('/workspace', lix_json('{\"source\":\"untracked\"}'), true)",
+                 VALUES ('/repository', lix_json('{\"source\":\"untracked\"}'), true)",
                 &[],
             )
             .await
             .expect("untracked row should write against the complete hot state");
-        let workspace_row = session
+        let repository_row = session
             .execute(
-                "SELECT value FROM json_pointer WHERE path = '/workspace'",
+                "SELECT value FROM json_pointer WHERE path = '/repository'",
                 &[],
             )
             .await
             .expect("untracked row should read from the complete hot state");
         assert_eq!(
-            workspace_row.rows()[0]
+            repository_row.rows()[0]
                 .get::<serde_json::Value>("value")
-                .expect("workspace value should decode"),
+                .expect("repository value should decode"),
             json!({"source": "untracked"})
         );
 
@@ -2162,7 +2162,7 @@ mod tests {
                 .iter()
                 .map(|row| row.get::<String>("path").expect("row path"))
                 .collect::<Vec<_>>(),
-            ["/after-checkpoint", "/checkpointed", "/workspace"]
+            ["/after-checkpoint", "/checkpointed", "/repository"]
         );
     }
 

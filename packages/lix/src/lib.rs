@@ -32,6 +32,17 @@
 // consumers now that the former engine and SDK share one crate.
 extern crate self as lix;
 
+pub mod plugin;
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+macro_rules! engine_surface {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+engine_surface! {
 pub(crate) mod account;
 mod binary_cas;
 pub(crate) mod branch;
@@ -48,8 +59,6 @@ pub(crate) mod columnar_row_group;
 pub(crate) mod commit_graph;
 mod common;
 pub(crate) mod compression;
-#[cfg(feature = "default_wasm_runtime")]
-mod default_wasm_runtime;
 pub(crate) mod domain;
 mod engine;
 pub(crate) mod entity_columnar;
@@ -72,10 +81,6 @@ mod module_layers;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
 pub(crate) mod order_preserving_key;
-pub(crate) mod plugin;
-mod plugin_arena;
-mod plugin_layout;
-mod plugin_wire;
 mod prepared_dml;
 // A `pub` view of `storage_spaces`, which is itself unconditional. This module
 // stays gated on its own merits rather than mirroring the registry's: a build
@@ -135,7 +140,7 @@ pub mod integration {
 pub use client_state::ClientState;
 #[cfg(feature = "default_wasm_runtime")]
 #[doc(hidden)]
-pub use default_wasm_runtime::runtime as default_wasm_runtime;
+pub use plugin::runtime::default::runtime as default_wasm_runtime;
 pub use handle::{Lix, LixTransaction, OpenLixBuilder, open_lix};
 
 pub use schema::{
@@ -175,3 +180,4 @@ pub const SYSTEM_ACCOUNT_ID: &str = "00000000-0000-7000-8000-000000000001";
 
 /// Fixed author used when a host opens a session without an authenticated account.
 pub const ANONYMOUS_ACCOUNT_ID: &str = "00000000-0000-7000-8000-000000000002";
+}

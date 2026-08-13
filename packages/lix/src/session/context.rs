@@ -25,7 +25,7 @@ use crate::hot_state::{
 };
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
-use crate::plugin::PluginRuntimeHost;
+use crate::plugin::runtime::PluginRuntimeHost;
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
     SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,

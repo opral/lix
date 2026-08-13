@@ -2681,7 +2681,7 @@ async fn hydrate_lix_file_content_result(
     filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
-    plugin_host: crate::plugin::PluginRuntimeHost,
+    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     session_file_views: Option<sql2::SessionFileViews>,
     query: &mut SqlQueryResult,
     data_column_index: usize,
@@ -5727,7 +5727,7 @@ mod tests {
                 branch_id: branch_id.clone(),
             })
             .await
-            .expect("workspace should switch back to the rootless main branch");
+            .expect("repository should switch back to the rootless main branch");
         let main_session = &session;
         session
             .execute(
@@ -5993,7 +5993,7 @@ mod tests {
         let main_branch_id = main
             .active_branch_id()
             .await
-            .expect("workspace branch should resolve");
+            .expect("repository branch should resolve");
         let schema = serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "x-lix-key": "columnar_lifecycle_probe",

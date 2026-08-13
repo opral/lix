@@ -7,22 +7,19 @@ wit_bindgen::generate!({
     world: "plugin",
     pub_export_macro: true,
     export_macro_name: "__export_plugin_component",
-    default_bindings_module: "lix_plugin_api",
 });
 
+use self::lix::plugin::host::{
+    ConflictSide as WitConflictSide, ConflictSource, EntityPage as WitEntityPage, EntitySource,
+    HostError, ResolutionSink, Snapshot as WitSnapshot, Transition as WitTransition,
+};
+use super::wire::{Operation, Page as WirePage, Representation, encode_single_section};
 use exports::lix::plugin::api::{
     ColdFileChangedRequest as WitColdFileChangedRequest, ConflictUpdate as WitConflictUpdate,
     EntitiesChangedRequest as WitEntitiesChangedRequest, Guest, PluginError,
     RestoreRequest as WitRestoreRequest, TransitionRequest,
 };
-use lix::plugin::host::{
-    ConflictSide as WitConflictSide, ConflictSource, EntityPage as WitEntityPage, EntitySource,
-    HostError, ResolutionSink, Snapshot as WitSnapshot, Transition as WitTransition,
-};
 use std::marker::PhantomData;
-use wire::{Operation, Page as WirePage, Representation, encode_single_section};
-
-mod wire;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -1203,10 +1200,13 @@ fn apply_cold_update<P: Plugin>(
     sink.finish().map_err(plugin_error)
 }
 
+#[doc(hidden)]
 #[macro_export]
-macro_rules! export_plugin {
+macro_rules! __lix_export_plugin {
     ($plugin:ty) => {
-        type __LixPluginComponent = $crate::Component<$plugin>;
-        $crate::__export_plugin_component!(__LixPluginComponent);
+        type __LixPluginComponent = $crate::plugin::Component<$plugin>;
+        $crate::plugin::api::__export_plugin_component!(
+            __LixPluginComponent with_types_in $crate::plugin::api
+        );
     };
 }

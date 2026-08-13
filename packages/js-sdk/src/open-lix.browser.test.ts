@@ -301,16 +301,16 @@ test("remote IndexedDbStorage isolates client state by server URL", async () => 
 			storage: new IndexedDbStorage({ name }),
 		});
 
-	const workspaceA = await openRemote("https://lixray.test/@acme/a");
-	await workspaceA.clientState.set("selected-panel", "history");
-	await workspaceA.close();
+	const repositoryA = await openRemote("https://lixray.test/@acme/a");
+	await repositoryA.clientState.set("selected-panel", "history");
+	await repositoryA.close();
 
-	const workspaceB = await openRemote("https://lixray.test/@acme/b");
+	const repositoryB = await openRemote("https://lixray.test/@acme/b");
 	await expect(
-		workspaceB.clientState.get("selected-panel"),
+		repositoryB.clientState.get("selected-panel"),
 	).resolves.toBeUndefined();
-	await workspaceB.clientState.set("selected-panel", "files");
-	await workspaceB.close();
+	await repositoryB.clientState.set("selected-panel", "files");
+	await repositoryB.close();
 
 	const reopenedA = await openRemote("https://lixray.test/@acme/a/");
 	await expect(reopenedA.clientState.get("selected-panel")).resolves.toBe(

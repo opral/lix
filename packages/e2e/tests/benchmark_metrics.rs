@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use lix::wasm::WasmTransitionCounters;
+use lix::plugin::runtime::WasmTransitionCounters;
 
 pub const MACHINE_RECORD_PREFIX: &str = "LIX_BATCH_BENCHMARK_JSON=";
 pub const TRANSITION_RECORD_PREFIX: &str = "LIX_TRANSITION_PROFILE_JSON=";

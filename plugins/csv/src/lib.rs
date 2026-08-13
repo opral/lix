@@ -7,7 +7,7 @@ use core::{
     ArenaRowIndex, ChangeEffect, ColdInitialImport, Document, EntityChange, EntityRecord, FileEdit,
     IdNamespace, ROW_SCHEMA_KEY, RowConflictResolution, TABLE_SCHEMA_KEY, resolve_row_conflict,
 };
-use lix_plugin_api as sdk;
+use lix::plugin as sdk;
 
 struct CsvPlugin;
 
@@ -764,7 +764,7 @@ fn push_text(output: &mut Vec<u8>, value: &str) -> sdk::Result<()> {
 }
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api::export_plugin!(CsvPlugin);
+lix::plugin::export!(CsvPlugin);
 
 #[cfg(test)]
 mod tests {

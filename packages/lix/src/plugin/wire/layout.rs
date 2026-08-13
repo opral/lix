@@ -1,4 +1,4 @@
-//! Compiled, format-neutral layouts for dense plugin entity rows.
+//! Compiled wire layouts for dense plugin entity rows.
 //!
 //! A layout describes a compact row wire shape and how its values map to a
 //! canonical JSON snapshot. Parsing resolves and validates every slot reference

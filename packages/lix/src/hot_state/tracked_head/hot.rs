@@ -15,7 +15,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use crate::wasm::WasmCreateContext;
+use crate::plugin::runtime::WasmCreateContext;
 use crate::storage_adapter::ValueSemantics;
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -26,7 +26,7 @@ use crate::storage_adapter::{
     PutBatch, PutEntry,
 };
 use crate::tracked_state::TrackedStateReadColumns;
-use crate::wasm::WasmCertifiedEntityBatch;
+use crate::plugin::runtime::WasmCertifiedEntityBatch;
 
 use super::*;
 
@@ -767,10 +767,10 @@ pub(crate) async fn stage_certified_entity_batches(
             for (page_index, page) in batch.pages.iter().enumerate() {
                 let (first_local_ref, last_local_ref) = match batch.format {
                     1 => certified_schema_row_page_local_ref_range(page)?,
-                    2 | crate::wasm::HOST_CERTIFIED_PACKET_FORMAT => {
+                    2 | crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT => {
                         certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX))
                     }
-                    crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
+                    crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
                         certified_zstd_packet_page_header(page)?.0
                     }
                     _ => (0, u32::MAX),
@@ -905,19 +905,19 @@ fn certified_entity_batch_page_key(content_key: &[u8], page_index: u32) -> Stora
 }
 
 fn certified_schema_row_page_local_ref_range(page: &[u8]) -> Result<(u32, u32), LixError> {
-    let page = crate::plugin_wire::Page::decode(page)
+    let page = crate::plugin::wire::Page::decode(page)
         .map_err(|error| head_value_error(format!("invalid certified entity page: {error:?}")))?;
     let section = page.section().map_err(|error| {
         head_value_error(format!("invalid certified entity-page section: {error:?}"))
     })?;
-    if section.representation != crate::plugin_wire::Representation::SchemaRows
-        || section.operation != crate::plugin_wire::Operation::Create
+    if section.representation != crate::plugin::wire::Representation::SchemaRows
+        || section.operation != crate::plugin::wire::Operation::Create
     {
         return Err(head_value_error(
             "certified schema-row entity page must contain created rows",
         ));
     }
-    let layout = crate::plugin_layout::CompiledLayout::parse(section.layout)
+    let layout = crate::plugin::wire::CompiledLayout::parse(section.layout)
         .map_err(|error| head_value_error(format!("invalid schema-row layout: {error}")))?;
     let mut rows = layout
         .rows(section.payload, section.record_count)
@@ -1060,8 +1060,8 @@ fn certified_external_page_plan(
     };
     let selected_local_refs = ((format == 1
         || format == 2
-        || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
-        || format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT)
+        || format == crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+        || format == crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT)
         && !request.filter.entity_pks.is_empty())
     .then(|| {
         let high = creates.high.to_be_bytes();
@@ -1625,8 +1625,8 @@ fn decode_certified_entity_batch_rows(
     let format = input.u16()?;
     if format != 1
         && format != 2
-        && format != crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
-        && format != crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        && format != crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+        && format != crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
     {
         return Err(head_value_error(format!(
             "unsupported certified entity batch format {format}"
@@ -1689,15 +1689,15 @@ fn decode_certified_entity_batch_rows(
         }
         let page = page.as_ref();
         let decoded_page;
-        let page = if format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT {
+        let page = if format == crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT {
             decoded_page = decode_certified_zstd_packet_page(page)?;
             decoded_page.as_slice()
         } else {
             page
         };
         if format == 2
-            || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
-            || format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+            || format == crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
+            || format == crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
         {
             decoded_rows = decoded_rows.saturating_add(decode_certified_packet_rows(
                 page,
@@ -1717,20 +1717,20 @@ fn decode_certified_entity_batch_rows(
             }
             continue;
         }
-        let entity_page = crate::plugin_wire::Page::decode(page).map_err(|error| {
+        let entity_page = crate::plugin::wire::Page::decode(page).map_err(|error| {
             head_value_error(format!("invalid certified entity page: {error:?}"))
         })?;
         let section = entity_page.section().map_err(|error| {
             head_value_error(format!("invalid certified entity-page section: {error:?}"))
         })?;
-        if section.representation != crate::plugin_wire::Representation::SchemaRows
-            || section.operation != crate::plugin_wire::Operation::Create
+        if section.representation != crate::plugin::wire::Representation::SchemaRows
+            || section.operation != crate::plugin::wire::Operation::Create
         {
             return Err(head_value_error(
                 "certified schema-row entity page must contain created rows",
             ));
         }
-        let layout = crate::plugin_layout::CompiledLayout::parse(section.layout)
+        let layout = crate::plugin::wire::CompiledLayout::parse(section.layout)
             .map_err(|error| head_value_error(format!("invalid schema-row layout: {error}")))?;
         let mut rows = layout
             .rows(section.payload, section.record_count)
@@ -1755,7 +1755,7 @@ fn decode_certified_entity_batch_rows(
                 .map_err(|error| head_value_error(error.to_string()))?;
             let entity_pk = EntityPk::uuid_from_bytes(id);
             let snapshot = if needs_snapshot {
-                let json = crate::plugin_layout::insert_generated_id(
+                let json = crate::plugin::wire::insert_generated_id(
                     &rendered_snapshots[rendered.snapshot],
                     layout.generated_id_path(),
                     &uuid::Uuid::from_bytes(id).to_string(),
@@ -14834,7 +14834,7 @@ mod tests {
             append_batch_text(&mut value, file_id).unwrap();
             value.extend_from_slice(commit_id.as_uuid().as_bytes());
             append_batch_text(&mut value, "2026-01-01T00:00:00Z").unwrap();
-            value.extend_from_slice(&crate::wasm::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes());
+            value.extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes());
             value.extend_from_slice(&0_u64.to_le_bytes());
             value.extend_from_slice(&0_u64.to_le_bytes());
             value.extend_from_slice(&0_u32.to_le_bytes());
@@ -14945,7 +14945,7 @@ mod tests {
         let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
         append_batch_text(&mut manifest_key, "unrelated.md").unwrap();
         manifest_key
-            .extend_from_slice(&crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+            .extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
         manifest_key.extend_from_slice(
             CommitId::for_test_label("unrelated-certified-commit")
                 .as_uuid()
@@ -15029,7 +15029,7 @@ mod tests {
         let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
         append_batch_text(&mut manifest_key, FILE_ID).unwrap();
         manifest_key
-            .extend_from_slice(&crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+            .extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
         manifest_key.extend_from_slice(
             CommitId::for_test_label("matching-certified-commit")
                 .as_uuid()
@@ -15133,9 +15133,9 @@ mod tests {
         page.extend_from_slice(&1_u16.to_le_bytes());
         page.extend_from_slice(&5_u32.to_le_bytes());
         page.extend_from_slice(b"value");
-        let page = crate::plugin_wire::encode_single_section(
-            crate::plugin_wire::Representation::SchemaRows,
-            crate::plugin_wire::Operation::Create,
+        let page = crate::plugin::wire::encode_single_section(
+            crate::plugin::wire::Representation::SchemaRows,
+            crate::plugin::wire::Operation::Create,
             SCHEMA_KEY,
             br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
             1,
@@ -15323,9 +15323,9 @@ mod tests {
         page.extend_from_slice(&1_u16.to_le_bytes());
         page.extend_from_slice(&5_u32.to_le_bytes());
         page.extend_from_slice(b"value");
-        let page = crate::plugin_wire::encode_single_section(
-            crate::plugin_wire::Representation::SchemaRows,
-            crate::plugin_wire::Operation::Create,
+        let page = crate::plugin::wire::encode_single_section(
+            crate::plugin::wire::Representation::SchemaRows,
+            crate::plugin::wire::Operation::Create,
             schema_key,
             br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
             1,

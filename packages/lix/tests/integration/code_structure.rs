@@ -1644,6 +1644,12 @@ fn violates_sealed_owner_boundary(
     imported_path: &[String],
     child_modules: &BTreeMap<String, BTreeSet<String>>,
 ) -> bool {
+    if owner_root == "plugin" {
+        return !matches!(
+            imported_path.get(1).map(String::as_str),
+            Some("runtime" | "wire")
+        );
+    }
     if sealed_owner_root_facade_owners().contains(owner_root) {
         return true;
     }

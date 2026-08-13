@@ -929,7 +929,7 @@ mod tests {
     /// Making publishers share a compare-and-set row broke exactly this. It was
     /// invisible at the public surface because `upsert_file_content_part` retries
     /// a bounded number of times — a full window plus any other concurrent writer
-    /// exhausts that budget, which is how the movie-workspace qualification fails
+    /// exhausts that budget, which is how the movie-repository qualification fails
     /// its upload acknowledgement.
     #[tokio::test]
     async fn concurrent_upload_part_publications_from_one_snapshot_all_commit() {

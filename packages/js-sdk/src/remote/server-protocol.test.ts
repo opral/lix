@@ -5,7 +5,7 @@ import {
 	decodeHandshake,
 	decodeObserveEvent,
 	encodeWireValue,
-} from "./protocol.js";
+} from "./server-protocol.js";
 
 test("remote executeBatch requires positional metadata and preserves labels", () => {
 	const result = decodeExecuteBatchResult({
@@ -89,7 +89,7 @@ test("remote blobs use native typed-array base64 when available", () => {
 			}),
 		).toThrow(
 			expect.objectContaining({
-				code: "LIX_REMOTE_PROTOCOL_ERROR",
+				code: "LIX_SERVER_PROTOCOL_ERROR",
 				message: "blob wire value contains invalid base64",
 			}),
 		);

@@ -2,7 +2,7 @@ use crate::cli::exp::{ExpGitReplayArgs, GitReplayParentTree, GitReplayPlugins, G
 use crate::db;
 use crate::error::CliError;
 use lix::storage::Storage;
-use lix::wasm::WasmTransitionCounters;
+use lix::plugin::runtime::WasmTransitionCounters;
 use lix::{Lix, PreparedDmlParameterBatch, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;

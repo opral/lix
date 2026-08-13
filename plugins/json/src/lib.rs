@@ -7,7 +7,7 @@ use core::{
     ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, EntityChange, EntityImportBuilder,
     EntityRecord, FileEdit, IdNamespace,
 };
-use lix_plugin_api as sdk;
+use lix::plugin as sdk;
 
 struct JsonPlugin;
 
@@ -1098,7 +1098,7 @@ fn push_text(output: &mut Vec<u8>, value: &str) -> sdk::Result<()> {
 }
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api::export_plugin!(JsonPlugin);
+lix::plugin::export!(JsonPlugin);
 
 #[cfg(test)]
 mod tests {
