@@ -12748,6 +12748,104 @@ mod tests {
         assert!(successor.contains(&replacement_key));
     }
 
+    /// Mechanism probe for the `lix_file` content-update scaling defect.
+    ///
+    /// A content-only update changes no descriptor -- same path, same name,
+    /// same parent -- so the visible filesystem path index is unchanged by it.
+    /// This measures how many times that index is nevertheless rebuilt from
+    /// scratch, and how many descriptor rows each rebuild reads, so the cost
+    /// can be attributed to repository size rather than inferred from timings.
+    ///
+    /// The counter lives inside `build_path_index`, the only full-rebuild site,
+    /// which is a different layer from the timing instrument that first showed
+    /// the slope.
+    #[tokio::test]
+    async fn content_updates_rebuild_the_whole_path_index_once_per_statement() {
+        async fn measure(files: usize, updates: usize) -> (usize, usize) {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("storage should initialize");
+            let engine = Engine::new(storage)
+                .await
+                .expect("engine should open initialized storage");
+            let session = engine.open_session().await.expect("session should open");
+
+            let values = (0..files)
+                .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            session
+                .execute(
+                    &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
+                    &[],
+                )
+                .await
+                .expect("fixture files should commit");
+
+            let rows = session
+                .execute("SELECT id FROM lix_file ORDER BY path", &[])
+                .await
+                .expect("file ids should read back");
+            let ids = rows
+                .rows()
+                .iter()
+                .map(|row| {
+                    row.get::<String>("id")
+                        .expect("file row should carry an id")
+                })
+                .collect::<Vec<_>>();
+            assert!(ids.len() >= updates, "fixture must cover every update");
+
+            crate::filesystem::reset_full_rebuild_stats();
+            for id in ids.iter().take(updates) {
+                session
+                    .execute(
+                        "UPDATE lix_file SET content = $1 WHERE id = $2",
+                        &[
+                            crate::Value::Blob(b"byte-02".to_vec().into()),
+                            crate::Value::Text(id.clone()),
+                        ],
+                    )
+                    .await
+                    .expect("content update should commit");
+            }
+            crate::filesystem::full_rebuild_stats()
+        }
+
+        let updates = 10;
+        let (small_builds, small_rows) = measure(50, updates).await;
+        let (large_builds, large_rows) = measure(500, updates).await;
+
+        // One full reconstruction per statement: the per-commit advance does
+        // not keep this cache warm across content updates.
+        assert_eq!(
+            small_builds, updates,
+            "50-file repository rebuilt {small_builds} times for {updates} content updates"
+        );
+        assert_eq!(
+            large_builds, updates,
+            "500-file repository rebuilt {large_builds} times for {updates} content updates"
+        );
+
+        // ... and each rebuild reads the whole repository, so the per-statement
+        // cost is O(descriptors), not O(rows touched).
+        let small_per_build = small_rows / small_builds;
+        let large_per_build = large_rows / large_builds;
+        assert!(
+            small_per_build >= 50,
+            "each rebuild should read the whole 50-file repository, read {small_per_build}"
+        );
+        assert!(
+            large_per_build >= 500,
+            "each rebuild should read the whole 500-file repository, read {large_per_build}"
+        );
+        assert!(
+            large_per_build >= small_per_build * 5,
+            "rebuild cost must track descriptor count: {small_per_build} -> {large_per_build}"
+        );
+    }
+
     #[tokio::test]
     async fn staged_descriptor_batches_advance_transaction_path_index() {
         let storage = Memory::new();
