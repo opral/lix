@@ -2,13 +2,23 @@
 //!
 //! # Why this is not behind a bench feature
 //!
-//! The digest has a silent failure mode. A repository whose commits carry no
-//! digest is still *correct* — the reader falls back to loading each reached
-//! commit's replay-state authority, exactly as it did before — but it is
-//! silently slow, and the whole optimization evaporates with nothing to say
-//! so. An operator upgrading a repository needs to be able to tell a fully
-//! digested repository from a fully pre-digest one, so these counters compile
-//! in every configuration and are emitted per history read.
+//! The digest has a silent *degradation* mode that is not the one it first
+//! appears to be, and the difference matters for what these counters are for.
+//!
+//! There is **no pre-digest repository to fall back for.** `CommitRecord` is
+//! `#[musli(packed)]` — positional and untagged — so a commit written before
+//! this format does not decode at all, and `init::REPOSITORY_PROTOCOL_VALUE`
+//! rejects such a repository at open. `LoadedAbsent` is therefore not "an old
+//! repository being read slowly"; it is a **writer that failed to derive a
+//! digest**, which is a defect in this build, not a legacy state.
+//!
+//! The degradation that can really happen is `LoadedOpaque`: a commit whose
+//! member scopes were not enumerable when it was written. That is correct and
+//! slow, silently, and if a workload shape made it common the optimization
+//! would quietly evaporate with nothing in the logs to say so.
+//!
+//! Both are counted, separately, in every configuration and emitted per history
+//! read, so the two are distinguishable from the outside without a profiler.
 //!
 //! The counter lives **inside** the new route (the membership test itself),
 //! not at the traversal layer above it, so "no effect" from the timing
@@ -32,9 +42,11 @@ pub(crate) enum ScopeDigestOutcome {
     LoadedPresent,
     /// The commit's member scopes were not enumerable when it was written.
     LoadedOpaque,
-    /// The commit carries no digest at all. **This is the silent-slowness
-    /// counter**: a repository written before this format reports every reached
-    /// commit here.
+    /// The commit carries no digest at all.
+    ///
+    /// Not a legacy state — a v66 repository is rejected at open, not read
+    /// slowly — so a non-zero count here means a commit writer in *this* build
+    /// failed to derive one. Treat it as a defect, not as degradation.
     LoadedAbsent,
     /// The request placed no schema constraint, so no digest could apply.
     Unconstrained,
@@ -142,8 +154,9 @@ impl ScopeDigestCensus {
 
     /// Emits one line per history read.
     ///
-    /// `loaded_absent` dominating this line is what a pre-digest repository
-    /// looks like from the outside: the read stays correct and stays slow.
+    /// `loaded_opaque` dominating this line is what a workload the digest
+    /// cannot serve looks like from the outside: the read stays correct and
+    /// stays slow. `loaded_absent` above zero is a writer defect.
     pub(crate) fn emit(&self, start_commit_id: &CommitId) {
         if self.probed() == 0 && self.unconstrained == 0 {
             return;

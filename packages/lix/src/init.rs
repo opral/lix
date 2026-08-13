@@ -51,7 +51,15 @@ pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace = StorageSpace::declare
     ValueSemantics::Mutable,
 );
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v66";
+/// v67 adds `CommitRecord::touched_scope_digest`.
+///
+/// This bump is **not** cosmetic. `CommitRecord` is `#[musli(packed)]`, so a
+/// v66 record cannot be decoded by a v67 reader — the failure would otherwise
+/// surface deep inside graph traversal as an opaque codec error instead of at
+/// open, where `unsupported_repository_protocol_error` tells the operator to
+/// recreate the repository. Every hard cut to a persisted record shape has to
+/// move this value with it.
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v67";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

@@ -283,6 +283,83 @@ mod tests {
         assert_eq!(digest.bits.len(), COMMIT_SCOPE_DIGEST_BYTES);
     }
 
+    /// Proves the upgrade path is a **hard cut**, not a graceful fallback.
+    ///
+    /// `CommitRecord` is `#[musli(packed)]`: positional and untagged. Adding a
+    /// field is therefore not "old readers see `None`" — it is a decode error in
+    /// both directions, and `storage_codec::decode` additionally rejects
+    /// trailing bytes outright. The repository-level consequence is
+    /// `REPOSITORY_PROTOCOL_VALUE` in `init.rs`: an existing repository is
+    /// rejected at open with "recreate the repository", it is not read slowly.
+    ///
+    /// This is asserted rather than assumed because reading the derive is not
+    /// the same as testing the codec, and the distinction decides what an
+    /// upgrading operator actually experiences.
+    #[test]
+    fn adding_the_digest_field_is_a_hard_cut_in_both_directions() {
+        use crate::common::LixTimestamp;
+
+        /// Byte-for-byte the pre-digest `CommitRecord` arity.
+        #[derive(Debug, musli::Encode, musli::Decode)]
+        #[musli(packed)]
+        struct CommitRecordV4 {
+            format_version: u32,
+            commit_id: crate::changelog::CommitId,
+            generation: u64,
+            parent_commit_ids: Vec<crate::changelog::CommitId>,
+            first_parent_jump_commit_id: crate::changelog::CommitId,
+            first_parent_jump_span: u64,
+            account_id: String,
+            created_at: LixTimestamp,
+        }
+
+        let commit_id = crate::changelog::CommitId::for_test_label("hard-cut-commit");
+        let created_at = LixTimestamp::expect_parse("hard cut test", "2026-08-12T00:00:00Z");
+        let old = CommitRecordV4 {
+            format_version: 4,
+            commit_id,
+            generation: 3,
+            parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
+            account_id: "account".to_string(),
+            created_at,
+        };
+        let old_bytes = crate::storage_codec::encode("v4 commit record", &old).expect("encode v4");
+
+        // New reader, old bytes: the digest field has nothing to read.
+        let forward =
+            crate::storage_codec::decode::<crate::changelog::CommitRecord>("v5 read", &old_bytes);
+        assert!(
+            forward.is_err(),
+            "a v5 reader must not silently accept a v4 record"
+        );
+
+        let new = crate::changelog::CommitRecord {
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+            commit_id,
+            generation: 3,
+            parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
+            account_id: "account".to_string(),
+            created_at,
+            touched_scope_digest: CommitTouchedScopeDigest::exact([&CommitScopeKey {
+                schema_key: "lix_file_descriptor".to_string(),
+                file_id: None,
+            }]),
+        };
+        let new_bytes = crate::storage_codec::encode("v5 commit record", &new).expect("encode v5");
+
+        // Old reader, new bytes: rejected as trailing bytes rather than
+        // mis-decoded.
+        let backward = crate::storage_codec::decode::<CommitRecordV4>("v4 read", &new_bytes);
+        assert!(
+            backward.is_err(),
+            "a v4 reader must not silently accept a v5 record"
+        );
+    }
+
     #[test]
     fn digest_round_trips_through_the_record_codec() {
         let digest = CommitTouchedScopeDigest::exact([&scope("lix_file_descriptor", None)]);
