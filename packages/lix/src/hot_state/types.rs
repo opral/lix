@@ -1259,6 +1259,20 @@ pub(crate) struct DeclaredColumnEq {
     pub(crate) values: Vec<crate::hot_state::HotIndexValue>,
 }
 
+/// One half-open interval on an indexed column, resolved through the index
+/// plane before a route is chosen.
+///
+/// Each bound carries its own inclusivity because the key encoding is
+/// order-preserving but the key space is half-open: an inclusive value bound
+/// becomes an exclusive key bound one successor above the value prefix.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DeclaredColumnRange {
+    pub(crate) schema_key: String,
+    pub(crate) ordinal: u16,
+    pub(crate) lower: Option<(crate::hot_state::HotIndexValue, bool)>,
+    pub(crate) upper: Option<(crate::hot_state::HotIndexValue, bool)>,
+}
+
 /// Identity-centered filter for visible live entities.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct HotStateFilter {
@@ -1284,6 +1298,10 @@ pub(crate) struct HotStateFilter {
     /// candidates, so the caller's predicate is what rejects stale ones.
     #[serde(default)]
     pub(crate) declared_column_eq: Option<DeclaredColumnEq>,
+    /// A range on an indexed column, resolved the same way and under the same
+    /// candidate-superset contract as [`Self::declared_column_eq`].
+    #[serde(default)]
+    pub(crate) declared_column_range: Option<DeclaredColumnRange>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
 }

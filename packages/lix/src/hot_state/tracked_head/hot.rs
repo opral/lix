@@ -5458,6 +5458,127 @@ where
         Ok(Some(candidates))
     }
 
+    /// Candidate entity primary keys whose indexed column falls in a range.
+    ///
+    /// The equality sibling's contract holds unchanged: `Some` is a candidate
+    /// **superset**, never an answer. Entries are not deleted within a
+    /// generation, so a candidate may name a row that has since changed value
+    /// or been deleted, and the caller re-applies its own predicate. The set
+    /// never omits a live matching row.
+    ///
+    /// Bounds are half-open in key space and closed in value space, so each
+    /// inclusive value bound becomes an exclusive key bound one successor up.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn scan_hot_index_range_candidates(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        schema_key: &str,
+        ordinal: u16,
+        lower: Option<(&HotIndexValue, bool)>,
+        upper: Option<(&HotIndexValue, bool)>,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        if lower.is_none() && upper.is_none() {
+            return Ok(None);
+        }
+        let witness = StorageKey(Bytes::from(encode_hot_index_witness_key(
+            branch_id,
+            generation,
+            schema_key,
+            ordinal,
+        )));
+        let present = PointReadPlan::new(INDEX_SPACE, &[witness])
+            .materialize(&self.store, StorageGetOptions::default())
+            .await?;
+        let Some(StorageProjectedValue::FullValue(witness_value)) =
+            present.value.into_iter().next().flatten()
+        else {
+            crate::storage_bench::record_hot_index_probe_refused_unwitnessed();
+            return Ok(None);
+        };
+        let Some(entries_published) = decode_hot_index_witness(&witness_value) else {
+            crate::storage_bench::record_hot_index_probe_refused_unwitnessed();
+            return Ok(None);
+        };
+        let budget = hot_index_candidate_budget(entries_published);
+
+        let column_prefix = hot_index_column_prefix(branch_id, generation, schema_key, ordinal);
+        let lower_bound = match lower {
+            // `>= v` starts at the value prefix, which sorts below every entry
+            // carrying that value.
+            Some((value, true)) => std::ops::Bound::Included(StorageKey(Bytes::from(hot_index_value_prefix(
+                branch_id, generation, schema_key, ordinal, value,
+            )))),
+            // `> v` must clear every entry of `v`, so it starts one successor up.
+            Some((value, false)) => {
+                let prefix =
+                    hot_index_value_prefix(branch_id, generation, schema_key, ordinal, value);
+                match hot_index_key_successor(&prefix) {
+                    Some(successor) => std::ops::Bound::Included(StorageKey(Bytes::from(successor))),
+                    None => return Ok(Some(Vec::new())),
+                }
+            }
+            None => std::ops::Bound::Included(StorageKey(Bytes::from(column_prefix.clone()))),
+        };
+        let upper_bound = match upper {
+            // `<= v` must retain every entry of `v`, which all sort above the
+            // value prefix — so the bound is the successor, not the prefix.
+            Some((value, true)) => {
+                let prefix =
+                    hot_index_value_prefix(branch_id, generation, schema_key, ordinal, value);
+                match hot_index_key_successor(&prefix) {
+                    Some(successor) => std::ops::Bound::Excluded(StorageKey(Bytes::from(successor))),
+                    None => std::ops::Bound::Unbounded,
+                }
+            }
+            // `< v` excludes them, and the value prefix sorts below them all.
+            Some((value, false)) => std::ops::Bound::Excluded(StorageKey(Bytes::from(hot_index_value_prefix(
+                branch_id, generation, schema_key, ordinal, value,
+            )))),
+            None => match hot_index_key_successor(&column_prefix) {
+                Some(successor) => std::ops::Bound::Excluded(StorageKey(Bytes::from(successor))),
+                None => std::ops::Bound::Unbounded,
+            },
+        };
+
+        let mut candidates = Vec::new();
+        let mut cursor = self
+            .store
+            .begin_scan(
+                INDEX_SPACE,
+                crate::storage_adapter::StorageKeyRange {
+                    lower: lower_bound,
+                    upper: upper_bound,
+                },
+                StorageBeginScanOptions::default(),
+            )
+            .await?;
+        loop {
+            let want = (budget + 1 - candidates.len()).min(HOT_INDEX_CANDIDATE_PAGE);
+            let (page, page_has_more) = cursor.next_page(want).await?.into_parts();
+            for entry in &page {
+                let StorageProjectedValue::FullValue(value) = &entry.value else {
+                    continue;
+                };
+                let text = std::str::from_utf8(value).map_err(|error| {
+                    head_value_error(format!("hot index entry is not utf-8: {error}"))
+                })?;
+                candidates.push(EntityPk::from_json_array_text(text).map_err(|error| {
+                    head_value_error(format!("hot index entry has an invalid entity pk: {error}"))
+                })?);
+            }
+            if candidates.len() > budget {
+                crate::storage_bench::record_hot_index_probe_refused_over_budget();
+                return Ok(None);
+            }
+            if !page_has_more {
+                break;
+            }
+        }
+        crate::storage_bench::record_hot_index_range_probe_engaged(candidates.len());
+        Ok(Some(candidates))
+    }
+
     pub(crate) async fn has_schema_rows(
         &self,
         branch_id: &str,
@@ -12801,6 +12922,45 @@ pub(crate) fn hot_index_value_prefix(
     key.extend_from_slice(&ordinal.to_be_bytes());
     value.write(&mut key);
     key
+}
+
+/// Every entry for one `(collection, column)`, whatever the value: the range
+/// access path's outer bound.
+pub(crate) fn hot_index_column_prefix(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    ordinal: u16,
+) -> Vec<u8> {
+    let mut key = hot_scope_prefix(branch_id, generation);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    key.push(HOT_INDEX_ENTRY_TAG);
+    key.extend_from_slice(&ordinal.to_be_bytes());
+    key
+}
+
+/// The least key strictly greater than every key having `prefix` as a prefix.
+///
+/// This is the whole of inclusive-upper-bound correctness. Entries for value
+/// `v` are `prefix_v ++ entity_pk`, so they all sort **after** `prefix_v`
+/// itself. An upper bound of `Excluded(prefix_v)` therefore excludes every row
+/// equal to `v` — right for `< v`, and silently wrong for `<= v`, which is the
+/// one place a range seek loses rows while still returning a plausible answer.
+/// `<= v` must bound with `Excluded(successor(prefix_v))`.
+///
+/// `None` means the prefix is all `0xff` and no successor exists, in which case
+/// the range runs to the end of the space.
+fn hot_index_key_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut successor = prefix.to_vec();
+    while let Some(last) = successor.last_mut() {
+        if *last == u8::MAX {
+            successor.pop();
+        } else {
+            *last += 1;
+            return Some(successor);
+        }
+    }
+    None
 }
 
 /// Asserts that this plane holds every row of one `(collection, column)` for

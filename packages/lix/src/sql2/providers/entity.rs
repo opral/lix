@@ -328,6 +328,7 @@ impl EntitySpec {
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
         apply_exact_file_id_filter(&mut request, exact_file_ids_from_filters(filters)?);
         request.filter.declared_column_eq = declared_column_eq(&self.spec, &row_filters);
+        request.filter.declared_column_range = declared_column_range(&self.spec, &row_filters);
         Ok((projected_schema, request, row_filters))
     }
 
@@ -1886,6 +1887,91 @@ fn declared_column_eq(
     })
 }
 
+/// The interval an indexed column is constrained to, when a conjunction of
+/// range predicates constrains one.
+///
+/// Only conjunctions contribute. A bound under a disjunction does not hold for
+/// every row the filter admits, so descending into `Or` would produce an
+/// interval that omits matching rows.
+///
+/// When several bounds constrain the same side, the first is taken rather than
+/// the tightest -- so `x > 5 AND x > 100` seeks from 5, not from 100. That is
+/// deliberate, not an oversight. Every conjunct must hold, so any one of them
+/// is a valid bound; a looser one costs candidates, never correctness, and the
+/// caller's residual rejects the surplus.
+fn declared_column_range(
+    spec: &EntitySurfaceSpec,
+    row_filters: &[EntityRowFilter],
+) -> Option<crate::hot_state::DeclaredColumnRange> {
+    let mut bounds = Vec::new();
+    for filter in row_filters {
+        collect_conjunctive_ranges(filter, &mut bounds);
+    }
+    if bounds.is_empty() {
+        return None;
+    }
+    for indexed in &spec.indexed_columns {
+        let mut lower = None;
+        let mut upper = None;
+        for (column, op, value) in &bounds {
+            if *column != indexed.name.as_str() {
+                continue;
+            }
+            let Some(value) = hot_index_value_from_filter_value(value) else {
+                continue;
+            };
+            match op {
+                EntityRangeOp::Gt if lower.is_none() => lower = Some((value, false)),
+                EntityRangeOp::GtEq if lower.is_none() => lower = Some((value, true)),
+                EntityRangeOp::Lt if upper.is_none() => upper = Some((value, false)),
+                EntityRangeOp::LtEq if upper.is_none() => upper = Some((value, true)),
+                _ => {}
+            }
+        }
+        if lower.is_some() || upper.is_some() {
+            return Some(crate::hot_state::DeclaredColumnRange {
+                schema_key: spec.schema_key.clone(),
+                ordinal: indexed.ordinal,
+                lower,
+                upper,
+            });
+        }
+    }
+    None
+}
+
+/// Range bounds that hold for every row the filter admits.
+fn collect_conjunctive_ranges<'a>(
+    filter: &'a EntityRowFilter,
+    out: &mut Vec<(&'a str, EntityRangeOp, &'a EntityFilterValue)>,
+) {
+    match filter {
+        EntityRowFilter::ColumnRange {
+            column, op, value, ..
+        } => out.push((column.as_str(), *op, value)),
+        EntityRowFilter::And(left, right) => {
+            collect_conjunctive_ranges(left, out);
+            collect_conjunctive_ranges(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// The index-plane representation of a filter literal, when one exists.
+fn hot_index_value_from_filter_value(
+    value: &EntityFilterValue,
+) -> Option<crate::hot_state::HotIndexValue> {
+    match value {
+        EntityFilterValue::String(value) => {
+            Some(crate::hot_state::HotIndexValue::String(value.clone()))
+        }
+        EntityFilterValue::Integer(value) => {
+            Some(crate::hot_state::HotIndexValue::Integer(*value))
+        }
+        _ => None,
+    }
+}
+
 /// The column and the value set one row filter constrains it to, when the
 /// filter is a membership test on a single column.
 ///
@@ -3208,9 +3294,27 @@ fn direct_entity_batch_eligible(
     request: &HotStateScanRequest,
     row_filters: &[EntityRowFilter],
 ) -> bool {
+    // A range filter does not disqualify this route *when nothing better is
+    // available*. Ranges are pushed down as `Inexact`, so DataFusion re-checks
+    // them above the scan and this route may legitimately ignore them — which
+    // keeps the pre-range fast path intact instead of demoting every range
+    // query to the generic visibility scan. Equality and IN still disqualify
+    // it, as they always have.
+    //
+    // But a range on an *indexed* column has something better: the index range
+    // seek, which reaches this collection through resolved entity pks instead
+    // of reading it end to end. That seek is resolved on the route this one
+    // bypasses, so admitting the range here would silently disable it — the
+    // fast full read would win the route and the seek would never run. When a
+    // `declared_column_range` is present the range therefore disqualifies this
+    // route, exactly as an equality on an indexed column already does.
     !schema.fields().is_empty()
         && matches!(request.filter.rows, HotStateRowFilter::All)
-        && row_filters.is_empty()
+        && (row_filters.is_empty()
+            || (request.filter.declared_column_range.is_none()
+                && row_filters
+                    .iter()
+                    .all(|filter| matches!(filter, EntityRowFilter::ColumnRange { .. }))))
         && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()
         && schema
