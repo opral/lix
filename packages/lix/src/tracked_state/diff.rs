@@ -1304,11 +1304,9 @@ mod tests {
             created_at,
             updated_at,
         };
-        let after = value(after_change_id, false);
-
         let entry = |before: Option<TrackedStateIndexValue>| {
             let mut batch = TrackedStateTreeDiffBatchBuilder::with_row_capacity(1);
-            batch.push_shared(key(), before, Some(after));
+            batch.push_shared(key(), before, Some(value(after_change_id, false)));
             let batch = batch.finish().expect("tree batch should seal");
             classify_tree_diff_batch(batch, &TrackedStatePayloadBatch::default())
                 .expect("rows should classify")
