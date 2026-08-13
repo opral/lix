@@ -618,15 +618,13 @@ async fn seed_visible_schema_rows<StorageImpl>(
 
 fn json_pointer_schema() -> JsonValue {
     json!({
-        "x-lix-key": "json_pointer",
-        "x-lix-primary-key": ["/path"],
-        "type": "object",
-        "properties": {
-            "path": { "type": "string" },
-            "value": true
-        },
-        "required": ["path", "value"],
-        "additionalProperties": false
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "json_pointer",
+        "columns": [
+            { "name": "path", "type": "text", "nullable": false },
+            { "name": "value", "type": "jsonb", "nullable": false }
+        ],
+        "primary_key": ["path"]
     })
 }
 
