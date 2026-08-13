@@ -16,6 +16,7 @@ mod execute_batch_benchmark;
 mod filesystem_fuzz;
 mod fs_api;
 mod json_pointer_crud_storage;
+mod lix_file_returning_route;
 mod merge_fuzz;
 mod observe;
 mod observe_mutation_revision;
