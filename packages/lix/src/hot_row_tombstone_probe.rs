@@ -2105,3 +2105,349 @@ async fn hot_row_tombstone_churn_cycles() {
         }
     }
 }
+
+
+/// Removes only the tombstones of identities created and deleted inside the
+/// current checkpoint interval, identified by name prefix rather than by
+/// reading the private baseline codec. Returns how many were removed.
+async fn drop_tombstones_named(storage: &Memory, needle: &str) -> usize {
+    let adapter = StorageAdapter::new(storage.clone());
+    let read = adapter
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("read the hot row plane");
+    let entries = space_entries(&read, crate::hot_state::ROW_SPACE).await;
+    drop(read);
+    let mut writes = adapter.new_write_set();
+    let mut removed = 0_usize;
+    for (key, value) in entries {
+        let is_tombstone = value.len() > 1 && value[1] & HEAD_VALUE_DELETED_BIT != 0;
+        let names = key
+            .0
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes());
+        if is_tombstone && names {
+            writes.delete(crate::hot_state::ROW_SPACE, key);
+            removed += 1;
+        }
+    }
+    adapter
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .expect("tombstone removal should commit");
+    removed
+}
+
+/// PHASE 12 - does any reader depend on an interval-local tombstone?
+///
+/// An *interval-local* identity is one created and deleted inside the same
+/// checkpoint interval. Phase 11 showed those are the ones that accumulate
+/// forever: the checkpoint reaches the compaction route and is offered
+/// nothing, because they are net-absent against the interval baseline.
+///
+/// The proposed upstream fix is to never publish their tombstone at all. This
+/// phase costs that proposal the same way phase 4 costed the sweep - remove
+/// exactly those tombstones behind the engine's back, reopen cold, and put
+/// every reader the design could plausibly depend on the tombstone in front of
+/// the result.
+///
+/// The readers, one arm each:
+///
+/// - the collection answer and the point answer, cold;
+/// - `lix_working_diff`, before and after;
+/// - the commit graph, which is what history is derived from;
+/// - a branch forked *mid-interval*, while the identity was still alive - the
+///   case where the removed key could plausibly have been serving somebody
+///   else's read;
+/// - a merge of that fork back into the branch whose tombstone was removed;
+/// - undo.
+///
+/// Every arm states what it expects *before* the removal so a reader that is
+/// already broken cannot read as a clean pass.
+#[tokio::test]
+#[ignore = "measurement probe, not a gate"]
+async fn interval_local_tombstone_has_no_dependent_reader() {
+    const N: usize = 40;
+
+    // ---------- arm 1: the local readers ----------
+    {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("p12row")).await;
+        session
+            .execute(
+                "INSERT INTO p12row (id, locale) VALUES ('row-0', 'keep')",
+                &[],
+            )
+            .await
+            .expect("survivor should insert");
+        // Establish the interval baseline, then create and delete inside it.
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should publish");
+        for i in 0..N {
+            session
+                .execute(
+                    "INSERT INTO p12row (id, locale) VALUES ($1, 'drop')",
+                    &[crate::Value::Text(format!("ephem-{i}"))],
+                )
+                .await
+                .expect("ephemeral insert should commit");
+        }
+        for i in 0..N {
+            session
+                .execute(
+                    "DELETE FROM p12row WHERE id = $1",
+                    &[crate::Value::Text(format!("ephem-{i}"))],
+                )
+                .await
+                .expect("ephemeral delete should commit");
+        }
+
+        let census = row_census(&storage).await;
+        let diff_before = working_diff_rows(&session, "p12row").await;
+        let live_before = session
+            .execute("SELECT id FROM p12row", &[])
+            .await
+            .expect("collection read")
+            .len();
+        println!(
+            "phase12 | arm=local before: entries={} tombstones={} packed_bases={} root_bases={} working_diff_rows={diff_before} live={live_before}",
+            census.entries, census.tombstones, census.packed_bases, census.root_bases
+        );
+        assert_eq!(live_before, 1, "only the survivor is live before the removal");
+
+        let removed = drop_tombstones_named(&storage, "ephem-").await;
+        let session = reopen_session(&storage).await;
+        let census = row_census(&storage).await;
+        let diff_after = working_diff_rows(&session, "p12row").await;
+        let live_after = session
+            .execute("SELECT id FROM p12row", &[])
+            .await
+            .expect("collection read")
+            .len();
+        let point = session
+            .execute(
+                "SELECT id FROM p12row WHERE id = $1",
+                &[crate::Value::Text("ephem-0".to_string())],
+            )
+            .await
+            .expect("point read")
+            .len();
+        println!(
+            "phase12 | arm=local after: removed={removed} entries={} tombstones={} working_diff_rows={diff_after} live={live_after} point_hits_for_deleted={point}"
+        , census.entries, census.tombstones);
+
+        assert_eq!(removed, N, "every interval-local tombstone should be removable");
+        assert_eq!(live_after, 1, "removal must not resurrect an ephemeral row");
+        assert_eq!(point, 0, "a point read must not resurrect an ephemeral row");
+        assert_eq!(
+            diff_after, diff_before,
+            "the working diff must not move when an interval-local tombstone goes"
+        );
+
+        // The checkpoint that closes the interval must still succeed and must
+        // still report nothing for the vanished identities.
+        session
+            .create_checkpoint()
+            .await
+            .expect("closing checkpoint should publish after the removal");
+        let live_ckpt = session
+            .execute("SELECT id FROM p12row", &[])
+            .await
+            .expect("collection read")
+            .len();
+        let census = row_census(&storage).await;
+        println!(
+            "phase12 | arm=local after_closing_checkpoint: entries={} tombstones={} live={live_ckpt} working_diff_rows={}",
+            census.entries,
+            census.tombstones,
+            working_diff_rows(&session, "p12row").await
+        );
+        assert_eq!(live_ckpt, 1, "the closing checkpoint must not resurrect");
+    }
+
+    // ---------- arm 2: a branch forked mid-interval, then merged back ----------
+    // Run twice. `remove=false` is the null control: byte-identical fixture and
+    // reader sequence, with the one step that executes the change omitted. A
+    // merge verdict is only evidence if the control produces the same one.
+    for remove in [false, true] {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("p12fork")).await;
+        session
+            .execute(
+                "INSERT INTO p12fork (id, locale) VALUES ('row-0', 'keep')",
+                &[],
+            )
+            .await
+            .expect("survivor should insert");
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should publish");
+        let main_branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+
+        for i in 0..N {
+            session
+                .execute(
+                    "INSERT INTO p12fork (id, locale) VALUES ($1, 'drop')",
+                    &[crate::Value::Text(format!("ephem-{i}"))],
+                )
+                .await
+                .expect("ephemeral insert should commit");
+        }
+
+        // Fork here: on this branch the ephemeral rows are ALIVE.
+        let fork = session
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "p12-midinterval".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("branch should create");
+
+        for i in 0..N {
+            session
+                .execute(
+                    "DELETE FROM p12fork WHERE id = $1",
+                    &[crate::Value::Text(format!("ephem-{i}"))],
+                )
+                .await
+                .expect("ephemeral delete should commit");
+        }
+
+        let commits_before = session
+            .execute("SELECT id FROM lix_commit", &[])
+            .await
+            .expect("commit graph read")
+            .len();
+        let census = row_census(&storage).await;
+        println!(
+            "phase12 | arm=fork(remove={remove}) before: entries={} tombstones={} root_bases={} commits={commits_before}",
+            census.entries, census.tombstones, census.root_bases
+        );
+
+        // Only the ACTIVE branch's tombstones are removed. The fork keeps its
+        // own scope, which is the point of the arm.
+        let removed = if remove {
+            drop_tombstones_named(&storage, "ephem-").await
+        } else {
+            0
+        };
+        let session = reopen_session(&storage).await;
+
+        let live_main = session
+            .execute("SELECT id FROM p12fork", &[])
+            .await
+            .expect("collection read")
+            .len();
+        session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: fork.id.clone(),
+            })
+            .await
+            .expect("switch to the fork");
+        let live_fork = session
+            .execute("SELECT id FROM p12fork", &[])
+            .await
+            .expect("fork collection read")
+            .len();
+        let commits_after = session
+            .execute("SELECT id FROM lix_commit", &[])
+            .await
+            .expect("commit graph read")
+            .len();
+        println!(
+            "phase12 | arm=fork(remove={remove}) after: removed={removed} live_main={live_main} live_fork={live_fork} commits={commits_after}"
+        );
+        assert_eq!(
+            removed,
+            if remove { N } else { 0 },
+            "the control must remove nothing and the treatment every tombstone"
+        );
+        assert_eq!(live_main, 1, "main must still show only the survivor");
+        assert_eq!(
+            live_fork,
+            N + 1,
+            "the fork forked while the ephemeral rows were alive and must still see them"
+        );
+        assert_eq!(
+            commits_after, commits_before,
+            "removing a serving-view tombstone must not change the commit graph"
+        );
+
+        // Merge the fork (rows alive) back into main (rows deleted, tombstones
+        // gone). This is the reader with the most to lose.
+        session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: main_branch_id,
+            })
+            .await
+            .expect("switch back to main");
+        let merged = session
+            .merge_branch(crate::MergeBranchOptions {
+                source_branch_id: fork.id.clone(),
+            })
+            .await;
+        let live_merged = session
+            .execute("SELECT id FROM p12fork", &[])
+            .await
+            .expect("post-merge collection read")
+            .len();
+        println!(
+            "phase12 | arm=fork(remove={remove}) merge: ok={} live_after_merge={live_merged}",
+            merged.is_ok()
+        );
+        merged.expect("merge must not error after the tombstones are gone");
+    }
+
+    // ---------- arm 3: undo, across the removal ----------
+    for remove in [false, true] {
+        let (storage, session) = open_session().await;
+        register(&session, probe_schema("p12undo")).await;
+        session
+            .execute(
+                "INSERT INTO p12undo (id, locale) VALUES ('row-0', 'keep')",
+                &[],
+            )
+            .await
+            .expect("survivor should insert");
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should publish");
+        session
+            .execute(
+                "INSERT INTO p12undo (id, locale) VALUES ('ephem-0', 'drop')",
+                &[],
+            )
+            .await
+            .expect("ephemeral insert should commit");
+        session
+            .execute("DELETE FROM p12undo WHERE id = 'ephem-0'", &[])
+            .await
+            .expect("ephemeral delete should commit");
+
+        let removed = if remove {
+            drop_tombstones_named(&storage, "ephem-").await
+        } else {
+            0
+        };
+        let session = reopen_session(&storage).await;
+        session.undo().await.expect("undo should run");
+        let live = session
+            .execute("SELECT id FROM p12undo", &[])
+            .await
+            .expect("post-undo collection read")
+            .len();
+        println!("phase12 | arm=undo(remove={remove}): removed={removed} live_after_undo={live}");
+        assert_eq!(
+            live, 2,
+            "undo of the delete must restore the ephemeral row even with its tombstone gone"
+        );
+    }
+}
