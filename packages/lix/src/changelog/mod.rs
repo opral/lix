@@ -34,7 +34,8 @@ pub(crate) use types::COMMIT_RECORD_FORMAT_VERSION;
 pub(crate) use types::{
     AuthenticatedNativeRow, ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangePayload,
     ChangeRecord, ChangeScanBatch, ChangeScanRequest, ChangelogAppend, CommitId, CommitLoadBatch,
-    CommitLoadRequest, CommitRecord, CommitScanBatch, CommitScanRequest, NativeScalarCell,
+    CommitLoadRequest, CommitRecord, CommitScanBatch, CommitScanRequest, NativeRowField,
+    NativeScalarCell,
     TransactionChangeRecordRef, TransactionChangelogAppend,
     commit_row_snapshot_json, next_first_parent_jump,
 };

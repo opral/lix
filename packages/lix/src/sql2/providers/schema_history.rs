@@ -282,7 +282,12 @@ static ROW_HISTORY_SYSTEM_COLS: ColumnTable<SchemaHistoryRow> = ColumnTable {
         ("lixcol_depth", Col::I64(|row| Some(i64::from(row.depth)))),
         (
             HISTORY_COL_IS_DELETED,
-            Col::Bool(|row| Some(row.change.snapshot_content.is_none())),
+            Col::Bool(|row| {
+                Some(
+                    row.change.snapshot_content.is_none()
+                        && row.change.native_snapshot.is_none(),
+                )
+            }),
         ),
     ],
 };
@@ -309,7 +314,13 @@ fn row_history_record_batch(
     // for every projected field.
     let snapshots = rows
         .iter()
-        .map(|row| parse_snapshot(row.change.snapshot_content.as_deref()))
+        .map(|row| {
+            if row.change.native_snapshot.is_some() {
+                Ok(None)
+            } else {
+                parse_snapshot(row.change.snapshot_content.as_deref())
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     let system_fields = schema
         .fields()
@@ -423,6 +434,10 @@ fn row_history_column_value<'a>(
     spec: &SchemaSurfaceSpec,
     column_name: &str,
 ) -> Result<Option<Cow<'a, JsonValue>>> {
+    if let Some(native) = row.change.native_snapshot.as_ref() {
+        return native_history_column_value(native, &row.change.row_pk, column_name)
+            .map(|value| value.map(Cow::Owned));
+    }
     if let Some(snapshot) = snapshot {
         return Ok(snapshot.get(column_name).map(Cow::Borrowed));
     }
@@ -439,6 +454,76 @@ fn row_history_column_value<'a>(
     )
     .map(|value| value.map(Cow::Owned))
     .map_err(|error| DataFusionError::Execution(error.to_string()))
+}
+
+fn native_history_column_value(
+    native: &crate::changelog::AuthenticatedNativeRow,
+    row_pk: &crate::row_pk::RowPk,
+    column_name: &str,
+) -> Result<Option<JsonValue>> {
+    use crate::changelog::{NativeRowField, NativeScalarCell};
+
+    let Some(field) = native.fields.iter().find(|field| match field {
+        NativeRowField::PrimaryKey { name, .. } | NativeRowField::Cell { name, .. } => {
+            name == column_name
+        }
+    }) else {
+        return Ok(None);
+    };
+    match field {
+        NativeRowField::PrimaryKey {
+            component_index, ..
+        } => {
+            let component = row_pk
+                .components
+                .as_slice()
+                .get(*component_index as usize)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "native history primary-key arity disagrees with its layout".to_owned(),
+                    )
+                })?;
+            Ok(Some(match component {
+                crate::row_pk::RowPkComponent::Integer(value) => JsonValue::from(*value),
+                crate::row_pk::RowPkComponent::Uuid(_)
+                | crate::row_pk::RowPkComponent::String(_)
+                | crate::row_pk::RowPkComponent::Bytes(_) => {
+                    JsonValue::String(component.external_string())
+                }
+            }))
+        }
+        NativeRowField::Cell { cell_index, .. } => {
+            let cell = native.cells.get(*cell_index as usize).ok_or_else(|| {
+                DataFusionError::Execution(
+                    "native history cell index disagrees with its payload".to_owned(),
+                )
+            })?;
+            Ok(Some(match cell {
+                NativeScalarCell::Null => JsonValue::Null,
+                NativeScalarCell::Text(value) => JsonValue::String(value.clone()),
+                NativeScalarCell::Uuid(value) => {
+                    JsonValue::String(uuid::Uuid::from_bytes(*value).to_string())
+                }
+                NativeScalarCell::Int8(value) => JsonValue::from(*value),
+                NativeScalarCell::Float8Bits(bits) => {
+                    serde_json::Number::from_f64(f64::from_bits(*bits))
+                        .map(JsonValue::Number)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "native history float8 is not representable".to_owned(),
+                            )
+                        })?
+                }
+                NativeScalarCell::Boolean(value) => JsonValue::Bool(*value),
+                NativeScalarCell::Jsonb(value) => serde_json::from_slice(&value).map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "native history jsonb is invalid: {error}"
+                    ))
+                })?,
+                NativeScalarCell::Timestamptz(value) => JsonValue::String(value.to_string()),
+            }))
+        }
+    }
 }
 
 #[cfg(test)]

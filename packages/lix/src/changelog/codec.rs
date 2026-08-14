@@ -305,8 +305,10 @@ mod tests {
                     owner_commit_id: CommitId::for_test_label("native-change-owner"),
                     row_group_set_id: [1; 16],
                     manifest_digest: [2; 32],
+                    state_key_digest: [5; 32],
                     layout_fingerprint: "schema-v1-layout".to_string(),
                     semantic_payload_digest: [3; 32],
+                    fields: Vec::new(),
                     cells: vec![
                         super::super::types::NativeScalarCell::Text("native".to_string()),
                         super::super::types::NativeScalarCell::Uuid([4; 16]),
@@ -341,8 +343,10 @@ mod tests {
             owner_commit_id: CommitId::for_test_label("native-semantic-owner"),
             row_group_set_id: [5; 16],
             manifest_digest: [6; 32],
+            state_key_digest: [4; 32],
             layout_fingerprint: "schema-v1-layout".to_string(),
             semantic_payload_digest: [7; 32],
+            fields: Vec::new(),
             cells: vec![super::super::types::NativeScalarCell::Int8(42)],
         };
         let left = super::super::types::ChangePayload::Native(native.clone());

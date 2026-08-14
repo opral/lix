@@ -519,7 +519,7 @@ fn tracked_row_payload_eq(
     // direction (a conflict is surfaced rather than a difference hidden).
     match (payloads.get(left.change_id), payloads.get(right.change_id)) {
         (Some(left), Some(right)) => {
-            left.snapshot == right.snapshot && left.metadata == right.metadata
+            left.snapshot.semantic_eq(right.snapshot) && left.metadata == right.metadata
         }
         _ => false,
     }
@@ -633,7 +633,7 @@ mod tests {
             vec![target],
             TrackedStatePayloadBatch::from_payloads([(
                 ChangeId::for_test_label("target"),
-                same.clone(),
+                crate::changelog::ChangePayload::from(same.clone()),
                 JsonSlot::None,
             )])
             .expect("target payload batch should seal"),
@@ -642,7 +642,7 @@ mod tests {
             vec![source],
             TrackedStatePayloadBatch::from_payloads([(
                 ChangeId::for_test_label("source"),
-                same,
+                crate::changelog::ChangePayload::from(same),
                 JsonSlot::None,
             )])
             .expect("source payload batch should seal"),

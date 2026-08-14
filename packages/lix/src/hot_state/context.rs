@@ -148,7 +148,7 @@ struct CachedRowColumnarLayout {
     id: crate::columnar_row_group::RowGroupSetId,
     manifest: std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
     manifest_digest: [u8; 32],
-    singleton_row_pk: Option<crate::row_pk::RowPk>,
+    singleton_row_pk: Option<RowPk>,
     overlay: std::sync::Arc<Vec<crate::hot_state::RowColumnarOverlayRow>>,
     head_commit_id: CommitId,
     live_count: u64,
@@ -184,7 +184,7 @@ impl RowColumnarLayoutCache {
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
-        singleton_row_pk: Option<crate::row_pk::RowPk>,
+        singleton_row_pk: Option<RowPk>,
         overlay: Vec<crate::hot_state::RowColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
@@ -209,7 +209,7 @@ impl RowColumnarLayoutCache {
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
-        singleton_row_pk: Option<crate::row_pk::RowPk>,
+        singleton_row_pk: Option<RowPk>,
         overlay: Vec<crate::hot_state::RowColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
@@ -267,7 +267,7 @@ impl RowColumnarLayoutCache {
 fn estimated_row_columnar_layout_bytes(
     key: &RowColumnarLayoutCacheKey,
     manifest: &crate::columnar_row_group::RowGroupManifest,
-    singleton_row_pk: &Option<crate::row_pk::RowPk>,
+    singleton_row_pk: &Option<RowPk>,
     overlay: &[crate::hot_state::RowColumnarOverlayRow],
     overlay_capacity: usize,
 ) -> usize {
@@ -280,7 +280,7 @@ fn estimated_row_columnar_layout_bytes(
         .saturating_add(
             singleton_row_pk
                 .as_ref()
-                .map_or(0, crate::row_pk::RowPk::estimated_heap_bytes),
+                .map_or(0, RowPk::estimated_heap_bytes),
         )
         .saturating_add(
             overlay_capacity
@@ -635,7 +635,7 @@ where
             crate::columnar_row_group::RowGroupSetId,
             std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
             [u8; 32],
-            Option<crate::row_pk::RowPk>,
+            Option<RowPk>,
             std::sync::Arc<Vec<crate::hot_state::RowColumnarOverlayRow>>,
             String,
             CommitId,
@@ -1967,6 +1967,7 @@ mod tests {
             crate::columnar_row_group::RowGroupSetId::new([1; 16]),
             empty_columnar_manifest(),
             [2; 32],
+            None,
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head"),
             1_000_000,

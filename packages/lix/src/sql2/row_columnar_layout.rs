@@ -32,6 +32,7 @@ pub(crate) const ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
 pub(crate) const ROW_COLUMNAR_AUTHORITATIVE_SINGLETON_METADATA_KEY: &str =
     "lix.row_columnar.authoritative_singleton_key_bound.v1";
 const AUTHORITATIVE_SINGLETON_LAYOUT: &str = "authoritative-singleton-key-bound-v1";
+pub(crate) const ROW_COLUMNAR_SCHEMA_V1_TYPE_METADATA_KEY: &str = "lix.schema_v1_type";
 pub(crate) use crate::hot_state::{
     ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, ROW_COLUMNAR_ROW_PK_FIELD,
 };
@@ -103,6 +104,12 @@ enum SingletonOrderedField {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthoritativeSingletonFieldSource {
+    PrimaryKey { name: String, component_index: usize },
+    Cell { name: String, column_index: usize },
+}
+
 /// Validated, catalog-independent interpretation of an authoritative
 /// singleton manifest.
 #[derive(Debug, Clone)]
@@ -113,6 +120,30 @@ pub(crate) struct AuthoritativeSingletonLayout {
 }
 
 impl AuthoritativeSingletonLayout {
+    pub(crate) fn native_field_sources(&self) -> Vec<AuthoritativeSingletonFieldSource> {
+        self.ordered_fields
+            .iter()
+            .filter_map(|field| match field {
+                SingletonOrderedField::PrimaryKey {
+                    name,
+                    component_index,
+                    ..
+                } => Some(AuthoritativeSingletonFieldSource::PrimaryKey {
+                    name: name.clone(),
+                    component_index: *component_index,
+                }),
+                SingletonOrderedField::Physical {
+                    name,
+                    column_index,
+                    absent,
+                } => (!*absent).then(|| AuthoritativeSingletonFieldSource::Cell {
+                    name: name.clone(),
+                    column_index: *column_index,
+                }),
+            })
+            .collect()
+    }
+
     /// Reconstructs declared fields in schema order. Missing nullable fields
     /// remain absent; explicit nulls are emitted as JSON null.
     pub(crate) fn reconstruct_full_ordered_field_map(
@@ -518,6 +549,20 @@ fn authoritative_singleton_batch(
         } else {
             visible_field
         };
+        let mut field_metadata = field.metadata().clone();
+        field_metadata.insert(
+            ROW_COLUMNAR_SCHEMA_V1_TYPE_METADATA_KEY.to_owned(),
+            match column.column_type {
+                SchemaColumnType::String => "text",
+                SchemaColumnType::Json => "jsonb",
+                SchemaColumnType::Integer => "int8",
+                SchemaColumnType::Number => "float8",
+                SchemaColumnType::Boolean => "boolean",
+                SchemaColumnType::Timestamptz => "timestamptz",
+            }
+            .to_owned(),
+        );
+        let field = field.with_metadata(field_metadata);
         columns.push(authoritative_singleton_column(
             &column.name,
             column.column_type,

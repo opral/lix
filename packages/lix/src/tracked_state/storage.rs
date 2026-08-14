@@ -2813,9 +2813,10 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
         snapshot_staged_scoped_range_nodes, stage_scoped_range_part_splice,
     };
 
-    if members.iter().any(|member| {
-        !member.value.deleted && member.change.snapshot == crate::json_store::JsonSlot::None
-    }) {
+    if members
+        .iter()
+        .any(|member| !member.value.deleted && member.change.snapshot.is_deleted())
+    {
         // The selected/reference source owns this payload. Until it is
         // available through the same read-your-writes authority, omit this
         // rebuildable serving root and let canonical replay answer the commit.
@@ -3339,9 +3340,11 @@ async fn load_scoped_current_state_descriptor_rows(
                             created_at: source.uniform_created_at,
                             updated_at: source.uniform_updated_at,
                         },
-                        snapshot: owned_scoped_json_slot(decoded.snapshot(ordinal)?.ok_or_else(
-                            || replacement_payload_error("replacement source omitted snapshot"),
-                        )?),
+                        snapshot: crate::changelog::ChangePayload::from_legacy_json(
+                            owned_scoped_json_slot(decoded.snapshot(ordinal)?.ok_or_else(|| {
+                                replacement_payload_error("replacement source omitted snapshot")
+                            })?),
+                        ),
                         metadata: owned_scoped_json_slot(decoded.metadata(ordinal)?.ok_or_else(
                             || replacement_payload_error("replacement source omitted metadata"),
                         )?),
@@ -6425,7 +6428,7 @@ fn hydrate_compact_replacement_direct_run(
                 schema_key: key.schema_key,
                 row_pk: key.row_pk,
                 file_id: key.file_id,
-                snapshot,
+                snapshot: crate::changelog::ChangePayload::from_legacy_json(snapshot),
                 metadata,
                 created_at: lifecycle.uniform_created_at,
                 origin_key: None,
@@ -6832,7 +6835,7 @@ where
             schema_key: key.schema_key,
             row_pk: key.row_pk,
             file_id: key.file_id,
-            snapshot,
+            snapshot: crate::changelog::ChangePayload::from_legacy_json(snapshot),
             metadata,
             created_at: updated_at,
             origin_key,
@@ -7084,10 +7087,8 @@ fn decode_columnar_change_record(
                 "key-bound singleton inventory key has the wrong owner",
             ));
         }
-        let fields = layout
-            .reconstruct_full_ordered_field_map(&key.row_pk, batch)
-            .map_err(|error| replacement_payload_error(&error.message))?;
-        (key.row_pk, fields.into_iter().collect())
+        let snapshot = decode_authenticated_singleton_payload(manifest, batch, parts, &layout)?;
+        (key.row_pk, crate::changelog::ChangePayload::Native(snapshot))
     } else {
         let identity_column = batch
             .column(batch.num_columns() - 1)
@@ -7158,10 +7159,15 @@ fn decode_columnar_change_record(
             };
             snapshot.insert(field.name.clone(), value);
         }
-        (row_pk, snapshot)
+        let snapshot = serde_json::to_string(&snapshot)
+            .map_err(|error| replacement_payload_error(&error.to_string()))?;
+        (
+            row_pk,
+            crate::changelog::ChangePayload::Json(crate::json_store::JsonSlot::from_json(
+                &snapshot,
+            )),
+        )
     };
-    let snapshot = serde_json::to_string(&snapshot)
-        .map_err(|error| replacement_payload_error(&error.to_string()))?;
     Ok(crate::changelog::ChangeRecord {
         account_id: account_id.to_string(),
         format_version: 2,
@@ -7169,10 +7175,161 @@ fn decode_columnar_change_record(
         schema_key: parts.schema_key.clone(),
         row_pk,
         file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+        snapshot,
         metadata: crate::json_store::JsonSlot::None,
         created_at: parts.uniform_updated_at,
         origin_key: parts.origin_key.clone(),
+    })
+}
+
+fn decode_authenticated_singleton_payload(
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+    batch: &datafusion::arrow::record_batch::RecordBatch,
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    layout: &crate::sql2::AuthoritativeSingletonLayout,
+) -> Result<crate::changelog::AuthenticatedNativeRow, LixError> {
+    use crate::changelog::{NativeRowField, NativeScalarCell};
+    use crate::sql2::AuthoritativeSingletonFieldSource;
+    use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+
+    if batch.num_rows() != 1 || batch.num_columns() != manifest.fields.len() {
+        return Err(replacement_payload_error(
+            "authenticated singleton payload has the wrong shape",
+        ));
+    }
+    let mut cells = Vec::with_capacity(manifest.fields.len());
+    let mut semantic = blake3::Hasher::new();
+    semantic.update(b"lix.schema_v1.native_row.v1\0");
+    semantic.update(&parts.manifest_digest);
+    semantic.update(&(parts.layout_fingerprint.len() as u64).to_be_bytes());
+    semantic.update(parts.layout_fingerprint.as_bytes());
+    for (column_index, field) in manifest.fields.iter().enumerate() {
+        let column = batch.column(column_index);
+        let kind = field
+            .metadata
+            .get(crate::sql2::ROW_COLUMNAR_SCHEMA_V1_TYPE_METADATA_KEY)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                replacement_payload_error("native singleton field omitted its Schema-v1 type")
+            })?;
+        semantic.update(&(field.name.len() as u64).to_be_bytes());
+        semantic.update(field.name.as_bytes());
+        semantic.update(&(kind.len() as u64).to_be_bytes());
+        semantic.update(kind.as_bytes());
+        let cell = if column.is_null(0) {
+            semantic.update(&[0]);
+            NativeScalarCell::Null
+        } else {
+            semantic.update(&[1]);
+            match kind {
+                "text" => {
+                    let value = column
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| replacement_payload_error("native text type drift"))?
+                        .value(0);
+                    semantic.update(&(value.len() as u64).to_be_bytes());
+                    semantic.update(value.as_bytes());
+                    NativeScalarCell::Text(value.to_owned())
+                }
+                "jsonb" => {
+                    let value = column
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| replacement_payload_error("native jsonb type drift"))?
+                        .value(0);
+                    let parsed: serde_json::Value = serde_json::from_str(value).map_err(|error| {
+                        replacement_payload_error(&format!("native jsonb is invalid: {error}"))
+                    })?;
+                    let canonical = serde_json::to_vec(&parsed)
+                        .map_err(|error| replacement_payload_error(&error.to_string()))?;
+                    semantic.update(&(canonical.len() as u64).to_be_bytes());
+                    semantic.update(&canonical);
+                    NativeScalarCell::Jsonb(canonical)
+                }
+                "int8" => {
+                    let value = column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| replacement_payload_error("native int8 type drift"))?
+                        .value(0);
+                    semantic.update(&value.to_be_bytes());
+                    NativeScalarCell::Int8(value)
+                }
+                "float8" => {
+                    let bits = column
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| replacement_payload_error("native float8 type drift"))?
+                        .value(0)
+                        .to_bits();
+                    semantic.update(&bits.to_be_bytes());
+                    NativeScalarCell::Float8Bits(bits)
+                }
+                "boolean" => {
+                    let value = column
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| replacement_payload_error("native boolean type drift"))?
+                        .value(0);
+                    semantic.update(&[u8::from(value)]);
+                    NativeScalarCell::Boolean(value)
+                }
+                "timestamptz" => {
+                    let value = column
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| replacement_payload_error("native timestamptz type drift"))?
+                        .value(0);
+                    let timestamp = crate::common::LixTimestamp::parse(value).map_err(|error| {
+                        replacement_payload_error(&format!(
+                            "native timestamptz is invalid: {error}"
+                        ))
+                    })?;
+                    semantic.update(timestamp.to_string().as_bytes());
+                    NativeScalarCell::Timestamptz(timestamp)
+                }
+                other => {
+                    return Err(replacement_payload_error(&format!(
+                        "native singleton field has unknown Schema-v1 type '{other}'"
+                    )));
+                }
+            }
+        };
+        cells.push(cell);
+    }
+    let fields = layout
+        .native_field_sources()
+        .into_iter()
+        .map(|field| match field {
+            AuthoritativeSingletonFieldSource::PrimaryKey {
+                name,
+                component_index,
+            } => Ok(NativeRowField::PrimaryKey {
+                name,
+                component_index: u32::try_from(component_index).map_err(|_| {
+                    replacement_payload_error("native PK component index exceeds u32")
+                })?,
+            }),
+            AuthoritativeSingletonFieldSource::Cell { name, column_index } => {
+                Ok(NativeRowField::Cell {
+                    name,
+                    cell_index: u32::try_from(column_index).map_err(|_| {
+                        replacement_payload_error("native cell index exceeds u32")
+                    })?,
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    Ok(crate::changelog::AuthenticatedNativeRow {
+        owner_commit_id: CommitId::new(uuid::Uuid::from_bytes(parts.owner_commit_id)),
+        row_group_set_id: parts.row_group_set_id,
+        manifest_digest: parts.manifest_digest,
+        state_key_digest: *blake3::hash(&parts.first_key).as_bytes(),
+        layout_fingerprint: parts.layout_fingerprint.clone(),
+        semantic_payload_digest: *semantic.finalize().as_bytes(),
+        fields,
+        cells,
     })
 }
 
@@ -8290,8 +8447,13 @@ pub(crate) async fn load_retained_commit_snapshots_for_schemas(
     let json_refs = members
         .iter()
         .filter_map(|member| match &member.change.snapshot {
-            crate::json_store::JsonSlot::Ref(json_ref) => Some(*json_ref),
-            crate::json_store::JsonSlot::None | crate::json_store::JsonSlot::Inline(_) => None,
+            crate::changelog::ChangePayload::Json(crate::json_store::JsonSlot::Ref(json_ref)) => {
+                Some(*json_ref)
+            }
+            crate::changelog::ChangePayload::Tombstone
+            | crate::changelog::ChangePayload::Native(_)
+            | crate::changelog::ChangePayload::Json(crate::json_store::JsonSlot::None)
+            | crate::changelog::ChangePayload::Json(crate::json_store::JsonSlot::Inline(_)) => None,
         })
         .collect::<Vec<_>>();
     let loaded = crate::json_store::JsonStoreContext::new()
@@ -8307,9 +8469,10 @@ pub(crate) async fn load_retained_commit_snapshots_for_schemas(
         .into_iter()
         .map(|member| {
             let snapshot = match member.change.snapshot {
-                crate::json_store::JsonSlot::None => None,
-                crate::json_store::JsonSlot::Inline(snapshot) => Some(snapshot.into()),
-                crate::json_store::JsonSlot::Ref(json_ref) => {
+                crate::changelog::ChangePayload::Tombstone => None,
+                crate::changelog::ChangePayload::Json(crate::json_store::JsonSlot::None) => None,
+                crate::changelog::ChangePayload::Json(crate::json_store::JsonSlot::Inline(snapshot)) => Some(snapshot.into()),
+                crate::changelog::ChangePayload::Json(crate::json_store::JsonSlot::Ref(json_ref)) => {
                     let bytes = loaded.next().flatten().ok_or_else(|| {
                         LixError::new(
                             LixError::CODE_STORAGE_ERROR,
@@ -8327,6 +8490,11 @@ pub(crate) async fn load_retained_commit_snapshots_for_schemas(
                             ),
                         )
                     })?)
+                }
+                crate::changelog::ChangePayload::Native(_) => {
+                    return Err(replacement_payload_error(
+                        "native retained snapshot requires typed projection",
+                    ));
                 }
             };
             Ok(RetainedCommitSnapshot {
@@ -11006,10 +11174,13 @@ pub(crate) async fn collect_local_commit_delta_json_refs(
         unreachable!("unbounded commit-delta payload inventory cannot exceed its segment limit")
     };
     for member in &members {
-        for slot in [&member.change.snapshot, &member.change.metadata] {
-            if let crate::json_store::JsonSlot::Ref(json_ref) = slot {
-                refs.insert(*json_ref.as_hash_array());
-            }
+        if let crate::changelog::ChangePayload::Json(crate::json_store::JsonSlot::Ref(json_ref)) =
+            &member.change.snapshot
+        {
+            refs.insert(*json_ref.as_hash_array());
+        }
+        if let crate::json_store::JsonSlot::Ref(json_ref) = &member.change.metadata {
+            refs.insert(*json_ref.as_hash_array());
         }
     }
     Ok(())
@@ -11360,7 +11531,7 @@ fn collect_strict_commit_delta_members(
             schema_key: key.schema_key.clone(),
             row_pk: key.row_pk.clone(),
             file_id: key.file_id.clone(),
-            snapshot,
+            snapshot: crate::changelog::ChangePayload::from_legacy_json(snapshot),
             metadata,
             created_at: value.updated_at,
             origin_key,
@@ -12760,7 +12931,7 @@ where
         schema_key: key.schema_key,
         row_pk: key.row_pk,
         file_id: key.file_id,
-        snapshot,
+        snapshot: crate::changelog::ChangePayload::from_legacy_json(snapshot),
         metadata,
         created_at: value.updated_at,
         origin_key,
@@ -14066,7 +14237,9 @@ mod tests {
                     created_at,
                     updated_at,
                 },
-                snapshot: JsonSlot::Inline(format!("{{\"version\":{index}}}").into()),
+                snapshot: crate::changelog::ChangePayload::from(JsonSlot::Inline(
+                    format!("{{\"version\":{index}}}").into(),
+                )),
                 metadata: JsonSlot::None,
             })
             .collect::<Vec<_>>();
@@ -14164,7 +14337,7 @@ mod tests {
                     created_at,
                     updated_at,
                 },
-                snapshot: JsonSlot::Inline("{}".into()),
+                snapshot: crate::changelog::ChangePayload::from(JsonSlot::Inline("{}".into())),
                 metadata: JsonSlot::None,
             })
             .collect::<Vec<_>>();
@@ -15930,7 +16103,9 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(
             changes[0].snapshot,
-            crate::json_store::JsonSlot::Inline(shared_snapshot.into())
+            crate::changelog::ChangePayload::from(crate::json_store::JsonSlot::Inline(
+                shared_snapshot.into(),
+            ))
         );
         assert_selected_direct_address_hydrates_inventory_gc_and_root_rebuild_paths().await;
     }
@@ -15992,7 +16167,9 @@ mod tests {
             .expect("direct owner should exist");
         assert_eq!(
             owner.snapshot,
-            crate::json_store::JsonSlot::Inline(snapshot.into())
+            crate::changelog::ChangePayload::from(crate::json_store::JsonSlot::Inline(
+                snapshot.into(),
+            ))
         );
         let selected_members = load_commit_delta_members_with_payloads(&read, selected_commit)
             .await
@@ -16000,7 +16177,9 @@ mod tests {
         assert_eq!(selected_members.len(), 1);
         assert_eq!(
             selected_members[0].change.snapshot,
-            crate::json_store::JsonSlot::Inline(snapshot.into())
+            crate::changelog::ChangePayload::from(crate::json_store::JsonSlot::Inline(
+                snapshot.into(),
+            ))
         );
         let inventory = scan_commit_delta_inventory(&read)
             .await
@@ -16010,7 +16189,9 @@ mod tests {
             inventory.commits[&selected_commit].members[0]
                 .change
                 .snapshot,
-            crate::json_store::JsonSlot::Inline(snapshot.into())
+            crate::changelog::ChangePayload::from(crate::json_store::JsonSlot::Inline(
+                snapshot.into(),
+            ))
         );
         let changes = scan_change_records_from_commit_deltas(&read)
             .await
@@ -16719,7 +16900,9 @@ mod tests {
             .expect("last segment payload should be present");
         assert_eq!(
             last_change.snapshot,
-            crate::json_store::JsonSlot::Inline(snapshots[999].clone().into_boxed_str())
+            crate::changelog::ChangePayload::from(crate::json_store::JsonSlot::Inline(
+                snapshots[999].clone().into_boxed_str(),
+            ))
         );
     }
 
@@ -16786,7 +16969,9 @@ mod tests {
         for (member, snapshot) in members.iter().zip(&snapshots) {
             assert_eq!(
                 member.change.snapshot,
-                crate::json_store::JsonSlot::Inline(snapshot.clone().into_boxed_str())
+                crate::changelog::ChangePayload::from(crate::json_store::JsonSlot::Inline(
+                    snapshot.clone().into_boxed_str(),
+                ))
             );
         }
     }
@@ -17372,19 +17557,19 @@ mod tests {
             .expect("indexed change-record points should load");
         assert_eq!(
             records[0].as_ref().map(|record| record.snapshot.clone()),
-            Some(crate::json_store::JsonSlot::Inline(
-                large_snapshot.into_boxed_str()
+            Some(crate::changelog::ChangePayload::from(
+                crate::json_store::JsonSlot::Inline(large_snapshot.into_boxed_str()),
             ))
         );
         assert!(
             records[1]
                 .as_ref()
-                .is_some_and(|record| record.snapshot == crate::json_store::JsonSlot::None)
+                .is_some_and(|record| record.snapshot == crate::changelog::ChangePayload::Tombstone)
         );
         assert!(
             records[2]
                 .as_ref()
-                .is_some_and(|record| record.snapshot == crate::json_store::JsonSlot::None)
+                .is_some_and(|record| record.snapshot == crate::changelog::ChangePayload::Tombstone)
         );
     }
 

@@ -1142,7 +1142,7 @@ mod tests {
             row_pk: RowPk::single("row-1"),
             schema_key: "message".to_string(),
             file_id: None,
-            snapshot: JsonSlot::None,
+            snapshot: crate::changelog::ChangePayload::Tombstone,
             metadata: JsonSlot::None,
             created_at,
             origin_key: None,

@@ -745,6 +745,107 @@ impl ChangePayload {
             _ => false,
         }
     }
+
+    /// Builds public whole-row JSON only at an explicitly requested terminal
+    /// projection. Native consumers must use `native_row()` directly.
+    pub(crate) fn terminal_json(
+        &self,
+        row_pk: &RowPk,
+    ) -> Result<Option<crate::common::SharedStr>, LixError> {
+        match self {
+            Self::Tombstone => Ok(None),
+            Self::Json(JsonSlot::Inline(value)) => Ok(Some(value.clone().into())),
+            Self::Json(JsonSlot::None) => Ok(None),
+            Self::Json(JsonSlot::Ref(_)) => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "referenced JSON requires JsonStore terminal materialization",
+            )),
+            Self::Native(native) => {
+                let mut object = serde_json::Map::new();
+                for field in &native.fields {
+                    let (name, value) = match field {
+                        NativeRowField::PrimaryKey {
+                            name,
+                            component_index,
+                        } => {
+                            let component = row_pk
+                                .components
+                                .as_slice()
+                                .get(*component_index as usize)
+                                .ok_or_else(|| {
+                                    LixError::new(
+                                        LixError::CODE_INTERNAL_ERROR,
+                                        "native row primary-key arity disagrees with its layout",
+                                    )
+                                })?;
+                            let value = match component {
+                                crate::row_pk::RowPkComponent::Integer(value) => {
+                                    serde_json::Value::from(*value)
+                                }
+                                crate::row_pk::RowPkComponent::Uuid(_)
+                                | crate::row_pk::RowPkComponent::String(_)
+                                | crate::row_pk::RowPkComponent::Bytes(_) => {
+                                    serde_json::Value::String(component.external_string())
+                                }
+                            };
+                            (name, value)
+                        }
+                        NativeRowField::Cell { name, cell_index } => {
+                            let cell = native.cells.get(*cell_index as usize).ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "native row cell index disagrees with its payload",
+                                )
+                            })?;
+                            let value = match cell {
+                                NativeScalarCell::Null => serde_json::Value::Null,
+                                NativeScalarCell::Text(value) => {
+                                    serde_json::Value::String(value.clone())
+                                }
+                                NativeScalarCell::Uuid(value) => serde_json::Value::String(
+                                    Uuid::from_bytes(*value).to_string(),
+                                ),
+                                NativeScalarCell::Int8(value) => serde_json::Value::from(*value),
+                                NativeScalarCell::Float8Bits(bits) => {
+                                    serde_json::Number::from_f64(f64::from_bits(*bits))
+                                        .map(serde_json::Value::Number)
+                                        .ok_or_else(|| {
+                                            LixError::new(
+                                                LixError::CODE_INTERNAL_ERROR,
+                                                "native float8 is not representable in JSON",
+                                            )
+                                        })?
+                                }
+                                NativeScalarCell::Boolean(value) => {
+                                    serde_json::Value::Bool(*value)
+                                }
+                                NativeScalarCell::Jsonb(value) => serde_json::from_slice(value)
+                                    .map_err(|error| {
+                                        LixError::new(
+                                            LixError::CODE_INTERNAL_ERROR,
+                                            format!("native jsonb is invalid: {error}"),
+                                        )
+                                    })?,
+                                NativeScalarCell::Timestamptz(value) => {
+                                    serde_json::Value::String(value.to_string())
+                                }
+                            };
+                            (name, value)
+                        }
+                    };
+                    if object.insert(name.clone(), value).is_some() {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "native row layout contains a duplicate field",
+                        ));
+                    }
+                }
+                serde_json::to_string(&object)
+                    .map(|value| Some(value.into()))
+                    .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))
+            }
+        }
+    }
 }
 
 impl From<JsonSlot> for ChangePayload {
@@ -753,6 +854,12 @@ impl From<JsonSlot> for ChangePayload {
             JsonSlot::None => Self::Tombstone,
             slot => Self::Json(slot),
         }
+    }
+}
+
+impl ChangePayload {
+    pub(crate) fn from_legacy_json(slot: JsonSlot) -> Self {
+        slot.into()
     }
 }
 
@@ -766,9 +873,25 @@ pub(crate) struct AuthenticatedNativeRow {
     pub(crate) owner_commit_id: CommitId,
     pub(crate) row_group_set_id: [u8; 16],
     pub(crate) manifest_digest: [u8; 32],
+    pub(crate) state_key_digest: [u8; 32],
     pub(crate) layout_fingerprint: String,
     pub(crate) semantic_payload_digest: [u8; 32],
+    pub(crate) fields: Vec<NativeRowField>,
     pub(crate) cells: Vec<NativeScalarCell>,
+}
+
+/// Authenticated schema layout for terminal native projection. PK values are
+/// references into `ChangeRecord::row_pk`, never duplicated in the payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeRowField {
+    PrimaryKey {
+        name: String,
+        component_index: u32,
+    },
+    Cell {
+        name: String,
+        cell_index: u32,
+    },
 }
 
 /// Lossless Schema-v1 scalar cells.

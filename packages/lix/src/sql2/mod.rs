@@ -59,7 +59,9 @@ pub(crate) use row_columnar_layout::{
     ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
     ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, EncodedRowGroups,
     RowColumnarRowRef, RowGroupLocations,
-    LOW_CARDINALITY_CLUSTER_MAX_VALUES, encode_authoritative_singleton_row_group,
+    AuthoritativeSingletonFieldSource, AuthoritativeSingletonLayout,
+    LOW_CARDINALITY_CLUSTER_MAX_VALUES, ROW_COLUMNAR_SCHEMA_V1_TYPE_METADATA_KEY,
+    encode_authoritative_singleton_row_group,
     encode_registered_row_groups, encode_unclustered_registered_row_groups,
     identify_authoritative_singleton_layout,
 };

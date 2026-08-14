@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use crate::LixError;
-use crate::changelog::{ChangeId, CommitId};
+use crate::changelog::{ChangeId, ChangePayload, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::json_store::JsonSlot;
 use crate::tracked_state::codec::DecodedTrackedStateKeyShared;
@@ -63,7 +63,7 @@ pub(crate) struct TrackedStatePayloadBatch {
 #[derive(Debug, PartialEq, Eq, Default)]
 struct TrackedStatePayloadColumns {
     change_ids: Vec<ChangeId>,
-    snapshots: Vec<JsonSlot>,
+    snapshots: Vec<ChangePayload>,
     metadata: Vec<JsonSlot>,
     id_ordinals: HashMap<ChangeId, u32>,
 }
@@ -72,7 +72,7 @@ struct TrackedStatePayloadColumns {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TrackedStatePayloadRef<'a> {
     pub(crate) change_id: ChangeId,
-    pub(crate) snapshot: &'a JsonSlot,
+    pub(crate) snapshot: &'a ChangePayload,
     pub(crate) metadata: &'a JsonSlot,
 }
 
@@ -235,7 +235,7 @@ impl TrackedStatePayloadBatch {
     /// directly out of decoded change records, so sealing does not clone
     /// inline payload buffers.
     pub(crate) fn from_payloads(
-        payloads: impl IntoIterator<Item = (ChangeId, JsonSlot, JsonSlot)>,
+        payloads: impl IntoIterator<Item = (ChangeId, ChangePayload, JsonSlot)>,
     ) -> Result<Self, LixError> {
         let mut payloads = payloads.into_iter().collect::<Vec<_>>();
         if payloads.is_empty() {
@@ -469,7 +469,7 @@ fn tracked_value_payload_eq(
     }
     match (payloads.get(left.change_id), payloads.get(right.change_id)) {
         (Some(left), Some(right)) => {
-            left.snapshot == right.snapshot && left.metadata == right.metadata
+            left.snapshot.semantic_eq(right.snapshot) && left.metadata == right.metadata
         }
         _ => false,
     }
@@ -1569,7 +1569,9 @@ mod tests {
         let payloads = TrackedStatePayloadBatch::from_payloads((0..10_000).map(|index| {
             (
                 ChangeId::for_test_label(&format!("payload-{index:05}")),
-                JsonSlot::from_json(&format!("{{\"snapshot\":{index}}}")),
+                ChangePayload::from(JsonSlot::from_json(&format!(
+                    "{{\"snapshot\":{index}}}"
+                ))),
                 JsonSlot::None,
             )
         }))
@@ -1586,7 +1588,12 @@ mod tests {
         let last_id = ChangeId::for_test_label("payload-09999");
         let last = cloned.get(last_id).expect("last payload should index");
         assert_eq!(last.change_id, last_id);
-        assert_eq!(last.snapshot, &JsonSlot::from_json("{\"snapshot\":9999}"));
+        assert_eq!(
+            last.snapshot,
+            &ChangePayload::from(JsonSlot::from_json(
+                "{\"snapshot\":9999}"
+            ))
+        );
     }
 
     #[test]

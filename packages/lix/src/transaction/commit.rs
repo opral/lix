@@ -5576,6 +5576,10 @@ fn prepare_row_columnar_write_sets(
         if !row.untracked
             && !row.global
             && row.file_id.is_none()
+            // Engine/control rows retain their dedicated authenticated
+            // domains. This carrier is the sole payload authority only for
+            // user-registered Schema-v1 entities.
+            && !row.schema_key.starts_with("lix_")
             && row.metadata.is_none()
             && let (Some(commit_id), Some(snapshot), Some(schema)) = (
                 row.commit_id,
@@ -7735,7 +7739,9 @@ mod tests {
             .expect("certified payload should be a commit member");
         assert_eq!(
             certified.change.snapshot,
-            crate::json_store::JsonSlot::Ref(large_snapshot_ref)
+            crate::changelog::ChangePayload::from(crate::json_store::JsonSlot::Ref(
+                large_snapshot_ref,
+            ))
         );
         let loaded = JsonStoreContext::new()
             .load_bytes_many(

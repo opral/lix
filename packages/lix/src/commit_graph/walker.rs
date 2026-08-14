@@ -1528,7 +1528,7 @@ mod tests {
                 row_pk: crate::row_pk::RowPk::single(commit_id),
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
-                snapshot: crate::json_store::JsonSlot::None,
+                snapshot: crate::changelog::ChangePayload::Tombstone,
                 metadata: crate::json_store::JsonSlot::None,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 origin_key: None,

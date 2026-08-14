@@ -3563,7 +3563,9 @@ mod tests {
                 created_at: timestamp,
                 updated_at: timestamp,
             },
-            snapshot: JsonSlot::Inline(r#"{"native":true}"#.into()),
+            snapshot: crate::changelog::ChangePayload::from(JsonSlot::Inline(
+                r#"{"native":true}"#.into(),
+            )),
             metadata: JsonSlot::None,
         };
         let encoded = crate::tracked_state::encode_current_state_data_part(
@@ -6150,7 +6152,7 @@ mod tests {
             row_pk: RowPk::single(row_label),
             schema_key: "authority_gc".to_string(),
             file_id: None,
-            snapshot: ChangePayload::from(snapshot),
+            snapshot: crate::changelog::ChangePayload::from(snapshot),
             metadata: JsonSlot::None,
             created_at: LixTimestamp::expect_parse(
                 "authority GC change timestamp",

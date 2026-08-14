@@ -19,6 +19,7 @@ pub(crate) struct MaterializedChange {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
+    pub(crate) native_snapshot: Option<crate::changelog::AuthenticatedNativeRow>,
     pub(crate) metadata: Option<SharedStr>,
     pub(crate) created_at: String,
     pub(crate) origin_key: Option<String>,
@@ -86,8 +87,15 @@ pub(crate) async fn materialize_commit_graph_change<S>(
 where
     S: StorageAdapterRead,
 {
+    let native_snapshot = change.snapshot.native_row().cloned();
     let snapshot_content = if payload_projection.snapshot_content {
-        load_changelog_json_slot(json_reader, &change.snapshot, "snapshot").await?
+        load_change_snapshot(
+            json_reader,
+            &change.snapshot,
+            &change.row_pk,
+            "snapshot",
+        )
+        .await?
     } else {
         None
     };
@@ -108,10 +116,29 @@ where
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot_content,
+        native_snapshot,
         metadata,
         created_at: change.created_at.to_string(),
         origin_key: change.origin_key,
     })
+}
+
+async fn load_change_snapshot<S>(
+    json_reader: &mut JsonStoreReader<S>,
+    payload: &crate::changelog::ChangePayload,
+    row_pk: &RowPk,
+    field: &str,
+) -> Result<Option<SharedStr>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    match payload {
+        crate::changelog::ChangePayload::Native(_) => payload.terminal_json(row_pk),
+        crate::changelog::ChangePayload::Tombstone => Ok(None),
+        crate::changelog::ChangePayload::Json(slot) => {
+            load_changelog_json_slot(json_reader, slot, field).await
+        }
+    }
 }
 
 async fn load_changelog_json_slot<S>(
@@ -154,7 +181,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::changelog::ChangeId;
+    use crate::changelog::{
+        AuthenticatedNativeRow, ChangeId, ChangePayload, CommitId, NativeRowField,
+        NativeScalarCell,
+    };
     use crate::commit_graph::CommitGraphChange;
     use crate::common::LixTimestamp;
     use crate::row_pk::RowPk;
@@ -172,7 +202,7 @@ mod tests {
             row_pk: RowPk::single("row-1"),
             schema_key: "example".to_string(),
             file_id: Some("file-1".to_string()),
-            snapshot,
+            snapshot: ChangePayload::from(snapshot),
             metadata,
             created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
             origin_key: Some("origin-1".to_string()),
@@ -271,5 +301,65 @@ mod tests {
 
         assert_eq!(row.snapshot_content.as_deref(), Some(snapshot));
         assert_eq!(row.metadata.as_deref(), Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn native_snapshot_json_is_constructed_only_when_projected() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("begin read");
+        let mut json_reader = JsonStoreContext::new().reader(read);
+        let change = CommitGraphChange {
+            id: ChangeId::for_test_label("native-change-projection"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            row_pk: RowPk::single("row-1"),
+            schema_key: "registered_entity".to_owned(),
+            file_id: None,
+            snapshot: ChangePayload::Native(AuthenticatedNativeRow {
+                owner_commit_id: CommitId::for_test_label("native-projection-owner"),
+                row_group_set_id: [1; 16],
+                manifest_digest: [2; 32],
+                state_key_digest: [3; 32],
+                layout_fingerprint: "schema-v1:native-projection".to_owned(),
+                semantic_payload_digest: [4; 32],
+                fields: vec![NativeRowField::Cell {
+                    name: "payload".to_owned(),
+                    cell_index: 0,
+                }],
+                // Invalid JSONB is a deterministic discriminator: an eager
+                // whole-row JSON projection would fail this unprojected read.
+                cells: vec![NativeScalarCell::Jsonb(b"not-json".to_vec())],
+            }),
+            metadata: JsonSlot::None,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
+            origin_key: None,
+        };
+
+        let row = materialize_commit_graph_change(
+            &mut json_reader,
+            change.clone(),
+            ChangePayloadProjection {
+                snapshot_content: false,
+                metadata: false,
+            },
+        )
+        .await
+        .expect("unprojected native snapshot must not build JSON");
+        assert!(row.native_snapshot.is_some());
+        assert!(row.snapshot_content.is_none());
+
+        let error = materialize_commit_graph_change(
+            &mut json_reader,
+            change,
+            ChangePayloadProjection {
+                snapshot_content: true,
+                metadata: false,
+            },
+        )
+        .await
+        .expect_err("projected invalid jsonb cell must fail closed");
+        assert!(error.message.contains("native jsonb is invalid"));
     }
 }

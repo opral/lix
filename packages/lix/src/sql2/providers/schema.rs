@@ -1190,6 +1190,7 @@ async fn row_columnar_scan_source(
             let group_index = group_indices[partition];
             let schema = Arc::clone(&stream_schema);
             let batch_schema = Arc::clone(&schema);
+            let output_schema = Arc::clone(&schema);
             let batches = stream::once(async move {
                 let coordinate_keep = coordinate_shadow_masks
                     .as_ref()
@@ -1218,7 +1219,7 @@ async fn row_columnar_scan_source(
                                 .map_err(lix_error_to_datafusion_error)?;
                             Arc::new(row_columnar_public_batch(
                                 batch,
-                                Arc::clone(&schema),
+                                Arc::clone(&output_schema),
                                 &public_projection,
                                 layout.singleton_row_pk.as_ref(),
                             )?)
@@ -1249,7 +1250,7 @@ async fn row_columnar_scan_source(
                                 .map_err(lix_error_to_datafusion_error)?;
                             let batch = row_columnar_public_batch(
                                 batch,
-                                Arc::clone(&schema),
+                                Arc::clone(&output_schema),
                                 &public_projection,
                                 layout.singleton_row_pk.as_ref(),
                             )?;
@@ -6056,8 +6057,13 @@ mod tests {
         ]));
 
         assert_eq!(
-            super::row_columnar_projection(&encoded.manifest, &payload_schema, &spec),
-            Some(vec![1]),
+            super::row_columnar_projection(&encoded.manifest, &payload_schema, &spec)
+                .expect("projection should validate"),
+            Some(super::RowColumnarProjection {
+                physical: vec![1],
+                output: vec![super::RowColumnarOutputColumn::Physical(0)],
+                cache_key: vec![1],
+            }),
             "schema-bound canonical JSON text is safe to scan directly"
         );
 
@@ -6067,7 +6073,9 @@ mod tests {
             "different registered schema".to_string(),
         );
         assert!(
-            super::row_columnar_projection(&drifted, &payload_schema, &spec).is_none(),
+            super::row_columnar_projection(&drifted, &payload_schema, &spec)
+                .expect("drift should be rejected without an execution error")
+                .is_none(),
             "a String/Json-compatible Arrow type must not bypass schema binding"
         );
     }

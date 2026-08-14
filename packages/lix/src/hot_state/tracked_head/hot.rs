@@ -5888,12 +5888,12 @@ where
                         include_tombstones: false,
                         ..TrackedStateFilter::default()
                     },
-                    // Retain the packed broad-scan route, which resolves the
-                    // same committed winners as snapshot scans. The provider
-                    // drops these bytes before Arrow conversion because only
-                    // the identity columns were requested.
+                    // Identity-only validation must not hydrate row payloads.
+                    // The packed provenance route resolves the same committed
+                    // winners while retaining the authenticated commit/member
+                    // ownership needed to return canonical primary keys.
                     read_columns: TrackedStateReadColumns {
-                        columns: vec!["snapshot_content".to_owned()],
+                        columns: vec!["commit_id".to_owned()],
                     },
                     limit,
                 },
@@ -5960,7 +5960,7 @@ where
             let manifest_digest = manifest.content_digest()?;
             if !parts.key_bound_singleton
                 || parts.owner_commit_id != *base_commit_id.as_uuid().as_bytes()
-                || parts.row_group_set_id != *id.as_bytes()
+                || parts.row_group_set_id != id.as_bytes()
                 || parts.manifest_digest != manifest_digest
                 || parts.schema_key != schema_key
                 || parts.layout_fingerprint
@@ -15266,7 +15266,10 @@ mod tests {
         );
         let (_, change, _) = entries[0].as_ref().expect("packed predecessor exists");
         assert!(
-            matches!(change.snapshot, JsonSlot::Ref(_)),
+            matches!(
+                change.snapshot,
+                crate::changelog::ChangePayload::Json(JsonSlot::Ref(_))
+            ),
             "mutation lookup must retain the out-of-band slot instead of materializing its payload"
         );
         assert_eq!(

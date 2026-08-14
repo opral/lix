@@ -6065,6 +6065,28 @@ mod tests {
         assert_eq!(history.rows()[0].get::<String>("tenant").unwrap(), tenant);
         assert_eq!(history.rows()[0].get::<i64>("id").unwrap(), 7);
         assert_eq!(history.rows()[0].get::<String>("value").unwrap(), "native");
+
+        drop(read);
+        drop(session);
+        drop(engine);
+        let reopened = Engine::new(storage).await.expect("cold reopen");
+        let reopened_session = reopened
+            .open_session_with_account(crate::SYSTEM_ACCOUNT_ID)
+            .await
+            .expect("reopened session");
+        let reopened_rows = reopened_session
+            .execute(
+                "SELECT tenant, id, value FROM key_bound_singleton_probe",
+                &[],
+            )
+            .await
+            .expect("cold current read");
+        assert_eq!(reopened_rows.len(), 1);
+        assert_eq!(
+            reopened_rows.rows()[0].get::<String>("tenant").unwrap(),
+            tenant
+        );
+        assert_eq!(reopened_rows.rows()[0].get::<i64>("id").unwrap(), 7);
     }
 
     #[tokio::test]
