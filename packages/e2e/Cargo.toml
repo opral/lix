@@ -229,6 +229,11 @@ name = "tracked_state_crud_public_result"
 path = "tests/tracked_state_crud_public_result.rs"
 required-features = ["storage-benches"]
 
+[[test]]
+name = "native_schema_point_reopen"
+path = "tests/native_schema_point_reopen.rs"
+required-features = ["rocksdb", "slatedb"]
+
 # Deliberately its own target rather than a `-p lix` unit test: the scoped-root
 # census counters it reads are process-global, and a dedicated test binary with
 # a single test keeps them free of concurrent contributors.
