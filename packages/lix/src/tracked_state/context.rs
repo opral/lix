@@ -3789,6 +3789,46 @@ impl<S> TrackedStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    #[cold]
+    #[inline(never)]
+    async fn file_cascade_schema_keys(
+        &self,
+        staged_read: &storage::TrackedStateStagedRead<'_, S>,
+        base_root: &TrackedStateRootId,
+    ) -> Result<Vec<String>, LixError> {
+        // A file-only predicate cannot bound this schema-first tree. Derive
+        // the complete schema inventory from authenticated registered-schema
+        // rows in this same parent root, then issue canonical
+        // `(schema_key, file_id)` ranges. Built-in filesystem schemas are
+        // native controls and therefore included independently of public
+        // registration.
+        let mut schema_keys = crate::filesystem::filesystem_schema_keys()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let registered_schemas = self
+            .tree
+            .scan(
+                staged_read,
+                base_root,
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    include_tombstones: false,
+                    ..TrackedStateTreeScanRequest::default()
+                },
+            )
+            .await?;
+        for (key, _) in registered_schemas {
+            schema_keys.insert(key.row_pk.as_single_string_owned().map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("registered schema cascade identity is invalid: {error}"),
+                )
+            })?);
+        }
+        Ok(schema_keys.into_iter().collect())
+    }
+
     pub(crate) fn into_transient_rebuild_state(self) -> TrackedStateTransientRebuildState {
         TrackedStateTransientRebuildState {
             chunk_overlay: self.chunk_overlay,
@@ -3976,12 +4016,16 @@ where
                 cascades.insert(file_id, delta);
             }
             if !cascades.is_empty() {
+                let cascade_schema_keys = self
+                    .file_cascade_schema_keys(&staged_read, base_root)
+                    .await?;
                 let rows = self
                     .tree
                     .scan(
                         &staged_read,
                         base_root,
                         &TrackedStateTreeScanRequest {
+                            schema_keys: cascade_schema_keys,
                             file_ids: cascades
                                 .keys()
                                 .cloned()
@@ -6342,6 +6386,13 @@ mod tests {
                 row
             })
             .collect::<Vec<_>>();
+        let mut schema_registration = row(
+            "a_schema",
+            "change-cascade-schema-registration",
+            "cascade-append-parent",
+        );
+        schema_registration.schema_key = REGISTERED_SCHEMA_KEY.to_string();
+        schema_registration.file_id = None;
         let mut descriptor =
             tombstone(FILE_ID, "change-cascade-descriptor", "cascade-append-child");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
@@ -6365,7 +6416,10 @@ mod tests {
             .stage_commit_root(
                 &parent_commit_id,
                 None,
-                parent_rows.iter().map(delta_from_materialized_row),
+                parent_rows
+                    .iter()
+                    .chain(std::iter::once(&schema_registration))
+                    .map(delta_from_materialized_row),
             )
             .await
             .expect("cascade parent root should stage");
@@ -6422,6 +6476,53 @@ mod tests {
             .expect("cascaded parent row should remain as a tombstone");
         assert!(cascaded.deleted());
         assert_eq!(cascaded.change_id, child_rows[0].change_id);
+    }
+
+    #[tokio::test]
+    async fn file_cascade_rejects_malformed_registered_schema_identity() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-0000000000a3.json";
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+
+        let mut descriptor = row(FILE_ID, "descriptor-parent", "parent");
+        descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
+        descriptor.file_id = Some(FILE_ID.to_string());
+        let mut malformed_registration = row("ignored", "schema-parent", "parent");
+        malformed_registration.schema_key = REGISTERED_SCHEMA_KEY.to_string();
+        malformed_registration.file_id = None;
+        malformed_registration.row_pk = RowPk::from_validated_shared_string_parts([
+            "schema-part-a".into(),
+            "schema-part-b".into(),
+        ]);
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "parent",
+            None,
+            &[descriptor.clone(), malformed_registration],
+        )
+        .await
+        .expect("malformed catalog fixture root should stage");
+
+        descriptor.snapshot_content = None;
+        descriptor.deleted = true;
+        descriptor.change_id = ChangeId::for_test_label("descriptor-delete");
+        descriptor.commit_id = CommitId::for_test_label("child");
+        let error = write_root_for_test(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("parent"),
+            &[descriptor],
+        )
+        .await
+        .expect_err("malformed authenticated schema inventory must fail closed");
+        assert!(
+            error
+                .message
+                .contains("registered schema cascade identity is invalid"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -9521,12 +9622,20 @@ mod tests {
         semantic.file_id = Some(FILE_ID.to_string());
         let mut retired = row("retired-blob", "retired-create", "initial");
         retired.file_id = Some(FILE_ID.to_string());
+        let mut schema_registration = row("test_schema", "schema-create", "initial");
+        schema_registration.schema_key = REGISTERED_SCHEMA_KEY.to_string();
+        schema_registration.file_id = None;
         write_root_for_test(
             &storage,
             &tracked_state,
             "initial",
             None,
-            &[descriptor.clone(), semantic, retired.clone()],
+            &[
+                descriptor.clone(),
+                semantic,
+                retired.clone(),
+                schema_registration,
+            ],
         )
         .await
         .expect("initial root should write");
