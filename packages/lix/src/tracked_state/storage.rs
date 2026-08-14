@@ -3474,6 +3474,11 @@ async fn load_scoped_current_state_descriptor_rows(
                         "",
                         true,
                     )?;
+                    let deleted = columnar_deleted_at(
+                        &batch,
+                        manifest.fields.len() - 2,
+                        row_index,
+                    )?;
                     Ok(CurrentStateDataRow {
                         encoded_key: encode_key_ref(TrackedStateKeyRef {
                             schema_key: &record.schema_key,
@@ -3483,7 +3488,7 @@ async fn load_scoped_current_state_descriptor_rows(
                         value: TrackedStateIndexValue {
                             change_id,
                             commit_id: owner,
-                            deleted: false,
+                            deleted,
                             created_at: source.uniform_created_at,
                             updated_at: source.uniform_updated_at,
                         },
@@ -7062,7 +7067,9 @@ fn decode_columnar_change_record(
     account_id: &str,
     materialize_json_snapshot: bool,
 ) -> Result<crate::changelog::ChangeRecord, LixError> {
-    use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+    use datafusion::arrow::array::{
+        Array, BooleanArray, Float64Array, Int64Array, StringArray,
+    };
 
     let deletion_column_index = batch.num_columns().checked_sub(2).ok_or_else(|| {
         replacement_payload_error("columnar mutation omitted deletion and identity columns")
@@ -7074,15 +7081,7 @@ fn decode_columnar_change_record(
             "columnar mutation deletion field is missing or misplaced",
         ));
     }
-    let deletion_column = batch
-        .column(deletion_column_index)
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| replacement_payload_error("columnar mutation deletion field is not boolean"))?;
-    if deletion_column.is_null(row_index) {
-        return Err(replacement_payload_error("columnar mutation deletion field is null"));
-    }
-    let deleted = deletion_column.value(row_index);
+    let deleted = columnar_deleted_at(batch, deletion_column_index, row_index)?;
     let identity_column = batch
         .column(batch.num_columns() - 1)
         .as_any()
@@ -7233,6 +7232,26 @@ fn decode_columnar_change_record(
         created_at: parts.uniform_updated_at,
         origin_key: parts.origin_key.clone(),
     })
+}
+
+fn columnar_deleted_at(
+    batch: &datafusion::arrow::record_batch::RecordBatch,
+    deletion_column_index: usize,
+    row_index: usize,
+) -> Result<bool, LixError> {
+    use datafusion::arrow::array::{Array, BooleanArray};
+
+    let deletion_column = batch
+        .column(deletion_column_index)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| replacement_payload_error("columnar mutation deletion field is not boolean"))?;
+    if deletion_column.is_null(row_index) {
+        return Err(replacement_payload_error(
+            "columnar mutation deletion field is null",
+        ));
+    }
+    Ok(deletion_column.value(row_index))
 }
 
 #[cfg(test)]
@@ -7787,6 +7806,7 @@ async fn load_columnar_mutation_values_encoded(
         .await?
         .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
     validate_columnar_mutation_manifest(&manifest, parts)?;
+    let deletion_column_index = manifest.fields.len() - 2;
     let identity_column_index = manifest.fields.len() - 1;
     let identities = encoded_keys
         .iter()
@@ -7820,11 +7840,11 @@ async fn load_columnar_mutation_values_encoded(
             &manifest,
             group_index,
             page_index,
-            &[identity_column_index],
+            &[deletion_column_index, identity_column_index],
         )
         .await?;
         let column = batch
-            .column(0)
+            .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| replacement_payload_error("columnar mutation identity type drift"))?;
@@ -7858,7 +7878,7 @@ async fn load_columnar_mutation_values_encoded(
             output[output_index] = Some(TrackedStateIndexValue {
                 change_id: change_id_from_packed_address(commit_id, packed),
                 commit_id,
-                deleted: false,
+                deleted: columnar_deleted_at(&batch, 0, row_index)?,
                 created_at: parts.uniform_created_at,
                 updated_at: parts.uniform_updated_at,
             });
@@ -7901,6 +7921,7 @@ async fn load_columnar_owned_entries(
         .await?
         .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
     validate_columnar_mutation_manifest(&manifest, parts)?;
+    let deletion_column_index = manifest.fields.len() - 2;
     let identity_column_index = manifest.fields.len() - 1;
     let mut grouped = BTreeMap::<(usize, usize), Vec<(usize, String)>>::new();
     for (output_index, key) in keys.iter().enumerate() {
@@ -7966,6 +7987,7 @@ async fn load_columnar_owned_entries(
                 .checked_add(1)
                 .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
             let change_id = change_id_from_packed_address(commit_id, packed);
+            let deleted = columnar_deleted_at(&batch, deletion_column_index, row_index)?;
             // The columnar route establishes identity by JSON text match, not
             // by the byte-equality assert the packed route uses. Counted here
             // so a test can prove which of the two served a row.
@@ -7975,7 +7997,7 @@ async fn load_columnar_owned_entries(
                 value: TrackedStateIndexValue {
                     change_id,
                     commit_id,
-                    deleted: false,
+                    deleted,
                     created_at: parts.uniform_created_at,
                     updated_at: parts.uniform_updated_at,
                 },
@@ -8880,6 +8902,7 @@ async fn load_columnar_mutation_members(
                 account_id,
                 materialize_json_snapshot,
             )?;
+            let deleted = columnar_deleted_at(&batch, manifest.fields.len() - 2, row_index)?;
             let key = TrackedStateKey {
                 schema_key: parts.schema_key.clone(),
                 file_id: None,
@@ -8897,7 +8920,7 @@ async fn load_columnar_mutation_members(
                 value: TrackedStateIndexValue {
                     change_id,
                     commit_id,
-                    deleted: false,
+                    deleted,
                     created_at: parts.uniform_created_at,
                     updated_at: parts.uniform_updated_at,
                 },
@@ -10100,6 +10123,7 @@ async fn scan_columnar_mutation_values(
         .await?
         .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
     validate_columnar_mutation_manifest(&manifest, parts)?;
+    let deletion_column_index = manifest.fields.len() - 2;
     let identity_column_index = manifest.fields.len() - 1;
     let mut builder = DecodedCommitDeltaBatchBuilder::with_capacity(
         parts.row_count as usize,
@@ -10112,11 +10136,11 @@ async fn scan_columnar_mutation_values(
             id,
             &manifest,
             group_index,
-            &[identity_column_index],
+            &[deletion_column_index, identity_column_index],
         )
         .await?;
         let identities = batch
-            .column(0)
+            .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| replacement_payload_error("columnar mutation identity type drift"))?;
@@ -10133,7 +10157,7 @@ async fn scan_columnar_mutation_values(
                 TrackedStateIndexValue {
                     change_id: change_id_from_packed_address(commit_id, packed),
                     commit_id,
-                    deleted: false,
+                    deleted: columnar_deleted_at(&batch, 0, row_index)?,
                     created_at: parts.uniform_created_at,
                     updated_at: parts.uniform_updated_at,
                 },

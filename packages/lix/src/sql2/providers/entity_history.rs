@@ -775,7 +775,7 @@ mod tests {
         Engine::initialize(storage.clone())
             .await
             .expect("repository should initialize");
-        let engine = Engine::new(storage)
+        let engine = Engine::new(storage.clone())
             .await
             .expect("engine should open");
         let session = engine.open_session().await.expect("session should open");
@@ -872,6 +872,38 @@ mod tests {
             )
             .await
             .expect("typed tombstone should publish");
+        let current = session
+            .execute(
+                "SELECT key FROM lix_key_value WHERE key = 'typed-history-authority'",
+                &[],
+            )
+            .await
+            .expect("typed tombstone current state should remain queryable");
+        assert!(current.is_empty(), "typed tombstone must mask the live row");
+        let reopened_storage = Memory::from_snapshot(
+            &storage
+                .export_snapshot()
+                .expect("typed tombstone storage should export"),
+        )
+        .expect("typed tombstone storage should import into an isolated backend");
+        let reopened = Engine::new(reopened_storage)
+            .await
+            .expect("typed tombstone storage should reopen");
+        let reopened_session = reopened
+            .open_session()
+            .await
+            .expect("typed tombstone session should reopen");
+        let reopened_current = reopened_session
+            .execute(
+                "SELECT key FROM lix_key_value WHERE key = 'typed-history-authority'",
+                &[],
+            )
+            .await
+            .expect("reopened typed tombstone current state should remain queryable");
+        assert!(
+            reopened_current.is_empty(),
+            "typed tombstone must survive replay and cold reopen"
+        );
         assert_eq!(
             crate::tracked_state::take_columnar_history_json_projections(),
             0
