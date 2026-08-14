@@ -227,16 +227,36 @@ mod tests {
         }
 
         let serving = include_str!("../forktree/serving.rs");
-        let historical_start = serving
+        let point_start = serving
             .find("pub(crate) async fn state_points_on_read_with_historical_auth")
             .expect("historical state point authority");
-        let historical_end = serving[historical_start..]
-            .find("fn validate_resolved_member_pack_binding")
-            .map(|offset| historical_start + offset)
-            .expect("historical state point authority terminator");
+        let point_end = serving[point_start..]
+            .find("async fn validate_resolved_native_body")
+            .map(|offset| point_start + offset)
+            .expect("historical point authority terminator");
         assert!(
-            serving[historical_start..historical_end].contains("crate::native_row::decode("),
-            "historical state authority must authenticate native bodies before diff/history callers receive them"
+            serving[point_start..point_end].contains("validate_resolved_native_body("),
+            "historical point authority must validate native bodies"
+        );
+        let validator_start = point_end;
+        let validator_end = serving[validator_start..]
+            .find("fn validate_resolved_member_pack_binding")
+            .map(|offset| validator_start + offset)
+            .expect("native body validator terminator");
+        assert!(
+            serving[validator_start..validator_end].contains("crate::native_row::decode("),
+            "historical native body validator must recompute typed semantic identity"
+        );
+        let range_start = serving
+            .find("async fn resolve_state_values_on_read")
+            .expect("historical range/diff authority");
+        let range_end = serving[range_start..]
+            .find("struct HistoricalMemberBinding")
+            .map(|offset| range_start + offset)
+            .expect("historical range/diff authority terminator");
+        assert!(
+            serving[range_start..range_end].contains("validate_resolved_native_body("),
+            "historical range/diff authority must validate native bodies"
         );
     }
 }
