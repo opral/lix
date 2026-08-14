@@ -7,8 +7,9 @@ pub struct CompactCodec;
 const MAGIC: &[u8; 4] = b"LJCI";
 const VERSION: u8 = 1;
 const HEADER: usize = 41;
-const SMALL_LIMIT: usize = 12;
 const INDEX_PAGE_ENTRIES: usize = 32;
+const SMALL_ARRAY_LIMIT: usize = INDEX_PAGE_ENTRIES;
+const SMALL_OBJECT_LIMIT: usize = 8;
 
 const NULL: u8 = 0;
 const FALSE: u8 = 1;
@@ -169,7 +170,7 @@ fn encode_number(number: &Number, output: &mut Vec<u8>) -> Result<(), String> {
 
 fn encode_array(children: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
-    if children.len() <= SMALL_LIMIT {
+    if children.len() <= SMALL_ARRAY_LIMIT {
         output.push(SMALL_ARRAY);
         put_varint(children.len() as u64, &mut output);
         for child in children {
@@ -197,7 +198,7 @@ fn encode_array(children: &[Vec<u8>]) -> Result<Vec<u8>, String> {
 
 fn encode_object(entries: &[(&[u8], Vec<u8>)]) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
-    if entries.len() <= SMALL_LIMIT {
+    if entries.len() <= SMALL_OBJECT_LIMIT {
         output.push(SMALL_OBJECT);
         put_varint(entries.len() as u64, &mut output);
         for (key, child) in entries {
@@ -257,7 +258,7 @@ impl<'a> Container<'a> {
 
 fn parse_small_array(mut bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
     let count = take_varint(&mut bytes, "small array count")? as usize;
-    if count > SMALL_LIMIT {
+    if count > SMALL_ARRAY_LIMIT {
         return Err("small array exceeds its canonical count".to_owned());
     }
     let mut children = Vec::with_capacity(count);
@@ -280,7 +281,7 @@ fn parse_small_array(mut bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
 
 fn parse_indexed_array(bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
     let count = read_u32(bytes, 0, "array count")?;
-    if count <= SMALL_LIMIT {
+    if count <= SMALL_ARRAY_LIMIT {
         return Err("indexed array is not canonical for its count".to_owned());
     }
     let page_count = read_u32(bytes, 4, "array page count")?;
@@ -326,7 +327,7 @@ fn parse_indexed_array(bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
 
 fn parse_small_object(mut bytes: &[u8]) -> Result<Vec<(&[u8], &[u8])>, String> {
     let count = take_varint(&mut bytes, "small object count")? as usize;
-    if count > SMALL_LIMIT {
+    if count > SMALL_OBJECT_LIMIT {
         return Err("small object exceeds its canonical count".to_owned());
     }
     let mut entries = Vec::with_capacity(count);
@@ -355,7 +356,7 @@ fn parse_small_object(mut bytes: &[u8]) -> Result<Vec<(&[u8], &[u8])>, String> {
 
 fn parse_indexed_object(bytes: &[u8]) -> Result<Vec<(&[u8], &[u8])>, String> {
     let count = read_u32(bytes, 0, "object count")?;
-    if count <= SMALL_LIMIT {
+    if count <= SMALL_OBJECT_LIMIT {
         return Err("indexed object is not canonical for its count".to_owned());
     }
     let table_size = (count + 1).checked_mul(4).ok_or("object table overflow")?;
@@ -672,12 +673,50 @@ mod tests {
     fn indexed_object_round_trips_an_empty_first_key() {
         let mut object = Map::new();
         object.insert(String::new(), Value::from("empty"));
-        for index in 0..12 {
+        for index in 0..8 {
             object.insert(format!("key-{index:02}"), Value::from(index));
         }
         let value = Value::Object(object);
         let encoded = CompactCodec::encode(&value).unwrap();
         let decoded = CompactCodec::decode(&encoded).unwrap();
         assert_eq!(CompactCodec::encode(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn container_size_classes_are_canonical() {
+        assert!(parse_small_object(&[9]).is_err());
+        assert!(parse_indexed_object(&8_u32.to_le_bytes()).is_err());
+        assert!(parse_small_array(&[33]).is_err());
+        assert!(parse_indexed_array(&32_u32.to_le_bytes()).is_err());
+
+        let object_at_limit = Value::Object(
+            (0..8)
+                .map(|index| (format!("k{index}"), Value::from(index)))
+                .collect(),
+        );
+        let object_above_limit = Value::Object(
+            (0..9)
+                .map(|index| (format!("k{index}"), Value::from(index)))
+                .collect(),
+        );
+        assert_eq!(
+            CompactCodec::encode(&object_at_limit).unwrap()[HEADER],
+            SMALL_OBJECT
+        );
+        assert_eq!(
+            CompactCodec::encode(&object_above_limit).unwrap()[HEADER],
+            INDEXED_OBJECT
+        );
+
+        let array_at_limit = Value::Array((0..32).map(Value::from).collect());
+        let array_above_limit = Value::Array((0..33).map(Value::from).collect());
+        assert_eq!(
+            CompactCodec::encode(&array_at_limit).unwrap()[HEADER],
+            SMALL_ARRAY
+        );
+        assert_eq!(
+            CompactCodec::encode(&array_above_limit).unwrap()[HEADER],
+            INDEXED_ARRAY
+        );
     }
 }

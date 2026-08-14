@@ -147,56 +147,299 @@ fn container_threshold_probes(samples: usize) -> Result<(), String> {
         let keys = (0..count)
             .map(|index| format!("key-{index:04}"))
             .collect::<Vec<_>>();
+        let values = (0..count)
+            .map(|index| format!("value-{index:04}"))
+            .collect::<Vec<_>>();
         let sought = keys.last().ok_or("empty threshold probe")?.clone();
         for algorithm in ["sequential", "binary"] {
-            let mut operation = || -> Result<bool, String> {
-                let mut found = false;
-                for _ in 0..1024 {
-                    found = match algorithm {
-                        "sequential" => keys.iter().any(|key| key == black_box(&sought)),
-                        "binary" => keys.binary_search(black_box(&sought)).is_ok(),
+            let indexed = algorithm == "binary";
+            let encoded = threshold_encode(&keys, &values, indexed)?;
+            if threshold_decode_owned(&encoded, indexed)?
+                != keys
+                    .iter()
+                    .cloned()
+                    .zip(values.iter().cloned())
+                    .collect::<Vec<_>>()
+            {
+                return Err("threshold codec roundtrip mismatch".into());
+            }
+            for operation_name in ["encode", "decode", "path", "rewrite"] {
+                let mut operation = || -> Result<bool, String> {
+                    match operation_name {
+                        "encode" => {
+                            Ok(
+                                !threshold_encode(black_box(&keys), black_box(&values), indexed)?
+                                    .is_empty(),
+                            )
+                        }
+                        "decode" => Ok(
+                            threshold_decode_owned(black_box(&encoded), indexed)?.len() == count
+                        ),
+                        "path" => {
+                            let mut found = false;
+                            for _ in 0..1024 {
+                                found = threshold_path(
+                                    black_box(&encoded),
+                                    indexed,
+                                    black_box(&sought),
+                                )?;
+                            }
+                            Ok(found)
+                        }
+                        "rewrite" => Ok(!threshold_rewrite(
+                            black_box(&encoded),
+                            indexed,
+                            black_box(&sought),
+                        )?
+                        .is_empty()),
                         _ => unreachable!(),
-                    };
+                    }
+                };
+                for _ in 0..WARMUPS {
+                    if !operation()? {
+                        return Err("container threshold warmup failed".to_owned());
+                    }
                 }
-                Ok(found)
-            };
-            for _ in 0..WARMUPS {
-                if !operation()? {
-                    return Err("container threshold warmup missed".to_owned());
+                let mut measured = Vec::with_capacity(samples);
+                for _ in 0..samples {
+                    let (sample, passed) = measure(&mut operation)?;
+                    if !passed {
+                        return Err("container threshold operation failed".to_owned());
+                    }
+                    measured.push(sample);
                 }
+                emit(json!({
+                    "schema_version": 1,
+                    "benchmark_id": format!("jsonb-layout-v1/container-threshold/{count}/{algorithm}/{operation_name}"),
+                    "mode": "container_threshold",
+                    "entry_count": count,
+                    "algorithm": algorithm,
+                    "operation": operation_name,
+                    "warmups": WARMUPS,
+                    "samples": samples,
+                    "lookups_per_path_sample": (operation_name == "path").then_some(1024),
+                    "encoded_bytes": encoded.len(),
+                    "wall_ns": stats(&measured, |sample| sample.wall),
+                    "cpu_ns": stats(&measured, |sample| sample.cpu),
+                    "raw_samples": measured.iter().map(|sample| json!({
+                        "wall_ns": sample.wall,
+                        "cpu_ns": sample.cpu,
+                        "allocated_bytes": sample.alloc,
+                        "rss_bytes": sample.rss
+                    })).collect::<Vec<_>>(),
+                    "model_matches_codec_layout": true,
+                    "correct": true
+                }))?;
             }
-            let mut measured = Vec::with_capacity(samples);
-            for _ in 0..samples {
-                let (sample, found) = measure(&mut operation)?;
-                if !found {
-                    return Err("container threshold lookup missed".to_owned());
-                }
-                measured.push(sample);
-            }
-            emit(json!({
-                "schema_version": 1,
-                "benchmark_id": format!("jsonb-layout-v1/container-threshold/{count}/{algorithm}"),
-                "mode": "container_threshold",
-                "entry_count": count,
-                "algorithm": algorithm,
-                "warmups": WARMUPS,
-                "samples": samples,
-                "lookups_per_sample": 1024,
-                "wall_ns": stats(&measured, |sample| sample.wall),
-                "cpu_ns": stats(&measured, |sample| sample.cpu),
-                "raw_samples": measured.iter().map(|sample| json!({
-                    "wall_ns": sample.wall,
-                    "cpu_ns": sample.cpu,
-                    "allocated_bytes": sample.alloc,
-                    "rss_bytes": sample.rss
-                })).collect::<Vec<_>>(),
-                "sequential_metadata_bytes": 2 * count,
-                "indexed_metadata_bytes": 4 + 8 * (count + 1),
-                "correct": true
-            }))?;
         }
     }
     Ok(())
+}
+
+fn threshold_encode(keys: &[String], values: &[String], indexed: bool) -> Result<Vec<u8>, String> {
+    if keys.len() != values.len() {
+        return Err("threshold fixture cardinality mismatch".into());
+    }
+    let mut output = vec![u8::from(indexed)];
+    if indexed {
+        output.extend_from_slice(
+            &u32::try_from(keys.len())
+                .map_err(|_| "count")?
+                .to_le_bytes(),
+        );
+        for items in [keys, values] {
+            let mut offset = 0_u32;
+            output.extend_from_slice(&offset.to_le_bytes());
+            for item in items {
+                offset = offset
+                    .checked_add(u32::try_from(item.len()).map_err(|_| "item")?)
+                    .ok_or("offset")?;
+                output.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+        for item in keys.iter().chain(values) {
+            output.extend_from_slice(item.as_bytes());
+        }
+    } else {
+        threshold_put_varint(keys.len() as u64, &mut output);
+        for (key, value) in keys.iter().zip(values) {
+            threshold_put_varint(key.len() as u64, &mut output);
+            output.extend_from_slice(key.as_bytes());
+            threshold_put_varint(value.len() as u64, &mut output);
+            output.extend_from_slice(value.as_bytes());
+        }
+    }
+    Ok(output)
+}
+
+fn threshold_decode_owned(bytes: &[u8], indexed: bool) -> Result<Vec<(String, String)>, String> {
+    if bytes.first().copied() != Some(u8::from(indexed)) {
+        return Err("threshold layout tag mismatch".into());
+    }
+    if indexed {
+        let count =
+            u32::from_le_bytes(bytes.get(1..5).ok_or("count")?.try_into().unwrap()) as usize;
+        let table = (count + 1).checked_mul(4).ok_or("table")?;
+        let key_table = 5;
+        let value_table = key_table + table;
+        let data = value_table + table;
+        let key_bytes = u32::from_le_bytes(
+            bytes
+                .get(key_table + count * 4..key_table + table)
+                .ok_or("keys")?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let key_data = bytes.get(data..data + key_bytes).ok_or("key data")?;
+        let value_data = bytes.get(data + key_bytes..).ok_or("value data")?;
+        let mut output = Vec::with_capacity(count);
+        for index in 0..count {
+            output.push((
+                std::str::from_utf8(threshold_indexed_range(bytes, key_table, index, key_data)?)
+                    .map_err(|e| e.to_string())?
+                    .to_owned(),
+                std::str::from_utf8(threshold_indexed_range(
+                    bytes,
+                    value_table,
+                    index,
+                    value_data,
+                )?)
+                .map_err(|e| e.to_string())?
+                .to_owned(),
+            ));
+        }
+        Ok(output)
+    } else {
+        let mut rest = &bytes[1..];
+        let count = threshold_take_varint(&mut rest)? as usize;
+        let mut output = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key_len = threshold_take_varint(&mut rest)? as usize;
+            let (key, tail) = rest.split_at_checked(key_len).ok_or("key")?;
+            rest = tail;
+            let value_len = threshold_take_varint(&mut rest)? as usize;
+            let (value, tail) = rest.split_at_checked(value_len).ok_or("value")?;
+            rest = tail;
+            output.push((
+                std::str::from_utf8(key)
+                    .map_err(|e| e.to_string())?
+                    .to_owned(),
+                std::str::from_utf8(value)
+                    .map_err(|e| e.to_string())?
+                    .to_owned(),
+            ));
+        }
+        if !rest.is_empty() {
+            return Err("trailing threshold bytes".into());
+        }
+        Ok(output)
+    }
+}
+
+fn threshold_indexed_range<'a>(
+    bytes: &[u8],
+    table_start: usize,
+    index: usize,
+    data: &'a [u8],
+) -> Result<&'a [u8], String> {
+    let at = table_start
+        .checked_add(index.checked_mul(4).ok_or("offset")?)
+        .ok_or("offset")?;
+    let start =
+        u32::from_le_bytes(bytes.get(at..at + 4).ok_or("offset")?.try_into().unwrap()) as usize;
+    let end = u32::from_le_bytes(
+        bytes
+            .get(at + 4..at + 8)
+            .ok_or("offset")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    data.get(start..end).ok_or("range".into())
+}
+
+fn threshold_path(bytes: &[u8], indexed: bool, sought: &str) -> Result<bool, String> {
+    if bytes.first().copied() != Some(u8::from(indexed)) {
+        return Err("threshold layout tag mismatch".into());
+    }
+    if indexed {
+        let count =
+            u32::from_le_bytes(bytes.get(1..5).ok_or("count")?.try_into().unwrap()) as usize;
+        let table = (count + 1).checked_mul(4).ok_or("table")?;
+        let key_table = 5;
+        let value_table = key_table + table;
+        let data = value_table + table;
+        let key_bytes = u32::from_le_bytes(
+            bytes
+                .get(key_table + count * 4..key_table + table)
+                .ok_or("keys")?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let key_data = bytes.get(data..data + key_bytes).ok_or("key data")?;
+        let mut lower = 0;
+        let mut upper = count;
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            let key =
+                std::str::from_utf8(threshold_indexed_range(bytes, key_table, middle, key_data)?)
+                    .map_err(|e| e.to_string())?;
+            match key.cmp(sought) {
+                std::cmp::Ordering::Less => lower = middle + 1,
+                std::cmp::Ordering::Greater => upper = middle,
+                std::cmp::Ordering::Equal => return Ok(true),
+            }
+        }
+        Ok(false)
+    } else {
+        let mut rest = &bytes[1..];
+        let count = threshold_take_varint(&mut rest)? as usize;
+        for _ in 0..count {
+            let key_len = threshold_take_varint(&mut rest)? as usize;
+            let (key, tail) = rest.split_at_checked(key_len).ok_or("key")?;
+            rest = tail;
+            let value_len = threshold_take_varint(&mut rest)? as usize;
+            let (_, tail) = rest.split_at_checked(value_len).ok_or("value")?;
+            rest = tail;
+            if std::str::from_utf8(key).map_err(|e| e.to_string())? == sought {
+                return Ok(true);
+            }
+        }
+        if !rest.is_empty() {
+            return Err("trailing threshold bytes".into());
+        }
+        Ok(false)
+    }
+}
+
+fn threshold_rewrite(bytes: &[u8], indexed: bool, sought: &str) -> Result<Vec<u8>, String> {
+    let mut entries = threshold_decode_owned(bytes, indexed)?;
+    let (_, value) = entries
+        .iter_mut()
+        .find(|(key, _)| key == sought)
+        .ok_or("missing")?;
+    value.push('x');
+    let (keys, values): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+    threshold_encode(&keys, &values, indexed)
+}
+
+fn threshold_put_varint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+fn threshold_take_varint(bytes: &mut &[u8]) -> Result<u64, String> {
+    let mut value = 0_u64;
+    for index in 0..10 {
+        let byte = *bytes.first().ok_or("varint")?;
+        *bytes = &bytes[1..];
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err("varint overflow".into())
 }
 
 fn semantic_oracles() -> Result<(), String> {
