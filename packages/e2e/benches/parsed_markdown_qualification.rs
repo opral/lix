@@ -42,7 +42,9 @@ impl QualificationBackend for SlateDB {
     }
 
     async fn flush_for_reopen(&self) {
-        self.flush().await.expect("flush SlateDB before cold reopen");
+        self.flush()
+            .await
+            .expect("flush SlateDB before cold reopen");
     }
 }
 
@@ -552,12 +554,12 @@ where
     let (diff_count, diff_digest) = measure(backend, "historical_diff", 1, async {
         let result = lix
             .execute(
-            "SELECT schema_key, row_pk, diff_type FROM lix_diff($1, $2) \
+                "SELECT schema_key, row_pk, diff_type FROM lix_diff($1, $2) \
              WHERE schema_key = 'markdown_node' ORDER BY row_pk",
-            &[Value::Text(before_commit), Value::Text(after_commit)],
-        )
-        .await
-        .expect("historical diff");
+                &[Value::Text(before_commit), Value::Text(after_commit)],
+            )
+            .await
+            .expect("historical diff");
         let expected_row_pk = json!([paragraph_id]);
         assert!(result.rows().iter().any(|row| {
             row.get::<JsonValue>("row_pk").expect("diff row PK") == expected_row_pk
@@ -569,9 +571,7 @@ where
                 format!(
                     "{}\0{}\0{}",
                     row.get::<String>("schema_key").expect("diff schema"),
-                    canonical_row_pk_text(
-                        &row.get::<JsonValue>("row_pk").expect("diff row PK")
-                    ),
+                    canonical_row_pk_text(&row.get::<JsonValue>("row_pk").expect("diff row PK")),
                     row.get::<String>("diff_type").expect("diff type")
                 )
             })
@@ -585,12 +585,12 @@ where
     let (history_count, history_digest) = measure(backend, "history_depth_one", 1, async {
         let result = lix
             .execute(
-            "SELECT id, kind, payload_json FROM markdown_node_history() \
+                "SELECT id, kind, payload_json FROM markdown_node_history() \
              WHERE lixcol_file_id = $1 AND lixcol_depth = 1 ORDER BY kind, id",
-            &[Value::Text(file_id.clone())],
-        )
-        .await
-        .expect("history query");
+                &[Value::Text(file_id.clone())],
+            )
+            .await
+            .expect("history query");
         let mut rows = result
             .rows()
             .iter()
@@ -599,8 +599,7 @@ where
                     "{}\0{}",
                     row.get::<String>("kind").expect("history kind"),
                     canonical_json_text(
-                        &row.get::<String>("payload_json")
-                            .expect("history payload")
+                        &row.get::<String>("payload_json").expect("history payload")
                     )
                 )
             })
@@ -727,12 +726,8 @@ async fn main() {
     let root = PathBuf::from(std::env::args().nth(2).expect("database path"));
     std::fs::create_dir_all(&root).expect("create database root");
     match backend.as_str() {
-        "rocksdb" => {
-            run::<RocksDB>("rocksdb", root).await
-        }
-        "slatedb" => {
-            run::<SlateDB>("slatedb", root).await
-        }
+        "rocksdb" => run::<RocksDB>("rocksdb", root).await,
+        "slatedb" => run::<SlateDB>("slatedb", root).await,
         other => panic!("backend must be rocksdb or slatedb, got {other}"),
     }
 }
