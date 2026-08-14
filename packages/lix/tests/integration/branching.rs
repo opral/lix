@@ -1256,18 +1256,17 @@ simulation_test!(
             .await
             .expect("true conflict preview should succeed");
         assert_eq!(preview.base_commit_id, checkpoint);
-        assert_eq!(preview.conflicts.len(), 1);
+        assert_eq!(preview.conflicts.len(), 0);
         assert_eq!(
             commit_parent_edges(&main, &source_head).await,
             vec![(recovered_head, 0), (checkpoint, 1)]
         );
-        let error = main
+        main
             .merge_branch(MergeBranchOptions {
                 source_branch_id: "01930000-0000-7000-8000-000000000002".to_string(),
             })
             .await
-            .expect_err("same-identity changes must still conflict");
-        assert_merge_conflict_error(&error);
+            .expect("same-identity changes use deterministic column LWW");
         assert_key_value(&main, "checkpoint-bridge-conflict", Some("\"target\"")).await;
     }
 );
@@ -1404,9 +1403,9 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_branch_errors_on_divergent_same_row_change,
+    merge_branch_uses_column_lww_on_divergent_same_row_change,
     |sim| async move {
-        let (engine, main, draft) = create_draft_from_main(&sim).await;
+        let (_engine, main, draft) = create_draft_from_main(&sim).await;
 
         main.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('merge-conflict', 'main')",
@@ -1421,28 +1420,14 @@ simulation_test!(
             )
             .await
             .expect("draft write should succeed");
-        let main_head_before = engine
-            .load_branch_head_commit_id(sim.main_branch_id())
-            .await
-            .expect("main head should load")
-            .expect("main head should exist");
-
-        let error = main
+        let receipt = main
             .merge_branch(MergeBranchOptions {
                 source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
             })
             .await
-            .expect_err("divergent same-row changes should conflict");
-        assert_merge_conflict_error(&error);
-        assert_eq!(
-            engine
-                .load_branch_head_commit_id(sim.main_branch_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "failed merge should not advance the target branch ref"
-        );
-        assert_key_value(&main, "merge-conflict", Some("\"main\"")).await;
+            .expect("divergent same-row changes use deterministic column LWW");
+        assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
+        assert_key_value(&main, "merge-conflict", Some("\"draft\"")).await;
     }
 );
 
@@ -1528,9 +1513,9 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_branch_conflicts_when_target_deletes_source_modifies,
+    merge_branch_uses_whole_row_lww_when_target_deletes_source_modifies,
     |sim| async move {
-        let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
+        let (_engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
         delete_key_value(&main, "73686172-6564-8d62-8566-6f72652d6200").await;
         draft
@@ -1540,35 +1525,25 @@ simulation_test!(
             )
             .await
             .expect("draft update should succeed");
-        let main_head_before = engine
-            .load_branch_head_commit_id(sim.main_branch_id())
-            .await
-            .expect("main head should load")
-            .expect("main head should exist");
-
-        let error = main
+        main
             .merge_branch(MergeBranchOptions {
                 source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
             })
             .await
-            .expect_err("delete/modify should conflict");
-        assert_merge_conflict_error(&error);
-        assert_eq!(
-            engine
-                .load_branch_head_commit_id(sim.main_branch_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "failed merge should not advance the target branch ref"
-        );
-        assert_key_value(&main, "73686172-6564-8d62-8566-6f72652d6200", None).await;
+            .expect("delete/modify uses deterministic whole-row LWW");
+        assert_key_value(
+            &main,
+            "73686172-6564-8d62-8566-6f72652d6200",
+            Some("\"draft\""),
+        )
+        .await;
     }
 );
 
 simulation_test!(
-    merge_branch_conflicts_when_target_modifies_source_deletes,
+    merge_branch_uses_whole_row_lww_when_target_modifies_source_deletes,
     |sim| async move {
-        let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
+        let (_engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
         main.execute(
             "UPDATE lix_key_value SET value = 'main' WHERE key = '73686172-6564-8d62-8566-6f72652d6200'",
@@ -1577,33 +1552,13 @@ simulation_test!(
         .await
         .expect("main update should succeed");
         delete_key_value(&draft, "73686172-6564-8d62-8566-6f72652d6200").await;
-        let main_head_before = engine
-            .load_branch_head_commit_id(sim.main_branch_id())
-            .await
-            .expect("main head should load")
-            .expect("main head should exist");
-
-        let error = main
+        main
             .merge_branch(MergeBranchOptions {
                 source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
             })
             .await
-            .expect_err("modify/delete should conflict");
-        assert_merge_conflict_error(&error);
-        assert_eq!(
-            engine
-                .load_branch_head_commit_id(sim.main_branch_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "failed merge should not advance the target branch ref"
-        );
-        assert_key_value(
-            &main,
-            "73686172-6564-8d62-8566-6f72652d6200",
-            Some("\"main\""),
-        )
-        .await;
+            .expect("modify/delete uses deterministic whole-row LWW");
+        assert_key_value(&main, "73686172-6564-8d62-8566-6f72652d6200", None).await;
     }
 );
 
@@ -1670,9 +1625,9 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_branch_conflicts_on_independent_add_same_identity_different_payload,
+    merge_branch_uses_whole_row_lww_on_independent_add_same_identity,
     |sim| async move {
-        let (engine, main, draft) = create_draft_from_main(&sim).await;
+        let (_engine, main, draft) = create_draft_from_main(&sim).await;
 
         main.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('merge-independent-add', 'main')",
@@ -1687,28 +1642,13 @@ simulation_test!(
             )
             .await
             .expect("draft insert should succeed");
-        let main_head_before = engine
-            .load_branch_head_commit_id(sim.main_branch_id())
-            .await
-            .expect("main head should load")
-            .expect("main head should exist");
-
-        let error = main
+        main
             .merge_branch(MergeBranchOptions {
                 source_branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
             })
             .await
-            .expect_err("independent adds with different payloads should conflict");
-        assert_merge_conflict_error(&error);
-        assert_eq!(
-            engine
-                .load_branch_head_commit_id(sim.main_branch_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "failed merge should not advance the target branch ref"
-        );
-        assert_key_value(&main, "merge-independent-add", Some("\"main\"")).await;
+            .expect("independent adds use deterministic whole-row LWW");
+        assert_key_value(&main, "merge-independent-add", Some("\"draft\"")).await;
     }
 );
 
@@ -2035,47 +1975,6 @@ fn assert_branch_pair_delete_restricted(error: &LixError) {
             .as_deref()
             .is_some_and(|hint| hint.contains("lix_branch")),
         "error should guide callers to the lix_branch surface: {error:?}"
-    );
-}
-
-fn assert_merge_conflict_error(error: &LixError) {
-    assert_eq!(error.code, "LIX_MERGE_CONFLICT");
-    assert!(
-        error.message.contains("tracked-state conflict"),
-        "unexpected merge error: {error:?}"
-    );
-    let details = error
-        .details
-        .as_ref()
-        .expect("merge conflict should include details");
-    let conflicts = details
-        .get("conflicts")
-        .and_then(JsonValue::as_array)
-        .expect("merge conflict details should include conflicts array");
-    assert_eq!(conflicts.len(), 1);
-    let conflict = &conflicts[0];
-    assert_eq!(
-        conflict.get("kind").and_then(JsonValue::as_str),
-        Some("sameRowChanged")
-    );
-    assert_eq!(
-        conflict.get("schemaKey").and_then(JsonValue::as_str),
-        Some("lix_key_value")
-    );
-    assert!(
-        conflict
-            .get("rowPk")
-            .and_then(JsonValue::as_array)
-            .is_some(),
-        "conflict should include rowPk: {conflict:?}"
-    );
-    assert!(
-        conflict.get("target").is_some(),
-        "conflict should include target side: {conflict:?}"
-    );
-    assert!(
-        conflict.get("source").is_some(),
-        "conflict should include source side: {conflict:?}"
     );
 }
 

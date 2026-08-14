@@ -30,9 +30,9 @@ const DEFAULT_MAX_DECODED_CHECKPOINT_BYTES: u64 = 96 * 1024 * 1024;
 // keeping each file actor's retained working set bounded.
 pub(crate) const DEFAULT_MAX_PLUGIN_FILE_HISTORY: usize = 1;
 
-/// Host-proven identities for schemas whose primary keys are allocated by the
-/// mutation create context. Successors retain sparse persistent overlays rather
-/// than cloning the complete document-sized set for every tiny edit.
+/// Host-proven identities for every row in a plugin-owned file. UUID create
+/// ranges stay compact, while natural-key rows and sparse successors use
+/// persistent overlays rather than cloning the complete set for every edit.
 #[derive(Clone)]
 pub(crate) struct PluginRowAuthorities {
     node: Arc<PluginRowAuthorityNode>,
@@ -204,6 +204,25 @@ impl PluginRowAuthorities {
                 depth,
             }),
         }
+    }
+
+    pub(crate) fn materialize_keys(&self) -> BTreeSet<WasmRowKey> {
+        let (ranges, mut keys, removed) = self.flatten();
+        for range in ranges {
+            for local_ref in range.first_local_ref..=range.last_local_ref {
+                let mut bytes = [0_u8; 16];
+                bytes[..12].copy_from_slice(&range.namespace);
+                bytes[12..].copy_from_slice(&local_ref.to_be_bytes());
+                keys.insert(WasmRowKey::from_owned_parts(
+                    range.schema_key.clone(),
+                    vec![uuid::Uuid::from_bytes(bytes).hyphenated().to_string()],
+                ));
+            }
+        }
+        for key in removed {
+            keys.remove(&key);
+        }
+        keys
     }
 
     #[cfg(test)]
@@ -2269,6 +2288,10 @@ mod tests {
         assert!(!authorities.contains(&removed));
         assert!(authorities.contains(&outside));
         assert!(!authorities.contains(&key(9)));
+        assert_eq!(
+            authorities.materialize_keys(),
+            BTreeSet::from([key(10), key(11), inside, key(14), key(15), outside])
+        );
     }
 
     #[test]

@@ -8276,7 +8276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_base_remote_transactions_report_the_existing_commit_conflict() {
+    async fn same_base_remote_transactions_converge_with_column_lww() {
         let app = app().await;
         let (first, _) = new_session(&app.router).await;
         let (second, _) = new_session(&app.router).await;
@@ -8320,11 +8320,44 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(second_commit.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            response_json(second_commit).await["error"]["code"],
-            LixError::CODE_UNIQUE
-        );
+        assert_eq!(second_commit.status(), StatusCode::NO_CONTENT);
+
+        // Ordinary rows no longer surface a stale same-key INSERT as a
+        // uniqueness error. The stale transaction is reconciled against the
+        // first commit and every session converges on the same ranked value.
+        let visible_from_second = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&second),
+            Some(json!({
+                "sql": "SELECT value FROM lix_key_value WHERE key = 'same-base'",
+                "params": []
+            })),
+        )
+        .await;
+        assert_eq!(visible_from_second.status(), StatusCode::OK);
+        let visible_from_first = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&first),
+            Some(json!({
+                "sql": "SELECT value FROM lix_key_value WHERE key = 'same-base'",
+                "params": []
+            })),
+        )
+        .await;
+        assert_eq!(visible_from_first.status(), StatusCode::OK);
+
+        let second_value = response_json(visible_from_second).await["rows"][0][0].clone();
+        let first_value = response_json(visible_from_first).await["rows"][0][0].clone();
+        assert_eq!(first_value, second_value);
+        assert!([
+            json!({ "kind": "json", "value": "first" }),
+            json!({ "kind": "json", "value": "second" }),
+        ]
+        .contains(&first_value));
     }
 
     #[tokio::test]

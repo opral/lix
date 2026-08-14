@@ -24,6 +24,7 @@ mod install;
 mod manifest;
 mod materializer;
 mod registry;
+mod row_reconcile;
 mod storage;
 
 pub(crate) use actor::{
@@ -41,9 +42,9 @@ pub(crate) use create_context::{
 };
 pub(crate) use incremental::{
     ArcByteSource, FileBytesSha256, LiveBatchRowSource, SchemaAllowlist,
-    ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
-    VecRowChangeSource, VecRowConflictSource, VecRowSource, build_file_update_splices,
-    canonicalize_snapshot, certify_dense_fresh_file, drain_conflict_transition_resolutions,
+    ValidatedColumnMergeTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
+    VecColumnMergeSource, VecRowChangeSource, VecRowSource, build_file_update_splices,
+    canonicalize_snapshot, certify_dense_fresh_file, drain_column_merge_transition_results,
     drain_file_transition_changes, drain_row_transition_edits, host_row_change_with_lazy_snapshot,
     host_row_with_lazy_snapshot, transport_splice_preserves_prefix_exclusion,
     transport_splice_preserves_utf8,
@@ -58,6 +59,9 @@ pub(crate) use registry::{
     PluginFileOwner, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
     collect_gc_wasm_blob_roots, load_plugin_registry_at_commit,
 };
+pub(crate) use row_reconcile::{
+    ColumnMergeResult, ReconciledRow, RowVersionRef, primary_key_columns, reconcile_row,
+};
 #[cfg(test)]
 pub(crate) use storage::plugin_storage_archive_path;
 pub(crate) use storage::{
@@ -71,16 +75,26 @@ pub(crate) struct InstalledPlugin {
     pub key: String,
     pub runtime: PluginRuntime,
     pub api_version: String,
-    pub path_glob: String,
+    pub capabilities: PluginCapabilities,
+    pub path_glob: Option<String>,
     pub content: Option<PluginContentMatcher>,
-    pub entry: String,
+    pub entry: Option<String>,
     pub schema_keys: Vec<String>,
     pub manifest_json: String,
     /// Content-addressed identity computed while the component bytes are
     /// already in hand. Warm component-cache lookups must use this fixed-size
     /// value instead of rehashing or comparing the full WASM payload.
-    pub wasm_hash: crate::binary_cas::BlobId,
-    pub wasm: Vec<u8>,
+    pub wasm_hash: Option<crate::binary_cas::BlobId>,
+    pub wasm: Option<Vec<u8>>,
+}
+
+/// Executable capabilities discovered from a plugin component at install.
+/// They are durable generation metadata, not user configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCapabilities {
+    pub column_merger: bool,
+    pub file_projection: bool,
 }
 
 #[cfg(test)]
@@ -89,7 +103,7 @@ pub(crate) struct InstalledPluginMetadata {
     pub key: String,
     pub archive_path: String,
     pub archive_blob_hash: String,
-    pub path_glob: String,
+    pub path_glob: Option<String>,
     pub content: Option<PluginContentMatcher>,
     pub schema_keys: Vec<String>,
 }

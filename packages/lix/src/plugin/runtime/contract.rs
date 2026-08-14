@@ -6,6 +6,7 @@
 //! cursor, output-table, and transition handles created by that instance.
 
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -80,7 +81,7 @@ impl WasmTransitionLimits {
     /// Returns a bounded budget for a first cold parse of one submitted file.
     ///
     /// A fresh `open-file` must legitimately examine all input bytes, unlike a
-    /// warm sparse edit or static conflict resolver. Keep the normal five
+    /// warm sparse edit or column merge. Keep the normal five
     /// second bound for a zero/small file, add one second per started MiB, and
     /// cap the result at one minute. This is admission policy, not an excuse
     /// for a plugin to make the hot path proportional to file size.
@@ -336,12 +337,18 @@ pub struct WasmPluginSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmFileDescriptor {
+    pub file_id: String,
     pub path: Option<String>,
     pub plugin: WasmPluginSelection,
 }
 
 impl WasmFileDescriptor {
     pub fn validate_warm_successor(&self, after: &Self) -> Result<(), LixError> {
+        if self.file_id != after.file_id {
+            return Err(invalid_param(
+                "warm component transitions require the same stable file id",
+            ));
+        }
         if self.plugin != after.plugin {
             return Err(invalid_param(
                 "warm component transitions require the same plugin key and generation",
@@ -1028,72 +1035,60 @@ pub trait WasmRowSource: Send {
     fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowPage>, LixError>;
 }
 
+/// Lazily materialized predecessor identities used only when a warm
+/// `parse_changes` transition elects to replace every row.
+pub trait WasmRowKeySource: Send {
+    fn into_keys(self: Box<Self>) -> Result<BTreeSet<WasmRowKey>, LixError>;
+}
+
 /// Bounded, merge-resolved host changes supplied to `rows_changed`.
 pub trait WasmRowChangeSource: Send {
     fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmHostRowChanges>, LixError>;
 }
 
-/// One same-identity three-way semantic conflict. `a` and `b` are
-/// canonically ordered by the durable `(updated_at, change_id)` tuple rather
-/// than by the branch into which a merge happens. A missing value represents a
-/// pre-creation or tombstoned row.
+/// One same-column concurrent overlap presented to a column merger. Complete
+/// rows remain available as read-only context, but the plugin can replace only
+/// the named column value.
 #[derive(Debug, Clone)]
-pub struct WasmRowConflict<B> {
-    /// Host-assigned zero-based position in this resolver invocation. The
-    /// guest must echo it in its resolution record, allowing the host to
-    /// prove that an untrusted cursor neither reordered nor duplicated picks.
+pub struct WasmColumnMerge<B> {
     pub ordinal: u32,
     pub key: WasmRowKey,
+    pub file_id: Option<String>,
+    pub column: String,
     pub base: Option<B>,
     pub a: Option<B>,
     pub b: Option<B>,
+    pub base_row: B,
+    pub a_row: B,
+    pub b_row: B,
 }
 
-pub type WasmHostRowConflict = WasmRowConflict<WasmHostBytes>;
-pub type WasmGuestRowConflict = WasmRowConflict<WasmGuestBytes>;
+pub type WasmHostColumnMerge = WasmColumnMerge<WasmHostBytes>;
 
 #[derive(Debug, Clone)]
-pub struct WasmRowConflictPage {
-    pub conflicts: Vec<WasmHostRowConflict>,
+pub struct WasmColumnMergePage {
+    pub merges: Vec<WasmHostColumnMerge>,
 }
 
-/// Bounded host conflict triples supplied to the static `resolve-conflicts`
-/// hook. Each complete snapshot stays lazy through `WasmHostBytes::Source`.
-pub trait WasmRowConflictSource: Send {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowConflictPage>, LixError>;
+pub trait WasmColumnMergeSource: Send {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmColumnMergePage>, LixError>;
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WasmConflictTake {
-    Base,
-    A,
-    B,
-}
-
-/// A conflict result is aligned with its input record; it cannot alter the
-/// schema key or row primary key. `Take` reuses the selected historical
-/// row, avoiding a large round trip through guest linear memory.
-#[derive(Debug, Clone)]
-pub enum WasmConflictResolution<B> {
-    Take(WasmConflictTake),
-    Replace {
-        snapshot_content: B,
-        effect: WasmChangeEffect,
-    },
-    Delete,
-}
-
-pub type WasmHostConflictResolution = WasmConflictResolution<WasmHostBytes>;
-pub type WasmGuestConflictResolution = WasmConflictResolution<WasmGuestBytes>;
 
 #[derive(Debug, Clone)]
-pub struct WasmConflictResolutionPage {
+pub enum WasmColumnMergeResult<B> {
+    UseLww,
+    /// `None` removes an optional column. `Some` contains its canonical JSON
+    /// value, including JSON `null` when the column is explicitly null.
+    Replace(Option<B>),
+}
+
+pub type WasmGuestColumnMergeResult = WasmColumnMergeResult<WasmGuestBytes>;
+
+#[derive(Debug, Clone)]
+pub struct WasmColumnMergeResultPage {
     pub format_version: u16,
-    /// Host-assigned input ordinal echoed by the guest for every aligned
-    /// resolution. It has the same length and order as `resolutions`.
     pub ordinals: Vec<u32>,
-    pub resolutions: Vec<WasmGuestConflictResolution>,
-    /// Exactly one page-local table supplies all `Replace` output ranges.
+    pub results: Vec<WasmGuestColumnMergeResult>,
     pub outputs: Option<WasmByteOutputsHandle>,
 }
 
@@ -1182,6 +1177,8 @@ pub struct WasmFileUpdate {
     pub edits: Vec<WasmInputSplice>,
     pub after: Arc<dyn WasmByteSource>,
     pub creates: WasmCreateContext,
+    pub rows: Option<Box<dyn WasmRowSource>>,
+    pub prior_row_keys: Option<Box<dyn WasmRowKeySource>>,
 }
 
 pub struct WasmColdFileUpdate {
@@ -1207,6 +1204,7 @@ impl fmt::Debug for WasmColdFileUpdate {
             .field("edits", &self.edits)
             .field("after_len", &self.after.len())
             .field("creates", &self.creates)
+            .field("rows", &"lazy complete row source")
             .finish()
     }
 }
@@ -1221,6 +1219,8 @@ impl WasmColdFileUpdate {
                 edits: self.edits.clone(),
                 after: Arc::clone(&self.after),
                 creates: self.creates,
+                rows: None,
+                prior_row_keys: None,
             }
             .validate(limits),
             None => {
@@ -1337,16 +1337,14 @@ pub struct WasmRowUpdate {
 /// Input for one stateless, file-scoped conflict-resolution call. It has no
 /// document handle on purpose: a one-row/one-paragraph merge must not force a
 /// cold open of all semantic rows in the file.
-pub struct WasmConflictUpdate {
-    pub descriptor: WasmFileDescriptor,
-    pub conflicts: Box<dyn WasmRowConflictSource>,
+pub struct WasmColumnMergeUpdate {
+    pub merges: Box<dyn WasmColumnMergeSource>,
 }
 
-impl fmt::Debug for WasmConflictUpdate {
+impl fmt::Debug for WasmColumnMergeUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("WasmConflictUpdate")
-            .field("descriptor", &self.descriptor)
+            .debug_struct("WasmColumnMergeUpdate")
             .finish_non_exhaustive()
     }
 }
@@ -1512,7 +1510,7 @@ impl WasmDocumentCheckpoint {
     }
 }
 handle_type!(WasmChangeCursorHandle);
-handle_type!(WasmResolutionCursorHandle);
+handle_type!(WasmColumnMergeCursorHandle);
 handle_type!(WasmEditCursorHandle);
 handle_type!(WasmByteOutputsHandle);
 handle_type!(WasmTransitionHandle);
@@ -1634,93 +1632,6 @@ impl WasmChangeDrainValidator {
         if self.attachment_refs > self.limits.max_attachment_refs {
             return Err(invalid_param(
                 "component attachment reference count exceeds its limit",
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn accept_eof(&mut self) {
-        self.reached_eof = true;
-    }
-}
-
-/// Cross-page validator for static conflict-resolution output. Input/output
-/// cardinality and selected-side availability are checked by the merge
-/// drainer, which owns the corresponding conflict stream; this validator owns
-/// cursor framing, attachment, page, and EOF invariants.
-#[derive(Debug, Clone, Copy)]
-pub struct WasmConflictResolutionDrainValidator {
-    limits: WasmTransitionLimits,
-    pages: u32,
-    attachment_refs: u32,
-    reached_eof: bool,
-}
-
-impl WasmConflictResolutionDrainValidator {
-    pub fn new(limits: WasmTransitionLimits) -> Result<Self, LixError> {
-        Ok(Self {
-            limits: limits.validate()?,
-            pages: 0,
-            attachment_refs: 0,
-            reached_eof: false,
-        })
-    }
-
-    pub fn accept_page(&mut self, page: &WasmConflictResolutionPage) -> Result<(), LixError> {
-        if self.reached_eof {
-            return Err(invalid_param(
-                "a component resolution cursor advanced after EOF",
-            ));
-        }
-        if page.format_version != PACKET_FORMAT_V1 {
-            return Err(invalid_param(
-                "unsupported component resolution packet format version",
-            ));
-        }
-        if page.resolutions.is_empty() {
-            return Err(invalid_param(
-                "a component resolution page must not be empty",
-            ));
-        }
-        if page.ordinals.len() != page.resolutions.len() {
-            return Err(invalid_param(
-                "a component resolution page must carry one ordinal per resolution",
-            ));
-        }
-        self.pages = self
-            .pages
-            .checked_add(1)
-            .ok_or_else(|| invalid_param("component resolution page count overflowed"))?;
-        if self.pages > self.limits.max_pages {
-            return Err(invalid_param(
-                "component resolution page count exceeds its limit",
-            ));
-        }
-
-        let mut page_refs = 0u32;
-        for resolution in &page.resolutions {
-            if let WasmConflictResolution::Replace {
-                snapshot_content: WasmGuestBytes::Output(range),
-                ..
-            } = resolution
-            {
-                range
-                    .offset
-                    .checked_add(range.length)
-                    .ok_or_else(|| invalid_param("component resolution output range overflowed"))?;
-                page_refs = page_refs.checked_add(1).ok_or_else(|| {
-                    invalid_param("component attachment reference count overflowed")
-                })?;
-            }
-        }
-        validate_attachment_table_presence(page_refs, page.outputs.is_some())?;
-        self.attachment_refs = self
-            .attachment_refs
-            .checked_add(page_refs)
-            .ok_or_else(|| invalid_param("component attachment reference count overflowed"))?;
-        if self.attachment_refs > self.limits.max_attachment_refs {
-            return Err(invalid_param(
-                "component resolution attachment reference count exceeds its limit",
             ));
         }
         Ok(())
@@ -1860,6 +1771,7 @@ pub struct WasmFileTransition {
     pub transition: WasmTransitionHandle,
     pub document: WasmDocumentHandle,
     pub changes: WasmChangeCursorHandle,
+    pub replace_all_rows: bool,
 }
 
 /// One immutable, host-validated semantic batch which remains encoded until
@@ -1904,13 +1816,10 @@ pub struct WasmRowTransition {
     pub edits: WasmEditCursorHandle,
 }
 
-/// Static conflict-resolution output has no successor document. The existing
-/// semantic renderer consumes the validated result afterwards and produces
-/// the one materialized file transition for the merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WasmConflictTransition {
+pub struct WasmColumnMergeTransition {
     pub transition: WasmTransitionHandle,
-    pub resolutions: WasmResolutionCursorHandle,
+    pub results: WasmColumnMergeCursorHandle,
 }
 
 /// A compiled Component. Implementations share this factory but create one
@@ -2012,14 +1921,14 @@ pub trait WasmComponentActor: Send {
         update: WasmRowUpdate,
     ) -> Result<WasmRowTransition, LixError>;
 
-    async fn resolve_conflicts(
+    async fn merge_columns(
         &mut self,
         limits: WasmTransitionLimits,
-        update: WasmConflictUpdate,
-    ) -> Result<WasmConflictTransition, LixError> {
+        update: WasmColumnMergeUpdate,
+    ) -> Result<WasmColumnMergeTransition, LixError> {
         let _ = (limits, update);
         Err(invalid_param(
-            "this component component actor does not implement conflict resolution",
+            "this component actor does not implement column merging",
         ))
     }
 
@@ -2041,15 +1950,15 @@ pub trait WasmComponentActor: Send {
         Vec::new()
     }
 
-    async fn next_resolution_page(
+    async fn next_column_merge_result_page(
         &mut self,
         transition: WasmTransitionHandle,
-        cursor: WasmResolutionCursorHandle,
+        cursor: WasmColumnMergeCursorHandle,
         max_bytes: u32,
-    ) -> Result<Option<WasmConflictResolutionPage>, LixError> {
+    ) -> Result<Option<WasmColumnMergeResultPage>, LixError> {
         let _ = (transition, cursor, max_bytes);
         Err(invalid_param(
-            "this component component actor does not implement conflict resolution",
+            "this component actor does not expose column merge results",
         ))
     }
 
@@ -2151,12 +2060,24 @@ mod tests {
 
     fn descriptor(generation: &str) -> WasmFileDescriptor {
         WasmFileDescriptor {
+            file_id: "file-1".to_owned(),
             path: Some("data.csv".to_owned()),
             plugin: WasmPluginSelection {
                 plugin_key: "plugin_csv".to_owned(),
                 generation: generation.to_owned(),
             },
         }
+    }
+
+    #[test]
+    fn warm_successor_rejects_a_different_stable_file_id() {
+        let before = descriptor("generation-1");
+        let mut after = before.clone();
+        after.file_id = "file-2".to_owned();
+        let error = before
+            .validate_warm_successor(&after)
+            .expect_err("a warm transition cannot cross file identities");
+        assert!(error.message.contains("stable file id"));
     }
 
     #[test]
@@ -2416,6 +2337,8 @@ mod tests {
             }],
             after,
             creates: WasmCreateContext { high: 1, low: 2 },
+            rows: None,
+            prior_row_keys: None,
         };
         update.validate(WasmTransitionLimits::default()).unwrap();
 
@@ -2627,14 +2550,23 @@ mod tests {
     }
 
     #[test]
-    fn production_wit_is_versioned_and_fused() {
+    fn production_wit_is_versioned_and_row_first() {
         let wit = include_str!("../../../wit/lix-plugin.wit");
         assert!(wit.starts_with("package lix:plugin@1.0.0;"));
         assert!(wit.contains("resource transition"));
-        assert!(wit.contains("apply:"));
-        assert!(wit.contains("rows-changed("));
-        assert!(!wit.contains("resolution-effect"));
-        assert!(!wit.contains("record restore-request {\n    path:"));
-        assert!(wit.contains("resolve-conflicts:"));
+        assert!(wit.contains("interface column-merger"));
+        assert!(wit.contains("interface file-projection"));
+        assert!(wit.contains("parse-changes: func("));
+        assert!(wit.contains("serialize-changes: func("));
+        assert!(wit.contains("world column-merger-plugin"));
+        assert!(wit.contains("world file-projection-plugin"));
+        assert!(!wit.contains("resolve-conflicts"));
+        for packaged_copy in [
+            include_str!("../../../../lix-plugin-bindings-column-merger/wit/lix-plugin.wit"),
+            include_str!("../../../../lix-plugin-bindings-combined/wit/lix-plugin.wit"),
+            include_str!("../../../../lix-plugin-bindings-file-projection/wit/lix-plugin.wit"),
+        ] {
+            assert_eq!(packaged_copy, wit, "published binding WIT must stay exact");
+        }
     }
 }

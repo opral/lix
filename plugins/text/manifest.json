@@ -1,6 +1,6 @@
 {
   "key": "plugin_text",
-  "match": {
+  "file_match": {
     "path_glob": "*",
     "content": { "prefix_excludes": { "byte": 0, "bytes": 8000 } }
   },

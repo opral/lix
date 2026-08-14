@@ -6,11 +6,11 @@ mod benchmark_metrics;
 
 use bytes::Bytes;
 use lix::plugin::runtime::{
-    WasmByteSource, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
-    WasmCreateContext, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate, WasmHostBytes,
-    WasmHostRow, WasmInputBytes, WasmInputSplice, WasmOpenRowsInput, WasmPluginSelection, WasmRow,
-    WasmRowChange, WasmRowKey, WasmRowPage, WasmRowSource, WasmRuntime, WasmSourceRange,
-    WasmSourceSlice, WasmTransitionCounters, WasmTransitionLimits,
+    PluginCapabilities, WasmByteSource, WasmColdFileUpdate, WasmComponentActor,
+    WasmComponentFactory, WasmCreateContext, WasmFileDescriptor, WasmFileTransition,
+    WasmFileUpdate, WasmHostBytes, WasmHostRow, WasmInputBytes, WasmInputSplice, WasmOpenRowsInput,
+    WasmPluginSelection, WasmRow, WasmRowChange, WasmRowKey, WasmRowPage, WasmRowSource,
+    WasmRuntime, WasmSourceRange, WasmSourceSlice, WasmTransitionCounters, WasmTransitionLimits,
 };
 use lix::storage::{
     BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
@@ -23,7 +23,7 @@ use lix::storage_bench::{layout_space_catalog, space_inventory};
 use lix::wasm::WasmLimits;
 use lix::{
     CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, MergeBranchOptions,
-    MergeBranchPreviewOptions, MergeConflictChangeKind, SwitchBranchOptions,
+    MergeBranchPreviewOptions, SwitchBranchOptions,
 };
 use lix::{Value, open_lix};
 use lix_storage_filesystem::FilesystemStorage;
@@ -218,6 +218,7 @@ impl WasmRuntime for HistoryRejectingRuntime {
         &self,
         _bytes: Vec<u8>,
         _limits: WasmLimits,
+        _capabilities: PluginCapabilities,
     ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
         self.compile_calls.fetch_add(1, Ordering::SeqCst);
         Err(LixError::new(
@@ -2749,7 +2750,7 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
 }
 
 #[tokio::test]
-async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
+async fn v2_csv_delete_vs_edit_fails_ownership_without_a_plugin_conflict_api() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -2795,7 +2796,7 @@ async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
          WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Json(serde_json::json!(["alpha", "ONE", "red"]).into()),
-            Value::Text(row_id),
+            Value::Text(row_id.clone()),
             Value::Text(file_id.clone()),
         ],
     )
@@ -2812,43 +2813,28 @@ async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
             source_branch_id: source.id.clone(),
         })
         .await
-        .expect("lifecycle conflict should still preview");
-    let lifecycle_conflict = preview
-        .conflicts
-        .iter()
-        .find(|conflict| {
-            conflict.schema_key == "lix_binary_blob_ref"
-                && conflict.file_id.as_deref() == Some(file_id.as_str())
-        })
-        .expect("delete-vs-edit must remain visible as a file-lifecycle conflict");
-    assert_eq!(
-        lifecycle_conflict.target.kind,
-        MergeConflictChangeKind::Removed
-    );
-    assert_eq!(
-        lifecycle_conflict.source.kind,
-        MergeConflictChangeKind::Modified
-    );
+        .expect("delete-vs-edit should preview with host-native LWW");
+    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
 
     let error = lix
         .merge_branch(MergeBranchOptions {
             source_branch_id: source.id,
         })
         .await
-        .expect_err("delete-vs-edit requires a first-class lifecycle decision");
-    assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
+        .expect_err("delete-vs-edit currently fails the ordinary ownership constraint");
+    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
 
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         None,
-        "a rejected lifecycle merge must not partially restore the file"
+        "the target-side file deletion wins while the source row edit cannot restore its descriptor"
     );
 
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
+async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -2890,7 +2876,6 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
     )
     .await
     .expect("target same-row edit should commit");
-
     lix.switch_branch(SwitchBranchOptions {
         branch_id: source.id.clone(),
     })
@@ -2909,7 +2894,7 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
         "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Json(serde_json::json!(["SOURCE", "one", "red"]).into()),
-            Value::Text(row_id),
+            Value::Text(row_id.clone()),
             Value::Text(file_id.clone()),
         ],
     )
@@ -2926,23 +2911,20 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
             source_branch_id: source.id.clone(),
         })
         .await
-        .expect("descriptor-divergent merge should still preview");
-    assert!(preview.conflicts.iter().any(|conflict| {
-        conflict.schema_key == "csv_row" && conflict.file_id.as_deref() == Some(file_id.as_str())
-    }));
+        .expect("descriptor rename and row edit should preview");
+    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
 
     let error = lix
         .merge_branch(MergeBranchOptions {
             source_branch_id: source.id,
         })
         .await
-        .expect_err("a resolver must not mix target CSV bytes with source TSV metadata");
-    assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
+        .expect_err("descriptor-plus-row reconciliation needs a future cross-row API");
+    assert_eq!(error.code, LixError::CODE_UNIQUE);
 
     assert_eq!(
         read_file(&lix, csv_path).await.unwrap(),
-        Some(b"TARGET,one,red\n".to_vec()),
-        "a rejected merge must preserve the target descriptor and bytes"
+        Some(b"TARGET,one,red\n".to_vec())
     );
     assert_eq!(read_file(&lix, tsv_path).await.unwrap(), None);
 
@@ -4040,10 +4022,18 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
         .expect("read JSON component");
     let runtime = lix::default_wasm_runtime().expect("default Wasm runtime");
     let factory = runtime
-        .compile_component(wasm, WasmLimits::default())
+        .compile_component(
+            wasm,
+            WasmLimits::default(),
+            PluginCapabilities {
+                column_merger: false,
+                file_projection: true,
+            },
+        )
         .await
         .expect("compile JSON component");
     let descriptor = WasmFileDescriptor {
+        file_id: "direct-cold-json".to_owned(),
         path: Some("/direct-cold.json".to_owned()),
         plugin: WasmPluginSelection {
             plugin_key: "plugin_json".to_owned(),
@@ -4213,10 +4203,15 @@ async fn v3_json_direct_cold_successor_benchmark() {
                 max_memory_bytes: 128 * 1024 * 1024,
                 ..WasmLimits::default()
             },
+            PluginCapabilities {
+                column_merger: false,
+                file_projection: true,
+            },
         )
         .await
         .unwrap();
     let descriptor = WasmFileDescriptor {
+        file_id: "direct-cold-large-json".to_owned(),
         path: Some("/direct-cold-large.json".to_owned()),
         plugin: WasmPluginSelection {
             plugin_key: "plugin_json".to_owned(),
@@ -4278,6 +4273,8 @@ async fn v3_json_direct_cold_successor_benchmark() {
                             }],
                             after: after_source,
                             creates,
+                            rows: None,
+                            prior_row_keys: None,
                         },
                     )
                     .await
@@ -6397,7 +6394,6 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
     write_file(&lix, path, base.clone())
         .await
         .expect("base CSV should import");
-    let file_id = file_id_at_path(&lix, path).await;
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
@@ -6437,16 +6433,13 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
     .await
     .unwrap();
 
-    let preview = lix
+    let preview_error = lix
         .merge_branch_preview(MergeBranchPreviewOptions {
             source_branch_id: source.id.clone(),
         })
         .await
-        .expect("generation-divergent merge should still preview");
-    assert!(preview.conflicts.iter().any(|conflict| {
-        conflict.schema_key == "lix_binary_blob_ref"
-            && conflict.file_id.as_deref() == Some(file_id.as_str())
-    }));
+        .expect_err("generation-divergent preview must abort before row reconciliation");
+    assert_eq!(preview_error.code, LixError::CODE_MERGE_CONFLICT);
 
     let error = lix
         .merge_branch(MergeBranchOptions {
@@ -7072,18 +7065,24 @@ where
     winner_lix
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ($1, 'winner')",
-            &[Value::Text(stale_key)],
+            &[Value::Text(stale_key.clone())],
         )
         .await
         .expect("publish winner owner");
-    assert_eq!(
-        stale
-            .commit()
-            .await
-            .expect_err("stale owner must conflict")
-            .code,
-        LixError::CODE_UNIQUE
-    );
+    stale
+        .commit()
+        .await
+        .expect("same-row stale inserts resolve by deterministic row-existence LWW");
+    let result = stale_lix
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = $1",
+            &[Value::Text(stale_key)],
+        )
+        .await
+        .expect("read reconciled owner");
+    assert_eq!(result.len(), 1);
+    let value = result.rows()[0].get::<serde_json::Value>("value").unwrap();
+    assert!(value == "stale" || value == "winner");
 }
 
 #[tokio::test]

@@ -11,6 +11,9 @@ import {
 
 const CRATES_IO_PACKAGES = new Set([
 	"lix",
+	"lix-plugin-bindings-column-merger",
+	"lix-plugin-bindings-combined",
+	"lix-plugin-bindings-file-projection",
 	"lix-schema",
 	"lix-storage-filesystem",
 	"lix-storage-rocksdb",

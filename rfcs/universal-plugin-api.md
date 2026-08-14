@@ -13,47 +13,57 @@ branches in the engine, or incomplete cold/reopen behavior are not acceptable.
 
 ## Selected author surface
 
-One required trait makes every file lifecycle visible at compile time:
+Capabilities are independent. Ordinary schemas need no executable component:
+Lix merges row snapshots column by column, using deterministic LWW only for a
+column changed differently on both sides. A schema-owning plugin may opt into
+`ColumnMerger` for those overlaps:
 
 ```rust
-pub trait Plugin: 'static {
-    fn open(input: &OpenFile<'_>, output: &mut Output<'_>) -> Result<()>;
-    fn file_changed(input: &FileUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
-    fn rows_changed(input: &mut RowUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
-    fn restore(input: &mut RestoreFile<'_>, output: &mut Output<'_>) -> Result<()>;
-    fn cold_file_changed(input: &mut ColdUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
-
-    fn resolve_conflict(conflict: RowConflict<'_>) -> Result<ConflictResolution> {
-        Ok(conflict.take_b_or_delete())
-    }
+pub trait ColumnMerger: 'static {
+    fn merge(input: ColumnMerge<'_>) -> Result<ColumnMergeResult>;
 }
 
-struct NotePlugin;
-
-// After implementing every callback above, export the Component entry point.
-lix::plugin::export!(NotePlugin);
+// `b` is the host's canonically later value. Most mergers return UseLww for
+// columns they do not understand and Replace only the domain-specific value.
 ```
 
-The export macro is required in the plugin crate. Without it, the Rust code may
-compile but the resulting Wasm component has no Lix plugin export.
+Files are only a projection of rows. A file format additionally implements all
+four directions so incremental behavior is explicit at compile time:
 
-The WIT has one stateful export, `apply(transition-request, transition)`, whose
-request variant uses the same five names. Conflict resolution is the only
-separate stateless export.
+```rust
+pub trait FileProjection: 'static {
+    fn parse(input: ParseInput<'_>, output: &mut RowOutput<'_, '_>) -> Result<()>;
+    fn parse_changes(
+        input: ParseChangesInput<'_>,
+        output: &mut RowChangeOutput<'_, '_>,
+    ) -> Result<()>;
+    fn serialize(input: SerializeInput<'_>, output: &mut FileOutput<'_, '_>) -> Result<()>;
+    fn serialize_changes(
+        input: SerializeChangesInput<'_>,
+        output: &mut FileEditOutput<'_, '_>,
+    ) -> Result<()>;
+}
 
-Normal row output is one typed call:
+lix::plugin::export_capabilities! {
+    column_merger: MarkdownMerger,
+    file_projection: MarkdownProjection,
+}
+```
+
+Export presence is the capability declaration. The Component has three valid
+shapes: column merger only, file projection only, or both. There are no
+manifest capability flags and no disabled placeholder exports. A schemas-only
+plugin has neither `entry` nor Wasm.
+
+Normal row output remains one typed call:
 
 ```rust
 let id = input.creates.id(0);
 let snapshot = format!(r#"{{"body":"hello","id":"{id}"}}"#);
-output.row(RowMutation::Create {
-    schema_key: "note",
-    local_ref: 0,
-    snapshot: snapshot.as_bytes(),
-})?;
+output.create("note", 0, snapshot.as_bytes())?;
 ```
 
-`Output::row` owns record framing, page limits, create-page separation,
+`RowOutput` owns record framing, page limits, create-page separation,
 record counts, automatic flushing, and host errors. Authors do not implement a
 packet codec. Creates carry the complete canonical snapshot; the host validates
 its generated primary key against `local_ref`. This is the only row output
@@ -75,30 +85,35 @@ example, `{"body":"hello","id":"..."}` is canonical while
 12-byte namespace for persisted plugin state, and reconstruction from those
 bytes. Its host representation is not author API.
 
-Cold input has one byte-authority shape:
+Incremental file parsing receives the accepted byte/state snapshot, sparse byte
+edits, and a create context. Cold execution additionally receives complete
+current rows for identity-preserving recovery; the warm 90% path leaves them
+absent:
 
 ```rust
-pub struct ColdUpdate<'a> {
-    pub before_path: String,
-    pub after_path: String,
-    pub before: Snapshot<'a>,
-    pub edits: Vec<FileEdit>,
-    pub rows: RowReader<'a>,
+pub struct ParseChangesInput<'a> {
+    pub file_id: &'a str,
+    pub before_path: &'a str,
+    pub after_path: &'a str,
+    pub before: ProjectionSnapshot<'a>,
+    pub file_edits: FileEditReader<'a>,
+    pub rows: Option<RowReader<'a>>,
     pub creates: CreateContext,
 }
 ```
 
-Every plugin lifecycle path is a required resolved string. The engine may use
-an absent path internally for unowned file states, but it rejects that state at
-the Component boundary instead of exposing an impossible `Option` branch to
-plugin authors. Restore remains descriptor-free by design.
+Every file projection path has a stable file ID and resolved path. Column
+merging does not: `file_id` is optional, so the same merger works for ordinary
+application rows (for example a conversation body) and rows projected from a
+file. Creation/deletion races remain whole-row LWW; plugins cannot change row
+identity or raise cross-row conflicts in v1.
 
 ## One row page in both directions
 
 Every row input and output crosses the Component boundary as the same
 bounded `row-page` byte envelope. A page has exactly one snapshot section;
 the codec does not expose representations, layouts, or manual page sizing.
-The typed SDK batches `Output::row` calls and flushes pages automatically.
+The typed SDK batches `RowOutput` mutations and flushes pages automatically.
 
 Large snapshots use a bounded attachment referenced by the page. Inputs and
 outputs remain paged; neither side requires a complete row collection or a
@@ -110,8 +125,8 @@ page limit, and a larger snapshot automatically uses an attachment. Profiling
 showed that this target preserves sparse point reads while amortizing Component
 calls on dense imports.
 
-Restore and cold transitions expose `RowReader`, whose items always contain
-a snapshot. Only `rows_changed` uses `RowChangeReader` and can yield a
+`serialize` and cold `parse_changes` expose `RowReader`, whose items always
+contain a snapshot. Only `serialize_changes` uses `RowChangeReader` and can yield a
 tombstone, so plugin authors do not repeat impossible-state checks.
 
 The engine validates complete typed creates generically; it does not branch on
@@ -120,7 +135,7 @@ CSV, Markdown, text, or any plugin/schema key.
 ### CSV A/B result
 
 The 10.68 MB / 220,001-row RocksDB import benchmark compared the removed dense
-row encoding with streaming `Output::row` snapshots. The universal path
+row encoding with streaming `RowOutput` snapshots. The universal path
 kept guest high-water memory unchanged at 28,639,232 bytes and changed median
 latency from 1,234.95 ms to 1,272.17 ms (+3.01%). P95 changed from 1,830.85 ms
 to 1,880.19 ms (+2.69%). Allocated bytes increased 0.13%, allocation count fell
@@ -131,13 +146,14 @@ for every plugin, so the dense authoring lane is removed.
 
 ## Manifest
 
-The author manifest keeps `entry` and omits constants already fixed by the
-component contract:
+The author manifest keeps `entry` only for executable capabilities and
+`file_match` only for a file projection. A row-only merger has `entry` but no
+matcher; a schemas-only plugin has neither:
 
 ```json
 {
   "key": "plugin_notes",
-  "match": {
+  "file_match": {
     "path_glob": "*.notes",
     "content": "text"
   },
@@ -163,7 +179,11 @@ and no format-specific selection rules.
 - direct cold update after eviction or restart;
 - lazy ranged file/state/attachment reads;
 - streamed file replacement;
-- conflict `take` does not copy selected snapshots through Wasm;
+- default column-based LWW makes no Wasm call;
+- a custom merger receives only same-column overlaps, with lazy complete rows
+  as context, and can replace only that column;
+- branch merges, stale commits, and commit cohorts share the same row merge;
+- row-only merging requires no file path, projection state, or document actor;
 - no engine/runtime branch on plugin keys, schema keys, or format names;
 - exact bytes, complete semantic rows, history, reopen, and cold successor
   remain correct.
@@ -193,11 +213,48 @@ envelope boundary allowance. A slightly larger result may still be selected
 only when the surface reduction is explicit and structural scaling remains
 bounded.
 
-## Measured decision
+## Row-first hard-cut profile
 
-Selected: the universal page and author surface above. Measurements compare the
-candidate with a frozen pre-change worktree on the same machine. Each lane used
-five discarded warmups followed by 21 release samples pinned to CPUs 0-3.
+The public SQL workflow benchmark compares this cut with exact `origin/main`
+`d2c634b2aeb780aff46013ec04902fcbb5c6f846`. Both worktrees use byte-identical
+fixtures and benchmark code, optimized builds, and 51 recorded samples per
+lane. Projection lanes verify exact bytes. Merge lanes verify the intended
+semantic result: both disjoint Markdown edits survive, and the two CSV column
+edits compose. Ratios below are candidate divided by baseline.
+
+This is a supplemental in-process regression check, not the comprehensive
+protocol above: it records elapsed time and Rust cumulative/peak allocation,
+but does not claim RSS, guest-memory, Component-call, or boundary-byte results.
+
+| Lane | p50 | p95 | allocated bytes | peak live bytes |
+| --- | ---: | ---: | ---: | ---: |
+| CSV file roundtrip | 1.016 | 1.084 | 0.993 | 1.031 |
+| CSV sparse file update | 1.026 | 1.120 | 1.033 | 1.002 |
+| JSON file roundtrip | 1.008 | 0.997 | 1.025 | 1.001 |
+| JSON sparse file update | 0.975 | 0.982 | 0.959 | 0.973 |
+| Markdown file roundtrip | 0.965 | 0.944 | 0.931 | 0.928 |
+| Markdown sparse file update | 0.971 | 0.949 | 1.021 | 1.000 |
+| Text file roundtrip | 0.914 | 0.914 | 0.887 | 0.888 |
+| Text sparse file update | 0.970 | 0.955 | 0.928 | 0.872 |
+| Excalidraw file roundtrip | 1.050 | 1.036 | 1.017 | 1.019 |
+| Excalidraw sparse file update | 0.961 | 0.831 | 1.006 | 1.004 |
+| Markdown same-row text merge | 1.002 | 0.955 | 1.039 | 0.989 |
+| CSV same-row column merge | 1.067 | 1.106 | 0.992 | 0.981 |
+
+Every reported ratio passes its corresponding in-process threshold. The sparse
+result depends on a deliberate API property: warm `parse_changes` receives file
+edits and plugin state without hydrating complete durable rows. If it elects to
+replace all rows, the host lazily materializes predecessor identities only;
+cold execution receives complete rows when identity recovery is required.
+
+## Historical projection baseline
+
+The measurements below selected the universal page and incremental projection
+surface before the row-first merge cut. They compare that earlier projection
+candidate with its own frozen predecessor; they do not measure `ColumnMerger`,
+capability discovery, or the removal of file-scoped conflict resolution. Each
+lane used five discarded warmups followed by 21 release samples pinned to CPUs
+0-3.
 
 | Lane | Candidate / baseline p50 | p95 | allocated bytes | peak live bytes | process RSS |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -210,21 +267,22 @@ five discarded warmups followed by 21 release samples pinned to CPUs 0-3.
 | Markdown VS Code API edit | 0.824 | 0.841 | 0.570 | 1.000 | 0.990 |
 | Excalidraw localized edit | 1.031 | 0.904 | 0.999 | 1.000 | 0.979 |
 
-All scored ratios pass the gates above. Process RSS is an external maximum-RSS
+All scored ratios passed the projection gates above. Process RSS is an external maximum-RSS
 measurement around the complete 21-sample process; it is reported separately
 from the in-process allocation scorecard. Correctness tests cover exact output,
 row cardinality and history, reopen, direct cold successor, generated-ID
 stability, and oversized attachment streaming for all applicable formats.
 
-The timing matrix measures import, sparse, and cold behavior for CSV and JSON,
+This historical timing matrix measures import, sparse, and cold behavior for CSV and JSON,
 and representative warm sparse transitions for Markdown and Excalidraw. Cold
 and reopen behavior for Markdown and Excalidraw is correctness-tested but is not
 a dedicated timed lane. Universal row pages are exercised in both ABI
 directions, but there is no isolated row-to-file microbenchmark. Those are
 explicit coverage limits, not inferred performance claims.
 
-Machine-readable summaries, captured sample logs, external RSS records, and the
-passing scorecard are stored outside the worktree in
+For this historical projection matrix, machine-readable summaries, captured
+sample logs, external RSS records, and the passing scorecard are stored outside
+the worktree in
 `/root/projects/lix-profile-results/final` so Cargo cleanup does not remove the
 evidence. The scorecard executable enforces the guest high-water and RSS gates
 from those logs in addition to its in-process metrics.

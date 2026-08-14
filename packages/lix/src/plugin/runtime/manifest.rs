@@ -17,9 +17,10 @@ pub enum PluginRuntime {
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
     pub key: String,
-    #[serde(rename = "match")]
-    pub file_match: PluginMatch,
-    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_match: Option<PluginMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
     pub schemas: Vec<String>,
 }
 
@@ -95,15 +96,17 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
             )
         })?;
     validate_plugin_manifest(&manifest)?;
-    compile_path_glob(&manifest.file_match.path_glob).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            format!(
-                "Plugin manifest path_glob '{}' is invalid: {error}",
-                manifest.file_match.path_glob
-            ),
-        )
-    })?;
+    if let Some(file_match) = &manifest.file_match {
+        compile_path_glob(&file_match.path_glob).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "Plugin manifest path_glob '{}' is invalid: {error}",
+                    file_match.path_glob
+                ),
+            )
+        })?;
+    }
     let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -151,11 +154,23 @@ fn validate_plugin_manifest(manifest: &PluginManifest) -> Result<(), LixError> {
     if !valid_key {
         return invalid_manifest("key must match ^[a-z][a-z0-9_-]*$ and contain at most 128 bytes");
     }
-    if !(1..=1024).contains(&manifest.file_match.path_glob.len()) {
-        return invalid_manifest("match.path_glob must contain between 1 and 1024 bytes");
+    if let Some(file_match) = &manifest.file_match {
+        if !(1..=1024).contains(&file_match.path_glob.len()) {
+            return invalid_manifest("file_match.path_glob must contain between 1 and 1024 bytes");
+        }
+        if let Some(PluginContentMatcher::PrefixExcludes { bytes, .. }) = file_match.content
+            && !(1..=16_777_216).contains(&bytes)
+        {
+            return invalid_manifest("file_match.content.prefix_excludes.bytes is out of range");
+        }
     }
-    if !(1..=512).contains(&manifest.entry.len()) {
+    if let Some(entry) = &manifest.entry
+        && !(1..=512).contains(&entry.len())
+    {
         return invalid_manifest("entry must contain between 1 and 512 bytes");
+    }
+    if manifest.file_match.is_some() && manifest.entry.is_none() {
+        return invalid_manifest("file_match requires entry");
     }
     if !(1..=64).contains(&manifest.schemas.len()) {
         return invalid_manifest("schemas must contain between 1 and 64 entries");
@@ -168,11 +183,6 @@ fn validate_plugin_manifest(manifest: &PluginManifest) -> Result<(), LixError> {
         if !schemas.insert(schema) {
             return invalid_manifest("schemas entries must be unique");
         }
-    }
-    if let Some(PluginContentMatcher::PrefixExcludes { bytes, .. }) = manifest.file_match.content
-        && !(1..=16_777_216).contains(&bytes)
-    {
-        return invalid_manifest("match.content.prefix_excludes.bytes is out of range");
     }
     Ok(())
 }
@@ -200,7 +210,7 @@ mod tests {
         let validated = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_json",
-                "match":{"path_glob":"*.json"},
+                "file_match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
             }"#,
@@ -208,7 +218,67 @@ mod tests {
         .expect("manifest should parse");
 
         assert_eq!(validated.manifest.key, "plugin_json");
-        assert_eq!(validated.manifest.entry, "plugin.wasm");
+        assert_eq!(validated.manifest.entry.as_deref(), Some("plugin.wasm"));
+    }
+
+    #[test]
+    fn parses_schema_only_manifest() {
+        let validated = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_notes",
+                "schemas":["schema/note.json"]
+            }"#,
+        )
+        .expect("schema-only manifest should parse");
+
+        assert_eq!(validated.manifest.entry, None);
+        assert_eq!(validated.manifest.file_match, None);
+    }
+
+    #[test]
+    fn parses_row_only_component_manifest() {
+        let validated = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_notes",
+                "entry":"plugin.wasm",
+                "schemas":["schema/note.json"]
+            }"#,
+        )
+        .expect("row-only component manifest should parse");
+
+        assert_eq!(validated.manifest.entry.as_deref(), Some("plugin.wasm"));
+        assert_eq!(validated.manifest.file_match, None);
+    }
+
+    #[test]
+    fn rejects_file_match_without_entry() {
+        let error = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_notes",
+                "file_match":{"path_glob":"*.notes"},
+                "schemas":["schema/note.json"]
+            }"#,
+        )
+        .expect_err("file projection requires an executable component");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("file_match requires entry"));
+    }
+
+    #[test]
+    fn rejects_legacy_match_field() {
+        let error = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_json",
+                "match":{"path_glob":"*.json"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"]
+            }"#,
+        )
+        .expect_err("the hard cut must reject the legacy match field");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("match"));
     }
 
     #[test]
@@ -217,7 +287,7 @@ mod tests {
             r#"{
                 "key":"plugin_csv",
                 "runtime":"wasm-component",
-                "match":{"path_glob":"*.csv"},
+                "file_match":{"path_glob":"*.csv"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/csv_row.json"]
             }"#,
@@ -234,7 +304,7 @@ mod tests {
             r#"{
                 "key":"plugin_csv",
                 "api_version":"1.0.0",
-                "match":{"path_glob":"*.csv"},
+                "file_match":{"path_glob":"*.csv"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/csv_row.json"]
             }"#,
@@ -251,7 +321,7 @@ mod tests {
             r#"{
                 "key":"plugin_csv",
                 "materialization":"blob",
-                "match":{"path_glob":"*.csv"},
+                "file_match":{"path_glob":"*.csv"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/csv_row.json"]
             }"#,
@@ -266,7 +336,7 @@ mod tests {
     fn rejects_invalid_manifest() {
         let err = parse_plugin_manifest_json(
             r#"{
-                "match":{"path_glob":"*.json"},
+                "file_match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
             }"#,
@@ -283,7 +353,7 @@ mod tests {
         let error = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_markdown",
-                "match":{"path_glob":"*.{md,mdx"},
+                "file_match":{"path_glob":"*.{md,mdx"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
             }"#,
@@ -337,7 +407,7 @@ mod tests {
         let validated = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_text",
-                "match":{"path_glob":"**/*", "content":"text"},
+                "file_match":{"path_glob":"**/*", "content":"text"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
             }"#,
@@ -345,7 +415,11 @@ mod tests {
         .expect("manifest should parse");
 
         assert_eq!(
-            validated.manifest.file_match.content,
+            validated
+                .manifest
+                .file_match
+                .expect("file matcher should be present")
+                .content,
             Some(PluginContentMatcher::Text)
         );
     }
@@ -355,7 +429,7 @@ mod tests {
         let err = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_markdown",
-                "match":{"path_glob":"*.{md,mdx}"},
+                "file_match":{"path_glob":"*.{md,mdx}"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"],
                 "detect_changes": {
@@ -375,7 +449,7 @@ mod tests {
     fn manifest_with(path_glob: &str, schemas: &[String]) -> String {
         serde_json::json!({
             "key": "plugin_bounds",
-            "match": { "path_glob": path_glob },
+            "file_match": { "path_glob": path_glob },
             "entry": "plugin.wasm",
             "schemas": schemas,
         })

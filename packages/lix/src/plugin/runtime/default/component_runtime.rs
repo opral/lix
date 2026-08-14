@@ -1,9 +1,9 @@
-//! Host-owned arena runtime for the fused Component API.
+//! Host-owned arena runtime for the row-first Component API.
 //!
 //! File bytes and opaque plugin state live in immutable host roots; one
 //! exported guest call reads sparse ranges and pushes bounded semantic pages.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -16,16 +16,17 @@ use lix::plugin::runtime::v1::{
     Transaction as ArenaTransaction,
 };
 use lix::plugin::runtime::{
-    PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmCertifiedCreateRange, WasmCertifiedRowBatch,
-    WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmColdFileUpdate,
-    WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictResolutionPage,
-    WasmConflictTake, WasmConflictTransition, WasmConflictUpdate, WasmCreateContext,
-    WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
+    PACKET_FORMAT_V1, PluginCapabilities, WasmByteOutputsHandle, WasmCertifiedCreateRange,
+    WasmCertifiedRowBatch, WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage,
+    WasmColdFileUpdate, WasmColumnMergeCursorHandle,
+    WasmColumnMergeResult as RuntimeColumnMergeResult, WasmColumnMergeResultPage,
+    WasmColumnMergeTransition, WasmColumnMergeUpdate, WasmComponentActor, WasmComponentFactory,
+    WasmCreateContext, WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
     WasmEditCursorHandle, WasmEditPage, WasmFileTransition, WasmFileUpdate, WasmGuestBytes,
-    WasmHostBytes, WasmHostRowConflict, WasmInputBytes, WasmOpenFileInput, WasmOpenRowsInput,
-    WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle, WasmRow, WasmRowChange,
-    WasmRowChanges, WasmRowKey, WasmRowTransition, WasmRowUpdate, WasmTransitionCounters,
-    WasmTransitionHandle, WasmTransitionLimits,
+    WasmHostBytes, WasmHostColumnMerge, WasmInputBytes, WasmOpenFileInput, WasmOpenRowsInput,
+    WasmOutputRange, WasmOutputSplice, WasmRow, WasmRowChange, WasmRowChanges, WasmRowKey,
+    WasmRowTransition, WasmRowUpdate, WasmTransitionCounters, WasmTransitionHandle,
+    WasmTransitionLimits,
 };
 use lix::wasm::WasmLimits;
 use lix::{LixError, SharedStr};
@@ -39,9 +40,9 @@ use super::{
 
 // Warm transitions normally retain the engine's 2 MiB fixed page schedule.
 // Cold admission may scale as high as 16 MiB so a valid single text row
-// (for example a one-line source map) can cross the fused push sink.
+// (for example a one-line source map) can cross the Component push sink.
 const COMPONENT_MAX_BATCH_BYTES: u32 = 16 * 1024 * 1024;
-// Admit one fused export per compiled plugin component before allocating its
+// Admit one capability export per compiled plugin component before allocating its
 // Wasmtime Store. This bounds both actor and pushed-page residency without
 // creating an executor thread or serializing different plugin types.
 const COMPONENT_MAX_CONCURRENT_EXECUTIONS_PER_COMPONENT: usize = 1;
@@ -64,9 +65,31 @@ pub(super) mod bindings {
         with: {
             "lix:plugin/host.snapshot": super::SnapshotResource,
             "lix:plugin/host.transition": super::TransitionResource,
-            "lix:plugin/host.conflict-source": super::ConflictSourceResource,
+            "lix:plugin/host.column-merge-source": super::ConflictSourceResource,
             "lix:plugin/host.row-source": super::RowSourceResource,
-            "lix:plugin/host.resolution-sink": super::ResolutionSinkResource,
+            "lix:plugin/host.column-merge-sink": super::ResolutionSinkResource,
+        },
+    });
+}
+
+pub(super) mod file_projection_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "file-projection-plugin",
+        with: {
+            "lix:plugin/host": super::bindings::lix::plugin::host,
+            "lix:plugin/types": super::bindings::lix::plugin::types,
+        },
+    });
+}
+
+pub(super) mod column_merger_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "column-merger-plugin",
+        with: {
+            "lix:plugin/host": super::bindings::lix::plugin::host,
+            "lix:plugin/types": super::bindings::lix::plugin::types,
         },
     });
 }
@@ -104,11 +127,19 @@ struct TransitionState {
     started: Instant,
     total_bytes: SharedByteBudget,
     pages: VecDeque<PendingChangePage>,
+    replace_all_rows: bool,
     attachments: Vec<Bytes>,
     pending_attachment: Option<PendingRowAttachment>,
     counters: WasmTransitionCounters,
     allow_file_replacement: bool,
     file_replacement: Option<PendingFileReplacement>,
+    file_edits: Vec<PendingFileEdit>,
+}
+
+struct PendingFileEdit {
+    offset: u64,
+    delete_len: u64,
+    insert: Bytes,
 }
 
 struct PendingFileReplacement {
@@ -129,6 +160,7 @@ struct RowChangeState {
     source: RowChangeInputSource,
     next_ordinal: u32,
     lazy_snapshots: HashMap<u32, WasmHostBytes>,
+    seen_row_keys: BTreeSet<WasmRowKey>,
     counters: WasmTransitionCounters,
 }
 
@@ -141,34 +173,31 @@ struct ResolutionState {
     limits: WasmTransitionLimits,
     started: Instant,
     total_bytes: u64,
-    conflicts: Vec<WasmHostRowConflict>,
+    conflicts: Vec<WasmHostColumnMerge>,
     resolutions: Vec<ComponentResolution>,
     pending: Option<PendingReplacement>,
     counters: WasmTransitionCounters,
 }
 
 enum ComponentResolution {
-    Take(WasmConflictTake),
-    Replace {
-        snapshot: Bytes,
-        effect: WasmChangeEffect,
-    },
-    Delete,
+    UseLww,
+    Replace(Option<Bytes>),
 }
 
 struct PendingReplacement {
     ordinal: u32,
-    expected_len: u64,
+    expected_len: Option<u64>,
     bytes: Vec<u8>,
 }
 
 /// Host-owned wire pages retained until the engine asks for the next page.
 ///
-/// The first fused implementation decoded every pushed page immediately and retained
+/// The first Component implementation decoded every pushed page immediately and retained
 /// the resulting row graph until the guest export returned. Large imports
 /// therefore held all generic row objects plus the gradually constructed
 /// canonical output. Keeping the bounded wire pages defers ownership expansion
 /// to the existing one-page-at-a-time drain.
+#[derive(Clone)]
 enum PendingChangePage {
     Packet {
         record_count: u32,
@@ -178,6 +207,7 @@ enum PendingChangePage {
         limits: WasmTransitionLimits,
         creates: WasmCreateContext,
     },
+    Decoded(WasmChangePage),
 }
 
 impl PendingChangePage {
@@ -197,8 +227,43 @@ impl PendingChangePage {
                 max_page_bytes,
                 limits,
             ),
+            Self::Decoded(page) => Ok(page),
         }
     }
+}
+
+fn append_replace_all_deletes(
+    state: &mut TransitionState,
+    mut prior_keys: BTreeSet<WasmRowKey>,
+) -> Result<(), LixError> {
+    if !state.replace_all_rows || prior_keys.is_empty() {
+        return Ok(());
+    }
+    for page in state.pages.iter().cloned() {
+        for change in page.decode()?.changes.changes {
+            match change {
+                WasmRowChange::Upsert { row, .. } => {
+                    prior_keys.remove(&row.key);
+                }
+                WasmRowChange::Delete(key) => {
+                    prior_keys.remove(&key);
+                }
+                WasmRowChange::Create { .. } => {}
+            }
+        }
+    }
+    if !prior_keys.is_empty() {
+        state
+            .pages
+            .push_back(PendingChangePage::Decoded(WasmChangePage {
+                format_version: PACKET_FORMAT_V1,
+                changes: WasmRowChanges {
+                    changes: prior_keys.into_iter().map(WasmRowChange::Delete).collect(),
+                },
+                outputs: None,
+            }));
+    }
+    Ok(())
 }
 
 fn decode_inline_change_page(
@@ -441,6 +506,7 @@ impl TransitionState {
             started: Instant::now(),
             total_bytes: total_bytes.unwrap_or_default(),
             pages: VecDeque::new(),
+            replace_all_rows: false,
             attachments: Vec::new(),
             pending_attachment: None,
             counters: WasmTransitionCounters {
@@ -449,6 +515,7 @@ impl TransitionState {
             },
             allow_file_replacement,
             file_replacement: None,
+            file_edits: Vec::new(),
         })
     }
 
@@ -514,7 +581,7 @@ impl TransitionState {
 impl ResolutionState {
     fn new(
         limits: WasmTransitionLimits,
-        conflicts: Vec<WasmHostRowConflict>,
+        conflicts: Vec<WasmHostColumnMerge>,
     ) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
@@ -567,7 +634,7 @@ impl ResolutionState {
     fn next_ordinal(&self) -> Result<u32, bindings::lix::plugin::host::HostError> {
         u32::try_from(self.resolutions.len()).map_err(|_| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "component conflict resolution count exceeds u32".to_owned(),
+                "component column merge result count exceeds u32".to_owned(),
             )
         })
     }
@@ -579,13 +646,13 @@ impl ResolutionState {
         let expected = self.next_ordinal()?;
         if ordinal != expected {
             return Err(bindings::lix::plugin::host::HostError::Rejected(format!(
-                "component conflict resolution ordinal {ordinal}, expected {expected}"
+                "component column merge result ordinal {ordinal}, expected {expected}"
             )));
         }
         let index = ordinal as usize;
         if self.conflicts.get(index).is_none() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "component conflict resolver returned excess output".to_owned(),
+                "component column merger returned excess output".to_owned(),
             ));
         }
         Ok(index)
@@ -605,6 +672,7 @@ impl RowChangeState {
             source: RowChangeInputSource::Rows(source),
             next_ordinal: 0,
             lazy_snapshots: HashMap::new(),
+            seen_row_keys: BTreeSet::new(),
             counters: WasmTransitionCounters::default(),
         })
     }
@@ -621,6 +689,7 @@ impl RowChangeState {
             source: RowChangeInputSource::Changes(source),
             next_ordinal: 0,
             lazy_snapshots: HashMap::new(),
+            seen_row_keys: BTreeSet::new(),
             counters: WasmTransitionCounters::default(),
         })
     }
@@ -631,6 +700,8 @@ impl RowChangeState {
     ) -> Result<Option<Vec<WasmRowChange<WasmHostBytes>>>, LixError> {
         match &mut self.source {
             RowChangeInputSource::Rows(source) => Ok(source.next_page(max_bytes)?.map(|page| {
+                self.seen_row_keys
+                    .extend(page.rows.iter().map(|row| row.key.clone()));
                 page.rows
                     .into_iter()
                     .map(|row| WasmRowChange::Upsert {
@@ -643,6 +714,11 @@ impl RowChangeState {
                 Ok(source.next_page(max_bytes)?.map(|page| page.changes))
             }
         }
+    }
+
+    fn drain_complete_row_keys(&mut self) -> Result<BTreeSet<WasmRowKey>, LixError> {
+        while self.next_page(self.limits.max_page_bytes)?.is_some() {}
+        Ok(std::mem::take(&mut self.seen_row_keys))
     }
 
     fn check_active(&self) -> Result<(), bindings::lix::plugin::host::HostError> {
@@ -702,13 +778,24 @@ fn merge_row_input_profile(target: &mut WasmTransitionCounters, source: &WasmTra
 }
 
 fn conflict_value<'a>(
-    conflict: &'a WasmHostRowConflict,
-    side: bindings::lix::plugin::host::ConflictSide,
+    conflict: &'a WasmHostColumnMerge,
+    side: bindings::lix::plugin::host::MergeSide,
 ) -> Option<&'a WasmHostBytes> {
     match side {
-        bindings::lix::plugin::host::ConflictSide::Base => conflict.base.as_ref(),
-        bindings::lix::plugin::host::ConflictSide::A => conflict.a.as_ref(),
-        bindings::lix::plugin::host::ConflictSide::B => conflict.b.as_ref(),
+        bindings::lix::plugin::host::MergeSide::Base => conflict.base.as_ref(),
+        bindings::lix::plugin::host::MergeSide::A => conflict.a.as_ref(),
+        bindings::lix::plugin::host::MergeSide::B => conflict.b.as_ref(),
+    }
+}
+
+fn conflict_row(
+    conflict: &WasmHostColumnMerge,
+    side: bindings::lix::plugin::host::MergeSide,
+) -> &WasmHostBytes {
+    match side {
+        bindings::lix::plugin::host::MergeSide::Base => &conflict.base_row,
+        bindings::lix::plugin::host::MergeSide::A => &conflict.a_row,
+        bindings::lix::plugin::host::MergeSide::B => &conflict.b_row,
     }
 }
 
@@ -1195,6 +1282,85 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         Ok(())
     }
 
+    fn replace_all_rows(
+        &mut self,
+        resource: Resource<TransitionResource>,
+    ) -> Result<(), bindings::lix::plugin::host::HostError> {
+        let shared = self
+            .table
+            .get(&resource)
+            .map_err(host_table_error)?
+            .state
+            .clone();
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.check_active()?;
+        if state.replace_all_rows {
+            return Err(bindings::lix::plugin::host::HostError::Rejected(
+                "replace-all-rows was already requested".to_owned(),
+            ));
+        }
+        state.replace_all_rows = true;
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        Ok(())
+    }
+
+    fn emit_file_edit(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        edit: bindings::lix::plugin::host::FileEdit,
+    ) -> Result<(), bindings::lix::plugin::host::HostError> {
+        let shared = self
+            .table
+            .get(&resource)
+            .map_err(host_table_error)?
+            .state
+            .clone();
+        {
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.check_active()?;
+            if !state.allow_file_replacement {
+                return Err(bindings::lix::plugin::host::HostError::Rejected(
+                    "file edits are unavailable while parsing bytes".to_owned(),
+                ));
+            }
+            if state.file_replacement.is_some() {
+                return Err(bindings::lix::plugin::host::HostError::Rejected(
+                    "file edits cannot be mixed with a file replacement".to_owned(),
+                ));
+            }
+            if let Some(previous) = state.file_edits.last()
+                && edit.offset <= previous.offset
+            {
+                return Err(bindings::lix::plugin::host::HostError::Rejected(
+                    "file edits must have strictly increasing offsets".to_owned(),
+                ));
+            }
+            state.charge_page(edit.insert.len())?;
+            state.file_edits.push(PendingFileEdit {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert: Bytes::from(edit.insert.clone()),
+            });
+            state.counters.component_import_calls =
+                state.counters.component_import_calls.saturating_add(1);
+        }
+        self.table
+            .get_mut(&resource)
+            .map_err(host_table_error)?
+            .transaction
+            .edit_bytes(ArenaByteEdit {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert: edit.insert,
+            });
+        Ok(())
+    }
+
     fn begin_file_replacement(
         &mut self,
         resource: Resource<TransitionResource>,
@@ -1218,6 +1384,11 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         if state.file_replacement.is_some() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
                 "file replacement is already open".to_owned(),
+            ));
+        }
+        if !state.file_edits.is_empty() {
+            return Err(bindings::lix::plugin::host::HostError::Rejected(
+                "file replacement cannot be mixed with file edits".to_owned(),
             ));
         }
         if total_length > state.limits.max_total_bytes {
@@ -1557,7 +1728,7 @@ impl bindings::lix::plugin::host::HostRowSource for WasiHostState {
     }
 }
 
-impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
+impl bindings::lix::plugin::host::HostColumnMergeSource for WasiHostState {
     fn len(&mut self, resource: Resource<ConflictSourceResource>) -> u32 {
         u32::try_from(
             self.table
@@ -1576,7 +1747,7 @@ impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
         &mut self,
         resource: Resource<ConflictSourceResource>,
         index: u32,
-    ) -> Result<bindings::lix::plugin::host::ConflictMeta, bindings::lix::plugin::host::HostError>
+    ) -> Result<bindings::lix::plugin::host::ColumnMergeMeta, bindings::lix::plugin::host::HostError>
     {
         let shared = self
             .table
@@ -1592,7 +1763,7 @@ impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
             .conflicts
             .get(index as usize)
             .ok_or(bindings::lix::plugin::host::HostError::InvalidRange)?;
-        let meta = bindings::lix::plugin::host::ConflictMeta {
+        let meta = bindings::lix::plugin::host::ColumnMergeMeta {
             ordinal: conflict.ordinal,
             schema_key: conflict.key.schema_key.to_string(),
             row_pk: conflict
@@ -1601,9 +1772,14 @@ impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            file_id: conflict.file_id.clone(),
+            column: conflict.column.clone(),
             base_len: conflict.base.as_ref().map(WasmHostBytes::len),
             a_len: conflict.a.as_ref().map(WasmHostBytes::len),
             b_len: conflict.b.as_ref().map(WasmHostBytes::len),
+            base_row_len: conflict.base_row.len(),
+            a_row_len: conflict.a_row.len(),
+            b_row_len: conflict.b_row.len(),
         };
         let metadata_bytes =
             meta.schema_key.len() + meta.row_pk.iter().map(String::len).sum::<usize>() + 32;
@@ -1617,7 +1793,7 @@ impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
         &mut self,
         resource: Resource<ConflictSourceResource>,
         index: u32,
-        side: bindings::lix::plugin::host::ConflictSide,
+        side: bindings::lix::plugin::host::MergeSide,
         offset: u64,
         length: u32,
     ) -> Result<Option<Vec<u8>>, bindings::lix::plugin::host::HostError> {
@@ -1652,13 +1828,49 @@ impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
         Ok(Some(bytes))
     }
 
+    fn read_row(
+        &mut self,
+        resource: Resource<ConflictSourceResource>,
+        index: u32,
+        side: bindings::lix::plugin::host::MergeSide,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>, bindings::lix::plugin::host::HostError> {
+        let shared = self
+            .table
+            .get(&resource)
+            .map_err(host_table_error)?
+            .state
+            .clone();
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.check_active()?;
+        ensure_source_page(length, state.limits.max_page_bytes)?;
+        let conflict = state
+            .conflicts
+            .get(index as usize)
+            .ok_or(bindings::lix::plugin::host::HostError::InvalidRange)?;
+        let bytes = read_host_bytes(conflict_row(conflict, side), offset, length)
+            .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
+        state.charge(bytes.len())?;
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        state.counters.source_read_calls = state.counters.source_read_calls.saturating_add(1);
+        state.counters.source_bytes_read = state
+            .counters
+            .source_bytes_read
+            .saturating_add(bytes.len() as u64);
+        Ok(bytes)
+    }
+
     fn drop(&mut self, resource: Resource<ConflictSourceResource>) -> wasmtime::Result<()> {
         self.table.delete(resource)?;
         Ok(())
     }
 }
 
-impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
+impl bindings::lix::plugin::host::HostColumnMergeSink for WasiHostState {
     fn max_batch_bytes(&mut self, resource: Resource<ResolutionSinkResource>) -> u32 {
         self.table
             .get(&resource)
@@ -1670,47 +1882,7 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
             .max_page_bytes
     }
 
-    fn take(
-        &mut self,
-        resource: Resource<ResolutionSinkResource>,
-        ordinal: u32,
-        side: bindings::lix::plugin::host::ConflictSide,
-    ) -> Result<(), bindings::lix::plugin::host::HostError> {
-        let shared = self
-            .table
-            .get(&resource)
-            .map_err(host_table_error)?
-            .state
-            .clone();
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.check_active()?;
-        if state.pending.is_some() {
-            return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "component replacement is incomplete".to_owned(),
-            ));
-        }
-        let index = state.validate_ordinal(ordinal)?;
-        if conflict_value(&state.conflicts[index], side).is_none() {
-            return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "component conflict resolver selected an absent side".to_owned(),
-            ));
-        }
-        let take = match side {
-            bindings::lix::plugin::host::ConflictSide::Base => WasmConflictTake::Base,
-            bindings::lix::plugin::host::ConflictSide::A => WasmConflictTake::A,
-            bindings::lix::plugin::host::ConflictSide::B => WasmConflictTake::B,
-        };
-        state.resolutions.push(ComponentResolution::Take(take));
-        state.counters.component_import_calls =
-            state.counters.component_import_calls.saturating_add(1);
-        state.counters.conflict_resolution_takes =
-            state.counters.conflict_resolution_takes.saturating_add(1);
-        Ok(())
-    }
-
-    fn delete(
+    fn use_lww(
         &mut self,
         resource: Resource<ResolutionSinkResource>,
         ordinal: u32,
@@ -1731,9 +1903,11 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
             ));
         }
         state.validate_ordinal(ordinal)?;
-        state.resolutions.push(ComponentResolution::Delete);
+        state.resolutions.push(ComponentResolution::UseLww);
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
+        state.counters.conflict_resolution_takes =
+            state.counters.conflict_resolution_takes.saturating_add(1);
         Ok(())
     }
 
@@ -1741,7 +1915,7 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
         &mut self,
         resource: Resource<ResolutionSinkResource>,
         ordinal: u32,
-        total_length: u64,
+        total_length: Option<u64>,
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
         let shared = self
             .table
@@ -1759,12 +1933,12 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
             ));
         }
         state.validate_ordinal(ordinal)?;
-        if total_length > state.limits.max_total_bytes {
+        if total_length.is_some_and(|length| length > state.limits.max_total_bytes) {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
                 "component replacement exceeds max-total-bytes".to_owned(),
             ));
         }
-        let capacity = usize::try_from(total_length).map_err(|_| {
+        let capacity = usize::try_from(total_length.unwrap_or(0)).map_err(|_| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
                 "component replacement exceeds host address space".to_owned(),
             )
@@ -1808,7 +1982,10 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
                     "component replacement length overflowed".to_owned(),
                 )
             })?;
-        if next_len as u64 > pending.expected_len {
+        if pending
+            .expected_len
+            .is_none_or(|expected| next_len as u64 > expected)
+        {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
                 "component replacement exceeds its declared length".to_owned(),
             ));
@@ -1838,16 +2015,18 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
                 "component replacement finish has no open replacement".to_owned(),
             )
         })?;
-        if pending.bytes.len() as u64 != pending.expected_len {
+        if pending
+            .expected_len
+            .is_some_and(|expected| pending.bytes.len() as u64 != expected)
+        {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
                 "component replacement ended before its declared length".to_owned(),
             ));
         }
         debug_assert_eq!(pending.ordinal as usize, state.resolutions.len());
-        state.resolutions.push(ComponentResolution::Replace {
-            snapshot: Bytes::from(pending.bytes),
-            effect: WasmChangeEffect::Content,
-        });
+        state.resolutions.push(ComponentResolution::Replace(
+            pending.expected_len.map(|_| Bytes::from(pending.bytes)),
+        ));
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
         Ok(())
@@ -2122,7 +2301,7 @@ fn duplicate_certified_packet_key() -> LixError {
 fn validate_new_certified_packet_keys(
     page: ValidatedCreatedPacketPage,
     existing: &CertifiedPacketRowKeys,
-) -> Result<(std::collections::BTreeSet<String>, CertifiedPacketRowKeys), LixError> {
+) -> Result<(BTreeSet<String>, CertifiedPacketRowKeys), LixError> {
     let ValidatedCreatedPacketPage {
         schemas,
         identities,
@@ -2303,6 +2482,7 @@ impl<'a> PacketSliceReader<'a> {
 }
 
 impl bindings::lix::plugin::host::Host for WasiHostState {}
+impl bindings::lix::plugin::types::Host for WasiHostState {}
 
 fn host_table_error(
     error: wasmtime::component::ResourceTableError,
@@ -2337,17 +2517,24 @@ fn read_source_all(
 
 struct ComponentFactory {
     component: Component,
-    linker: Arc<Linker<WasiHostState>>,
+    linker: ComponentLinker,
     runtime: Arc<super::WasmtimeSharedRuntime>,
     limits: WasmLimits,
     profile: CompileProfile,
     execution_permit: Arc<tokio::sync::Semaphore>,
 }
 
+enum ComponentLinker {
+    Combined(Arc<Linker<WasiHostState>>),
+    FileProjection(Arc<Linker<WasiHostState>>),
+    ColumnMerger(Arc<Linker<WasiHostState>>),
+}
+
 pub(super) async fn compile_component(
     runtime: &WasmtimePluginRuntime,
     bytes: Vec<u8>,
     limits: WasmLimits,
+    capabilities: PluginCapabilities,
 ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
     if limits.max_memory_bytes == 0 {
         return Err(component_error(
@@ -2372,13 +2559,46 @@ pub(super) async fn compile_component(
     let mut linker = Linker::<WasiHostState>::new(engine);
     add_to_linker_sync(&mut linker)
         .map_err(|error| wasm_runtime_error("failed to configure component WASI linker", error))?;
-    bindings::Plugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |state| {
-        state
-    })
-    .map_err(|error| wasm_runtime_error("failed to configure component plugin linker", error))?;
+    let linker = match (capabilities.column_merger, capabilities.file_projection) {
+        (true, true) => {
+            bindings::Plugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
+                &mut linker,
+                |state| state,
+            )
+            .map_err(|error| {
+                wasm_runtime_error("failed to configure combined plugin linker", error)
+            })?;
+            ComponentLinker::Combined(Arc::new(linker))
+        }
+        (false, true) => {
+            file_projection_bindings::FileProjectionPlugin::add_to_linker::<
+                _,
+                wasmtime::component::HasSelf<_>,
+            >(&mut linker, |state| state)
+            .map_err(|error| {
+                wasm_runtime_error("failed to configure file projection linker", error)
+            })?;
+            ComponentLinker::FileProjection(Arc::new(linker))
+        }
+        (true, false) => {
+            column_merger_bindings::ColumnMergerPlugin::add_to_linker::<
+                _,
+                wasmtime::component::HasSelf<_>,
+            >(&mut linker, |state| state)
+            .map_err(|error| {
+                wasm_runtime_error("failed to configure column merger linker", error)
+            })?;
+            ComponentLinker::ColumnMerger(Arc::new(linker))
+        }
+        (false, false) => {
+            return Err(component_error(
+                "cannot compile a plugin component without an executable capability",
+            ));
+        }
+    };
     Ok(Arc::new(ComponentFactory {
         component,
-        linker: Arc::new(linker),
+        linker,
         runtime: runtime.shared.clone(),
         limits,
         profile,
@@ -2404,12 +2624,58 @@ impl WasmComponentFactory for ComponentFactory {
             .ok_or_else(|| component_error("component actor requires an epoch timeout ticker"))?;
         let mut store = create_store(engine, self.limits)?;
         store.epoch_deadline_trap();
-        let bindings = bindings::Plugin::instantiate(&mut store, &self.component, &self.linker)
-            .map_err(|error| wasm_runtime_error("failed to instantiate plugin actor", error))?;
-        let guest = bindings.lix_plugin_api().clone();
+        let (file_projection, column_merger) = match &self.linker {
+            ComponentLinker::Combined(linker) => {
+                let instance = bindings::Plugin::instantiate(&mut store, &self.component, linker)
+                    .map_err(|error| {
+                    wasm_runtime_error("failed to instantiate combined plugin actor", error)
+                })?;
+                (
+                    Some(FileProjectionGuest::Combined(
+                        instance.lix_plugin_file_projection().clone(),
+                    )),
+                    Some(ColumnMergerGuest::Combined(
+                        instance.lix_plugin_column_merger().clone(),
+                    )),
+                )
+            }
+            ComponentLinker::FileProjection(linker) => {
+                let instance = file_projection_bindings::FileProjectionPlugin::instantiate(
+                    &mut store,
+                    &self.component,
+                    linker,
+                )
+                .map_err(|error| {
+                    wasm_runtime_error("failed to instantiate file projection actor", error)
+                })?;
+                (
+                    Some(FileProjectionGuest::Narrow(
+                        instance.lix_plugin_file_projection().clone(),
+                    )),
+                    None,
+                )
+            }
+            ComponentLinker::ColumnMerger(linker) => {
+                let instance = column_merger_bindings::ColumnMergerPlugin::instantiate(
+                    &mut store,
+                    &self.component,
+                    linker,
+                )
+                .map_err(|error| {
+                    wasm_runtime_error("failed to instantiate column merger actor", error)
+                })?;
+                (
+                    None,
+                    Some(ColumnMergerGuest::Narrow(
+                        instance.lix_plugin_column_merger().clone(),
+                    )),
+                )
+            }
+        };
         let worker = ComponentWorker {
             store,
-            guest,
+            file_projection,
+            column_merger,
             limits: self.limits,
             documents: HashMap::new(),
             next_document: 1,
@@ -2421,7 +2687,7 @@ impl WasmComponentFactory for ComponentFactory {
             _timeout_ticker: timeout_ticker,
             next_handle: 1,
             cursors: HashMap::new(),
-            resolution_cursors: HashMap::new(),
+            column_merge_cursors: HashMap::new(),
             edit_cursors: HashMap::new(),
             outputs: HashMap::new(),
             transitions: HashMap::new(),
@@ -2436,10 +2702,85 @@ impl WasmComponentFactory for ComponentFactory {
 
 struct ComponentWorker {
     store: Store<WasiHostState>,
-    guest: bindings::exports::lix::plugin::api::Guest,
+    file_projection: Option<FileProjectionGuest>,
+    column_merger: Option<ColumnMergerGuest>,
     limits: WasmLimits,
     documents: HashMap<u64, ComponentDocument>,
     next_document: u64,
+}
+
+enum FileProjectionGuest {
+    Combined(bindings::exports::lix::plugin::file_projection::Guest),
+    Narrow(file_projection_bindings::exports::lix::plugin::file_projection::Guest),
+}
+
+enum ColumnMergerGuest {
+    Combined(bindings::exports::lix::plugin::column_merger::Guest),
+    Narrow(column_merger_bindings::exports::lix::plugin::column_merger::Guest),
+}
+
+impl FileProjectionGuest {
+    fn call_parse(
+        &self,
+        store: &mut Store<WasiHostState>,
+        input: &bindings::lix::plugin::types::ParseRequest,
+        output: Resource<TransitionResource>,
+    ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
+        match self {
+            Self::Combined(guest) => guest.call_parse(store, input, output),
+            Self::Narrow(guest) => guest.call_parse(store, input, output),
+        }
+    }
+
+    fn call_parse_changes(
+        &self,
+        store: &mut Store<WasiHostState>,
+        input: &bindings::lix::plugin::types::ParseChangesRequest,
+        output: Resource<TransitionResource>,
+    ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
+        match self {
+            Self::Combined(guest) => guest.call_parse_changes(store, input, output),
+            Self::Narrow(guest) => guest.call_parse_changes(store, input, output),
+        }
+    }
+
+    fn call_serialize(
+        &self,
+        store: &mut Store<WasiHostState>,
+        input: &bindings::lix::plugin::types::SerializeRequest,
+        output: Resource<TransitionResource>,
+    ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
+        match self {
+            Self::Combined(guest) => guest.call_serialize(store, input, output),
+            Self::Narrow(guest) => guest.call_serialize(store, input, output),
+        }
+    }
+
+    fn call_serialize_changes(
+        &self,
+        store: &mut Store<WasiHostState>,
+        input: &bindings::lix::plugin::types::SerializeChangesRequest,
+        output: Resource<TransitionResource>,
+    ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
+        match self {
+            Self::Combined(guest) => guest.call_serialize_changes(store, input, output),
+            Self::Narrow(guest) => guest.call_serialize_changes(store, input, output),
+        }
+    }
+}
+
+impl ColumnMergerGuest {
+    fn call_merge(
+        &self,
+        store: &mut Store<WasiHostState>,
+        input: Resource<ConflictSourceResource>,
+        output: Resource<ResolutionSinkResource>,
+    ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
+        match self {
+            Self::Combined(guest) => guest.call_merge(store, input, output),
+            Self::Narrow(guest) => guest.call_merge(store, input, output),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2453,7 +2794,7 @@ struct ResolutionWorkerOutput {
 }
 
 struct RowWorkerOutput {
-    replacement: Bytes,
+    edits: Vec<PendingFileEdit>,
     counters: WasmTransitionCounters,
 }
 
@@ -2465,6 +2806,7 @@ struct HydrateWorkerOutput {
 
 struct FileWorkerOutput {
     pages: VecDeque<PendingChangePage>,
+    replace_all_rows: bool,
     counters: WasmTransitionCounters,
 }
 
@@ -2530,21 +2872,24 @@ impl ComponentWorker {
                 component_error(format!("failed to register component transition: {error}"))
             })?;
         let transition_rep = transition.rep();
-        let binding_input = bindings::exports::lix::plugin::api::TransitionRequest::Open(
-            bindings::exports::lix::plugin::api::OpenRequest {
-                path: required_plugin_path(input.descriptor.path, "open")?,
-                accepted,
-                creates: bindings::exports::lix::plugin::api::CreateContext {
-                    high: input.creates.high,
-                    low: input.creates.low,
-                },
+        let binding_input = bindings::lix::plugin::types::ParseRequest {
+            file_id: input.descriptor.file_id.clone(),
+            path: required_plugin_path(input.descriptor.path, "parse")?,
+            file: accepted,
+            creates: bindings::lix::plugin::types::CreateContext {
+                high: input.creates.high,
+                low: input.creates.low,
             },
-        );
-        let result = self.guest.call_apply(
-            &mut self.store,
-            &binding_input,
-            Resource::new_borrow(transition_rep),
-        );
+        };
+        let result = self
+            .file_projection
+            .as_ref()
+            .ok_or_else(|| component_error("plugin has no file-projection capability"))?
+            .call_parse(
+                &mut self.store,
+                &binding_input,
+                Resource::new_borrow(transition_rep),
+            );
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
             transition,
@@ -2555,12 +2900,12 @@ impl ComponentWorker {
             Ok(Err(error)) => {
                 drop(transition);
                 return Err(component_error(format!(
-                    "component open-file rejected input: {error:?}"
+                    "component parse rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error("component open-file trapped", error));
+                return Err(wasm_runtime_error("component parse trapped", error));
             }
         }
         let TransitionResource {
@@ -2584,6 +2929,7 @@ impl ComponentWorker {
         let pages = state.take_pages()?;
         Ok(FileWorkerOutput {
             pages,
+            replace_all_rows: state.replace_all_rows,
             counters: state.counters,
         })
     }
@@ -2593,7 +2939,7 @@ impl ComponentWorker {
         document: u64,
         next_document: u64,
         limits: WasmTransitionLimits,
-        update: WasmFileUpdate,
+        mut update: WasmFileUpdate,
     ) -> Result<FileWorkerOutput, LixError> {
         let limits = component_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
@@ -2652,7 +2998,7 @@ impl ComponentWorker {
                 delete_len: edit.delete_len,
                 insert: insert.clone(),
             });
-            binding_edits.push(bindings::exports::lix::plugin::api::FileEdit {
+            binding_edits.push(bindings::lix::plugin::host::FileEdit {
                 offset: edit.offset,
                 delete_len: edit.delete_len,
                 insert,
@@ -2669,33 +3015,60 @@ impl ComponentWorker {
             .map_err(|error| {
                 component_error(format!("failed to register component transition: {error}"))
             })?;
+        let row_state = update
+            .rows
+            .take()
+            .map(|rows| {
+                RowChangeState::from_rows(limits, rows, SharedByteBudget::default())
+                    .map(|state| Arc::new(Mutex::new(state)))
+            })
+            .transpose()?;
+        let rows = row_state
+            .as_ref()
+            .map(|row_state| {
+                self.store
+                    .data_mut()
+                    .table
+                    .push(RowSourceResource {
+                        state: row_state.clone(),
+                    })
+                    .map_err(|error| {
+                        component_error(format!(
+                            "failed to register component parse-changes row source: {error}"
+                        ))
+                    })
+            })
+            .transpose()?;
         let transition_rep = transition.rep();
-        let binding_update = bindings::exports::lix::plugin::api::TransitionRequest::FileChanged(
-            bindings::exports::lix::plugin::api::FileChangedRequest {
-                before_path: required_plugin_path(
-                    update.before_descriptor.path,
-                    "file-changed predecessor",
-                )?,
-                after_path: required_plugin_path(
-                    update.after_descriptor.path,
-                    "file-changed successor",
-                )?,
-                before,
-                edits: binding_edits,
-                creates: bindings::exports::lix::plugin::api::CreateContext {
-                    high: update.creates.high,
-                    low: update.creates.low,
-                },
+        let binding_update = bindings::lix::plugin::types::ParseChangesRequest {
+            file_id: update.after_descriptor.file_id.clone(),
+            before_path: required_plugin_path(
+                update.before_descriptor.path,
+                "parse-changes predecessor",
+            )?,
+            after_path: required_plugin_path(
+                update.after_descriptor.path,
+                "parse-changes successor",
+            )?,
+            before,
+            file_edits: binding_edits,
+            rows,
+            creates: bindings::lix::plugin::types::CreateContext {
+                high: update.creates.high,
+                low: update.creates.low,
             },
-        );
+        };
         let result =
             tracing::debug_span!(target: "lix_perf", "lix.perf.component_guest_file_changed")
                 .in_scope(|| {
-                    self.guest.call_apply(
-                        &mut self.store,
-                        &binding_update,
-                        Resource::new_borrow(transition_rep),
-                    )
+                    self.file_projection
+                        .as_ref()
+                        .ok_or_else(|| component_error("plugin has no file-projection capability"))?
+                        .call_parse_changes(
+                            &mut self.store,
+                            &binding_update,
+                            Resource::new_borrow(transition_rep),
+                        )
                 });
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
@@ -2707,12 +3080,12 @@ impl ComponentWorker {
             Ok(Err(error)) => {
                 drop(transition);
                 return Err(component_error(format!(
-                    "component file-changed rejected input: {error:?}"
+                    "component parse-changes rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error("component file-changed trapped", error));
+                return Err(wasm_runtime_error("component parse-changes trapped", error));
             }
         }
         let TransitionResource {
@@ -2735,11 +3108,61 @@ impl ComponentWorker {
             })?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut row_state = row_state
+            .map(|row_state| {
+                Arc::try_unwrap(row_state)
+                    .map_err(|_| {
+                        component_error("component parse-changes row source remained live")
+                    })
+                    .map(|state| {
+                        state
+                            .into_inner()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    })
+            })
+            .transpose()?;
+        let prior_keys = if state.replace_all_rows {
+            match row_state.as_mut() {
+                Some(row_state) => row_state.drain_complete_row_keys()?,
+                None => update
+                    .prior_row_keys
+                    .take()
+                    .ok_or_else(|| {
+                        component_error(
+                            "parse_changes replacement requires predecessor row identities",
+                        )
+                    })?
+                    .into_keys()?,
+            }
+        } else {
+            BTreeSet::new()
+        };
+        append_replace_all_deletes(&mut state, prior_keys)?;
+        if let Some(row_state) = &row_state {
+            state.counters.component_import_calls = state
+                .counters
+                .component_import_calls
+                .saturating_add(row_state.counters.component_import_calls);
+            state.counters.component_boundary_bytes = state
+                .counters
+                .component_boundary_bytes
+                .saturating_add(row_state.counters.component_boundary_bytes);
+            state.counters.source_read_calls = state
+                .counters
+                .source_read_calls
+                .saturating_add(row_state.counters.source_read_calls);
+            state.counters.source_bytes_read = state
+                .counters
+                .source_bytes_read
+                .saturating_add(row_state.counters.source_bytes_read);
+            merge_row_input_profile(&mut state.counters, &row_state.counters);
+        }
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
         let pages = state.take_pages()?;
         Ok(FileWorkerOutput {
             pages,
+            replace_all_rows: state.replace_all_rows,
             counters: state.counters,
         })
     }
@@ -2826,7 +3249,7 @@ impl ComponentWorker {
                 delete_len: edit.delete_len,
                 insert: insert.clone(),
             });
-            binding_edits.push(bindings::exports::lix::plugin::api::FileEdit {
+            binding_edits.push(bindings::lix::plugin::host::FileEdit {
                 offset: edit.offset,
                 delete_len: edit.delete_len,
                 insert,
@@ -2846,35 +3269,37 @@ impl ComponentWorker {
                 ))
             })?;
         let transition_rep = transition.rep();
-        let binding_input = bindings::exports::lix::plugin::api::TransitionRequest::ColdFileChanged(
-            bindings::exports::lix::plugin::api::ColdFileChangedRequest {
-                before_path: required_plugin_path(
-                    cold.before_descriptor.path,
-                    "cold-file-changed predecessor",
-                )?,
-                after_path: required_plugin_path(
-                    cold.after_descriptor.path,
-                    "cold-file-changed successor",
-                )?,
-                before,
-                edits: binding_edits,
-                rows: source,
-                creates: bindings::exports::lix::plugin::api::CreateContext {
-                    high: cold.creates.high,
-                    low: cold.creates.low,
-                },
+        let binding_input = bindings::lix::plugin::types::ParseChangesRequest {
+            file_id: cold.after_descriptor.file_id.clone(),
+            before_path: required_plugin_path(
+                cold.before_descriptor.path,
+                "cold parse-changes predecessor",
+            )?,
+            after_path: required_plugin_path(
+                cold.after_descriptor.path,
+                "cold parse-changes successor",
+            )?,
+            before,
+            file_edits: binding_edits,
+            rows: Some(source),
+            creates: bindings::lix::plugin::types::CreateContext {
+                high: cold.creates.high,
+                low: cold.creates.low,
             },
-        );
+        };
         let result = tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.component_guest_cold_successor"
         )
         .in_scope(|| {
-            self.guest.call_apply(
-                &mut self.store,
-                &binding_input,
-                Resource::new_borrow(transition_rep),
-            )
+            self.file_projection
+                .as_ref()
+                .ok_or_else(|| component_error("plugin has no file-projection capability"))?
+                .call_parse_changes(
+                    &mut self.store,
+                    &binding_input,
+                    Resource::new_borrow(transition_rep),
+                )
         });
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
@@ -2886,13 +3311,13 @@ impl ComponentWorker {
             Ok(Err(error)) => {
                 drop(transition);
                 return Err(component_error(format!(
-                    "component cold-successor rejected input: {error:?}"
+                    "component cold parse-changes rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
                 return Err(wasm_runtime_error(
-                    "component cold-successor trapped",
+                    "component cold parse-changes trapped",
                     error,
                 ));
             }
@@ -2909,14 +3334,20 @@ impl ComponentWorker {
         })?;
         self.documents.insert(document, ComponentDocument { root });
         self.next_document = self.next_document.max(document.saturating_add(1));
-        let row_state = Arc::try_unwrap(row_state)
-            .map_err(|_| component_error("component cold-successor row source remained live"))?
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = Arc::try_unwrap(state)
             .map_err(|_| component_error("component cold-successor resources remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut row_state = Arc::try_unwrap(row_state)
+            .map_err(|_| component_error("component cold-successor row source remained live"))?
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_keys = if state.replace_all_rows {
+            row_state.drain_complete_row_keys()?
+        } else {
+            BTreeSet::new()
+        };
+        append_replace_all_deletes(&mut state, prior_keys)?;
         state.counters.component_import_calls = state
             .counters
             .component_import_calls
@@ -2939,27 +3370,28 @@ impl ComponentWorker {
         let pages = state.take_pages()?;
         Ok(FileWorkerOutput {
             pages,
+            replace_all_rows: state.replace_all_rows,
             counters: state.counters,
         })
     }
 
-    fn resolve_conflicts(
+    fn merge_columns(
         &mut self,
         limits: WasmTransitionLimits,
-        mut update: WasmConflictUpdate,
+        mut update: WasmColumnMergeUpdate,
     ) -> Result<ResolutionWorkerOutput, LixError> {
         let limits = component_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
         let mut conflicts = Vec::new();
-        while let Some(page) = update.conflicts.next_page(limits.max_page_bytes)? {
-            if page.conflicts.is_empty() {
+        while let Some(page) = update.merges.next_page(limits.max_page_bytes)? {
+            if page.merges.is_empty() {
                 return Err(component_error(
                     "component conflict source returned an empty page",
                 ));
             }
-            for conflict in page.conflicts {
+            for conflict in page.merges {
                 let expected = u32::try_from(conflicts.len())
                     .map_err(|_| component_error("component conflict count exceeds u32"))?;
                 if conflict.ordinal != expected {
@@ -2998,44 +3430,37 @@ impl ComponentWorker {
                 ))
             })?;
         let sink_rep = sink.rep();
-        let binding_input = bindings::exports::lix::plugin::api::ConflictUpdate {
-            path: required_plugin_path(update.descriptor.path, "conflict resolution")?,
-            conflicts: source,
-        };
-        let result = self.guest.call_resolve_conflicts(
-            &mut self.store,
-            &binding_input,
-            Resource::new_borrow(sink_rep),
-        );
+        let result = self
+            .column_merger
+            .as_ref()
+            .ok_or_else(|| component_error("plugin has no column-merger capability"))?
+            .call_merge(&mut self.store, source, Resource::new_borrow(sink_rep));
         let _ = self.store.data_mut().table.delete(sink);
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 return Err(component_error(format!(
-                    "component resolve-conflicts rejected input: {error:?}"
+                    "component column merge rejected input: {error:?}"
                 )));
             }
             Err(error) => {
-                return Err(wasm_runtime_error(
-                    "component resolve-conflicts trapped",
-                    error,
-                ));
+                return Err(wasm_runtime_error("component column merge trapped", error));
             }
         }
         let mut state = Arc::try_unwrap(state)
             .map_err(|_| {
-                component_error("component conflict resources remained live after resolution")
+                component_error("component column merge resources remained live after merging")
             })?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.pending.is_some() {
             return Err(component_error(
-                "component conflict replacement remained incomplete",
+                "component column replacement remained incomplete",
             ));
         }
         if state.resolutions.len() != expected_count {
             return Err(component_error(format!(
-                "component conflict resolver returned {} results for {expected_count} conflicts",
+                "component column merger returned {} results for {expected_count} overlaps",
                 state.resolutions.len()
             )));
         }
@@ -3117,21 +3542,21 @@ impl ComponentWorker {
                 ))
             })?;
         let transition_rep = transition.rep();
-        let binding_input = bindings::exports::lix::plugin::api::TransitionRequest::RowsChanged(
-            bindings::exports::lix::plugin::api::RowsChangedRequest {
-                before_path: required_plugin_path(
-                    update.before_descriptor.path,
-                    "rows-changed predecessor",
-                )?,
-                before,
-                changes: source,
-            },
-        );
-        let result = self.guest.call_apply(
-            &mut self.store,
-            &binding_input,
-            Resource::new_borrow(transition_rep),
-        );
+        let binding_input = bindings::lix::plugin::types::SerializeChangesRequest {
+            file_id: update.before_descriptor.file_id.clone(),
+            path: required_plugin_path(update.before_descriptor.path, "serialize-changes path")?,
+            before,
+            row_changes: source,
+        };
+        let result = self
+            .file_projection
+            .as_ref()
+            .ok_or_else(|| component_error("plugin has no file-projection capability"))?
+            .call_serialize_changes(
+                &mut self.store,
+                &binding_input,
+                Resource::new_borrow(transition_rep),
+            );
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
             transition,
@@ -3142,12 +3567,15 @@ impl ComponentWorker {
             Ok(Err(error)) => {
                 drop(transition);
                 return Err(component_error(format!(
-                    "component rows-changed rejected input: {error:?}"
+                    "component serialize-changes rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error("component rows-changed trapped", error));
+                return Err(wasm_runtime_error(
+                    "component serialize-changes trapped",
+                    error,
+                ));
             }
         }
         let TransitionResource {
@@ -3159,19 +3587,25 @@ impl ComponentWorker {
             .map_err(|_| component_error("component row transition resources remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let replacement = state.file_replacement.take().ok_or_else(|| {
-            component_error("component rows-changed did not emit a file replacement")
-        })?;
-        if !replacement.complete {
-            return Err(component_error(
-                "component rows-changed file replacement is incomplete",
-            ));
-        }
-        transaction.edit_bytes(ArenaByteEdit {
-            offset: 0,
-            delete_len: root.bytes.len(),
-            insert: replacement.bytes.clone(),
-        });
+        let edits = if let Some(replacement) = state.file_replacement.take() {
+            if !replacement.complete {
+                return Err(component_error(
+                    "component serialize-changes file replacement is incomplete",
+                ));
+            }
+            transaction.edit_bytes(ArenaByteEdit {
+                offset: 0,
+                delete_len: root.bytes.len(),
+                insert: replacement.bytes.clone(),
+            });
+            vec![PendingFileEdit {
+                offset: 0,
+                delete_len: root.bytes.len(),
+                insert: Bytes::from(replacement.bytes),
+            }]
+        } else {
+            std::mem::take(&mut state.file_edits)
+        };
         let successor = transaction.commit().map_err(|error| {
             component_error(format!("failed to commit component row root: {error}"))
         })?;
@@ -3202,7 +3636,7 @@ impl ComponentWorker {
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
         Ok(RowWorkerOutput {
-            replacement: Bytes::from(replacement.bytes),
+            edits,
             counters: state.counters,
         })
     }
@@ -3289,17 +3723,21 @@ impl ComponentWorker {
                 ))
             })?;
         let transition_rep = transition.rep();
-        let request = bindings::exports::lix::plugin::api::TransitionRequest::Restore(
-            bindings::exports::lix::plugin::api::RestoreRequest {
-                accepted,
-                rows: source,
-            },
-        );
-        let result = self.guest.call_apply(
-            &mut self.store,
-            &request,
-            Resource::new_borrow(transition_rep),
-        );
+        let request = bindings::lix::plugin::types::SerializeRequest {
+            file_id: input.descriptor.file_id.clone(),
+            path: required_plugin_path(input.descriptor.path, "serialize")?,
+            rows: source,
+            before: accepted,
+        };
+        let result = self
+            .file_projection
+            .as_ref()
+            .ok_or_else(|| component_error("plugin has no file-projection capability"))?
+            .call_serialize(
+                &mut self.store,
+                &request,
+                Resource::new_borrow(transition_rep),
+            );
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
             transition,
@@ -3310,15 +3748,12 @@ impl ComponentWorker {
             Ok(Err(error)) => {
                 drop(transition);
                 return Err(component_error(format!(
-                    "component cold hydration rejected input: {error:?}"
+                    "component serialize rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error(
-                    "component cold hydration trapped",
-                    error,
-                ));
+                return Err(wasm_runtime_error("component serialize trapped", error));
             }
         }
         let TransitionResource {
@@ -3414,13 +3849,13 @@ struct CursorState {
     certified_packet_pages: Vec<Bytes>,
     certified_packet_rows: u64,
     certified_packet_creates: Option<WasmCreateContext>,
-    certified_packet_schema_keys: std::collections::BTreeSet<String>,
+    certified_packet_schema_keys: BTreeSet<String>,
     certified_packet_row_keys: CertifiedPacketRowKeys,
 }
 
-struct ResolutionCursorState {
+struct ColumnMergeCursorState {
     transition: WasmTransitionHandle,
-    pages: VecDeque<WasmConflictResolutionPage>,
+    pages: VecDeque<WasmColumnMergeResultPage>,
 }
 
 struct OutputState {
@@ -3440,7 +3875,7 @@ struct ComponentActor {
     _timeout_ticker: TimeoutTickerLease,
     next_handle: u64,
     cursors: HashMap<u64, CursorState>,
-    resolution_cursors: HashMap<u64, ResolutionCursorState>,
+    column_merge_cursors: HashMap<u64, ColumnMergeCursorState>,
     edit_cursors: HashMap<u64, ComponentEditCursorState>,
     outputs: HashMap<u64, OutputState>,
     transitions: HashMap<u64, WasmTransitionCounters>,
@@ -3679,7 +4114,7 @@ impl WasmComponentActor for ComponentActor {
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
-                certified_packet_schema_keys: std::collections::BTreeSet::new(),
+                certified_packet_schema_keys: BTreeSet::new(),
                 certified_packet_row_keys: CertifiedPacketRowKeys::default(),
             },
         );
@@ -3689,6 +4124,7 @@ impl WasmComponentActor for ComponentActor {
             transition,
             document: WasmDocumentHandle(document),
             changes: cursor,
+            replace_all_rows: true,
         })
     }
 
@@ -3775,13 +4211,13 @@ impl WasmComponentActor for ComponentActor {
             CursorState {
                 transition,
                 pages: output.pages,
-                complete_file_state: false,
+                complete_file_state: output.replace_all_rows,
                 certified_packets_available: true,
                 certified_all_row_keys: CertifiedPacketRowKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
-                certified_packet_schema_keys: std::collections::BTreeSet::new(),
+                certified_packet_schema_keys: BTreeSet::new(),
                 certified_packet_row_keys: CertifiedPacketRowKeys::default(),
             },
         );
@@ -3791,6 +4227,7 @@ impl WasmComponentActor for ComponentActor {
             transition,
             document: WasmDocumentHandle(next_document),
             changes: cursor,
+            replace_all_rows: output.replace_all_rows,
         })
     }
 
@@ -3823,13 +4260,13 @@ impl WasmComponentActor for ComponentActor {
             CursorState {
                 transition,
                 pages: output.pages,
-                complete_file_state: false,
+                complete_file_state: output.replace_all_rows,
                 certified_packets_available: true,
                 certified_all_row_keys: CertifiedPacketRowKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
-                certified_packet_schema_keys: std::collections::BTreeSet::new(),
+                certified_packet_schema_keys: BTreeSet::new(),
                 certified_packet_row_keys: CertifiedPacketRowKeys::default(),
             },
         );
@@ -3839,6 +4276,7 @@ impl WasmComponentActor for ComponentActor {
             transition,
             document: WasmDocumentHandle(document),
             changes: cursor,
+            replace_all_rows: output.replace_all_rows,
         })
     }
 
@@ -3849,7 +4287,6 @@ impl WasmComponentActor for ComponentActor {
         update: WasmRowUpdate,
     ) -> Result<WasmRowTransition, LixError> {
         let next_document = self.allocate_document()?;
-        let before_len = update.before.len();
         self.ensure_active()?;
         let permit = Self::acquire_execution_permit(
             self.initial_execution_permit.take(),
@@ -3868,32 +4305,48 @@ impl WasmComponentActor for ComponentActor {
         };
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let edits = WasmEditCursorHandle(self.allocate_handle()?);
-        let outputs = WasmByteOutputsHandle(self.allocate_handle()?);
-        let length = resolved.replacement.len() as u64;
-        self.outputs.insert(
-            outputs.0,
-            OutputState {
-                transition,
-                values: vec![resolved.replacement],
-            },
-        );
+        let output_handle = (!resolved.edits.is_empty())
+            .then(|| self.allocate_handle().map(WasmByteOutputsHandle))
+            .transpose()?;
+        let mut output_values = Vec::with_capacity(resolved.edits.len());
+        let output_edits = resolved
+            .edits
+            .into_iter()
+            .enumerate()
+            .map(|(index, edit)| {
+                let length = edit.insert.len() as u64;
+                output_values.push(edit.insert);
+                Ok(WasmOutputSplice {
+                    offset: edit.offset,
+                    delete_len: edit.delete_len,
+                    insert: WasmGuestBytes::Output(WasmOutputRange {
+                        index: u32::try_from(index).map_err(|_| {
+                            component_error("component file edit count exceeds u32")
+                        })?,
+                        offset: 0,
+                        length,
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        if let Some(outputs) = output_handle {
+            self.outputs.insert(
+                outputs.0,
+                OutputState {
+                    transition,
+                    values: output_values,
+                },
+            );
+        }
         self.transitions.insert(transition.0, resolved.counters);
         self.prospective_documents.track(transition, next_document);
         self.edit_cursors.insert(
             edits.0,
             ComponentEditCursorState {
                 transition,
-                page: Some(WasmEditPage {
-                    edits: vec![WasmOutputSplice {
-                        offset: 0,
-                        delete_len: before_len,
-                        insert: WasmGuestBytes::Output(WasmOutputRange {
-                            index: 0,
-                            offset: 0,
-                            length,
-                        }),
-                    }],
-                    outputs: Some(outputs),
+                page: (!output_edits.is_empty()).then_some(WasmEditPage {
+                    edits: output_edits,
+                    outputs: output_handle,
                 }),
             },
         );
@@ -3905,18 +4358,18 @@ impl WasmComponentActor for ComponentActor {
         })
     }
 
-    async fn resolve_conflicts(
+    async fn merge_columns(
         &mut self,
         limits: WasmTransitionLimits,
-        update: WasmConflictUpdate,
-    ) -> Result<WasmConflictTransition, LixError> {
+        update: WasmColumnMergeUpdate,
+    ) -> Result<WasmColumnMergeTransition, LixError> {
         self.ensure_active()?;
         let permit = Self::acquire_execution_permit(
             self.initial_execution_permit.take(),
             self.execution_scheduler(),
         )
         .await?;
-        let resolved = self.worker.resolve_conflicts(limits, update);
+        let resolved = self.worker.merge_columns(limits, update);
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -3925,14 +4378,14 @@ impl WasmComponentActor for ComponentActor {
             }
         };
         let transition = WasmTransitionHandle(self.allocate_handle()?);
-        let cursor = WasmResolutionCursorHandle(self.allocate_handle()?);
+        let cursor = WasmColumnMergeCursorHandle(self.allocate_handle()?);
         let records_per_page = (limits.max_page_bytes as usize / 64).max(1);
         let mut pages = VecDeque::new();
         let mut ordinal = 0_u32;
         let mut resolutions = resolved.resolutions.into_iter();
         loop {
             let mut page_ordinals = Vec::with_capacity(records_per_page);
-            let mut page_resolutions = Vec::with_capacity(records_per_page);
+            let mut page_results = Vec::with_capacity(records_per_page);
             let mut page_outputs = Vec::new();
             for _ in 0..records_per_page {
                 let Some(resolution) = resolutions.next() else {
@@ -3942,27 +4395,26 @@ impl WasmComponentActor for ComponentActor {
                 ordinal = ordinal
                     .checked_add(1)
                     .ok_or_else(|| component_error("component resolution ordinal overflowed"))?;
-                page_resolutions.push(match resolution {
-                    ComponentResolution::Take(side) => WasmConflictResolution::Take(side),
-                    ComponentResolution::Delete => WasmConflictResolution::Delete,
-                    ComponentResolution::Replace { snapshot, effect } => {
+                page_results.push(match resolution {
+                    ComponentResolution::UseLww => RuntimeColumnMergeResult::UseLww,
+                    ComponentResolution::Replace(None) => RuntimeColumnMergeResult::Replace(None),
+                    ComponentResolution::Replace(Some(snapshot)) => {
                         let index = u32::try_from(page_outputs.len()).map_err(|_| {
                             component_error("component replacement output count exceeds u32")
                         })?;
                         let length = snapshot.len() as u64;
                         page_outputs.push(snapshot);
-                        WasmConflictResolution::Replace {
-                            snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
+                        RuntimeColumnMergeResult::Replace(Some(WasmGuestBytes::Output(
+                            WasmOutputRange {
                                 index,
                                 offset: 0,
                                 length,
-                            }),
-                            effect,
-                        }
+                            },
+                        )))
                     }
                 });
             }
-            if page_resolutions.is_empty() {
+            if page_results.is_empty() {
                 break;
             }
             let outputs = if page_outputs.is_empty() {
@@ -3978,20 +4430,20 @@ impl WasmComponentActor for ComponentActor {
                 );
                 Some(handle)
             };
-            pages.push_back(WasmConflictResolutionPage {
+            pages.push_back(WasmColumnMergeResultPage {
                 format_version: PACKET_FORMAT_V1,
                 ordinals: page_ordinals,
-                resolutions: page_resolutions,
+                results: page_results,
                 outputs,
             });
         }
         self.transitions.insert(transition.0, resolved.counters);
-        self.resolution_cursors
-            .insert(cursor.0, ResolutionCursorState { transition, pages });
+        self.column_merge_cursors
+            .insert(cursor.0, ColumnMergeCursorState { transition, pages });
         self.transition_permits.insert(transition.0, permit);
-        Ok(WasmConflictTransition {
+        Ok(WasmColumnMergeTransition {
             transition,
-            resolutions: cursor,
+            results: cursor,
         })
     }
 
@@ -4012,6 +4464,7 @@ impl WasmComponentActor for ComponentActor {
         }
         loop {
             match cursor.pages.pop_front() {
+                Some(PendingChangePage::Decoded(page)) => return Ok(Some(page)),
                 Some(PendingChangePage::Packet {
                     record_count,
                     payload,
@@ -4100,19 +4553,19 @@ impl WasmComponentActor for ComponentActor {
         }
     }
 
-    async fn next_resolution_page(
+    async fn next_column_merge_result_page(
         &mut self,
         transition: WasmTransitionHandle,
-        cursor: WasmResolutionCursorHandle,
+        cursor: WasmColumnMergeCursorHandle,
         _max_bytes: u32,
-    ) -> Result<Option<WasmConflictResolutionPage>, LixError> {
+    ) -> Result<Option<WasmColumnMergeResultPage>, LixError> {
         let cursor = self
-            .resolution_cursors
+            .column_merge_cursors
             .get_mut(&cursor.0)
-            .ok_or_else(|| component_error("unknown component resolution cursor"))?;
+            .ok_or_else(|| component_error("unknown component column merge cursor"))?;
         if cursor.transition != transition {
             return Err(component_error(
-                "component resolution cursor belongs to another transition",
+                "component column merge cursor belongs to another transition",
             ));
         }
         Ok(cursor.pages.pop_front())
@@ -4231,7 +4684,7 @@ impl WasmComponentActor for ComponentActor {
         let _permit = self.transition_permits.remove(&transition.0);
         self.cursors
             .retain(|_, cursor| cursor.transition != transition);
-        self.resolution_cursors
+        self.column_merge_cursors
             .retain(|_, cursor| cursor.transition != transition);
         self.edit_cursors
             .retain(|_, cursor| cursor.transition != transition);
@@ -4252,7 +4705,7 @@ impl WasmComponentActor for ComponentActor {
         let _permit = self.transition_permits.remove(&transition.0);
         self.cursors
             .retain(|_, cursor| cursor.transition != transition);
-        self.resolution_cursors
+        self.column_merge_cursors
             .retain(|_, cursor| cursor.transition != transition);
         self.edit_cursors
             .retain(|_, cursor| cursor.transition != transition);
@@ -4318,6 +4771,78 @@ fn component_transition_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_parse_changes_row_source_exposes_complete_current_rows() {
+        let limits = WasmTransitionLimits::default();
+        let key = WasmRowKey::from_owned_parts("note", vec!["note-1".to_owned()]);
+        let source = crate::plugin::runtime::VecRowSource::new(
+            vec![WasmRow {
+                key: key.clone(),
+                snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
+                    br#"{"body":"current"}"#,
+                )),
+            }],
+            limits,
+        )
+        .expect("valid durable row source");
+        let mut state =
+            RowChangeState::from_rows(limits, Box::new(source), SharedByteBudget::default())
+                .expect("warm parse-changes source should initialize");
+        let page = state
+            .next_page(limits.max_page_bytes)
+            .expect("row source should be readable")
+            .expect("one row page should exist");
+        assert!(matches!(
+            page.as_slice(),
+            [WasmRowChange::Upsert { row, .. }] if row.key == key
+        ));
+        assert!(
+            state
+                .next_page(limits.max_page_bytes)
+                .expect("row source EOF should be readable")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn replace_all_rows_synthesizes_delete_for_omitted_prior_row() {
+        let limits = WasmTransitionLimits::default();
+        let keep = WasmRowKey::from_owned_parts("note", vec!["keep".to_owned()]);
+        let omitted = WasmRowKey::from_owned_parts("note", vec!["omitted".to_owned()]);
+        let mut state =
+            TransitionState::new(limits, WasmCreateContext { high: 1, low: 2 }, false, None)
+                .expect("transition state");
+        state.replace_all_rows = true;
+        state
+            .pages
+            .push_back(PendingChangePage::Decoded(WasmChangePage {
+                format_version: PACKET_FORMAT_V1,
+                changes: WasmRowChanges {
+                    changes: vec![WasmRowChange::Upsert {
+                        row: WasmRow {
+                            key: keep.clone(),
+                            snapshot_content: WasmGuestBytes::Inline(Bytes::from_static(
+                                br#"{"body":"kept"}"#,
+                            )),
+                        },
+                        effect: WasmChangeEffect::Content,
+                    }],
+                },
+                outputs: None,
+            }));
+        append_replace_all_deletes(&mut state, BTreeSet::from([keep, omitted.clone()]))
+            .expect("replacement deletion synthesis");
+        let deletes = state
+            .pages
+            .pop_back()
+            .expect("synthesized delete page")
+            .decode()
+            .expect("decode synthesized page")
+            .changes
+            .changes;
+        assert!(matches!(deletes.as_slice(), [WasmRowChange::Delete(key)] if key == &omitted));
+    }
 
     #[cfg(any())]
     #[derive(Clone, Debug)]
@@ -4394,10 +4919,18 @@ mod tests {
             .expect("read JSON component");
         let factory = crate::default_wasm_runtime()
             .expect("default Wasm runtime")
-            .compile_component(wasm, WasmLimits::default())
+            .compile_component(
+                wasm,
+                WasmLimits::default(),
+                PluginCapabilities {
+                    column_merger: true,
+                    file_projection: true,
+                },
+            )
             .await
             .expect("compile JSON component");
         let descriptor = WasmFileDescriptor {
+            file_id: "direct-cold-fallback".to_owned(),
             path: Some("/direct-cold-fallback.json".to_owned()),
             plugin: WasmPluginSelection {
                 plugin_key: "plugin_json".to_owned(),
@@ -4500,6 +5033,8 @@ mod tests {
                     }],
                     after: Arc::new(JsonTestSource(successor_after.clone())),
                     creates,
+                    rows: Some(Box::new(JsonTestRowSource { rows: Some(rows) })),
+                    prior_row_keys: None,
                 },
             )
             .await

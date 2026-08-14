@@ -1352,7 +1352,7 @@ test("engine errors cross the native boundary", async () => {
 	await lix.close();
 });
 
-test("merge conflicts expose structured preview details and merge error", async () => {
+test("same-row merges use host column LWW without conflict details", async () => {
 	const lix = await openLix();
 	const mainBranchId = await lix.activeBranchId();
 	await registerCrmTaskSchema(lix);
@@ -1378,26 +1378,15 @@ test("merge conflicts expose structured preview details and merge error", async 
 	]);
 
 	const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
-	expect(preview.conflicts).toHaveLength(1);
-	expect(preview.conflicts[0]).toMatchObject({
-		kind: "sameRowChanged",
-		schemaKey: "crm_task",
-		rowPk: ["conflict-task"],
-	});
-	expect(preview.conflicts[0]?.target).toBeDefined();
-	expect(preview.conflicts[0]?.source).toBeDefined();
+	expect(preview.conflicts).toHaveLength(0);
 
-	try {
-		await lix.mergeBranch({ sourceBranchId: draft.id });
-		throw new Error("expected merge conflict");
-	} catch (error) {
-		expect(error).toMatchObject({
-			name: "LixError",
-			code: "LIX_MERGE_CONFLICT",
-		});
-		if (!(error instanceof Error)) throw error;
-		expect(error.message).toContain("tracked-state conflict");
-	}
+	await lix.mergeBranch({ sourceBranchId: draft.id });
+	const merged = await lix.execute(
+		"SELECT title FROM crm_task WHERE id = $1",
+		["conflict-task"],
+	);
+	expect(merged.rows).toHaveLength(1);
+	expect(["Draft", "Main"]).toContain(merged.rows[0]?.get("title"));
 
 	await lix.close();
 });

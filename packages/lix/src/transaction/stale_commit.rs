@@ -6,27 +6,25 @@ use crate::tracked_state::TrackedStateKeyRef;
 use super::staging::PreparedWriteSet;
 
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum StaleCommitPlan {
     Direct,
-    RevalidateOrdinaryInsert,
-    ReconcilePlugin(StalePluginReconciliationPlan),
-    Unsafe,
+    ReconcileRows(StaleRowReconciliationPlan),
 }
 
 impl StaleCommitPlan {
     pub(super) const fn kind(&self) -> &'static str {
         match self {
             Self::Direct => "direct",
-            Self::RevalidateOrdinaryInsert => "revalidate_ordinary_insert",
-            Self::ReconcilePlugin(_) => "reconcile_plugin",
-            Self::Unsafe => "unsafe",
+            Self::ReconcileRows(_) => "reconcile_rows",
         }
     }
 }
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct StalePluginReconciliationPlan {
+pub(super) struct StaleRowReconciliationPlan {
     pub(super) semantic_conflict_indices: Vec<usize>,
     pub(super) file_ids: BTreeSet<String>,
 }
@@ -56,16 +54,6 @@ pub(super) fn classify_stale_commit<'a>(
         return StaleCommitPlan::Direct;
     }
 
-    // Ordinary INSERT races keep their established constraint surface:
-    // commit-time validation reports the exact UNIQUE/statement-index error
-    // from the current snapshot.
-    if overlapping_indices.iter().all(|&index| {
-        prepared_writes.insert_selection.contains(index)
-            && prepared_writes.state_rows.row(index).file_id.is_none()
-    }) {
-        return StaleCommitPlan::RevalidateOrdinaryInsert;
-    }
-
     let file_ids = overlapping_indices
         .iter()
         .filter_map(|&index| {
@@ -76,14 +64,6 @@ pub(super) fn classify_stale_commit<'a>(
                 .map(ToString::to_string)
         })
         .collect::<BTreeSet<_>>();
-    if file_ids.is_empty()
-        || overlapping_indices
-            .iter()
-            .any(|&index| prepared_writes.state_rows.row(index).file_id.is_none())
-    {
-        return StaleCommitPlan::Unsafe;
-    }
-
     let semantic_conflict_indices = overlapping_indices
         .iter()
         .copied()
@@ -91,10 +71,12 @@ pub(super) fn classify_stale_commit<'a>(
             !matches!(
                 prepared_writes.state_rows.row(index).schema_key.as_str(),
                 BLOB_REF_SCHEMA_KEY
+                    | FILE_DESCRIPTOR_SCHEMA_KEY
+                    | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
             )
         })
         .collect();
-    StaleCommitPlan::ReconcilePlugin(StalePluginReconciliationPlan {
+    StaleCommitPlan::ReconcileRows(StaleRowReconciliationPlan {
         semantic_conflict_indices,
         file_ids,
     })

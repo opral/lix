@@ -21,7 +21,6 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::{Domain, DomainRowIdentity};
-use crate::row_pk::RowPk;
 #[cfg(test)]
 use crate::functions::FunctionProvider;
 use crate::functions::FunctionProviderHandle;
@@ -35,6 +34,7 @@ use crate::hot_state::{
     HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateBatchBuilder,
     MaterializedHotStateExactBatch,
 };
+use crate::row_pk::RowPk;
 use crate::transaction::staged_commit_changes::StagedCommitChangeBatch;
 use crate::transaction::staged_commit_changes::StagedCommitChangeRefs;
 use crate::transaction_types::{
@@ -824,8 +824,7 @@ impl StagedScanCandidateIndex {
 
             let mut slots = Vec::new();
             for schema_key in &filter.schema_keys {
-                let Some(by_row) = self.slots_by_schema_and_row.get(schema_key.as_str())
-                else {
+                let Some(by_row) = self.slots_by_schema_and_row.get(schema_key.as_str()) else {
                     continue;
                 };
                 for row_pk in &filter.row_pks {
@@ -1540,7 +1539,10 @@ impl PreparedWriteSet {
         Ok(())
     }
 
-    pub(crate) fn replace_reconciled_file_writes(
+    /// Replaces every original row whose identity appears in `replacement`.
+    /// `file_ids` additionally selects projected byte writes to supersede; it
+    /// is intentionally empty for reconciliation of ordinary unfiled rows.
+    pub(crate) fn replace_reconciled_writes(
         &mut self,
         mut replacement: PreparedWriteSet,
         file_ids: &BTreeSet<String>,
@@ -1995,11 +1997,11 @@ impl TransactionWriteBuffer {
             StagedPreparedRows::AppendOnly { rows, .. }
             | StagedPreparedRows::Indexed { rows, .. } => rows,
         };
-        let has_file = rows.iter().any(|row| row.file_id.is_some());
+        let has_rows = !rows.is_empty();
         let invalid_row = rows
             .iter()
             .any(|row| row.untracked || row.global || row.branch_id.as_str() != branch_id);
-        if !has_file || invalid_row {
+        if !has_rows || invalid_row {
             return false;
         }
         let eligible = self
@@ -2848,8 +2850,7 @@ impl TransactionWriteBuffer {
             )
         })?;
         if ordered.as_ref().is_some_and(|journal| {
-            ordered_mutation_journal_row(journal, branch_id, schema_key, file_id, row_pk)
-                .is_some()
+            ordered_mutation_journal_row(journal, branch_id, schema_key, file_id, row_pk).is_some()
         }) {
             return Ok(true);
         }
@@ -4283,8 +4284,7 @@ fn append_matching_staged_rows(
         let Some(row) = staged_rows.get(index) else {
             continue;
         };
-        if staged_row_identity_matches_scan(row, request, candidate_index_matched_schema_and_row)
-        {
+        if staged_row_identity_matches_scan(row, request, candidate_index_matched_schema_and_row) {
             push_prepared_materialized(output, row);
         }
     }
@@ -4804,8 +4804,7 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: prepared_rows![
-                    tracked_append_row("row-a", "duplicate")
-                        .with_change_id("duplicate-row-a"),
+                    tracked_append_row("row-a", "duplicate").with_change_id("duplicate-row-a"),
                 ],
             })
             .expect_err("a later INSERT must reject a journaled identity");
@@ -4837,8 +4836,7 @@ mod tests {
                 mode: TransactionWriteMode::Insert,
                 rows: prepared_rows![
                     tracked_append_row("row-c", "must-not-stage"),
-                    tracked_append_row("row-a", "duplicate")
-                        .with_change_id("duplicate-row-a"),
+                    tracked_append_row("row-a", "duplicate").with_change_id("duplicate-row-a"),
                 ],
             })
             .expect_err("the later duplicate must reject the whole incoming batch");

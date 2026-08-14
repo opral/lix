@@ -1,4 +1,4 @@
-//! JSON support for the fused Component API v1.
+//! JSON support for the row-first Component API v1.
 #![allow(dead_code)]
 
 mod core;
@@ -22,69 +22,73 @@ const SCALAR_INDEX_ENTRY_BYTES: u32 = 20;
 const SCALAR_PAGE_BYTES: usize = 1024 * 1024;
 const STATE_PAGE_BYTES: usize = 1024 * 1024;
 
-impl sdk::Plugin for JsonPlugin {
-    fn cold_file_changed(
-        update: &mut sdk::ColdUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
-    ) -> sdk::Result<()> {
-        let accepted = update.before.read_all()?;
-        let mut builder = RowImportBuilder::new();
-        while let Some(row) = update.rows.next()? {
-            builder
-                .push(RowRecord {
-                    schema_key: row.schema_key,
-                    row_pk: row.row_pk,
-                    snapshot: row.snapshot,
-                })
-                .map_err(sdk::Error::invalid_input)?;
-        }
-        let create_namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
-        let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
-        if !document.bytes_equal(&accepted) {
-            let reconcile = [FileEdit {
-                offset: 0,
-                delete_len: document.byte_len() as u64,
-                insert: &accepted,
-            }];
-            document = document
-                .file_changed(&reconcile, create_namespace)
-                .map_err(sdk::Error::invalid_input)?
-                .0;
-        }
-        let inserts = update
-            .edits
-            .iter()
-            .map(|edit| edit.insert.clone())
-            .collect::<Vec<_>>();
-        let splices = update
-            .edits
-            .iter()
-            .zip(&inserts)
-            .map(|(edit, insert)| FileEdit {
-                offset: edit.offset,
-                delete_len: edit.delete_len,
-                insert,
+fn cold_parse_changes(
+    update: &mut sdk::ParseChangesInput<'_>,
+    sink: &mut sdk::RowChangeOutput<'_, '_>,
+) -> sdk::Result<()> {
+    let accepted = update.before.read_all()?;
+    let mut builder = RowImportBuilder::new();
+    let rows = update
+        .rows
+        .as_mut()
+        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable rows"))?;
+    while let Some(row) = rows.next()? {
+        builder
+            .push(RowRecord {
+                schema_key: row.schema_key,
+                row_pk: row.row_pk,
+                snapshot: row.snapshot,
             })
-            .collect::<Vec<_>>();
-        let (document, changes) = document
-            .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
-        sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
-        store_fallback_rows_fresh(
-            sink,
-            &document.row_records().map_err(sdk::Error::invalid_input)?,
-        )?;
-        emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
-        Ok(())
     }
+    let create_namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
+    let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
+    if !document.bytes_equal(&accepted) {
+        let reconcile = [FileEdit {
+            offset: 0,
+            delete_len: document.byte_len() as u64,
+            insert: &accepted,
+        }];
+        document = document
+            .file_changed(&reconcile, create_namespace)
+            .map_err(sdk::Error::invalid_input)?
+            .0;
+    }
+    let inserts = update
+        .file_edits
+        .iter()
+        .map(|edit| edit.insert.clone())
+        .collect::<Vec<_>>();
+    let splices = update
+        .file_edits
+        .iter()
+        .zip(&inserts)
+        .map(|(edit, insert)| FileEdit {
+            offset: edit.offset,
+            delete_len: edit.delete_len,
+            insert,
+        })
+        .collect::<Vec<_>>();
+    let (document, changes) = document
+        .file_changed(&splices, create_namespace)
+        .map_err(sdk::Error::invalid_input)?;
+    sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
+    store_fallback_rows_fresh(
+        sink,
+        &document.row_records().map_err(sdk::Error::invalid_input)?,
+    )?;
+    emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
+    Ok(())
+}
 
-    fn rows_changed(
-        update: &mut sdk::RowUpdate<'_>,
-        sink: &mut sdk::Output<'_>,
+impl sdk::FileProjection for JsonPlugin {
+    fn serialize_changes(
+        mut update: sdk::SerializeChangesInput<'_>,
+        sink: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
-        while let Some(change) = update.changes.next()? {
+        while let Some(change) = update.row_changes.next()? {
             changes.push(RowChange {
                 schema_key: change.schema_key,
                 row_pk: change.row_pk,
@@ -98,21 +102,22 @@ impl sdk::Plugin for JsonPlugin {
         let namespace = read_namespace(&update.before, ID_NAMESPACE_STATE)?
             .or_else(|| namespace_from_changes(&changes))
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let document = read_fallback_document(
-            &update.before,
-            before.clone(),
-            Some(update.before_path.as_str()),
-            namespace,
-        )?;
+        let document =
+            read_fallback_document(&update.before, before.clone(), Some(update.path), namespace)?;
         let (successor, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
-        sink.replace_file(&apply_edits(before, &edits)?)?;
+        for edit in edits {
+            sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
+        }
         store_fallback_rows(&update.before, sink, &successor)?;
         Ok(())
     }
 
-    fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn serialize(
+        mut input: sdk::SerializeInput<'_>,
+        sink: &mut sdk::FileOutput<'_, '_>,
+    ) -> sdk::Result<()> {
         let mut builder = RowImportBuilder::new();
         let mut records = Vec::new();
         while let Some(row) = input.rows.next()? {
@@ -128,35 +133,39 @@ impl sdk::Plugin for JsonPlugin {
         }
         let (document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
         store_fallback_rows_fresh(sink, &records)?;
-        if input.accepted.is_none() {
-            sink.replace_file(&document.bytes())?;
-        }
-        Ok(())
+        sink.write(&document.bytes())
     }
 
-    fn open(input: &sdk::OpenFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
-        let bytes = input.accepted.read_all()?;
+    fn parse(input: sdk::ParseInput<'_>, sink: &mut sdk::RowOutput<'_, '_>) -> sdk::Result<()> {
+        let bytes = input.file.read_all()?;
         let namespace = IdNamespace::from_namespace_bytes(input.creates.namespace_bytes());
-        let (document, changes) =
-            Document::open_fresh_file(bytes, Some(input.path.as_str()), namespace)
-                .map_err(sdk::Error::invalid_input)?;
+        let (document, changes) = Document::open_fresh_file(bytes, Some(input.path), namespace)
+            .map_err(sdk::Error::invalid_input)?;
         sink.put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
         store_scalar_state(sink, &document)?;
         emit_changes(changes, input.creates, sink)?;
         Ok(())
     }
 
-    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+    fn parse_changes(
+        mut update: sdk::ParseChangesInput<'_>,
+        sink: &mut sdk::RowChangeOutput<'_, '_>,
+    ) -> sdk::Result<()> {
+        if update.before.state_len(SCALAR_INDEX_STATE)?.is_none()
+            && update.before.state_len(FALLBACK_ROWS_STATE)?.is_none()
+        {
+            return cold_parse_changes(&mut update, sink);
+        }
         let create_namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
         let accepted_namespace =
             read_namespace(&update.before, ID_NAMESPACE_STATE)?.unwrap_or(create_namespace);
         let inserts = update
-            .edits
+            .file_edits
             .iter()
             .map(|edit| edit.insert.clone())
             .collect::<Vec<_>>();
         let splices = update
-            .edits
+            .file_edits
             .iter()
             .zip(&inserts)
             .map(|(edit, insert)| FileEdit {
@@ -167,8 +176,9 @@ impl sdk::Plugin for JsonPlugin {
             .collect::<Vec<_>>();
         if update.before.state_len(FALLBACK_ROWS_STATE)?.is_none()
             && update.before_path == update.after_path
-            && let [edit] = update.edits.as_slice()
-            && let Some((change, shifts)) = sparse_scalar_change(update, edit, &inserts[0])?
+            && update.file_edits.iter().len() == 1
+            && let Some(edit) = update.file_edits.iter().next()
+            && let Some((change, shifts)) = sparse_scalar_change(&update, edit, &inserts[0])?
         {
             if shifts.is_empty() {
                 if update.before.state_len(SCALAR_SHIFTS_STATE)?.is_some() {
@@ -185,14 +195,14 @@ impl sdk::Plugin for JsonPlugin {
         let document = read_fallback_document(
             &update.before,
             before_bytes,
-            Some(update.before_path.as_str()),
+            Some(update.before_path),
             accepted_namespace,
         )?;
         let (document, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
         store_fallback_rows_in_transaction(&update.before, sink, &document)?;
-        let (old_index_page_count, old_scalar_page_count) = scalar_page_counts(update)?;
+        let (old_index_page_count, old_scalar_page_count) = scalar_page_counts(&update)?;
         sink.delete_state(SCALAR_INDEX_STATE)?;
         for ordinal in 0..old_index_page_count {
             sink.delete_state(&scalar_index_page_key(ordinal))?;
@@ -244,7 +254,7 @@ fn read_fallback_document(
 
 fn store_fallback_rows(
     before: &sdk::Snapshot<'_>,
-    sink: &mut sdk::Output<'_>,
+    sink: &mut impl StateOutput,
     document: &Document,
 ) -> sdk::Result<()> {
     let records = document.row_records().map_err(sdk::Error::invalid_input)?;
@@ -271,7 +281,7 @@ fn store_fallback_rows(
 
 fn store_fallback_rows_in_transaction(
     before: &sdk::Snapshot<'_>,
-    successor: &sdk::Output<'_>,
+    successor: &mut impl StateOutput,
     document: &Document,
 ) -> sdk::Result<()> {
     let records = document.row_records().map_err(sdk::Error::invalid_input)?;
@@ -288,7 +298,7 @@ fn store_fallback_rows_in_transaction(
 }
 
 fn store_fallback_rows_fresh(
-    successor: &sdk::Output<'_>,
+    successor: &mut impl StateOutput,
     records: &[RowRecord],
 ) -> sdk::Result<()> {
     let (manifest, pages) = encode_row_records(records)?;
@@ -537,7 +547,7 @@ fn apply_file_splices(mut bytes: Vec<u8>, splices: &[FileEdit<'_>]) -> sdk::Resu
     Ok(bytes)
 }
 
-fn store_scalar_state(successor: &sdk::Output, document: &Document) -> sdk::Result<()> {
+fn store_scalar_state(successor: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
     let state = encode_scalar_state(
         &document
             .arena_scalars()
@@ -554,7 +564,7 @@ fn store_scalar_state(successor: &sdk::Output, document: &Document) -> sdk::Resu
 }
 
 fn sparse_scalar_change(
-    update: &sdk::FileUpdate<'_>,
+    update: &sdk::ParseChangesInput<'_>,
     edit: &sdk::FileEdit,
     insert: &[u8],
 ) -> sdk::Result<Option<(RowChange, Vec<u8>)>> {
@@ -874,7 +884,10 @@ struct ScalarEntry {
     blob_len: u32,
 }
 
-fn read_scalar_entry(update: &sdk::FileUpdate<'_>, ordinal: u32) -> sdk::Result<ScalarEntry> {
+fn read_scalar_entry(
+    update: &sdk::ParseChangesInput<'_>,
+    ordinal: u32,
+) -> sdk::Result<ScalarEntry> {
     let entries_per_page = u32::try_from(STATE_PAGE_BYTES / SCALAR_INDEX_ENTRY_BYTES as usize)
         .expect("scalar index page capacity fits u32");
     let page = ordinal / entries_per_page;
@@ -942,7 +955,7 @@ fn scalar_index_page_key(ordinal: u32) -> Vec<u8> {
     key
 }
 
-fn scalar_page_counts(update: &sdk::FileUpdate<'_>) -> sdk::Result<(u32, u32)> {
+fn scalar_page_counts(update: &sdk::ParseChangesInput<'_>) -> sdk::Result<(u32, u32)> {
     scalar_page_counts_root(&update.before)
 }
 
@@ -1031,7 +1044,7 @@ fn take_state_text(input: &mut &[u8]) -> sdk::Result<String> {
 fn emit_changes<I>(
     changes: I,
     creates: sdk::CreateContext,
-    sink: &mut sdk::Output<'_>,
+    sink: &mut impl MutationOutput,
 ) -> sdk::Result<()>
 where
     I: IntoIterator<Item = Result<RowChange, String>>,
@@ -1046,30 +1059,80 @@ where
                     .filter(|_| change.row_pk.len() == 1)
                     .and_then(|id| local_ref(creates, id));
                 if let Some(local_ref) = local_ref {
-                    sink.row(sdk::RowMutation::Create {
-                        schema_key: &change.schema_key,
-                        local_ref,
-                        snapshot: &snapshot,
-                    })?;
+                    sink.create(&change.schema_key, local_ref, &snapshot)?;
                 } else {
-                    sink.row(sdk::RowMutation::Upsert {
-                        schema_key: &change.schema_key,
-                        row_pk: &change.row_pk,
-                        snapshot: &snapshot,
-                        effect: match change.effect {
+                    sink.upsert(
+                        &change.schema_key,
+                        &change.row_pk,
+                        &snapshot,
+                        match change.effect {
                             ChangeEffect::Content => sdk::ChangeEffect::Content,
                             ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
                         },
-                    })?;
+                    )?;
                 }
             }
-            None => sink.row(sdk::RowMutation::Delete {
-                schema_key: &change.schema_key,
-                row_pk: &change.row_pk,
-            })?,
+            None => sink.delete(&change.schema_key, &change.row_pk)?,
         }
     }
     Ok(())
+}
+
+trait StateOutput {
+    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
+    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
+}
+macro_rules! impl_state_output {
+    ($type:ty) => {
+        impl StateOutput for $type {
+            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
+                <$type>::put_state(self, key, value)
+            }
+            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
+                <$type>::delete_state(self, key)
+            }
+        }
+    };
+}
+impl_state_output!(sdk::RowOutput<'_, '_>);
+impl_state_output!(sdk::RowChangeOutput<'_, '_>);
+impl_state_output!(sdk::FileOutput<'_, '_>);
+impl_state_output!(sdk::FileEditOutput<'_, '_>);
+
+trait MutationOutput {
+    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()>;
+    fn upsert(
+        &mut self,
+        schema_key: &str,
+        row_pk: &[String],
+        snapshot: &[u8],
+        effect: sdk::ChangeEffect,
+    ) -> sdk::Result<()>;
+    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()>;
+}
+impl MutationOutput for sdk::RowOutput<'_, '_> {
+    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
+        self.create(s, l, v)
+    }
+    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], _: sdk::ChangeEffect) -> sdk::Result<()> {
+        self.upsert(s, k, v)
+    }
+    fn delete(&mut self, _: &str, _: &[String]) -> sdk::Result<()> {
+        Err(sdk::Error::invalid_input(
+            "initial JSON parse produced a deletion",
+        ))
+    }
+}
+impl MutationOutput for sdk::RowChangeOutput<'_, '_> {
+    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
+        self.create(s, l, v)
+    }
+    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], e: sdk::ChangeEffect) -> sdk::Result<()> {
+        self.upsert(s, k, v, e)
+    }
+    fn delete(&mut self, s: &str, k: &[String]) -> sdk::Result<()> {
+        self.delete(s, k)
+    }
 }
 
 fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
@@ -1092,7 +1155,7 @@ fn push_text(output: &mut Vec<u8>, value: &str) -> sdk::Result<()> {
 }
 
 #[cfg(target_family = "wasm")]
-lix::plugin::export!(JsonPlugin);
+lix::plugin::export_capabilities! { file_projection: JsonPlugin }
 
 #[cfg(test)]
 mod tests {

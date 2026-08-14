@@ -114,9 +114,13 @@ path = "tests/hot_index_range_probe.rs"
 
 [dependencies]
 lix_schema.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
 
 [target.'cfg(any(not(target_arch = "wasm32"), all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
-wit-bindgen = "0.57"
+lix-plugin-bindings-column-merger = { path = "../lix-plugin-bindings-column-merger", version = "=0.11.0" }
+lix-plugin-bindings-combined = { path = "../lix-plugin-bindings-combined", version = "=0.11.0" }
+lix-plugin-bindings-file-projection = { path = "../lix-plugin-bindings-file-projection", version = "=0.11.0" }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2"))'.dependencies]
 uuid = { version = "1", features = ["std"] }
@@ -134,8 +138,6 @@ datafusion = { version = "53.0.0", default-features = false, features = [
     "unicode_expressions",
 ] }
 musli = { version = "0.0.149", features = ["storage"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 smallvec = "1.15"
 globset = "0.4"
@@ -161,6 +163,7 @@ http = { version = "1", optional = true }
 http-body = { version = "1", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+wasmparser = { version = "0.247", features = ["component-model"] }
 wasmtime = { version = "45", default-features = false, features = ["cache", "component-model", "cranelift", "runtime", "std"], optional = true }
 wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
 

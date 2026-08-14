@@ -11,7 +11,7 @@ use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 
 #[cfg(test)]
 use super::{InstalledPlugin, InstalledPluginMetadata};
-use super::{PluginManifest, parse_plugin_manifest_json};
+use super::{PluginCapabilities, PluginManifest, parse_plugin_manifest_json};
 
 /// Fully validated plugin package data needed by the install transaction.
 ///
@@ -25,8 +25,9 @@ pub(crate) struct ParsedPluginArchive {
     pub schemas: Vec<JsonValue>,
     pub schema_keys: Vec<String>,
     pub create_schema_keys: Vec<String>,
-    pub wasm_bytes: Vec<u8>,
-    pub wasm_hash: BlobId,
+    pub capabilities: PluginCapabilities,
+    pub wasm_bytes: Option<Vec<u8>>,
+    pub wasm_hash: Option<BlobId>,
 }
 
 const KIB: u64 = 1024;
@@ -114,16 +115,21 @@ pub(crate) fn parse_plugin_archive_for_install(
     archive_bytes: &[u8],
 ) -> Result<ParsedPluginArchive, LixError> {
     let loaded = load_plugin_archive(archive_bytes, true, PluginArchiveLimits::DEFAULT)?;
-    let wasm_bytes = loaded
-        .wasm
-        .expect("full plugin archive load should include WASM bytes");
-    let wasm_hash = BlobId::from_content(&wasm_bytes);
+    let wasm_bytes = loaded.wasm;
+    let wasm_hash = wasm_bytes.as_deref().map(BlobId::from_content);
+    let capabilities = wasm_bytes
+        .as_deref()
+        .map(detect_plugin_capabilities)
+        .transpose()?
+        .unwrap_or_default();
+    validate_manifest_capabilities(&loaded.manifest, capabilities)?;
     Ok(ParsedPluginArchive {
         manifest: loaded.manifest,
         normalized_manifest_json: loaded.normalized_manifest_json,
         schemas: loaded.schemas,
         schema_keys: loaded.schema_keys,
         create_schema_keys: loaded.create_schema_keys,
+        capabilities,
         wasm_bytes,
         wasm_hash,
     })
@@ -142,17 +148,23 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             loaded.manifest.key
         )));
     }
-    let wasm = loaded
-        .wasm
-        .expect("full plugin archive load should include WASM bytes");
-    let wasm_hash = BlobId::from_content(&wasm);
+    let wasm = loaded.wasm;
+    let wasm_hash = wasm.as_deref().map(BlobId::from_content);
+    let capabilities = wasm
+        .as_deref()
+        .map(detect_plugin_capabilities)
+        .transpose()?
+        .unwrap_or_default();
+    validate_manifest_capabilities(&loaded.manifest, capabilities)?;
+    let file_match = loaded.manifest.file_match.as_ref();
 
     Ok(InstalledPlugin {
         key: loaded.manifest.key,
         runtime: super::PluginRuntime::WasmComponent,
         api_version: crate::plugin::runtime::WASM_COMPONENT_API_VERSION.to_owned(),
-        path_glob: loaded.manifest.file_match.path_glob,
-        content: loaded.manifest.file_match.content,
+        capabilities,
+        path_glob: file_match.map(|matcher| matcher.path_glob.clone()),
+        content: file_match.and_then(|matcher| matcher.content),
         entry: loaded.manifest.entry,
         schema_keys: loaded.schema_keys,
         manifest_json: loaded.normalized_manifest_json,
@@ -180,8 +192,16 @@ pub(crate) fn load_installed_plugin_metadata_from_archive_bytes(
         key: loaded.manifest.key,
         archive_path: archive_path.to_string(),
         archive_blob_hash: archive_blob_hash.to_string(),
-        path_glob: loaded.manifest.file_match.path_glob,
-        content: loaded.manifest.file_match.content,
+        path_glob: loaded
+            .manifest
+            .file_match
+            .as_ref()
+            .map(|matcher| matcher.path_glob.clone()),
+        content: loaded
+            .manifest
+            .file_match
+            .as_ref()
+            .and_then(|matcher| matcher.content),
         schema_keys: loaded.schema_keys,
     })
 }
@@ -200,20 +220,21 @@ fn load_plugin_archive(
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
 
-    let entry_path = parse_plugin_archive_path_with_limit(
-        &validated_manifest.manifest.entry,
-        "Plugin manifest entry",
-        limits.path_bytes,
-    )?;
-    archive.require_file(&entry_path, PluginArchiveReadKind::Wasm)?;
-    let wasm = if include_wasm {
-        let wasm = archive.read_file(&entry_path, PluginArchiveReadKind::Wasm)?;
-        ensure_valid_plugin_wasm(&wasm)?;
-        Some(wasm)
+    let wasm = if let Some(entry) = &validated_manifest.manifest.entry {
+        let entry_path = parse_plugin_archive_path_with_limit(
+            entry,
+            "Plugin manifest entry",
+            limits.path_bytes,
+        )?;
+        archive.require_file(&entry_path, PluginArchiveReadKind::Wasm)?;
+        if include_wasm {
+            let wasm = archive.read_file(&entry_path, PluginArchiveReadKind::Wasm)?;
+            ensure_valid_plugin_wasm(&wasm)?;
+            Some(wasm)
+        } else {
+            None
+        }
     } else {
-        // Reserved plugin paths can only be written through the full install
-        // validator. Metadata discovery therefore checks package structure and
-        // referenced files without paying to inflate an already-validated WASM.
         None
     };
 
@@ -844,6 +865,71 @@ fn ensure_valid_plugin_wasm(bytes: &[u8]) -> Result<(), LixError> {
     Ok(())
 }
 
+fn detect_plugin_capabilities(bytes: &[u8]) -> Result<PluginCapabilities, LixError> {
+    const COLUMN_MERGER_EXPORT: &str = "lix:plugin/column-merger@1.0.0";
+    const FILE_PROJECTION_EXPORT: &str = "lix:plugin/file-projection@1.0.0";
+
+    let mut capabilities = PluginCapabilities::default();
+    let mut saw_root = false;
+    let mut depth = 0usize;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|error| {
+            invalid_plugin(format!("Plugin component is invalid WebAssembly: {error}"))
+        })?;
+        match payload {
+            wasmparser::Payload::Version { .. } => {
+                if saw_root {
+                    depth = depth.saturating_add(1);
+                } else {
+                    saw_root = true;
+                }
+            }
+            wasmparser::Payload::End(_) => {
+                depth = depth.saturating_sub(1);
+            }
+            wasmparser::Payload::ComponentExportSection(exports) if depth == 0 => {
+                for export in exports {
+                    let export = export.map_err(|error| {
+                        invalid_plugin(format!("Plugin component export is invalid: {error}"))
+                    })?;
+                    if export.kind != wasmparser::ComponentExternalKind::Instance {
+                        continue;
+                    }
+                    match export.name.0 {
+                        COLUMN_MERGER_EXPORT => capabilities.column_merger = true,
+                        FILE_PROJECTION_EXPORT => capabilities.file_projection = true,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !capabilities.column_merger && !capabilities.file_projection {
+        return Err(invalid_plugin(
+            "Plugin component must export column-merger, file-projection, or both",
+        ));
+    }
+    Ok(capabilities)
+}
+
+fn validate_manifest_capabilities(
+    manifest: &PluginManifest,
+    capabilities: PluginCapabilities,
+) -> Result<(), LixError> {
+    if manifest.entry.is_some() != (capabilities.column_merger || capabilities.file_projection) {
+        return Err(invalid_plugin(
+            "Plugin manifest entry must name a component with at least one capability",
+        ));
+    }
+    if manifest.file_match.is_some() != capabilities.file_projection {
+        return Err(invalid_plugin(
+            "Plugin manifest file_match requires the file-projection capability, and file-projection requires file_match",
+        ));
+    }
+    Ok(())
+}
+
 fn is_symlink_mode(mode: Option<u32>) -> bool {
     const MODE_FILE_TYPE_MASK: u32 = 0o170_000;
     const MODE_SYMLINK: u32 = 0o120_000;
@@ -854,6 +940,7 @@ fn is_symlink_mode(mode: Option<u32>) -> bool {
 mod tests {
     use std::io::{Cursor, Write};
 
+    use wasm_encoder::{ComponentBuilder, ComponentExportKind};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
@@ -870,7 +957,7 @@ mod tests {
 
     const MANIFEST: &[u8] = br#"{
         "key":"plugin_test",
-        "match":{"path_glob":"*.test"},
+        "file_match":{"path_glob":"*.test"},
         "entry":"plugin.wasm",
         "schemas":["schema/plugin_test_note.json"]
     }"#;
@@ -880,7 +967,7 @@ mod tests {
         "columns":[{"name":"id","type":"text","nullable":false}],
         "primary_key":["id"]
     }"#;
-    const WASM: &[u8] = b"\0asm\x01\0\0\0";
+    const FILE_PROJECTION_EXPORT: &str = "lix:plugin/file-projection@1.0.0";
 
     #[test]
     fn archive_path_parsing_is_slash_based() {
@@ -917,15 +1004,16 @@ mod tests {
 
     #[test]
     fn accepts_stored_and_deflated_plugin_archives() {
+        let wasm = capability_component(&[FILE_PROJECTION_EXPORT]);
         for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
-            let archive = plugin_archive(method);
+            let archive = plugin_archive(method, &wasm);
             let parsed = parse_plugin_archive_for_install(&archive)
                 .expect("canonical plugin archive should parse");
             assert_eq!(parsed.manifest.key, "plugin_test");
             assert_eq!(parsed.schemas.len(), 1);
             assert_eq!(parsed.schema_keys, ["plugin_test_note"]);
-            assert_eq!(parsed.wasm_bytes, WASM);
-            assert_eq!(parsed.wasm_hash, BlobId::from_content(WASM));
+            assert_eq!(parsed.wasm_bytes.as_deref(), Some(wasm.as_slice()));
+            assert_eq!(parsed.wasm_hash, Some(BlobId::from_content(&wasm)));
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&parsed.normalized_manifest_json)
                     .expect("normalized manifest should remain JSON")["key"],
@@ -937,17 +1025,94 @@ mod tests {
                 &archive,
             )
             .expect("canonical plugin archive should materialize");
-            assert_eq!(installed.wasm_hash, BlobId::from_content(WASM));
+            assert_eq!(installed.wasm_hash, Some(BlobId::from_content(&wasm)));
         }
     }
 
     #[test]
+    fn accepts_schema_only_archive_without_component() {
+        let manifest = br#"{
+            "key":"plugin_schema_only",
+            "schemas":["schema/plugin_test_note.json"]
+        }"#;
+        let archive = zip_entries(
+            &[
+                ("manifest.json", manifest),
+                ("schema/plugin_test_note.json", SCHEMA),
+            ],
+            CompressionMethod::Stored,
+        );
+        let parsed = parse_plugin_archive_for_install(&archive)
+            .expect("schema-only archive should not require a component");
+        assert_eq!(parsed.wasm_bytes, None);
+        assert_eq!(parsed.wasm_hash, None);
+        assert_eq!(parsed.capabilities, super::PluginCapabilities::default());
+    }
+
+    #[test]
+    fn rejects_reserved_capability_export_only_in_a_nested_component() {
+        let mut nested = ComponentBuilder::default();
+        let empty = nested.component(Some("empty"), ComponentBuilder::default());
+        let instance = nested.instantiate(
+            Some(FILE_PROJECTION_EXPORT),
+            empty,
+            std::iter::empty::<(&str, ComponentExportKind, u32)>(),
+        );
+        nested.export(
+            FILE_PROJECTION_EXPORT,
+            ComponentExportKind::Instance,
+            instance,
+            None,
+        );
+
+        let mut outer = ComponentBuilder::default();
+        outer.component(Some("nested"), nested);
+        let wasm = outer.finish();
+        let archive = zip_entries(
+            &[
+                ("manifest.json", MANIFEST),
+                ("schema/plugin_test_note.json", SCHEMA),
+                ("plugin.wasm", &wasm),
+            ],
+            CompressionMethod::Stored,
+        );
+        let error = parse_plugin_archive_for_install(&archive)
+            .expect_err("a nested export must not declare a host-visible capability");
+        assert!(error.message.contains("must export"), "{error:?}");
+    }
+
+    #[test]
+    fn rejects_reserved_capability_export_with_the_wrong_kind() {
+        let mut component = ComponentBuilder::default();
+        let nested = component.component(Some(FILE_PROJECTION_EXPORT), ComponentBuilder::default());
+        component.export(
+            FILE_PROJECTION_EXPORT,
+            ComponentExportKind::Component,
+            nested,
+            None,
+        );
+        let wasm = component.finish();
+        let archive = zip_entries(
+            &[
+                ("manifest.json", MANIFEST),
+                ("schema/plugin_test_note.json", SCHEMA),
+                ("plugin.wasm", &wasm),
+            ],
+            CompressionMethod::Stored,
+        );
+        let error = parse_plugin_archive_for_install(&archive)
+            .expect_err("the reserved name only counts when it exports an instance");
+        assert!(error.message.contains("must export"), "{error:?}");
+    }
+
+    #[test]
     fn embedded_schema_errors_keep_the_schema_error_code() {
+        let wasm = capability_component(&[FILE_PROJECTION_EXPORT]);
         let archive = zip_entries(
             &[
                 ("manifest.json", MANIFEST),
                 ("schema/plugin_test_note.json", b"{"),
-                ("plugin.wasm", WASM),
+                ("plugin.wasm", &wasm),
             ],
             CompressionMethod::Stored,
         );
@@ -958,8 +1123,9 @@ mod tests {
 
     #[test]
     fn enforces_plugin_archive_limits_at_the_boundary() {
-        let archive = plugin_archive(CompressionMethod::Stored);
-        let payloads = [MANIFEST, SCHEMA, WASM];
+        let wasm = capability_component(&[FILE_PROJECTION_EXPORT]);
+        let archive = plugin_archive(CompressionMethod::Stored, &wasm);
+        let payloads = [MANIFEST, SCHEMA, wasm.as_slice()];
         let paths = [
             "manifest.json",
             "schema/plugin_test_note.json",
@@ -1206,11 +1372,12 @@ mod tests {
 
     #[test]
     fn exact_limit_reads_still_validate_crc() {
-        let mut archive = zip_entries(&[("plugin.wasm", WASM)], CompressionMethod::Stored);
+        let wasm = capability_component(&[FILE_PROJECTION_EXPORT]);
+        let mut archive = zip_entries(&[("plugin.wasm", &wasm)], CompressionMethod::Stored);
         corrupt_first_entry_crc(&mut archive);
         let limits = PluginArchiveLimits {
-            entry_bytes: to_u64(WASM.len()),
-            expanded_bytes: to_u64(WASM.len()),
+            entry_bytes: to_u64(wasm.len()),
+            expanded_bytes: to_u64(wasm.len()),
             ..PluginArchiveLimits::DEFAULT
         };
         let mut bounded = BoundedPluginArchive::open(&archive, limits)
@@ -1236,11 +1403,16 @@ mod tests {
 
     #[test]
     fn metadata_loading_does_not_inflate_wasm() {
-        let mut archive = plugin_archive(CompressionMethod::Stored);
+        let wasm = capability_component(&[FILE_PROJECTION_EXPORT]);
+        let mut archive = plugin_archive(CompressionMethod::Stored, &wasm);
+        let mut corrupted_wasm = wasm.clone();
+        *corrupted_wasm
+            .last_mut()
+            .expect("component fixture must not be empty") ^= 0xff;
         assert_eq!(
-            replace_all(&mut archive, WASM, b"\0asm\x02\0\0\0"),
+            replace_all(&mut archive, &wasm, &corrupted_wasm),
             1,
-            "WASM payload should occur exactly once"
+            "component payload should occur exactly once"
         );
 
         let metadata = load_installed_plugin_metadata_from_archive_bytes(
@@ -1265,15 +1437,29 @@ mod tests {
         );
     }
 
-    fn plugin_archive(method: CompressionMethod) -> Vec<u8> {
+    fn plugin_archive(method: CompressionMethod, wasm: &[u8]) -> Vec<u8> {
         zip_entries(
             &[
                 ("manifest.json", MANIFEST),
                 ("schema/plugin_test_note.json", SCHEMA),
-                ("plugin.wasm", WASM),
+                ("plugin.wasm", wasm),
             ],
             method,
         )
+    }
+
+    fn capability_component(exports: &[&str]) -> Vec<u8> {
+        let mut component = ComponentBuilder::default();
+        let empty = component.component(Some("capability"), ComponentBuilder::default());
+        let instance = component.instantiate(
+            Some("capability"),
+            empty,
+            std::iter::empty::<(&str, ComponentExportKind, u32)>(),
+        );
+        for name in exports {
+            component.export(name, ComponentExportKind::Instance, instance, None);
+        }
+        component.finish()
     }
 
     fn zip_entries(entries: &[(&str, &[u8])], method: CompressionMethod) -> Vec<u8> {
@@ -1352,6 +1538,8 @@ mod benchmark_probe {
     use std::io::{Cursor, Write};
     use std::time::{Duration, Instant};
 
+    use wasm_encoder::{ComponentBuilder, ComponentExportKind};
+
     use super::{
         load_installed_plugin_from_archive_bytes,
         load_installed_plugin_metadata_from_archive_bytes, parse_plugin_archive_for_install,
@@ -1362,6 +1550,19 @@ mod benchmark_probe {
         Install,
         Metadata,
         Materialize,
+    }
+
+    #[test]
+    fn benchmark_component_padding_is_valid_and_exact() {
+        let base = capability_component().len();
+        for requested in [base + 3, base + 130, base + 16_388, 2 * 1024 * 1024] {
+            let component = capability_component_with_size(requested);
+            assert_eq!(component.len(), requested);
+            let capabilities = super::detect_plugin_capabilities(&component)
+                .expect("padded benchmark component should remain valid");
+            assert!(capabilities.file_projection);
+            assert!(!capabilities.column_merger);
+        }
     }
 
     #[test]
@@ -1381,7 +1582,11 @@ mod benchmark_probe {
         let wasm_bytes = env_usize("LIX_PLUGIN_ARCHIVE_BENCH_WASM_BYTES", 2 * 1024 * 1024);
         let rounds = env_usize("LIX_PLUGIN_ARCHIVE_BENCH_ROUNDS", 200);
         let warmups = env_usize("LIX_PLUGIN_ARCHIVE_BENCH_WARMUPS", 20);
-        assert!(wasm_bytes >= 8, "benchmark WASM must include its header");
+        assert!(
+            wasm_bytes >= minimum_capability_component_len(),
+            "benchmark component needs at least {} bytes",
+            minimum_capability_component_len()
+        );
         assert!(rounds > 0, "benchmark needs at least one measured round");
 
         let archive = benchmark_archive(wasm_bytes);
@@ -1463,7 +1668,7 @@ mod benchmark_probe {
     fn benchmark_archive(wasm_bytes: usize) -> Vec<u8> {
         let manifest = br#"{
             "key":"plugin_bench",
-            "match":{"path_glob":"*.bench"},
+            "file_match":{"path_glob":"*.bench"},
             "entry":"plugin.wasm",
             "schemas":["schema/plugin_bench_note.json"]
         }"#;
@@ -1473,15 +1678,7 @@ mod benchmark_probe {
             "columns":[{"name":"id","type":"text","nullable":false}],
             "primary_key":["id"]
         }"#;
-        let mut wasm = vec![0u8; wasm_bytes];
-        wasm[..8].copy_from_slice(b"\0asm\x01\0\0\0");
-        let mut state = 0x9e37_79b9_u32;
-        for byte in &mut wasm[8..] {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            *byte = state.to_le_bytes()[0];
-        }
+        let wasm = capability_component_with_size(wasm_bytes);
 
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default()
@@ -1502,5 +1699,91 @@ mod benchmark_probe {
             .finish()
             .expect("benchmark ZIP should finish")
             .into_inner()
+    }
+
+    fn capability_component() -> Vec<u8> {
+        let mut component = ComponentBuilder::default();
+        let empty = component.component(Some("capability"), ComponentBuilder::default());
+        let instance = component.instantiate(
+            Some("file-projection"),
+            empty,
+            std::iter::empty::<(&str, ComponentExportKind, u32)>(),
+        );
+        component.export(
+            "lix:plugin/file-projection@1.0.0",
+            ComponentExportKind::Instance,
+            instance,
+            None,
+        );
+        component.finish()
+    }
+
+    fn minimum_capability_component_len() -> usize {
+        capability_component().len() + 3
+    }
+
+    fn capability_component_with_size(target_len: usize) -> Vec<u8> {
+        let mut component = capability_component();
+        let mut available = target_len
+            .checked_sub(component.len())
+            .expect("requested component size must fit its capability export");
+        let padding = exact_custom_section_padding(available)
+            .or_else(|| {
+                // Canonical LEB lengths leave a one-byte hole at each size
+                // boundary. A minimal empty custom section shifts past that hole.
+                component.extend_from_slice(&[0, 1, 0]);
+                available = available.checked_sub(3)?;
+                exact_custom_section_padding(available)
+            })
+            .expect("requested component size must fit valid custom sections");
+
+        component.push(0);
+        encode_u32_leb(
+            u32::try_from(padding + 1).expect("benchmark section must fit u32"),
+            &mut component,
+        );
+        component.push(0);
+        let padding_start = component.len();
+        component.resize(target_len, 0);
+        let mut state = 0x9e37_79b9_u32;
+        for byte in &mut component[padding_start..] {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state.to_le_bytes()[0];
+        }
+        debug_assert_eq!(component.len(), target_len);
+        component
+    }
+
+    fn exact_custom_section_padding(available: usize) -> Option<usize> {
+        (1..=5).find_map(|section_len_bytes| {
+            let padding = available.checked_sub(2 + section_len_bytes)?;
+            (u32_leb_len(padding + 1) == section_len_bytes).then_some(padding)
+        })
+    }
+
+    fn u32_leb_len(value: usize) -> usize {
+        let mut value = value;
+        let mut len = 1;
+        while value >= 0x80 {
+            value >>= 7;
+            len += 1;
+        }
+        len
+    }
+
+    fn encode_u32_leb(mut value: u32, output: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
     }
 }

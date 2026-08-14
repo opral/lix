@@ -21,13 +21,12 @@ use crate::hot_state::MaterializedHotStateBatch;
 use crate::plugin::runtime::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedRowBatch,
-    WasmChangeDrainValidator, WasmChangePage, WasmComponentActor, WasmConflictResolution,
-    WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
-    WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmFileTransition, WasmGuestBytes,
-    WasmHostBytes, WasmHostConflictResolution, WasmHostRow, WasmHostRowChanges, WasmInputBytes,
-    WasmInputSplice, WasmOutputRange, WasmRow, WasmRowChange, WasmRowChangeSource, WasmRowChanges,
-    WasmRowConflict, WasmRowConflictPage, WasmRowConflictSource, WasmRowKey, WasmRowPage,
-    WasmRowSource, WasmRowTransition, WasmSourceRange, WasmTransitionCounters,
+    WasmChangeDrainValidator, WasmChangePage, WasmColumnMergePage, WasmColumnMergeResult,
+    WasmColumnMergeSource, WasmColumnMergeTransition, WasmComponentActor, WasmDocumentHandle,
+    WasmEditDrainValidator, WasmEditPage, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
+    WasmHostColumnMerge, WasmHostRow, WasmHostRowChanges, WasmInputBytes, WasmInputSplice,
+    WasmOutputRange, WasmRow, WasmRowChange, WasmRowChangeSource, WasmRowChanges, WasmRowKey,
+    WasmRowPage, WasmRowSource, WasmRowTransition, WasmSourceRange, WasmTransitionCounters,
     WasmTransitionHandle, WasmTransitionLimits, validate_change_cursor_key_uniqueness,
 };
 use crate::row_pk::RowPk;
@@ -1464,103 +1463,89 @@ impl WasmRowChangeSource for VecRowChangeSource {
     }
 }
 
-/// Vec-backed lazy source for same-identity three-way conflict triples. The
-/// source is deliberately separate from `VecRowChangeSource`: a conflict
-/// exposes three immutable versions, while a row update exposes only the
-/// already resolved final state.
 #[derive(Debug)]
-pub(crate) struct VecRowConflictSource {
-    conflicts: VecDeque<WasmRowConflict<WasmHostBytes>>,
+pub(crate) struct VecColumnMergeSource {
+    merges: VecDeque<WasmHostColumnMerge>,
     state: VecSourceState,
 }
 
-impl VecRowConflictSource {
+impl VecColumnMergeSource {
     pub(crate) fn new(
-        conflicts: Vec<WasmRowConflict<WasmHostBytes>>,
+        merges: Vec<WasmHostColumnMerge>,
         limits: WasmTransitionLimits,
     ) -> Result<Self, LixError> {
-        validate_conflict_order(&conflicts)?;
-        for (expected_ordinal, conflict) in conflicts.iter().enumerate() {
-            if conflict.ordinal
-                != u32::try_from(expected_ordinal).map_err(|_| {
-                    invalid_input("component conflict source has more than u32::MAX records")
-                })?
+        for (expected, merge) in merges.iter().enumerate() {
+            if merge.ordinal
+                != u32::try_from(expected)
+                    .map_err(|_| invalid_input("column merge source exceeds u32"))?
+                || merge.key.row_pk.is_empty()
+                || merge.column.is_empty()
             {
                 return Err(invalid_input(
-                    "component conflict source ordinals must be zero-based and contiguous",
+                    "column merge source requires contiguous ordinals, a row key, and a column",
                 ));
             }
-            for snapshot in [&conflict.base, &conflict.a, &conflict.b]
-                .into_iter()
-                .flatten()
-            {
+            for row in [&merge.base_row, &merge.a_row, &merge.b_row] {
                 validate_host_row(&WasmRow {
-                    key: conflict.key.clone(),
-                    snapshot_content: snapshot.clone(),
+                    key: merge.key.clone(),
+                    snapshot_content: row.clone(),
                 })?;
             }
         }
         Ok(Self {
-            conflicts: conflicts.into(),
+            merges: merges.into(),
             state: VecSourceState::new(limits)?,
         })
     }
 }
 
-impl WasmRowConflictSource for VecRowConflictSource {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowConflictPage>, LixError> {
+impl WasmColumnMergeSource for VecColumnMergeSource {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmColumnMergePage>, LixError> {
         if self.state.reached_eof {
             return Ok(None);
         }
         let page_limit = self.state.page_limit(max_bytes)?;
-        if self.conflicts.is_empty() {
+        if self.merges.is_empty() {
             self.state.reached_eof = true;
             return Ok(None);
         }
-
         let mut page_bytes = 0u64;
         let mut page_refs = 0u32;
-        let mut conflicts = Vec::new();
-        while let Some(conflict) = self.conflicts.front() {
-            let record_bytes = encoded_row_conflict_record_bytes(conflict)?;
-            if record_bytes > u64::from(self.state.limits.max_record_bytes) {
-                return Err(invalid_input(
-                    "component conflict record exceeds max_record_bytes",
-                ));
-            }
-            let framed_bytes = record_bytes
-                .checked_add(4)
-                .ok_or_else(|| invalid_input("component conflict frame length overflowed"))?;
-            if page_bytes
-                .checked_add(framed_bytes)
-                .is_none_or(|size| size > page_limit)
+        let mut merges = Vec::new();
+        while let Some(merge) = self.merges.front() {
+            let mut record_bytes = encoded_row_key_bytes(&merge.key)?
+                .saturating_add(merge.column.len() as u64)
+                .saturating_add(merge.file_id.as_ref().map_or(0, |id| id.len()) as u64)
+                .saturating_add(64);
+            let mut record_refs = 0u32;
+            for value in [
+                merge.base.as_ref(),
+                merge.a.as_ref(),
+                merge.b.as_ref(),
+                Some(&merge.base_row),
+                Some(&merge.a_row),
+                Some(&merge.b_row),
+            ]
+            .into_iter()
+            .flatten()
             {
-                if conflicts.is_empty() {
+                record_bytes = record_bytes.saturating_add(encoded_host_bytes_ref_bytes(value)?);
+                record_refs = record_refs.saturating_add(host_bytes_attachment_refs(value));
+            }
+            if page_bytes.saturating_add(record_bytes) > page_limit {
+                if merges.is_empty() {
                     return Err(invalid_input(
-                        "component conflict record does not fit the requested page",
+                        "column merge record does not fit the requested page",
                     ));
                 }
                 break;
             }
-            page_bytes += framed_bytes;
-            for snapshot in [&conflict.base, &conflict.a, &conflict.b]
-                .into_iter()
-                .flatten()
-            {
-                page_refs = page_refs
-                    .checked_add(host_bytes_attachment_refs(snapshot))
-                    .ok_or_else(|| {
-                        invalid_input("component conflict attachment count overflowed")
-                    })?;
-            }
-            conflicts.push(
-                self.conflicts
-                    .pop_front()
-                    .expect("front conflict was just inspected"),
-            );
+            page_bytes = page_bytes.saturating_add(record_bytes);
+            page_refs = page_refs.saturating_add(record_refs);
+            merges.push(self.merges.pop_front().expect("front merge was inspected"));
         }
         self.state.accept_page(page_bytes, page_refs)?;
-        Ok(Some(WasmRowConflictPage { conflicts }))
+        Ok(Some(WasmColumnMergePage { merges }))
     }
 }
 
@@ -1654,24 +1639,6 @@ fn validate_change_order<B>(changes: &[WasmRowChange<B>]) -> Result<(), LixError
     Ok(())
 }
 
-fn validate_conflict_order(conflicts: &[WasmRowConflict<WasmHostBytes>]) -> Result<(), LixError> {
-    for conflict in conflicts {
-        if conflict.key.row_pk.is_empty() {
-            return Err(invalid_input(
-                "component conflict row primary keys must not be empty",
-            ));
-        }
-    }
-    for pair in conflicts.windows(2) {
-        if pair[0].key > pair[1].key {
-            return Err(invalid_input(
-                "component conflict sources must be key-sorted",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_host_row(row: &WasmHostRow) -> Result<(), LixError> {
     if row.key.row_pk.is_empty() {
         return Err(invalid_input(
@@ -1721,27 +1688,6 @@ fn encoded_row_change_record_bytes(change: &WasmRowChange<WasmHostBytes>) -> Res
         size = size
             .checked_add(encoded_host_bytes_ref_bytes(&row.snapshot_content)?)
             .ok_or_else(|| invalid_input("component change record size overflowed"))?;
-    }
-    Ok(size)
-}
-
-fn encoded_row_conflict_record_bytes(
-    conflict: &WasmRowConflict<WasmHostBytes>,
-) -> Result<u64, LixError> {
-    let mut size = encoded_row_key_bytes(&conflict.key)?
-        .checked_add(4)
-        .ok_or_else(|| invalid_input("component conflict record size overflowed"))?;
-    for snapshot in [&conflict.base, &conflict.a, &conflict.b] {
-        // One state tag: 0 for an absent/tombstoned value, 1 followed by the
-        // normal lazy blob reference for a live complete snapshot.
-        size = size
-            .checked_add(1)
-            .ok_or_else(|| invalid_input("component conflict record size overflowed"))?;
-        if let Some(snapshot) = snapshot {
-            size = size
-                .checked_add(encoded_host_bytes_ref_bytes(snapshot)?)
-                .ok_or_else(|| invalid_input("component conflict record size overflowed"))?;
-        }
     }
     Ok(size)
 }
@@ -1809,15 +1755,13 @@ pub(crate) struct ValidatedFileTransition {
     pub(crate) document: WasmDocumentHandle,
     pub(crate) changes: WasmHostRowChanges,
     pub(crate) certified_batches: Vec<WasmCertifiedRowBatch>,
+    pub(crate) replace_all_rows: bool,
     pub(crate) counters: WasmTransitionCounters,
 }
 
-/// Fully drained static conflict-resolution output. Results remain aligned to
-/// the caller's conflict list; the merge planner owns the row keys and
-/// historical rows used by a `Take` result.
 #[derive(Debug, Clone)]
-pub(crate) struct ValidatedConflictTransition {
-    pub(crate) resolutions: Vec<WasmHostConflictResolution>,
+pub(crate) struct ValidatedColumnMergeTransition {
+    pub(crate) results: Vec<WasmColumnMergeResult<WasmHostBytes>>,
     pub(crate) counters: WasmTransitionCounters,
 }
 
@@ -2595,163 +2539,108 @@ async fn drain_file_transition_changes_inner(
         document: transition.document,
         changes: WasmRowChanges { changes },
         certified_batches,
+        replace_all_rows: transition.replace_all_rows,
         counters: merge_counter_snapshots(local_counters, runtime_counters),
     })
 }
 
-/// Drains one static resolver cursor. The resolver cannot invent keys: output
-/// cardinality is exactly the input conflict count and every result remains in
-/// the source's canonical key order. This lets `Take(B)` reuse a durable
-/// historical row without moving its snapshot through guest memory.
-pub(crate) async fn drain_conflict_transition_resolutions(
+pub(crate) async fn drain_column_merge_transition_results(
     actor: &mut dyn WasmComponentActor,
-    transition: WasmConflictTransition,
+    transition: WasmColumnMergeTransition,
     expected_count: usize,
     limits: WasmTransitionLimits,
-) -> Result<ValidatedConflictTransition, LixError> {
+) -> Result<ValidatedColumnMergeTransition, LixError> {
     let transition_handle = transition.transition;
-    match drain_conflict_transition_resolutions_inner(actor, transition, expected_count, limits)
-        .await
-    {
-        Ok(validated) => Ok(validated),
+    let result = async {
+        limits.validate()?;
+        let mut budget = OutputDrainBudget::new(limits)?;
+        let mut counters = WasmTransitionCounters {
+            conflict_resolution_calls: 1,
+            ..WasmTransitionCounters::default()
+        };
+        let mut results = Vec::with_capacity(expected_count);
+        loop {
+            let Some(page) = actor
+                .next_column_merge_result_page(
+                    transition.transition,
+                    transition.results,
+                    limits.max_page_bytes,
+                )
+                .await?
+            else {
+                break;
+            };
+            if page.format_version != PACKET_FORMAT_V1
+                || page.ordinals.len() != page.results.len()
+                || page.results.is_empty()
+            {
+                return Err(invalid_guest("invalid component column merge result page"));
+            }
+            let has_output_refs = page.results.iter().any(|result| {
+                matches!(
+                    result,
+                    WasmColumnMergeResult::Replace(Some(WasmGuestBytes::Output(_)))
+                )
+            });
+            if has_output_refs != page.outputs.is_some() {
+                return Err(invalid_guest(
+                    "column merge output table must exist exactly when referenced",
+                ));
+            }
+            counters.packet_pages = counters.packet_pages.saturating_add(1);
+            counters.packet_records = counters
+                .packet_records
+                .saturating_add(page.results.len() as u64);
+            for (ordinal, result) in page.ordinals.into_iter().zip(page.results) {
+                let expected = u32::try_from(results.len())
+                    .map_err(|_| invalid_guest("column merge result count exceeds u32"))?;
+                if ordinal != expected {
+                    return Err(invalid_guest(format!(
+                        "column merger returned ordinal {ordinal}, expected {expected}",
+                    )));
+                }
+                let result = match result {
+                    WasmColumnMergeResult::UseLww => WasmColumnMergeResult::UseLww,
+                    WasmColumnMergeResult::Replace(None) => WasmColumnMergeResult::Replace(None),
+                    WasmColumnMergeResult::Replace(Some(value)) => {
+                        let value = resolve_guest_bytes(
+                            actor,
+                            transition.transition,
+                            page.outputs,
+                            value,
+                            &mut budget,
+                            &mut counters,
+                        )
+                        .await?;
+                        WasmColumnMergeResult::Replace(Some(WasmHostBytes::Inline(value)))
+                    }
+                };
+                results.push(result);
+                if results.len() > expected_count {
+                    return Err(invalid_guest(
+                        "column merger returned more results than input overlaps",
+                    ));
+                }
+            }
+        }
+        if results.len() != expected_count {
+            return Err(invalid_guest(format!(
+                "column merger returned {} results for {expected_count} overlaps",
+                results.len(),
+            )));
+        }
+        counters.conflict_resolution_records = results.len() as u64;
+        let runtime = actor.finish_transition(transition.transition).await?;
+        Ok(ValidatedColumnMergeTransition {
+            results,
+            counters: merge_counter_snapshots(counters, runtime),
+        })
+    }
+    .await;
+    match result {
+        Ok(result) => Ok(result),
         Err(error) => Err(cleanup_rejected_transition(actor, transition_handle, error).await),
     }
-}
-
-async fn drain_conflict_transition_resolutions_inner(
-    actor: &mut dyn WasmComponentActor,
-    transition: WasmConflictTransition,
-    expected_count: usize,
-    limits: WasmTransitionLimits,
-) -> Result<ValidatedConflictTransition, LixError> {
-    let mut validator = WasmConflictResolutionDrainValidator::new(limits)?;
-    let mut budget = OutputDrainBudget::new(limits)?;
-    let mut local_counters = WasmTransitionCounters {
-        conflict_resolution_calls: 1,
-        ..WasmTransitionCounters::default()
-    };
-    let mut resolutions = Vec::with_capacity(expected_count);
-
-    loop {
-        let Some(page) = actor
-            .next_resolution_page(
-                transition.transition,
-                transition.resolutions,
-                limits.max_page_bytes,
-            )
-            .await?
-        else {
-            validator.accept_eof();
-            break;
-        };
-        validator.accept_page(&page).map_err(|error| {
-            invalid_guest(format!(
-                "invalid component resolution cursor page: {}",
-                error.message
-            ))
-        })?;
-        // Check every replacement's complete byte range before asking the
-        // guest output table for its length or allocating its output buffer.
-        // `Take` and `Delete` are snapshot-free, but an untrusted `Replace`
-        // may otherwise name an arbitrarily large output range.
-        prevalidate_conflict_resolution_page(&page, &mut budget)?;
-        local_counters.packet_pages = local_counters.packet_pages.saturating_add(1);
-        local_counters.packet_records = local_counters
-            .packet_records
-            .saturating_add(page.resolutions.len() as u64);
-
-        let page_row_count = page.resolutions.len();
-        let page_snapshot_count = page
-            .resolutions
-            .iter()
-            .filter(|resolution| matches!(resolution, WasmConflictResolution::Replace { .. }))
-            .count();
-        let page_start = resolutions.len();
-        let mut snapshots = CanonicalJsonBatchBuilder::with_row_capacity(page_snapshot_count);
-        let outputs = page.outputs;
-        let mut page_snapshot_ordinal = 0usize;
-        for (ordinal, resolution) in page.ordinals.into_iter().zip(page.resolutions) {
-            let expected_ordinal = u32::try_from(resolutions.len()).map_err(|_| {
-                invalid_guest("component conflict resolver has more than u32::MAX results")
-            })?;
-            if ordinal != expected_ordinal {
-                return Err(invalid_guest(format!(
-                    "component conflict resolver returned ordinal {ordinal}, expected {expected_ordinal}",
-                )));
-            }
-            let resolved = match resolution {
-                WasmConflictResolution::Take(side) => {
-                    local_counters.conflict_resolution_takes =
-                        local_counters.conflict_resolution_takes.saturating_add(1);
-                    WasmConflictResolution::Take(side)
-                }
-                WasmConflictResolution::Delete => WasmConflictResolution::Delete,
-                WasmConflictResolution::Replace {
-                    snapshot_content,
-                    effect,
-                } => {
-                    let snapshot = resolve_guest_bytes(
-                        actor,
-                        transition.transition,
-                        outputs,
-                        snapshot_content,
-                        &mut budget,
-                        &mut local_counters,
-                    )
-                    .await?;
-                    let snapshot_row = snapshots.push(&snapshot)?;
-                    debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
-                    page_snapshot_ordinal += 1;
-                    WasmConflictResolution::Replace {
-                        // See the file-transition drain above: finish the
-                        // canonical page once, then replace this sentinel
-                        // inside the stable result vector.
-                        snapshot_content: WasmHostBytes::Inline(Bytes::new()),
-                        effect,
-                    }
-                }
-            };
-            resolutions.push(resolved);
-            if resolutions.len() > expected_count {
-                return Err(invalid_guest(
-                    "component conflict resolver returned more results than input conflicts",
-                ));
-            }
-        }
-        debug_assert_eq!(page_snapshot_ordinal, page_snapshot_count);
-        let mut canonical = snapshots.finish()?.into_iter();
-        debug_assert_eq!(resolutions.len() - page_start, page_row_count);
-        for resolution in &mut resolutions[page_start..] {
-            if let WasmConflictResolution::Replace {
-                snapshot_content, ..
-            } = resolution
-            {
-                debug_assert!(matches!(
-                    snapshot_content,
-                    WasmHostBytes::Inline(bytes) if bytes.is_empty()
-                ));
-                let snapshot = canonical
-                    .next()
-                    .expect("one canonical snapshot exists for every appended replacement");
-                *snapshot_content = WasmHostBytes::CanonicalJson(snapshot);
-            }
-        }
-        #[cfg(debug_assertions)]
-        assert!(canonical.next().is_none());
-    }
-    if resolutions.len() != expected_count {
-        return Err(invalid_guest(format!(
-            "component conflict resolver returned {} results for {expected_count} input conflicts",
-            resolutions.len()
-        )));
-    }
-    local_counters.conflict_resolution_records =
-        u64::try_from(resolutions.len()).unwrap_or(u64::MAX);
-    let runtime_counters = actor.finish_transition(transition.transition).await?;
-    Ok(ValidatedConflictTransition {
-        resolutions,
-        counters: merge_counter_snapshots(local_counters, runtime_counters),
-    })
 }
 
 /// Drains renderer edit pages, resolves lazy output ranges, applies the edits
@@ -3066,58 +2955,6 @@ fn prevalidate_change_page(
             }
         }
     }
-    budget.preflight_cursor_page(
-        inline_bytes,
-        output_bytes,
-        0,
-        references,
-        minimum_attachment_reads,
-    )
-}
-
-/// Preflights every complete snapshot returned by a static conflict resolver.
-/// This must run before `resolve_guest_bytes`: an output-backed replacement's
-/// declared length is guest-controlled, and `read_output_range` intentionally
-/// reserves its final buffer capacity before draining bounded chunks.
-fn prevalidate_conflict_resolution_page(
-    page: &WasmConflictResolutionPage,
-    budget: &mut OutputDrainBudget,
-) -> Result<(), LixError> {
-    let mut inline_bytes = 0u64;
-    let mut output_bytes = 0u64;
-    let mut minimum_attachment_reads = 0u64;
-    let mut references = 0u32;
-    for resolution in &page.resolutions {
-        let WasmConflictResolution::Replace {
-            snapshot_content, ..
-        } = resolution
-        else {
-            continue;
-        };
-        match snapshot_content {
-            WasmGuestBytes::Inline(bytes) => {
-                inline_bytes = inline_bytes
-                    .checked_add(bytes.len() as u64)
-                    .ok_or_else(|| {
-                        invalid_guest("component conflict replacement inline bytes overflowed")
-                    })?;
-            }
-            WasmGuestBytes::Output(range) => {
-                output_bytes = output_bytes.checked_add(range.length).ok_or_else(|| {
-                    invalid_guest("component conflict replacement output bytes overflowed")
-                })?;
-                minimum_attachment_reads = minimum_attachment_reads
-                    .checked_add(budget.minimum_attachment_reads(range.length))
-                    .ok_or_else(|| invalid_guest("component attachment page count overflowed"))?;
-                references = references
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_guest("component output references overflowed"))?;
-            }
-        }
-    }
-    // Resolution pages are packet-v1 frames, so the runtime has already
-    // charged their wire metadata. Only the replacement values are charged
-    // here, as for a change page.
     budget.preflight_cursor_page(
         inline_bytes,
         output_bytes,
@@ -4299,7 +4136,6 @@ mod tests {
 
     struct FakeActor {
         change_pages: VecDeque<WasmChangePage>,
-        resolution_pages: VecDeque<WasmConflictResolutionPage>,
         edit_pages: VecDeque<WasmEditPage>,
         outputs: BTreeMap<(WasmByteOutputsHandle, u32), Vec<u8>>,
         max_read_prefix: usize,
@@ -4315,7 +4151,6 @@ mod tests {
         fn default() -> Self {
             Self {
                 change_pages: VecDeque::new(),
-                resolution_pages: VecDeque::new(),
                 edit_pages: VecDeque::new(),
                 outputs: BTreeMap::new(),
                 max_read_prefix: usize::MAX,
@@ -4383,15 +4218,6 @@ mod tests {
             _max_bytes: u32,
         ) -> Result<Option<WasmChangePage>, LixError> {
             Ok(self.change_pages.pop_front())
-        }
-
-        async fn next_resolution_page(
-            &mut self,
-            _transition: WasmTransitionHandle,
-            _cursor: crate::plugin::runtime::WasmResolutionCursorHandle,
-            _max_bytes: u32,
-        ) -> Result<Option<WasmConflictResolutionPage>, LixError> {
-            Ok(self.resolution_pages.pop_front())
         }
 
         async fn next_edit_page(
@@ -4471,233 +4297,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflict_drain_requires_contiguous_host_ordinals() {
-        let transition = WasmConflictTransition {
-            transition: WasmTransitionHandle(41),
-            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(42),
-        };
-        let page = WasmConflictResolutionPage {
-            format_version: PACKET_FORMAT_V1,
-            ordinals: vec![1],
-            resolutions: vec![WasmConflictResolution::Take(
-                crate::plugin::runtime::WasmConflictTake::B,
-            )],
-            outputs: None,
-        };
-        let mut actor = FakeActor {
-            resolution_pages: [page].into(),
-            ..FakeActor::default()
-        };
-
-        let error = drain_conflict_transition_resolutions(
-            &mut actor,
-            transition,
-            1,
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .expect_err("a reordered resolution must be rejected");
-        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-        assert_eq!(actor.discarded_transitions, vec![transition.transition]);
-        assert!(!actor.finished);
-    }
-
-    #[tokio::test]
-    async fn conflict_drain_preserves_take_without_snapshot_output() {
-        let transition = WasmConflictTransition {
-            transition: WasmTransitionHandle(51),
-            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(52),
-        };
-        let page = WasmConflictResolutionPage {
-            format_version: PACKET_FORMAT_V1,
-            ordinals: vec![0, 1],
-            resolutions: vec![
-                WasmConflictResolution::Take(crate::plugin::runtime::WasmConflictTake::B),
-                WasmConflictResolution::Delete,
-            ],
-            outputs: None,
-        };
-        let mut actor = FakeActor {
-            resolution_pages: [page].into(),
-            ..FakeActor::default()
-        };
-
-        let drained = drain_conflict_transition_resolutions(
-            &mut actor,
-            transition,
-            2,
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .expect("aligned resolution cursor should drain");
-        assert_eq!(drained.resolutions.len(), 2);
-        assert_eq!(drained.counters.conflict_resolution_calls, 1);
-        assert_eq!(drained.counters.conflict_resolution_records, 2);
-        assert_eq!(drained.counters.conflict_resolution_takes, 1);
-        assert!(actor.finished);
-    }
-
-    #[tokio::test]
-    async fn conflict_replacements_share_one_canonical_batch() {
-        let transition = WasmConflictTransition {
-            transition: WasmTransitionHandle(56),
-            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(57),
-        };
-        let page = WasmConflictResolutionPage {
-            format_version: PACKET_FORMAT_V1,
-            ordinals: vec![0, 1],
-            resolutions: vec![
-                WasmConflictResolution::Replace {
-                    snapshot_content: WasmGuestBytes::Inline(br#"{"id":"a"}"#.to_vec().into()),
-                    effect: WasmChangeEffect::Content,
-                },
-                WasmConflictResolution::Replace {
-                    snapshot_content: WasmGuestBytes::Inline(br#"{"id":"b"}"#.to_vec().into()),
-                    effect: WasmChangeEffect::FormatOnly,
-                },
-            ],
-            outputs: None,
-        };
-        let mut actor = FakeActor {
-            resolution_pages: [page].into(),
-            ..FakeActor::default()
-        };
-
-        let drained = drain_conflict_transition_resolutions(
-            &mut actor,
-            transition,
-            2,
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .expect("valid replacements should drain");
-        let WasmConflictResolution::Replace {
-            snapshot_content: WasmHostBytes::CanonicalJson(first),
-            ..
-        } = &drained.resolutions[0]
-        else {
-            panic!("first resolution must retain canonical JSON")
-        };
-        let WasmConflictResolution::Replace {
-            snapshot_content: WasmHostBytes::CanonicalJson(second),
-            ..
-        } = &drained.resolutions[1]
-        else {
-            panic!("second resolution must retain canonical JSON")
-        };
-        assert!(first.shares_batch_with(second));
-        assert_eq!(first.validation_counts(), (2, 2));
-        assert_eq!(first.batch_arena_allocation_count(), 1);
-        assert_eq!(first.normalized(), r#"{"id":"a"}"#);
-        assert_eq!(second.normalized(), r#"{"id":"b"}"#);
-    }
-
-    #[tokio::test]
-    async fn conflict_drain_patches_replacements_without_reordering_other_results() {
-        let transition = WasmConflictTransition {
-            transition: WasmTransitionHandle(58),
-            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(59),
-        };
-        let page = WasmConflictResolutionPage {
-            format_version: PACKET_FORMAT_V1,
-            ordinals: vec![0, 1, 2, 3],
-            resolutions: vec![
-                WasmConflictResolution::Replace {
-                    snapshot_content: WasmGuestBytes::Inline(br#"{"id":"a"}"#.to_vec().into()),
-                    effect: WasmChangeEffect::Content,
-                },
-                WasmConflictResolution::Take(crate::plugin::runtime::WasmConflictTake::B),
-                WasmConflictResolution::Delete,
-                WasmConflictResolution::Replace {
-                    snapshot_content: WasmGuestBytes::Inline(br#"{"id":"b"}"#.to_vec().into()),
-                    effect: WasmChangeEffect::FormatOnly,
-                },
-            ],
-            outputs: None,
-        };
-        let mut actor = FakeActor {
-            resolution_pages: [page].into(),
-            ..FakeActor::default()
-        };
-
-        let drained = drain_conflict_transition_resolutions(
-            &mut actor,
-            transition,
-            4,
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .expect("interleaved replacements should retain their input ordinals");
-
-        let WasmConflictResolution::Replace {
-            snapshot_content: WasmHostBytes::CanonicalJson(first),
-            effect: WasmChangeEffect::Content,
-        } = &drained.resolutions[0]
-        else {
-            panic!("ordinal zero must remain the first replacement")
-        };
-        assert!(matches!(
-            drained.resolutions[1],
-            WasmConflictResolution::Take(crate::plugin::runtime::WasmConflictTake::B)
-        ));
-        assert!(matches!(
-            drained.resolutions[2],
-            WasmConflictResolution::Delete
-        ));
-        let WasmConflictResolution::Replace {
-            snapshot_content: WasmHostBytes::CanonicalJson(second),
-            effect: WasmChangeEffect::FormatOnly,
-        } = &drained.resolutions[3]
-        else {
-            panic!("ordinal three must remain the second replacement")
-        };
-        assert!(first.shares_batch_with(second));
-        assert_eq!(first.normalized(), r#"{"id":"a"}"#);
-        assert_eq!(second.normalized(), r#"{"id":"b"}"#);
-    }
-
-    #[tokio::test]
-    async fn conflict_drain_rejects_oversized_replacement_before_output_read() {
-        let transition = WasmConflictTransition {
-            transition: WasmTransitionHandle(61),
-            resolutions: crate::plugin::runtime::WasmResolutionCursorHandle(62),
-        };
-        let limits = WasmTransitionLimits::default();
-        let page = WasmConflictResolutionPage {
-            format_version: PACKET_FORMAT_V1,
-            ordinals: vec![0],
-            resolutions: vec![WasmConflictResolution::Replace {
-                snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
-                    index: 0,
-                    offset: 0,
-                    length: limits
-                        .max_total_bytes
-                        .checked_add(1)
-                        .expect("default total-byte budget has headroom"),
-                }),
-                effect: WasmChangeEffect::Content,
-            }],
-            outputs: Some(WasmByteOutputsHandle(63)),
-        };
-        let mut actor = FakeActor {
-            resolution_pages: [page].into(),
-            ..FakeActor::default()
-        };
-
-        let error = drain_conflict_transition_resolutions(&mut actor, transition, 1, limits)
-            .await
-            .expect_err("oversized replacement must fail before output allocation or reads");
-        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-        assert!(error.message.contains("max_total_bytes"), "{error:?}");
-        assert_eq!(
-            actor.output_len_calls, 0,
-            "the preflight must reject before querying the guest output table"
-        );
-        assert_eq!(actor.discarded_transitions, vec![transition.transition]);
-        assert!(!actor.finished);
-    }
-
-    #[tokio::test]
     async fn change_drain_validates_before_reading_and_canonicalizes_attachments() {
         let outputs = WasmByteOutputsHandle(7);
         let snapshot = br#"{"order_key":"a","id":"row","cells":[]}"#.to_vec();
@@ -4742,6 +4341,7 @@ mod tests {
             transition: WasmTransitionHandle(1),
             document: WasmDocumentHandle(2),
             changes: WasmChangeCursorHandle(3),
+            replace_all_rows: false,
         };
         let schemas = SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
 
@@ -4805,6 +4405,7 @@ mod tests {
             transition: WasmTransitionHandle(11),
             document: WasmDocumentHandle(12),
             changes: WasmChangeCursorHandle(13),
+            replace_all_rows: false,
         };
         let schemas = SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
 
@@ -4875,6 +4476,7 @@ mod tests {
             transition: WasmTransitionHandle(14),
             document: WasmDocumentHandle(15),
             changes: WasmChangeCursorHandle(16),
+            replace_all_rows: false,
         };
         let schemas = SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
 
@@ -4937,6 +4539,7 @@ mod tests {
             transition: WasmTransitionHandle(1),
             document: WasmDocumentHandle(2),
             changes: WasmChangeCursorHandle(3),
+            replace_all_rows: false,
         };
 
         let error = drain_file_transition_changes(
@@ -4989,6 +4592,7 @@ mod tests {
                 transition: WasmTransitionHandle(1),
                 document: WasmDocumentHandle(2),
                 changes: WasmChangeCursorHandle(3),
+                replace_all_rows: false,
             },
             test_creates(),
             &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
@@ -5015,6 +4619,7 @@ mod tests {
                 transition: WasmTransitionHandle(4),
                 document: WasmDocumentHandle(5),
                 changes: WasmChangeCursorHandle(6),
+                replace_all_rows: false,
             },
             test_creates(),
             &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
@@ -5051,6 +4656,7 @@ mod tests {
                 transition: WasmTransitionHandle(1),
                 document: WasmDocumentHandle(2),
                 changes: WasmChangeCursorHandle(3),
+                replace_all_rows: false,
             },
             test_creates(),
             &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),

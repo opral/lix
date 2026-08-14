@@ -108,6 +108,7 @@ fn plugin_schema_rows(
 mod tests {
     use std::io::{Cursor, Write};
 
+    use wasm_encoder::{ComponentBuilder, ComponentExportKind};
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
 
@@ -122,10 +123,9 @@ mod tests {
         "columns":[{"name":"id","type":"text","nullable":false}],
         "primary_key":["id"]
     }"#;
-    const WASM: &[u8] = b"\0asm\x01\0\0\0";
-
     #[test]
     fn install_plan_contains_all_parse_once_derived_state() {
+        let wasm = file_projection_component();
         let archive = plugin_archive(None);
         let plan = plugin_install_plan_from_archive_path(
             "/.lix/plugins/plugin_test.lixplugin",
@@ -143,8 +143,8 @@ mod tests {
         );
         assert_eq!(plan.parsed.manifest.key, "plugin_test");
         assert_eq!(plan.parsed.schema_keys, ["plugin_test_note"]);
-        assert_eq!(plan.parsed.wasm_bytes, WASM);
-        assert_eq!(plan.parsed.wasm_hash, BlobId::from_content(WASM));
+        assert_eq!(plan.parsed.wasm_bytes.as_deref(), Some(wasm.as_slice()));
+        assert_eq!(plan.parsed.wasm_hash, Some(BlobId::from_content(&wasm)));
         assert_eq!(plan.schema_rows.len(), 1);
         let schema_row = plan.schema_rows.row(0);
         assert_eq!(schema_row.schema_key, "lix_registered_schema");
@@ -170,7 +170,12 @@ mod tests {
         .expect("content is part of the durable matcher contract");
 
         assert_eq!(
-            plan.parsed.manifest.file_match.content,
+            plan.parsed
+                .manifest
+                .file_match
+                .as_ref()
+                .expect("fixture has a file matcher")
+                .content,
             Some(crate::plugin::runtime::PluginContentMatcher::Text)
         );
     }
@@ -191,9 +196,15 @@ mod tests {
                 });
 
             assert_eq!(plan.plugin_key, plugin_key);
-            assert_eq!(plan.parsed.manifest.file_match.path_glob, path_glob);
+            let file_match = plan
+                .parsed
+                .manifest
+                .file_match
+                .as_ref()
+                .expect("fixture has a file matcher");
+            assert_eq!(file_match.path_glob, path_glob);
             assert_eq!(
-                plan.parsed.manifest.file_match.content,
+                file_match.content,
                 Some(crate::plugin::runtime::PluginContentMatcher::Text)
             );
         }
@@ -240,13 +251,14 @@ mod tests {
     }
 
     fn plugin_archive_for(plugin_key: &str, path_glob: &str, content: Option<&str>) -> Vec<u8> {
+        let wasm = file_projection_component();
         let content = content
             .map(|value| format!(r#", "content":"{value}""#))
             .unwrap_or_default();
         let manifest = format!(
             r#"{{
                 "key":"{plugin_key}",
-                "match":{{"path_glob":"{path_glob}"{content}}},
+                "file_match":{{"path_glob":"{path_glob}"{content}}},
                 "entry":"plugin.wasm",
                 "schemas":["schema/plugin_test_note.json"]
             }}"#
@@ -256,7 +268,7 @@ mod tests {
         for (path, bytes) in [
             ("manifest.json", manifest.as_bytes()),
             ("schema/plugin_test_note.json", SCHEMA),
-            ("plugin.wasm", WASM),
+            ("plugin.wasm", wasm.as_slice()),
         ] {
             writer
                 .start_file(path, options)
@@ -269,5 +281,22 @@ mod tests {
             .finish()
             .expect("plugin fixture should finish")
             .into_inner()
+    }
+
+    fn file_projection_component() -> Vec<u8> {
+        let mut component = ComponentBuilder::default();
+        let empty = component.component(Some("capability"), ComponentBuilder::default());
+        let instance = component.instantiate(
+            Some("file-projection"),
+            empty,
+            std::iter::empty::<(&str, ComponentExportKind, u32)>(),
+        );
+        component.export(
+            "lix:plugin/file-projection@1.0.0",
+            ComponentExportKind::Instance,
+            instance,
+            None,
+        );
+        component.finish()
     }
 }

@@ -27,19 +27,19 @@ use crate::tracked_state::{
 use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
-use super::InstalledPlugin;
 use super::manifest::{
     PluginContentMatcher, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
     validate_runtime_api_version,
 };
 use super::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
+use super::{InstalledPlugin, PluginCapabilities};
 
 pub(crate) const PLUGIN_REGISTRY_KEY: &str = "lix_plugin_registry_v2";
 pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v2";
 pub(crate) const MAX_PLUGIN_REGISTRY_ENTRIES: usize = 128;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const PLUGIN_REGISTRY_FORMAT_VERSION: u32 = 5;
+const PLUGIN_REGISTRY_FORMAT_VERSION: u32 = 6;
 const PLUGIN_FILE_OWNER_FORMAT_VERSION: u32 = 2;
 const MAX_CACHED_PLUGIN_CATALOGS: usize = 16;
 const DEFAULT_CACHED_PLUGIN_CATALOGS: usize = 8;
@@ -50,16 +50,17 @@ pub(crate) struct PluginRegistryEntryInput {
     pub(crate) key: String,
     pub(crate) runtime: PluginRuntime,
     pub(crate) api_version: String,
-    pub(crate) path_glob: String,
+    pub(crate) capabilities: PluginCapabilities,
+    pub(crate) path_glob: Option<String>,
     pub(crate) content: Option<PluginContentMatcher>,
-    pub(crate) entry: String,
+    pub(crate) entry: Option<String>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) create_schema_keys: Vec<String>,
     pub(crate) manifest_json: String,
     pub(crate) archive_file_id: String,
     pub(crate) archive_path: String,
     pub(crate) archive_blob_hash: String,
-    pub(crate) wasm_blob_hash: String,
+    pub(crate) wasm_blob_hash: Option<String>,
 }
 
 /// Metadata needed by current-state plugin matching and execution.
@@ -73,17 +74,18 @@ pub(crate) struct PluginRegistryEntry {
     key: String,
     runtime: PluginRuntime,
     api_version: String,
-    path_glob: String,
+    capabilities: PluginCapabilities,
+    path_glob: Option<String>,
     #[serde(deserialize_with = "deserialize_required_content")]
     content: Option<PluginContentMatcher>,
-    entry: String,
+    entry: Option<String>,
     schema_keys: Vec<String>,
     create_schema_keys: Vec<String>,
     manifest_json: String,
     archive_file_id: String,
     archive_path: String,
     archive_blob_hash: String,
-    wasm_blob_hash: String,
+    wasm_blob_hash: Option<String>,
 }
 
 fn deserialize_required_content<'de, D>(
@@ -104,6 +106,7 @@ impl PluginRegistryEntry {
             key: input.key,
             runtime: input.runtime,
             api_version: input.api_version,
+            capabilities: input.capabilities,
             path_glob: input.path_glob,
             content: input.content,
             entry: input.entry,
@@ -149,8 +152,16 @@ impl PluginRegistryEntry {
         &self.archive_blob_hash
     }
 
-    pub(crate) fn wasm_blob_hash(&self) -> &str {
-        &self.wasm_blob_hash
+    pub(crate) fn wasm_blob_hash(&self) -> Option<&str> {
+        self.wasm_blob_hash.as_deref()
+    }
+
+    pub(crate) fn has_column_merger(&self) -> bool {
+        self.capabilities.column_merger
+    }
+
+    pub(crate) fn has_file_projection(&self) -> bool {
+        self.capabilities.file_projection
     }
 
     /// Verifies the durable contract that every existing owner relies on
@@ -165,6 +176,7 @@ impl PluginRegistryEntry {
     ) -> Result<(), LixError> {
         let incompatible = self.key != replacement.key
             || self.api_version != replacement.api_version
+            || self.capabilities != replacement.capabilities
             || self.path_glob != replacement.path_glob
             || self.content != replacement.content
             || self.schema_keys != replacement.schema_keys
@@ -184,19 +196,23 @@ impl PluginRegistryEntry {
         Ok(())
     }
 
-    pub(crate) fn to_installed_plugin(&self, wasm: Vec<u8>) -> Result<InstalledPlugin, LixError> {
-        let wasm_hash = BlobId::from_content(&wasm);
-        let actual_hash = wasm_hash.to_hex();
-        if actual_hash != self.wasm_blob_hash {
+    pub(crate) fn to_installed_plugin(
+        &self,
+        wasm: Option<Vec<u8>>,
+    ) -> Result<InstalledPlugin, LixError> {
+        let wasm_hash = wasm.as_deref().map(BlobId::from_content);
+        let actual_hash = wasm_hash.map(BlobId::to_hex);
+        if actual_hash.as_deref() != self.wasm_blob_hash.as_deref() {
             return Err(invalid_registry(format!(
-                "plugin '{}' WASM bytes hash '{}' does not match registry hash '{}'",
-                self.key, actual_hash, self.wasm_blob_hash
+                "plugin '{}' WASM bytes do not match its registry hash",
+                self.key
             )));
         }
         Ok(InstalledPlugin {
             key: self.key.clone(),
             runtime: self.runtime,
             api_version: self.api_version.clone(),
+            capabilities: self.capabilities,
             path_glob: self.path_glob.clone(),
             content: self.content,
             entry: self.entry.clone(),
@@ -571,7 +587,9 @@ fn extend_registry_wasm_roots(
     roots: &mut BTreeSet<BlobId>,
 ) -> Result<(), LixError> {
     for plugin in registry.plugins() {
-        roots.insert(BlobId::from_hex(plugin.wasm_blob_hash())?);
+        if let Some(hash) = plugin.wasm_blob_hash() {
+            roots.insert(BlobId::from_hex(hash)?);
+        }
     }
     Ok(())
 }
@@ -788,6 +806,7 @@ impl PluginFileOwner {
 #[derive(Debug)]
 pub(crate) struct CompiledPluginCatalog {
     plugins: Arc<[PluginRegistryEntry]>,
+    file_plugin_indices: Vec<usize>,
     globs: GlobSet,
     specificity: Vec<(u8, i32)>,
 }
@@ -796,25 +815,49 @@ impl CompiledPluginCatalog {
     pub(crate) fn compile(registry: &PluginRegistry) -> Result<Self, LixError> {
         registry.validate()?;
         let mut builder = GlobSetBuilder::new();
-        let mut specificity = Vec::with_capacity(registry.plugins.len());
-        for plugin in &registry.plugins {
-            let glob = GlobBuilder::new(&plugin.path_glob)
+        let mut file_plugin_indices = Vec::new();
+        let mut column_mergers = HashMap::new();
+        let mut specificity = Vec::new();
+        for (plugin_index, plugin) in registry.plugins.iter().enumerate() {
+            if plugin.has_column_merger() {
+                for schema_key in plugin.schema_keys() {
+                    if let Some(previous) = column_mergers.insert(schema_key.clone(), plugin_index)
+                    {
+                        return Err(invalid_registry(format!(
+                            "schema '{}' has more than one column merger ('{}' and '{}')",
+                            schema_key, registry.plugins[previous].key, plugin.key
+                        )));
+                    }
+                }
+            }
+            if !plugin.has_file_projection() {
+                continue;
+            }
+            let path_glob = plugin.path_glob.as_deref().ok_or_else(|| {
+                invalid_registry(format!(
+                    "file projection plugin '{}' has no path_glob",
+                    plugin.key
+                ))
+            })?;
+            let glob = GlobBuilder::new(path_glob)
                 .literal_separator(false)
                 .build()
                 .map_err(|error| {
                     invalid_registry(format!(
                         "plugin '{}' has invalid path_glob '{}': {error}",
-                        plugin.key, plugin.path_glob
+                        plugin.key, path_glob
                     ))
                 })?;
             builder.add(glob);
-            specificity.push(glob_specificity_rank(&plugin.path_glob));
+            file_plugin_indices.push(plugin_index);
+            specificity.push(glob_specificity_rank(path_glob));
         }
         let globs = builder.build().map_err(|error| {
             invalid_registry(format!("failed to compile plugin matcher catalog: {error}"))
         })?;
         Ok(Self {
             plugins: registry.plugins.clone().into(),
+            file_plugin_indices,
             globs,
             specificity,
         })
@@ -838,7 +881,10 @@ impl CompiledPluginCatalog {
         else {
             return false;
         };
-        self.globs.matches(path).contains(&plugin_index)
+        self.globs
+            .matches(path)
+            .iter()
+            .any(|match_index| self.file_plugin_indices[*match_index] == plugin_index)
     }
 
     /// Selects for a known payload without scanning its bytes unless at least
@@ -907,12 +953,13 @@ impl CompiledPluginCatalog {
             if selected_rank.is_some_and(|current| rank <= current) {
                 continue;
             }
-            if let Some(required) = self.plugins[index].content()
+            let plugin_index = self.file_plugin_indices[index];
+            if let Some(required) = self.plugins[plugin_index].content()
                 && !content_matches(required).unwrap_or(false)
             {
                 continue;
             }
-            selected = Some(index);
+            selected = Some(plugin_index);
             selected_rank = Some(rank);
         }
         selected.map(|index| &self.plugins[index])
@@ -981,7 +1028,28 @@ fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
         )));
     }
     validate_blob_hash(&entry.archive_blob_hash, "archive_blob_hash", &entry.key)?;
-    validate_blob_hash(&entry.wasm_blob_hash, "wasm_blob_hash", &entry.key)?;
+    if let Some(wasm_blob_hash) = &entry.wasm_blob_hash {
+        validate_blob_hash(wasm_blob_hash, "wasm_blob_hash", &entry.key)?;
+    }
+    let executable = entry.capabilities.column_merger || entry.capabilities.file_projection;
+    if executable != entry.entry.is_some() || executable != entry.wasm_blob_hash.is_some() {
+        return Err(invalid_registry(format!(
+            "plugin '{}' executable capability, entry, and wasm hash must agree",
+            entry.key
+        )));
+    }
+    if entry.capabilities.file_projection != entry.path_glob.is_some() {
+        return Err(invalid_registry(format!(
+            "plugin '{}' file projection capability and file matcher must agree",
+            entry.key
+        )));
+    }
+    if entry.path_glob.is_none() && entry.content.is_some() {
+        return Err(invalid_registry(format!(
+            "plugin '{}' content matcher requires a file matcher",
+            entry.key
+        )));
+    }
     if entry.schema_keys.is_empty() {
         return Err(invalid_registry(format!(
             "plugin '{}' must own at least one schema",
@@ -1026,9 +1094,17 @@ fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
             entry.key, error.message
         ))
     })?;
+    let manifest_path_glob = manifest
+        .file_match
+        .as_ref()
+        .map(|matcher| &matcher.path_glob);
+    let manifest_content = manifest
+        .file_match
+        .as_ref()
+        .and_then(|matcher| matcher.content);
     if manifest.key != entry.key
-        || manifest.file_match.path_glob != entry.path_glob
-        || manifest.file_match.content != entry.content
+        || manifest_path_glob != entry.path_glob.as_ref()
+        || manifest_content != entry.content
         || manifest.entry != entry.entry
     {
         return Err(invalid_registry(format!(
@@ -1302,7 +1378,7 @@ mod tests {
             r#"{{
                 "schemas":["schema/default.json"],
                 "entry":"plugin.wasm",
-                "match":{{"path_glob":{path_glob:?}{content}}},
+                "file_match":{{"path_glob":{path_glob:?}{content}}},
                 "key":{key:?}
             }}"#
         )
@@ -1322,16 +1398,20 @@ mod tests {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
-            path_glob: path_glob.to_string(),
+            capabilities: PluginCapabilities {
+                column_merger: true,
+                file_projection: true,
+            },
+            path_glob: Some(path_glob.to_string()),
             content,
-            entry: "plugin.wasm".to_string(),
+            entry: Some("plugin.wasm".to_string()),
             schema_keys: vec![format!("{key}_schema")],
             create_schema_keys: Vec::new(),
             manifest_json: manifest_with_content(key, path_glob, content),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
             archive_blob_hash: hash(hash_byte),
-            wasm_blob_hash: hash(hash_byte),
+            wasm_blob_hash: Some(hash(hash_byte)),
         })
         .expect("test registry entry should be valid")
     }
@@ -1343,18 +1423,22 @@ mod tests {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
-            path_glob: path_glob.to_string(),
+            capabilities: PluginCapabilities {
+                column_merger: true,
+                file_projection: true,
+            },
+            path_glob: Some(path_glob.to_string()),
             content: Some(PluginContentMatcher::Text),
-            entry: "plugin.wasm".to_string(),
+            entry: Some("plugin.wasm".to_string()),
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
             manifest_json: format!(
-                r#"{{"entry":"plugin.wasm","key":"{key}","match":{{"content":"text","path_glob":"{path_glob}"}},"schemas":["schema/csv_row.json"]}}"#
+                r#"{{"entry":"plugin.wasm","file_match":{{"content":"text","path_glob":"{path_glob}"}},"key":"{key}","schemas":["schema/csv_row.json"]}}"#
             ),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
             archive_blob_hash: hash(hash_byte),
-            wasm_blob_hash: hash(hash_byte),
+            wasm_blob_hash: Some(hash(hash_byte)),
         })
         .expect("test component registry entry should be valid")
     }
@@ -1391,7 +1475,7 @@ mod tests {
         value.api_version = "2.2.0".to_string();
         incompatible.push(value);
         let mut value = replacement.clone();
-        value.path_glob = "*.tsv".to_string();
+        value.path_glob = Some("*.tsv".to_string());
         incompatible.push(value);
         let mut value = replacement.clone();
         value.content = Some(PluginContentMatcher::Binary);
@@ -1452,7 +1536,10 @@ mod tests {
             .upsert(entry("plugin_a", "*.json", 'a'))
             .expect("install should be valid");
         assert_ne!(installed.generation(), empty.generation());
-        assert_eq!(installed.plugin("plugin_a").unwrap().path_glob, "*.json");
+        assert_eq!(
+            installed.plugin("plugin_a").unwrap().path_glob.as_deref(),
+            Some("*.json")
+        );
         installed
             .remove("plugin_a")
             .expect("remove should be valid");
@@ -1560,9 +1647,13 @@ mod tests {
             key: "plugin_a".to_string(),
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
-            path_glob: "*.json".to_string(),
+            capabilities: PluginCapabilities {
+                column_merger: true,
+                file_projection: true,
+            },
+            path_glob: Some("*.json".to_string()),
             content: Some(PluginContentMatcher::Text),
-            entry: "plugin.wasm".to_string(),
+            entry: Some("plugin.wasm".to_string()),
             schema_keys: vec!["plugin_a_schema".to_string()],
             create_schema_keys: Vec::new(),
             manifest_json: manifest_with_content(
@@ -1573,23 +1664,23 @@ mod tests {
             archive_file_id: plugin_storage_archive_file_id("plugin_a"),
             archive_path: plugin_storage_archive_path("plugin_a"),
             archive_blob_hash: hash('a'),
-            wasm_blob_hash: BlobId::from_content(&wasm).to_hex(),
+            wasm_blob_hash: Some(BlobId::from_content(&wasm).to_hex()),
         };
         let registry_entry = PluginRegistryEntry::new(input.clone()).unwrap();
         let installed = registry_entry
-            .to_installed_plugin(wasm.clone())
+            .to_installed_plugin(Some(wasm.clone()))
             .expect("matching extracted WASM should materialize");
         assert_eq!(installed.key, "plugin_a");
         assert_eq!(installed.content, Some(PluginContentMatcher::Text));
-        assert_eq!(installed.wasm_hash, BlobId::from_content(&wasm));
-        assert_eq!(installed.wasm, wasm);
+        assert_eq!(installed.wasm_hash, Some(BlobId::from_content(&wasm)));
+        assert_eq!(installed.wasm, Some(wasm));
 
-        input.wasm_blob_hash = hash('b');
+        input.wasm_blob_hash = Some(hash('b'));
         let registry_entry = PluginRegistryEntry::new(input).unwrap();
         let error = registry_entry
-            .to_installed_plugin(b"compiled component".to_vec())
+            .to_installed_plugin(Some(b"compiled component".to_vec()))
             .expect_err("mismatched extracted WASM must fail integrity validation");
-        assert!(error.message.contains("WASM bytes hash"));
+        assert!(error.message.contains("WASM bytes"));
     }
 
     #[test]

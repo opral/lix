@@ -5,7 +5,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 #[test]
-fn plugin_v1_wit_is_valid_and_has_no_guest_document_resource() {
+fn plugin_v1_wit_is_valid_and_exposes_independent_row_first_capabilities() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("wit");
     let mut resolve = wit_parser::Resolve::default();
     resolve
@@ -15,18 +15,19 @@ fn plugin_v1_wit_is_valid_and_has_no_guest_document_resource() {
     assert!(wit.contains("package lix:plugin@1.0.0"));
     assert!(wit.contains("resource snapshot"));
     assert!(wit.contains("resource transition"));
-    assert!(wit.contains("apply: func("));
     assert!(wit.contains("output: borrow<transition>"));
-    assert!(wit.contains("resolve-conflicts: func("));
-    assert!(wit.contains("variant transition-request"));
-    assert!(wit.contains("open(open-request)"));
-    assert!(wit.contains("file-changed(file-changed-request)"));
-    assert!(wit.contains("rows-changed(rows-changed-request)"));
-    assert!(wit.contains("restore(restore-request)"));
-    assert!(wit.contains("cold-file-changed(cold-file-changed-request)"));
-    assert!(!wit.contains("path: option<string>"));
+    assert!(wit.contains("interface column-merger"));
+    assert!(wit.contains("interface file-projection"));
+    assert!(wit.contains("parse: func("));
+    assert!(wit.contains("parse-changes: func("));
+    assert!(wit.contains("serialize: func("));
+    assert!(wit.contains("serialize-changes: func("));
+    assert!(wit.contains("file-id: option<string>"));
+    assert!(wit.contains("world column-merger-plugin"));
+    assert!(wit.contains("world file-projection-plugin"));
     assert!(!wit.contains("resource document"));
     assert!(!wit.contains("resource change-cursor"));
+    assert!(!wit.contains("resolve-conflicts"));
 }
 
 #[derive(Clone, Copy, Debug)]
