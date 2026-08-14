@@ -558,7 +558,6 @@ fn profile_hot_sql_session_operations(
         rows,
         read_many_pk_count,
     ));
-    let _ = lix::storage_bench::take_row_point_snapshot_cache_accounting();
     if sql_session::selected_olap_read_shape().is_some() {
         // Full semantic validation is intentionally outside the samples. This
         // keeps Rust-vs-JavaScript assertion work out of the engine ratio while
@@ -624,13 +623,6 @@ fn profile_hot_sql_session_operations(
             TransactionBenchOp::ReadManyByPk,
             read_many_pk_count,
             samples,
-        );
-    }
-    if matches!(operation, TransactionBenchOp::ReadOneByPk) {
-        let cache = lix::storage_bench::take_row_point_snapshot_cache_accounting();
-        println!(
-            "tracked_state_crud point cache accounting: hits={} misses={}",
-            cache.hits, cache.misses
         );
     }
     black_box(row_count);

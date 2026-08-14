@@ -49,7 +49,8 @@ async fn slatedb_native_schema_point_survives_cold_reopen() {
 async fn native_schema_point_survives_cold_reopen<S: ReopenStorage>() {
     let temp = tempfile::tempdir().expect("create native point fixture");
     let path = temp.path().join("database");
-    let expected = r#"{"a":[true,null],"z":7}"#;
+    let initial = r#"{"a":[true,null],"z":7}"#;
+    let expected = r#"{"a":[false,{"root":"replacement"}],"z":8}"#;
     {
         let storage = S::open(&path);
         let lix = open_lix()
@@ -73,10 +74,18 @@ async fn native_schema_point_survives_cold_reopen<S: ReopenStorage>() {
         .expect("register native point schema");
         lix.execute(
             &format!("INSERT INTO {SCHEMA_KEY} (id, payload) VALUES ($1, CAST($2 AS JSONB))"),
-            &[Value::Text("row-a".into()), Value::Text(expected.into())],
+            &[Value::Text("row-a".into()), Value::Text(initial.into())],
         )
         .await
         .expect("insert native point row");
+        assert_point(&lix, initial).await;
+        lix.execute(
+            &format!("UPDATE {SCHEMA_KEY} SET payload = CAST($2 AS JSONB) WHERE id = $1"),
+            &[Value::Text("row-a".into()), Value::Text(expected.into())],
+        )
+        .await
+        .expect("replace native point row under a new authenticated root");
+        assert_point(&lix, expected).await;
         assert_point(&lix, expected).await;
         lix.close().await.expect("close native point fixture");
         drop(lix);
