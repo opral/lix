@@ -1,9 +1,9 @@
-//! EXP-HAMT-05: canonical authenticated HAMT layout experiment.
+//! EXP-BPTREE-07: canonical authenticated high-fanout B+ tree experiment.
 //!
 //! Compares identical Schema-v1 typed tuple bytes stored as either:
 //! - immutable 64-row slotted snapshot pages with a rewritten page manifest; or
-//! - a canonical content-addressed 16-way HAMT keyed by the hash of the full
-//!   encoded StateKey, with bounded collision leaves and path-copy updates.
+//! - a canonical content-addressed B+ tree ordered by the full encoded
+//!   StateKey, with prefix-compressed pages and path-copy value updates.
 //!
 //! The benchmark uses the shipping RocksDB/SlateDB storage traits. There is no
 //! SQL or workload-specific production shortcut: both layouts implement the
@@ -28,12 +28,10 @@ use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use uuid::Uuid;
 
-const LEDGER: &str = "EXP-HAMT-05";
+const LEDGER: &str = "EXP-BPTREE-07";
 const PAGE_ROWS: usize = 64;
-const HAMT_BITS: usize = 4;
-const HAMT_FANOUT: usize = 1 << HAMT_BITS;
-const HAMT_LEAF_MAX: usize = 8;
-const HAMT_MAX_DEPTH: usize = 64 / HAMT_BITS;
+const BPTREE_MIN_PAGE_BYTES: usize = 4 * 1024;
+const BPTREE_MAX_PAGE_BYTES: usize = 32 * 1024;
 const ROOT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00fe_2001), "exp.delta_page.root");
 const PAGE_SPACE: StorageSpace =
@@ -67,21 +65,21 @@ const TUPLE_PLAN: [BodyColumn; 5] = [
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Layout {
     Slotted,
-    Hamt,
+    Bptree,
 }
 
 impl Layout {
     fn name(self) -> &'static str {
         match self {
             Self::Slotted => "slotted",
-            Self::Hamt => "hamt",
+            Self::Bptree => "bptree",
         }
     }
 
     fn tag(self) -> u8 {
         match self {
             Self::Slotted => 1,
-            Self::Hamt => 2,
+            Self::Bptree => 2,
         }
     }
 }
@@ -154,21 +152,22 @@ struct Root {
     parent: Option<ObjectId>,
     /// Immutable schema-partitioned base pages.
     pages: Vec<ObjectId>,
-    /// Sole current-state owner for the HAMT layout.
-    hamt_root: Option<ObjectId>,
+    /// Sole current-state owner for the B+ tree layout.
+    tree_root: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug)]
-enum HamtNode {
+enum BptreeNode {
     Branch {
-        bitmap: u16,
+        /// Canonical minimum encoded key for each child, in strict order.
+        fences: Vec<Vec<u8>>,
         children: Vec<ObjectId>,
     },
-    Leaf(Vec<HamtEntry>),
+    Leaf(Vec<BptreeEntry>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct HamtEntry {
+struct BptreeEntry {
     encoded_key: Vec<u8>,
     ordinal: u64,
     value: Vec<u8>,
@@ -443,9 +442,10 @@ impl<S: Storage + Clone> Store<S> {
 #[tokio::main]
 async fn main() {
     let config = parse_config();
-    hamt_codec_controls();
+    bptree_codec_controls();
     println!(
-        "{LEDGER},kind=config,page_rows={PAGE_ROWS},hamt_fanout={HAMT_FANOUT},hamt_leaf_max={HAMT_LEAF_MAX},pk_kind={},pattern={},sizes={:?},histories={:?}",
+        "{LEDGER},kind=config,page_rows={PAGE_ROWS},bptree_page_bytes={},pk_kind={},pattern={},sizes={:?},histories={:?}",
+        bptree_page_bytes(),
         pk_kind(),
         mutation_pattern(),
         config.sizes,
@@ -456,7 +456,7 @@ async fn main() {
         for &n in &config.sizes {
             for &history in &config.histories {
                 for &delta in &config.deltas {
-                    for layout in [Layout::Slotted, Layout::Hamt] {
+                    for layout in [Layout::Slotted, Layout::Bptree] {
                         match backend.as_str() {
                             "rocksdb" => run_rocks(&config, case, n, history, delta, layout).await,
                             "slatedb" => run_slate(&config, case, n, history, delta, layout).await,
@@ -644,6 +644,39 @@ async fn run_case<S: Storage + Clone>(
         }
         emit_latency_summary(backend, layout, n, h, d, operation, &samples);
     }
+
+    let missing_key = n as u64 + 1;
+    let before = store.counters;
+    let started = Instant::now();
+    assert!(
+        point(&mut store, root, missing_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    emit(
+        backend,
+        path,
+        layout,
+        n,
+        h,
+        d,
+        "point_miss",
+        started.elapsed().as_micros(),
+        store.counters.delta(before),
+    );
+    let mut miss_samples = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let started = Instant::now();
+        assert!(
+            point(&mut store, root, missing_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        miss_samples.push(started.elapsed().as_micros());
+    }
+    emit_latency_summary(backend, layout, n, h, d, "point_miss", &miss_samples);
 
     for (operation, keys) in [
         ("point_hot_series", history_hot_keys.clone()),
@@ -901,20 +934,20 @@ async fn build_initial<S: Storage + Clone>(
                 generation: 0,
                 parent: None,
                 pages: pages.iter().map(|(id, _)| *id).collect(),
-                hamt_root: None,
+                tree_root: None,
             }
         }
-        Layout::Hamt => {
+        Layout::Bptree => {
             let entries = rows
                 .iter()
-                .map(|(ordinal, value)| HamtEntry {
+                .map(|(ordinal, value)| BptreeEntry {
                     encoded_key: state_key(*ordinal),
                     ordinal: *ordinal,
                     value: value.clone(),
                 })
                 .collect::<Vec<_>>();
             let mut staged = Vec::new();
-            let hamt_root = build_hamt_subtree(&entries, 0, &mut staged)?;
+            let tree_root = build_bptree(&entries, &mut staged)?;
             store.counters.nodes_staged += staged.len() as u64;
             store.put_objects(PAGE_SPACE, &staged).await?;
             Root {
@@ -923,7 +956,7 @@ async fn build_initial<S: Storage + Clone>(
                 generation: 0,
                 parent: None,
                 pages: Vec::new(),
-                hamt_root: Some(hamt_root),
+                tree_root: Some(tree_root),
             }
         }
     };
@@ -972,28 +1005,24 @@ async fn commit<S: Storage + Clone>(
                     generation,
                     parent: None,
                     pages: page_ids,
-                    hamt_root: None,
+                    tree_root: None,
                 },
             )
             .await
         }
-        Layout::Hamt => {
-            let mut hamt_root = root
-                .hamt_root
-                .ok_or_else(|| "HAMT root is missing".to_owned())?;
-            for (ordinal, value) in mutations {
-                hamt_root = hamt_insert(
-                    store,
-                    hamt_root,
-                    HamtEntry {
-                        encoded_key: state_key(*ordinal),
-                        ordinal: *ordinal,
-                        value: value.clone(),
-                    },
-                    0,
-                )
-                .await?;
-            }
+        Layout::Bptree => {
+            let tree_root = root
+                .tree_root
+                .ok_or_else(|| "B+ tree root is missing".to_owned())?;
+            let entries = mutations
+                .iter()
+                .map(|(ordinal, value)| BptreeEntry {
+                    encoded_key: state_key(*ordinal),
+                    ordinal: *ordinal,
+                    value: value.clone(),
+                })
+                .collect::<Vec<_>>();
+            let tree_root = bptree_update_many(store, tree_root, entries).await?;
             put_root(
                 store,
                 &Root {
@@ -1002,7 +1031,7 @@ async fn commit<S: Storage + Clone>(
                     generation,
                     parent: Some(current),
                     pages: Vec::new(),
-                    hamt_root: Some(hamt_root),
+                    tree_root: Some(tree_root),
                 },
             )
             .await
@@ -1025,12 +1054,12 @@ async fn point_on_read<R: StorageRead>(
     key: u64,
 ) -> Result<Option<Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
-    if root.layout == Layout::Hamt {
+    if root.layout == Layout::Bptree {
         let encoded_key = state_key(key);
-        return hamt_point(
+        return bptree_point(
             store,
-            root.hamt_root
-                .ok_or_else(|| "HAMT root is missing".to_owned())?,
+            root.tree_root
+                .ok_or_else(|| "B+ tree root is missing".to_owned())?,
             &encoded_key,
         )
         .await;
@@ -1063,17 +1092,15 @@ async fn range<S: Storage + Clone>(
     if start >= end {
         return Ok(BTreeMap::new());
     }
-    if root.layout == Layout::Hamt {
-        let rows = hamt_enumerate(
+    if root.layout == Layout::Bptree {
+        return bptree_range(
             &mut read,
-            root.hamt_root
-                .ok_or_else(|| "HAMT root is missing".to_owned())?,
+            root.tree_root
+                .ok_or_else(|| "B+ tree root is missing".to_owned())?,
+            &state_key(start),
+            &state_key(end),
         )
-        .await?;
-        return Ok(rows
-            .range(start..end)
-            .map(|(key, value)| (*key, value.clone()))
-            .collect());
+        .await;
     }
     let first = start as usize / PAGE_ROWS;
     let last = (end.saturating_sub(1) as usize / PAGE_ROWS).min(root.pages.len() - 1);
@@ -1093,11 +1120,11 @@ async fn materialize_on_read<R: StorageRead>(
     root_id: ObjectId,
 ) -> Result<BTreeMap<u64, Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
-    if root.layout == Layout::Hamt {
-        let rows = hamt_enumerate(
+    if root.layout == Layout::Bptree {
+        let rows = bptree_enumerate(
             store,
-            root.hamt_root
-                .ok_or_else(|| "HAMT root is missing".to_owned())?,
+            root.tree_root
+                .ok_or_else(|| "B+ tree root is missing".to_owned())?,
         )
         .await?;
         return Ok(rows);
@@ -1134,15 +1161,15 @@ async fn diff_on_read<R: StorageRead>(
     }
     match before_root.layout {
         Layout::Slotted => diff_slotted(store, &before_root, &after_root).await,
-        Layout::Hamt => {
-            hamt_diff(
+        Layout::Bptree => {
+            bptree_diff(
                 store,
                 before_root
-                    .hamt_root
-                    .ok_or_else(|| "HAMT root is missing".to_owned())?,
+                    .tree_root
+                    .ok_or_else(|| "B+ tree root is missing".to_owned())?,
                 after_root
-                    .hamt_root
-                    .ok_or_else(|| "HAMT root is missing".to_owned())?,
+                    .tree_root
+                    .ok_or_else(|| "B+ tree root is missing".to_owned())?,
             )
             .await
         }
@@ -1215,11 +1242,11 @@ async fn corruption_control<S: Storage + Clone>(
             corrupted.pages[0] = wrong;
             page
         }
-        Layout::Hamt => {
+        Layout::Bptree => {
             let node = decoded
-                .hamt_root
-                .ok_or_else(|| "HAMT root is missing".to_owned())?;
-            corrupted.hamt_root = Some(wrong);
+                .tree_root
+                .ok_or_else(|| "B+ tree root is missing".to_owned())?;
+            corrupted.tree_root = Some(wrong);
             node
         }
     };
@@ -1230,22 +1257,43 @@ async fn corruption_control<S: Storage + Clone>(
         .await?;
     assert!(materialize(store, corrupt_id).await.is_err());
     assert!(store.get_one(PAGE_SPACE, retained).await.is_ok());
-    if decoded.layout == Layout::Hamt {
+    if decoded.layout == Layout::Bptree {
         let node_bytes = store.get_one(PAGE_SPACE, retained).await?;
-        if let HamtNode::Branch {
-            bitmap,
+        if let BptreeNode::Branch {
+            fences,
             mut children,
-        } = decode_hamt_node(&node_bytes)?
+        } = decode_bptree_node(&node_bytes)?
         {
+            if children.len() >= 2 {
+                let mut substituted_children = children.clone();
+                substituted_children[0] = substituted_children[1];
+                let substituted = BptreeNode::Branch {
+                    fences: fences.clone(),
+                    children: substituted_children,
+                };
+                let substituted_bytes = encode_bptree_node(&substituted);
+                let substituted_id = ObjectId::of(&substituted_bytes);
+                store
+                    .put_objects(PAGE_SPACE, &[(substituted_id, substituted_bytes)])
+                    .await?;
+                let mut substituted_root = decoded.clone();
+                substituted_root.tree_root = Some(substituted_id);
+                let root_bytes = encode_root(&substituted_root);
+                let root_id = ObjectId::of(&root_bytes);
+                store
+                    .put_objects(ROOT_SPACE, &[(root_id, root_bytes)])
+                    .await?;
+                assert!(materialize(store, root_id).await.is_err());
+            }
             children[0] = wrong;
-            let malformed_child = HamtNode::Branch { bitmap, children };
-            let malformed_bytes = encode_hamt_node(&malformed_child);
+            let malformed_child = BptreeNode::Branch { fences, children };
+            let malformed_bytes = encode_bptree_node(&malformed_child);
             let malformed_id = ObjectId::of(&malformed_bytes);
             store
                 .put_objects(PAGE_SPACE, &[(malformed_id, malformed_bytes)])
                 .await?;
             let mut malformed_root = decoded.clone();
-            malformed_root.hamt_root = Some(malformed_id);
+            malformed_root.tree_root = Some(malformed_id);
             let root_bytes = encode_root(&malformed_root);
             let root_id = ObjectId::of(&root_bytes);
             store
@@ -1253,14 +1301,12 @@ async fn corruption_control<S: Storage + Clone>(
                 .await?;
             assert!(materialize(store, root_id).await.is_err());
 
-            let mut bitmap_bytes = b"HMB1".to_vec();
-            bitmap_bytes.extend_from_slice(&1u16.to_be_bytes());
-            bitmap_bytes.push(0);
-            let bitmap_id = ObjectId::of(&bitmap_bytes);
+            let malformed_fence_bytes = b"BPB1\0\0\0\x01\0\0\0\0".to_vec();
+            let malformed_fence_id = ObjectId::of(&malformed_fence_bytes);
             store
-                .put_objects(PAGE_SPACE, &[(bitmap_id, bitmap_bytes)])
+                .put_objects(PAGE_SPACE, &[(malformed_fence_id, malformed_fence_bytes)])
                 .await?;
-            malformed_root.hamt_root = Some(bitmap_id);
+            malformed_root.tree_root = Some(malformed_fence_id);
             let root_bytes = encode_root(&malformed_root);
             let root_id = ObjectId::of(&root_bytes);
             store
@@ -1371,7 +1417,7 @@ fn encode_root(root: &Root) -> Vec<u8> {
     for page in &root.pages {
         out.extend_from_slice(&page.0);
     }
-    match root.hamt_root {
+    match root.tree_root {
         Some(id) => {
             out.push(1);
             out.extend_from_slice(&id.0);
@@ -1386,7 +1432,7 @@ fn decode_root(bytes: &[u8]) -> Result<Root, String> {
     input.magic(b"EHR1")?;
     let layout = match input.u8()? {
         1 => Layout::Slotted,
-        2 => Layout::Hamt,
+        2 => Layout::Bptree,
         _ => return Err("unknown root layout".to_owned()),
     };
     let count = input.u64()?;
@@ -1397,29 +1443,29 @@ fn decode_root(bytes: &[u8]) -> Result<Root, String> {
         _ => return Err("invalid parent tag".to_owned()),
     };
     if layout == Layout::Slotted && parent.is_some() {
-        return Err("slotted root has HAMT ancestry".to_owned());
+        return Err("slotted root has B+ tree ancestry".to_owned());
     }
-    if layout == Layout::Hamt && generation == 0 && parent.is_some() {
-        return Err("initial HAMT root has parent".to_owned());
+    if layout == Layout::Bptree && generation == 0 && parent.is_some() {
+        return Err("initial B+ tree root has parent".to_owned());
     }
-    if layout == Layout::Hamt && generation > 0 && parent.is_none() {
-        return Err("versioned HAMT root is missing chronology parent".to_owned());
+    if layout == Layout::Bptree && generation > 0 && parent.is_none() {
+        return Err("versioned B+ tree root is missing chronology parent".to_owned());
     }
     let count_pages = input.u32()? as usize;
     let mut pages = Vec::with_capacity(count_pages);
     for _ in 0..count_pages {
         pages.push(ObjectId(input.fixed_32()?));
     }
-    let hamt_root = match input.u8()? {
+    let tree_root = match input.u8()? {
         0 => None,
         1 => Some(ObjectId(input.fixed_32()?)),
-        _ => return Err("invalid HAMT root tag".to_owned()),
+        _ => return Err("invalid B+ tree root tag".to_owned()),
     };
-    if layout == Layout::Slotted && hamt_root.is_some() {
-        return Err("slotted root has HAMT owner".to_owned());
+    if layout == Layout::Slotted && tree_root.is_some() {
+        return Err("slotted root has B+ tree owner".to_owned());
     }
-    if layout == Layout::Hamt && (!pages.is_empty() || hamt_root.is_none()) {
-        return Err("HAMT root has a second or missing state owner".to_owned());
+    if layout == Layout::Bptree && (!pages.is_empty() || tree_root.is_none()) {
+        return Err("B+ tree root has a second or missing state owner".to_owned());
     }
     input.finish()?;
     Ok(Root {
@@ -1428,7 +1474,7 @@ fn decode_root(bytes: &[u8]) -> Result<Root, String> {
         generation,
         parent,
         pages,
-        hamt_root,
+        tree_root,
     })
 }
 
@@ -1462,302 +1508,527 @@ fn state_key(ordinal: u64) -> Vec<u8> {
 }
 
 fn pk_kind() -> String {
-    std::env::var("EXP_HAMT_PK_KIND").unwrap_or_else(|_| "integer".to_owned())
+    std::env::var("EXP_BPTREE_PK_KIND").unwrap_or_else(|_| "integer".to_owned())
 }
 
-fn hamt_hash(key: &[u8]) -> [u8; 32] {
-    *blake3::hash(key).as_bytes()
+fn bptree_page_bytes() -> usize {
+    std::env::var("EXP_BPTREE_PAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (*value).is_power_of_two())
+        .filter(|value| (BPTREE_MIN_PAGE_BYTES..=BPTREE_MAX_PAGE_BYTES).contains(value))
+        .unwrap_or_else(|| {
+            let width = state_key(0).len() + tuple(0, 0).len();
+            (width * 32)
+                .next_power_of_two()
+                .clamp(BPTREE_MIN_PAGE_BYTES, BPTREE_MAX_PAGE_BYTES)
+        })
 }
 
-fn hamt_slot(hash: &[u8; 32], depth: usize) -> usize {
-    let byte = hash[depth / 2];
-    if depth.is_multiple_of(2) {
-        (byte >> 4) as usize
-    } else {
-        (byte & 0x0f) as usize
+fn common_prefix(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn encode_prefixed_keys<'a>(keys: impl Iterator<Item = &'a [u8]>, out: &mut Vec<u8>) {
+    let mut previous = Vec::new();
+    for key in keys {
+        let prefix = common_prefix(&previous, key);
+        let suffix = &key[prefix..];
+        out.extend_from_slice(&(prefix as u16).to_be_bytes());
+        out.extend_from_slice(&(suffix.len() as u16).to_be_bytes());
+        out.extend_from_slice(suffix);
+        previous.clear();
+        previous.extend_from_slice(key);
     }
 }
 
-fn encode_hamt_node(node: &HamtNode) -> Vec<u8> {
+fn decode_prefixed_key(input: &mut Decoder<'_>, previous: &[u8]) -> Result<Vec<u8>, String> {
+    let prefix = u16::from_be_bytes(input.bytes(2)?.try_into().unwrap()) as usize;
+    let suffix = u16::from_be_bytes(input.bytes(2)?.try_into().unwrap()) as usize;
+    if prefix > previous.len() {
+        return Err("malformed B+ tree key prefix".to_owned());
+    }
+    let mut key = previous[..prefix].to_vec();
+    key.extend_from_slice(input.bytes(suffix)?);
+    Ok(key)
+}
+
+fn encode_bptree_node(node: &BptreeNode) -> Vec<u8> {
     match node {
-        HamtNode::Branch { bitmap, children } => {
-            let mut out = b"HMB1".to_vec();
-            out.extend_from_slice(&bitmap.to_be_bytes());
-            out.push(children.len() as u8);
+        BptreeNode::Branch { fences, children } => {
+            let mut out = b"BPB1".to_vec();
+            out.extend_from_slice(&(fences.len() as u32).to_be_bytes());
+            encode_prefixed_keys(fences.iter().map(Vec::as_slice), &mut out);
             for child in children {
                 out.extend_from_slice(&child.0);
             }
             out
         }
-        HamtNode::Leaf(entries) => {
-            let mut out = b"HML1".to_vec();
-            out.push(entries.len() as u8);
+        BptreeNode::Leaf(entries) => {
+            let mut out = b"BPL1".to_vec();
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            let mut previous = Vec::new();
             for entry in entries {
-                out.extend_from_slice(&(entry.encoded_key.len() as u32).to_be_bytes());
-                out.extend_from_slice(&entry.encoded_key);
+                let prefix = common_prefix(&previous, &entry.encoded_key);
+                let suffix = &entry.encoded_key[prefix..];
+                out.extend_from_slice(&(prefix as u16).to_be_bytes());
+                out.extend_from_slice(&(suffix.len() as u16).to_be_bytes());
+                out.extend_from_slice(suffix);
                 out.extend_from_slice(&entry.ordinal.to_be_bytes());
                 out.extend_from_slice(&(entry.value.len() as u32).to_be_bytes());
                 out.extend_from_slice(&entry.value);
+                previous.clone_from(&entry.encoded_key);
             }
             out
         }
     }
 }
 
-fn decode_hamt_node(bytes: &[u8]) -> Result<HamtNode, String> {
-    if bytes.starts_with(b"HMB1") {
+fn decode_bptree_node(bytes: &[u8]) -> Result<BptreeNode, String> {
+    if bytes.len() > bptree_page_bytes() {
+        return Err("B+ tree node exceeds canonical byte target".to_owned());
+    }
+    if bytes.starts_with(b"BPB1") {
         let mut input = Decoder::new(bytes);
-        input.magic(b"HMB1")?;
-        let bitmap = u16::from_be_bytes(input.bytes(2)?.try_into().unwrap());
-        let count = input.u8()? as usize;
-        if count == 0 || count != bitmap.count_ones() as usize {
-            return Err("malformed HAMT bitmap cardinality".to_owned());
+        input.magic(b"BPB1")?;
+        let count = input.u32()? as usize;
+        if count < 2 {
+            return Err("noncanonical unary/empty B+ tree branch".to_owned());
+        }
+        let mut fences = Vec::with_capacity(count);
+        let mut previous = Vec::new();
+        for _ in 0..count {
+            let key = decode_prefixed_key(&mut input, &previous)?;
+            if !previous.is_empty() && previous >= key {
+                return Err("duplicate or unordered B+ tree fence".to_owned());
+            }
+            previous.clone_from(&key);
+            fences.push(key);
         }
         let mut children = Vec::with_capacity(count);
         for _ in 0..count {
             children.push(ObjectId(input.fixed_32()?));
         }
         input.finish()?;
-        return Ok(HamtNode::Branch { bitmap, children });
+        return Ok(BptreeNode::Branch { fences, children });
     }
     let mut input = Decoder::new(bytes);
-    input.magic(b"HML1")?;
-    let count = input.u8()? as usize;
-    if count == 0 || count > HAMT_LEAF_MAX {
-        return Err("noncanonical HAMT collision leaf size".to_owned());
+    input.magic(b"BPL1")?;
+    let count = input.u32()? as usize;
+    if count == 0 {
+        return Err("empty B+ tree leaf".to_owned());
     }
     let mut entries = Vec::with_capacity(count);
+    let mut previous = Vec::new();
     for _ in 0..count {
-        let key_len = input.u32()? as usize;
-        let encoded_key = input.bytes(key_len)?.to_vec();
+        let encoded_key = decode_prefixed_key(&mut input, &previous)?;
+        if !previous.is_empty() && previous >= encoded_key {
+            return Err("duplicate or unordered B+ tree leaf key".to_owned());
+        }
         let ordinal = input.u64()?;
         let value_len = input.u32()? as usize;
         let value = input.bytes(value_len)?.to_vec();
         if encoded_key != state_key(ordinal) {
-            return Err("HAMT encoded StateKey/ordinal binding mismatch".to_owned());
+            return Err("B+ tree StateKey/ordinal binding mismatch".to_owned());
         }
         decode_body(&TUPLE_PLAN, &value).map_err(|error| error.to_string())?;
-        entries.push(HamtEntry {
+        previous.clone_from(&encoded_key);
+        entries.push(BptreeEntry {
             encoded_key,
             ordinal,
             value,
         });
     }
     input.finish()?;
-    if !entries
-        .windows(2)
-        .all(|pair| pair[0].encoded_key < pair[1].encoded_key)
-    {
-        return Err("duplicate or noncanonical HAMT leaf order".to_owned());
-    }
-    Ok(HamtNode::Leaf(entries))
+    Ok(BptreeNode::Leaf(entries))
 }
 
-fn stage_hamt_node(node: &HamtNode, staged: &mut Vec<(ObjectId, Vec<u8>)>) -> ObjectId {
-    let bytes = encode_hamt_node(node);
+fn node_min_key(node: &BptreeNode) -> &[u8] {
+    match node {
+        BptreeNode::Branch { fences, .. } => &fences[0],
+        BptreeNode::Leaf(entries) => &entries[0].encoded_key,
+    }
+}
+
+fn stage_bptree_node(
+    node: &BptreeNode,
+    staged: &mut Vec<(ObjectId, Vec<u8>)>,
+) -> Result<ObjectId, String> {
+    let bytes = encode_bptree_node(node);
+    if bytes.len() > bptree_page_bytes() {
+        return Err("B+ tree node exceeds target during staging".to_owned());
+    }
     let id = ObjectId::of(&bytes);
     staged.push((id, bytes));
-    id
+    Ok(id)
 }
 
-fn build_hamt_subtree(
-    entries: &[HamtEntry],
-    depth: usize,
+fn partition_entries(entries: &[BptreeEntry]) -> Vec<Vec<BptreeEntry>> {
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    for entry in entries {
+        let mut candidate = current.clone();
+        candidate.push(entry.clone());
+        if !current.is_empty()
+            && encode_bptree_node(&BptreeNode::Leaf(candidate)).len() > bptree_page_bytes()
+        {
+            pages.push(std::mem::take(&mut current));
+        }
+        current.push(entry.clone());
+    }
+    if !current.is_empty() {
+        pages.push(current);
+    }
+    pages
+}
+
+fn partition_children(children: &[(Vec<u8>, ObjectId)]) -> Vec<Vec<(Vec<u8>, ObjectId)>> {
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    for child in children {
+        let mut candidate = current.clone();
+        candidate.push(child.clone());
+        let node = BptreeNode::Branch {
+            fences: candidate.iter().map(|(key, _)| key.clone()).collect(),
+            children: candidate.iter().map(|(_, id)| *id).collect(),
+        };
+        if current.len() >= 2 && encode_bptree_node(&node).len() > bptree_page_bytes() {
+            pages.push(std::mem::take(&mut current));
+        }
+        current.push(child.clone());
+    }
+    if !current.is_empty() {
+        pages.push(current);
+    }
+    pages
+}
+
+fn build_bptree(
+    entries: &[BptreeEntry],
     staged: &mut Vec<(ObjectId, Vec<u8>)>,
 ) -> Result<ObjectId, String> {
     if entries.is_empty() {
-        return Err("cannot build empty HAMT subtree".to_owned());
+        return Err("cannot build empty B+ tree".to_owned());
     }
-    if entries.len() <= HAMT_LEAF_MAX {
-        let mut leaf = entries.to_vec();
-        leaf.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
-        leaf.dedup_by(|left, right| left.encoded_key == right.encoded_key);
-        if leaf.len() != entries.len() {
-            return Err("duplicate HAMT StateKey".to_owned());
-        }
-        return Ok(stage_hamt_node(&HamtNode::Leaf(leaf), staged));
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+    if !sorted
+        .windows(2)
+        .all(|pair| pair[0].encoded_key < pair[1].encoded_key)
+    {
+        return Err("duplicate B+ tree StateKey".to_owned());
     }
-    if depth >= HAMT_MAX_DEPTH {
-        return Err("HAMT collision leaf exceeds canonical bound".to_owned());
+    let mut level = Vec::new();
+    for page in partition_entries(&sorted) {
+        let node = BptreeNode::Leaf(page);
+        let min = node_min_key(&node).to_vec();
+        level.push((min, stage_bptree_node(&node, staged)?));
     }
-    let mut buckets = vec![Vec::new(); HAMT_FANOUT];
-    for entry in entries {
-        buckets[hamt_slot(&hamt_hash(&entry.encoded_key), depth)].push(entry.clone());
+    while level.len() > 1 {
+        let groups = partition_children(&level);
+        level = groups
+            .into_iter()
+            .map(|group| {
+                if group.len() == 1 {
+                    return Ok(group[0].clone());
+                }
+                let node = BptreeNode::Branch {
+                    fences: group.iter().map(|(key, _)| key.clone()).collect(),
+                    children: group.iter().map(|(_, id)| *id).collect(),
+                };
+                let min = node_min_key(&node).to_vec();
+                Ok((min, stage_bptree_node(&node, staged)?))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
     }
-    let mut bitmap = 0u16;
-    let mut children = Vec::new();
-    for (slot, bucket) in buckets.into_iter().enumerate() {
-        if bucket.is_empty() {
-            continue;
-        }
-        bitmap |= 1u16 << slot;
-        children.push(build_hamt_subtree(&bucket, depth + 1, staged)?);
-    }
-    Ok(stage_hamt_node(
-        &HamtNode::Branch { bitmap, children },
-        staged,
-    ))
+    Ok(level[0].1)
 }
 
-async fn load_hamt_node<R: StorageRead>(
+async fn load_bptree_node<R: StorageRead>(
     store: &mut Reader<'_, R>,
     id: ObjectId,
-) -> Result<HamtNode, String> {
+    expected_min: Option<&[u8]>,
+) -> Result<BptreeNode, String> {
     let bytes = store.get_one(PAGE_SPACE, id).await?;
-    let node = decode_hamt_node(&bytes)?;
+    let node = decode_bptree_node(&bytes)?;
+    if expected_min.is_some_and(|expected| expected != node_min_key(&node)) {
+        return Err("B+ tree fence/child minimum binding mismatch".to_owned());
+    }
     store.counters.node_reads += 1;
     store.counters.decoded_pages += 1;
-    if let HamtNode::Leaf(entries) = &node {
+    if let BptreeNode::Leaf(entries) = &node {
         store.counters.decoded_rows += entries.len() as u64;
     }
     Ok(node)
 }
 
-async fn put_hamt_node<S: Storage + Clone>(
+async fn put_bptree_node<S: Storage + Clone>(
     store: &mut Store<S>,
-    node: &HamtNode,
+    node: &BptreeNode,
 ) -> Result<ObjectId, String> {
-    let bytes = encode_hamt_node(node);
+    let bytes = encode_bptree_node(node);
+    if bytes.len() > bptree_page_bytes() {
+        return Err("B+ tree path-copy page exceeds target".to_owned());
+    }
     let id = ObjectId::of(&bytes);
     store.put_objects(PAGE_SPACE, &[(id, bytes)]).await?;
     store.counters.nodes_staged += 1;
     Ok(id)
 }
 
-fn hamt_insert<'a, S: Storage + Clone + 'a>(
+fn branch_child_index(fences: &[Vec<u8>], key: &[u8]) -> usize {
+    fences
+        .partition_point(|fence| fence.as_slice() <= key)
+        .saturating_sub(1)
+}
+
+async fn bptree_update_many<S: Storage + Clone>(
+    store: &mut Store<S>,
+    node_id: ObjectId,
+    entries: Vec<BptreeEntry>,
+) -> Result<ObjectId, String> {
+    let mut level = bptree_update_nodes(store, node_id, None, entries).await?;
+    while level.len() > 1 {
+        let groups = partition_children(&level);
+        let mut next = Vec::new();
+        for group in groups {
+            if group.len() == 1 {
+                next.push(group[0].clone());
+                continue;
+            }
+            let node = BptreeNode::Branch {
+                fences: group.iter().map(|(key, _)| key.clone()).collect(),
+                children: group.iter().map(|(_, id)| *id).collect(),
+            };
+            let min = node_min_key(&node).to_vec();
+            next.push((min, put_bptree_node(store, &node).await?));
+        }
+        level = next;
+    }
+    Ok(level[0].1)
+}
+
+fn bptree_update_nodes<'a, S: Storage + Clone + 'a>(
     store: &'a mut Store<S>,
     node_id: ObjectId,
-    entry: HamtEntry,
-    depth: usize,
-) -> Pin<Box<dyn Future<Output = Result<ObjectId, String>> + 'a>> {
+    expected_min: Option<Vec<u8>>,
+    entries: Vec<BptreeEntry>,
+) -> Pin<Box<dyn Future<Output = Result<Vec<(Vec<u8>, ObjectId)>, String>> + 'a>> {
     Box::pin(async move {
+        if entries.is_empty() {
+            return Ok(vec![(
+                expected_min.ok_or_else(|| "missing unchanged subtree fence".to_owned())?,
+                node_id,
+            )]);
+        }
         let node = {
             let mut read = store.reader().await?;
-            load_hamt_node(&mut read, node_id).await?
+            load_bptree_node(&mut read, node_id, expected_min.as_deref()).await?
         };
         match node {
-            HamtNode::Leaf(mut entries) => {
-                match entries
-                    .binary_search_by(|candidate| candidate.encoded_key.cmp(&entry.encoded_key))
-                {
-                    Ok(index) => entries[index] = entry,
-                    Err(index) => entries.insert(index, entry),
+            BptreeNode::Leaf(mut existing) => {
+                for entry in entries {
+                    let index = existing
+                        .binary_search_by(|candidate| candidate.encoded_key.cmp(&entry.encoded_key))
+                        .map_err(|_| {
+                            "B+ tree update cannot insert through value-only path".to_owned()
+                        })?;
+                    existing[index] = entry;
                 }
-                if entries.len() <= HAMT_LEAF_MAX {
-                    put_hamt_node(store, &HamtNode::Leaf(entries)).await
-                } else {
-                    let mut staged = Vec::new();
-                    let root = build_hamt_subtree(&entries, depth, &mut staged)?;
-                    store.counters.nodes_staged += staged.len() as u64;
-                    store.put_objects(PAGE_SPACE, &staged).await?;
-                    Ok(root)
+                let mut result = Vec::new();
+                for page in partition_entries(&existing) {
+                    let node = BptreeNode::Leaf(page);
+                    let min = node_min_key(&node).to_vec();
+                    result.push((min, put_bptree_node(store, &node).await?));
                 }
+                Ok(result)
             }
-            HamtNode::Branch {
-                mut bitmap,
-                mut children,
-            } => {
-                if depth >= HAMT_MAX_DEPTH {
-                    return Err("HAMT branch exceeds hash depth".to_owned());
+            BptreeNode::Branch { fences, children } => {
+                let mut grouped = BTreeMap::<usize, Vec<BptreeEntry>>::new();
+                for entry in entries {
+                    let index = branch_child_index(&fences, &entry.encoded_key);
+                    if entry.encoded_key.as_slice() < fences[index].as_slice() {
+                        return Err("B+ tree update escaped selected fence".to_owned());
+                    }
+                    grouped.entry(index).or_default().push(entry);
                 }
-                let slot = hamt_slot(&hamt_hash(&entry.encoded_key), depth);
-                let mask = 1u16 << slot;
-                let rank = (bitmap & (mask - 1)).count_ones() as usize;
-                if bitmap & mask == 0 {
-                    let child = put_hamt_node(store, &HamtNode::Leaf(vec![entry])).await?;
-                    bitmap |= mask;
-                    children.insert(rank, child);
-                } else {
-                    children[rank] = hamt_insert(store, children[rank], entry, depth + 1).await?;
+                let mut replacement = Vec::new();
+                for index in 0..children.len() {
+                    if let Some(entries) = grouped.remove(&index) {
+                        replacement.extend(
+                            bptree_update_nodes(
+                                store,
+                                children[index],
+                                Some(fences[index].clone()),
+                                entries,
+                            )
+                            .await?,
+                        );
+                    } else {
+                        replacement.push((fences[index].clone(), children[index]));
+                    }
                 }
-                put_hamt_node(store, &HamtNode::Branch { bitmap, children }).await
+                let mut result = Vec::new();
+                for group in partition_children(&replacement) {
+                    if group.len() == 1 {
+                        result.push(group[0].clone());
+                        continue;
+                    }
+                    let node = BptreeNode::Branch {
+                        fences: group.iter().map(|(key, _)| key.clone()).collect(),
+                        children: group.iter().map(|(_, id)| *id).collect(),
+                    };
+                    let min = node_min_key(&node).to_vec();
+                    result.push((min, put_bptree_node(store, &node).await?));
+                }
+                Ok(result)
             }
         }
     })
 }
 
-async fn hamt_point<R: StorageRead>(
+async fn bptree_point<R: StorageRead>(
     store: &mut Reader<'_, R>,
     mut node_id: ObjectId,
     encoded_key: &[u8],
 ) -> Result<Option<Vec<u8>>, String> {
-    let hash = hamt_hash(encoded_key);
-    for depth in 0..=HAMT_MAX_DEPTH {
-        match load_hamt_node(store, node_id).await? {
-            HamtNode::Leaf(entries) => {
+    let mut expected_min: Option<Vec<u8>> = None;
+    loop {
+        match load_bptree_node(store, node_id, expected_min.as_deref()).await? {
+            BptreeNode::Leaf(entries) => {
                 return Ok(entries
                     .binary_search_by(|entry| entry.encoded_key.as_slice().cmp(encoded_key))
                     .ok()
                     .map(|index| entries[index].value.clone()));
             }
-            HamtNode::Branch { bitmap, children } => {
-                if depth >= HAMT_MAX_DEPTH {
-                    return Err("HAMT branch exceeds hash depth".to_owned());
-                }
-                let slot = hamt_slot(&hash, depth);
-                let mask = 1u16 << slot;
-                if bitmap & mask == 0 {
-                    return Ok(None);
-                }
-                let rank = (bitmap & (mask - 1)).count_ones() as usize;
-                node_id = children[rank];
+            BptreeNode::Branch { fences, children } => {
+                let index = branch_child_index(&fences, encoded_key);
+                expected_min = Some(fences[index].clone());
+                node_id = children[index];
             }
         }
     }
-    Err("HAMT point exceeded hash depth".to_owned())
 }
 
-async fn hamt_enumerate<R: StorageRead>(
+fn bptree_collect_range<'a, R: StorageRead + 'a>(
+    store: &'a mut Reader<'_, R>,
+    node_id: ObjectId,
+    expected_min: Option<Vec<u8>>,
+    start: &'a [u8],
+    end: &'a [u8],
+    rows: &'a mut BTreeMap<u64, Vec<u8>>,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
+    Box::pin(async move {
+        match load_bptree_node(store, node_id, expected_min.as_deref()).await? {
+            BptreeNode::Leaf(entries) => {
+                for entry in entries {
+                    if entry.encoded_key.as_slice() >= start && entry.encoded_key.as_slice() < end {
+                        if rows.insert(entry.ordinal, entry.value).is_some() {
+                            return Err("duplicate B+ tree row during range".to_owned());
+                        }
+                    }
+                }
+            }
+            BptreeNode::Branch { fences, children } => {
+                for index in 0..children.len() {
+                    let lower = fences[index].as_slice();
+                    let upper = fences.get(index + 1).map(Vec::as_slice);
+                    if upper.is_some_and(|upper| upper <= start) || lower >= end {
+                        continue;
+                    }
+                    bptree_collect_range(
+                        store,
+                        children[index],
+                        Some(fences[index].clone()),
+                        start,
+                        end,
+                        rows,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+async fn bptree_range<R: StorageRead>(
+    store: &mut Reader<'_, R>,
+    node_id: ObjectId,
+    start: &[u8],
+    end: &[u8],
+) -> Result<BTreeMap<u64, Vec<u8>>, String> {
+    let mut rows = BTreeMap::new();
+    bptree_collect_range(store, node_id, None, start, end, &mut rows).await?;
+    Ok(rows)
+}
+
+async fn bptree_enumerate<R: StorageRead>(
     store: &mut Reader<'_, R>,
     node_id: ObjectId,
 ) -> Result<BTreeMap<u64, Vec<u8>>, String> {
     let mut rows = BTreeMap::new();
-    let mut stack = vec![node_id];
-    while let Some(id) = stack.pop() {
-        match load_hamt_node(store, id).await? {
-            HamtNode::Leaf(entries) => {
+    let mut stack = vec![(node_id, None)];
+    while let Some((id, expected_min)) = stack.pop() {
+        match load_bptree_node(store, id, expected_min.as_deref()).await? {
+            BptreeNode::Leaf(entries) => {
                 for entry in entries {
                     if rows.insert(entry.ordinal, entry.value).is_some() {
-                        return Err("duplicate HAMT row during enumeration".to_owned());
+                        return Err("duplicate B+ tree row during enumeration".to_owned());
                     }
                 }
             }
-            HamtNode::Branch { children, .. } => {
-                stack.extend(children.into_iter().rev());
+            BptreeNode::Branch { fences, children } => {
+                stack.extend(
+                    children
+                        .into_iter()
+                        .zip(fences)
+                        .rev()
+                        .map(|(id, fence)| (id, Some(fence))),
+                );
             }
         }
     }
     Ok(rows)
 }
 
-async fn hamt_diff<R: StorageRead>(
+async fn bptree_diff<R: StorageRead>(
     store: &mut Reader<'_, R>,
     before: ObjectId,
     after: ObjectId,
 ) -> Result<BTreeSet<u64>, String> {
     let mut changed = BTreeSet::new();
-    let mut stack = vec![(before, after)];
-    while let Some((before, after)) = stack.pop() {
+    let mut stack = vec![(before, after, None::<Vec<u8>>)];
+    while let Some((before, after, expected_min)) = stack.pop() {
         if before == after {
             store.counters.hash_pruned += 1;
             continue;
         }
-        let before_node = load_hamt_node(store, before).await?;
-        let after_node = load_hamt_node(store, after).await?;
+        let before_node = load_bptree_node(store, before, expected_min.as_deref()).await?;
+        let after_node = load_bptree_node(store, after, expected_min.as_deref()).await?;
         match (before_node, after_node) {
             (
-                HamtNode::Branch {
-                    bitmap: before_bitmap,
+                BptreeNode::Branch {
+                    fences: before_fences,
                     children: before_children,
                 },
-                HamtNode::Branch {
-                    bitmap: after_bitmap,
+                BptreeNode::Branch {
+                    fences: after_fences,
                     children: after_children,
                 },
-            ) if before_bitmap == after_bitmap => {
-                stack.extend(before_children.into_iter().zip(after_children));
+            ) if before_fences == after_fences => {
+                stack.extend(
+                    before_children
+                        .into_iter()
+                        .zip(after_children)
+                        .zip(before_fences)
+                        .map(|((before, after), fence)| (before, after, Some(fence))),
+                );
             }
-            (HamtNode::Leaf(before_entries), HamtNode::Leaf(after_entries)) => {
+            (BptreeNode::Leaf(before_entries), BptreeNode::Leaf(after_entries)) => {
                 let before_rows = before_entries
                     .into_iter()
                     .map(|entry| (entry.ordinal, entry.value))
@@ -1774,9 +2045,11 @@ async fn hamt_diff<R: StorageRead>(
                         .filter(|key| before_rows.get(key) != after_rows.get(key)),
                 );
             }
-            (before_node, after_node) => {
-                let before_rows = enumerate_loaded_hamt(store, before_node).await?;
-                let after_rows = enumerate_loaded_hamt(store, after_node).await?;
+            _ => {
+                // Deterministic split/merge can change local geometry. Only
+                // the unequal authenticated subtree is enumerated.
+                let before_rows = bptree_enumerate(store, before).await?;
+                let after_rows = bptree_enumerate(store, after).await?;
                 changed.extend(
                     before_rows
                         .keys()
@@ -1788,33 +2061,6 @@ async fn hamt_diff<R: StorageRead>(
         }
     }
     Ok(changed)
-}
-
-async fn enumerate_loaded_hamt<R: StorageRead>(
-    store: &mut Reader<'_, R>,
-    node: HamtNode,
-) -> Result<BTreeMap<u64, Vec<u8>>, String> {
-    let mut rows = BTreeMap::new();
-    let mut loaded = vec![node];
-    let mut ids = Vec::new();
-    while let Some(node) = loaded.pop() {
-        match node {
-            HamtNode::Leaf(entries) => {
-                for entry in entries {
-                    if rows.insert(entry.ordinal, entry.value).is_some() {
-                        return Err("duplicate HAMT row during diff".to_owned());
-                    }
-                }
-            }
-            HamtNode::Branch { children, .. } => {
-                ids.extend(children);
-            }
-        }
-        while let Some(id) = ids.pop() {
-            loaded.push(load_hamt_node(store, id).await?);
-        }
-    }
-    Ok(rows)
 }
 
 fn tuple(key: u64, generation: u64) -> Vec<u8> {
@@ -1854,11 +2100,8 @@ fn mutation_keys(n: usize, d: usize, generation: u64) -> Vec<u64> {
             keys.into_iter().collect()
         }
         "prefix" => {
-            let wanted = generation as usize % HAMT_FANOUT;
-            (0..n as u64)
-                .filter(|ordinal| hamt_slot(&hamt_hash(&state_key(*ordinal)), 0) == wanted)
-                .take(d)
-                .collect()
+            let start = (generation as usize * d.max(1)) % n;
+            (0..d).map(|offset| ((start + offset) % n) as u64).collect()
         }
         _ => {
             let stride = (n / d.max(1)).max(1);
@@ -1869,46 +2112,53 @@ fn mutation_keys(n: usize, d: usize, generation: u64) -> Vec<u64> {
     }
 }
 
-fn hamt_codec_controls() {
-    let entries = (0..100u64)
-        .map(|ordinal| HamtEntry {
+fn bptree_codec_controls() {
+    let entries = (0..1_000u64)
+        .map(|ordinal| BptreeEntry {
             encoded_key: state_key(ordinal),
             ordinal,
             value: tuple(ordinal, 0),
         })
         .collect::<Vec<_>>();
     let mut forward = Vec::new();
-    let forward_root = build_hamt_subtree(&entries, 0, &mut forward).unwrap();
+    let forward_root = build_bptree(&entries, &mut forward).unwrap();
     let mut reversed_entries = entries.clone();
     reversed_entries.reverse();
     let mut reverse = Vec::new();
-    let reverse_root = build_hamt_subtree(&reversed_entries, 0, &mut reverse).unwrap();
+    let reverse_root = build_bptree(&reversed_entries, &mut reverse).unwrap();
     assert_eq!(forward_root, reverse_root);
 
-    let mut malformed_bitmap = b"HMB1".to_vec();
-    malformed_bitmap.extend_from_slice(&1u16.to_be_bytes());
-    malformed_bitmap.push(0);
-    assert!(decode_hamt_node(&malformed_bitmap).is_err());
+    let duplicate_fences = BptreeNode::Branch {
+        fences: vec![state_key(0), state_key(0)],
+        children: vec![ObjectId([1; 32]), ObjectId([2; 32])],
+    };
+    assert!(decode_bptree_node(&encode_bptree_node(&duplicate_fences)).is_err());
 
-    let oversized = HamtNode::Leaf(
-        (0..=HAMT_LEAF_MAX as u64)
-            .map(|ordinal| HamtEntry {
-                encoded_key: state_key(ordinal),
-                ordinal,
-                value: tuple(ordinal, 0),
-            })
-            .collect(),
-    );
-    assert!(decode_hamt_node(&encode_hamt_node(&oversized)).is_err());
-
-    let leaf = HamtNode::Leaf(vec![entries[0].clone()]);
-    let mut truncated = encode_hamt_node(&leaf);
+    let leaf = BptreeNode::Leaf(vec![entries[0].clone()]);
+    let mut truncated = encode_bptree_node(&leaf);
     truncated.pop();
-    assert!(decode_hamt_node(&truncated).is_err());
+    assert!(decode_bptree_node(&truncated).is_err());
+
+    // Canonical deterministic split/merge/delete: rebuilding after deleting
+    // an adversarial boundary key is independent of insertion order, and
+    // reinsertion restores the original authenticated root.
+    let mut deleted = entries.clone();
+    let removed = deleted.remove(deleted.len() / 2);
+    let mut deleted_forward = Vec::new();
+    let deleted_root = build_bptree(&deleted, &mut deleted_forward).unwrap();
+    deleted.reverse();
+    let mut deleted_reverse = Vec::new();
+    assert_eq!(
+        deleted_root,
+        build_bptree(&deleted, &mut deleted_reverse).unwrap()
+    );
+    deleted.push(removed);
+    let mut restored = Vec::new();
+    assert_eq!(forward_root, build_bptree(&deleted, &mut restored).unwrap());
 }
 
 fn mutation_pattern() -> String {
-    std::env::var("EXP_HAMT_PATTERN").unwrap_or_else(|_| "uniform".to_owned())
+    std::env::var("EXP_BPTREE_PATTERN").unwrap_or_else(|_| "uniform".to_owned())
 }
 
 fn map_digest(rows: &BTreeMap<u64, Vec<u8>>) -> ObjectId {

@@ -2,7 +2,12 @@
 
 ## Verdict
 
-**QUALIFIED NO-WIN. Global radical-layout no-win streak: 5/20.**
+**QUALIFIED NO-WIN. Corrected global radical-layout no-win streak: 6/20.**
+
+The original immutable HAMT ref reported the then-local 5/20 ledger. The
+global coordinator subsequently established that independently completed
+EXP-JSONB-01 precedes HAMT, making HAMT the sixth consecutive no-win. This
+correction does not mutate the frozen HAMT ref.
 
 The authenticated HAMT materially improves exact point lookup and sometimes
 sparse RocksDB updates, but it fails the OLTP-first gate. Without a second
