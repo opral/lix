@@ -3,6 +3,11 @@
 
 use async_trait::async_trait;
 use lix::storage::Storage;
+use lix::storage::{
+    BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
+    PutBatch, ReadOptions, ScanChunk, ScanCursor, StorageError, StorageRead, StorageScanSource,
+    StorageSpace, StorageWrite, WriteOptions,
+};
 use lix::{CreateBranchOptions, Lix, SwitchBranchOptions, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
@@ -13,6 +18,7 @@ use std::future::Future;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const PATH: &str = "/company/competitors.md";
@@ -54,6 +60,194 @@ static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
+
+#[derive(Clone, Copy, Default)]
+struct IoStats {
+    get_many_calls: u64,
+    get_many_keys: u64,
+    scan_calls: u64,
+    scan_rows: u64,
+    scan_value_bytes: u64,
+    write_batches: u64,
+    puts: u64,
+    deletes: u64,
+    write_bytes: u64,
+}
+
+impl IoStats {
+    fn delta(self, before: Self) -> Self {
+        Self {
+            get_many_calls: self.get_many_calls.saturating_sub(before.get_many_calls),
+            get_many_keys: self.get_many_keys.saturating_sub(before.get_many_keys),
+            scan_calls: self.scan_calls.saturating_sub(before.scan_calls),
+            scan_rows: self.scan_rows.saturating_sub(before.scan_rows),
+            scan_value_bytes: self
+                .scan_value_bytes
+                .saturating_sub(before.scan_value_bytes),
+            write_batches: self.write_batches.saturating_sub(before.write_batches),
+            puts: self.puts.saturating_sub(before.puts),
+            deletes: self.deletes.saturating_sub(before.deletes),
+            write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CountingStorage<S> {
+    inner: S,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+struct CountingRead<R> {
+    inner: R,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+struct CountingWrite<W> {
+    inner: W,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+impl<S> CountingStorage<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            stats: Arc::new(Mutex::new(IoStats::default())),
+        }
+    }
+
+    fn snapshot(&self) -> IoStats {
+        *self.stats.lock().expect("I/O stats mutex")
+    }
+}
+
+impl<S: Storage> Storage for CountingStorage<S> {
+    type Read<'a>
+        = CountingRead<S::Read<'a>>
+    where
+        Self: 'a;
+    type Write<'a>
+        = CountingWrite<S::Write<'a>>
+    where
+        Self: 'a;
+
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+        Ok(CountingRead {
+            inner: self.inner.begin_read(opts).await?,
+            stats: Arc::clone(&self.stats),
+        })
+    }
+
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+        Ok(CountingWrite {
+            inner: self.inner.begin_write(opts).await?,
+            stats: Arc::clone(&self.stats),
+        })
+    }
+}
+
+impl<R: StorageRead> StorageRead for CountingRead<R> {
+    async fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> Result<GetManyResult, StorageError> {
+        {
+            let mut stats = self.stats.lock().expect("I/O stats mutex");
+            stats.get_many_calls += 1;
+            stats.get_many_keys += requests
+                .iter()
+                .map(|request| request.keys.len() as u64)
+                .sum::<u64>();
+        }
+        self.inner.get_many(requests).await
+    }
+
+    async fn begin_scan(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        let order = opts.order;
+        self.stats.lock().expect("I/O stats mutex").scan_calls += 1;
+        let inner = self.inner.begin_scan(space, range.clone(), opts).await?;
+        ScanCursor::from_source(
+            range,
+            order,
+            CountingScanSource {
+                inner,
+                stats: Arc::clone(&self.stats),
+            },
+        )
+    }
+}
+
+struct CountingScanSource<'a> {
+    inner: ScanCursor<'a>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+impl StorageScanSource for CountingScanSource<'_> {
+    fn next_page(
+        &mut self,
+        limit_rows: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let (chunk, has_more) = self.inner.next_page(limit_rows).await?.into_parts();
+            let mut stats = self.stats.lock().expect("I/O stats mutex");
+            stats.scan_rows += chunk.len() as u64;
+            stats.scan_value_bytes += chunk
+                .iter()
+                .map(|entry| match &entry.value {
+                    ProjectedValue::KeyOnly => 0,
+                    ProjectedValue::FullValue(value) => value.len() as u64,
+                })
+                .sum::<u64>();
+            drop(stats);
+            Ok(ScanChunk::new(chunk, has_more))
+        })
+    }
+}
+
+impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
+    async fn put_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        {
+            let mut stats = self.stats.lock().expect("I/O stats mutex");
+            stats.write_batches += 1;
+            stats.puts += entries.entries.len() as u64;
+            stats.write_bytes += entries
+                .entries
+                .iter()
+                .map(|entry| (entry.key.0.len() + entry.value.bytes.len()) as u64)
+                .sum::<u64>();
+        }
+        self.inner.put_many(space, entries).await
+    }
+
+    async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
+        self.stats.lock().expect("I/O stats mutex").deletes += keys.len() as u64;
+        self.inner.delete_many(space, keys).await
+    }
+
+    async fn delete_range(
+        &mut self,
+        space: StorageSpace,
+        range: KeyRange,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_range(space, range).await
+    }
+
+    async fn commit(self) -> Result<CommitResult, StorageError> {
+        self.inner.commit().await
+    }
+    async fn rollback(self) -> Result<(), StorageError> {
+        self.inner.rollback().await
+    }
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -160,18 +354,26 @@ fn process_counters() -> ProcessCounters {
     }
 }
 
-async fn measure<T, F>(backend: &str, operation: &str, units: u64, future: F) -> T
+async fn measure<T, F, S>(
+    backend: &str,
+    operation: &str,
+    units: u64,
+    storage: &CountingStorage<S>,
+    future: F,
+) -> T
 where
     F: Future<Output = T>,
 {
     ALLOC_BYTES.store(0, Ordering::Relaxed);
     let before = process_counters();
+    let io_before = storage.snapshot();
     let started = Instant::now();
     ALLOC_ON.store(true, Ordering::Relaxed);
     let output = future.await;
     ALLOC_ON.store(false, Ordering::Relaxed);
     let elapsed = started.elapsed();
     let after = process_counters();
+    let io = storage.snapshot().delta(io_before);
     println!(
         "{}",
         json!({
@@ -187,6 +389,15 @@ where
             "rss_hwm_kib": after.rss_hwm_kib,
             "read_bytes": after.read_bytes.saturating_sub(before.read_bytes),
             "write_bytes": after.write_bytes.saturating_sub(before.write_bytes),
+            "storage_get_many_calls": io.get_many_calls,
+            "storage_get_many_keys": io.get_many_keys,
+            "storage_scan_calls": io.scan_calls,
+            "storage_scan_rows": io.scan_rows,
+            "storage_scan_value_bytes": io.scan_value_bytes,
+            "storage_write_batches": io.write_batches,
+            "storage_puts": io.puts,
+            "storage_deletes": io.deletes,
+            "storage_write_bytes": io.write_bytes,
         })
     );
     output
@@ -387,13 +598,13 @@ where
 {
     let expected = fixture();
     let expected_digest = digest(&expected);
-    let storage = S::open(&root.join(".lix"));
+    let storage = CountingStorage::new(S::open(&root.join(".lix")));
     let lix = setup_adapter::open(storage.clone()).await;
 
     // Fixture/plugin setup is intentionally outside timed regions.
     install_plugin(&lix, plugin_archive()).await;
 
-    measure(backend, "parse_to_native_rows_insert", 1, async {
+    measure(backend, "parse_to_native_rows_insert", 1, &storage, async {
         write_file(&lix, PATH, expected.clone()).await
     })
     .await;
@@ -434,7 +645,7 @@ where
     paragraph_candidates.sort_unstable();
     let paragraph_id = paragraph_candidates[0].1.clone();
 
-    let exact_digest = measure(backend, "exact_row_query", 1, async {
+    let exact_digest = measure(backend, "exact_row_query", 1, &storage, async {
         let result = lix
             .execute(
                 "SELECT id, kind, payload_json FROM markdown_node \
@@ -459,34 +670,35 @@ where
     })
     .await;
 
-    let (range_count, range_digest) = measure(backend, "bounded_row_range_query", 1, async {
-        let result = lix
-            .execute(
-                "SELECT id, kind, payload_json FROM markdown_node \
+    let (range_count, range_digest) =
+        measure(backend, "bounded_row_range_query", 1, &storage, async {
+            let result = lix
+                .execute(
+                    "SELECT id, kind, payload_json FROM markdown_node \
                  WHERE lixcol_file_id = $1 AND kind >= 'heading' AND kind <= 'paragraph' \
                  ORDER BY kind, id LIMIT 8",
-                &[Value::Text(file_id.clone())],
-            )
-            .await
-            .expect("bounded row range query");
-        let mut canonical = String::new();
-        for row in result.rows() {
-            canonical.push_str(&row.get::<String>("kind").expect("range kind"));
-            canonical.push('\0');
-            canonical.push_str(&canonical_json_text(
-                &row.get::<String>("payload_json").expect("range payload"),
-            ));
-            canonical.push('\n');
-        }
-        let count = result.rows().len();
-        let mut rows = canonical.lines().collect::<Vec<_>>();
-        rows.sort_unstable();
-        (count, digest(rows.join("\n").as_bytes()))
-    })
-    .await;
+                    &[Value::Text(file_id.clone())],
+                )
+                .await
+                .expect("bounded row range query");
+            let mut canonical = String::new();
+            for row in result.rows() {
+                canonical.push_str(&row.get::<String>("kind").expect("range kind"));
+                canonical.push('\0');
+                canonical.push_str(&canonical_json_text(
+                    &row.get::<String>("payload_json").expect("range payload"),
+                ));
+                canonical.push('\n');
+            }
+            let count = result.rows().len();
+            let mut rows = canonical.lines().collect::<Vec<_>>();
+            rows.sort_unstable();
+            (count, digest(rows.join("\n").as_bytes()))
+        })
+        .await;
     assert!(range_count > 0 && range_count <= 8);
 
-    let (full_count, full_digest) = measure(backend, "full_typed_row_read", 1, async {
+    let (full_count, full_digest) = measure(backend, "full_typed_row_read", 1, &storage, async {
         let result = lix
             .execute(
                 "SELECT id, kind, payload_json FROM markdown_node \
@@ -523,7 +735,7 @@ where
         "inline": [{"type": "text", "value": "Peer 12 was edited after durable restore."}]
     })
     .to_string();
-    measure(backend, "semantic_row_update", 1, async {
+    measure(backend, "semantic_row_update", 1, &storage, async {
         lix.execute(
             "UPDATE markdown_node SET payload_json = $1 \
              WHERE id = $2 AND lixcol_file_id = $3",
@@ -551,7 +763,7 @@ where
         .rows()[0]
         .get::<String>("id")
         .expect("after commit id");
-    let (diff_count, diff_digest) = measure(backend, "historical_diff", 1, async {
+    let (diff_count, diff_digest) = measure(backend, "historical_diff", 1, &storage, async {
         let result = lix
             .execute(
                 "SELECT schema_key, row_pk, diff_type FROM lix_diff($1, $2) \
@@ -582,35 +794,36 @@ where
     .await;
     assert!(diff_count > 0);
 
-    let (history_count, history_digest) = measure(backend, "history_depth_one", 1, async {
-        let result = lix
-            .execute(
-                "SELECT id, kind, payload_json FROM markdown_node_history() \
+    let (history_count, history_digest) =
+        measure(backend, "history_depth_one", 1, &storage, async {
+            let result = lix
+                .execute(
+                    "SELECT id, kind, payload_json FROM markdown_node_history() \
              WHERE lixcol_file_id = $1 AND lixcol_depth = 1 ORDER BY kind, id",
-                &[Value::Text(file_id.clone())],
-            )
-            .await
-            .expect("history query");
-        let mut rows = result
-            .rows()
-            .iter()
-            .map(|row| {
-                format!(
-                    "{}\0{}",
-                    row.get::<String>("kind").expect("history kind"),
-                    canonical_json_text(
-                        &row.get::<String>("payload_json").expect("history payload")
-                    )
+                    &[Value::Text(file_id.clone())],
                 )
-            })
-            .collect::<Vec<_>>();
-        rows.sort_unstable();
-        (rows.len(), digest(rows.join("\n").as_bytes()))
-    })
-    .await;
+                .await
+                .expect("history query");
+            let mut rows = result
+                .rows()
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{}\0{}",
+                        row.get::<String>("kind").expect("history kind"),
+                        canonical_json_text(
+                            &row.get::<String>("payload_json").expect("history payload")
+                        )
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (rows.len(), digest(rows.join("\n").as_bytes()))
+        })
+        .await;
     assert!(history_count > 0);
 
-    measure(backend, "transaction_insert_17_files", 17, async {
+    measure(backend, "transaction_insert_17_files", 17, &storage, async {
         let mut transaction = lix.begin_transaction().await.expect("begin transaction");
         for index in 0..17 {
             let path = format!("/batch/peer-{index}.md");
@@ -649,22 +862,28 @@ where
     let batch_digest = digest(&batch_canonical);
 
     let main_branch_id = lix.active_branch_id().await.expect("main branch");
-    let branch_read = measure(backend, "branch_create_switch_shared_read", 1, async {
-        let branch = lix
-            .create_branch(CreateBranchOptions {
-                id: Some(BRANCH_ID.to_owned()),
-                name: "Markdown qualification branch".to_owned(),
-                from_commit_id: None,
+    let branch_read = measure(
+        backend,
+        "branch_create_switch_shared_read",
+        1,
+        &storage,
+        async {
+            let branch = lix
+                .create_branch(CreateBranchOptions {
+                    id: Some(BRANCH_ID.to_owned()),
+                    name: "Markdown qualification branch".to_owned(),
+                    from_commit_id: None,
+                })
+                .await
+                .expect("create branch");
+            lix.switch_branch(SwitchBranchOptions {
+                branch_id: branch.id,
             })
             .await
-            .expect("create branch");
-        lix.switch_branch(SwitchBranchOptions {
-            branch_id: branch.id,
-        })
-        .await
-        .expect("switch branch");
-        read_file(&lix, PATH).await
-    })
+            .expect("switch branch");
+            read_file(&lix, PATH).await
+        },
+    )
     .await;
     assert_eq!(digest(&branch_read), digest(&rendered));
     lix.switch_branch(SwitchBranchOptions {
@@ -675,24 +894,25 @@ where
 
     lix.close().await.expect("close repository");
     drop(lix);
-    storage.flush_for_reopen().await;
-    let (cold, reopened_rows) = measure(backend, "cold_reopen_exact_file_read", 1, async {
-        let reopened = setup_adapter::open(S::open(&root.join(".lix"))).await;
-        let cold = read_file(&reopened, PATH).await;
-        let reopened_rows = reopened
-            .execute(
-                "SELECT COUNT(*) AS count FROM markdown_node WHERE lixcol_file_id = $1",
-                &[Value::Text(file_id.clone())],
-            )
-            .await
-            .expect("reopened row count")
-            .rows()[0]
-            .get::<i64>("count")
-            .expect("row count");
-        reopened.close().await.expect("close reopened repository");
-        (cold, reopened_rows)
-    })
-    .await;
+    storage.inner.flush_for_reopen().await;
+    let (cold, reopened_rows) =
+        measure(backend, "cold_reopen_exact_file_read", 1, &storage, async {
+            let reopened = setup_adapter::open(S::open(&root.join(".lix"))).await;
+            let cold = read_file(&reopened, PATH).await;
+            let reopened_rows = reopened
+                .execute(
+                    "SELECT COUNT(*) AS count FROM markdown_node WHERE lixcol_file_id = $1",
+                    &[Value::Text(file_id.clone())],
+                )
+                .await
+                .expect("reopened row count")
+                .rows()[0]
+                .get::<i64>("count")
+                .expect("row count");
+            reopened.close().await.expect("close reopened repository");
+            (cold, reopened_rows)
+        })
+        .await;
     assert_eq!(digest(&cold), digest(&rendered));
     assert!(reopened_rows > 0);
 
