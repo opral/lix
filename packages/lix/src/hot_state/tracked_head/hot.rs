@@ -5880,6 +5880,7 @@ where
         Option<(
             crate::columnar_row_group::RowGroupSetId,
             crate::columnar_row_group::RowGroupManifest,
+            Option<RowPk>,
             Vec<RowColumnarOverlayRow>,
             u64,
         )>,
@@ -5902,6 +5903,66 @@ where
                 "row columnar sidecar disagrees with its collection publication",
             ));
         }
+        let singleton_row_pk = if crate::sql2::identify_authoritative_singleton_layout(
+            &manifest.schema(),
+        )?
+        .is_some()
+        {
+            let state = crate::tracked_state::load_commit_state_manifest(
+                &self.store,
+                base_commit_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                head_value_error(
+                    "authoritative singleton row group is missing its owning commit manifest",
+                )
+            })?;
+            let parts = state.mutations.columnar_parts.as_ref().ok_or_else(|| {
+                head_value_error(
+                    "authoritative singleton row group is missing its commit inventory",
+                )
+            })?;
+            let manifest_digest = manifest.content_digest()?;
+            if !parts.key_bound_singleton
+                || parts.owner_commit_id != *base_commit_id.as_uuid().as_bytes()
+                || parts.row_group_set_id != *id.as_bytes()
+                || parts.manifest_digest != manifest_digest
+                || parts.schema_key != schema_key
+                || parts.layout_fingerprint
+                    != crate::sql2::identify_authoritative_singleton_layout(&manifest.schema())?
+                        .expect("singleton metadata was identified above")
+                        .schema_fingerprint
+                || parts.row_count != 1
+                || parts.first_key != parts.last_key
+            {
+                return Err(head_value_error(
+                    "authoritative singleton row group disagrees with its commit inventory",
+                ));
+            }
+            let mut offset = 0usize;
+            let (key_schema, schema_terminator) =
+                read_key_string(&parts.first_key, &mut offset, "schema key")?;
+            if schema_terminator != KEY_PART_FINAL || key_schema != schema_key {
+                return Err(head_value_error(
+                    "authoritative singleton key belongs to a different schema",
+                ));
+            }
+            if read_file_id(&parts.first_key, &mut offset)?.is_some() {
+                return Err(head_value_error(
+                    "authoritative singleton key unexpectedly has a file owner",
+                ));
+            }
+            let row_pk = read_row_pk(&parts.first_key, &mut offset)?;
+            if offset != parts.first_key.len() {
+                return Err(head_value_error(
+                    "authoritative singleton key has trailing bytes",
+                ));
+            }
+            Some(row_pk)
+        } else {
+            None
+        };
 
         // Read at most one bounded HOT generation. This is deliberately
         // independent of the SQL predicate: an update or tombstone that no
@@ -5972,7 +6033,13 @@ where
                 columnar_base_coordinate: row.columnar_base_coordinate(),
             });
         }
-        Ok(Some((id, manifest, overlay, live_count)))
+        Ok(Some((
+            id,
+            manifest,
+            singleton_row_pk,
+            overlay,
+            live_count,
+        )))
     }
 
     async fn row_columnar_base(

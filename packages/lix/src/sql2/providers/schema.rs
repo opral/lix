@@ -689,8 +689,11 @@ impl TableSpec for SchemaSpec {
                 .plan_row_columnar_scan(columnar_request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?
-            && let Some(projection) =
-                row_columnar_projection(&layout.manifest, &schema, &self.spec)
+            && let Some(projection) = row_columnar_projection(
+                &layout.manifest,
+                &schema,
+                &self.spec,
+            )?
         {
             let group_indices = row_columnar_group_indices(&layout.manifest, &row_filters);
             return Ok(PlannedScan {
@@ -887,41 +890,92 @@ fn row_columnar_projection_eligible(schema: &Schema) -> bool {
             .all(|field| !field.name().starts_with("lixcol_"))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RowColumnarOutputColumn {
+    Physical(usize),
+    PrimaryKey(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RowColumnarProjection {
+    /// Manifest column indices loaded from the authenticated row group.
+    physical: Vec<usize>,
+    /// Public output columns in requested order. Physical indices address
+    /// `physical`, not the manifest, so each immutable array is loaded once.
+    output: Vec<RowColumnarOutputColumn>,
+    /// Distinguishes synthetic PK columns in the immutable batch cache key.
+    cache_key: Vec<usize>,
+}
+
 fn row_columnar_projection(
     manifest: &crate::columnar_row_group::RowGroupManifest,
     schema: &Schema,
     spec: &SchemaSurfaceSpec,
-) -> Option<Vec<usize>> {
+) -> Result<Option<RowColumnarProjection>> {
     let expected_fingerprint = spec.columnar_layout_fingerprint();
     if manifest
         .metadata
         .get(crate::sql2::ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
         != Some(&expected_fingerprint)
     {
-        return None;
+        return Ok(None);
     }
-    schema
-        .fields()
-        .iter()
-        .map(|field| {
-            spec.visible_column(field.name())?;
-            manifest.fields.iter().position(|candidate| {
+    let singleton = crate::sql2::identify_authoritative_singleton_layout(&manifest.schema())
+        .map_err(lix_error_to_datafusion_error)?;
+    let primary_key = if singleton.is_some() {
+        spec.top_level_primary_key_columns()
+    } else {
+        None
+    };
+    if singleton.is_some() && primary_key.is_none() {
+        return Ok(None);
+    }
+
+    let mut physical = Vec::new();
+    let mut output = Vec::with_capacity(schema.fields().len());
+    let mut cache_key = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if spec.visible_column(field.name()).is_none() {
+            return Ok(None);
+        }
+        if let Some(manifest_index) = manifest.fields.iter().position(|candidate| {
                 candidate.name == *field.name()
                     && candidate.data_type.to_arrow() == *field.data_type()
             })
-        })
-        .collect()
+        {
+            let loaded_index = physical.len();
+            physical.push(manifest_index);
+            output.push(RowColumnarOutputColumn::Physical(loaded_index));
+            cache_key.push(manifest_index);
+            continue;
+        }
+        let Some(component_index) = primary_key.as_ref().and_then(|columns| {
+            columns
+                .iter()
+                .position(|column| column.name == field.name().as_str())
+        }) else {
+            return Ok(None);
+        };
+        output.push(RowColumnarOutputColumn::PrimaryKey(component_index));
+        cache_key.push(usize::MAX.saturating_sub(component_index));
+    }
+    Ok(Some(RowColumnarProjection {
+        physical,
+        output,
+        cache_key,
+    }))
 }
 
 async fn row_columnar_scan_source(
     reader: Arc<dyn RowSnapshotReader>,
     layout: Arc<crate::sql2::row_batch::RowColumnarScanLayout>,
-    projection: Vec<usize>,
+    projection: RowColumnarProjection,
     group_indices: Vec<usize>,
     schema: SchemaRef,
     spec: Arc<SchemaSurfaceSpec>,
     row_filters: Vec<RowFilter>,
 ) -> Result<super::spec::ScanSource> {
+    let coordinate_shadow_masks = row_columnar_coordinate_shadow_masks(&layout, &spec)?;
     let identity_column = layout
         .manifest
         .fields
@@ -929,13 +983,7 @@ async fn row_columnar_scan_source(
         .position(|field| {
             field.name == crate::sql2::ROW_COLUMNAR_ROW_PK_FIELD
                 && field.data_type.to_arrow() == datafusion::arrow::datatypes::DataType::Utf8
-        })
-        .ok_or_else(|| {
-            DataFusionError::Execution(
-                "row columnar sidecar is missing its hidden row identity".to_owned(),
-            )
-        })?;
-    let coordinate_shadow_masks = row_columnar_coordinate_shadow_masks(&layout, &spec)?;
+        });
     let mut shadow_identities = if coordinate_shadow_masks.is_some() {
         Vec::new()
     } else {
@@ -966,7 +1014,15 @@ async fn row_columnar_scan_source(
             .into_iter()
             .collect::<HashSet<_, ahash::RandomState>>(),
     );
-    let mut overlay_cache_projection = projection.clone();
+    if coordinate_shadow_masks.is_none()
+        && !layout.overlay.is_empty()
+        && identity_column.is_none()
+    {
+        return exec_err!(
+            "key-bound singleton overlay is missing authenticated base coordinates"
+        );
+    }
+    let mut overlay_cache_projection = projection.cache_key.clone();
     overlay_cache_projection.push(usize::MAX);
     let filter_digest = blake3::hash(format!("{row_filters:?}").as_bytes());
     overlay_cache_projection.extend(
@@ -1033,7 +1089,7 @@ async fn row_columnar_scan_source(
         group_indices
             .iter()
             .map(|&group_index| {
-                row_columnar_group_statistics(
+                row_columnar_projected_group_statistics(
                     &layout.manifest.groups[group_index],
                     &projection,
                     schema.as_ref(),
@@ -1048,7 +1104,7 @@ async fn row_columnar_scan_source(
                 .is_some_and(|masks| masks[group_index].is_none())
             {
                 base_statistics_cached.push(true);
-                cached.push(row_columnar_group_statistics(
+                cached.push(row_columnar_projected_group_statistics(
                     &layout.manifest.groups[group_index],
                     &projection,
                     schema.as_ref(),
@@ -1060,7 +1116,7 @@ async fn row_columnar_scan_source(
                     &layout,
                     group_index,
                     shadow_identity_digest,
-                    &projection,
+                    &projection.cache_key,
                 )
                 .await
                 .map_err(lix_error_to_datafusion_error)?
@@ -1127,7 +1183,7 @@ async fn row_columnar_scan_source(
             let reader = Arc::clone(&reader);
             let layout = layout.clone();
             let public_projection = projection.clone();
-            let statistics_projection = projection.clone();
+            let statistics_projection = projection.cache_key.clone();
             let statistics_cached = base_statistics_cached[partition];
             let shadow_identities = Arc::clone(&shadow_identities);
             let coordinate_shadow_masks = coordinate_shadow_masks.clone();
@@ -1146,22 +1202,26 @@ async fn row_columnar_scan_source(
                     &layout,
                     group_index,
                     shadow_identity_digest,
-                    public_projection.clone(),
+                    public_projection.cache_key.clone(),
                     async {
                         let batch = if (shadow_identities.is_empty()
                             && coordinate_shadow_masks.is_none())
                             || coordinates_prove_unshadowed
                         {
-                            Arc::new(
-                                reader
-                                    .load_row_columnar_group(
-                                        layout.clone(),
-                                        group_index,
-                                        public_projection.clone(),
-                                    )
-                                    .await
-                                    .map_err(lix_error_to_datafusion_error)?,
-                            )
+                            let batch = reader
+                                .load_row_columnar_group(
+                                    layout.clone(),
+                                    group_index,
+                                    public_projection.physical.clone(),
+                                )
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?;
+                            Arc::new(row_columnar_public_batch(
+                                batch,
+                                Arc::clone(&schema),
+                                &public_projection,
+                                layout.singleton_row_pk.as_ref(),
+                            )?)
                         } else {
                             let keep = if let Some(keep) = coordinate_keep {
                                 keep
@@ -1170,7 +1230,9 @@ async fn row_columnar_scan_source(
                                     .row_columnar_shadow_mask(
                                         layout.clone(),
                                         group_index,
-                                        identity_column,
+                                        identity_column.expect(
+                                            "non-coordinate shadowing validated an identity column",
+                                        ),
                                         Arc::clone(&shadow_identities),
                                         shadow_identity_digest,
                                     )
@@ -1181,10 +1243,16 @@ async fn row_columnar_scan_source(
                                 .load_row_columnar_group(
                                     layout.clone(),
                                     group_index,
-                                    public_projection.clone(),
+                                    public_projection.physical.clone(),
                                 )
                                 .await
                                 .map_err(lix_error_to_datafusion_error)?;
+                            let batch = row_columnar_public_batch(
+                                batch,
+                                Arc::clone(&schema),
+                                &public_projection,
+                                layout.singleton_row_pk.as_ref(),
+                            )?;
                             Arc::new(filter_record_batch(&batch, keep.as_ref())?)
                         };
                         Ok(batch)
@@ -1253,6 +1321,80 @@ async fn cached_or_load_row_columnar_batch(
         )
         .await
         .map_err(lix_error_to_datafusion_error)
+}
+
+fn row_columnar_public_batch(
+    physical: RecordBatch,
+    schema: SchemaRef,
+    projection: &RowColumnarProjection,
+    singleton_row_pk: Option<&RowPk>,
+) -> Result<RecordBatch> {
+    let columns = projection
+        .output
+        .iter()
+        .enumerate()
+        .map(|(output_index, source)| match source {
+            RowColumnarOutputColumn::Physical(physical_index) => physical
+                .columns()
+                .get(*physical_index)
+                .cloned()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "row columnar physical projection is incomplete".to_owned(),
+                    )
+                }),
+            RowColumnarOutputColumn::PrimaryKey(component_index) => {
+                let row_pk = singleton_row_pk.ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "key-bound singleton scan is missing its authenticated primary key"
+                            .to_owned(),
+                    )
+                })?;
+                let component = row_pk.components.as_slice().get(*component_index).ok_or_else(
+                    || {
+                        DataFusionError::Execution(
+                            "key-bound singleton primary-key arity disagrees with its schema"
+                                .to_owned(),
+                        )
+                    },
+                )?;
+                let field = schema.field(output_index);
+                row_columnar_primary_key_array(component, field)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return RecordBatch::try_new_with_options(
+            schema,
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(physical.num_rows())),
+        )
+        .map_err(DataFusionError::from);
+    }
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+fn row_columnar_primary_key_array(
+    component: &crate::row_pk::RowPkComponent,
+    field: &datafusion::arrow::datatypes::Field,
+) -> Result<ArrayRef> {
+    match (component, field.data_type()) {
+        (crate::row_pk::RowPkComponent::Integer(value), datafusion::arrow::datatypes::DataType::Int64) => {
+            Ok(Arc::new(Int64Array::from(vec![Some(*value)])))
+        }
+        (
+            crate::row_pk::RowPkComponent::Uuid(_)
+            | crate::row_pk::RowPkComponent::String(_)
+            | crate::row_pk::RowPkComponent::Bytes(_),
+            datafusion::arrow::datatypes::DataType::Utf8,
+        ) => Ok(Arc::new(StringArray::from(vec![Some(
+            component.external_string(),
+        )]))),
+        _ => Err(DataFusionError::Execution(format!(
+            "key-bound singleton component has the wrong type for column '{}'",
+            field.name()
+        ))),
+    }
 }
 
 fn row_columnar_coordinate_shadow_masks(
@@ -1442,6 +1584,22 @@ fn row_columnar_group_statistics(
     statistics.num_rows = Precision::Exact(group.row_count as usize);
     statistics.column_statistics = column_statistics;
     statistics
+}
+
+fn row_columnar_projected_group_statistics(
+    group: &crate::columnar_row_group::RowGroupStatistics,
+    projection: &RowColumnarProjection,
+    schema: &Schema,
+) -> Statistics {
+    if projection
+        .output
+        .iter()
+        .any(|source| matches!(source, RowColumnarOutputColumn::PrimaryKey(_)))
+    {
+        return Statistics::new_unknown(schema)
+            .with_num_rows(Precision::Exact(group.row_count as usize));
+    }
+    row_columnar_group_statistics(group, &projection.physical, schema)
 }
 
 fn row_columnar_record_batch_statistics(batch: &RecordBatch) -> Result<Statistics> {
@@ -6092,6 +6250,7 @@ mod tests {
             id: crate::hot_state::row_group_set_id(base_commit_id, &spec.schema_key),
             manifest: Arc::new(encoded.manifest.clone()),
             manifest_digest: encoded.manifest.content_digest().expect("manifest digest"),
+            singleton_row_pk: None,
             overlay: Arc::new(vec![
                 crate::hot_state::RowColumnarOverlayRow {
                     row_pk: identities[0].clone(),
@@ -6148,6 +6307,7 @@ mod tests {
                 encoded_digest: [0; 32],
             }),
             manifest_digest: [24; 32],
+            singleton_row_pk: None,
             overlay: Arc::new(Vec::new()),
             branch_id: Arc::from(branch_id),
             head_commit_id: CommitId::for_test_label("cached-batch-test-head"),

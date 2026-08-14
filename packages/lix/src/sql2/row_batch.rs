@@ -29,6 +29,10 @@ pub(crate) struct RowColumnarScanLayout {
     pub(crate) id: crate::columnar_row_group::RowGroupSetId,
     pub(crate) manifest: Arc<crate::columnar_row_group::RowGroupManifest>,
     pub(crate) manifest_digest: [u8; 32],
+    /// PK carried by the authenticated `first_key == last_key` commit
+    /// inventory for key-bound singleton layouts. Bulk layouts retain their
+    /// physical hidden identity column and leave this empty.
+    pub(crate) singleton_row_pk: Option<RowPk>,
     pub(crate) overlay: Arc<Vec<crate::hot_state::RowColumnarOverlayRow>>,
     pub(crate) branch_id: Arc<str>,
     pub(crate) head_commit_id: crate::changelog::CommitId,
@@ -218,6 +222,7 @@ where
                     id,
                     manifest,
                     manifest_digest,
+                    singleton_row_pk,
                     overlay,
                     branch_id,
                     head_commit_id,
@@ -228,6 +233,7 @@ where
                         id,
                         manifest,
                         manifest_digest,
+                        singleton_row_pk,
                         overlay,
                         branch_id: Arc::from(branch_id),
                         head_commit_id,
@@ -459,6 +465,7 @@ mod tests {
                 encoded_digest: [0; 32],
             }),
             manifest_digest: [42; 32],
+            singleton_row_pk: None,
             overlay: Arc::new(Vec::new()),
             branch_id: Arc::from("branch-a"),
             head_commit_id: crate::changelog::CommitId::for_test_label("cache-key-head"),

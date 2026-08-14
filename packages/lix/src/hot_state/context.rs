@@ -148,6 +148,7 @@ struct CachedRowColumnarLayout {
     id: crate::columnar_row_group::RowGroupSetId,
     manifest: std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
     manifest_digest: [u8; 32],
+    singleton_row_pk: Option<crate::row_pk::RowPk>,
     overlay: std::sync::Arc<Vec<crate::hot_state::RowColumnarOverlayRow>>,
     head_commit_id: CommitId,
     live_count: u64,
@@ -183,6 +184,7 @@ impl RowColumnarLayoutCache {
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
+        singleton_row_pk: Option<crate::row_pk::RowPk>,
         overlay: Vec<crate::hot_state::RowColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
@@ -192,6 +194,7 @@ impl RowColumnarLayoutCache {
             id,
             manifest,
             manifest_digest,
+            singleton_row_pk,
             overlay,
             head_commit_id,
             live_count,
@@ -206,6 +209,7 @@ impl RowColumnarLayoutCache {
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
+        singleton_row_pk: Option<crate::row_pk::RowPk>,
         overlay: Vec<crate::hot_state::RowColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
@@ -215,15 +219,21 @@ impl RowColumnarLayoutCache {
         // Capacity accounting covers every owned buffer. A 2x admission
         // margin conservatively absorbs allocator and HashMap control-byte
         // overhead that Rust's collections do not expose.
-        let bytes =
-            estimated_row_columnar_layout_bytes(&key, &manifest, &overlay, overlay.capacity())
-                .saturating_mul(2);
+        let bytes = estimated_row_columnar_layout_bytes(
+            &key,
+            &manifest,
+            &singleton_row_pk,
+            &overlay,
+            overlay.capacity(),
+        )
+        .saturating_mul(2);
         let manifest = std::sync::Arc::new(manifest);
         let entry = std::sync::Arc::new(CachedRowColumnarLayout {
             key,
             id,
             manifest,
             manifest_digest,
+            singleton_row_pk,
             overlay,
             head_commit_id,
             live_count,
@@ -257,6 +267,7 @@ impl RowColumnarLayoutCache {
 fn estimated_row_columnar_layout_bytes(
     key: &RowColumnarLayoutCacheKey,
     manifest: &crate::columnar_row_group::RowGroupManifest,
+    singleton_row_pk: &Option<crate::row_pk::RowPk>,
     overlay: &[crate::hot_state::RowColumnarOverlayRow],
     overlay_capacity: usize,
 ) -> usize {
@@ -266,6 +277,11 @@ fn estimated_row_columnar_layout_bytes(
         .saturating_add(key.branch_id.capacity())
         .saturating_add(key.schema_key.capacity())
         .saturating_add(manifest_bytes)
+        .saturating_add(
+            singleton_row_pk
+                .as_ref()
+                .map_or(0, crate::row_pk::RowPk::estimated_heap_bytes),
+        )
         .saturating_add(
             overlay_capacity
                 .saturating_mul(size_of::<crate::hot_state::RowColumnarOverlayRow>()),
@@ -619,6 +635,7 @@ where
             crate::columnar_row_group::RowGroupSetId,
             std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
             [u8; 32],
+            Option<crate::row_pk::RowPk>,
             std::sync::Arc<Vec<crate::hot_state::RowColumnarOverlayRow>>,
             String,
             CommitId,
@@ -653,6 +670,7 @@ where
                 layout.id,
                 std::sync::Arc::clone(&layout.manifest),
                 layout.manifest_digest,
+                layout.singleton_row_pk.clone(),
                 std::sync::Arc::clone(&layout.overlay),
                 branch_id,
                 layout.head_commit_id,
@@ -665,7 +683,7 @@ where
             .reader(&self.store)
             .row_columnar_layout(&branch_id, control, &schema_key)
             .await?;
-        let Some((id, manifest, overlay, live_count)) = layout else {
+        let Some((id, manifest, singleton_row_pk, overlay, live_count)) = layout else {
             return Ok(None);
         };
         let manifest_digest = manifest.content_digest()?;
@@ -674,6 +692,7 @@ where
             id,
             manifest,
             manifest_digest,
+            singleton_row_pk,
             overlay,
             control.head_commit_id,
             live_count,
@@ -682,6 +701,7 @@ where
             layout.id,
             std::sync::Arc::clone(&layout.manifest),
             layout.manifest_digest,
+            layout.singleton_row_pk.clone(),
             std::sync::Arc::clone(&layout.overlay),
             branch_id,
             layout.head_commit_id,
@@ -708,7 +728,7 @@ where
             .reader(&self.store)
             .row_columnar_layout(branch_id, control, schema_key)
             .await?
-            .map(|(_, _, overlay, _)| overlay.len()))
+            .map(|(_, _, _, overlay, _)| overlay.len()))
     }
 
     async fn direct_row_snapshot_scope(
@@ -1897,6 +1917,7 @@ mod tests {
             crate::columnar_row_group::RowGroupSetId::new([1; 16]),
             empty_columnar_manifest(),
             [2; 32],
+            None,
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head"),
             1_000_000,
@@ -1917,6 +1938,7 @@ mod tests {
             crate::columnar_row_group::RowGroupSetId::new([1; 16]),
             empty_columnar_manifest(),
             [2; 32],
+            None,
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head-7"),
             1_000_000,
@@ -1927,6 +1949,7 @@ mod tests {
             crate::columnar_row_group::RowGroupSetId::new([2; 16]),
             empty_columnar_manifest(),
             [3; 32],
+            None,
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head-8"),
             999_999,
