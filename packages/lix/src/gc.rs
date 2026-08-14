@@ -21,7 +21,6 @@ use crate::changelog::{ChangeRecord, CommitScanRequest};
 use crate::changelog::{ChangeScanRequest, ChangelogContext, ChangelogReader};
 use crate::commit_graph::CommitGraphContext;
 use crate::hot_state::TrackedHeadContext;
-#[cfg(test)]
 use crate::hot_state::stage_collect_stale_working_diff_indexes;
 use crate::json_store::{JsonRef, JsonSlot, JsonStoreContext};
 #[cfg(test)]
@@ -1581,6 +1580,11 @@ where
     if !reclaimed_semantic_commits.is_empty() {
         writes.seal_changelog_gc();
     }
+
+    // Checkpoint publication rotates the authenticated sparse dirty-index
+    // marker in O(1). Retire every now-unreachable epoch here, under the same
+    // observed branch-control preconditions as the rest of repository GC.
+    stage_collect_stale_working_diff_indexes(&store, writes).await?;
 
     preconditions.extend(staged_preconditions);
     Ok(RepositoryGcPlan {

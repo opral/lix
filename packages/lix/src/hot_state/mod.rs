@@ -36,7 +36,6 @@ pub(crate) use tracked_head::TrackedHeadDeltaRef;
 pub(crate) use tracked_head::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
 pub(crate) use tracked_head::hot_generation_scope_prefix;
-#[cfg(test)]
 pub(crate) use tracked_head::stage_collect_stale_working_diff_indexes;
 pub(crate) use tracked_head::stage_retire_hot_generation;
 // Read only by `#[cfg(test)]` probes, so a features-on *library* build compiles
@@ -67,8 +66,7 @@ pub(crate) use tracked_head::{
     ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
     TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, load_certified_rows_at_commit,
     materialize_certified_root_rows, scan_certified_history_rows, stage_certified_row_batches,
-    stage_delete_tracked_working_diff_epoch, stage_hot_index_entries,
-    stage_tracked_working_diff_epoch,
+    stage_hot_index_entries, stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

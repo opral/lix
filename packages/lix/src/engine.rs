@@ -2182,11 +2182,63 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("post-checkpoint inventory read should open");
-        let after = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
+        let before_gc = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
+        assert!(
+            before_gc.len() > 1,
+            "checkpoint rotation must not synchronously scan and delete the superseded sparse epoch"
+        );
+        let logical = session
+            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
+            .await
+            .expect("post-checkpoint logical diff should execute");
         assert_eq!(
-            after.len(),
+            logical.rows()[0]
+                .get::<i64>("entries")
+                .expect("working-diff count should be numeric"),
+            0,
+            "the superseded physical epoch must be unreachable immediately"
+        );
+        assert_eq!(
+            before_gc.len(),
+            3,
+            "the first checkpoint leaves the two superseded branch index records for GC"
+        );
+        drop(read);
+
+        let read = SharedStorageAdapterRead::new(
+            adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("working-diff GC read should open"),
+        );
+        let mut gc_writes = adapter.new_write_set();
+        let mut gc_preconditions = Vec::new();
+        crate::gc::stage_repository_gc_with_preconditions(
+            read,
+            &mut gc_writes,
+            &mut gc_preconditions,
+        )
+            .await
+            .expect("repository GC should collect superseded sparse epochs");
+        adapter
+            .commit_write_set(
+                gc_writes,
+                StorageWriteOptions {
+                    preconditions: gc_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("working-diff GC should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-GC inventory read should open");
+        let after_gc = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
+        assert_eq!(
+            after_gc.len(),
             1,
-            "the superseded branch epoch must be reclaimed; only the repository-global checkpoint row may remain dirty"
+            "GC must reclaim the superseded branch epoch; only the repository-global checkpoint row may remain dirty"
         );
         drop(read);
         session
@@ -2206,7 +2258,7 @@ mod tests {
         let logical = session
             .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
             .await
-            .expect("post-checkpoint logical diff should execute");
+            .expect("second post-checkpoint logical diff should execute");
         assert_eq!(
             logical.rows()[0]
                 .get::<i64>("entries")

@@ -7936,6 +7936,27 @@ where
         Ok(generation)
     }
 
+    /// Whether a checkpoint can rotate its working-diff epoch without
+    /// materializing current-state base rows first.
+    ///
+    /// Immutable packed bases encode interval-relative absent-at-checkpoint
+    /// facts and must take the existing materializing route once. Root bases
+    /// are already the branch's checkpoint state and remain clean under a new
+    /// epoch, so they do not prevent lazy rotation.
+    pub(crate) async fn can_rotate_checkpoint_epoch(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+    ) -> Result<bool, LixError> {
+        if !packed_current_base_refs(self.store, branch_id, generation)
+            .await?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Stages deltas whose absence was already validated against the coherent
     /// transaction snapshot. The caller must publish the corresponding branch
     /// control with a compare-and-swap precondition from that same snapshot.
@@ -8502,7 +8523,7 @@ where
                 // for modified/removed rows.
                 delta.created_at
             } else {
-                existing.created_at
+                effective_hot_created_at(existing, working_diff_capture_checkpoint_commit_id)
             });
         }
         // A checkpoint often selects immutable change records whose HOT row
@@ -9204,6 +9225,7 @@ fn next_cascade_working_diff_baseline(
             let mut before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked cascade member has no version"))?;
+            before.created_at = effective_hot_created_at(previous, Some(active_checkpoint_commit_id));
             before.commit_id = active_checkpoint_commit_id;
             Ok((
                 WorkingDiffBaseline::BeforePresent {
@@ -9283,6 +9305,7 @@ fn next_hot_working_diff_baseline(
             let mut before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked mutation has no working-diff version"))?;
+            before.created_at = effective_hot_created_at(previous, Some(active_checkpoint_commit_id));
             before.commit_id = active_checkpoint_commit_id;
             Ok((
                 WorkingDiffBaseline::BeforePresent {
@@ -13309,7 +13332,6 @@ fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
     key
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 struct HotDiffSegmentScope {
     branch_id: String,
     checkpoint_commit_id: CommitId,
@@ -13425,7 +13447,6 @@ fn visit_hot_diff_segment(
     Ok(())
 }
 
-#[cfg(test)]
 fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -13587,7 +13608,6 @@ where
     Ok(deleted)
 }
 
-#[cfg(test)]
 pub(crate) async fn stage_collect_stale_hot_diff_records<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -13641,51 +13661,6 @@ where
                 writes.delete(DIFF_SPACE, entry.key);
             }
         }
-        if !page_has_more {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Reclaims one superseded working-diff epoch without scanning any other
-/// branch or checkpoint. A checkpoint already performs work linear in its
-/// selected dirty set; this prefix-local scan keeps reclamation on the same
-/// bound while preventing unreachable epochs from accumulating until GC.
-pub(super) async fn stage_delete_hot_diff_scope<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    branch_id: &str,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let range = StoragePrefix {
-        bytes: Bytes::from(encode_working_diff_scope_prefix(
-            branch_id,
-            checkpoint_commit_id,
-            generation,
-        )),
-    }
-    .to_range()?;
-    let mut cursor = store
-        .begin_scan(
-            DIFF_SPACE,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    loop {
-        let (page, page_has_more) = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?
-            .into_parts();
-        writes.delete_batch(DIFF_SPACE, page.into_iter().map(|entry| entry.key));
         if !page_has_more {
             break;
         }
