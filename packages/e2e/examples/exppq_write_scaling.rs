@@ -151,7 +151,7 @@ where
     samples.sort_by(|left, right| left.partial_cmp(right).expect("no NaN timings"));
     phase_ratios.sort_by(|left, right| left.0.partial_cmp(&right.0).expect("no NaN ratios"));
     println!(
-        "op=insert lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1} median_scan_pct={:.3} median_select_pct={:.3} median_json_pct={:.3}",
+        "op=insert lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1} median_scan_pct={:.3} median_select_pct={:.3} median_json_pct={:.3} median_combined_pct={:.3}",
         lane.label(),
         percentile(&samples, 0.50),
         percentile(&samples, 0.95),
@@ -167,6 +167,7 @@ where
         median_ratio(&phase_ratios, 0),
         median_ratio(&phase_ratios, 1),
         median_ratio(&phase_ratios, 2),
+        median_combined_ratio(&phase_ratios),
     );
 
     if lane == Lane::ForeignKey {
@@ -195,7 +196,7 @@ where
         updates.sort_by(|left, right| left.partial_cmp(right).expect("no NaN timings"));
         phase_ratios.sort_by(|left, right| left.0.partial_cmp(&right.0).expect("no NaN ratios"));
         println!(
-            "op=update lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1} median_scan_pct={:.3} median_select_pct={:.3} median_json_pct={:.3}",
+            "op=update lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1} median_scan_pct={:.3} median_select_pct={:.3} median_json_pct={:.3} median_combined_pct={:.3}",
             lane.label(),
             percentile(&updates, 0.50),
             percentile(&updates, 0.95),
@@ -211,6 +212,7 @@ where
             median_ratio(&phase_ratios, 0),
             median_ratio(&phase_ratios, 1),
             median_ratio(&phase_ratios, 2),
+            median_combined_ratio(&phase_ratios),
         );
         let error = session
             .execute(
@@ -246,6 +248,15 @@ fn median_ratio(samples: &[(f64, f64, f64)], field: usize) -> f64 {
             1 => sample.1,
             _ => sample.2,
         })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| left.partial_cmp(right).expect("no NaN ratios"));
+    percentile(&values, 0.50)
+}
+
+fn median_combined_ratio(samples: &[(f64, f64, f64)]) -> f64 {
+    let mut values = samples
+        .iter()
+        .map(|sample| sample.0 + sample.1 + sample.2)
         .collect::<Vec<_>>();
     values.sort_by(|left, right| left.partial_cmp(right).expect("no NaN ratios"));
     percentile(&values, 0.50)
