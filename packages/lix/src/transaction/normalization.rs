@@ -28,6 +28,7 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) struct NormalizedRowFacts {
     pub(crate) schema_plan_id: SchemaPlanId,
     pub(crate) facts: PreparedRowFacts,
+    pub(crate) native_row: Option<crate::forktree::NativeRowCell>,
 }
 
 /// Normalizes one incoming row into a row with final snapshot/row primary key.
@@ -69,6 +70,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
             ),
         ));
     };
+    let relational_schema = schema_plan.relational_schema.clone();
 
     if let Some(certificate) = row
         .snapshot
@@ -116,13 +118,16 @@ pub(crate) fn normalize_raw_write_row_in_place(
                 Some(TransactionJson::from_certified_shared_normalized_row_content(normalized)),
             );
             canonicalize_descriptor_file_id(rows, row_index)?;
-            return Ok(NormalizedRowFacts {
+            return normalized_row_facts(
+                rows,
+                row_index,
                 schema_plan_id,
-                facts: PreparedRowFacts {
+                &relational_schema,
+                PreparedRowFacts {
                     row_content_validated: true,
                     requires_transaction_validation: false,
                 },
-            });
+            );
         }
     }
 
@@ -138,13 +143,16 @@ pub(crate) fn normalize_raw_write_row_in_place(
             ));
         }
         canonicalize_descriptor_file_id(rows, row_index)?;
-        return Ok(NormalizedRowFacts {
+        return normalized_row_facts(
+            rows,
+            row_index,
             schema_plan_id,
-            facts: PreparedRowFacts {
+            &relational_schema,
+            PreparedRowFacts {
                 row_content_validated: true,
                 requires_transaction_validation: false,
             },
-        });
+        );
     }
 
     let normalized_snapshot = if let Some(snapshot) = rows.take_snapshot(row_index) {
@@ -223,12 +231,52 @@ pub(crate) fn normalize_raw_write_row_in_place(
 
     rows.set_snapshot(row_index, normalized_snapshot);
     canonicalize_descriptor_file_id(rows, row_index)?;
-    Ok(NormalizedRowFacts {
+    normalized_row_facts(
+        rows,
+        row_index,
         schema_plan_id,
-        facts: PreparedRowFacts {
+        &relational_schema,
+        PreparedRowFacts {
             row_content_validated: true,
             requires_transaction_validation,
         },
+    )
+}
+
+fn normalized_row_facts(
+    rows: &RawWriteBatch,
+    row_index: usize,
+    schema_plan_id: SchemaPlanId,
+    relational_schema: &lix_schema::Schema,
+    facts: PreparedRowFacts,
+) -> Result<NormalizedRowFacts, LixError> {
+    let row = rows.row(row_index);
+    let native_row = row
+        .snapshot
+        .map(|snapshot| {
+            let entity_pk = row.entity_pk.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "normalized native row is missing its entity identity",
+                )
+            })?;
+            crate::native_row::encode(
+                relational_schema,
+                entity_pk,
+                if row.global {
+                    crate::GLOBAL_BRANCH_ID
+                } else {
+                    row.branch_id.as_str()
+                },
+                row.file_id.map(AsRef::as_ref),
+                snapshot.value(),
+            )
+        })
+        .transpose()?;
+    Ok(NormalizedRowFacts {
+        schema_plan_id,
+        facts,
+        native_row,
     })
 }
 
@@ -1073,12 +1121,12 @@ mod tests {
     fn normalization_supports_global_checkpoint_row() {
         let mut catalog = catalog_with(vec![
             builtin_schema("lix_commit"),
-            builtin_schema(crate::checkpoint::CHECKPOINT_SCHEMA_KEY),
+            builtin_schema(crate::schema::LIX_CHECKPOINT_SCHEMA_KEY),
         ]);
         let commit_id = "01920000-0000-7000-8000-0000000000c6";
         let row = TransactionWriteRow {
             row_pk: None,
-            schema_key: crate::checkpoint::CHECKPOINT_SCHEMA_KEY.into(),
+            schema_key: crate::schema::LIX_CHECKPOINT_SCHEMA_KEY.into(),
             snapshot: Some(transaction_json(json!({
                 "id": commit_id,
                 "commit_id": commit_id,
@@ -1099,7 +1147,7 @@ mod tests {
         assert!(
             catalog
                 .snapshot()
-                .schema(crate::checkpoint::CHECKPOINT_SCHEMA_KEY)
+                .schema(crate::schema::LIX_CHECKPOINT_SCHEMA_KEY)
                 .is_some()
         );
     }

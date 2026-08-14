@@ -149,6 +149,19 @@ pub(crate) struct StateDiffEntry {
 }
 
 impl StateRow {
+    pub(crate) fn seed_logical_snapshot(
+        &self,
+        active_branch_id: &str,
+    ) -> Result<Option<crate::common::SharedStr>, LixError> {
+        let key = crate::forktree::decode_state_key(&self.key)?;
+        let owner = if self.source == StateRowSource::Global {
+            crate::GLOBAL_BRANCH_ID
+        } else {
+            active_branch_id
+        };
+        self.value.cell.seed_logical_text(&key, owner)
+    }
+
     fn from_committed(row: VisibleStateRow) -> Self {
         Self {
             key: row.encoded_key,
@@ -558,15 +571,14 @@ where
                     format!("active account '{account_id}' does not exist"),
                 )
             })?;
-        let snapshot = match row.value.cell {
-            StateCell::Value(value) => value,
-            StateCell::Null | StateCell::Tombstone => {
-                return Err(LixError::new(
+        let snapshot = row
+            .seed_logical_snapshot(crate::GLOBAL_BRANCH_ID)?
+            .ok_or_else(|| {
+                LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("account '{account_id}' has no snapshot"),
-                ));
-            }
-        };
+                )
+            })?;
         let value: serde_json::Value =
             serde_json::from_str(snapshot.as_str()).map_err(|error| {
                 LixError::new(
@@ -597,7 +609,7 @@ where
                 "staged state rows are not strictly ordered",
             ));
         }
-        let removed_local_ranges = collection_delete_ranges(&staged)?;
+        let removed_local_ranges = collection_delete_ranges(&staged, &committed.branch_id())?;
         Ok(Self {
             committed,
             staged,
@@ -813,6 +825,7 @@ where
 
 fn collection_delete_ranges(
     staged: &[StagedStateRow],
+    active_branch_id: &str,
 ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, LixError> {
     let mut ranges = Vec::new();
     for row in staged {
@@ -820,7 +833,7 @@ fn collection_delete_ranges(
         if key.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
             continue;
         }
-        let StateCell::Value(snapshot) = &row.value.cell else {
+        let Some(snapshot) = row.value.cell.seed_logical_text(&key, active_branch_id)? else {
             continue;
         };
         let value: serde_json::Value =

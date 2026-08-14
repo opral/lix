@@ -1280,6 +1280,7 @@ impl WasmEntitySource for VecEntitySource {
 #[derive(Debug)]
 pub(crate) struct StateRowEntitySource {
     rows: Vec<StateRow>,
+    branch_id: String,
     ordinals: VecDeque<u32>,
     pending: Option<WasmHostEntity>,
     state: VecSourceState,
@@ -1290,6 +1291,7 @@ impl StateRowEntitySource {
         rows: Vec<StateRow>,
         ordinals: Vec<u32>,
         limits: WasmTransitionLimits,
+        branch_id: String,
     ) -> Result<Self, LixError> {
         for pair in ordinals.windows(2) {
             let left = rows.get(pair[0] as usize).ok_or_else(|| {
@@ -1317,6 +1319,7 @@ impl StateRowEntitySource {
         }
         Ok(Self {
             rows,
+            branch_id,
             ordinals: ordinals.into(),
             pending: None,
             state: VecSourceState::new(limits)?,
@@ -1336,17 +1339,13 @@ impl StateRowEntitySource {
                 "plugin state selection references a row outside its batch owner",
             )
         })?;
-        let snapshot = match &row.value.cell {
-            crate::forktree::StateCell::Value(value) => value,
-            crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "plugin state selection references a tombstoned row",
-                ));
-            }
-        };
+        let snapshot = row.seed_logical_snapshot(&self.branch_id)?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "plugin state selection references a tombstoned row",
+            )
+        })?;
         let key = crate::forktree::decode_state_key(&row.key)?;
-        let snapshot = snapshot.as_str();
         host_entity_with_lazy_snapshot(
             WasmEntityKey::from_owned_parts(key.schema_key, key.entity_pk.into_parts()),
             snapshot.as_bytes().to_vec().into(),

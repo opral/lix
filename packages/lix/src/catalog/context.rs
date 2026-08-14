@@ -141,17 +141,14 @@ struct CatalogRow {
     snapshot_content: Option<crate::common::SharedStr>,
 }
 
-fn catalog_row_from_state(row: StateRow) -> CatalogRow {
+fn catalog_row_from_state(row: StateRow, branch_id: &str) -> Result<CatalogRow, LixError> {
     let key = crate::forktree::decode_state_key(&row.key)
         .expect("authenticated state view must return canonical state keys");
-    let snapshot_content = match row.value.cell {
-        crate::forktree::StateCell::Value(value) => Some(value),
-        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
-    };
-    CatalogRow {
+    let snapshot_content = row.seed_logical_snapshot(branch_id)?;
+    Ok(CatalogRow {
         key,
         snapshot_content,
-    }
+    })
 }
 
 async fn scan_transaction_catalog_rows<R>(
@@ -171,9 +168,10 @@ where
     let schema_domains = domain.schema_catalog_domains();
     let mut catalog_rows = Vec::with_capacity(schema_domains.len());
     for schema_domain in schema_domains {
+        let branch_id = schema_domain.branch_id().to_owned();
         let rows = state
             .branch_range(
-                schema_domain.branch_id(),
+                &branch_id,
                 Some(&lower),
                 upper.as_deref(),
                 None,
@@ -181,8 +179,8 @@ where
             )
             .await?
             .into_iter()
-            .map(catalog_row_from_state)
-            .collect();
+            .map(|row| catalog_row_from_state(row, &branch_id))
+            .collect::<Result<Vec<_>, _>>()?;
         catalog_rows.push(CatalogDomainRows {
             domain: schema_domain,
             rows,
