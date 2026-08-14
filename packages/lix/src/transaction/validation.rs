@@ -3039,16 +3039,7 @@ async fn committed_normal_foreign_key_target_exists(
             else {
                 continue;
             };
-            let snapshot =
-                serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_VALIDATION,
-                        format!(
-                            "committed snapshot_content for schema '{}' is invalid JSON: {error}",
-                            row.schema_key()
-                        ),
-                    )
-                })?;
+            let snapshot = parse_committed_snapshot(row, snapshot_content)?;
             if UniqueConstraintValue::from_snapshot(&snapshot, &target.pointer_group).as_ref()
                 == Some(&target.value)
             {
@@ -3217,15 +3208,7 @@ fn reject_committed_unique_conflicts(
         else {
             continue;
         };
-        let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-            LixError::new(
-                LixError::CODE_SCHEMA_VALIDATION,
-                format!(
-                    "committed snapshot_content for schema '{}' is invalid JSON: {error}",
-                    committed_row.schema_key()
-                ),
-            )
-        })?;
+        let snapshot = parse_committed_snapshot(committed_row, snapshot_content)?;
         let Some(committed_value) =
             UniqueConstraintValue::from_snapshot(&snapshot, &scope.pointer_group)
         else {

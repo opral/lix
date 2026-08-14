@@ -135,18 +135,23 @@ where
     }
 
     let mut samples = Vec::with_capacity(measured);
-    let _ = lix::storage_bench::take_constraint_validation_accounting();
+    let mut phase_ratios = Vec::with_capacity(measured);
+    let mut accounting = lix::storage_bench::ConstraintValidationAccounting::default();
     for step in 0..measured {
         let index = seeded + step;
+        let _ = lix::storage_bench::take_constraint_validation_accounting();
         let started = Instant::now();
         insert_row(&session, lane, index).await;
-        samples.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+        let wall_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+        let sample = lix::storage_bench::take_constraint_validation_accounting();
+        phase_ratios.push(validation_phase_ratios(sample, wall_us));
+        add_validation_accounting(&mut accounting, sample);
+        samples.push(wall_us);
     }
     samples.sort_by(|left, right| left.partial_cmp(right).expect("no NaN timings"));
-
-    let accounting = lix::storage_bench::take_constraint_validation_accounting();
+    phase_ratios.sort_by(|left, right| left.0.partial_cmp(&right.0).expect("no NaN ratios"));
     println!(
-        "op=insert lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1}",
+        "op=insert lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1} median_scan_pct={:.3} median_select_pct={:.3} median_json_pct={:.3}",
         lane.label(),
         percentile(&samples, 0.50),
         percentile(&samples, 0.95),
@@ -159,12 +164,17 @@ where
         accounting.json_parse_calls,
         accounting.json_parse_bytes,
         accounting.json_parse_ns as f64 / 1_000.0,
+        median_ratio(&phase_ratios, 0),
+        median_ratio(&phase_ratios, 1),
+        median_ratio(&phase_ratios, 2),
     );
 
     if lane == Lane::ForeignKey {
-        let _ = lix::storage_bench::take_constraint_validation_accounting();
         let mut updates = Vec::with_capacity(measured);
+        let mut phase_ratios = Vec::with_capacity(measured);
+        let mut accounting = lix::storage_bench::ConstraintValidationAccounting::default();
         for step in 0..measured {
+            let _ = lix::storage_bench::take_constraint_validation_accounting();
             let started = Instant::now();
             session
                 .execute(
@@ -176,12 +186,16 @@ where
                 )
                 .await
                 .expect("update fk row");
-            updates.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+            let wall_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+            let sample = lix::storage_bench::take_constraint_validation_accounting();
+            phase_ratios.push(validation_phase_ratios(sample, wall_us));
+            add_validation_accounting(&mut accounting, sample);
+            updates.push(wall_us);
         }
         updates.sort_by(|left, right| left.partial_cmp(right).expect("no NaN timings"));
-        let accounting = lix::storage_bench::take_constraint_validation_accounting();
+        phase_ratios.sort_by(|left, right| left.0.partial_cmp(&right.0).expect("no NaN ratios"));
         println!(
-            "op=update lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1}",
+            "op=update lane={} seeded_rows={seeded} measured={measured} p50_us={:.1} p95_us={:.1} min_us={:.1} constraint_scan_calls={} constraint_scan_rows={} constraint_scan_us={:.1} select_rows={} select_us={:.1} json_parse_calls={} json_parse_bytes={} json_parse_us={:.1} median_scan_pct={:.3} median_select_pct={:.3} median_json_pct={:.3}",
             lane.label(),
             percentile(&updates, 0.50),
             percentile(&updates, 0.95),
@@ -194,6 +208,9 @@ where
             accounting.json_parse_calls,
             accounting.json_parse_bytes,
             accounting.json_parse_ns as f64 / 1_000.0,
+            median_ratio(&phase_ratios, 0),
+            median_ratio(&phase_ratios, 1),
+            median_ratio(&phase_ratios, 2),
         );
         let error = session
             .execute(
@@ -207,6 +224,45 @@ where
             .expect_err("missing FK target must fail");
         assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
     }
+}
+
+fn validation_phase_ratios(
+    sample: lix::storage_bench::ConstraintValidationAccounting,
+    wall_us: f64,
+) -> (f64, f64, f64) {
+    let wall_ns = wall_us * 1_000.0;
+    (
+        sample.committed_scan_ns as f64 * 100.0 / wall_ns,
+        sample.materialized_select_ns as f64 * 100.0 / wall_ns,
+        sample.json_parse_ns as f64 * 100.0 / wall_ns,
+    )
+}
+
+fn median_ratio(samples: &[(f64, f64, f64)], field: usize) -> f64 {
+    let mut values = samples
+        .iter()
+        .map(|sample| match field {
+            0 => sample.0,
+            1 => sample.1,
+            _ => sample.2,
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| left.partial_cmp(right).expect("no NaN ratios"));
+    percentile(&values, 0.50)
+}
+
+fn add_validation_accounting(
+    total: &mut lix::storage_bench::ConstraintValidationAccounting,
+    sample: lix::storage_bench::ConstraintValidationAccounting,
+) {
+    total.committed_scan_calls += sample.committed_scan_calls;
+    total.committed_scan_rows += sample.committed_scan_rows;
+    total.committed_scan_ns += sample.committed_scan_ns;
+    total.materialized_select_rows += sample.materialized_select_rows;
+    total.materialized_select_ns += sample.materialized_select_ns;
+    total.json_parse_calls += sample.json_parse_calls;
+    total.json_parse_bytes += sample.json_parse_bytes;
+    total.json_parse_ns += sample.json_parse_ns;
 }
 
 async fn insert_row<S>(session: &Lix<S>, lane: Lane, index: usize)
