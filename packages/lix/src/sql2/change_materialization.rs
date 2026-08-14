@@ -204,5 +204,26 @@ mod tests {
                 );
             }
         }
+
+        let history_route = include_str!("history_route.rs");
+        let native_start = history_route
+            .find("if metadata_projection.native_entity_rows {")
+            .expect("native history branch");
+        let native_end = history_route[native_start..]
+            .find("            continue;")
+            .map(|offset| native_start + offset)
+            .expect("native history branch terminator");
+        let native_route = &history_route[native_start..native_end];
+        for forbidden in [
+            "seed_snapshot_content(",
+            "load_json_slot(",
+            "decode_forktree_change_payload(",
+            "parse_snapshot(",
+        ] {
+            assert!(
+                !native_route.contains(forbidden),
+                "native history route contains forbidden JSON hydration call {forbidden}"
+            );
+        }
     }
 }

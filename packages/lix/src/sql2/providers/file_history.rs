@@ -167,7 +167,8 @@ where
         });
         let mut route = HistoryRoute::from_filters(filters);
         route.default_to_as_of_commit_id(&self.default_as_of_commit_id);
-        let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
+        let metadata_projection =
+            HistoryMetadataProjection::from_scan(&schema, filters).with_snapshot_content();
         let public_predicate = FileHistoryPublicPredicate::from_filters(filters);
         let lookup_ids = FileHistoryLookupIds::from_public_predicate(&public_predicate);
         Ok(PlannedScan {

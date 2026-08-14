@@ -45,7 +45,7 @@ where
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "authenticated history commit '{}' changed identity",
+                "authenticated history commit '{}' changed idrow",
                 commit_id
             ),
         ));
@@ -70,7 +70,7 @@ where
 pub(crate) struct HistoryRoute {
     pub(crate) as_of_commit_ids: Vec<String>,
     pub(crate) row_pks: Vec<String>,
-    /// Schema-resolved physical identitys for traversal.
+    /// Schema-resolved physical identities for traversal.
     ///
     /// `row_pks` remains the canonical JSON surface representation used to
     /// match projected rows. Keeping the typed form alongside it avoids
@@ -115,7 +115,7 @@ impl HistoryRoute {
     ///
     /// Surface providers such as `lix_file_history` may be caused by different
     /// canonical event schemas than the schema they expose. For those providers,
-    /// identity/schema filters must be evaluated against the shaped output row,
+    /// idrow/schema filters must be evaluated against the shaped output row,
     /// not against the canonical event row.
     pub(crate) fn traversal_only(&self) -> Self {
         Self {
@@ -424,6 +424,7 @@ pub(crate) struct HistoryViewDescriptor<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HistoryMetadataProjection {
     commit_created_at: bool,
+    snapshot_content: bool,
     native_row_rows: bool,
 }
 
@@ -437,10 +438,25 @@ impl HistoryMetadataProjection {
                     .iter()
                     .any(|column| column.name == column_name)
             });
+        let snapshot_content = projected_schema
+            .field_with_name(HISTORY_COL_SNAPSHOT_CONTENT)
+            .is_ok()
+            || filters.iter().any(|filter| {
+                filter
+                    .column_refs()
+                    .iter()
+                    .any(|column| column.name == HISTORY_COL_SNAPSHOT_CONTENT)
+            });
         Self {
             commit_created_at,
+            snapshot_content,
             native_row_rows: false,
         }
+    }
+
+    pub(crate) fn with_snapshot_content(mut self) -> Self {
+        self.snapshot_content = true;
+        self
     }
 
     pub(crate) fn with_native_row_rows(mut self) -> Self {
@@ -451,6 +467,11 @@ impl HistoryMetadataProjection {
     #[cfg(test)]
     fn commit_created_at(self) -> bool {
         self.commit_created_at
+    }
+
+    #[cfg(test)]
+    fn snapshot_content(self) -> bool {
+        self.snapshot_content
     }
 }
 
@@ -545,7 +566,7 @@ where
             // event/plugin rows.  It must not depend on whether the caller
             // projected the optional created_at column: omitting metadata is
             // a SQL projection choice, not permission to drop the topology
-            // and its commit identitys.
+            // and its commit identities.
             let reachable_nodes = history.reachable_nodes;
             let mut reachable_by_id = BTreeMap::new();
             if !reachable_nodes.is_empty() {
@@ -586,7 +607,7 @@ where
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
                             format!(
-                                "history commit metadata identity mismatch for '{}'",
+                                "history commit metadata idrow mismatch for '{}'",
                                 commit_id
                             ),
                         ));
@@ -972,7 +993,11 @@ where
                 if !existing_change_ids.insert(change_id.clone()) {
                     continue;
                 }
-                let snapshot_content = row.seed_snapshot_content()?;
+                let snapshot_content = if metadata_projection.snapshot_content {
+                    row.seed_snapshot_content()?
+                } else {
+                    None
+                };
                 rows.push(HistoryEntry {
                     change: MaterializedChange {
                         id: change_id,
@@ -1421,8 +1446,8 @@ mod tests {
 
     use super::{
         HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-        HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
-        parse_history_filter,
+        HISTORY_COL_SNAPSHOT_CONTENT, HistoryMetadataProjection, HistoryRoute,
+        HistoryViewDescriptor, load_history_entries, parse_history_filter,
     };
 
     #[test]
@@ -1511,6 +1536,18 @@ mod tests {
         assert!(
             HistoryMetadataProjection::from_scan(&unrelated_schema, &[residual_filter])
                 .commit_created_at()
+        );
+
+        let snapshot_schema = Arc::new(Schema::new(vec![Field::new(
+            HISTORY_COL_SNAPSHOT_CONTENT,
+            DataType::Utf8,
+            true,
+        )]));
+        assert!(
+            HistoryMetadataProjection::from_scan(&snapshot_schema, &[]).snapshot_content()
+        );
+        assert!(
+            !HistoryMetadataProjection::from_scan(&unrelated_schema, &[]).snapshot_content()
         );
     }
 
