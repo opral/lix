@@ -4512,6 +4512,8 @@ fn tree_scan_request_from_tracked(
     TrackedStateTreeScanRequest {
         schema_keys: request.filter.schema_keys.clone(),
         row_pks: request.filter.row_pks.clone(),
+        row_pk_lower: request.filter.row_pk_lower.clone(),
+        row_pk_upper: request.filter.row_pk_upper.clone(),
         file_ids: request.filter.file_ids.clone(),
         include_tombstones: request.filter.include_tombstones,
         // User limits belong above delta overlay and tombstone visibility.
@@ -9117,6 +9119,8 @@ mod tests {
                     schema_keys: vec![SCHEMA_KEY.to_owned()],
                     row_pks: vec![key.row_pk.clone()],
                     file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_owned())],
+                    row_pk_lower: None,
+                    row_pk_upper: None,
                     include_tombstones: true,
                 },
                 read_columns: crate::tracked_state::TrackedStateReadColumns {

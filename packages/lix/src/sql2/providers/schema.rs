@@ -419,6 +419,14 @@ impl SchemaSpec {
         apply_exact_branch_id_filter(&mut request, exact_branch_ids);
         apply_exact_row_pk_filters(&mut request, &self.spec, filters)?;
         apply_exact_file_id_filter(&mut request, exact_file_ids_from_filters(filters)?);
+        if request.filter.row_pks.is_empty()
+            && request.filter.file_ids.len() == 1
+            && !matches!(request.filter.file_ids[0], crate::NullableKeyFilter::Any)
+            && let Some((lower, upper)) = primary_key_range(&self.spec, &row_filters)
+        {
+            request.filter.row_pk_lower = lower;
+            request.filter.row_pk_upper = upper;
+        }
         request.filter.declared_column_eq = declared_column_eq(&self.spec, &row_filters);
         request.filter.declared_column_range = declared_column_range(&self.spec, &row_filters);
         Ok((projected_schema, request, row_filters))
@@ -2108,6 +2116,165 @@ fn apply_exact_row_pk_filters(
     Ok(())
 }
 
+fn primary_key_range(
+    spec: &SchemaSurfaceSpec,
+    row_filters: &[RowFilter],
+) -> Option<(
+    Option<crate::tracked_state::RowPkRangeBound>,
+    Option<crate::tracked_state::RowPkRangeBound>,
+)> {
+    let primary_key_columns = top_level_primary_key_columns(spec);
+    if primary_key_columns.is_empty() {
+        return None;
+    }
+    let mut equalities = BTreeMap::<String, RowFilterValue>::new();
+    let mut ranges = Vec::<(String, RowRangeOp, RowFilterValue)>::new();
+    for filter in row_filters {
+        if !collect_primary_key_range_terms(
+            filter,
+            &primary_key_columns,
+            &mut equalities,
+            &mut ranges,
+        ) {
+            return None;
+        }
+    }
+    let range_column_index = ranges
+        .iter()
+        .map(|(column, _, _)| primary_key_columns.iter().position(|pk| *pk == column))
+        .collect::<Option<BTreeSet<_>>>()?;
+    if range_column_index.len() != 1 {
+        return None;
+    }
+    let range_column_index = *range_column_index.iter().next()?;
+    if range_column_index + 1 != primary_key_columns.len() {
+        return None;
+    }
+    let prefix = primary_key_columns[..range_column_index]
+        .iter()
+        .map(|column| {
+            primary_key_filter_external_value(
+                equalities.get(*column)?,
+                spec.primary_key_component_types[primary_key_columns
+                    .iter()
+                    .position(|candidate| candidate == column)?],
+            )
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut lower: Option<crate::tracked_state::RowPkRangeBound> = None;
+    let mut upper: Option<crate::tracked_state::RowPkRangeBound> = None;
+    for (_, op, value) in ranges {
+        let mut parts = prefix.clone();
+        parts.push(primary_key_filter_external_value(
+            &value,
+            spec.primary_key_component_types[range_column_index],
+        )?);
+        let row_pk = RowPk::from_external_parts(parts, &spec.primary_key_component_types).ok()?;
+        let (target, inclusive, lower_side) = match op {
+            RowRangeOp::Gt => (&mut lower, false, true),
+            RowRangeOp::GtEq => (&mut lower, true, true),
+            RowRangeOp::Lt => (&mut upper, false, false),
+            RowRangeOp::LtEq => (&mut upper, true, false),
+        };
+        let candidate = crate::tracked_state::RowPkRangeBound { row_pk, inclusive };
+        let replace = target.as_ref().is_none_or(|existing| {
+            if lower_side {
+                candidate.row_pk > existing.row_pk
+                    || (candidate.row_pk == existing.row_pk
+                        && !candidate.inclusive
+                        && existing.inclusive)
+            } else {
+                candidate.row_pk < existing.row_pk
+                    || (candidate.row_pk == existing.row_pk
+                        && !candidate.inclusive
+                        && existing.inclusive)
+            }
+        });
+        if replace {
+            *target = Some(candidate);
+        }
+    }
+    if primary_key_columns.len() > 1 && (lower.is_none() || upper.is_none()) {
+        return None;
+    }
+    (lower.is_some() || upper.is_some()).then_some((lower, upper))
+}
+
+fn collect_primary_key_range_terms(
+    filter: &RowFilter,
+    primary_key_columns: &[&str],
+    equalities: &mut BTreeMap<String, RowFilterValue>,
+    ranges: &mut Vec<(String, RowRangeOp, RowFilterValue)>,
+) -> bool {
+    match filter {
+        RowFilter::And(left, right) => {
+            collect_primary_key_range_terms(left, primary_key_columns, equalities, ranges)
+                && collect_primary_key_range_terms(right, primary_key_columns, equalities, ranges)
+        }
+        RowFilter::ColumnEq { column, value, .. }
+            if primary_key_columns.contains(&column.as_str()) =>
+        {
+            equalities
+                .insert(column.clone(), value.clone())
+                .is_none_or(|previous| previous == *value)
+        }
+        RowFilter::ColumnIn { column, values, .. }
+            if primary_key_columns.contains(&column.as_str()) =>
+        {
+            let [value] = values.as_slice() else {
+                return false;
+            };
+            equalities
+                .insert(column.clone(), value.clone())
+                .is_none_or(|previous| previous == *value)
+        }
+        RowFilter::ColumnRange {
+            column, op, value, ..
+        } if primary_key_columns.contains(&column.as_str()) => {
+            ranges.push((column.clone(), *op, value.clone()));
+            true
+        }
+        RowFilter::Or(left, right) => {
+            !row_filter_mentions_primary_key(left, primary_key_columns)
+                && !row_filter_mentions_primary_key(right, primary_key_columns)
+        }
+        _ => true,
+    }
+}
+
+fn row_filter_mentions_primary_key(filter: &RowFilter, primary_key_columns: &[&str]) -> bool {
+    match filter {
+        RowFilter::ColumnEq { column, .. }
+        | RowFilter::ColumnIn { column, .. }
+        | RowFilter::ColumnRange { column, .. } => {
+            primary_key_columns.contains(&column.as_str())
+        }
+        RowFilter::And(left, right) | RowFilter::Or(left, right) => {
+            row_filter_mentions_primary_key(left, primary_key_columns)
+                || row_filter_mentions_primary_key(right, primary_key_columns)
+        }
+    }
+}
+
+fn primary_key_filter_external_value(
+    value: &RowFilterValue,
+    component_type: crate::row_pk::RowPkComponentType,
+) -> Option<String> {
+    match (component_type, value) {
+        (crate::row_pk::RowPkComponentType::Integer, RowFilterValue::Integer(value)) => {
+            Some(value.to_string())
+        }
+        (
+            crate::row_pk::RowPkComponentType::String
+            | crate::row_pk::RowPkComponentType::Uuid
+            | crate::row_pk::RowPkComponentType::Bytes,
+            RowFilterValue::String(value),
+        ) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 fn exact_branch_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> {
     let analyzer = ExactBranchIdFilterAnalyzer;
     let mut branch_ids: Option<BTreeSet<String>> = None;
@@ -2147,9 +2314,9 @@ fn apply_exact_branch_id_filter(
 /// so the merged answer stays complete. Without this analyzer the predicate
 /// only ever survived as a DataFusion residual and every file-scoped read paid
 /// O(rows in the branch).
-fn exact_file_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> {
+fn exact_file_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<ExactFileId>>> {
     let analyzer = ExactFileIdFilterAnalyzer;
-    let mut file_ids: Option<BTreeSet<String>> = None;
+    let mut file_ids: Option<BTreeSet<ExactFileId>> = None;
     for filter in filters {
         let Some(filter_ids) = analyzer.analyze(filter)? else {
             continue;
@@ -2162,16 +2329,25 @@ fn exact_file_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> 
     Ok(file_ids.map(|ids| ids.into_iter().collect()))
 }
 
-fn apply_exact_file_id_filter(request: &mut HotStateScanRequest, file_ids: Option<Vec<String>>) {
+fn apply_exact_file_id_filter(request: &mut HotStateScanRequest, file_ids: Option<Vec<ExactFileId>>) {
     if let Some(file_ids) = file_ids {
         if file_ids.is_empty() {
             request.filter.rows = HotStateRowFilter::None;
         }
         request.filter.file_ids = file_ids
             .into_iter()
-            .map(crate::NullableKeyFilter::Value)
+            .map(|file_id| match file_id {
+                ExactFileId::Null => crate::NullableKeyFilter::Null,
+                ExactFileId::Value(file_id) => crate::NullableKeyFilter::Value(file_id),
+            })
             .collect();
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ExactFileId {
+    Null,
+    Value(String),
 }
 
 struct ExactFileIdFilterAnalyzer;
@@ -2183,7 +2359,7 @@ impl ExactFileIdFilterAnalyzer {
     }
 
     #[expect(clippy::self_only_used_in_recursion)]
-    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<String>>> {
+    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<ExactFileId>>> {
         match expr {
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
                 let Some(left) = self.analyze(&binary_expr.left)? else {
@@ -2210,12 +2386,19 @@ impl ExactFileIdFilterAnalyzer {
             Expr::InList(in_list) => Ok(
                 file_ids_from_in_list_filter(in_list).map(|values| values.into_iter().collect())
             ),
+            Expr::IsNull(expression) => {
+                let Expr::Column(column) = expression.as_ref() else {
+                    return Ok(None);
+                };
+                Ok((column.name == "lixcol_file_id")
+                    .then(|| BTreeSet::from([ExactFileId::Null])))
+            }
             _ => Ok(None),
         }
     }
 }
 
-fn file_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
+fn file_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<ExactFileId> {
     if binary_expr.op != Operator::Eq {
         return None;
     }
@@ -2223,7 +2406,7 @@ fn file_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
         .or_else(|| file_id_from_column_literal_filter(&binary_expr.right, &binary_expr.left))
 }
 
-fn file_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
+fn file_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<ExactFileId>> {
     if in_list.negated {
         return None;
     }
@@ -2236,7 +2419,7 @@ fn file_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
     let values = in_list
         .list
         .iter()
-        .map(string_expr_literal)
+        .map(|expr| string_expr_literal(expr).map(ExactFileId::Value))
         .collect::<Option<Vec<_>>>()?;
     if values.is_empty() {
         return None;
@@ -2244,14 +2427,17 @@ fn file_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
     Some(values)
 }
 
-fn file_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr) -> Option<String> {
+fn file_id_from_column_literal_filter(
+    column_expr: &Expr,
+    literal_expr: &Expr,
+) -> Option<ExactFileId> {
     let Expr::Column(column) = column_expr else {
         return None;
     };
     if column.name != "lixcol_file_id" {
         return None;
     }
-    string_expr_literal(literal_expr)
+    string_expr_literal(literal_expr).map(ExactFileId::Value)
 }
 
 pub(super) struct RowPrimaryKeyFilterAnalyzer<'a> {
@@ -5466,6 +5652,96 @@ mod tests {
             super::row_pks_from_primary_key_filters(&spec, &[eq_filter("id", "42")])
                 .expect("mismatched filter should be safely ignored")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn primary_key_range_uses_typed_inclusive_and_exclusive_bounds() {
+        let spec = derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "integer_note_range",
+            "columns": [
+                { "name": "id", "type": "int8", "nullable": false },
+                { "name": "body", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        }))
+        .expect("integer range schema should derive");
+        let filters = vec![
+            super::RowFilter::ColumnRange {
+                column: "id".to_owned(),
+                column_type: SchemaColumnType::Integer,
+                op: super::RowRangeOp::Gt,
+                value: super::RowFilterValue::Integer(41),
+            },
+            super::RowFilter::ColumnRange {
+                column: "id".to_owned(),
+                column_type: SchemaColumnType::Integer,
+                op: super::RowRangeOp::LtEq,
+                value: super::RowFilterValue::Integer(45),
+            },
+        ];
+
+        let (lower, upper) = super::primary_key_range(&spec, &filters)
+            .expect("contiguous typed range should route");
+        let lower = lower.expect("lower bound");
+        let upper = upper.expect("upper bound");
+        assert_eq!(lower.row_pk.clone().into_parts(), vec!["41"]);
+        assert!(!lower.inclusive);
+        assert_eq!(upper.row_pk.clone().into_parts(), vec!["45"]);
+        assert!(upper.inclusive);
+    }
+
+    #[test]
+    fn composite_primary_key_range_requires_single_prefix_and_both_bounds() {
+        let spec = derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "versioned_note_range",
+            "columns": [
+                { "name": "namespace", "type": "text", "nullable": false },
+                { "name": "revision", "type": "int8", "nullable": false },
+            ],
+            "primary_key": ["namespace", "revision"],
+        }))
+        .expect("composite range schema should derive");
+        let prefix = super::RowFilter::ColumnEq {
+            column: "namespace".to_owned(),
+            column_type: SchemaColumnType::String,
+            value: super::RowFilterValue::String("docs".to_owned()),
+        };
+        let lower = super::RowFilter::ColumnRange {
+            column: "revision".to_owned(),
+            column_type: SchemaColumnType::Integer,
+            op: super::RowRangeOp::GtEq,
+            value: super::RowFilterValue::Integer(10),
+        };
+        let upper = super::RowFilter::ColumnRange {
+            column: "revision".to_owned(),
+            column_type: SchemaColumnType::Integer,
+            op: super::RowRangeOp::Lt,
+            value: super::RowFilterValue::Integer(20),
+        };
+
+        assert!(super::primary_key_range(&spec, &[prefix.clone(), lower.clone()]).is_none());
+        let (actual_lower, actual_upper) =
+            super::primary_key_range(&spec, &[prefix, lower, upper])
+                .expect("bounded final component with exact prefix should route");
+        assert_eq!(
+            actual_lower.expect("lower").row_pk.into_parts(),
+            vec!["docs", "10"]
+        );
+        assert_eq!(
+            actual_upper.expect("upper").row_pk.into_parts(),
+            vec!["docs", "20"]
+        );
+    }
+
+    #[test]
+    fn null_file_owner_is_an_exact_physical_fence() {
+        let filter = Expr::IsNull(Box::new(column("lixcol_file_id")));
+        assert_eq!(
+            super::exact_file_ids_from_filters(&[filter]).expect("IS NULL should analyze"),
+            Some(vec![super::ExactFileId::Null])
         );
     }
 

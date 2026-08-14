@@ -2574,6 +2574,13 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
                     NullableKeyFilter::Any => unreachable!("filtered above"),
                 };
                 for row_pk in &request.row_pks {
+                    if !crate::tracked_state::row_pk_satisfies_bounds(
+                        row_pk,
+                        request.row_pk_lower.as_ref(),
+                        request.row_pk_upper.as_ref(),
+                    ) {
+                        continue;
+                    }
                     let key = TrackedStateKey {
                         schema_key: schema_key.clone(),
                         file_id: file_id.clone(),
@@ -2596,14 +2603,21 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
         }
 
         for file_filter in &request.file_ids {
-            let prefix = match file_filter {
-                NullableKeyFilter::Null => encode_schema_file_prefix(schema_key, None),
-                NullableKeyFilter::Value(file_id) => {
-                    encode_schema_file_prefix(schema_key, Some(file_id))
-                }
+            let (prefix, file_id) = match file_filter {
+                NullableKeyFilter::Null => (encode_schema_file_prefix(schema_key, None), None),
+                NullableKeyFilter::Value(file_id) => (
+                    encode_schema_file_prefix(schema_key, Some(file_id)),
+                    Some(file_id.clone()),
+                ),
                 NullableKeyFilter::Any => unreachable!("handled above"),
             };
-            ranges.push(prefix_scan_range(prefix));
+            ranges.push(row_pk_scan_range(
+                schema_key,
+                file_id,
+                prefix,
+                request.row_pk_lower.as_ref(),
+                request.row_pk_upper.as_ref(),
+            ));
         }
     }
     ranges
@@ -2627,7 +2641,7 @@ fn scan_key_decode_hint<'a>(
     Some(ScanKeyDecodeHint {
         schema_key: request.schema_keys.first()?.as_str(),
         file_id,
-        prefix_len: ranges.first()?.start.len(),
+        prefix_len: encode_schema_file_prefix(request.schema_keys.first()?, file_id).len(),
     })
 }
 
@@ -2643,6 +2657,46 @@ fn exact_scan_range(key: Vec<u8>) -> EncodedScanRange {
         end: lexicographic_successor(&key),
         start: key,
     }
+}
+
+fn row_pk_scan_range(
+    schema_key: &str,
+    file_id: Option<String>,
+    prefix: Vec<u8>,
+    lower: Option<&crate::tracked_state::RowPkRangeBound>,
+    upper: Option<&crate::tracked_state::RowPkRangeBound>,
+) -> EncodedScanRange {
+    let start = lower.map_or_else(
+        || prefix.clone(),
+        |bound| {
+            let key = encode_key(&TrackedStateKey {
+                schema_key: schema_key.to_owned(),
+                file_id: file_id.clone(),
+                row_pk: bound.row_pk.clone(),
+            });
+            if bound.inclusive {
+                key
+            } else {
+                lexicographic_successor(&key).unwrap_or(key)
+            }
+        },
+    );
+    let end = upper.map_or_else(
+        || lexicographic_successor(&prefix),
+        |bound| {
+            let key = encode_key(&TrackedStateKey {
+                schema_key: schema_key.to_owned(),
+                file_id,
+                row_pk: bound.row_pk.clone(),
+            });
+            if bound.inclusive {
+                lexicographic_successor(&key)
+            } else {
+                Some(key)
+            }
+        },
+    );
+    EncodedScanRange { start, end }
 }
 
 fn lexicographic_successor(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -2681,6 +2735,13 @@ fn key_matches_scan_filters(request: &TrackedStateTreeScanRequest, key: &Tracked
         return false;
     }
     if !request.row_pks.is_empty() && !request.row_pks.contains(&key.row_pk) {
+        return false;
+    }
+    if !crate::tracked_state::row_pk_satisfies_bounds(
+        &key.row_pk,
+        request.row_pk_lower.as_ref(),
+        request.row_pk_upper.as_ref(),
+    ) {
         return false;
     }
     if !request.file_ids.is_empty()
@@ -3577,6 +3638,39 @@ mod tests {
             Some("01920000-0000-7000-8000-0000000000a2")
         );
 
+        let bounded_exact_rows = tree
+            .scan(
+                &store,
+                &result.root_id,
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema-a".to_string()],
+                    row_pks: vec![RowPk::single("row-a"), RowPk::single("row-b")],
+                    file_ids: vec![NullableKeyFilter::Value(
+                        "01920000-0000-7000-8000-0000000000a2".to_string(),
+                    )],
+                    row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("row-b"),
+                        inclusive: true,
+                    }),
+                    row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("row-b"),
+                        inclusive: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("exact candidates must intersect range bounds");
+        assert_eq!(bounded_exact_rows.len(), 1);
+        assert_eq!(
+            bounded_exact_rows[0]
+                .0
+                .row_pk
+                .as_single_string_owned()
+                .expect("identity"),
+            "row-b"
+        );
+
         // With no schema predicate there is no encoded scan range or trusted
         // prefix. This exercises the decoded-key filter path directly.
         let row_only_rows = tree
@@ -3674,6 +3768,79 @@ mod tests {
                 .map(|(key, _)| key.row_pk.as_single_string_owned().expect("identity"))
                 .collect::<Vec<_>>(),
             vec!["row-a", "row-c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_schema_file_primary_key_range_honors_open_closed_and_empty_bounds() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::new();
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let result = apply_mutations_for_test(
+            &tree,
+            &storage,
+            None,
+            ["row-a", "row-b", "row-c", "row-d"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, row_pk)| {
+                    mutation_owned(
+                        key("schema-a", Some(file_id), row_pk),
+                        value(&format!("range-c{index}"), Some("{}")),
+                    )
+                })
+                .collect(),
+            None,
+        )
+        .await
+        .expect("range fixture should apply");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("range read should open");
+        let request = |lower: (&str, bool), upper: (&str, bool)| {
+            TrackedStateTreeScanRequest {
+                schema_keys: vec!["schema-a".to_owned()],
+                file_ids: vec![NullableKeyFilter::Value(file_id.to_owned())],
+                row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                    row_pk: RowPk::single(lower.0),
+                    inclusive: lower.1,
+                }),
+                row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                    row_pk: RowPk::single(upper.0),
+                    inclusive: upper.1,
+                }),
+                ..Default::default()
+            }
+        };
+
+        let rows = tree
+            .scan(&store, &result.root_id, &request(("row-a", false), ("row-d", false)))
+            .await
+            .expect("open range should scan");
+        assert_eq!(
+            rows.into_iter()
+                .map(|(key, _)| key.row_pk.into_parts())
+                .collect::<Vec<_>>(),
+            vec![vec!["row-b"], vec!["row-c"]]
+        );
+
+        let rows = tree
+            .scan(&store, &result.root_id, &request(("row-b", true), ("row-c", true)))
+            .await
+            .expect("closed range should scan");
+        assert_eq!(
+            rows.into_iter()
+                .map(|(key, _)| key.row_pk.into_parts())
+                .collect::<Vec<_>>(),
+            vec![vec!["row-b"], vec!["row-c"]]
+        );
+
+        assert!(
+            tree.scan(&store, &result.root_id, &request(("row-d", true), ("row-a", true)))
+                .await
+                .expect("empty inverted range should not fail")
+                .is_empty()
         );
     }
 

@@ -1329,8 +1329,7 @@ mod tests {
                 .any(|branch_id| branch_id == row.branch_id.as_ref());
         let schema_matches =
             filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.schema_key);
-        let row_matches =
-            filter.row_pks.is_empty() || filter.row_pks.contains(&row.row_pk);
+        let row_matches = filter.matches_row_pk(&row.row_pk);
         let file_matches = filter.file_ids.is_empty()
             || filter.file_ids.iter().any(|file_id| match file_id {
                 NullableKeyFilter::Any => true,
