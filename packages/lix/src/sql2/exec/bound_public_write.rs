@@ -1493,13 +1493,6 @@ impl<'a> EntityLiveRowRef<'a> {
         }
     }
 
-    fn snapshot_content(self) -> Option<&'a str> {
-        match self {
-            Self::Owned(row) => row.snapshot_content.as_deref(),
-            Self::Batch(row) => row.snapshot_content().map(SharedStr::as_str),
-        }
-    }
-
     fn metadata(self) -> Option<&'a str> {
         match self {
             Self::Owned(row) => row.metadata.as_deref(),
@@ -3159,7 +3152,7 @@ async fn entity_staged_postimage_returning_rows(
                 ),
             )
         })?;
-        let snapshot = candidate_snapshot(candidate)?.ok_or_else(|| {
+        let snapshot = candidate_snapshot(candidate, spec)?.ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -3281,7 +3274,7 @@ fn append_entity_update_row<'a>(
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<bool, LixError> {
     let candidate = candidate.into();
-    let Some(snapshot) = candidate_snapshot(candidate)? else {
+    let Some(snapshot) = candidate_snapshot(candidate, spec)? else {
         return Ok(false);
     };
     let original_context = EntityEvalContext::live(&snapshot, candidate, spec);
@@ -3357,7 +3350,7 @@ async fn entity_delete(
     let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
     let mut returning_rows = plan.bound.returning.as_ref().map(|_| Vec::new());
     for candidate in candidates.iter() {
-        let Some(snapshot) = candidate_snapshot(candidate)? else {
+        let Some(snapshot) = candidate_snapshot(candidate, spec)? else {
             continue;
         };
         let context = EntityEvalContext::live(&snapshot, candidate, spec);
@@ -3529,7 +3522,7 @@ fn append_entity_conflict_update_row<'a>(
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<(), LixError> {
     let candidate = candidate.into();
-    let snapshot = candidate_snapshot(candidate)?.ok_or_else(|| {
+    let snapshot = candidate_snapshot(candidate, spec)?.ok_or_else(|| {
         LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "INSERT ON CONFLICT cannot update a tombstone row",
@@ -5511,7 +5504,7 @@ fn append_entity_replace_row_from_live<'a>(
 ) -> Result<(), LixError> {
     let row = row.into();
     let metadata = if let Some(expr) = assignment_value(assignments, "lixcol_metadata") {
-        let snapshot_for_eval = candidate_snapshot(row)?.unwrap_or(JsonValue::Null);
+        let snapshot_for_eval = candidate_snapshot(row, spec)?.unwrap_or(JsonValue::Null);
         let context = EntityEvalContext::live(&snapshot_for_eval, row, spec);
         let value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
         optional_metadata_from_eval_value(value, "lixcol_metadata", &spec.schema_key)?
@@ -6541,18 +6534,35 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
 
 fn candidate_snapshot<'a>(
     row: impl Into<EntityLiveRowRef<'a>>,
+    spec: &EntitySurfaceSpec,
 ) -> Result<Option<JsonValue>, LixError> {
-    row.into()
-        .snapshot_content()
-        .map(|snapshot| {
-            serde_json::from_str(snapshot).map_err(|error| {
+    let row = row.into();
+    match row {
+        EntityLiveRowRef::Batch(row) => {
+            let native = row.native_snapshot().ok_or_else(|| {
                 LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    format!("entity row snapshot_content is not valid JSON: {error}"),
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "Schema v1 current-state row '{}' is missing its native scalar tuple",
+                        spec.schema_key
+                    ),
                 )
+            })?;
+            crate::native_row::logical_value(&spec.native_schema, row.entity_pk(), native).map(Some)
+        }
+        EntityLiveRowRef::Owned(row) => row
+            .snapshot_content
+            .as_deref()
+            .map(|snapshot| {
+                serde_json::from_str(snapshot).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        format!("staged entity row snapshot is not valid JSON: {error}"),
+                    )
+                })
             })
-        })
-        .transpose()
+            .transpose(),
+    }
 }
 
 fn entity_json_value(

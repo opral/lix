@@ -148,6 +148,78 @@ pub(crate) fn decode(
     })
 }
 
+/// Reconstructs the logical row object at a semantic boundary.
+///
+/// The durable current-state authority remains the typed key plus non-PK
+/// tuple. This allocation exists only for consumers (history and expression
+/// evaluation) whose public contract is still JSON-shaped; it is never read
+/// from or written back as a current-state snapshot.
+pub(crate) fn logical_value(
+    schema: &lix_schema::Schema,
+    entity_pk: &EntityPk,
+    native: &NativeRowSnapshot,
+) -> Result<JsonValue, LixError> {
+    use lix_schema::value_layout::BodyValue;
+
+    let body = decode(schema, native)?;
+    let JsonValue::Array(pk) = entity_pk.as_json_array_value()? else {
+        unreachable!("typed entity primary key always encodes as an array")
+    };
+    if pk.len() != schema.primary_key.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("native primary key arity mismatch for schema '{}'", schema.key),
+        ));
+    }
+    let value_columns = schema
+        .columns
+        .iter()
+        .filter(|column| !schema.primary_key.contains(&column.name))
+        .collect::<Vec<_>>();
+    if body.len() != value_columns.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("native row body arity mismatch for schema '{}'", schema.key),
+        ));
+    }
+    let mut object = serde_json::Map::with_capacity(schema.columns.len());
+    for (name, value) in schema.primary_key.iter().zip(pk) {
+        object.insert(name.clone(), value);
+    }
+    for (column, value) in value_columns.into_iter().zip(body) {
+        let value = match value {
+            BodyValue::Null => JsonValue::Null,
+            BodyValue::Text(value) => JsonValue::String(value),
+            BodyValue::Uuid(value) => JsonValue::String(value.to_string()),
+            BodyValue::Int8(value) => JsonValue::from(value),
+            BodyValue::Float8(value) => serde_json::Number::from_f64(value)
+                .map(JsonValue::Number)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("native row '{}.{}' contains non-finite float8", schema.key, column.name),
+                    )
+                })?,
+            BodyValue::Boolean(value) => JsonValue::Bool(value),
+            BodyValue::Jsonb(value) => value,
+            BodyValue::Timestamptz(value) => chrono::DateTime::from_timestamp_micros(value)
+                .map(|timestamp| {
+                    JsonValue::String(
+                        timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    )
+                })
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("native row '{}.{}' contains invalid timestamptz", schema.key, column.name),
+                    )
+                })?,
+        };
+        object.insert(column.name.clone(), value);
+    }
+    Ok(JsonValue::Object(object))
+}
+
 pub(crate) fn seed_schema(schema_key: &str) -> Result<&'static lix_schema::Schema, LixError> {
     static SCHEMAS: std::sync::OnceLock<std::collections::BTreeMap<String, lix_schema::Schema>> =
         std::sync::OnceLock::new();

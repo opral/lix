@@ -42,6 +42,16 @@ simulation_test!(schema_v1_seven_types_have_a_runnable_entity_surface, |sim| asy
     assert_eq!(values[4], Value::Boolean(true));
     assert_eq!(values[5], Value::Json(json!({"answer": 42}).into()));
     assert!(matches!(values[6], Value::Timestamp(_)));
+
+    let updated = session
+        .execute(
+            "UPDATE seven_type_probe SET count = 43 WHERE label = 'ready' RETURNING count",
+            &[],
+        )
+        .await
+        .expect("native seven-type UPDATE should retain its typed source row");
+    assert_eq!(updated.rows_affected(), 1);
+    assert_rows_eq(updated, vec![vec![Value::Integer(43)]]);
 });
 
 simulation_test!(timestamptz_is_native_and_current_timestamp_is_stable, |sim| async move {

@@ -318,6 +318,7 @@ impl MaterializedHotStateBatch {
         retain_by_mask(&mut self.branch_ids, &mask);
         retain_by_mask(&mut self.entity_pks, &mask);
         retain_by_mask(&mut self.snapshot_content, &mask);
+        retain_by_mask(&mut self.native_snapshot, &mask);
         retain_by_mask(&mut self.metadata, &mask);
         retain_by_mask(&mut self.deleted, &mask);
         retain_by_mask(&mut self.created_at, &mask);
@@ -1893,6 +1894,32 @@ mod batch_tests {
             filtered.row(0).schema_key().as_ptr(),
             filtered.row(499).schema_key().as_ptr()
         );
+    }
+
+    #[test]
+    fn filtering_compacts_native_snapshots_with_their_authenticated_rows() {
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(3);
+        for (ordinal, name) in ["drop", "keep-a", "keep-b"].into_iter().enumerate() {
+            builder.push_owned(row(EntityPk::single(name)));
+            builder.set_native_snapshot(
+                ordinal,
+                NativeRowSnapshot {
+                    layout_id: [ordinal as u8; 32],
+                    owner_digest: [(ordinal + 10) as u8; 32],
+                    body: Bytes::from(vec![ordinal as u8]),
+                },
+            );
+        }
+
+        let filtered = builder
+            .finish()
+            .filter(|row| row.entity_pk() != &EntityPk::single("drop"), None);
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered.row(0).entity_pk(), &EntityPk::single("keep-a"));
+        assert_eq!(filtered.row(0).native_snapshot().unwrap().body.as_ref(), &[1]);
+        assert_eq!(filtered.row(1).entity_pk(), &EntityPk::single("keep-b"));
+        assert_eq!(filtered.row(1).native_snapshot().unwrap().body.as_ref(), &[2]);
     }
 
     #[test]

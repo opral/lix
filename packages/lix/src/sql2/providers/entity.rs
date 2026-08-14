@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 #[cfg(test)]
 use datafusion::arrow::array::Array;
 use datafusion::arrow::array::{
@@ -24,7 +25,6 @@ use serde_json::Value as JsonValue;
 
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
-use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
 use crate::hot_state::MaterializedHotStateBatch;
 #[cfg(test)]
@@ -439,22 +439,14 @@ impl EntitySpec {
     ) -> Result<PlannedDml> {
         reject_read_only_entity_surface(&self.spec.schema_key, "UPDATE")?;
         let (schema, mut request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
-        // UPDATE needs the complete source snapshot even when the public
-        // entity schema has no projected properties (for example, a
-        // metadata-only update on a propertyless schema). Keep that internal
-        // dependency on the retained live-state scan rather than exposing a
-        // raw snapshot column through SQL.
-        if !request
+        // Schema-v1 UPDATE owns the authenticated scalar tuple. The public
+        // table schema still contains the historical snapshot system column,
+        // but asking current-state materialization for it would turn a native
+        // row into an absent JSON slot and silently remove the update source.
+        request
             .projection
             .columns
-            .iter()
-            .any(|column| column == "snapshot_content")
-        {
-            request
-                .projection
-                .columns
-                .push("snapshot_content".to_string());
-        }
+            .retain(|column| column != "snapshot_content");
         let batch_projection = EntityBatchProjection::for_request(&request);
         let update_snapshots = Arc::new(Mutex::new(BTreeMap::new()));
         let source = row_source(
@@ -480,8 +472,8 @@ impl EntitySpec {
                     .scan_batch(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                let filtered = apply_entity_batch_filters(rows, &row_filters)?;
-                capture_entity_update_snapshots(&filtered.rows, &update_snapshots)?;
+                let filtered = apply_entity_batch_filters(&spec, rows, &row_filters)?;
+                capture_entity_update_snapshots(&spec, &filtered.rows, &update_snapshots)?;
                 entity_record_batch(&spec, schema, &filtered.rows, batch_projection)
             },
         );
@@ -557,20 +549,27 @@ struct EntityUpdateSnapshotKey {
     branch_id: String,
 }
 
-type EntityUpdateSnapshots = Arc<Mutex<BTreeMap<EntityUpdateSnapshotKey, SharedStr>>>;
+type EntityUpdateSnapshots = Arc<Mutex<BTreeMap<EntityUpdateSnapshotKey, JsonValue>>>;
 
 fn capture_entity_update_snapshots(
+    spec: &EntitySurfaceSpec,
     rows: &MaterializedHotStateBatch,
     snapshots: &EntityUpdateSnapshots,
 ) -> Result<()> {
     let mut captured = BTreeMap::new();
     for row in rows.iter() {
-        let snapshot = row.snapshot_content().cloned().ok_or_else(|| {
+        let native = row.native_snapshot().ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "UPDATE entity surface source row for schema '{}' has no snapshot",
+                "Schema v1 current-state row '{}' is missing its native scalar tuple",
                 row.schema_key()
             ))
         })?;
+        let snapshot = crate::native_row::logical_value(
+            &spec.native_schema,
+            row.entity_pk(),
+            native,
+        )
+        .map_err(lix_error_to_datafusion_error)?;
         let key = EntityUpdateSnapshotKey {
             entity_pk: row.entity_pk().clone(),
             branch_id: if row.global() {
@@ -750,7 +749,7 @@ impl TableSpec for EntitySpec {
                     // Before `row_filters` run: this is the row count a
                     // predicate without an indexed access path pays for.
                     record_rows_examined(rows.len());
-                    let filtered = apply_entity_batch_filters(rows, &row_filters)?;
+                    let filtered = apply_entity_batch_filters(&spec, rows, &row_filters)?;
                     entity_record_batch(&spec, schema, &filtered.rows, batch_projection)
                 },
             ),
@@ -802,7 +801,7 @@ impl TableSpec for EntitySpec {
                     .scan_batch(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                let filtered = apply_entity_batch_filters(rows, &row_filters)?;
+                let filtered = apply_entity_batch_filters(&spec, rows, &row_filters)?;
                 entity_record_batch(&spec, schema, &filtered.rows, batch_projection)
             },
         );
@@ -1628,11 +1627,7 @@ fn entity_update_stage_rows_from_batch(
                     spec.schema_key
                 ))
             })?;
-        let mut snapshot = parse_snapshot_value(snapshot_content.as_ref()).map_err(|error| {
-            DataFusionError::Execution(format!(
-                "UPDATE entity surface source snapshot is invalid: {error}"
-            ))
-        })?;
+        let mut snapshot = snapshot_content.clone();
         let object = snapshot.as_object_mut().ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "UPDATE entity surface expected object snapshot for schema '{}'",
@@ -3232,15 +3227,12 @@ fn apply_entity_row_filters(
 }
 
 fn apply_entity_batch_filters(
+    spec: &EntitySurfaceSpec,
     rows: MaterializedHotStateBatch,
     filters: &[EntityRowFilter],
 ) -> Result<FilteredEntityBatch> {
     if filters.is_empty() {
         return Ok(FilteredEntityBatch { rows });
-    }
-    let mut filter_columns = BTreeSet::new();
-    for filter in filters {
-        filter.collect_filter_columns(&mut filter_columns);
     }
     // The batch is compacted in place. Rebuilding it row by row cloned every
     // surviving row's shared identity and snapshot buffers and then dropped
@@ -3252,33 +3244,25 @@ fn apply_entity_batch_filters(
             if failure.is_some() {
                 return false;
             }
-            let Some(snapshot_content) = row.snapshot_content().map(AsRef::<str>::as_ref) else {
-                return false;
+            let native = match row.native_snapshot() {
+                Some(native) => native,
+                None => {
+                    failure = Some(DataFusionError::Execution(format!(
+                        "Schema v1 current-state row '{}' is missing its native scalar tuple",
+                        row.schema_key()
+                    )));
+                    return false;
+                }
             };
-            // The predicate reads a handful of named columns. Materializing the
-            // whole snapshot map here charged every *scanned* row for a DOM the
-            // predicate never looked at; the projection below decodes the
-            // *surviving* rows on its own streaming path.
-            //
-            // This DOM is partial by construction and is deliberately NOT
-            // carried forward to projection as a parsed-snapshot side column --
-            // see `parse_snapshot_filter_columns`, which says the same thing.
-            let snapshot = match parse_snapshot_filter_columns(snapshot_content, &filter_columns) {
-                Ok(snapshot) => snapshot,
+            let decoded = match crate::native_row::decode(&spec.native_schema, native) {
+                Ok(decoded) => decoded,
                 Err(error) => {
-                    failure = Some(DataFusionError::External(Box::new(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "entity scan filter could not parse snapshot_content for schema '{}' entity_pk '{:?}': {error}",
-                            row.schema_key(),
-                            row.entity_pk()
-                        ),
-                    ))));
+                    failure = Some(lix_error_to_datafusion_error(error));
                     return false;
                 }
             };
             for filter in filters {
-                match filter.matches_snapshot(Some(&snapshot), row.schema_key()) {
+                match filter.matches_native(spec, row.entity_pk(), &decoded) {
                     Ok(true) => {}
                     Ok(false) => return false,
                     Err(error) => {
@@ -3295,6 +3279,114 @@ fn apply_entity_batch_filters(
         return Err(failure);
     }
     Ok(FilteredEntityBatch { rows })
+}
+
+impl EntityRowFilter {
+    fn matches_native(
+        &self,
+        spec: &EntitySurfaceSpec,
+        entity_pk: &EntityPk,
+        body: &[lix_schema::value_layout::BodyValue],
+    ) -> Result<bool> {
+        match self {
+            Self::ColumnEq {
+                column,
+                column_type,
+                value,
+            } => Ok(entity_native_filter_value(spec, entity_pk, body, column)?
+                .is_some_and(|actual| {
+                    entity_filter_values_equal(&actual, value, *column_type)
+                })),
+            Self::ColumnIn {
+                column,
+                column_type,
+                values,
+            } => Ok(entity_native_filter_value(spec, entity_pk, body, column)?
+                .is_some_and(|actual| {
+                    values.iter().any(|expected| {
+                        entity_filter_values_equal(&actual, expected, *column_type)
+                    })
+                })),
+            Self::ColumnRange {
+                column,
+                op,
+                value,
+                ..
+            } => Ok(entity_native_filter_value(spec, entity_pk, body, column)?
+                .and_then(|actual| entity_filter_value_cmp(&actual, value))
+                .is_some_and(|ordering| op.matches(ordering))),
+            Self::And(left, right) => Ok(left.matches_native(spec, entity_pk, body)?
+                && right.matches_native(spec, entity_pk, body)?),
+            Self::Or(left, right) => Ok(left.matches_native(spec, entity_pk, body)?
+                || right.matches_native(spec, entity_pk, body)?),
+        }
+    }
+}
+
+fn entity_native_filter_value(
+    spec: &EntitySurfaceSpec,
+    entity_pk: &EntityPk,
+    body: &[lix_schema::value_layout::BodyValue],
+    column_name: &str,
+) -> Result<Option<EntityFilterValue>> {
+    use crate::entity_pk::EntityPkComponent;
+    use lix_schema::value_layout::BodyValue;
+
+    if let Some(pk_ordinal) = spec
+        .native_schema
+        .primary_key
+        .iter()
+        .position(|name| name == column_name)
+    {
+        return Ok(match entity_pk.components.get(pk_ordinal) {
+            Some(EntityPkComponent::Uuid(value)) => Some(EntityFilterValue::String(
+                uuid::Uuid::from_bytes(*value).to_string(),
+            )),
+            Some(EntityPkComponent::Integer(value)) => Some(EntityFilterValue::Integer(*value)),
+            Some(EntityPkComponent::String(value)) => {
+                Some(EntityFilterValue::String(value.to_string()))
+            }
+            Some(EntityPkComponent::Bytes(value)) => Some(EntityFilterValue::String(
+                base64::engine::general_purpose::STANDARD.encode(value),
+            )),
+            None => {
+                return Err(DataFusionError::Execution(format!(
+                    "native primary key arity mismatch for schema '{}'",
+                    spec.schema_key
+                )));
+            }
+        });
+    }
+
+    let value_ordinal = spec
+        .native_schema
+        .columns
+        .iter()
+        .filter(|column| !spec.native_schema.primary_key.contains(&column.name))
+        .position(|column| column.name == column_name)
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "unknown native filter column '{}.{}'",
+                spec.schema_key, column_name
+            ))
+        })?;
+    Ok(match body.get(value_ordinal) {
+        Some(BodyValue::Null) => None,
+        Some(BodyValue::Text(value)) => Some(EntityFilterValue::String(value.clone())),
+        Some(BodyValue::Uuid(value)) => {
+            Some(EntityFilterValue::String(value.to_string()))
+        }
+        Some(BodyValue::Int8(value)) => Some(EntityFilterValue::Integer(*value)),
+        Some(BodyValue::Float8(value)) => Some(EntityFilterValue::Number(*value)),
+        Some(BodyValue::Boolean(value)) => Some(EntityFilterValue::Boolean(*value)),
+        Some(BodyValue::Timestamptz(_)) | Some(BodyValue::Jsonb(_)) => None,
+        None => {
+            return Err(DataFusionError::Execution(format!(
+                "native row body arity mismatch for schema '{}'",
+                spec.schema_key
+            )));
+        }
+    })
 }
 struct FilteredEntityBatch {
     rows: MaterializedHotStateBatch,
@@ -3927,7 +4019,7 @@ mod tests {
     use crate::entity_pk::EntityPk as TestEntityPk;
     use crate::hot_state::{
         HotStateFilter, HotStateProjection, HotStateReader, HotStateRowFilter, HotStateScanRequest,
-        MaterializedHotStateBatch, MaterializedHotStateRow,
+        MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
     };
     use crate::sql2::catalog::{
         EntityColumnType, EntitySurfaceShape, derive_entity_surface_spec_from_schema,
@@ -4300,12 +4392,17 @@ mod tests {
     }
 
     #[test]
-    fn filtered_entity_scan_never_builds_a_candidate_snapshot_dom() {
+    fn filtered_entity_scan_reads_authenticated_native_cells_without_snapshot_dom() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
+                "x-lix-primary-key": ["/id"],
                 "type": "object",
-                "properties": { "body": { "type": "string" } }
+                "properties": {
+                    "id": { "type": "string" },
+                    "body": { "type": "string" }
+                },
+                "required": ["id", "body"]
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -4313,10 +4410,6 @@ mod tests {
         winner.untracked = true;
         let rejected = MaterializedHotStateRow {
             snapshot_content: Some(r#"{"body":"goodbye"}"#.into()),
-            ..live_row()
-        };
-        let tombstone = MaterializedHotStateRow {
-            snapshot_content: None,
             ..live_row()
         };
         let filter = super::EntityRowFilter::ColumnEq {
@@ -4327,19 +4420,45 @@ mod tests {
 
         super::reset_entity_snapshot_parse_count();
         super::reset_entity_snapshot_filter_parse_count();
-        let filtered = super::apply_entity_batch_filters(
-            live_batch(vec![winner, rejected, tombstone]),
-            &[filter],
-        )
+        let rows = vec![winner, rejected];
+        let native = rows
+            .iter()
+            .map(|row| {
+                let snapshot = serde_json::from_str(
+                    row.snapshot_content.as_deref().expect("test snapshot"),
+                )
+                .expect("test snapshot JSON");
+                crate::native_row::encode(
+                    &spec.native_schema,
+                    &row.entity_pk,
+                    row.branch_id.as_ref(),
+                    row.file_id.as_deref(),
+                    row.untracked,
+                    &snapshot,
+                )
+                .expect("test native row")
+            })
+            .collect::<Vec<_>>();
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(rows.len());
+        for (index, (row, native)) in rows.into_iter().zip(native).enumerate() {
+            builder.push_owned(row);
+            builder.set_native_snapshot(
+                index,
+                crate::hot_state::NativeRowSnapshot {
+                    layout_id: native.layout_id,
+                    owner_digest: native.owner_digest,
+                    body: native.body,
+                },
+            );
+        }
+        let rows = builder.finish();
+        let filtered = super::apply_entity_batch_filters(&spec, rows, &[filter])
         .expect("entity filter should select the matching row");
         assert_eq!(filtered.rows.len(), 1);
-        // Engagement: the streaming predicate parser observed both candidates
-        // carrying a snapshot. Without this, a zero full-parse count would
-        // read identically to a filter route that never ran at all.
         assert_eq!(
             super::entity_snapshot_filter_parse_count(),
-            2,
-            "the streaming predicate parser must observe every candidate"
+            0,
+            "native scalar predicates must not inspect a JSON snapshot"
         );
         assert_eq!(
             super::entity_snapshot_parse_count(),
