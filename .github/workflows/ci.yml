@@ -199,12 +199,16 @@ jobs:
           rustup target add wasm32-wasip2
           cargo package --locked -p lix-schema -p lix --no-verify
           package_archive="$(find target/package -maxdepth 1 -type f -name 'lix-[0-9]*.crate' | head -n 1)"
+          schema_archive="$(find target/package -maxdepth 1 -type f -name 'lix-schema-*.crate' | head -n 1)"
           tar -tf "$package_archive" |
             rg '^[^/]+/wit/lix-plugin\.wit$'
           packaged_lix="$(mktemp -d)"
+          packaged_schema="$(mktemp -d)"
           tar -xf "$package_archive" -C "$packaged_lix" --strip-components=1
+          tar -xf "$schema_archive" -C "$packaged_schema" --strip-components=1
           downstream="$(mktemp -d)"
           cargo init --lib --name downstream_lix_plugin "$downstream"
+          printf '\n[patch.crates-io]\nlix-schema = { path = "%s" }\n' "$packaged_schema" >> "$downstream/Cargo.toml"
           cargo add --manifest-path "$downstream/Cargo.toml" --path "$packaged_lix" lix
           cp packages/lix/examples/plugin_minimal.rs "$downstream/src/lib.rs"
           cargo build --manifest-path "$downstream/Cargo.toml" --target wasm32-wasip2
