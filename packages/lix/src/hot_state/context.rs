@@ -1026,7 +1026,7 @@ where
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
 
-        let mut storage_identities = Vec::with_capacity(request.rows.len().saturating_mul(2));
+        let mut storage_identities = Vec::with_capacity(request.rows.len());
         for row in &request.rows {
             if !visible_branch_ids.contains(&row.branch_id) {
                 continue;
@@ -1037,14 +1037,6 @@ where
                 row_pk: &row.row_pk,
                 file_id: row.file_id.as_deref(),
             });
-            if row.branch_id != GLOBAL_BRANCH_ID {
-                storage_identities.push(crate::hot_state::HotStateRowIdentityRef {
-                    branch_id: GLOBAL_BRANCH_ID,
-                    schema_key: row.schema_key.as_str(),
-                    row_pk: &row.row_pk,
-                    file_id: row.file_id.as_deref(),
-                });
-            }
         }
         storage_identities.sort_unstable();
         storage_identities.dedup();
@@ -1064,7 +1056,7 @@ where
         }
         let projection =
             crate::changelog::ChangeRecordProjection::from_columns(&request.projection.columns);
-        let current_batches = stream::iter(branch_ranges)
+        let mut current_batches = stream::iter(branch_ranges)
             .map(|range| {
                 let identities = &storage_identities[range.clone()];
                 let branch_id = identities[0].branch_id;
@@ -1115,9 +1107,81 @@ where
                 }
             }
         }
-        // `storage_identities` and branch ranges are sorted, and `buffered`
-        // preserves input order, so candidate slots are already identity
-        // ordered. Keep the assertion close to the binary-search contract.
+        // Resolve the branch-local plane first. A local value or tombstone is
+        // authoritative and suppresses the global row; only a genuinely
+        // absent (or retention-mismatched) local identity needs a global
+        // point. This preserves aligned overlay semantics while avoiding the
+        // eager 2*K multiget paid by every ordinary exact batch.
+        let mut global_identities = Vec::new();
+        for requested in &request.rows {
+            if requested.branch_id == GLOBAL_BRANCH_ID
+                || !visible_branch_ids.contains(&requested.branch_id)
+            {
+                continue;
+            }
+            let local_identity = crate::hot_state::HotStateRowIdentityRef {
+                branch_id: requested.branch_id.as_str(),
+                schema_key: requested.schema_key.as_str(),
+                row_pk: &requested.row_pk,
+                file_id: requested.file_id.as_deref(),
+            };
+            let local = candidate_slots
+                .binary_search_by_key(&local_identity, |candidate| candidate.0)
+                .ok()
+                .and_then(|index| {
+                    let (_, batch_index, slot) = candidate_slots[index];
+                    current_batches[batch_index].1.row(slot)
+                })
+                .filter(|row| current_row_matches_retention(*row, request.untracked));
+            if local.is_none() {
+                global_identities.push(crate::hot_state::HotStateRowIdentityRef {
+                    branch_id: GLOBAL_BRANCH_ID,
+                    ..local_identity
+                });
+            }
+        }
+        global_identities.sort_unstable();
+        global_identities.dedup();
+        if !global_identities.is_empty()
+            && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
+        {
+            let keys = global_identities
+                .iter()
+                .map(|identity| crate::tracked_state::TrackedStateKeyRef {
+                    schema_key: identity.schema_key,
+                    row_pk: identity.row_pk,
+                    file_id: identity.file_id,
+                })
+                .collect::<Vec<_>>();
+            let domain = request
+                .untracked
+                .map_or(HotStateReadDomain::Combined, |untracked| {
+                    if untracked {
+                        HotStateReadDomain::Untracked
+                    } else {
+                        HotStateReadDomain::Tracked
+                    }
+                });
+            let rows = self
+                .tracked_head
+                .reader(&self.store)
+                .load_projected_live_batch_refs_for_domain(
+                    GLOBAL_BRANCH_ID,
+                    global_control,
+                    &keys,
+                    &projection,
+                    domain,
+                )
+                .await?;
+            let batch_index = current_batches.len();
+            for (slot, identity) in global_identities.iter().copied().enumerate() {
+                if rows.row(slot).is_some() {
+                    candidate_slots.push((identity, batch_index, slot));
+                }
+            }
+            current_batches.push((0..global_identities.len(), rows));
+        }
+        candidate_slots.sort_unstable_by_key(|candidate| candidate.0);
         debug_assert!(candidate_slots.windows(2).all(|pair| pair[0].0 < pair[1].0));
 
         let mut builder = MaterializedHotStateBatchBuilder::with_capacity(request.rows.len());

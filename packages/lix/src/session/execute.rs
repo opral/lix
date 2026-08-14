@@ -1323,8 +1323,13 @@ where
             .is_none()
             .then(|| exact_schema_point_read_route(&statement, params))
             .flatten();
-        let late_file_content_read = (exact_filesystem_read.is_none()
+        let exact_schema_batch_read = (exact_filesystem_read.is_none()
             && exact_schema_point_read.is_none())
+            .then(|| exact_schema_batch_read_route(&statement, params))
+            .flatten();
+        let late_file_content_read = (exact_filesystem_read.is_none()
+            && exact_schema_point_read.is_none()
+            && exact_schema_batch_read.is_none())
             .then(|| late_materialized_lix_file_content_read(&statement))
             .flatten();
         let acknowledge_file_views = is_acknowledgeable_file_content_read(&statement, params)
@@ -1369,6 +1374,7 @@ where
                     acknowledge_file_views,
                     exact_filesystem_read,
                     exact_schema_point_read,
+                    exact_schema_batch_read,
                     late_file_content_read,
                     has_durable_runtime_function,
                 )
@@ -2327,6 +2333,7 @@ where
         acknowledge_file_views: bool,
         exact_filesystem_read: Option<ExactFilesystemRead>,
         exact_schema_point_read: Option<ExactSchemaPointRead>,
+        exact_schema_batch_read: Option<ExactSchemaBatchRead>,
         late_file_content_read: Option<LateMaterializedLixFileContentRead>,
         has_durable_runtime_function: bool,
     ) -> Result<
@@ -2488,6 +2495,46 @@ where
                         1,
                     ));
                 }
+            }
+        }
+        if let Some(exact) = exact_schema_batch_read {
+            let ctx = SessionSqlExecutionContext {
+                active_branch_id: &active_branch_id,
+                active_account_id: self.active_account_id(),
+                read_store: read_store.clone(),
+                hot_state: Arc::clone(&self.hot_state),
+                binary_cas: Arc::clone(&self.binary_cas),
+                branch_ctx: Arc::clone(&self.branch_ctx),
+                catalog_context: Arc::clone(&self.catalog_context),
+                sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+                functions: FunctionProviderHandle::system(),
+                plugin_host: self.plugin_host.clone(),
+                file_views: None,
+            };
+            let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
+            if let Some((spec, identities)) =
+                resolve_exact_schema_batch_read(catalog.as_ref(), &exact)?
+            {
+                let provider_rows_examined = identities.iter().collect::<BTreeSet<_>>().len();
+                let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+                    Arc::new(self.hot_state.reader(read_store.clone()));
+                let query = sql2::execute_exact_schema_batch_read(
+                    &spec,
+                    &active_branch_id,
+                    hot_state,
+                    identities,
+                    &exact.projected_columns,
+                    exact.output_columns,
+                )
+                .await?;
+                return Ok((
+                    sql2::SessionReadSqlResult {
+                        runtime_functions: None,
+                        query: sql2::SessionReadResult::Rows(query),
+                    },
+                    Vec::new(),
+                    provider_rows_examined,
+                ));
             }
         }
         let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
@@ -3922,6 +3969,15 @@ struct ExactSchemaPointRead {
     equalities: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ExactSchemaBatchRead {
+    table_name: String,
+    projected_columns: Vec<String>,
+    output_columns: Vec<String>,
+    identities: Vec<BTreeMap<String, Value>>,
+    order_by_columns: Vec<String>,
+}
+
 fn exact_schema_point_read_route(
     statement: &DataFusionStatement,
     params: &[Value],
@@ -3962,6 +4018,144 @@ fn exact_schema_point_read_route(
         output_columns,
         equalities,
     })
+}
+
+fn exact_schema_batch_read_route(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<ExactSchemaBatchRead> {
+    let simple = simple_single_table_select(statement)?;
+    if !simple.unqualified_unquoted_table
+        || simple.alias.is_some()
+        || simple.query.fetch.is_some()
+        || simple.query.limit_clause.is_some()
+    {
+        return None;
+    }
+    let mut projected_columns = Vec::with_capacity(simple.select.projection.len());
+    let mut output_columns = Vec::with_capacity(simple.select.projection.len());
+    for item in &simple.select.projection {
+        let (expression, alias) = match item {
+            SelectItem::UnnamedExpr(expression) => (expression, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+            _ => return None,
+        };
+        let column = exact_point_column(expression)?;
+        projected_columns.push(column.clone());
+        output_columns.push(alias.map_or(column, |alias| alias.value.clone()));
+    }
+    if projected_columns.is_empty() {
+        return None;
+    }
+    let order_by_columns = match &simple.query.order_by {
+        None => Vec::new(),
+        Some(order_by) if order_by.interpolate.is_none() => {
+            let OrderByKind::Expressions(expressions) = &order_by.kind else {
+                return None;
+            };
+            expressions
+                .iter()
+                .map(|order| {
+                    (order.with_fill.is_none()
+                        && order.options.asc != Some(false)
+                        && order.options.nulls_first.is_none())
+                    .then(|| exact_point_column(&order.expr))
+                    .flatten()
+                })
+                .collect::<Option<Vec<_>>>()?
+        }
+        Some(_) => return None,
+    };
+    let identities = collect_exact_schema_identity_rows(
+        simple.select.selection.as_ref()?,
+        params,
+    )?;
+    (identities.len() > 1).then_some(ExactSchemaBatchRead {
+        table_name: simple.table_name,
+        projected_columns,
+        output_columns,
+        identities,
+        order_by_columns,
+    })
+}
+
+fn collect_exact_schema_identity_rows(
+    expression: &Expr,
+    params: &[Value],
+) -> Option<Vec<BTreeMap<String, Value>>> {
+    match expression {
+        Expr::Nested(expression) => collect_exact_schema_identity_rows(expression, params),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            let mut rows = collect_exact_schema_identity_rows(left, params)?;
+            rows.extend(collect_exact_schema_identity_rows(right, params)?);
+            Some(rows)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let left = collect_exact_schema_identity_rows(left, params)?;
+            let right = collect_exact_schema_identity_rows(right, params)?;
+            (left.len().checked_mul(right.len())? <= 4096).then_some(())?;
+            let mut rows = Vec::with_capacity(left.len() * right.len());
+            for left in left {
+                for right in &right {
+                    let mut combined = left.clone();
+                    let mut compatible = true;
+                    for (column, value) in right {
+                        if combined
+                            .insert(column.clone(), value.clone())
+                            .is_some_and(|existing| existing != *value)
+                        {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                    if compatible {
+                        rows.push(combined);
+                    }
+                }
+            }
+            Some(rows)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let (column, value) = match (exact_point_column(left), exact_point_column(right)) {
+                (Some(column), None) => (column, exact_schema_literal(right, params)?),
+                (None, Some(column)) => (column, exact_schema_literal(left, params)?),
+                _ => return None,
+            };
+            Some(vec![BTreeMap::from([(column, value)])])
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } if !list.is_empty() => {
+            let column = exact_point_column(expr)?;
+            list.iter()
+                .map(|value| {
+                    Some(BTreeMap::from([(
+                        column.clone(),
+                        exact_schema_literal(value, params)?,
+                    )]))
+                })
+                .collect()
+        }
+        Expr::IsNull(expression) => {
+            let column = exact_point_column(expression)?;
+            Some(vec![BTreeMap::from([(column, Value::Null)])])
+        }
+        _ => None,
+    }
 }
 
 fn collect_exact_schema_equalities(
@@ -4078,6 +4272,114 @@ fn resolve_exact_schema_point_read(
         return Ok(None);
     };
     Ok(Some((spec, row_pk)))
+}
+
+fn resolve_exact_schema_batch_read(
+    catalog: &sql2::PublicCatalog,
+    exact: &ExactSchemaBatchRead,
+) -> Result<
+    Option<(
+        sql2::SchemaSurfaceSpec,
+        Vec<(crate::row_pk::RowPk, Option<String>)>,
+    )>,
+    LixError,
+> {
+    let Some(surface) = catalog.surface(&exact.table_name) else {
+        return Ok(None);
+    };
+    let sql2::PublicSurfaceKind::SchemaBase { schema_key } = &surface.kind else {
+        return Ok(None);
+    };
+    let spec = catalog.schema_spec(schema_key).cloned().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "exact schema batch route is missing schema metadata",
+        )
+    })?;
+    if exact
+        .projected_columns
+        .iter()
+        .any(|column| spec.visible_column(column).is_none())
+    {
+        return Ok(None);
+    }
+    let primary_key_columns = spec
+        .primary_key_paths
+        .iter()
+        .map(|path| match path.as_slice() {
+            [column] => Some(column.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "exact schema batch route requires top-level primary-key columns",
+            )
+        })?;
+    if !exact.order_by_columns.is_empty()
+        && exact.order_by_columns
+            != primary_key_columns
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect::<Vec<_>>()
+    {
+        return Ok(None);
+    }
+    let mut seen = BTreeSet::new();
+    let mut identities = Vec::with_capacity(exact.identities.len());
+    for identity in &exact.identities {
+        if identity.len() != primary_key_columns.len() + 1
+            || identity
+                .keys()
+                .any(|column| {
+                    column != "lixcol_file_id"
+                        && !primary_key_columns.contains(&column.as_str())
+                })
+        {
+            return Ok(None);
+        }
+        let file_id = match identity.get("lixcol_file_id") {
+            Some(Value::Null) => None,
+            Some(Value::Text(file_id)) => Some(file_id.clone()),
+            _ => return Ok(None),
+        };
+        let parts = primary_key_columns
+            .iter()
+            .zip(&spec.primary_key_component_types)
+            .map(|(column, component_type)| {
+                let value = identity.get(*column)?;
+                match (component_type, value) {
+                    (
+                        crate::row_pk::RowPkComponentType::Uuid
+                        | crate::row_pk::RowPkComponentType::String
+                        | crate::row_pk::RowPkComponentType::Bytes,
+                        Value::Text(value),
+                    ) => Some(value.clone()),
+                    (crate::row_pk::RowPkComponentType::Integer, Value::Integer(value)) => {
+                        Some(value.to_string())
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(parts) = parts else {
+            return Ok(None);
+        };
+        let Ok(row_pk) = crate::row_pk::RowPk::from_external_parts(
+            parts,
+            &spec.primary_key_component_types,
+        ) else {
+            return Ok(None);
+        };
+        if seen.insert((row_pk.clone(), file_id.clone())) {
+            identities.push((row_pk, file_id));
+        }
+    }
+    if !exact.order_by_columns.is_empty() {
+        identities.sort_unstable();
+    }
+    Ok(Some((spec, identities)))
 }
 
 fn exact_filesystem_read_route(
@@ -5168,6 +5470,113 @@ mod tests {
                 "unexpected fast-path match for {sql}"
             );
         }
+    }
+
+    #[test]
+    fn exact_schema_batch_route_preserves_composite_identity_expansion() {
+        let statement = sql2::parse_statement(
+            "SELECT tenant, revision, payload FROM batch_route_row \
+             WHERE tenant = $1 AND revision IN ($2, $3, $2) \
+               AND lixcol_file_id IS NULL \
+             ORDER BY tenant, revision",
+        )
+        .expect("batch route SQL should parse");
+        let route = exact_schema_batch_read_route(
+            &statement,
+            &[
+                Value::Text("docs".to_owned()),
+                Value::Integer(7),
+                Value::Integer(9),
+            ],
+        )
+        .expect("complete composite identities should route");
+        assert_eq!(route.identities.len(), 3, "request slots stay aligned");
+        assert_eq!(route.order_by_columns, ["tenant", "revision"]);
+        assert_eq!(route.identities[0]["tenant"], Value::Text("docs".to_owned()));
+        assert_eq!(route.identities[0]["revision"], Value::Integer(7));
+        assert_eq!(route.identities[0]["lixcol_file_id"], Value::Null);
+        assert_eq!(route.identities[1]["revision"], Value::Integer(9));
+        assert_eq!(route.identities[2]["revision"], Value::Integer(7));
+    }
+
+    #[tokio::test]
+    async fn exact_schema_batch_matches_relational_duplicate_missing_null_and_jsonb_semantics() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "batch_route_row",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "note", "type": "text", "nullable": true },
+                { "name": "payload", "type": "jsonb", "nullable": false }
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) \
+                 VALUES ('batch_route_row', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("register batch-route schema");
+        session
+            .execute(
+                "INSERT INTO batch_route_row (id, note, payload) VALUES \
+                 ('a', NULL, CAST('{\"rank\":1}' AS JSONB)), \
+                 ('b', 'present', CAST('{\"rank\":2}' AS JSONB))",
+                &[],
+            )
+            .await
+            .expect("seed batch-route rows");
+
+        let params = [
+            Value::Text("b".to_owned()),
+            Value::Text("missing".to_owned()),
+            Value::Text("a".to_owned()),
+            Value::Text("b".to_owned()),
+        ];
+        let exact = session
+            .execute(
+                "SELECT id, note, payload FROM batch_route_row \
+                 WHERE id IN ($1, $2, $3, $4) \
+                   AND lixcol_file_id IS NULL ORDER BY id",
+                &params,
+            )
+            .await
+            .expect("native batch route should execute");
+        let relational = session
+            .execute(
+                "SELECT row.id, row.note, row.payload FROM batch_route_row AS row \
+                 WHERE row.id IN ($1, $2, $3, $4) \
+                   AND row.lixcol_file_id IS NULL ORDER BY row.id",
+                &params,
+            )
+            .await
+            .expect("relational control should execute");
+        assert_eq!(exact, relational);
+        assert_eq!(exact.rows().len(), 2, "duplicates and misses emit no extra rows");
+        assert_eq!(exact.rows()[0].value("note").expect("note column"), &Value::Null);
+        assert_eq!(
+            exact.rows()[1].value("payload").expect("payload column"),
+            &Value::Json(serde_json::json!({"rank": 2}).into())
+        );
+
+        let (profiled, profile) = session
+            .execute_profiled(
+                "SELECT id, note, payload FROM batch_route_row \
+                 WHERE id IN ($1, $2, $3, $4) \
+                   AND lixcol_file_id IS NULL ORDER BY id",
+                &params,
+            )
+            .await
+            .expect("profiled native batch route should execute");
+        assert_eq!(profiled.rows().len(), 2);
+        assert_eq!(profile.scan_rows, 2, "only returned public rows are scanned");
+        assert_eq!(
+            profile.provider_rows_examined, 3,
+            "present, missing, and duplicate slots examine three unique exact identities"
+        );
     }
 
     #[tokio::test]
