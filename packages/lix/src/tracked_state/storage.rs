@@ -1100,6 +1100,46 @@ async fn load_current_state_values_from_descriptors(
         }
     }
     for (&source_id, manifest) in &columnar_manifests {
+        if crate::sql2::identify_authoritative_singleton_layout(&manifest.schema())?.is_some() {
+            for (descriptor, source, output_indices) in &columnar {
+                if source.source_id != source_id {
+                    continue;
+                }
+                let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
+                if manifest.content_digest()? != descriptor.content_digest
+                    || crate::row_columnar::row_group_set_id(owner, &manifest.namespace).as_bytes()
+                        != source.source_id
+                    || descriptor.first_key != descriptor.last_key
+                    || descriptor.row_count != 1
+                    || descriptor.source_row_offset != 0
+                    || source.part_index != 0
+                    || source.source_page_index != 0
+                    || manifest.row_count() != 1
+                {
+                    return Err(replacement_payload_error(
+                        "key-bound singleton current-state route disagrees with its authority",
+                    ));
+                }
+                let key = decode_key(&descriptor.first_key)?;
+                if key.schema_key != manifest.namespace || key.file_id.is_some() {
+                    return Err(replacement_payload_error(
+                        "key-bound singleton current-state key has the wrong owner",
+                    ));
+                }
+                for output_index in output_indices.iter().copied() {
+                    if encoded_keys[output_index].as_ref() == descriptor.first_key.as_slice() {
+                        values[output_index] = Some(TrackedStateIndexValue {
+                            change_id: change_id_from_packed_address(owner, 1),
+                            commit_id: owner,
+                            deleted: false,
+                            created_at: source.uniform_created_at,
+                            updated_at: source.uniform_updated_at,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
         let identity_column_index = crate::row_columnar::row_identity_column_index(manifest)
             .ok_or_else(|| {
                 replacement_payload_error("current-state columnar identity contract drifted")
@@ -3402,6 +3442,19 @@ async fn load_scoped_current_state_descriptor_rows(
                 row_group_set_id: source.source_id,
                 manifest_digest: descriptor.content_digest,
                 schema_key: manifest.namespace.clone(),
+                layout_fingerprint: manifest
+                    .metadata
+                    .get(crate::sql2::ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+                    .cloned()
+                    .ok_or_else(|| {
+                        replacement_payload_error(
+                            "columnar current-state manifest omitted its layout fingerprint",
+                        )
+                    })?,
+                key_bound_singleton: crate::sql2::identify_authoritative_singleton_layout(
+                    &manifest.schema(),
+                )?
+                .is_some(),
                 row_count: manifest.groups.iter().map(|group| group.row_count).sum(),
                 group_row_counts: manifest
                     .groups
@@ -6978,11 +7031,22 @@ pub(crate) fn validate_columnar_mutation_manifest(
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
 ) -> Result<(), LixError> {
     let owner = CommitId::new(uuid::Uuid::from_bytes(parts.owner_commit_id));
+    let singleton = crate::sql2::identify_authoritative_singleton_layout(&manifest.schema())?;
     if crate::row_columnar::row_group_set_id(owner, &parts.schema_key).as_bytes()
         != parts.row_group_set_id
         || manifest.content_digest()? != parts.manifest_digest
         || manifest.namespace != parts.schema_key
-        || crate::row_columnar::row_identity_column_index(manifest).is_none()
+        || manifest
+            .metadata
+            .get(crate::sql2::ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+            != Some(&parts.layout_fingerprint)
+        || singleton.is_some() != parts.key_bound_singleton
+        || (parts.key_bound_singleton
+            && (parts.row_count != 1
+                || parts.first_key != parts.last_key
+                || manifest.row_count() != 1))
+        || (!parts.key_bound_singleton
+            && crate::row_columnar::row_identity_column_index(manifest).is_none())
         || manifest
             .groups
             .iter()
@@ -7007,75 +7071,95 @@ fn decode_columnar_change_record(
 ) -> Result<crate::changelog::ChangeRecord, LixError> {
     use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 
-    let identity_column = batch
-        .column(batch.num_columns() - 1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| replacement_payload_error("columnar mutation identity is not UTF-8"))?;
-    if identity_column.is_null(row_index) {
-        return Err(replacement_payload_error(
-            "columnar mutation identity is null",
-        ));
-    }
-    let row_pk = RowPk::from_json_array_text(identity_column.value(row_index))
-        .map_err(|error| replacement_payload_error(&error.to_string()))?;
-    let mut snapshot = serde_json::Map::new();
-    for (column_index, field) in manifest
-        .fields
-        .iter()
-        .take(manifest.fields.len() - 1)
-        .enumerate()
-    {
-        let column = batch.column(column_index);
-        let value = if column.is_null(row_index) {
-            serde_json::Value::Null
-        } else {
-            match field.data_type {
-                crate::columnar_row_group::RowGroupDataType::String => {
-                    let value = column
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| replacement_payload_error("columnar string type drift"))?
-                        .value(row_index);
-                    if field.metadata.get("lix.value_type").map(String::as_str) == Some("json") {
-                        serde_json::from_str(value).map_err(|error| {
-                            replacement_payload_error(&format!(
-                                "columnar JSON value is invalid: {error}"
-                            ))
-                        })?
-                    } else {
-                        serde_json::Value::String(value.to_owned())
+    let singleton = crate::sql2::identify_authoritative_singleton_layout(&manifest.schema())?;
+    let (row_pk, snapshot) = if let Some(layout) = singleton {
+        if row_index != 0 {
+            return Err(replacement_payload_error(
+                "key-bound singleton requested a nonzero row",
+            ));
+        }
+        let key = decode_key(&parts.first_key)?;
+        if key.schema_key != parts.schema_key || key.file_id.is_some() {
+            return Err(replacement_payload_error(
+                "key-bound singleton inventory key has the wrong owner",
+            ));
+        }
+        let fields = layout
+            .reconstruct_full_ordered_field_map(&key.row_pk, batch)
+            .map_err(|error| replacement_payload_error(&error.message))?;
+        (key.row_pk, fields.into_iter().collect())
+    } else {
+        let identity_column = batch
+            .column(batch.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| replacement_payload_error("columnar mutation identity is not UTF-8"))?;
+        if identity_column.is_null(row_index) {
+            return Err(replacement_payload_error(
+                "columnar mutation identity is null",
+            ));
+        }
+        let row_pk = RowPk::from_json_array_text(identity_column.value(row_index))
+            .map_err(|error| replacement_payload_error(&error.to_string()))?;
+        let mut snapshot = serde_json::Map::new();
+        for (column_index, field) in manifest
+            .fields
+            .iter()
+            .take(manifest.fields.len() - 1)
+            .enumerate()
+        {
+            let column = batch.column(column_index);
+            let value = if column.is_null(row_index) {
+                serde_json::Value::Null
+            } else {
+                match field.data_type {
+                    crate::columnar_row_group::RowGroupDataType::String => {
+                        let value = column
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| replacement_payload_error("columnar string type drift"))?
+                            .value(row_index);
+                        if field.metadata.get("lix.value_type").map(String::as_str) == Some("json") {
+                            serde_json::from_str(value).map_err(|error| {
+                                replacement_payload_error(&format!(
+                                    "columnar JSON value is invalid: {error}"
+                                ))
+                            })?
+                        } else {
+                            serde_json::Value::String(value.to_owned())
+                        }
                     }
+                    crate::columnar_row_group::RowGroupDataType::Int64 => serde_json::Value::Number(
+                        column
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or_else(|| replacement_payload_error("columnar integer type drift"))?
+                            .value(row_index)
+                            .into(),
+                    ),
+                    crate::columnar_row_group::RowGroupDataType::Float64 => {
+                        let value = column
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or_else(|| replacement_payload_error("columnar number type drift"))?
+                            .value(row_index);
+                        serde_json::Number::from_f64(value)
+                            .map(serde_json::Value::Number)
+                            .ok_or_else(|| replacement_payload_error("columnar number is non-finite"))?
+                    }
+                    crate::columnar_row_group::RowGroupDataType::Boolean => serde_json::Value::Bool(
+                        column
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .ok_or_else(|| replacement_payload_error("columnar boolean type drift"))?
+                            .value(row_index),
+                    ),
                 }
-                crate::columnar_row_group::RowGroupDataType::Int64 => serde_json::Value::Number(
-                    column
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| replacement_payload_error("columnar integer type drift"))?
-                        .value(row_index)
-                        .into(),
-                ),
-                crate::columnar_row_group::RowGroupDataType::Float64 => {
-                    let value = column
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .ok_or_else(|| replacement_payload_error("columnar number type drift"))?
-                        .value(row_index);
-                    serde_json::Number::from_f64(value)
-                        .map(serde_json::Value::Number)
-                        .ok_or_else(|| replacement_payload_error("columnar number is non-finite"))?
-                }
-                crate::columnar_row_group::RowGroupDataType::Boolean => serde_json::Value::Bool(
-                    column
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or_else(|| replacement_payload_error("columnar boolean type drift"))?
-                        .value(row_index),
-                ),
-            }
-        };
-        snapshot.insert(field.name.clone(), value);
-    }
+            };
+            snapshot.insert(field.name.clone(), value);
+        }
+        (row_pk, snapshot)
+    };
     let snapshot = serde_json::to_string(&snapshot)
         .map_err(|error| replacement_payload_error(&error.to_string()))?;
     Ok(crate::changelog::ChangeRecord {
@@ -7579,6 +7663,22 @@ async fn load_columnar_mutation_values_encoded(
         .await?
         .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
     validate_columnar_mutation_manifest(&manifest, parts)?;
+    if parts.key_bound_singleton {
+        return encoded_keys
+            .iter()
+            .map(|encoded| {
+                Ok((encoded.as_ref() == parts.first_key.as_slice()).then(|| {
+                    TrackedStateIndexValue {
+                        change_id: change_id_from_packed_address(commit_id, 1),
+                        commit_id,
+                        deleted: false,
+                        created_at: parts.uniform_created_at,
+                        updated_at: parts.uniform_updated_at,
+                    }
+                }))
+            })
+            .collect();
+    }
     let identity_column_index = manifest.fields.len() - 1;
     let identities = encoded_keys
         .iter()
@@ -7693,6 +7793,49 @@ async fn load_columnar_owned_entries(
         .await?
         .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
     validate_columnar_mutation_manifest(&manifest, parts)?;
+    if parts.key_bound_singleton {
+        let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
+        let batch = crate::columnar_row_group::load_row_group_page(
+            store,
+            id,
+            &manifest,
+            0,
+            0,
+            &projection,
+        )
+        .await?;
+        let change_id = change_id_from_packed_address(commit_id, 1);
+        let change_record = decode_columnar_change_record(
+            &manifest,
+            &batch,
+            0,
+            parts,
+            change_id,
+            account_id,
+        )?;
+        return Ok(keys
+            .iter()
+            .map(|key| {
+                let encoded = encode_key_ref(*key);
+                (encoded == parts.first_key).then(|| LoadedCommitDeltaEntry {
+                    value: TrackedStateIndexValue {
+                        change_id,
+                        commit_id,
+                        deleted: false,
+                        created_at: parts.uniform_created_at,
+                        updated_at: parts.uniform_updated_at,
+                    },
+                    change_record: change_record.clone(),
+                    base_coordinate: Some(TrackedStateBaseCoordinate {
+                        base_commit_id: commit_id,
+                        group_index: 0,
+                        row_index: 0,
+                    }),
+                    selected_ref: false,
+                })
+            })
+            .collect::<Vec<_>>());
+    }
     let identity_column_index = manifest.fields.len() - 1;
     let mut grouped = BTreeMap::<(usize, usize), Vec<(usize, String)>>::new();
     for (output_index, key) in keys.iter().enumerate() {
@@ -9817,11 +9960,31 @@ async fn scan_columnar_mutation_values(
         .await?
         .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
     validate_columnar_mutation_manifest(&manifest, parts)?;
-    let identity_column_index = manifest.fields.len() - 1;
     let mut builder = DecodedCommitDeltaBatchBuilder::with_capacity(
         parts.row_count as usize,
         (parts.row_count as usize).div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
     );
+    if parts.key_bound_singleton {
+        let key = decode_key(&parts.first_key)?;
+        if key.schema_key != parts.schema_key || key.file_id.is_some() {
+            return Err(replacement_payload_error(
+                "key-bound singleton inventory key has the wrong owner",
+            ));
+        }
+        builder.push_columnar_row(
+            &parts.schema_key,
+            key.row_pk,
+            TrackedStateIndexValue {
+                change_id: change_id_from_packed_address(commit_id, 1),
+                commit_id,
+                deleted: false,
+                created_at: parts.uniform_created_at,
+                updated_at: parts.uniform_updated_at,
+            },
+        )?;
+        return Ok(builder.finish());
+    }
+    let identity_column_index = manifest.fields.len() - 1;
     let mut global_ordinal = 0usize;
     for group_index in 0..manifest.groups.len() {
         let batch = crate::columnar_row_group::load_row_group_batch(

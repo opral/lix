@@ -2419,7 +2419,8 @@ async fn stage_tracked_commit_delta_index(
                 )
                 .entered();
                 let state_rows = &*state_rows;
-                let order_certified = state_rows.certified_tracked_keys_strictly_ordered()
+                let order_certified = (state_row_indices.len() == 1
+                    || state_rows.certified_tracked_keys_strictly_ordered())
                     && state_row_indices.len() == state_rows.len()
                     && state_row_indices
                         .iter()
@@ -2723,11 +2724,13 @@ fn try_stage_lossless_columnar_mutations(
         {
             return Ok(None);
         }
-        let Ok(identity) = row.row_pk.as_single_string() else {
-            return Ok(None);
-        };
+        let identity = encode_key_ref(TrackedStateKeyRef {
+            schema_key: row.schema_key.as_str(),
+            file_id: None,
+            row_pk: row.row_pk,
+        });
         identity_digest.update(&(identity.len() as u64).to_le_bytes());
-        identity_digest.update(identity.as_bytes());
+        identity_digest.update(&identity);
     }
     let last = state_rows.row(*state_row_indices.last().expect("non-empty rows"));
     let mut page_first_keys = Vec::new();
@@ -2755,6 +2758,20 @@ fn try_stage_lossless_columnar_mutations(
         .as_bytes(),
         manifest_digest: encoded.manifest.content_digest()?,
         schema_key: first.schema_key.to_string(),
+        layout_fingerprint: encoded
+            .manifest
+            .metadata
+            .get(crate::sql2::ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+            .cloned()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "columnar mutation manifest omitted its registered layout fingerprint",
+                )
+            })?,
+        key_bound_singleton: encoded.manifest.metadata.contains_key(
+            crate::sql2::ROW_COLUMNAR_AUTHORITATIVE_SINGLETON_METADATA_KEY,
+        ),
         row_count: u32::try_from(state_row_indices.len()).map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -3926,7 +3943,8 @@ async fn stage_tracked_head(
         let can_publish_ordered_packed_current_base = ordered_addressable_commits
             .contains(&root.commit_id)
             && !is_checkpoint_publication
-            && state_row_indices.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+            && (state_row_indices.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+                || certified_columnar_parts.is_some())
             && certified_fresh_plugin_file_id.is_none()
             && !host_certified_live_increments.contains_key(&root.branch_id)
             && staged.selected_change_batches.is_empty()
@@ -5547,6 +5565,37 @@ fn prepare_row_columnar_write_sets(
     insert_selection: &PreparedInsertSelection,
     row_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<crate::hot_state::RowColumnarWriteSets, LixError> {
+    if state_rows.len() == 1 && insert_selection.covers_all(1) {
+        let row = state_rows.row(0);
+        if !row.untracked
+            && !row.global
+            && row.file_id.is_none()
+            && row.metadata.is_none()
+            && let (Some(commit_id), Some(snapshot), Some(schema)) = (
+                row.commit_id,
+                row.snapshot,
+                row_schema_catalog.and_then(|catalog| catalog.schema(row.schema_key)),
+            )
+            && let Ok(spec) = crate::sql2::derive_schema_surface_spec_from_schema(schema)
+        {
+            let encoded = crate::sql2::encode_authoritative_singleton_row_group(
+                &spec,
+                crate::sql2::RowColumnarRowRef {
+                    row_pk: row.row_pk,
+                    snapshot_bytes: snapshot.normalized().as_bytes(),
+                    snapshot_value: snapshot.value(),
+                },
+            )?;
+            let (row_group_set, locations) = encoded.into_parts();
+            debug_assert!(matches!(
+                locations,
+                crate::sql2::RowGroupLocations::Dense { row_count: 1 }
+            ));
+            let mut encoded = crate::hot_state::RowColumnarWriteSets::with_dense_state_rows(1);
+            encoded.insert((commit_id, row.schema_key.to_string()), row_group_set);
+            return Ok(encoded);
+        }
+    }
     if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS {
         return Ok(crate::hot_state::RowColumnarWriteSets::new());
     }

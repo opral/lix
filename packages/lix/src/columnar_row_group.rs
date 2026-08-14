@@ -207,9 +207,8 @@ impl RowGroupManifest {
             .sum()
     }
 
-    /// Only the codec tests reconstruct the full Arrow schema; every read path
-    /// projects columns through `row_group_projected_schema` instead.
-    #[cfg(test)]
+    /// Reconstructs the authenticated Arrow schema for physical-layout
+    /// validation that needs manifest metadata in addition to projected data.
     pub(crate) fn schema(&self) -> SchemaRef {
         let fields = self.fields.iter().map(|field| {
             Field::new(&field.name, field.data_type.to_arrow(), field.nullable)

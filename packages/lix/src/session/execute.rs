@@ -5987,6 +5987,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_singleton_uses_one_key_bound_typed_authority() {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone()).await.expect("initialize");
+        let engine = Engine::new(storage.clone()).await.expect("open");
+        let session = engine
+            .open_session_with_account(crate::SYSTEM_ACCOUNT_ID)
+            .await
+            .expect("session");
+        let branch_id = session.active_branch_id().await.expect("branch");
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "key_bound_singleton_probe",
+            "columns": [
+                { "name": "tenant", "type": "uuid", "nullable": false },
+                { "name": "id", "type": "int8", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+                { "name": "payload", "type": "jsonb", "nullable": false }
+            ],
+            "primary_key": ["tenant", "id"]
+        });
+        session.execute(
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+            &[Value::Text(schema.to_string())],
+        ).await.expect("register");
+        let tenant = uuid::Uuid::from_u128(17).to_string();
+        session.execute(
+            "INSERT INTO key_bound_singleton_probe (tenant, id, value, payload) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
+            &[
+                Value::Text(tenant.clone()),
+                Value::Integer(7),
+                Value::Text("native".to_owned()),
+                Value::Text(r#"{"declared":true}"#.to_owned()),
+            ],
+        ).await.expect("insert");
+
+        let head = engine
+            .load_branch_head_commit_id(&branch_id)
+            .await
+            .expect("head")
+            .expect("head exists");
+        let commit_id = crate::changelog::CommitId::parse_lix(&head, "singleton head")
+            .expect("canonical head");
+        let read = engine.storage().begin_read(StorageReadOptions::default())
+            .await.expect("read");
+        let authority = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+            .await.expect("manifest read").expect("manifest");
+        let parts = authority.mutations.columnar_parts.as_ref().expect("typed authority");
+        assert!(parts.key_bound_singleton);
+        assert_eq!(parts.first_key, parts.last_key);
+        assert!(authority.mutations.inline_part.is_empty());
+        assert!(authority.mutations.parts.is_empty());
+        let row_group = crate::columnar_row_group::load_row_group_manifest(
+            &read,
+            crate::hot_state::row_group_set_id(commit_id, "key_bound_singleton_probe"),
+        ).await.expect("row group read").expect("row group");
+        assert!(row_group.fields.iter().all(|field| {
+            field.name != "tenant"
+                && field.name != "id"
+                && field.name != sql2::ROW_COLUMNAR_ROW_PK_FIELD
+        }));
+
+        let current = session.execute(
+            "SELECT tenant, id, value, payload FROM key_bound_singleton_probe",
+            &[],
+        ).await.expect("current read");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current.rows()[0].get::<String>("tenant").unwrap(), tenant);
+        assert_eq!(current.rows()[0].get::<i64>("id").unwrap(), 7);
+        assert_eq!(current.rows()[0].get::<String>("value").unwrap(), "native");
+
+        let history = session.execute(
+            &format!("SELECT tenant, id, value FROM key_bound_singleton_probe_history('{head}')"),
+            &[],
+        ).await.expect("history read");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.rows()[0].get::<String>("tenant").unwrap(), tenant);
+        assert_eq!(history.rows()[0].get::<i64>("id").unwrap(), 7);
+        assert_eq!(history.rows()[0].get::<String>("value").unwrap(), "native");
+    }
+
+    #[tokio::test]
     async fn typed_columnar_base_preserves_current_diff_and_history_across_lifecycle_changes() {
         const ROW_COUNT: usize = 65_537;
         let storage = Memory::default();

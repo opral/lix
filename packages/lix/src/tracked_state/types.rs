@@ -206,6 +206,13 @@ pub(crate) struct ColumnarMutationPartSet {
     pub(crate) row_group_set_id: [u8; 16],
     pub(crate) manifest_digest: [u8; 32],
     pub(crate) schema_key: String,
+    /// Registered Schema-v1 layout authenticated by the owning commit.
+    /// Readers compare this with the immutable row-group manifest before
+    /// interpreting any positional scalar value.
+    pub(crate) layout_fingerprint: String,
+    /// The one-row physical form carries no PK value column. Its sole key is
+    /// the authenticated `first_key == last_key` inventory entry below.
+    pub(crate) key_bound_singleton: bool,
     pub(crate) row_count: u32,
     pub(crate) group_row_counts: Vec<u32>,
     #[musli(bytes)]
