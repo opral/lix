@@ -678,7 +678,7 @@ where
     /// paths and audit fields are derived during staging, so applying SQL
     /// assignments to the pre-image would produce stale `RETURNING *` values.
     /// Scan the complete directory graph for the relevant branch scope, then
-    /// select the requested identitys in write-row order.
+    /// select the requested identities in write-row order.
     async fn returning_post_image(
         &self,
         write_ctx: &SqlWriteContext<R>,
@@ -3532,7 +3532,7 @@ mod tests {
         .expect("recursive directory delete should plan");
 
         assert_eq!(count, 4);
-        let identitys = rows
+        let identities = rows
             .iter()
             .map(|row| {
                 (
@@ -3543,7 +3543,7 @@ mod tests {
                 )
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(identitys.len(), rows.len());
+        assert_eq!(identities.len(), rows.len());
         assert_eq!(rows.len(), 5);
     }
 

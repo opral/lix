@@ -682,7 +682,7 @@ mod tests {
                     .await
             })
             .await
-            .expect_err("duplicate transition identitys are rejected");
+            .expect_err("duplicate transition identities are rejected");
         assert_eq!(duplicate.code, LixError::CODE_CONSTRAINT_VIOLATION);
         assert_eq!(value(&session, "typed").await.as_deref(), Some("after"));
 
@@ -936,7 +936,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("file identitys read");
+            .expect("file identities read");
         let file_id = |path: &str| {
             files
                 .rows()

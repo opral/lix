@@ -37,7 +37,7 @@ pub(crate) fn branch_descriptor_tombstone_row(branch_id: &str) -> TransactionWri
     let mut row = branch_descriptor_stage_row(branch_id, "", false);
     row.row_pk = Some(
         RowPk::uuid_from_canonical(branch_id)
-            .expect("branch tombstones target validated UUID identitys"),
+            .expect("branch tombstones target validated UUID identities"),
     );
     row.snapshot = None;
     row

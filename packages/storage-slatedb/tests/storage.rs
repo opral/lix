@@ -10,7 +10,7 @@ use lix::integration::Engine;
 use lix::storage::conformance::{
     StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
 };
-use lix::{LixError, Value};
+use lix::{LixError, Value, open_lix};
 use lix_storage_slatedb::{
     SlateDB, SlateDBCacheOptions, SlateDBFactory, SlateDBObjectStoreOptions,
 };
@@ -144,29 +144,31 @@ async fn checkpointed_state_survives_undo_redo_and_cold_reopen_on_slatedb() {
     let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
     let path = temp_dir.path().join("undo-redo.slatedb");
     let storage = SlateDB::open(&path).expect("open SlateDB storage");
-    Engine::initialize(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("initialize SlateDB storage");
-    let engine = Engine::new(storage.clone()).await.expect("open engine");
-    let branch_id = undo_redo_checkpoint::stage_checkpointed_a_and_undo_b(&engine).await;
-    drop(engine);
+        .expect("open repository");
+    let branch_id = undo_redo_checkpoint::stage_checkpointed_a_and_undo_b(&lix).await;
+    drop(lix);
     storage.flush().await.expect("flush undo state");
     drop(storage);
 
     let storage = SlateDB::open(&path).expect("reopen SlateDB after undo");
-    let engine = Engine::new(storage.clone())
+    let lix = open_lix()
+        .with_storage(storage.clone())
         .await
-        .expect("reopen engine after undo");
-    undo_redo_checkpoint::assert_cold_undo_then_redo(&engine, branch_id.clone()).await;
-    drop(engine);
+        .expect("reopen repository after undo");
+    undo_redo_checkpoint::assert_cold_undo_then_redo(&lix, branch_id.clone()).await;
+    drop(lix);
     storage.flush().await.expect("flush redo state");
     drop(storage);
 
     let storage = SlateDB::open(&path).expect("reopen SlateDB after redo");
-    let engine = Engine::new(storage)
+    let lix = open_lix()
+        .with_storage(storage)
         .await
-        .expect("reopen engine after redo");
-    undo_redo_checkpoint::assert_cold_redo(&engine, branch_id).await;
+        .expect("reopen repository after redo");
+    undo_redo_checkpoint::assert_cold_redo(&lix, branch_id).await;
 }
 
 #[cfg(any())]

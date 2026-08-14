@@ -30,7 +30,7 @@ use crate::sql2::catalog::{
 #[cfg(test)]
 use crate::sql2::row_batch::row_snapshot;
 use crate::sql2::row_batch::{
-    RowExactBatchRequest, RowExactRowRequest, RowProjection, RowRowSelection,
+    RowExactBatchRequest, RowExactRowRequest, RowProjection, RowSelection,
     RowScanFilter, RowScanRequest, RowStateSlot, exact_forktree, exact_transaction,
     scan_slots_forktree, scan_slots_transaction,
 };
@@ -251,9 +251,9 @@ where
 {
     async fn authenticated_zero_projection_count(
         &self,
-        request: &EntityScanRequest,
+        request: &RowScanRequest,
     ) -> Result<Option<usize>> {
-        if request.filter.rows != EntityRowSelection::All
+        if request.filter.rows != RowSelection::All
             || request.filter.include_tombstones
             || request.filter.untracked.is_some()
             || !request.filter.file_ids.is_empty()
@@ -263,7 +263,7 @@ where
         {
             return Ok(None);
         }
-        let (lower, upper) = crate::sql2::entity_batch::schema_bounds(request)
+        let (lower, upper) = crate::sql2::row_batch::schema_bounds(request)
             .map_err(lix_error_to_datafusion_error)?;
         let count = if let Some(state_view) = &self.state_view {
             if request.filter.branch_ids[0] != state_view.branch_id() {
@@ -1660,7 +1660,7 @@ fn apply_exact_row_pk_filters(
 ) -> Result<()> {
     if let Some(row_pks) = row_pks_from_primary_key_filters(spec, filters)? {
         if row_pks.is_empty() {
-            request.filter.rows = RowRowSelection::None;
+            request.filter.rows = RowSelection::None;
         }
         request.filter.row_pks = row_pks;
     }
@@ -1685,7 +1685,7 @@ fn exact_file_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<Option<Str
 fn apply_exact_file_id_filters(request: &mut RowScanRequest, filters: &[Expr]) -> Result<()> {
     if let Some(file_ids) = exact_file_ids_from_filters(filters)? {
         if file_ids.is_empty() {
-            request.filter.rows = RowRowSelection::None;
+            request.filter.rows = RowSelection::None;
         }
         if let [file_id] = file_ids.as_slice() {
             request.filter.file_ids = vec![
@@ -1699,7 +1699,7 @@ fn apply_exact_file_id_filters(request: &mut RowScanRequest, filters: &[Expr]) -
 }
 
 fn exact_row_batch_request(request: &RowScanRequest) -> Option<RowExactBatchRequest> {
-    if !matches!(request.filter.rows, RowRowSelection::All)
+    if !matches!(request.filter.rows, RowSelection::All)
         || !request.filter.constraints.is_empty()
         || request.filter.row_pks.is_empty()
     {
@@ -1757,7 +1757,7 @@ fn exact_branch_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>
 fn apply_exact_branch_id_filter(request: &mut RowScanRequest, branch_ids: Option<Vec<String>>) {
     if let Some(branch_ids) = branch_ids {
         if branch_ids.is_empty() {
-            request.filter.rows = RowRowSelection::None;
+            request.filter.rows = RowSelection::None;
         }
         request.filter.branch_ids = branch_ids;
     }
@@ -2548,10 +2548,10 @@ fn row_pks_from_primary_key_parts(
         return None;
     }
 
-    let mut identitys = BTreeSet::from([Vec::<String>::new()]);
+    let mut identities = BTreeSet::from([Vec::<String>::new()]);
     for column in primary_key_columns {
         let values = parts.get(*column)?;
-        identitys = identitys
+        identities = identities
             .into_iter()
             .flat_map(|prefix| {
                 values.iter().map(move |value| {
@@ -2562,7 +2562,7 @@ fn row_pks_from_primary_key_parts(
             })
             .collect();
     }
-    identitys
+    identities
         .into_iter()
         .map(|parts| RowPk::from_external_parts(parts, component_types))
         .collect::<std::result::Result<BTreeSet<_>, _>>()
@@ -2704,7 +2704,7 @@ fn direct_row_batch_eligible(
     row_filters: &[RowRowFilter],
 ) -> bool {
     !schema.fields().is_empty()
-        && matches!(request.filter.rows, RowRowSelection::All)
+        && matches!(request.filter.rows, RowSelection::All)
         && !request.filter.include_tombstones
         && request.filter.file_ids.is_empty()
         && row_filters.is_empty()
@@ -4544,13 +4544,13 @@ mod tests {
             &[]
         ));
         request.filter.file_ids.clear();
-        request.filter.rows = RowRowSelection::None;
+        request.filter.rows = RowSelection::None;
         assert!(!direct_row_batch_eligible(
             &payload_schema,
             &request,
             &[]
         ));
-        request.filter.rows = RowRowSelection::All;
+        request.filter.rows = RowSelection::All;
         assert!(!direct_row_batch_eligible(&system_schema, &request, &[]));
         assert!(!direct_row_batch_eligible(
             &Schema::empty(),

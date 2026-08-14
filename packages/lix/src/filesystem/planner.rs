@@ -1648,7 +1648,7 @@ fn append_partial_state_row(
     let derived_row_pk = row_pk.map(|value| {
         if snapshot.is_none() {
             RowPk::uuid_from_canonical(&value)
-                .expect("filesystem tombstones target validated UUID identitys")
+                .expect("filesystem tombstones target validated UUID identities")
         } else {
             // These builders are schema-aware: filesystem descriptor and
             // materialization IDs are declared UUID primary keys. Preserve an

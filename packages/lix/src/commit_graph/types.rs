@@ -88,7 +88,7 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError>;
 
-    /// Returns commit identitys pinned by authenticated ForkTree snapshot
+    /// Returns commit identities pinned by authenticated ForkTree snapshot
     /// selectors. Recovery, checkpoint, undo, redo, and tombstone selectors
     /// are physical roots; no legacy checkpoint JSON row is consulted.
     async fn snapshot_roots(&mut self) -> Result<Vec<(String, CommitId)>, LixError>;

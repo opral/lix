@@ -39,7 +39,7 @@ pub(crate) use create_context::{
     validate_create_changes, validate_create_reservation,
 };
 pub(crate) use incremental::{
-    ArcByteSource, FileBytesSha256, SchemaAllowlist, StateRowRowSource,
+    ArcByteSource, FileBytesSha256, NativeStateRowSource, SchemaAllowlist,
     ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
     VecRowChangeSource, VecRowConflictSource, VecRowSource, build_file_update_splices,
     canonicalize_snapshot, certify_dense_fresh_file, drain_conflict_transition_resolutions,

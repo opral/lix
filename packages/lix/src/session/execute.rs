@@ -4239,7 +4239,7 @@ fn classify_execute_batch(
     // Distinct literal UPDATE statements have the same execution shape as a
     // homogeneous bound batch. Explicit transactions already normalize this
     // narrow SQL subset one statement at a time; recognize the complete batch
-    // here so the ordered mutation kernel can fold repeated identitys and use
+    // here so the ordered mutation kernel can fold repeated identities and use
     // the certified columnar route. Shapes that have not yet been lowered into
     // that mutation program retain their original sequential execution.
     if statements.len() >= 2

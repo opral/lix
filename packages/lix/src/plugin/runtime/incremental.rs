@@ -1272,7 +1272,7 @@ impl WasmRowSource for VecRowSource {
 /// constructs generic Wasm rows only for the page currently crossing the
 /// component boundary.
 #[derive(Debug)]
-pub(crate) struct StateRowRowSource {
+pub(crate) struct NativeStateRowSource {
     rows: Vec<StateRow>,
     branch_id: String,
     ordinals: VecDeque<u32>,
@@ -1280,7 +1280,7 @@ pub(crate) struct StateRowRowSource {
     state: VecSourceState,
 }
 
-impl StateRowRowSource {
+impl NativeStateRowSource {
     pub(crate) fn new(
         rows: Vec<StateRow>,
         ordinals: Vec<u32>,
@@ -1347,7 +1347,7 @@ impl StateRowRowSource {
     }
 }
 
-impl WasmRowSource for StateRowRowSource {
+impl WasmRowSource for NativeStateRowSource {
     fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowPage>, LixError> {
         if self.state.reached_eof {
             return Ok(None);

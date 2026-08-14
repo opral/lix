@@ -336,11 +336,43 @@ impl FilesystemStorage {
         &'a self,
         lix: &'a Lix<FilesystemStorage>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>> {
+        let startup = match FilesystemSyncStartup::begin(Arc::clone(&self.sync_lifecycle)) {
+            Ok(startup) => startup,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        let storage = self.clone();
+        let lix = lix.clone();
+        let (startup_tx, startup_rx) = oneshot::channel();
+        let worker = thread::Builder::new()
+            .name("lix-sdk-filesystem-start".to_string())
+            .spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .map_err(|error| {
+                        LixError::new(
+                            "LIX_FILESYSTEM_RUNTIME_ERROR",
+                            format!("failed to create filesystem startup runtime: {error}"),
+                        )
+                    })
+                    .and_then(|runtime| runtime.block_on(storage.open_supervisor(&lix)));
+                let result = result.map(|supervisor| startup.complete(supervisor));
+                let _ = startup_tx.send(result);
+            });
+        if let Err(error) = worker {
+            return Box::pin(async move {
+                Err(LixError::new(
+                    "LIX_FILESYSTEM_THREAD_ERROR",
+                    format!("failed to start filesystem initialization: {error}"),
+                ))
+            });
+        }
         Box::pin(async move {
-            let startup = FilesystemSyncStartup::begin(Arc::clone(&self.sync_lifecycle))?;
-            let supervisor = self.open_supervisor(lix).await?;
-            startup.complete(supervisor);
-            Ok(())
+            startup_rx.await.map_err(|_| {
+                LixError::new(
+                    "LIX_FILESYSTEM_THREAD_ERROR",
+                    "filesystem initialization stopped before reporting its result",
+                )
+            })?
         })
     }
 
@@ -2975,7 +3007,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let secondary = primary.open_another_session().await.unwrap();
+        let secondary = open_lix().with_storage(storage.clone()).await.unwrap();
         secondary
             .switch_branch(lix::SwitchBranchOptions {
                 branch_id: branch.id,

@@ -518,7 +518,7 @@ mod key_order_tests {
 
     fn key(row_pk: &str, file_id: &str) -> StateKey {
         StateKey {
-            schema_key: "app.row".to_owned(),
+            schema_key: "app_row".to_owned(),
             file_id: Some(file_id.to_owned()),
             row_pk: RowPk::single(row_pk),
         }

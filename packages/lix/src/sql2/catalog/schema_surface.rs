@@ -8,7 +8,7 @@ use crate::LixError;
 use crate::row_pk::RowPkComponentType;
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ROW_PK, HISTORY_COL_FILE_ID,
     HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY,
 };
@@ -358,7 +358,7 @@ pub(crate) fn schema_surface_schema(
 pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
     if shape == SchemaSurfaceShape::History {
         return vec![
-            json_field(HISTORY_COL_ENTITY_PK, false),
+            json_field(HISTORY_COL_ROW_PK, false),
             Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
             Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
             json_field(HISTORY_COL_METADATA, true),

@@ -37,10 +37,6 @@ server-protocol = [
 ]
 
 [[test]]
-name = "integration"
-path = "tests/integration/main.rs"
-
-[[test]]
 name = "execute_result_allocations"
 path = "tests/execute_result_allocations.rs"
 
@@ -57,16 +53,37 @@ name = "runtime_contract"
 path = "tests/runtime_contract.rs"
 
 [[test]]
-name = "semantic_merge"
-path = "tests/semantic_merge.rs"
-
-[[test]]
 name = "send_futures"
 path = "tests/send_futures.rs"
 
 [[test]]
 name = "schema_v1_public_smoke"
 path = "tests/schema_v1_public_smoke.rs"
+
+[[bench]]
+name = "diff_commands"
+path = "benches/diff_commands.rs"
+harness = false
+
+[[bench]]
+name = "undo_redo"
+path = "benches/undo_redo.rs"
+harness = false
+
+[[bench]]
+name = "row_default_values"
+path = "benches/row_default_values.rs"
+harness = false
+
+[[bench]]
+name = "row_pk_layout"
+path = "benches/row_pk_layout.rs"
+harness = false
+
+[[bench]]
+name = "registered_row_returning"
+path = "benches/registered_row_returning.rs"
+harness = false
 
 [[bench]]
 name = "profile_sql_result_streaming"
@@ -125,6 +142,8 @@ bytes = { version = "1", features = ["serde"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
+async-executor = "1"
+criterion = { package = "codspeed-criterion-compat", version = "4" }
 flate2 = "1"
 http-body-util = "0.1"
 lix_collaboration_test_support = { path = "../collaboration-test-support" }

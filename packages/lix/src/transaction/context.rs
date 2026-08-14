@@ -55,7 +55,7 @@ use crate::plugin::{
     PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentMatcher,
     PluginRowAuthorities, PluginRowAuthorityRange, PluginFileOwner, PluginObservation,
     PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntimeHost,
-    SchemaAllowlist, StateRowRowSource, ValidatedConflictTransition, ValidatedFileTransition,
+    SchemaAllowlist, NativeStateRowSource, ValidatedConflictTransition, ValidatedFileTransition,
     ValidatedSameLengthOutputSplice, VecRowChangeSource, VecRowConflictSource,
     VecRowSource, build_file_update_splices, canonicalize_snapshot,
     drain_conflict_transition_resolutions, drain_row_transition_edits,
@@ -492,7 +492,7 @@ impl TransactionMutationJournal {
         let &(start, end) = self.identity_offsets.last()?;
         Some(
             std::str::from_utf8(&self.identity_arena[start..end])
-                .expect("transaction journal identitys are appended from str"),
+                .expect("transaction journal identities are appended from str"),
         )
     }
 
@@ -910,7 +910,7 @@ where
         };
 
         // A complete-set journal is certified against the coherent opening
-        // snapshot. If this branch advanced, expose its identitys—with exact
+        // snapshot. If this branch advanced, expose its identities—with exact
         // current predecessor lifecycle—to the established stale-write
         // classifier and generic reconciliation lane. Unchanged-head commits
         // retain the zero-reconstruction direct path.
@@ -2740,7 +2740,7 @@ where
                 ),
             )
         })?;
-        let source = StateRowRowSource::new(
+        let source = NativeStateRowSource::new(
             rows,
             row_ordinals,
             limits,
@@ -5087,7 +5087,7 @@ where
                                     &row_rows,
                                     &row_ordinals,
                                 );
-                                let row_source = StateRowRowSource::new(
+                                let row_source = NativeStateRowSource::new(
                                     row_rows,
                                     row_ordinals,
                                     cold_limits,
@@ -7043,7 +7043,7 @@ where
     /// Applies a tracked-state transition resolved from two immutable commits.
     ///
     /// This is the internal counterpart to the public diff command. The
-    /// caller supplies typed identitys instead of user-facing `diff_id`
+    /// caller supplies typed identities instead of user-facing `diff_id`
     /// strings. The transaction's coherent opening head certifies the current
     /// side, so undo/redo does not need to reload visible live state after it
     /// has already read that exact historical root.
@@ -7267,7 +7267,7 @@ where
         drop(forktree_reader);
         drop(read);
         let branch_id = self.active_branch_id.clone();
-        let mut identitys = BTreeSet::new();
+        let mut identities = BTreeSet::new();
         let mut plans = Vec::with_capacity(selections.len());
         for (diff_id, sides) in selections {
             let before = sides
@@ -7292,7 +7292,7 @@ where
                     format!("diff_id '{diff_id}' joins changes for different rows"),
                 ));
             }
-            if !identitys.insert(identity.clone()) {
+            if !identities.insert(identity.clone()) {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     "diff command selection contains more than one row for the same row",

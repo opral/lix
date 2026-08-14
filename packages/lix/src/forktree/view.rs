@@ -915,7 +915,7 @@ where
     }
 
     /// Loads exact historical rows from the authenticated ForkTree state
-    /// owner. The transaction supplies the key identitys; the returned
+    /// owner. The transaction supplies the key identities; the returned
     /// ForkTree-owned row shape is a terminal merge-consumer value and never
     /// opens another reader or consults the superseded tracked-state reader.
     pub(crate) async fn load_state_rows_at_commit(
@@ -1102,7 +1102,7 @@ where
         Ok(
             stale_state_changes_between_commits_on_read(self, before, after, true)
                 .await?
-                .identitys,
+                .identities,
         )
     }
 
@@ -1227,7 +1227,7 @@ pub(crate) struct StaleStateChanges {
     /// Complete public historical changes, including authenticated write
     /// identity-only changes whose endpoint payloads are equal.
     pub(crate) complete: Vec<super::state::HistoricalStateDiffEntry>,
-    pub(crate) identitys: Vec<super::state::HistoricalStateIdentityChange>,
+    pub(crate) identities: Vec<super::state::HistoricalStateIdentityChange>,
 }
 
 async fn stale_state_changes_between_commits_on_read<R>(
@@ -1248,7 +1248,7 @@ where
         return Ok(StaleStateChanges {
             payload: Vec::new(),
             complete: Vec::new(),
-            identitys: Vec::new(),
+            identities: Vec::new(),
         });
     }
     let after_roots = view
@@ -1271,7 +1271,7 @@ where
         return Ok(StaleStateChanges {
             payload: Vec::new(),
             complete: Vec::new(),
-            identitys: Vec::new(),
+            identities: Vec::new(),
         });
     }
 
@@ -1306,7 +1306,7 @@ where
 
     let mut payload = Vec::new();
     let mut complete = Vec::new();
-    let mut identitys = Vec::new();
+    let mut identities = Vec::new();
     for ((key, before), after) in keys.into_iter().zip(before_rows).zip(after_rows) {
         let before = historical_state_row_from_point(key.clone(), before, include_global)?;
         let after = historical_state_row_from_point(key, after, include_global)?;
@@ -1331,7 +1331,7 @@ where
                     commit_id: row.commit_id,
                 }
             };
-            identitys.push(super::state::HistoricalStateIdentityChange {
+            identities.push(super::state::HistoricalStateIdentityChange {
                 key: row.key.clone(),
                 before: entry.before.as_ref().map(identity),
                 after: entry.after.as_ref().map(identity),
@@ -1341,7 +1341,7 @@ where
     Ok(StaleStateChanges {
         payload,
         complete,
-        identitys,
+        identities,
     })
 }
 

@@ -3,7 +3,7 @@
 //! A compiled component may be shared, but a mutable Component instance and
 //! its document handles belong to exactly one branch/file actor.  This cache
 //! deliberately keys path, incarnation, and plugin generation in addition to
-//! the file id: none of those identitys may be inferred from equal bytes.
+//! the file id: none of those identities may be inferred from equal bytes.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
@@ -30,7 +30,7 @@ const DEFAULT_MAX_DECODED_CHECKPOINT_BYTES: u64 = 96 * 1024 * 1024;
 // keeping each file actor's retained working set bounded.
 pub(crate) const DEFAULT_MAX_PLUGIN_FILE_HISTORY: usize = 1;
 
-/// Host-proven identitys for schemas whose primary keys are allocated by the
+/// Host-proven identities for schemas whose primary keys are allocated by the
 /// mutation create context. Successors retain sparse persistent overlays rather
 /// than cloning the complete document-sized set for every tiny edit.
 #[derive(Clone)]

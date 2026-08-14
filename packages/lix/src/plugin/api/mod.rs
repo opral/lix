@@ -1000,7 +1000,7 @@ pub trait Plugin: 'static {
     ///
     /// This is mandatory: the host may choose the cold route after eviction,
     /// process restart, or cache pressure. A format must therefore preserve
-    /// durable identitys without requiring hydrate followed by a second
+    /// durable identities without requiring hydrate followed by a second
     /// guest transition.
     fn cold_file_changed(update: &mut ColdUpdate<'_>, output: &mut Output<'_>) -> Result<()>;
 }

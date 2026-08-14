@@ -11693,7 +11693,7 @@ mod tests {
         }
 
         let batch = builder.finish();
-        let entity_column = batch.entity_column_ptr();
+        let row_column = batch.row_column_ptr();
         let prepared = super::prepare_lix_file_rows(batch, &super::FilePathPredicate::All)
             .expect("bulk descriptor/blob batch should prepare");
 
@@ -11701,8 +11701,8 @@ mod tests {
         assert_eq!(prepared.blob_rows.len(), FILE_COUNT);
         assert_eq!(prepared.live_rows.batches.len(), 1);
         assert_eq!(
-            prepared.live_rows.batch(0).entity_column_ptr(),
-            entity_column,
+            prepared.live_rows.batch(0).row_column_ptr(),
+            row_column,
             "preparation should retain the source batch instead of rebuilding row DTOs"
         );
         assert!(

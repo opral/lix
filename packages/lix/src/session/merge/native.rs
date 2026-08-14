@@ -856,7 +856,7 @@ mod tests {
             (change_id, StateCell::Tombstone, None),
             (change_id, StateCell::Tombstone, None),
         ])
-        .expect_err("duplicate payload identitys must fail closed");
+        .expect_err("duplicate payload identities must fail closed");
 
         assert!(error.message.contains("duplicate change id"));
     }

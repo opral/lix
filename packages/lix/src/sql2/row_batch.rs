@@ -40,7 +40,7 @@ pub(crate) struct RowScanFilter {
     pub(crate) untracked: Option<bool>,
     pub(crate) include_tombstones: bool,
     pub(crate) constraints: Vec<()>,
-    pub(crate) rows: RowRowSelection,
+    pub(crate) rows: RowSelection,
 }
 
 impl Default for RowScanFilter {
@@ -53,18 +53,18 @@ impl Default for RowScanFilter {
             untracked: None,
             include_tombstones: false,
             constraints: Vec::new(),
-            rows: RowRowSelection::All,
+            rows: RowSelection::All,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RowRowSelection {
+pub(crate) enum RowSelection {
     All,
     None,
 }
 
-impl Default for RowRowSelection {
+impl Default for RowSelection {
     fn default() -> Self {
         Self::All
     }
@@ -253,7 +253,7 @@ where
     F: FnMut(String, Option<Vec<u8>>, Option<Vec<u8>>) -> Fut,
     Fut: Future<Output = Result<Vec<RowStateSlot>, LixError>>,
 {
-    if request.limit == Some(0) || matches!(request.filter.rows, RowRowSelection::None) {
+    if request.limit == Some(0) || matches!(request.filter.rows, RowSelection::None) {
         return Ok(Vec::new());
     }
     let mut bounds_request = request.clone();

@@ -3206,7 +3206,7 @@ mod tests {
             true,
             6,
         );
-        file_tombstone.snapshot_content = Some(
+        file_tombstone.cell = crate::forktree::StateCell::Value(
             serde_json::json!({
                 "id": file_id,
                 "directory_id": null,
@@ -3222,7 +3222,7 @@ mod tests {
             true,
             7,
         );
-        directory_tombstone.snapshot_content = Some(
+        directory_tombstone.cell = crate::forktree::StateCell::Value(
             serde_json::json!({
                 "id": "01920000-0000-7000-8000-0000000000b2",
                 "parent_id": null,
@@ -3238,7 +3238,7 @@ mod tests {
             true,
             8,
         );
-        owner_tombstone.snapshot_content = Some("{}".into());
+        owner_tombstone.cell = crate::forktree::StateCell::Value("{}".into());
 
         let rows = ObservedStateRows::from_rows(
             SharedStr::from_static("commit-0"),

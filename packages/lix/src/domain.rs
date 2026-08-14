@@ -128,7 +128,7 @@ impl Domain {
         // Registered schemas are authoritative tracked ForkTree state. The
         // untracked state domain no longer exists, so projecting a caller's
         // legacy domain bit into two catalog domains would read the same
-        // tracked branch twice and manufacture duplicate schema identitys.
+        // tracked branch twice and manufacture duplicate schema identities.
         vec![Self::schema_catalog(self.branch_id.clone(), false)]
     }
 

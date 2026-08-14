@@ -170,7 +170,7 @@ impl ImmutableMutationJournalChunk {
             if previous_identity.is_some_and(|previous| previous >= value) {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "immutable mutation journal identitys are not strictly ordered",
+                    "immutable mutation journal identities are not strictly ordered",
                 ));
             }
             offsets.push((
@@ -2363,7 +2363,7 @@ impl TransactionWriteBuffer {
         for index in 0..batch.len() {
             batch.set_commit_id(index, Some(commit_id));
         }
-        let identitys = batch
+        let identities = batch
             .iter()
             .map(PreparedStateRowIdentity::from)
             .collect::<Vec<_>>();
@@ -2382,7 +2382,7 @@ impl TransactionWriteBuffer {
         else {
             unreachable!("intermediate row staging requires the identity index");
         };
-        if identitys
+        if identities
             .iter()
             .any(|identity| by_identity.contains_key(identity))
         {
@@ -2398,7 +2398,7 @@ impl TransactionWriteBuffer {
             insert_selection.push_not_insert();
         }
         rows.append(batch);
-        for (offset, identity) in identitys.into_iter().enumerate() {
+        for (offset, identity) in identities.into_iter().enumerate() {
             by_identity.insert(identity, RowSlot::State(start + offset));
         }
         commit.change_refs.add_change_count(count);
@@ -2537,11 +2537,11 @@ impl TransactionWriteBuffer {
                 AppendOnlyStage::Fallback(fallback_rows) => rows = fallback_rows,
             }
         }
-        let identitys = rows
+        let identities = rows
             .iter()
             .map(PreparedStateRowIdentity::from)
             .collect::<Vec<_>>();
-        let identitys_are_unique = validate_batch_row_identitys(&rows, &identitys)?;
+        let identitys_are_unique = validate_batch_row_identitys(&rows, &identities)?;
         self.ensure_identity_index(true)?;
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
@@ -2587,18 +2587,18 @@ impl TransactionWriteBuffer {
                 .filter_map(|(index, row)| row_is_insert(mode, row).then_some(index))
                 .collect::<Vec<_>>();
             insert_order.sort_unstable_by(|&left, &right| {
-                identitys[left]
-                    .cmp(&identitys[right])
+                identities[left]
+                    .cmp(&identities[right])
                     .then(left.cmp(&right))
             });
             let duplicate_in_batch = insert_order
                 .windows(2)
-                .find(|pair| identitys[pair[0]] == identitys[pair[1]])
+                .find(|pair| identities[pair[0]] == identities[pair[1]])
                 .map(|pair| pair[1]);
             let duplicate_staged = insert_order
                 .iter()
                 .copied()
-                .find(|&index| by_identity.contains_key(&identitys[index]));
+                .find(|&index| by_identity.contains_key(&identities[index]));
             if let Some(index) = duplicate_in_batch.into_iter().chain(duplicate_staged).min() {
                 return Err(duplicate_insert_identity_error(rows.row(index)));
             }
@@ -2642,7 +2642,7 @@ impl TransactionWriteBuffer {
         let mut inserted_destinations = Vec::with_capacity(insert_count);
         let mut latest_incoming_source_by_destination =
             HashMap::<usize, usize>::with_capacity(rows.len());
-        for (source_index, identity) in identitys.into_iter().enumerate() {
+        for (source_index, identity) in identities.into_iter().enumerate() {
             let row = rows.row(source_index);
             let is_insert = row_is_insert(mode, row);
             let existing_slot = by_identity.get(&identity).copied();
@@ -4060,11 +4060,11 @@ fn reorder_rows_by_source_permutation(
 
 fn validate_batch_row_identitys(
     rows: &PreparedStateBatch,
-    identitys: &[PreparedStateRowIdentity],
+    identities: &[PreparedStateRowIdentity],
 ) -> Result<bool, LixError> {
-    debug_assert_eq!(rows.len(), identitys.len());
-    if identitys.windows(2).all(|pair| pair[0] <= pair[1]) {
-        return validate_rows_in_identity_order(rows, identitys, 0..rows.len());
+    debug_assert_eq!(rows.len(), identities.len());
+    if identities.windows(2).all(|pair| pair[0] <= pair[1]) {
+        return validate_rows_in_identity_order(rows, identities, 0..rows.len());
     }
 
     // Irregular frontend batches share one dense ordering buffer rather than
@@ -4072,11 +4072,11 @@ fn validate_batch_row_identitys(
     // tiebreaker so equal-identity transitions retain their original order.
     let mut order = (0..rows.len()).collect::<Vec<_>>();
     order.sort_unstable_by(|&left, &right| {
-        identitys[left]
-            .cmp(&identitys[right])
+        identities[left]
+            .cmp(&identities[right])
             .then_with(|| left.cmp(&right))
     });
-    validate_rows_in_identity_order(rows, identitys, order)
+    validate_rows_in_identity_order(rows, identities, order)
 }
 
 enum BatchIdentityViolation<'a> {
@@ -4089,7 +4089,7 @@ enum BatchIdentityViolation<'a> {
 
 fn validate_rows_in_identity_order<'a>(
     rows: &'a PreparedStateBatch,
-    identitys: &[PreparedStateRowIdentity],
+    identities: &[PreparedStateRowIdentity],
     order: impl IntoIterator<Item = usize>,
 ) -> Result<bool, LixError> {
     let mut previous_identity = None::<&PreparedStateRowIdentity>;
@@ -4100,7 +4100,7 @@ fn validate_rows_in_identity_order<'a>(
 
     for index in order {
         let row = rows.row(index);
-        let identity = &identitys[index];
+        let identity = &identities[index];
         if previous_identity != Some(identity) {
             previous_identity = Some(identity);
             group_untracked = row.untracked;

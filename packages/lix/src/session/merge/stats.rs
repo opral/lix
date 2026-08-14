@@ -68,16 +68,16 @@ fn stats_from_sorted_plan(
 }
 
 fn identitys_are_strictly_sorted<'a>(
-    mut identitys: impl Iterator<Item = &'a crate::forktree::StateKey>,
+    mut identities: impl Iterator<Item = &'a crate::forktree::StateKey>,
     len: usize,
 ) -> bool {
     if len < 2 {
         return true;
     }
-    let Some(mut previous) = identitys.next() else {
+    let Some(mut previous) = identities.next() else {
         return true;
     };
-    for identity in identitys {
+    for identity in identities {
         if identity_cmp(previous, identity) != Ordering::Less {
             return false;
         }
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn ten_thousand_sorted_merge_picks_have_linear_stats_scan() {
         const ROW_COUNT: usize = 10_000;
-        let identitys = (0..ROW_COUNT)
+        let identities = (0..ROW_COUNT)
             .map(|index| crate::forktree::StateKey {
                 schema_key: "shared_schema".to_string(),
                 file_id: Some("shared_file".to_string()),
@@ -154,7 +154,7 @@ mod tests {
         let change_id = ChangeId::for_test_label("stats-change");
         let commit_id = CommitId::for_test_label("stats-commit");
         let source_diff = MergeDiff::from_entries_with_payloads(
-            identitys
+            identities
                 .iter()
                 .enumerate()
                 .map(|(index, identity)| {

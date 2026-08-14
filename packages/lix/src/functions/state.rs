@@ -111,7 +111,7 @@ where
         )
         .await
         .map_err(LixError::from)?;
-    let mut identitys = std::collections::BTreeSet::new();
+    let mut identities = std::collections::BTreeSet::new();
     for row in &rows {
         let state_key = state_row_key(row)?;
         if state_key.schema_key != KEY_VALUE_SCHEMA_KEY || state_key.file_id.is_some() {
@@ -126,7 +126,7 @@ where
                 format!("deterministic key-value row has an invalid identity: {error}"),
             )
         })?;
-        if !identitys.insert(key.to_owned()) {
+        if !identities.insert(key.to_owned()) {
             return Err(LixError::new(
                 LixError::CODE_STORAGE_ERROR,
                 format!("deterministic key-value row '{key}' has a duplicate identity"),

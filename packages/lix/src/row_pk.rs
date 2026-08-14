@@ -1064,7 +1064,7 @@ mod tests {
         assert!(actual_namespace.shares_buffer_with(&namespace));
         assert!(actual_entity.shares_buffer_with(&row));
 
-        let identitys = (0..10_000)
+        let identities = (0..10_000)
             .map(|_| {
                 RowPk::from_shared_external_parts(
                     [namespace.clone(), row.clone()],
@@ -1073,7 +1073,7 @@ mod tests {
                 .expect("two-component external identity")
             })
             .collect::<Vec<_>>();
-        for identity in &identitys {
+        for identity in &identities {
             let RowPkComponents::Shared(owner) = &identity.components else {
                 panic!("two components retain one final shared owner")
             };

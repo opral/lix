@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn typed_history_diff_merge_sources_have_no_json_hydration_calls() {
         for (name, source) in [
-            ("row_history", include_str!("providers/row_history.rs")),
+            ("row_history", include_str!("providers/schema_history.rs")),
             ("diff", include_str!("providers/diff.rs")),
             ("merge_analysis", include_str!("../session/merge/analysis.rs")),
             ("merge_native", include_str!("../session/merge/native.rs")),
@@ -207,7 +207,7 @@ mod tests {
 
         let history_route = include_str!("history_route.rs");
         let native_start = history_route
-            .find("if metadata_projection.native_entity_rows {")
+            .find("if metadata_projection.native_row_rows {")
             .expect("native history branch");
         let native_end = history_route[native_start..]
             .find("            continue;")

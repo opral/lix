@@ -90,7 +90,7 @@ where
 
 /// Hydrates retained change records without collapsing repeated change ids.
 ///
-/// Eager plugin materialization can produce multiple semantic identitys from
+/// Eager plugin materialization can produce multiple semantic identities from
 /// one source change. Lifecycle operations such as checkpoints must preserve
 /// each identity-specific payload even though those rows share a change id.
 pub(crate) async fn materialize_known_change_payloads_in_order<S>(

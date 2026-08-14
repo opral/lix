@@ -34,7 +34,7 @@ use crate::sql2::history_route::{
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::row::{RowPrimaryKeyFilterAnalyzer, row_pks_from_primary_key_filters};
+use super::schema::{RowPrimaryKeyFilterAnalyzer, row_pks_from_primary_key_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
 pub(super) fn register_row_history_surface<S>(

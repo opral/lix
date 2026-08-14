@@ -15,7 +15,7 @@ use crate::sql2::catalog::{
 };
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ROW_PK, HISTORY_COL_FILE_ID,
     HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
 };
@@ -487,7 +487,7 @@ fn history_filesystem_schema(include_data: bool) -> SchemaRef {
         ]
     };
     fields.extend([
-        json_field(HISTORY_COL_ENTITY_PK, false),
+        json_field(HISTORY_COL_ROW_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
@@ -637,7 +637,7 @@ fn row_system_columns(
 
 fn row_history_system_columns() -> Vec<PublicColumn> {
     history_columns([
-        (HISTORY_COL_ENTITY_PK, false),
+        (HISTORY_COL_ROW_PK, false),
         (HISTORY_COL_SCHEMA_KEY, false),
         (HISTORY_COL_FILE_ID, true),
         (HISTORY_COL_METADATA, true),
@@ -659,7 +659,7 @@ fn file_history_columns() -> Vec<PublicColumn> {
         ("directory_id", true),
         ("name", true),
         ("content", true),
-        (HISTORY_COL_ENTITY_PK, false),
+        (HISTORY_COL_ROW_PK, false),
         (HISTORY_COL_SOURCE_CHANGES, false),
         (HISTORY_COL_OBSERVED_COMMIT_ID, false),
         (HISTORY_COL_COMMIT_CREATED_AT, false),
@@ -675,7 +675,7 @@ fn directory_history_columns() -> Vec<PublicColumn> {
         ("path", true),
         ("parent_id", true),
         ("name", true),
-        (HISTORY_COL_ENTITY_PK, false),
+        (HISTORY_COL_ROW_PK, false),
         (HISTORY_COL_SOURCE_CHANGES, false),
         (HISTORY_COL_OBSERVED_COMMIT_ID, false),
         (HISTORY_COL_COMMIT_CREATED_AT, false),

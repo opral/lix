@@ -446,7 +446,7 @@ struct RawWriteSlot {
 
 /// Mutable Arrow-style ingress representation shared by SQL and plugin writes.
 ///
-/// Row identitys and JSON payloads are aligned typed columns because
+/// Row identities and JSON payloads are aligned typed columns because
 /// normalization mutates them in place. Repeated strings and origins use
 /// dictionary ordinals. `TransactionJson` values retain canonical page arenas,
 /// so moving, selecting, or extracting rows clones neither parsed snapshots
@@ -1115,7 +1115,7 @@ impl RawWriteBatch {
     ///
     /// A certified producer has already established row shape, identity, and
     /// current-plan semantics. Re-reading every row through the generic
-    /// preparation API only clones identitys, re-interns the same schema and
+    /// preparation API only clones identities, re-interns the same schema and
     /// branch strings, and keeps both dense batches live at once. This lowering
     /// transfers the ingress dictionaries and aligned owners directly while
     /// constructing only the final fixed-width slots and staged JSON handles.
@@ -3987,7 +3987,7 @@ impl StagedCommitChangeRefs {
 /// batch. Cloning this batch through transaction staging is O(1).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct StagedCommitChangeColumns {
-    identitys: Vec<StateKey>,
+    identities: Vec<StateKey>,
     source_commit_ids: Vec<CommitId>,
     change_ids: Vec<ChangeId>,
     deleted: Vec<bool>,
@@ -4001,7 +4001,7 @@ pub(crate) struct StagedCommitChangeBatch {
     /// Every `(source_commit_id, change_id, identity)` tuple was produced by
     /// the tracked diff reader from immutable commit authority.
     source_membership_certified: bool,
-    /// Present only when duplicate identitys were filtered while combining
+    /// Present only when duplicate identities were filtered while combining
     /// independently supplied batches. The normal merge/checkpoint path views
     /// every row directly and allocates no selection column.
     selection: Option<Arc<[u32]>>,
@@ -4026,7 +4026,7 @@ impl StagedCommitChangeBatchBuilder {
     pub(crate) fn with_capacity(row_count: usize) -> Self {
         Self {
             columns: StagedCommitChangeColumns {
-                identitys: Vec::with_capacity(row_count),
+                identities: Vec::with_capacity(row_count),
                 source_commit_ids: Vec::with_capacity(row_count),
                 change_ids: Vec::with_capacity(row_count),
                 deleted: Vec::with_capacity(row_count),
@@ -4045,7 +4045,7 @@ impl StagedCommitChangeBatchBuilder {
         created_at: LixTimestamp,
         updated_at: LixTimestamp,
     ) {
-        self.columns.identitys.push(identity);
+        self.columns.identities.push(identity);
         self.columns.source_commit_ids.push(source_commit_id);
         self.columns.change_ids.push(change_id);
         self.columns.deleted.push(deleted);
@@ -4094,7 +4094,7 @@ impl StagedCommitChangeBatch {
     pub(crate) fn len(&self) -> usize {
         self.selection
             .as_ref()
-            .map_or(self.columns.identitys.len(), |selection| selection.len())
+            .map_or(self.columns.identities.len(), |selection| selection.len())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -4111,7 +4111,7 @@ impl StagedCommitChangeBatch {
             .as_ref()
             .map_or(row_index, |selection| selection[row_index] as usize);
         StagedCommitChangeRef {
-            identity: &self.columns.identitys[column_index],
+            identity: &self.columns.identities[column_index],
             source_commit_id: self.columns.source_commit_ids[column_index],
             change_id: self.columns.change_ids[column_index],
             deleted: self.columns.deleted[column_index],
@@ -4121,7 +4121,7 @@ impl StagedCommitChangeBatch {
     }
 
     fn select(self, selection: Vec<u32>) -> Self {
-        if selection.len() == self.columns.identitys.len() {
+        if selection.len() == self.columns.identities.len() {
             self
         } else {
             Self {
@@ -4143,7 +4143,7 @@ impl StagedCommitChangeBatch {
 
     #[cfg(test)]
     pub(crate) fn large_buffer_count(&self) -> usize {
-        usize::from(!self.columns.identitys.is_empty())
+        usize::from(!self.columns.identities.is_empty())
             + usize::from(!self.columns.source_commit_ids.is_empty())
             + usize::from(!self.columns.change_ids.is_empty())
             + usize::from(!self.columns.deleted.is_empty())
@@ -4236,21 +4236,21 @@ impl StagedCommitChangeRefs {
             return;
         }
 
-        // Deduplicate logical identitys only while batches are combined,
+        // Deduplicate logical identities only while batches are combined,
         // then drop the index. Eager plugin rows may legitimately share one
         // source change id.
         // Unlike the former BTreeSet retained for the transaction lifetime,
         // this is one temporary contiguous table rather than one allocation
         // per selected mutation.
-        let mut identitys =
+        let mut identities =
             HashSet::with_capacity(self.selected_change_count().saturating_add(batch.len()));
-        identitys.extend(
+        identities.extend(
             self.selected_changes()
                 .map(|change| (change.schema_key(), change.file_id(), change.row_pk())),
         );
         let mut selected: Option<Vec<u32>> = None;
         for (row_index, change) in batch.iter().enumerate() {
-            if identitys.insert((change.schema_key(), change.file_id(), change.row_pk())) {
+            if identities.insert((change.schema_key(), change.file_id(), change.row_pk())) {
                 if let Some(selected) = selected.as_mut() {
                     selected.push(
                         u32::try_from(row_index)
@@ -4420,7 +4420,7 @@ mod tests {
             crate::collection_generation::ordered_single_string_identity_digest(
                 prepared.iter().map(|row| row.row_pk),
             )
-            .expect("single-string identitys should hash");
+            .expect("single-string identities should hash");
         assert!(prepared.certify_complete_collection_replacement(
             "dense_replacement",
             "main",
@@ -4470,7 +4470,7 @@ mod tests {
             crate::collection_generation::ordered_single_string_identity_digest(
                 prepared.iter().map(|row| row.row_pk),
             )
-            .expect("single-string identitys should hash");
+            .expect("single-string identities should hash");
 
         assert!(!prepared.certify_complete_collection_replacement(
             "target_schema",
@@ -4486,7 +4486,7 @@ mod tests {
     #[test]
     fn ten_thousand_selected_changes_retain_one_shared_typed_batch() {
         const ROW_COUNT: usize = 10_000;
-        let identitys = (0..ROW_COUNT)
+        let identities = (0..ROW_COUNT)
             .map(|index| StateKey {
                 schema_key: "shared_schema".to_string(),
                 file_id: Some("shared_file".to_string()),
@@ -4495,7 +4495,7 @@ mod tests {
             .collect::<Vec<_>>();
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let mut builder = StagedCommitChangeBatchBuilder::with_capacity(ROW_COUNT);
-        for (index, identity) in identitys.iter().enumerate() {
+        for (index, identity) in identities.iter().enumerate() {
             builder.push(
                 identity.clone(),
                 CommitId::for_test_label(&format!("selected-owner-{index}")),
@@ -4512,7 +4512,7 @@ mod tests {
         assert!(
             batch
                 .iter()
-                .zip(&identitys)
+                .zip(&identities)
                 .all(|(change, identity)| change.identity() == identity),
             "selected changes must retain the exact native identity"
         );
@@ -4538,7 +4538,7 @@ mod tests {
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let source_commit = CommitId::for_test_label("shared-source");
         let shared_change = ChangeId::for_test_label("shared-change");
-        let identitys = ["row-a", "row-b"]
+        let identities = ["row-a", "row-b"]
             .into_iter()
             .map(|row| StateKey {
                 schema_key: "schema".to_string(),
@@ -4549,7 +4549,7 @@ mod tests {
 
         let mut first = StagedCommitChangeBatchBuilder::with_capacity(1);
         first.push(
-            identitys[0].clone(),
+            identities[0].clone(),
             source_commit,
             shared_change,
             false,
@@ -4558,7 +4558,7 @@ mod tests {
         );
         let mut second = StagedCommitChangeBatchBuilder::with_capacity(2);
         second.push(
-            identitys[1].clone(),
+            identities[1].clone(),
             source_commit,
             shared_change,
             false,
@@ -4566,7 +4566,7 @@ mod tests {
             timestamp,
         );
         second.push(
-            identitys[0].clone(),
+            identities[0].clone(),
             source_commit,
             ChangeId::for_test_label("duplicate-identity"),
             false,

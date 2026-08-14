@@ -5461,7 +5461,7 @@ where
             | StateTreeMutation::Update { key, value, audit } => (key, Some(value), audit.as_ref()),
             StateTreeMutation::Remove { key } => (key, None, None),
             StateTreeMutation::RemoveRange { lower, upper } => {
-                super::state::validate_state_entity_prefix(lower)
+                super::state::validate_state_row_prefix(lower)
                     .map_err(|error| corruption(error.to_string()))?;
                 if upper.as_ref().is_some_and(|upper| lower >= upper) {
                     return Err(corruption("state-tree delete range is empty or reversed"));
@@ -5553,7 +5553,7 @@ pub(crate) async fn replace_state_tree_range<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    super::state::validate_state_entity_prefix(&lower)
+    super::state::validate_state_row_prefix(&lower)
         .map_err(|error| corruption(error.to_string()))?;
     if upper.as_ref().is_some_and(|upper| lower >= *upper) {
         return Err(corruption(

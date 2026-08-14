@@ -887,7 +887,7 @@ impl ResolvablePluginConflicts {
     }
 }
 
-/// Returns exactly the semantic conflict identitys that can be handed to a
+/// Returns exactly the semantic conflict identities that can be handed to a
 /// static resolver. This deliberately does not execute Wasm: callers use it
 /// both to make merge preview honest and to reject ordinary conflicts before
 /// allocating a Component Store.

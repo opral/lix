@@ -2286,7 +2286,7 @@ mod intent_tests {
         let mut batch = StagedCommitChangeBatchBuilder::with_capacity(1);
         batch.push(
             StateKey {
-                schema_key: "app.row".to_string(),
+                schema_key: "app_row".to_string(),
                 file_id: None,
                 row_pk: RowPk::single("selected"),
             },

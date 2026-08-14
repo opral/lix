@@ -570,7 +570,7 @@ async fn try_execute_row_insert_batch(
         for (row_index, row) in raw_rows.iter().enumerate() {
             let row_pk = row
                 .row_pk
-                .expect("certified parameter INSERT rows have explicit identitys");
+                .expect("certified parameter INSERT rows have explicit identities");
             let identity = (
                 row_pk.clone(),
                 row.file_id.cloned(),
@@ -675,7 +675,7 @@ async fn collection_is_certifiably_empty(
 /// scan/stage operation.
 ///
 /// `executeBatch` remains ordered at its public boundary. This route folds
-/// repeated identitys in statement order and lowers the resulting unique,
+/// repeated identities in statement order and lowers the resulting unique,
 /// identity-sorted replacements in one physical scan/stage operation.
 pub(crate) async fn try_execute_row_update_value_batch<'a>(
     ctx: &mut impl SqlWriteExecutionContext,
@@ -807,7 +807,7 @@ async fn try_execute_row_update_batch(
             match previous.cmp(&row_pk) {
                 Ordering::Less => {}
                 Ordering::Equal => {
-                    // Repeated identitys observe earlier staged writes and
+                    // Repeated identities observe earlier staged writes and
                     // are not independent statements.
                     return Ok(None);
                 }
@@ -1028,7 +1028,7 @@ fn parameter_batch_row_values(
 /// Lowers the dominant JSON-pointer replacement shape directly from borrowed
 /// public parameters into one canonical row-content arena.
 ///
-/// Statement order is preserved even when identitys repeat or arrive out of
+/// Statement order is preserved even when identities repeat or arrive out of
 /// order: each live identity reports every matching statement as affected and
 /// the last statement supplies the staged replacement. The canonical write
 /// batch itself remains identity-sorted and contains one row per identity.
@@ -1313,7 +1313,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
         candidates
     };
-    // Sorting identitys changes expression evaluation order. Once this route
+    // Sorting identities changes expression evaluation order. Once this route
     // is fully certified, validate JSON arguments for live rows in original
     // statement order so a later replacement cannot hide an earlier error.
     // Missing-row UPDATEs do not evaluate SET expressions, so first derive

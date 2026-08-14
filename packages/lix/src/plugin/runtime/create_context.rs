@@ -134,13 +134,13 @@ fn framed_digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
     BlobId::from_canonical_content(&input).into_bytes()
 }
 
-/// Result of validating generated identitys in one sparse guest transition.
+/// Result of validating generated identities in one sparse guest transition.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct CreateValidation {
     /// A keyless create was emitted. The transaction must check or
     /// create the corresponding durable reservation before staging changes.
     pub(crate) requires_reservation: bool,
-    /// Non-current compact identitys are valid only when the exact durable
+    /// Non-current compact identities are valid only when the exact durable
     /// row already exists.
     pub(crate) existing_authorities: Vec<WasmRowKey>,
 }

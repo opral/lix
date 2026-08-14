@@ -196,7 +196,7 @@ pub(crate) fn encode_state_key(key: StateKeyRef<'_>) -> Vec<u8> {
 /// Encodes the canonical contiguous lookup prefix for one row identity.
 /// File ownership is the final key component, so a SQL row-PK predicate
 /// can authenticate every matching file/global row without scanning unrelated
-/// identitys or maintaining a second index.
+/// identities or maintaining a second index.
 pub(crate) fn encode_state_row_prefix(schema_key: &str, row_pk: &RowPk) -> Vec<u8> {
     let mut output = Vec::with_capacity(schema_key.len() + 4 + row_pk.components.len() * 18);
     write_key_string(&mut output, schema_key, KEY_PART_FINAL);
