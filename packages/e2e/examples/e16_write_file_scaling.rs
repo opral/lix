@@ -38,11 +38,13 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context as TracingContext, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
+use async_trait::async_trait;
 use lix::storage::{ReadOptions, Storage};
 use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::layout_accounting;
 use lix::{Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
+use lix_storage_slatedb::SlateDB;
 
 const INSERT_BATCH: usize = 100;
 /// Directories the seeded files are spread across. Held at 1 by default so the
@@ -102,25 +104,40 @@ fn main() {
             .expect("create write-scaling runtime");
 
         runtime.block_on(async {
-            for files in sizes {
-                run_case(files, probes, &shapes, &collector).await;
+            match std::env::var("E16_BACKEND")
+                .unwrap_or_else(|_| "rocksdb".to_string())
+                .as_str()
+            {
+                "rocksdb" => {
+                    for files in sizes {
+                        run_case::<RocksDB>(files, probes, &shapes, &collector).await;
+                    }
+                }
+                "slatedb" => {
+                    for files in sizes {
+                        run_case::<SlateDB>(files, probes, &shapes, &collector).await;
+                    }
+                }
+                other => panic!("unknown E16_BACKEND {other}; expected rocksdb or slatedb"),
             }
         });
     });
 }
 
-async fn run_case(
+async fn run_case<StorageImpl>(
     files: usize,
     probes: usize,
     shapes: &[&'static str],
     collector: &PerfSpanCollector,
-) {
+) where
+    StorageImpl: BenchmarkStorage,
+{
     let root = tempfile::Builder::new()
         .prefix("e16-write-scaling-")
         .tempdir()
         .expect("create write-scaling directory");
     let db_path = root.path().join("db");
-    let storage = RocksDB::open(&db_path).expect("open write-scaling RocksDB");
+    let storage = StorageImpl::open_for_benchmark(&db_path);
     let lix = open_lix()
         .with_storage(storage.clone())
         .await
@@ -272,7 +289,7 @@ where
     }
 }
 
-const SHAPES: [&str; 12] = [
+const SHAPES: [&str; 22] = [
     "insert_file_80line",
     "insert_file_1line",
     // Ten single-row statements inside ONE explicit transaction. The
@@ -301,7 +318,17 @@ const SHAPES: [&str; 12] = [
     // `None`, which is the discriminator for taking the indexed staging route
     // rather than the whole-branch descriptor scan.
     "upsert_file_1line",
+    "read_file_1line",
     "update_file_1line",
+    "truncate_file_1line",
+    "truncate_10files_1txn",
+    "truncate_1pct_1txn",
+    "rename_file_1line",
+    "rename_10files_1txn",
+    "rename_1pct_1txn",
+    "delete_file_1line",
+    "delete_10files_1txn",
+    "delete_1pct_1txn",
     "key_value_write",
 ];
 
@@ -427,6 +454,17 @@ where
             .await
             .expect("upsert 1-line probe file");
         }
+        "read_file_1line" => {
+            let target = probe % files.max(1);
+            let result = lix
+                .execute(
+                    "SELECT path, content FROM lix_file WHERE path = $1",
+                    &[Value::Text(seed_path(target))],
+                )
+                .await
+                .expect("read resident probe file");
+            assert_eq!(result.rows().len(), 1, "exact file read must return one row");
+        }
         "update_file_1line" => {
             // Rewrites a resident seeded file, changing exactly one line.
             let target = probe % files.max(1);
@@ -441,6 +479,164 @@ where
             )
             .await
             .expect("update resident probe file");
+        }
+        "truncate_file_1line" => {
+            let target = files / 3 + probe;
+            lix.execute(
+                "UPDATE lix_file SET content = CAST('' AS BYTEA) WHERE path = $1",
+                &[Value::Text(seed_path(target))],
+            )
+            .await
+            .expect("truncate resident probe file");
+        }
+        "truncate_10files_1txn" => {
+            let mut transaction = lix
+                .begin_transaction()
+                .await
+                .expect("begin truncate transaction");
+            for offset in 0..10 {
+                let target = files / 3 + probe * 10 + offset;
+                transaction
+                    .execute(
+                        "UPDATE lix_file SET content = CAST('' AS BYTEA) WHERE path = $1",
+                        &[Value::Text(seed_path(target))],
+                    )
+                    .await
+                    .expect("truncate resident transaction file");
+            }
+            transaction.commit().await.expect("commit truncates");
+        }
+        "truncate_1pct_1txn" => {
+            let count = (files / 100).max(1);
+            let mut transaction = lix
+                .begin_transaction()
+                .await
+                .expect("begin one-percent truncate transaction");
+            for offset in 0..count {
+                let target = files / 3 + probe * count + offset;
+                transaction
+                    .execute(
+                        "UPDATE lix_file SET content = CAST('' AS BYTEA) WHERE path = $1",
+                        &[Value::Text(seed_path(target))],
+                    )
+                    .await
+                    .expect("truncate one-percent resident file");
+            }
+            transaction
+                .commit()
+                .await
+                .expect("commit one-percent truncates");
+        }
+        "rename_file_1line" => {
+            let target = files.saturating_sub(1).saturating_sub(probe);
+            lix.execute(
+                "UPDATE lix_file SET path = $2 WHERE path = $1",
+                &[
+                    Value::Text(seed_path(target)),
+                    Value::Text(format!("/renamed/file-{probe:05}.txt")),
+                ],
+            )
+            .await
+            .expect("rename resident probe file");
+        }
+        "rename_10files_1txn" => {
+            let mut transaction = lix
+                .begin_transaction()
+                .await
+                .expect("begin rename transaction");
+            for offset in 0..10 {
+                let target = files
+                    .saturating_sub(1)
+                    .saturating_sub(probe * 10 + offset);
+                transaction
+                    .execute(
+                        "UPDATE lix_file SET path = $2 WHERE path = $1",
+                        &[
+                            Value::Text(seed_path(target)),
+                            Value::Text(format!(
+                                "/renamed/batch-{probe:05}-{offset:02}.txt"
+                            )),
+                        ],
+                    )
+                    .await
+                    .expect("rename resident transaction file");
+            }
+            transaction.commit().await.expect("commit renames");
+        }
+        "rename_1pct_1txn" => {
+            let count = (files / 100).max(1);
+            let mut transaction = lix
+                .begin_transaction()
+                .await
+                .expect("begin one-percent rename transaction");
+            for offset in 0..count {
+                let target = files
+                    .saturating_sub(1)
+                    .saturating_sub(probe * count + offset);
+                transaction
+                    .execute(
+                        "UPDATE lix_file SET path = $2 WHERE path = $1",
+                        &[
+                            Value::Text(seed_path(target)),
+                            Value::Text(format!(
+                                "/renamed/percent-{probe:05}-{offset:05}.txt"
+                            )),
+                        ],
+                    )
+                    .await
+                    .expect("rename one-percent resident file");
+            }
+            transaction
+                .commit()
+                .await
+                .expect("commit one-percent renames");
+        }
+        "delete_file_1line" => {
+            let target = files / 2 + probe;
+            lix.execute(
+                "DELETE FROM lix_file WHERE path = $1",
+                &[Value::Text(seed_path(target))],
+            )
+            .await
+            .expect("delete resident probe file");
+        }
+        "delete_10files_1txn" => {
+            let mut transaction = lix
+                .begin_transaction()
+                .await
+                .expect("begin delete transaction");
+            for offset in 0..10 {
+                let target = files / 2 + probe * 10 + offset;
+                transaction
+                    .execute(
+                        "DELETE FROM lix_file WHERE path = $1",
+                        &[Value::Text(seed_path(target))],
+                    )
+                    .await
+                    .expect("delete resident transaction file");
+            }
+            transaction.commit().await.expect("commit deletes");
+        }
+        "delete_1pct_1txn" => {
+            let count = (files / 100).max(1);
+            let mut transaction = lix
+                .begin_transaction()
+                .await
+                .expect("begin one-percent delete transaction");
+            for offset in 0..count {
+                let target = files / 2 + probe * count + offset;
+                transaction
+                    .execute(
+                        "DELETE FROM lix_file WHERE path = $1",
+                        &[Value::Text(seed_path(target))],
+                    )
+                    .await
+                    .expect("delete one-percent resident file");
+            }
+            transaction
+                .commit()
+                .await
+                .expect("commit one-percent deletes");
         }
         "key_value_write" => {
             lix.execute(
@@ -491,8 +687,11 @@ impl Snapshot {
     }
 }
 
-async fn snapshot(storage: &RocksDB, _directory: &Path) -> Snapshot {
-    storage.flush().expect("flush write-scaling RocksDB");
+async fn snapshot<StorageImpl>(storage: &StorageImpl, _directory: &Path) -> Snapshot
+where
+    StorageImpl: BenchmarkStorage,
+{
+    storage.flush_for_benchmark().await;
     let adapter = StorageAdapter::new(storage.clone());
     let read = adapter
         .begin_read(ReadOptions::default())
@@ -512,6 +711,35 @@ async fn snapshot(storage: &RocksDB, _directory: &Path) -> Snapshot {
         );
     }
     Snapshot { spaces }
+}
+
+#[async_trait]
+trait BenchmarkStorage: Storage + Clone + Send + Sync + 'static {
+    fn open_for_benchmark(path: &Path) -> Self;
+
+    async fn flush_for_benchmark(&self);
+}
+
+#[async_trait]
+impl BenchmarkStorage for RocksDB {
+    fn open_for_benchmark(path: &Path) -> Self {
+        Self::open(path).expect("open write-scaling RocksDB")
+    }
+
+    async fn flush_for_benchmark(&self) {
+        self.flush().expect("flush write-scaling RocksDB");
+    }
+}
+
+#[async_trait]
+impl BenchmarkStorage for SlateDB {
+    fn open_for_benchmark(path: &Path) -> Self {
+        Self::open(path).expect("open write-scaling SlateDB")
+    }
+
+    async fn flush_for_benchmark(&self) {
+        self.flush().await.expect("flush write-scaling SlateDB");
+    }
 }
 
 async fn install_text_plugin<StorageImpl>(lix: &Lix<StorageImpl>)
