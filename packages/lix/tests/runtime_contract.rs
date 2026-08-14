@@ -60,7 +60,7 @@ fn public_sdk_opens_writes_and_reads_without_a_tokio_runtime() {
     futures_lite::future::block_on(async {
         let lix = open_lix().await.expect("open Lix under plain block_on");
         lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('executor', lix_json('true'))",
+            "INSERT INTO lix_key_value (key, value) VALUES ('executor', CAST('true' AS JSONB))",
             &[],
         )
         .await
