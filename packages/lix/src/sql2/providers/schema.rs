@@ -20,7 +20,7 @@ use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchRefReader};
 use crate::changelog::CommitRecord;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::LixTimestamp;
-use crate::entity_pk::EntityPk;
+use crate::entity_pk::{EntityPk, EntityPkComponent};
 use crate::forktree::{StateCell, StateKeyRef, StateValue, decode_state_key, encode_state_key};
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
@@ -32,7 +32,7 @@ use crate::sql2::entity_batch::row_snapshot;
 use crate::sql2::entity_batch::{
     EntityExactBatchRequest, EntityExactRowRequest, EntityProjection, EntityRowSelection,
     EntityScanFilter, EntityScanRequest, EntityStateSlot, exact_forktree, exact_transaction,
-    scan_slots_forktree, scan_slots_transaction, slot_snapshot,
+    scan_slots_forktree, scan_slots_transaction,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_entity_surface;
@@ -2206,6 +2206,37 @@ impl EntityRowFilter {
                 || right.matches_snapshot(snapshot, schema_key)?),
         }
     }
+
+    fn matches_native(
+        &self,
+        spec: &EntitySurfaceSpec,
+        row: Option<&DecodedNativeEntitySlot>,
+    ) -> Result<bool> {
+        match self {
+            Self::ColumnEq {
+                column,
+                column_type,
+                value,
+            } => Ok(native_entity_filter_value(spec, row, column, *column_type)?
+                .is_some_and(|actual| {
+                    entity_filter_values_equal(&actual, value, *column_type)
+                })),
+            Self::ColumnIn {
+                column,
+                column_type,
+                values,
+            } => Ok(native_entity_filter_value(spec, row, column, *column_type)?
+                .is_some_and(|actual| {
+                    values.iter().any(|expected| {
+                        entity_filter_values_equal(&actual, expected, *column_type)
+                    })
+                })),
+            Self::And(left, right) => Ok(left.matches_native(spec, row)?
+                && right.matches_native(spec, row)?),
+            Self::Or(left, right) => Ok(left.matches_native(spec, row)?
+                || right.matches_native(spec, row)?),
+        }
+    }
 }
 
 fn entity_filter_value_literal(
@@ -2546,15 +2577,15 @@ fn apply_entity_state_slot_filters(
     }
     let mut filtered = Vec::with_capacity(slots.len());
     for slot in slots {
-        let Some(snapshot) = entity_slot_logical_value(spec, &slot, branch_id)? else {
+        let decoded = decode_native_entity_slot(spec, &slot, branch_id)?;
+        let Some(decoded) = decoded.as_ref() else {
             continue;
         };
-        let key = slot_state_key(&slot).map_err(lix_error_to_datafusion_error)?;
         let matches = filters.iter().try_fold(true, |matches, filter| {
             if !matches {
                 return Ok(false);
             }
-            filter.matches_snapshot(Some(&snapshot), &key.schema_key)
+            filter.matches_native(spec, Some(decoded))
         })?;
         if matches {
             filtered.push(slot);
@@ -2591,13 +2622,10 @@ fn entity_state_projection(
         return EntityProjection::default();
     };
     let mut columns = projection_column_names(schema);
-    if (force_snapshot_content
-        || schema
-            .fields()
-            .iter()
-            .any(|field| !field.name().starts_with("lixcol_")))
-        && !columns.iter().any(|column| column == "snapshot_content")
-    {
+    // Native entity values are typed tuples. Ordinary SQL fields never need a
+    // synthesized whole-row snapshot; only the explicit system column asks
+    // for that API-boundary materialization.
+    if force_snapshot_content && !columns.iter().any(|column| column == "snapshot_content") {
         columns.push("snapshot_content".to_string());
     }
     EntityProjection { columns }
@@ -2708,193 +2736,128 @@ fn entity_record_batch_from_slots(
     slots: &[EntityStateSlot],
     branch_id: Option<&str>,
 ) -> Result<RecordBatch> {
+    // Authentication is independent of projection. COUNT(*) and other
+    // zero-column plans must reject the same malformed/substituted row as a
+    // visible scalar projection.
+    let decoded = slots
+        .iter()
+        .map(|slot| decode_native_entity_slot(spec, slot, branch_id))
+        .collect::<Result<Vec<_>>>()?;
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(slots.len()));
         return RecordBatch::try_new_with_options(schema, vec![], &options)
             .map_err(DataFusionError::from);
     }
-    let snapshots = slots
-        .iter()
-        .map(|slot| entity_slot_logical_value(spec, slot, branch_id))
-        .collect::<Result<Vec<_>>>()?;
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| entity_slot_column_array(spec, field.name(), slots, &snapshots, branch_id))
-        .collect::<Result<Vec<_>>>()?;
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
-}
-
-/// Borrowed terminal projection for the certified `{path, value}` entity
-/// shape. The canonical ForkTree snapshot remains the only row authority; the
-/// projector validates the complete outer JSON object once and materializes
-/// only requested fields at the Arrow boundary.
-#[derive(Clone, Copy)]
-struct BorrowedPathValueSnapshot<'a> {
-    path: Option<&'a serde_json::value::RawValue>,
-    value: Option<&'a serde_json::value::RawValue>,
-}
-
-impl<'de> serde::Deserialize<'de> for BorrowedPathValueSnapshot<'de> {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = BorrowedPathValueSnapshot<'de>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a path/value snapshot object")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                let mut path = None;
-                let mut value = None;
-                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-                    let raw = map.next_value::<&'de serde_json::value::RawValue>()?;
-                    match key.as_ref() {
-                        // serde_json's DOM semantics are last-key-wins. Keep
-                        // exactly that behavior without constructing the
-                        // complete outer object.
-                        "path" => path = Some(raw),
-                        "value" => value = Some(raw),
-                        _ => {}
-                    }
-                }
-                Ok(BorrowedPathValueSnapshot { path, value })
-            }
-        }
-
-        deserializer.deserialize_map(Visitor)
-    }
-}
-
-fn parse_borrowed_path_value_snapshot(snapshot: &str) -> Result<BorrowedPathValueSnapshot<'_>> {
-    let mut deserializer = serde_json::Deserializer::from_str(snapshot);
-    let parsed = serde::Deserialize::deserialize(&mut deserializer).map_err(|error| {
-        DataFusionError::Execution(format!(
-            "sql2 entity provider expected valid snapshot_content JSON: {error}"
-        ))
-    })?;
-    deserializer.end().map_err(|error| {
-        DataFusionError::Execution(format!(
-            "sql2 entity provider expected valid snapshot_content JSON: {error}"
-        ))
-    })?;
-    Ok(parsed)
-}
-
-fn path_value_record_batch_from_slots(
-    spec: &EntitySurfaceSpec,
-    schema: SchemaRef,
-    slots: &[EntityStateSlot],
-    branch_id: Option<&str>,
-) -> Result<RecordBatch> {
-    let snapshots = slots
-        .iter()
-        .map(|slot| {
-            slot_snapshot(slot)
-                .map(parse_borrowed_path_value_snapshot)
-                .transpose()
-        })
-        .collect::<Result<Vec<_>>>()?;
     let columns = schema
         .fields()
         .iter()
         .map(|field| {
-            if let Some(property_name) = field.name().strip_prefix("lixcol_") {
-                return entity_slot_system_column_array(spec, property_name, slots, branch_id);
-            }
-            let column = spec.visible_column(field.name()).ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "sql2 entity provider '{}' does not expose column '{}'",
-                    spec.schema_key,
-                    field.name()
-                ))
-            })?;
-            let values = slots
-                .iter()
-                .zip(&snapshots)
-                .map(|(slot, snapshot)| {
-                    let raw = snapshot.and_then(|snapshot| match field.name().as_str() {
-                        "path" => snapshot.path,
-                        "value" => snapshot.value,
-                        _ => None,
-                    });
-                    match raw {
-                        Some(raw) => serde_json::from_str::<JsonValue>(raw.get())
-                            .map(Some)
-                            .map_err(|error| {
-                                DataFusionError::Execution(format!(
-                                    "sql2 entity provider expected valid snapshot_content JSON: {error}"
-                                ))
-                            }),
-                        None => entity_primary_key_value(spec, field.name(), slot),
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let array: ArrayRef = match column.column_type {
-                EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
-                    values
-                        .iter()
-                        .map(|value| {
-                            entity_json_text_value(value.as_ref(), column.column_type)
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                )),
-                EntityColumnType::Integer => Arc::new(Int64Array::from(
-                    values
-                        .iter()
-                        .map(|value| {
-                            entity_i64_value(value.as_ref(), &spec.schema_key, field.name())
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                )),
-                EntityColumnType::Number => Arc::new(Float64Array::from(
-                    values
-                        .iter()
-                        .map(|value| {
-                            entity_f64_value(value.as_ref(), &spec.schema_key, field.name())
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                )),
-                EntityColumnType::Boolean => Arc::new(BooleanArray::from_iter(
-                    values
-                        .iter()
-                        .map(|value| value.as_ref().and_then(JsonValue::as_bool)),
-                )),
-                EntityColumnType::Timestamptz => Arc::new(
-                    TimestampMicrosecondArray::from(
-                        values
-                            .iter()
-                            .map(|value| {
-                                entity_timestamptz_value(
-                                    value.as_ref(),
-                                    &spec.schema_key,
-                                    field.name(),
-                                )
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                    )
-                    .with_timezone("UTC"),
-                ),
-            };
-            Ok(array)
+            native_entity_slot_column_array(
+                spec,
+                field.name(),
+                slots,
+                &decoded,
+                branch_id,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
 }
 
-fn entity_slot_column_array(
+struct DecodedNativeEntitySlot {
+    key: crate::forktree::StateKey,
+    body: Vec<lix_schema::value_layout::BodyValue>,
+}
+
+fn native_body_column_index(spec: &EntitySurfaceSpec, column_name: &str) -> Option<usize> {
+    spec.native_schema
+        .columns
+        .iter()
+        .filter(|column| !spec.native_schema.primary_key.contains(&column.name))
+        .position(|column| column.name == column_name)
+}
+
+fn native_pk_column_index(spec: &EntitySurfaceSpec, column_name: &str) -> Option<usize> {
+    spec.native_schema
+        .primary_key
+        .iter()
+        .position(|name| name == column_name)
+}
+
+fn native_projection_error(
+    spec: &EntitySurfaceSpec,
+    column_name: &str,
+    expected: &str,
+) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "native entity projection for '{}.{}' expected {expected}",
+        spec.schema_key, column_name
+    ))
+}
+
+fn native_entity_filter_value(
+    spec: &EntitySurfaceSpec,
+    row: Option<&DecodedNativeEntitySlot>,
+    column_name: &str,
+    column_type: EntityColumnType,
+) -> Result<Option<EntityFilterValue>> {
+    let Some(row) = row else { return Ok(None) };
+    if let Some(index) = native_pk_column_index(spec, column_name) {
+        let component = row.key.entity_pk.components.get(index).ok_or_else(|| {
+            native_projection_error(spec, column_name, "a primary-key component")
+        })?;
+        return Ok(match (column_type, component) {
+            (EntityColumnType::String, EntityPkComponent::Uuid(value)) => Some(
+                EntityFilterValue::String(uuid::Uuid::from_bytes(*value).to_string()),
+            ),
+            (EntityColumnType::String, EntityPkComponent::String(value)) => {
+                Some(EntityFilterValue::String(value.to_string()))
+            }
+            (EntityColumnType::Integer, EntityPkComponent::Integer(value)) => {
+                Some(EntityFilterValue::Integer(*value))
+            }
+            _ => return Err(native_projection_error(spec, column_name, "its declared PK type")),
+        });
+    }
+    let Some(index) = native_body_column_index(spec, column_name) else {
+        return Ok(None);
+    };
+    let value = row.body.get(index).ok_or_else(|| {
+        native_projection_error(spec, column_name, "a native body slot")
+    })?;
+    Ok(match (column_type, value) {
+        (_, lix_schema::value_layout::BodyValue::Null) => None,
+        (EntityColumnType::String, lix_schema::value_layout::BodyValue::Text(value)) => {
+            Some(EntityFilterValue::String(value.clone()))
+        }
+        (EntityColumnType::String, lix_schema::value_layout::BodyValue::Uuid(value)) => {
+            Some(EntityFilterValue::String(value.to_string()))
+        }
+        (EntityColumnType::Integer, lix_schema::value_layout::BodyValue::Int8(value)) => {
+            Some(EntityFilterValue::Integer(*value))
+        }
+        (EntityColumnType::Number, lix_schema::value_layout::BodyValue::Float8(value)) => {
+            Some(EntityFilterValue::Number(*value))
+        }
+        (EntityColumnType::Boolean, lix_schema::value_layout::BodyValue::Boolean(value)) => {
+            Some(EntityFilterValue::Boolean(*value))
+        }
+        (EntityColumnType::Timestamptz, lix_schema::value_layout::BodyValue::Timestamptz(value)) => {
+            Some(EntityFilterValue::String(
+                chrono::DateTime::from_timestamp_micros(*value)
+                    .ok_or_else(|| native_projection_error(spec, column_name, "valid UTC microseconds"))?
+                    .to_rfc3339(),
+            ))
+        }
+        _ => return Err(native_projection_error(spec, column_name, "its declared scalar type")),
+    })
+}
+
+fn native_entity_slot_column_array(
     spec: &EntitySurfaceSpec,
     column_name: &str,
     slots: &[EntityStateSlot],
-    snapshots: &[Option<JsonValue>],
+    decoded: &[Option<DecodedNativeEntitySlot>],
     branch_id: Option<&str>,
 ) -> Result<ArrayRef> {
     if let Some(property_name) = column_name.strip_prefix("lixcol_") {
@@ -2909,55 +2872,116 @@ fn entity_slot_column_array(
             ))
         })?
         .column_type;
-    let values = slots
-        .iter()
-        .zip(snapshots.iter())
-        .map(|(slot, snapshot)| {
-            if let Some(value) = snapshot
-                .as_ref()
-                .and_then(|value| value.get(column_name))
-                .cloned()
-            {
-                Ok(Some(value))
-            } else {
-                entity_primary_key_value(spec, column_name, slot)
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let body_index = native_body_column_index(spec, column_name);
+    let pk_index = native_pk_column_index(spec, column_name);
+    if body_index.is_none() && pk_index.is_none() {
+        return Err(native_projection_error(spec, column_name, "a declared native column"));
+    }
+
     let array: ArrayRef = match column_type {
-        EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
-            values
+        EntityColumnType::String => Arc::new(StringArray::from(
+            decoded
                 .iter()
-                .map(|value| entity_json_text_value(value.as_ref(), column_type))
+                .map(|row| {
+                    let Some(row) = row else { return Ok(None) };
+                    if let Some(index) = pk_index {
+                        return match row.key.entity_pk.components.get(index) {
+                            Some(EntityPkComponent::Uuid(value)) => {
+                                Ok(Some(uuid::Uuid::from_bytes(*value).to_string()))
+                            }
+                            Some(EntityPkComponent::String(value)) => Ok(Some(value.to_string())),
+                            _ => Err(native_projection_error(spec, column_name, "text or uuid PK")),
+                        };
+                    }
+                    match row.body.get(body_index.expect("body column was established")) {
+                        Some(lix_schema::value_layout::BodyValue::Null) => Ok(None),
+                        Some(lix_schema::value_layout::BodyValue::Text(value)) => {
+                            Ok(Some(value.clone()))
+                        }
+                        Some(lix_schema::value_layout::BodyValue::Uuid(value)) => {
+                            Ok(Some(value.to_string()))
+                        }
+                        _ => Err(native_projection_error(spec, column_name, "text or uuid")),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        EntityColumnType::Json => Arc::new(StringArray::from(
+            decoded
+                .iter()
+                .map(|row| {
+                    let Some(row) = row else { return Ok(None) };
+                    match row.body.get(body_index.expect("jsonb cannot be a primary key")) {
+                        Some(lix_schema::value_layout::BodyValue::Null) => Ok(None),
+                        Some(lix_schema::value_layout::BodyValue::Jsonb(value)) => {
+                            serde_json::to_string(value).map(Some).map_err(|error| {
+                                DataFusionError::Execution(format!(
+                                    "failed to project native jsonb '{}.{}': {error}",
+                                    spec.schema_key, column_name
+                                ))
+                            })
+                        }
+                        _ => Err(native_projection_error(spec, column_name, "jsonb")),
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?,
         )),
         EntityColumnType::Integer => Arc::new(Int64Array::from(
-            values
+            decoded
                 .iter()
-                .map(|value| entity_i64_value(value.as_ref(), &spec.schema_key, column_name))
+                .map(|row| {
+                    let Some(row) = row else { return Ok(None) };
+                    if let Some(index) = pk_index {
+                        return match row.key.entity_pk.components.get(index) {
+                            Some(EntityPkComponent::Integer(value)) => Ok(Some(*value)),
+                            _ => Err(native_projection_error(spec, column_name, "int8 PK")),
+                        };
+                    }
+                    match row.body.get(body_index.expect("body column was established")) {
+                        Some(lix_schema::value_layout::BodyValue::Null) => Ok(None),
+                        Some(lix_schema::value_layout::BodyValue::Int8(value)) => Ok(Some(*value)),
+                        _ => Err(native_projection_error(spec, column_name, "int8")),
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?,
         )),
         EntityColumnType::Number => Arc::new(Float64Array::from(
-            values
+            decoded
                 .iter()
-                .map(|value| entity_f64_value(value.as_ref(), &spec.schema_key, column_name))
+                .map(|row| {
+                    let Some(row) = row else { return Ok(None) };
+                    match row.body.get(body_index.expect("float8 cannot be a primary key")) {
+                        Some(lix_schema::value_layout::BodyValue::Null) => Ok(None),
+                        Some(lix_schema::value_layout::BodyValue::Float8(value)) => Ok(Some(*value)),
+                        _ => Err(native_projection_error(spec, column_name, "float8")),
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?,
         )),
-        EntityColumnType::Boolean => Arc::new(BooleanArray::from_iter(
-            values
+        EntityColumnType::Boolean => Arc::new(BooleanArray::from(
+            decoded
                 .iter()
-                .map(|value| value.as_ref().and_then(JsonValue::as_bool)),
+                .map(|row| {
+                    let Some(row) = row else { return Ok(None) };
+                    match row.body.get(body_index.expect("boolean cannot be a primary key")) {
+                        Some(lix_schema::value_layout::BodyValue::Null) => Ok(None),
+                        Some(lix_schema::value_layout::BodyValue::Boolean(value)) => Ok(Some(*value)),
+                        _ => Err(native_projection_error(spec, column_name, "boolean")),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
         )),
         EntityColumnType::Timestamptz => Arc::new(
             TimestampMicrosecondArray::from(
-                values
+                decoded
                     .iter()
-                    .map(|value| {
-                        entity_timestamptz_value(
-                            value.as_ref(),
-                            &spec.schema_key,
-                            column_name,
-                        )
+                    .map(|row| {
+                        let Some(row) = row else { return Ok(None) };
+                        match row.body.get(body_index.expect("timestamptz cannot be a primary key")) {
+                            Some(lix_schema::value_layout::BodyValue::Null) => Ok(None),
+                            Some(lix_schema::value_layout::BodyValue::Timestamptz(value)) => Ok(Some(*value)),
+                            _ => Err(native_projection_error(spec, column_name, "timestamptz")),
+                        }
                     })
                     .collect::<Result<Vec<_>>>()?,
             )
@@ -2967,54 +2991,88 @@ fn entity_slot_column_array(
     Ok(array)
 }
 
-fn entity_timestamptz_value(
-    value: Option<&JsonValue>,
-    schema_key: &str,
-    column_name: &str,
-) -> Result<Option<i64>> {
-    let Some(value) = value else { return Ok(None) };
-    if value.is_null() {
-        return Ok(None);
-    }
-    let text = value.as_str().ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "{schema_key}.{column_name} expected timestamptz text"
-        ))
-    })?;
-    chrono::DateTime::parse_from_rfc3339(text)
-        .map(|timestamp| Some(timestamp.timestamp_micros()))
-        .map_err(|error| {
-            DataFusionError::Execution(format!(
-                "{schema_key}.{column_name} contains invalid timestamptz: {error}"
-            ))
-        })
-}
-
-/// Certified state snapshots may encode a primary-key component only in the
-/// canonical StateKey (for example, the compact `path`/`value` shape used by
-/// `lix_key_value`). Reconstruct that visible column from the already loaded
-/// key rather than emitting a null into a non-nullable Arrow field.
-fn entity_primary_key_value(
+fn decode_native_entity_slot(
     spec: &EntitySurfaceSpec,
-    column_name: &str,
     slot: &EntityStateSlot,
-) -> Result<Option<JsonValue>> {
-    let Some(component_index) = spec
-        .primary_key_paths
-        .iter()
-        .position(|path| path.len() == 1 && path.first().is_some_and(|name| name == column_name))
-    else {
-        return Ok(None);
+    active_branch_id: Option<&str>,
+) -> Result<Option<DecodedNativeEntitySlot>> {
+    let (row, explicit_branch_id) = match slot {
+        EntityStateSlot::Tracked(row) => (row, None),
+        EntityStateSlot::TrackedAt { row, branch_id } => (row, Some(branch_id.as_str())),
     };
-    let key = slot_state_key(slot).map_err(lix_error_to_datafusion_error)?;
-    let values = key
-        .entity_pk
-        .as_json_array_value()
-        .map_err(lix_error_to_datafusion_error)?;
-    Ok(values
-        .as_array()
-        .and_then(|values| values.get(component_index))
-        .cloned())
+    let key = decode_state_key(&row.key).map_err(lix_error_to_datafusion_error)?;
+    if key.schema_key != spec.schema_key {
+        return Err(lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!(
+                "native entity row schema '{}' does not match selected schema '{}'",
+                key.schema_key, spec.schema_key
+            ),
+        )));
+    }
+    if key.entity_pk.components.len() != spec.primary_key_component_types.len()
+        || key
+            .entity_pk
+            .components
+            .iter()
+            .zip(&spec.primary_key_component_types)
+            .any(|(component, expected)| {
+                !matches!(
+                    (component, expected),
+                    (EntityPkComponent::Uuid(_), crate::entity_pk::EntityPkComponentType::Uuid)
+                        | (
+                            EntityPkComponent::Integer(_),
+                            crate::entity_pk::EntityPkComponentType::Integer
+                        )
+                        | (
+                            EntityPkComponent::String(_),
+                            crate::entity_pk::EntityPkComponentType::String
+                        )
+                        | (
+                            EntityPkComponent::Bytes(_),
+                            crate::entity_pk::EntityPkComponentType::Bytes
+                        )
+                )
+            })
+    {
+        return Err(lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!(
+                "native entity row for schema '{}' has an invalid primary-key arity or scalar type",
+                spec.schema_key
+            ),
+        )));
+    }
+    match &row.value.cell {
+        StateCell::NativeRow(native) => {
+            let global = row.source == StateRowSource::Global;
+            if !global {
+                explicit_branch_id.or(active_branch_id).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "entity provider '{}' has no authenticated branch owner",
+                        spec.schema_key
+                    ))
+                })?;
+            }
+            let body = crate::native_row::decode(
+                spec.native_schema.as_ref(),
+                &key.entity_pk,
+                global,
+                key.file_id.as_deref(),
+                native,
+            )
+            .map_err(lix_error_to_datafusion_error)?;
+            Ok(Some(DecodedNativeEntitySlot { key, body }))
+        }
+        StateCell::Value(_) => Err(lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!(
+                "Schema-v1 entity '{}' uses the removed JSON current-state representation",
+                spec.schema_key
+            ),
+        ))),
+        StateCell::Null | StateCell::Tombstone => Ok(None),
+    }
 }
 
 fn slot_state_key(slot: &EntityStateSlot) -> Result<crate::forktree::StateKey, LixError> {
