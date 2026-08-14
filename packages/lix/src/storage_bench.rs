@@ -4207,6 +4207,11 @@ mod tests {
         assert_eq!(
             first.delete_counts_by_space,
             vec![
+                (crate::hot_state::DIFF_SPACE.id.0, 100), // retired checkpoint working-diff rows
+                (
+                    crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE.id.0,
+                    1,
+                ), // retired checkpoint epoch marker
                 (
                     crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
                         .id
@@ -4241,11 +4246,23 @@ mod tests {
         const FENCE_KEY_BYTES: usize =
             crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
-        // Every canonical-record delete is UUID keyed, so each descriptor is
-        // exactly 16 bytes.
+        // Canonical-record deletes are UUID keyed. Checkpoint rotation also
+        // retires the fixture's fixed-width working-diff identities and the
+        // branch-ref marker through their authenticated physical encodings.
+        const UUID_KEY_BYTES: usize = 16;
+        const WORKING_DIFF_KEY_BYTES: usize = 121;
+        const WORKING_DIFF_MARKER_KEY_BYTES: usize = 37;
+        let working_diff_deletes = 100;
+        let marker_deletes = 1;
+        let uuid_deletes = first.staged_deletes as usize
+            - working_diff_deletes
+            - marker_deletes;
         assert_eq!(
             first.key_shared_bytes,
-            first.staged_deletes as usize * 16 + FENCE_KEY_BYTES
+            uuid_deletes * UUID_KEY_BYTES
+                + working_diff_deletes * WORKING_DIFF_KEY_BYTES
+                + marker_deletes * WORKING_DIFF_MARKER_KEY_BYTES
+                + FENCE_KEY_BYTES
         );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);
