@@ -165,8 +165,13 @@ impl TrackedStateTree {
         lower: &[u8],
     ) -> Result<Option<Bytes>, LixError> {
         let mut current = *root_id.as_bytes();
+        let mut expected_summary = None;
         loop {
-            match self.load_node(store, &current).await? {
+            let node = self.load_node(store, &current).await?;
+            if let Some(expected) = expected_summary.take() {
+                validate_decoded_node_summary(&node, &expected)?;
+            }
+            match node {
                 DecodedNode::Leaf(leaf) => {
                     let mut low = 0usize;
                     let mut high = leaf.len();
@@ -191,10 +196,12 @@ impl TrackedStateTree {
                         .children()
                         .iter()
                         .find(|child| child.last_key.as_ref() >= lower)
+                        .cloned()
                     else {
                         return Ok(None);
                     };
                     current = child.child_hash;
+                    expected_summary = Some(child);
                 }
             }
         }
@@ -2591,6 +2598,46 @@ fn decoded_leaf_summary(
     }
 }
 
+fn validate_decoded_node_summary(
+    node: &DecodedNode,
+    expected: &ChildSummary,
+) -> Result<(), LixError> {
+    let (first_key, last_key, subtree_count) = match node {
+        DecodedNode::Leaf(leaf) => (
+            leaf.first_key().unwrap_or_default(),
+            leaf.last_key().unwrap_or_default(),
+            leaf.len() as u64,
+        ),
+        DecodedNode::Internal(internal) => {
+            let children = internal.children();
+            let first_key = children.first().map(|child| child.first_key.as_ref());
+            let last_key = children.last().map(|child| child.last_key.as_ref());
+            let subtree_count = children
+                .iter()
+                .try_fold(0_u64, |total, child| total.checked_add(child.subtree_count));
+            let (Some(first_key), Some(last_key), Some(subtree_count)) =
+                (first_key, last_key, subtree_count)
+            else {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "tracked-state internal child summary is invalid",
+                ));
+            };
+            (first_key, last_key, subtree_count)
+        }
+    };
+    if first_key != expected.first_key.as_ref()
+        || last_key != expected.last_key.as_ref()
+        || subtree_count != expected.subtree_count
+    {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "tracked-state child summary does not match authenticated child contents",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn internal_summary(
     hash: [u8; TRACKED_STATE_HASH_BYTES],
@@ -2820,6 +2867,32 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageAdapterReadScope};
     use crate::tracked_state::codec::{encode_value, hash_bytes};
+
+    #[test]
+    fn schema_inventory_rejects_parent_child_summary_substitution() {
+        let key = encode_key(&TrackedStateKey {
+            schema_key: "private_schema".to_string(),
+            file_id: Some("file-a".to_string()),
+            row_pk: RowPk::single("row-a"),
+        });
+        let value = encode_value(&value("change-a", Some("present")));
+        let bytes = Bytes::from(encode_leaf_node(&[EncodedLeafEntry {
+            key: Bytes::from(key.clone()),
+            value: Bytes::from(value),
+        }]));
+        let node = decode_node(&bytes).expect("fixture leaf should decode");
+        let error = validate_decoded_node_summary(
+            &node,
+            &ChildSummary {
+                first_key: Bytes::from_static(b"forged-first"),
+                last_key: Bytes::from(key),
+                child_hash: hash_bytes(&bytes),
+                subtree_count: 1,
+            },
+        )
+        .expect_err("hash-valid child with substituted boundary must fail closed");
+        assert!(error.message.contains("child summary does not match"));
+    }
 
     struct CountingChunkRead {
         hash: [u8; TRACKED_STATE_HASH_BYTES],
