@@ -245,8 +245,8 @@ test("execute and executeBatch expose registered-entity RETURNING postimages", a
 	await registerCrmTaskSchema(lix);
 
 	const inserted = await lix.execute(
-		"INSERT INTO crm_task (title, done) VALUES ($1, $2) RETURNING id, title",
-		["Created through SDK RETURNING", false],
+		"INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3) RETURNING id, title",
+		["returning-task", "Created through SDK RETURNING", false],
 	);
 	expect(inserted.rowsAffected).toBe(1);
 	expect(inserted.columns).toEqual(["id", "title"]);
@@ -268,8 +268,8 @@ test("execute and executeBatch expose registered-entity RETURNING postimages", a
 
 	const [batched] = await lix.executeBatch([
 		{
-			sql: "INSERT INTO crm_task (title, done) VALUES ($1, $2) RETURNING id, title",
-			params: ["Batched SDK RETURNING", true],
+			sql: "INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3) RETURNING id, title",
+			params: ["batched-returning-task", "Batched SDK RETURNING", true],
 		},
 	]);
 	expect(batched?.rowsAffected).toBe(1);
@@ -1821,7 +1821,7 @@ async function registerCrmTaskSchema(lix: Lix): Promise<void> {
 		$schema: "https://lix.dev/schema-v1.json",
 		key: "crm_task",
 		columns: [
-			{ name: "id", type: "uuid", nullable: false, default_expression: "uuidv7()" },
+			{ name: "id", type: "text", nullable: false },
 			{ name: "title", type: "text", nullable: false },
 			{ name: "done", type: "boolean", nullable: false },
 			{ name: "meta", type: "jsonb", nullable: true },
