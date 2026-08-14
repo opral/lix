@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "benchmark-overlays/schema_v1_public",
   "packages/*",
   "plugins/*",
   # This patched dependency has private parser-equivalence tests that must run
