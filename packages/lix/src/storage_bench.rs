@@ -1,6 +1,16 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::storage_adapter::StorageWriteSet;
+
+/// Declares an isolated storage space for authenticated benchmark models.
+#[cfg(feature = "storage-benches")]
+pub const fn experiment_storage_space(
+    id: u32,
+    name: &'static str,
+    semantics: crate::storage::ValueSemantics,
+) -> crate::storage::StorageSpace {
+    crate::storage::StorageSpace::engine_declared(id, name, semantics)
+}
 static TRANSACTION_ROWS_STAGED: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
