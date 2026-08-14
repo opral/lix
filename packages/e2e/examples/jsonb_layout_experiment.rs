@@ -358,6 +358,7 @@ fn threshold_indexed_range<'a>(
 }
 
 fn threshold_path(bytes: &[u8], indexed: bool, sought: &str) -> Result<bool, String> {
+    threshold_validate(bytes, indexed)?;
     if bytes.first().copied() != Some(u8::from(indexed)) {
         return Err("threshold layout tag mismatch".into());
     }
@@ -409,6 +410,68 @@ fn threshold_path(bytes: &[u8], indexed: bool, sought: &str) -> Result<bool, Str
         }
         Ok(false)
     }
+}
+
+fn threshold_validate(bytes: &[u8], indexed: bool) -> Result<(), String> {
+    if bytes.first().copied() != Some(u8::from(indexed)) {
+        return Err("threshold layout tag mismatch".into());
+    }
+    if indexed {
+        let count =
+            u32::from_le_bytes(bytes.get(1..5).ok_or("count")?.try_into().unwrap()) as usize;
+        let table = (count + 1).checked_mul(4).ok_or("table")?;
+        let key_table = 5;
+        let value_table = key_table + table;
+        let data = value_table + table;
+        let key_bytes = u32::from_le_bytes(
+            bytes
+                .get(key_table + count * 4..key_table + table)
+                .ok_or("keys")?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let key_data = bytes.get(data..data + key_bytes).ok_or("key data")?;
+        let value_data = bytes.get(data + key_bytes..).ok_or("value data")?;
+        let mut previous: Option<&str> = None;
+        for index in 0..count {
+            let key =
+                std::str::from_utf8(threshold_indexed_range(bytes, key_table, index, key_data)?)
+                    .map_err(|e| e.to_string())?;
+            if previous.is_some_and(|previous| previous >= key) {
+                return Err("keys are not strictly ordered".into());
+            }
+            previous = Some(key);
+            std::str::from_utf8(threshold_indexed_range(
+                bytes,
+                value_table,
+                index,
+                value_data,
+            )?)
+            .map_err(|e| e.to_string())?;
+        }
+    } else {
+        let mut rest = &bytes[1..];
+        let count = threshold_take_varint(&mut rest)? as usize;
+        let mut previous: Option<&str> = None;
+        for _ in 0..count {
+            let key_len = threshold_take_varint(&mut rest)? as usize;
+            let (key, tail) = rest.split_at_checked(key_len).ok_or("key")?;
+            rest = tail;
+            let key = std::str::from_utf8(key).map_err(|e| e.to_string())?;
+            if previous.is_some_and(|previous| previous >= key) {
+                return Err("keys are not strictly ordered".into());
+            }
+            previous = Some(key);
+            let value_len = threshold_take_varint(&mut rest)? as usize;
+            let (value, tail) = rest.split_at_checked(value_len).ok_or("value")?;
+            rest = tail;
+            std::str::from_utf8(value).map_err(|e| e.to_string())?;
+        }
+        if !rest.is_empty() {
+            return Err("trailing threshold bytes".into());
+        }
+    }
+    Ok(())
 }
 
 fn threshold_rewrite(bytes: &[u8], indexed: bool, sought: &str) -> Result<Vec<u8>, String> {

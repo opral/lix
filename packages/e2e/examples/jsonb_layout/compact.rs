@@ -7,22 +7,16 @@ pub struct CompactCodec;
 const MAGIC: &[u8; 4] = b"LJCI";
 const VERSION: u8 = 1;
 const HEADER: usize = 41;
-const INDEX_PAGE_ENTRIES: usize = 32;
-const SMALL_ARRAY_LIMIT: usize = INDEX_PAGE_ENTRIES;
-const SMALL_OBJECT_LIMIT: usize = 8;
-
 const NULL: u8 = 0;
 const FALSE: u8 = 1;
 const TRUE: u8 = 2;
 const NUMBER: u8 = 3;
 const STRING: u8 = 4;
 const SMALL_ARRAY: u8 = 5;
-const INDEXED_ARRAY: u8 = 6;
 const SMALL_OBJECT: u8 = 7;
-const INDEXED_OBJECT: u8 = 8;
 
 impl JsonbCodec for CompactCodec {
-    const NAME: &'static str = "compact-indexed";
+    const NAME: &'static str = "compact-inline";
 
     fn encode(value: &Value) -> Result<Vec<u8>, String> {
         let mut value = value.clone();
@@ -170,68 +164,24 @@ fn encode_number(number: &Number, output: &mut Vec<u8>) -> Result<(), String> {
 
 fn encode_array(children: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
-    if children.len() <= SMALL_ARRAY_LIMIT {
-        output.push(SMALL_ARRAY);
-        put_varint(children.len() as u64, &mut output);
-        for child in children {
-            put_varint(child.len() as u64, &mut output);
-            output.extend_from_slice(child);
-        }
-    } else {
-        output.push(INDEXED_ARRAY);
-        push_u32(children.len(), &mut output, "array count")?;
-        let page_count = children.len().div_ceil(INDEX_PAGE_ENTRIES);
-        push_u32(page_count, &mut output, "array page count")?;
-        let mut page_data = Vec::new();
-        push_u32(0, &mut output, "array page offset")?;
-        for page in children.chunks(INDEX_PAGE_ENTRIES) {
-            for child in page {
-                put_varint(child.len() as u64, &mut page_data);
-                page_data.extend_from_slice(child);
-            }
-            push_u32(page_data.len(), &mut output, "array page offset")?;
-        }
-        output.extend_from_slice(&page_data);
+    output.push(SMALL_ARRAY);
+    put_varint(children.len() as u64, &mut output);
+    for child in children {
+        put_varint(child.len() as u64, &mut output);
+        output.extend_from_slice(child);
     }
     Ok(output)
 }
 
 fn encode_object(entries: &[(&[u8], Vec<u8>)]) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
-    if entries.len() <= SMALL_OBJECT_LIMIT {
-        output.push(SMALL_OBJECT);
-        put_varint(entries.len() as u64, &mut output);
-        for (key, child) in entries {
-            put_varint(key.len() as u64, &mut output);
-            output.extend_from_slice(key);
-            put_varint(child.len() as u64, &mut output);
-            output.extend_from_slice(child);
-        }
-    } else {
-        output.push(INDEXED_OBJECT);
-        push_u32(entries.len(), &mut output, "object count")?;
-        let mut key_offset = 0usize;
-        push_u32(key_offset, &mut output, "object key offset")?;
-        for (key, _) in entries {
-            key_offset = key_offset
-                .checked_add(key.len())
-                .ok_or_else(|| "object key data overflow".to_owned())?;
-            push_u32(key_offset, &mut output, "object key offset")?;
-        }
-        let mut child_offset = 0usize;
-        push_u32(child_offset, &mut output, "object child offset")?;
-        for (_, child) in entries {
-            child_offset = child_offset
-                .checked_add(child.len())
-                .ok_or_else(|| "object child data overflow".to_owned())?;
-            push_u32(child_offset, &mut output, "object child offset")?;
-        }
-        for (key, _) in entries {
-            output.extend_from_slice(key);
-        }
-        for (_, child) in entries {
-            output.extend_from_slice(child);
-        }
+    output.push(SMALL_OBJECT);
+    put_varint(entries.len() as u64, &mut output);
+    for (key, child) in entries {
+        put_varint(key.len() as u64, &mut output);
+        output.extend_from_slice(key);
+        put_varint(child.len() as u64, &mut output);
+        output.extend_from_slice(child);
     }
     Ok(output)
 }
@@ -247,9 +197,7 @@ impl<'a> Container<'a> {
         let (&tag, payload) = frame.split_first().ok_or("empty compact JSONB frame")?;
         match tag {
             SMALL_ARRAY => parse_small_array(payload).map(Self::Array),
-            INDEXED_ARRAY => parse_indexed_array(payload).map(Self::Array),
             SMALL_OBJECT => parse_small_object(payload).map(Self::Object),
-            INDEXED_OBJECT => parse_indexed_object(payload).map(Self::Object),
             NULL | FALSE | TRUE | NUMBER | STRING => Ok(Self::Scalar),
             _ => Err(format!("unknown compact JSONB tag {tag}")),
         }
@@ -258,9 +206,6 @@ impl<'a> Container<'a> {
 
 fn parse_small_array(mut bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
     let count = take_varint(&mut bytes, "small array count")? as usize;
-    if count > SMALL_ARRAY_LIMIT {
-        return Err("small array exceeds its canonical count".to_owned());
-    }
     let mut children = Vec::with_capacity(count);
     for _ in 0..count {
         let length = take_varint(&mut bytes, "small array child length")? as usize;
@@ -279,57 +224,8 @@ fn parse_small_array(mut bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
     Ok(children)
 }
 
-fn parse_indexed_array(bytes: &[u8]) -> Result<Vec<&[u8]>, String> {
-    let count = read_u32(bytes, 0, "array count")?;
-    if count <= SMALL_ARRAY_LIMIT {
-        return Err("indexed array is not canonical for its count".to_owned());
-    }
-    let page_count = read_u32(bytes, 4, "array page count")?;
-    let expected_pages = count.div_ceil(INDEX_PAGE_ENTRIES);
-    if page_count != expected_pages {
-        return Err("indexed array page count is not canonical".to_owned());
-    }
-    let table_end = 8usize
-        .checked_add(
-            (page_count + 1)
-                .checked_mul(4)
-                .ok_or("array page table overflow")?,
-        )
-        .ok_or("array table overflow")?;
-    let data = bytes
-        .get(table_end..)
-        .ok_or("array page table is truncated")?;
-    let pages = slices_from_offsets(bytes, 8, page_count, data, "array page", false)?;
-    let mut children = Vec::with_capacity(count);
-    for (page_index, mut page) in pages.into_iter().enumerate() {
-        let remaining = count - children.len();
-        let expected_children = remaining.min(INDEX_PAGE_ENTRIES);
-        for _ in 0..expected_children {
-            let length = take_varint(&mut page, "array child length")? as usize;
-            let (child, rest) = page
-                .split_at_checked(length)
-                .ok_or("array child is truncated")?;
-            if child.is_empty() {
-                return Err("array child is empty".to_owned());
-            }
-            children.push(child);
-            page = rest;
-        }
-        if !page.is_empty() {
-            return Err(format!("array page {page_index} has trailing bytes"));
-        }
-    }
-    if children.len() != count {
-        return Err("indexed array child count mismatch".to_owned());
-    }
-    Ok(children)
-}
-
 fn parse_small_object(mut bytes: &[u8]) -> Result<Vec<(&[u8], &[u8])>, String> {
     let count = take_varint(&mut bytes, "small object count")? as usize;
-    if count > SMALL_OBJECT_LIMIT {
-        return Err("small object exceeds its canonical count".to_owned());
-    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let key_length = take_varint(&mut bytes, "small object key length")? as usize;
@@ -354,66 +250,6 @@ fn parse_small_object(mut bytes: &[u8]) -> Result<Vec<(&[u8], &[u8])>, String> {
     Ok(entries)
 }
 
-fn parse_indexed_object(bytes: &[u8]) -> Result<Vec<(&[u8], &[u8])>, String> {
-    let count = read_u32(bytes, 0, "object count")?;
-    if count <= SMALL_OBJECT_LIMIT {
-        return Err("indexed object is not canonical for its count".to_owned());
-    }
-    let table_size = (count + 1).checked_mul(4).ok_or("object table overflow")?;
-    let child_offsets = 4usize
-        .checked_add(table_size)
-        .ok_or("object table overflow")?;
-    let key_data = child_offsets
-        .checked_add(table_size)
-        .ok_or("object table overflow")?;
-    let key_total = read_u32(bytes, 4 + count * 4, "terminal key offset")?;
-    let child_data = key_data
-        .checked_add(key_total)
-        .ok_or("object key overflow")?;
-    let keys = bytes
-        .get(key_data..child_data)
-        .ok_or("object keys are truncated")?;
-    let children = bytes
-        .get(child_data..)
-        .ok_or("object children are truncated")?;
-    let key_slices = slices_from_offsets(bytes, 4, count, keys, "object key", true)?;
-    let child_slices =
-        slices_from_offsets(bytes, child_offsets, count, children, "object child", false)?;
-    let mut entries = Vec::with_capacity(count);
-    for (key, child) in key_slices.into_iter().zip(child_slices) {
-        validate_key(key, entries.last().map(|entry: &(&[u8], &[u8])| entry.0))?;
-        entries.push((key, child));
-    }
-    Ok(entries)
-}
-
-fn slices_from_offsets<'a>(
-    table: &[u8],
-    start: usize,
-    count: usize,
-    data: &'a [u8],
-    context: &str,
-    allow_empty: bool,
-) -> Result<Vec<&'a [u8]>, String> {
-    let mut slices = Vec::with_capacity(count);
-    let mut previous = read_u32(table, start, context)?;
-    if previous != 0 {
-        return Err(format!("{context} offsets do not start at zero"));
-    }
-    for index in 0..count {
-        let next = read_u32(table, start + (index + 1) * 4, context)?;
-        if next < previous || (!allow_empty && next == previous) || next > data.len() {
-            return Err(format!("{context} offsets are invalid"));
-        }
-        slices.push(&data[previous..next]);
-        previous = next;
-    }
-    if previous != data.len() {
-        return Err(format!("{context} offsets do not span their data"));
-    }
-    Ok(slices)
-}
-
 fn decode_frame(frame: &[u8]) -> Result<Value, String> {
     let (&tag, payload) = frame.split_first().ok_or("empty compact JSONB frame")?;
     match tag {
@@ -426,7 +262,7 @@ fn decode_frame(frame: &[u8]) -> Result<Value, String> {
             reject_nul(value, "string")?;
             Ok(Value::String(value.to_owned()))
         }
-        SMALL_ARRAY | INDEXED_ARRAY => Container::parse(frame).and_then(|container| {
+        SMALL_ARRAY => Container::parse(frame).and_then(|container| {
             let Container::Array(children) = container else {
                 unreachable!()
             };
@@ -436,7 +272,7 @@ fn decode_frame(frame: &[u8]) -> Result<Value, String> {
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array)
         }),
-        SMALL_OBJECT | INDEXED_OBJECT => Container::parse(frame).and_then(|container| {
+        SMALL_OBJECT => Container::parse(frame).and_then(|container| {
             let Container::Object(entries) = container else {
                 unreachable!()
             };
@@ -597,22 +433,6 @@ fn take_varint(bytes: &mut &[u8], context: &str) -> Result<u64, String> {
     Err(format!("{context} varint is too long"))
 }
 
-fn read_u32(bytes: &[u8], offset: usize, context: &str) -> Result<usize, String> {
-    let raw = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| format!("{context} is truncated"))?;
-    Ok(u32::from_le_bytes(raw.try_into().expect("four bytes")) as usize)
-}
-
-fn push_u32(value: usize, output: &mut Vec<u8>, context: &str) -> Result<(), String> {
-    output.extend_from_slice(
-        &u32::try_from(value)
-            .map_err(|_| format!("{context} exceeds u32"))?
-            .to_le_bytes(),
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_object_round_trips_an_empty_first_key() {
+    fn object_round_trips_an_empty_first_key() {
         let mut object = Map::new();
         object.insert(String::new(), Value::from("empty"));
         for index in 0..8 {
@@ -684,11 +504,6 @@ mod tests {
 
     #[test]
     fn container_size_classes_are_canonical() {
-        assert!(parse_small_object(&[9]).is_err());
-        assert!(parse_indexed_object(&8_u32.to_le_bytes()).is_err());
-        assert!(parse_small_array(&[33]).is_err());
-        assert!(parse_indexed_array(&32_u32.to_le_bytes()).is_err());
-
         let object_at_limit = Value::Object(
             (0..8)
                 .map(|index| (format!("k{index}"), Value::from(index)))
@@ -705,7 +520,7 @@ mod tests {
         );
         assert_eq!(
             CompactCodec::encode(&object_above_limit).unwrap()[HEADER],
-            INDEXED_OBJECT
+            SMALL_OBJECT
         );
 
         let array_at_limit = Value::Array((0..32).map(Value::from).collect());
@@ -716,7 +531,7 @@ mod tests {
         );
         assert_eq!(
             CompactCodec::encode(&array_above_limit).unwrap()[HEADER],
-            INDEXED_ARRAY
+            SMALL_ARRAY
         );
     }
 }
