@@ -362,12 +362,12 @@ impl PluginRegistry {
             )));
         };
         validate_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id)?;
-        if !matches!(row.value.cell, crate::forktree::StateCell::Value(_)) {
+        if row.value.cell.deleted() {
             return Err(invalid_registry(format!(
                 "authenticated plugin registry is not a value for branch '{branch_id}'"
             )));
         }
-        let snapshot = parse_snapshot_content(row, "plugin registry")?;
+        let snapshot = parse_snapshot_content(row, branch_id, "plugin registry")?;
         Self::from_optional_snapshot(Some(&snapshot))
     }
 
@@ -484,6 +484,12 @@ where
                 )
             })?)
         }
+        crate::forktree::StateCell::NativeRow(_) => {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "historical native plugin registry requires its authenticated branch owner",
+            ));
+        }
         crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
             return Err(LixError::new(
                 LixError::CODE_STORAGE_ERROR,
@@ -567,10 +573,10 @@ impl PluginFileOwner {
             invalid_registry("plugin owner row is missing its file_id storage identity")
         })?;
         validate_state_identity(row, PLUGIN_OWNER_KEY, Some(file_id), branch_id)?;
-        if row.value.cell.deleted() || state_snapshot_content(row).is_none() {
+        if row.value.cell.deleted() {
             return Ok(None);
         }
-        let snapshot = parse_snapshot_content(row, "plugin owner")?;
+        let snapshot = parse_snapshot_content(row, branch_id, "plugin owner")?;
         Self::from_snapshot(file_id, &snapshot).map(Some)
     }
 
@@ -1118,18 +1124,16 @@ fn validate_branch_local_scope(branch_id: &str) -> Result<(), LixError> {
     Ok(())
 }
 
-fn parse_snapshot_content(row: &StateRow, kind: &str) -> Result<JsonValue, LixError> {
-    let raw = state_snapshot_content(row)
+fn parse_snapshot_content(
+    row: &StateRow,
+    branch_id: &str,
+    kind: &str,
+) -> Result<JsonValue, LixError> {
+    let raw = row
+        .seed_logical_snapshot(branch_id)?
         .ok_or_else(|| invalid_registry(format!("{kind} state row is missing snapshot content")))?;
-    serde_json::from_str(raw)
+    serde_json::from_str(&raw)
         .map_err(|error| invalid_registry(format!("{kind} snapshot is invalid JSON: {error}")))
-}
-
-fn state_snapshot_content(row: &StateRow) -> Option<&str> {
-    match &row.value.cell {
-        crate::forktree::StateCell::Value(value) => Some(value.as_str()),
-        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
-    }
 }
 
 fn glob_specificity_rank(glob: &str) -> (u8, i32) {

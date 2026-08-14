@@ -413,10 +413,11 @@ where
             commit_id,
             created_at: row.created_at,
             updated_at: row.updated_at,
-            cell: match canonical_snapshot.as_deref() {
+            cell: match row.snapshot {
                 None => StateCell::Tombstone,
-                Some("null") => StateCell::Null,
-                Some(value) => StateCell::Value(value.into()),
+                Some(_) => StateCell::NativeRow(row.native_row.cloned().ok_or_else(|| {
+                    writer_error("live prepared row has no authenticated native tuple")
+                })?),
             },
             metadata: row
                 .metadata
@@ -1222,10 +1223,11 @@ where
                         commit_id: draft.commit_id,
                         created_at: row.created_at,
                         updated_at: row.updated_at,
-                        cell: match canonical_snapshot.as_deref() {
+                        cell: match row.snapshot {
                             None => StateCell::Tombstone,
-                            Some("null") => StateCell::Null,
-                            Some(value) => StateCell::Value(value.into()),
+                            Some(_) => StateCell::NativeRow(row.native_row.cloned().ok_or_else(|| {
+                                writer_error("live prepared row has no authenticated native tuple")
+                            })?),
                         },
                         metadata: row
                             .metadata

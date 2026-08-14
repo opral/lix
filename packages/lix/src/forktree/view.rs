@@ -541,6 +541,9 @@ where
 /// later exact point batches can only traverse the two bound state roots.
 pub(crate) struct AuthenticatedHistoricalStateView<'a, R: ?Sized> {
     read: &'a R,
+    commit_catalog_root: ObjectId,
+    change_catalog_root: ObjectId,
+    endpoint_commit_object_id: ObjectId,
     global_state_root: ObjectId,
     local_state_root: ObjectId,
 }
@@ -555,11 +558,14 @@ where
         include_tombstone: bool,
     ) -> Result<Option<(super::state::StateValue, super::serving::StateSource)>, crate::LixError>
     {
-        let mut values = super::serving::state_points_on_read(
+        let mut values = super::serving::state_points_on_read_with_historical_auth(
             self.global_state_root,
             Some(self.local_state_root),
             &[key.to_vec()],
             include_tombstone,
+            self.commit_catalog_root,
+            self.change_catalog_root,
+            self.endpoint_commit_object_id,
             self.read,
         )
         .await?;
@@ -580,11 +586,14 @@ where
                 })
             })
             .collect::<Vec<_>>();
-        let values = super::serving::state_points_on_read(
+        let values = super::serving::state_points_on_read_with_historical_auth(
             self.global_state_root,
             Some(self.local_state_root),
             &encoded_keys,
             true,
+            self.commit_catalog_root,
+            self.change_catalog_root,
+            self.endpoint_commit_object_id,
             self.read,
         )
         .await?;
@@ -592,13 +601,21 @@ where
             .iter()
             .zip(values)
             .map(|(key, value)| {
-                value.map(|(value, source)| {
+                let Some((value, source)) = value else {
+                    return Ok(None);
+                };
                     let (snapshot_content, deleted) = match value.cell {
                         super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
+                        super::state::StateCell::NativeRow(_) => {
+                            return Err(crate::LixError::new(
+                                crate::LixError::CODE_STORAGE_ERROR,
+                                "historical native row requires its authenticated branch owner",
+                            ));
+                        }
                         super::state::StateCell::Null => (None, false),
                         super::state::StateCell::Tombstone => (None, true),
                     };
-                    super::state::HistoricalStateRow {
+                    Ok(Some(super::state::HistoricalStateRow {
                         key: key.clone(),
                         global: source == super::serving::StateSource::Global,
                         snapshot_content,
@@ -609,10 +626,9 @@ where
                         updated_at: value.updated_at,
                         change_id: value.change_id,
                         commit_id: value.commit_id,
-                    }
-                })
+                    }))
             })
-            .collect())
+            .collect::<Result<Vec<_>, crate::LixError>>()?)
     }
 }
 
@@ -689,10 +705,19 @@ where
         commit_id: &str,
     ) -> Result<AuthenticatedHistoricalStateView<'_, R>, crate::LixError> {
         let commit_id = crate::changelog::CommitId::parse_lix(commit_id, "historical commit")?;
-        let (global_state_root, local_state_root) =
-            super::serving::authenticate_historical_state_roots(&self.read, commit_id).await?;
+        let (
+            commit_catalog_root,
+            change_catalog_root,
+            endpoint_commit_object_id,
+            global_state_root,
+            local_state_root,
+        ) = super::serving::authenticate_historical_state_roots_for_diff(&self.read, commit_id)
+            .await?;
         Ok(AuthenticatedHistoricalStateView {
             read: &self.read,
+            commit_catalog_root,
+            change_catalog_root,
+            endpoint_commit_object_id,
             global_state_root,
             local_state_root,
         })
@@ -754,10 +779,16 @@ where
                 "collection generation row identity does not match its requested scope",
             ));
         }
-        let snapshot = match row.value.cell {
-            super::state::StateCell::Value(value) => value,
-            super::state::StateCell::Null | super::state::StateCell::Tombstone => return Ok(None),
-        };
+        let snapshot = row
+            .value
+            .cell
+            .seed_logical_text(&decoded, branch_id)?
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_STORAGE_ERROR,
+                    "collection generation row is not live",
+                )
+            })?;
         let snapshot =
             serde_json::from_str::<serde_json::Value>(snapshot.as_str()).map_err(|error| {
                 crate::LixError::new(
@@ -1320,6 +1351,12 @@ fn historical_state_row_from_point(
     }
     let (snapshot_content, deleted) = match value.cell {
         super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
+        super::state::StateCell::NativeRow(_) => {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_STORAGE_ERROR,
+                "historical native row requires its authenticated branch owner",
+            ));
+        }
         super::state::StateCell::Null => (None, false),
         super::state::StateCell::Tombstone => (None, true),
     };
@@ -1486,6 +1523,12 @@ fn historical_state_rows_from_points(
             let key = super::state::decode_state_key(encoded_key)?;
             let (snapshot_content, deleted) = match value.cell {
                 super::state::StateCell::Value(snapshot) => (Some(snapshot), false),
+                super::state::StateCell::NativeRow(_) => {
+                    return Err(crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        "historical native row requires its authenticated branch owner",
+                    ));
+                }
                 super::state::StateCell::Null => (None, false),
                 super::state::StateCell::Tombstone => (None, true),
             };

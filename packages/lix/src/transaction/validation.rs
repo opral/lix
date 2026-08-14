@@ -77,16 +77,13 @@ struct NativeValidationRow {
 impl NativeValidationRow {
     fn from_tracked(row: StateRow, branch_id: &str) -> Result<Self, LixError> {
         let key = decode_state_key(&row.key)?;
-        let (snapshot, deleted) = match row.value.cell {
-            StateCell::Value(value) => (Some(value), false),
-            StateCell::Null => (Some(SharedStr::from("null")), false),
-            StateCell::Tombstone => (None, true),
-        };
         let branch_id = if key.schema_key == BRANCH_DESCRIPTOR_SCHEMA_KEY {
             GLOBAL_BRANCH_ID.to_owned()
         } else {
             branch_id.to_owned()
         };
+        let deleted = row.value.cell.deleted();
+        let snapshot = row.value.cell.seed_logical_text(&key, &branch_id)?;
         Ok(Self {
             key,
             branch_id,

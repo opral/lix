@@ -62,15 +62,14 @@ pub(crate) async fn load_workspace_branch_id_from_index(
                 "workspace branch selector is missing lix_key_value:lix_workspace_branch_id",
             )
         })?;
-    let snapshot_content = match row.value.cell {
-        StateCell::Value(value) => value,
-        StateCell::Null | StateCell::Tombstone => {
-            return Err(LixError::new(
+    let snapshot_content = row
+        .seed_logical_snapshot(GLOBAL_BRANCH_ID)?
+        .ok_or_else(|| {
+            LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "workspace branch selector is missing snapshot_content",
-            ));
-        }
-    };
+            )
+        })?;
     let snapshot =
         serde_json::from_str::<JsonValue>(snapshot_content.as_ref()).map_err(|error| {
             LixError::new(

@@ -56,6 +56,57 @@ async fn seven_types_register_write_and_read_through_public_api() {
         "timestamptz projection returned {:?}",
         values[6]
     );
+    let Value::Text(id) = &values[0] else {
+        unreachable!("UUID projection was asserted above")
+    };
+    let id = id.clone();
+
+    let updated = lix
+        .execute(
+            "UPDATE seven_type_probe SET count = 43 WHERE id = $1 RETURNING id, count",
+            &[Value::Text(id.clone())],
+        )
+        .await
+        .expect("seven-type row updates");
+    assert_eq!(updated.rows()[0].values()[1], Value::Integer(43));
+
+    let point = lix
+        .execute(
+            "SELECT count, metadata FROM seven_type_probe WHERE id = $1",
+            &[Value::Text(id.clone())],
+        )
+        .await
+        .expect("seven-type point read");
+    assert_eq!(point.rows()[0].values()[0], Value::Integer(43));
+    let range = lix
+        .execute(
+            "SELECT id, label FROM seven_type_probe ORDER BY id LIMIT 10",
+            &[],
+        )
+        .await
+        .expect("seven-type range read");
+    assert_eq!(range.rows().len(), 1);
+    let full = lix
+        .execute("SELECT * FROM seven_type_probe", &[])
+        .await
+        .expect("seven-type full projection");
+    assert_eq!(full.rows().len(), 1);
+    let deleted = lix
+        .execute(
+            "DELETE FROM seven_type_probe WHERE id = $1 RETURNING id",
+            &[Value::Text(id)],
+        )
+        .await
+        .expect("seven-type row deletes");
+    assert_eq!(deleted.rows().len(), 1);
+    assert_eq!(
+        lix.execute("SELECT * FROM seven_type_probe", &[])
+            .await
+            .expect("deleted row remains absent")
+            .rows()
+            .len(),
+        0
+    );
 
     lix.close().await.expect("memory Lix closes");
 }

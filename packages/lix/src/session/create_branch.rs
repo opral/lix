@@ -92,10 +92,8 @@ where
                 )
                 .await?;
             for row in existing_descriptors {
-                let Some(snapshot) = (match row.value.cell {
-                    StateCell::Value(snapshot) => Some(snapshot),
-                    StateCell::Null | StateCell::Tombstone => None,
-                }) else {
+                let Some(snapshot) = row.seed_logical_snapshot(transaction.active_branch_id())?
+                else {
                     continue;
                 };
                 let value = serde_json::from_str::<serde_json::Value>(snapshot.as_ref())

@@ -380,6 +380,7 @@ pub(crate) struct SchemaPlan {
     pub(crate) schema: Arc<JsonValue>,
     fingerprint: Arc<SchemaPlanFingerprint>,
     pub(crate) compiled_schema: lix_schema::CompiledSchema,
+    pub(crate) relational_schema: lix_schema::Schema,
     fast_object_validation: Option<FastObjectValidationPlan>,
     pub(crate) defaults: DefaultPlan,
     pub(crate) primary_key: Option<PointerGroup>,
@@ -711,7 +712,15 @@ impl SchemaPlan {
         let fingerprint = Arc::new(SchemaPlanFingerprint(
             *blake3::hash(canonical_schema.as_bytes()).as_bytes(),
         ));
-        let compiled_schema = compile_lix_schema(&schema)?;
+        let relational_schema = crate::schema::parse_lix_schema(&schema)?;
+        let compiled_schema = lix_schema::CompiledSchema::compile(&relational_schema).map_err(
+            |error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!("Invalid Lix schema definition: {error}"),
+                )
+            },
+        )?;
         let fast_object_validation = FastObjectValidationPlan::compile(&schema);
         let defaults = DefaultPlan::from_schema(&schema);
         let primary_key = primary_key_paths(&schema)?;
@@ -732,6 +741,7 @@ impl SchemaPlan {
             schema: Arc::new(schema),
             fingerprint,
             compiled_schema,
+            relational_schema,
             fast_object_validation,
             defaults,
             primary_key,

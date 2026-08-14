@@ -262,7 +262,7 @@ pub(crate) fn require_existing_id_authorities(
                 return false;
             };
             !row.value.cell.deleted()
-                && state_snapshot_content(row).is_some()
+                && matches!(row.value.cell, crate::forktree::StateCell::NativeRow(_))
                 && key.schema_key == state_key.schema_key
                 && key.entity_pk.len() == 1
                 && EntityPk::uuid_from_canonical(&key.entity_pk[0])
@@ -344,9 +344,10 @@ pub(crate) fn validate_create_reservation(
     };
     let key = bound.reservation_key();
     validate_reservation_identity(row, &key, file_id, branch_id)?;
-    let snapshot = state_snapshot_content(row)
+    let snapshot = row
+        .seed_logical_snapshot(branch_id)?
         .ok_or_else(|| invalid_id(format!("create reservation '{key}' has no snapshot")))?;
-    let snapshot: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
+    let snapshot: JsonValue = serde_json::from_str(&snapshot).map_err(|error| {
         invalid_id(format!(
             "create reservation '{key}' is invalid JSON: {error}"
         ))
@@ -462,13 +463,6 @@ fn validate_reservation_identity(
         )));
     }
     Ok(())
-}
-
-fn state_snapshot_content(row: &StateRow) -> Option<&str> {
-    match &row.value.cell {
-        crate::forktree::StateCell::Value(value) => Some(value.as_str()),
-        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
-    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

@@ -1366,13 +1366,21 @@ where
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let (global_state_root, local_state_root) =
-        authenticate_historical_state_roots(read, commit_id).await?;
-    state_points_on_read(
+    let (
+        commit_catalog_root,
+        change_catalog_root,
+        endpoint_commit_object_id,
+        global_state_root,
+        local_state_root,
+    ) = authenticate_historical_state_roots_for_diff(read, commit_id).await?;
+    state_points_on_read_with_historical_auth(
         global_state_root,
         Some(local_state_root),
         keys,
         include_tombstone,
+        commit_catalog_root,
+        change_catalog_root,
+        endpoint_commit_object_id,
         read,
     )
     .await
@@ -4156,18 +4164,11 @@ where
                 "state value page identity differs from its state key",
             ));
         }
-        let cell = match record.snapshot {
-            crate::json_store::JsonSlot::None => StateCell::Tombstone,
-            crate::json_store::JsonSlot::Inline(value) if value.as_ref() == "null" => {
-                StateCell::Null
-            }
-            crate::json_store::JsonSlot::Inline(value) => StateCell::Value(value.into()),
-            crate::json_store::JsonSlot::ForkTreeObject(_) => {
-                return Err(corruption(
-                    "state value page contains an out-of-page JSON reference",
-                ));
-            }
-        };
+        let cell = authenticated_current_cell_for_history(
+            &record.snapshot,
+            &pack_row.value.cell,
+        )?;
+        let logical_cell = logical_history_cell(&record.snapshot)?;
         let metadata = match record.metadata {
             crate::json_store::JsonSlot::None => None,
             crate::json_store::JsonSlot::Inline(value) => Some(value),
@@ -4192,7 +4193,9 @@ where
                 "current-state pack value differs from its stale-authenticated history member",
             ));
         }
-        output.push(Some((pack_row.value, *source)));
+        let mut output_value = historical_value;
+        output_value.cell = logical_cell;
+        output.push(Some((output_value, *source)));
     }
 
     output
@@ -4206,6 +4209,54 @@ where
             value => Ok(value),
         })
         .collect()
+}
+
+fn authenticated_current_cell_for_history(
+    historical: &crate::json_store::JsonSlot,
+    current: &StateCell,
+) -> Result<StateCell, StorageError> {
+    match (historical, current) {
+        (crate::json_store::JsonSlot::None, StateCell::Tombstone) => Ok(StateCell::Tombstone),
+        (crate::json_store::JsonSlot::Inline(value), StateCell::Null)
+            if value.as_ref() == "null" =>
+        {
+            Ok(StateCell::Null)
+        }
+        (crate::json_store::JsonSlot::Inline(value), StateCell::NativeRow(native)) => {
+            let digest = crate::native_row::semantic_digest_text(value)
+                .map_err(|error| corruption(error.to_string()))?;
+            if digest != native.semantic_digest {
+                return Err(corruption(
+                    "native current-state payload differs from its authenticated history member",
+                ));
+            }
+            Ok(current.clone())
+        }
+        (crate::json_store::JsonSlot::ForkTreeObject(_), _) => Err(corruption(
+            "state value page contains an out-of-page JSON reference",
+        )),
+        (_, StateCell::Value(_)) => Err(corruption(
+            "state value page uses the removed JSON current-state representation",
+        )),
+        _ => Err(corruption(
+            "current-state cell kind differs from its authenticated history member",
+        )),
+    }
+}
+
+fn logical_history_cell(
+    historical: &crate::json_store::JsonSlot,
+) -> Result<StateCell, StorageError> {
+    match historical {
+        crate::json_store::JsonSlot::None => Ok(StateCell::Tombstone),
+        crate::json_store::JsonSlot::Inline(value) if value.as_ref() == "null" => {
+            Ok(StateCell::Null)
+        }
+        crate::json_store::JsonSlot::Inline(value) => Ok(StateCell::Value(value.clone().into())),
+        crate::json_store::JsonSlot::ForkTreeObject(_) => Err(corruption(
+            "state value page contains an out-of-page JSON reference",
+        )),
+    }
 }
 #[derive(Clone, Debug)]
 struct ResolvedCurrentPackRow {
@@ -4393,18 +4444,11 @@ where
                 "state value page identity differs from its state key",
             ));
         }
-        let cell = match record.snapshot {
-            crate::json_store::JsonSlot::None => StateCell::Tombstone,
-            crate::json_store::JsonSlot::Inline(value) if value.as_ref() == "null" => {
-                StateCell::Null
-            }
-            crate::json_store::JsonSlot::Inline(value) => StateCell::Value(value.into()),
-            crate::json_store::JsonSlot::ForkTreeObject(_) => {
-                return Err(corruption(
-                    "state value page contains an out-of-page JSON reference",
-                ));
-            }
-        };
+        let cell = authenticated_current_cell_for_history(
+            &record.snapshot,
+            &pack_row.value.cell,
+        )?;
+        let logical_cell = logical_history_cell(&record.snapshot)?;
         let metadata = match record.metadata {
             crate::json_store::JsonSlot::None => None,
             crate::json_store::JsonSlot::Inline(value) => Some(value),
@@ -4429,7 +4473,9 @@ where
                 "current-state pack value differs from its authenticated history member",
             ));
         }
-        output.push(Some((pack_row.value, *source)));
+        let mut output_value = historical_value;
+        output_value.cell = logical_cell;
+        output.push(Some((output_value, *source)));
     }
     Ok(output)
 }
@@ -5091,6 +5137,12 @@ fn historical_state_rows_from_range(
             let key = decode_state_key(&encoded_key)?;
             let (snapshot_content, deleted) = match value.cell {
                 StateCell::Value(snapshot) => (Some(snapshot), false),
+                StateCell::NativeRow(_) => {
+                    return Err(corruption(
+                        "historical native state range requires its authenticated branch owner",
+                    )
+                    .into());
+                }
                 StateCell::Null => (None, false),
                 StateCell::Tombstone => (None, true),
             };
@@ -5117,19 +5169,7 @@ pub(crate) async fn scan_state_rows_at_commit<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let (global_state_root, local_state_root) =
-        load_historical_commit_state_roots(read, commit_id).await?;
-    let rows = state_range_on_roots(
-        global_state_root,
-        Some(local_state_root),
-        read,
-        None,
-        None,
-        None,
-        true,
-    )
-    .await?;
-    historical_state_rows_from_range(rows)
+    scan_state_rows_at_commit_bounds(read, commit_id, None, None).await
 }
 
 /// Loads only one authenticated state-key range for a historical commit. The
@@ -5145,18 +5185,59 @@ pub(crate) async fn scan_state_rows_at_commit_range<R>(
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let (global_state_root, local_state_root) =
-        load_historical_commit_state_roots(read, commit_id).await?;
-    let rows = state_range_on_roots(
+    scan_state_rows_at_commit_bounds(read, commit_id, Some(lower), upper).await
+}
+
+async fn scan_state_rows_at_commit_bounds<R>(
+    read: &R,
+    commit_id: crate::changelog::CommitId,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> Result<Vec<HistoricalStateRow>, crate::LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let (
+        commit_catalog_root,
+        change_catalog_root,
+        endpoint_commit_object_id,
+        global_state_root,
+        local_state_root,
+    ) = authenticate_historical_state_roots_for_diff(read, commit_id).await?;
+    let discovered = state_range_on_roots(
         global_state_root,
         Some(local_state_root),
         read,
-        Some(lower),
+        lower,
         upper,
         None,
         true,
     )
     .await?;
+    let keys = discovered
+        .into_iter()
+        .map(|(key, _, _)| key)
+        .collect::<Vec<_>>();
+    let values = state_points_on_read_with_historical_auth(
+        global_state_root,
+        Some(local_state_root),
+        &keys,
+        true,
+        commit_catalog_root,
+        change_catalog_root,
+        endpoint_commit_object_id,
+        read,
+    )
+    .await?;
+    let rows = keys
+        .into_iter()
+        .zip(values)
+        .map(|(key, value)| {
+            value
+                .map(|(value, source)| (key, value, source))
+                .ok_or_else(|| corruption("historical range key disappeared during exact authentication"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     historical_state_rows_from_range(rows)
 }
 

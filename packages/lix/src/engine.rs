@@ -305,15 +305,14 @@ where
                     format!("active account '{account_id}' does not exist"),
                 )
             })?;
-        let snapshot = match row.value.cell {
-            StateCell::Value(value) => value,
-            StateCell::Null | StateCell::Tombstone => {
-                return Err(LixError::new(
+        let snapshot = row
+            .seed_logical_snapshot(GLOBAL_BRANCH_ID)?
+            .ok_or_else(|| {
+                LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("account '{account_id}' has no snapshot"),
-                ));
-            }
-        };
+                )
+            })?;
         let snapshot = snapshot.as_str();
         let value: serde_json::Value = serde_json::from_str(snapshot).map_err(|error| {
             LixError::new(
