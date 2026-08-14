@@ -3507,7 +3507,16 @@ fn packed_exact_keys_for_filter(filter: &TrackedStateFilter) -> Option<Vec<Track
             filter
                 .row_pks
                 .iter()
-                .filter(|row_pk| filter.matches_row_pk(row_pk))
+                // These rows already come from `filter.row_pks`; checking
+                // membership again makes an exact K-key lookup O(K^2).
+                // Only the independent range conjunction remains here.
+                .filter(|row_pk| {
+                    crate::tracked_state::row_pk_satisfies_bounds(
+                        row_pk,
+                        filter.row_pk_lower.as_ref(),
+                        filter.row_pk_upper.as_ref(),
+                    )
+                })
                 .map(move |row_pk| TrackedStateKey {
                     schema_key: schema_key.clone(),
                     file_id: None,
@@ -16746,6 +16755,33 @@ mod tests {
                     row_pk: RowPk::single("second"),
                 },
             ]
+        );
+
+        let bounded = TrackedStateFilter {
+            schema_keys: vec!["schema".to_owned()],
+            row_pks: vec![
+                RowPk::single("first"),
+                RowPk::single("second"),
+                RowPk::single("second"),
+                RowPk::single("third"),
+            ],
+            row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                row_pk: RowPk::single("second"),
+                inclusive: true,
+            }),
+            row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                row_pk: RowPk::single("third"),
+                inclusive: false,
+            }),
+            ..TrackedStateFilter::default()
+        };
+        assert_eq!(
+            packed_exact_keys_for_filter(&bounded).expect("bounded filter is finite"),
+            vec![TrackedStateKey {
+                schema_key: "schema".to_owned(),
+                file_id: None,
+                row_pk: RowPk::single("second"),
+            }]
         );
     }
 
