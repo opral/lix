@@ -5,6 +5,7 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,92 +14,75 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::Cell;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
+use crate::binary_cas::{BlobBytesBatch, BlobId};
 use crate::branch::{
-    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchRefReader,
-    branch_ref_stage_row,
+    BRANCH_REF_SCHEMA_KEY, BranchLifecycle, BranchOperation, BranchRefReader, BranchRefStoreReader,
+    BranchReferenceRole,
 };
-use crate::catalog::{
-    CatalogContext, CatalogFingerprint, CatalogRevision, CatalogSnapshot, SchemaPlanId,
-    stage_catalog_revision,
-};
+use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId};
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangeRecordProjection, ChangelogContext, ChangelogReader, CommitId,
-    CommitLoadRequest, load_change_records, materialize_known_change_payloads,
+    ChangeId, ChangeRecord, ChangeRecordProjection, CommitId, load_change_records,
+    materialize_known_change_payloads,
 };
-use crate::checkpoint::{
-    CHECKPOINT_SCHEMA_KEY, checkpoint_commit_id_at_head, checkpoint_stage_row,
-};
-use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
-use crate::common::{LixTimestamp, SharedStr};
+use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_marker_stage_row};
+use crate::commit_graph::CommitGraphStoreReader;
+use crate::common::{LixTimestamp, SharedStr, compose_directory_path, compose_file_path};
 use crate::domain::Domain;
-use crate::row_pk::RowPk;
+use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    BlobRefRowInput, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
-    FilesystemPathIndexRequest, FilesystemPathKind, FilesystemRowContext, load_path_index_revision,
+    BlobRefPluginCheckpoint, BlobRefRowInput, FileDescriptorWriteIntent, FilesystemPathIndex,
+    FilesystemPathIndexCache, FilesystemPathIndexReader, FilesystemPathIndexRequest,
+    FilesystemPathKind, FilesystemRowContext, append_blob_ref_tombstone_row,
+};
+use crate::forktree::{
+    AuthenticatedBlobReader, CanonicalUploadId, ForkTreeReadFacade, HistoricalStateRow,
+    PreparedPublication, StateCell, StateKey, StateKeyRef, UploadBindingRef, decode_state_key,
+    encode_state_key, prepare_upload_part,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
-use crate::gc::{
-    CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_gc_state,
-    load_recovery_ref,
-};
-#[cfg(test)]
-use crate::hot_state::HotStateRowRequest;
-use crate::hot_state::{
-    BranchHeadControlCache, CertifiedCurrentStatePredecessor, HotStateContext,
-    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
-    HotStateReader, HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateExactBatch,
-    MaterializedHotStateRow, MaterializedHotStateRowRef, StagedHotStateRows, TrackedHeadContext,
-    TrackedWorkingDiff, overlay_load_exact_batch, overlay_scan_batch,
-};
-use crate::plugin::runtime::{
+use crate::gc::{CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_publication_state};
+use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
-    LiveBatchRowSource, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache,
-    PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
-    PluginActorStagedCheckpoint, PluginActorStore, PluginActorStorePermit,
-    PluginArchiveInstallPlan, PluginContentMatcher, PluginRowAuthorities,
-    PluginRowAuthorityRange, PluginFileOwner, PluginObservation, PluginRegistry,
-    PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntimeHost, SchemaAllowlist,
-    ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
-    VecRowChangeSource, VecRowConflictSource, VecRowSource, build_file_update_splices,
-    canonicalize_snapshot, drain_conflict_transition_resolutions, drain_row_transition_edits,
-    drain_file_transition_changes, host_row_change_with_lazy_snapshot,
-    host_row_with_lazy_snapshot, is_plugin_storage_path, is_reservation_key,
+    PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache, PluginActorColdInstall,
+    PluginActorColdOpen, PluginActorKey, PluginActorLease, PluginActorStagedCheckpoint,
+    PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentMatcher,
+    PluginEntityAuthorities, PluginEntityAuthorityRange, PluginFileOwner, PluginObservation,
+    PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntimeHost,
+    SchemaAllowlist, StateRowEntitySource, ValidatedConflictTransition, ValidatedFileTransition,
+    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
+    VecEntitySource, build_file_update_splices, canonicalize_snapshot,
+    drain_conflict_transition_resolutions, drain_entity_transition_edits,
+    drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
+    host_entity_with_lazy_snapshot, is_plugin_storage_path, is_reservation_key,
     local_mutation_identity, materialize_keyless_creates, plugin_archive_file_id_matches,
     plugin_install_plan_from_archive_path, plugin_key_from_archive_delete_origin,
-    plugin_state_hot_state_projection, require_existing_id_authorities, reservation_tombstone_row,
+    plugin_storage_wasm_file_id, require_existing_id_authorities, reservation_tombstone_row,
     reserve_create_row, transport_splice_preserves_prefix_exclusion,
     transport_splice_preserves_utf8, validate_create_changes, validate_create_reservation,
 };
 use crate::session::{
-    EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt,
-    SessionBranch, encode_receipt,
+    EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
+    encode_receipt,
 };
 use crate::sql2::{
-    CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
-    HistoryQuerySource, MaterializedChange, SessionFileViewKey, SessionFileViewMutation,
+    ChangelogQuerySource, DiffCommand, SessionFileViewKey, SessionFileViewMutation,
     SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
+use crate::state::{CertifiedStatePredecessor, ForkTreeStateView, StateRow, TransactionStateView};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
-    StorageWriteSetStats,
+    Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
 };
 use crate::storage_adapter::{
-    REVISION_KEY_CATALOG, REVISION_KEY_TRACKED_MUTATION, SharedStorageAdapterRead, StorageAdapter,
-    StorageAdapterRead, StorageAdapterReadScope, load_revisions,
-};
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateKey,
-    TrackedStateScanRequest, TrackedStateStoreReader,
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -106,129 +90,82 @@ use crate::transaction::normalization::{
     remember_pending_registered_schema,
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
-use crate::transaction::staged_commit_changes::{
-    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder,
-};
 use crate::transaction::staging::{
-    ImmutableMutationChunkStage, ImmutableMutationJournalChunk, PreparedStateRowOverlay,
-    PreparedWriteSet, TransactionWriteBuffer, TransactionWriteBufferCheckpoint,
+    BranchRefPublicationIntent, HistoricalBlobManifestEdges, ImmutableMutationChunkStage,
+    ImmutableMutationJournalChunk, PreparedWriteSet, TransactionWriteBuffer,
+    TransactionWriteBufferCheckpoint,
 };
 use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
-use crate::transaction_types::{
+#[cfg(test)]
+use crate::transaction::types::CertifiedRawWriteBatchPreparation;
+use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
-    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedIndexValues,
-    TransactionFileContent, TransactionJson, TransactionWrite, TransactionWriteMode,
-    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
-    TransactionWriteRow, TypedMutationJournalBatch, canonicalize_transaction_json_batch,
-    stage_json_from_value,
+    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
+    TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
 };
+use crate::transaction::validation::validate_prepared_writes_by_branch;
 
-pub(crate) struct CertifiedHistoryStoreReader<S> {
-    store: S,
-}
-
-impl<S> CertifiedHistoryStoreReader<S> {
-    pub(crate) const fn new(store: S) -> Self {
-        Self { store }
-    }
-}
-
-#[async_trait]
-impl<S> CertifiedHistoryReader for CertifiedHistoryStoreReader<S>
-where
-    S: StorageAdapterRead + Send + Sync,
-{
-    async fn scan(
-        &self,
-        commit_ids: &BTreeSet<CommitId>,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Vec<CertifiedHistoryChange>, LixError> {
-        let rows =
-            crate::hot_state::scan_certified_history_rows(&self.store, commit_ids, request).await?;
-        // Certified rows may use generated IDs that intentionally have no
-        // standalone or packed change record. Their embedded commit is the
-        // immutable authoring authority and survives inherited manifests.
-        let commit_ids = rows
-            .iter()
-            .filter_map(|row| row.commit_id)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let records = ChangelogContext::new()
-            .reader(&self.store)
-            .load_commits(CommitLoadRequest {
-                commit_ids: &commit_ids,
-            })
-            .await?;
-        let accounts_by_commit = records
-            .into_iter()
-            .map(|(commit_id, record)| {
-                record
-                    .map(|record| (*commit_id, record.account_id))
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "certified historical row references missing commit '{commit_id}'"
-                            ),
-                        )
-                    })
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
-        let mut changes = Vec::with_capacity(rows.len());
-        for row in rows {
-            let (Some(commit_id), Some(change_id)) = (row.commit_id, row.change_id) else {
-                continue;
-            };
-            let account_id = accounts_by_commit
-                .get(&commit_id)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("certified historical row references missing commit '{commit_id}'"),
-                    )
-                })?
-                .clone();
-            changes.push(CertifiedHistoryChange {
-                commit_id,
-                change: MaterializedChange {
-                    id: change_id.to_string(),
-                    account_id,
-                    row_pk: row.row_pk,
-                    schema_key: row.schema_key,
-                    file_id: row.file_id,
-                    snapshot_content: row.snapshot_content,
-                    metadata: row.metadata,
-                    created_at: row.created_at.to_string(),
-                    origin_key: None,
-                },
-            });
-        }
-        Ok(changes)
-    }
-}
 use crate::plugin::runtime::{
-    WASM_COMPONENT_API_VERSION, WasmCertifiedRowBatch, WasmChangeEffect, WasmColdFileUpdate,
+    WASM_COMPONENT_API_VERSION, WasmCertifiedEntityBatch, WasmChangeEffect, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictTake,
     WasmConflictUpdate, WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
-    WasmRowChange, WasmRowConflict, WasmRowKey, WasmRowUpdate, WasmFileDescriptor,
-    WasmFileUpdate, WasmHostBytes, WasmHostRow, WasmHostRowChanges, WasmOpenRowsInput,
+    WasmEntityChange, WasmEntityConflict, WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor,
+    WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput,
     WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
 };
-use crate::transaction::validation::{
-    TransactionValidationInput, fresh_plugin_file_import_certificate,
-    prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
-    validate_certified_tracked_insert_identities, validate_prepared_writes,
-};
-use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
+use crate::{LixError, SqlQueryResult, Value};
+
+/// # Safety
+///
+/// The transaction retains the storage value that created `read` and drops
+/// the widened read before that storage value. This keeps the concrete native
+/// retained-read boundary valid without introducing a second reader owner.
+unsafe fn assume_static_storage_read<StorageImpl>(
+    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
+) -> StorageAdapterReadScope<StorageImpl::Read<'static>>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let read = std::mem::ManuallyDrop::new(read);
+    unsafe {
+        std::ptr::read(
+            std::ptr::from_ref(&*read)
+                .cast::<StorageAdapterReadScope<StorageImpl::Read<'static>>>(),
+        )
+    }
+}
 
 mod cohort;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ForkTreeSelectorFence {
+    global: Bytes,
+    branch: Bytes,
+}
+
+async fn load_forktree_selector_fence<R>(
+    read: &R,
+    branch_id: &str,
+) -> Result<ForkTreeSelectorFence, LixError>
+where
+    R: StorageAdapterRead + Clone,
+{
+    let facade = ForkTreeReadFacade::new(read.clone());
+    let view = facade.branch(branch_id).await?;
+    Ok(ForkTreeSelectorFence {
+        global: view.raw_global_selector().clone(),
+        branch: view.raw_branch_selector().clone(),
+    })
 }
 
 /// Commits one coordinator-owned cohort in queue order.
@@ -258,15 +195,11 @@ where
     a.active_branch_id == b.active_branch_id
         && a.opening_active_branch_head == b.opening_active_branch_head
         && a.opening_global_branch_head == b.opening_global_branch_head
-        && a.opening_tracked_mutation_revision == b.opening_tracked_mutation_revision
+        && a.opening_selector_fence == b.opening_selector_fence
         && a.idempotency_receipt.is_none()
         && b.idempotency_receipt.is_none()
-        && a.atomic_metadata_writes.is_none()
-        && b.atomic_metadata_writes.is_none()
-        && a.atomic_metadata_preconditions.is_empty()
-        && b.atomic_metadata_preconditions.is_empty()
-        && a.pending_branch_checkpoint_replacements.is_empty()
-        && b.pending_branch_checkpoint_replacements.is_empty()
+        && a.pending_forktree_publication.is_none()
+        && b.pending_forktree_publication.is_none()
         && !a.await_durable_commit
         && !b.await_durable_commit
         && eligible_a
@@ -291,7 +224,7 @@ struct StaleConflictPayload {
 }
 
 struct StaleSemanticConflict {
-    key: TrackedStateKey,
+    key: StateKey,
     base: Option<StaleConflictPayload>,
     a: Option<StaleConflictPayload>,
     b: Option<StaleConflictPayload>,
@@ -303,15 +236,77 @@ struct StalePluginConflictGroup {
     conflicts: Vec<StaleSemanticConflict>,
 }
 
-fn stale_payload_from_tracked(
-    row: Option<crate::tracked_state::MaterializedTrackedStateRowRef<'_>>,
-) -> Option<StaleConflictPayload> {
-    row.filter(|row| !row.deleted()).and_then(|row| {
+fn stale_payload_from_historical(row: Option<&HistoricalStateRow>) -> Option<StaleConflictPayload> {
+    row.filter(|row| !row.deleted).and_then(|row| {
         Some(StaleConflictPayload {
-            snapshot: row.snapshot_content()?.clone(),
-            metadata: row.metadata().cloned(),
+            snapshot: row.snapshot_content.clone()?,
+            metadata: row.metadata.clone(),
         })
     })
+}
+
+fn state_key_from_tracked(key: &StateKey) -> StateKey {
+    StateKey {
+        schema_key: key.schema_key.clone(),
+        file_id: key.file_id.clone(),
+        entity_pk: key.entity_pk.clone(),
+    }
+}
+
+fn plugin_wasm_state_key(_branch_id: &str, plugin_key: &str) -> StateKey {
+    let file_id = plugin_storage_wasm_file_id(plugin_key);
+    StateKey {
+        schema_key: BLOB_REF_SCHEMA_KEY.to_owned(),
+        file_id: Some(file_id.clone()),
+        entity_pk: EntityPk::uuid_from_canonical(&file_id)
+            .expect("deterministic plugin WASM owner ID is a UUID"),
+    }
+}
+
+fn plugin_materialization_state_key(file_id: &str) -> StateKey {
+    StateKey {
+        schema_key: BLOB_REF_SCHEMA_KEY.to_owned(),
+        file_id: Some(file_id.to_owned()),
+        entity_pk: EntityPk::uuid_from_canonical(file_id)
+            .expect("plugin materialization owner ID is a UUID"),
+    }
+}
+
+fn historical_row_matches_key(row: &HistoricalStateRow, key: &StateKey) -> bool {
+    row.key.schema_key == key.schema_key
+        && row.key.file_id == key.file_id
+        && row.key.entity_pk == key.entity_pk
+}
+
+async fn load_historical_rows_at_commit<R>(
+    facade: &ForkTreeReadFacade<R>,
+    commit_id: CommitId,
+    keys: &[StateKey],
+) -> Result<Vec<Option<HistoricalStateRow>>, LixError>
+where
+    R: StorageAdapterRead,
+{
+    let state_keys = keys.iter().map(state_key_from_tracked).collect::<Vec<_>>();
+    let rows = facade
+        .load_state_rows_at_commit(&commit_id.to_string(), &state_keys)
+        .await?;
+    if rows.len() != keys.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "ForkTree historical state batch returned the wrong number of rows",
+        ));
+    }
+    for (row, key) in rows.iter().zip(keys) {
+        if let Some(row) = row
+            && !historical_row_matches_key(row, key)
+        {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "ForkTree historical state row identity does not match its requested key",
+            ));
+        }
+    }
+    Ok(rows)
 }
 
 fn stale_conflict_bytes(payload: Option<&StaleConflictPayload>) -> Option<WasmHostBytes> {
@@ -375,101 +370,6 @@ fn stale_conflict_resolution_payload(
     Ok(payload)
 }
 
-/// The durable identity and blob reference of one plugin materialization.
-#[derive(Debug, Clone)]
-struct VisibleMaterialization {
-    semantic_root: String,
-    bytes: VisibleMaterializationBytes,
-}
-
-#[derive(Debug, Clone)]
-enum VisibleMaterializationBytes {
-    Blob { hash: BlobId },
-}
-
-#[cfg(test)]
-fn decode_visible_materialization(
-    row: &MaterializedHotStateRow,
-    file_id: &str,
-) -> Result<VisibleMaterialization, LixError> {
-    decode_visible_materialization_parts(
-        row.schema_key.as_str(),
-        row.change_id,
-        row.snapshot_content.as_deref(),
-        file_id,
-    )
-}
-
-fn decode_visible_materialization_ref(
-    row: MaterializedHotStateRowRef<'_>,
-    file_id: &str,
-) -> Result<VisibleMaterialization, LixError> {
-    decode_visible_materialization_parts(
-        row.schema_key(),
-        row.change_id(),
-        row.snapshot_content().map(|content| content.as_str()),
-        file_id,
-    )
-}
-
-fn decode_visible_materialization_parts(
-    schema_key: &str,
-    change_id: Option<ChangeId>,
-    snapshot_content: Option<&str>,
-    file_id: &str,
-) -> Result<VisibleMaterialization, LixError> {
-    let semantic_root = change_id.map(|root| root.to_string()).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("component materialization root for file '{file_id}' is missing change_id"),
-        )
-    })?;
-    let snapshot = snapshot_content.ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            format!(
-                "owned component plugin file '{file_id}' materialization is missing its durable proof"
-            ),
-        )
-    })?;
-    let bytes = match schema_key {
-        BLOB_REF_SCHEMA_KEY => {
-            let snapshot: PluginUpgradeBlobRefSnapshot =
-                serde_json::from_str(snapshot).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!(
-                            "owned component plugin file '{file_id}' has an invalid blob reference: {error}"
-                        ),
-                    )
-                })?;
-            if snapshot.id != file_id {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!(
-                        "owned component plugin file '{file_id}' materialization identity does not match its file scope"
-                    ),
-                ));
-            }
-            VisibleMaterializationBytes::Blob {
-                hash: BlobId::from_hex(&snapshot.blob_hash)?,
-            }
-        }
-        schema_key => {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!(
-                    "owned component plugin file '{file_id}' materialization uses unsupported schema '{schema_key}'"
-                ),
-            ));
-        }
-    };
-    Ok(VisibleMaterialization {
-        semantic_root,
-        bytes,
-    })
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TransactionPathIndexBuildStats {
@@ -484,16 +384,6 @@ thread_local! {
             builds: 0,
             descriptor_rows: 0,
         }) };
-}
-
-#[cfg(test)]
-fn reset_transaction_path_index_build_stats() {
-    TRANSACTION_PATH_INDEX_BUILD_STATS.set(TransactionPathIndexBuildStats::default());
-}
-
-#[cfg(test)]
-fn transaction_path_index_build_stats() -> TransactionPathIndexBuildStats {
-    TRANSACTION_PATH_INDEX_BUILD_STATS.get()
 }
 
 #[cfg(test)]
@@ -516,24 +406,10 @@ fn record_transaction_path_index_build(descriptor_rows: usize) {
 /// that may write. Write-relevant reads must be exposed from this transaction,
 /// after the storage write transaction has begun, rather than from session-level
 /// helpers.
-/// Retires the write-context revocation token so any `SqlWriteContext` that
-/// outlives this transaction fails deterministically instead of dereferencing
-/// freed memory. See `sql2::WriteContextLiveness`.
-impl<StorageImpl: Storage + 'static> Drop for Transaction<StorageImpl> {
-    fn drop(&mut self) {
-        self.write_context_liveness.retire();
-    }
-}
-
 pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
-    write_context_liveness: crate::sql2::WriteContextLiveness,
     active_branch_id: String,
     active_account_id: String,
-    hot_state: Arc<HotStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
-    binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
-    branch_ctx: Arc<BranchContext>,
     schema_resolver: TransactionSchemaResolver,
     /// SQL binding is snapshot-isolated at transaction open. Schema writes
     /// staged later in this transaction affect validation but become visible
@@ -544,22 +420,8 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
         Arc<str>,
         Arc<crate::sql2::PreparedPathValueReplacementProgram>,
     )>,
-    prepared_mutation_membership: PreparedMutationMembership,
-    /// Once proven, a homogeneous prepared generation can avoid locking the
-    /// generic row overlay for every independent scalar mutation. Changing
-    /// the prepared program invalidates this transaction-local proof.
-    prepared_mutation_overlay_empty: bool,
-    /// One logical timestamp for a homogeneous columnar mutation generation.
-    /// Immutable replacement parts require their post-image rows to share the
-    /// same lifecycle boundary, so sealing must not preserve per-call clocks.
     prepared_mutation_timestamp: Option<LixTimestamp>,
     mutation_journal: Option<TransactionMutationJournal>,
-    mutation_journal_compressor: Option<crate::compression::ZstdLevel1Compressor>,
-    mutation_journal_sealed_rows: usize,
-    /// Eagerly sealed parts must remain one canonical prefix. Once a flush
-    /// leaves an unsealed tail or exceeds the bounded prefix, later chunks
-    /// must stay unsealed so commit can encode one contiguous suffix.
-    mutation_journal_seal_prefix_open: bool,
     /// Sealing consumes the journal's owned column buffers. If any fallible
     /// validation or staging step rejects those buffers, this transaction can
     /// no longer provide statement atomicity and must remain rollback-only.
@@ -567,18 +429,16 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
     /// Coherent storage snapshot retained for explicit transaction reads.
     /// This field is declared before `storage` so it is dropped first.
     opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+    state_view: TransactionStateView<SharedStorageAdapterRead<StorageImpl::Read<'static>>>,
     storage: Arc<StorageAdapter<StorageImpl>>,
     functions: FunctionProviderHandle,
-    /// PostgreSQL `CURRENT_TIMESTAMP`, fixed at this implicit transaction's start.
-    current_timestamp: Option<LixTimestamp>,
-    /// Tracked-state revision observed by the coherent transaction-open read.
-    /// Durable tracked publication must still be based on this revision;
-    /// untracked current-state writes do not invalidate the tracked snapshot.
-    opening_tracked_mutation_revision: Option<Bytes>,
+    /// Raw authenticated ForkTree selector pair observed by the coherent
+    /// transaction-open read. Publication rechecks this pair through the
+    /// same global epoch/branch-generation CAS fence.
+    opening_selector_fence: ForkTreeSelectorFence,
     /// Branch roots captured by the same coherent opening read. They let an
     /// explicit transaction distinguish a disjoint concurrent commit from an
     /// overlapping semantic write without creating a temporary branch.
@@ -591,17 +451,12 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// Storage-native metadata that must publish in the same backend commit as
     /// this transaction's file rows and history. Resumable media finalization
     /// uses this lane for its completed manifest and upload receipt.
-    atomic_metadata_writes: Option<StorageWriteSet>,
-    atomic_metadata_preconditions: Vec<StoragePrecondition>,
+    pending_forktree_publication: Option<PreparedPublication>,
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
+    pending_plugin_wasm_by_owner: BTreeMap<(String, String), (BlobId, Vec<u8>)>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
-    /// Explicit historical branch sources whose branchability may be owned by
-    /// one still-pending authenticated checkpoint replacement. Resolution is
-    /// delayed to the coherent commit-boundary read so its queue observation
-    /// is fenced by the same branch publication batch.
-    pending_branch_checkpoint_replacements: BTreeMap<String, CommitId>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     plugin_generation_upgrade_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
@@ -618,13 +473,6 @@ struct TransactionMutationJournal {
 
 const INITIAL_MUTATION_JOURNAL_ROWS: usize = 16;
 const INITIAL_MUTATION_JOURNAL_ARENA_BYTES: usize = 1_024;
-const MUTATION_JOURNAL_EAGER_SEAL_MAX_ROWS: usize = 16 * 1_024;
-
-enum PreparedMutationMembership {
-    Unprepared,
-    Unavailable,
-    Packed(crate::hot_state::PackedIdentityMembership),
-}
 
 impl TransactionMutationJournal {
     fn len(&self) -> usize {
@@ -672,7 +520,7 @@ impl TransactionMutationJournal {
 /// certified by the active branch head and its immutable historical root;
 /// target payloads come from an exact read of the desired root.
 struct TypedStateTransition {
-    identity: TrackedStateKey,
+    identity: StateKey,
     expected_change_id: Option<ChangeId>,
     target: Option<TypedStateTransitionTarget>,
 }
@@ -681,6 +529,8 @@ struct TypedStateTransitionTarget {
     change_id: ChangeId,
     snapshot_content: Option<SharedStr>,
     metadata: Option<SharedStr>,
+    global: bool,
+    blob_manifest_object_ids: Vec<crate::forktree::ObjectId>,
 }
 
 /// State which must be restored when `RETURNING` evaluation fails after a
@@ -689,6 +539,7 @@ pub(crate) struct SqlStatementCheckpoint {
     staged_writes: TransactionWriteBufferCheckpoint,
     filesystem_path_index_epoch: usize,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
+    pending_plugin_wasm_by_owner: BTreeMap<(String, String), (BlobId, Vec<u8>)>,
     trust_filesystem_planner: bool,
 }
 
@@ -815,35 +666,170 @@ impl<StorageImpl> Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub(crate) fn stage_atomic_cas_publication(
+    pub(crate) async fn stage_forktree_upload_part(
         &mut self,
-        writes: StorageWriteSet,
-        preconditions: Vec<StoragePrecondition>,
-        blob_id: BlobId,
-    ) -> Result<(), LixError> {
-        if self.atomic_metadata_writes.is_some() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "atomic transaction metadata was staged more than once",
-            ));
+        upload_id: &str,
+        binding: UploadBindingRef<'_>,
+        part_number: u64,
+        byte_offset: u64,
+        content: &[u8],
+    ) -> Result<crate::forktree::PreparedUploadPart, LixError> {
+        let upload_id = CanonicalUploadId::new(upload_id.as_bytes())?;
+        let facade = self.forktree_read_facade();
+        let view = facade.branch(&self.active_branch_id).await?;
+        let prepared =
+            prepare_upload_part(&view, upload_id, binding, part_number, byte_offset, content)
+                .await
+                .map_err(|error| {
+                    let error = LixError::from(error);
+                    if error
+                        .message
+                        .contains("upload selector binding does not match this request")
+                    {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "upload id is already bound to a different path or size",
+                        )
+                    } else if error
+                        .message
+                        .contains("upload part is outside the four-part completion window")
+                    {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "upload part is outside the four-part completion window",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+        if !prepared.already_present {
+            let mut publication = PreparedPublication::from_branch_view(&view)?;
+            publication.publish_upload_part(prepared.clone())?;
+            if let Some(mut pending) = self.pending_forktree_publication.take() {
+                pending.merge_from(publication)?;
+                self.pending_forktree_publication = Some(pending);
+            } else {
+                self.pending_forktree_publication = Some(publication);
+            }
+            self.await_durable_commit = true;
         }
-        if !self
-            .binary_cas
-            .prepared_manifest_is_staged(&writes, blob_id)
+        Ok(prepared)
+    }
+
+    /// Rejects a resumable upload that races with an already-published file.
+    ///
+    /// Completed upload selectors are deliberately retired with the receipt
+    /// tree, so the visible BlobRef is the only durable idempotency witness
+    /// after completion. An exact one-part replay may therefore return
+    /// success without staging a second publication; a different payload (or
+    /// a multipart continuation) fails closed as a stale target.
+    pub(crate) async fn check_forktree_upload_target(
+        &mut self,
+        path: &str,
+        total_size: u64,
+        byte_offset: u64,
+        content: &[u8],
+    ) -> Result<bool, LixError> {
+        let request = FilesystemPathIndexRequest::new(vec![self.active_branch_id.clone()])
+            .with_blob_refs(true);
+        let index = self.filesystem_path_index(&request).await?;
+        let Some(entry) = index
+            .exact_entries(path)
+            .into_iter()
+            .find(|entry| entry.kind == FilesystemPathKind::File)
+        else {
+            return Ok(false);
+        };
+        let row = entry.blob_ref_state_row().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "visible upload target has no authenticated BlobRef",
+            )
+        })?;
+        let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "visible upload target BlobRef has no snapshot",
+            )
+        })?;
+        let snapshot = serde_json::from_str::<serde_json::Value>(snapshot).map_err(|_| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "visible upload target BlobRef snapshot is malformed",
+            )
+        })?;
+        let declared_size = snapshot
+            .get("size_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "visible upload target BlobRef size is absent",
+                )
+            })?;
+        let blob_hash = snapshot
+            .get("blob_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "visible upload target BlobRef identity is absent",
+                )
+            })?;
+        let expected = BlobId::from_canonical_content(content).to_hex();
+        if byte_offset == 0
+            && total_size == content.len() as u64
+            && declared_size == total_size
+            && blob_hash == expected
         {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "atomic CAS publication is missing its prepared manifest",
-            ));
+            return Ok(true);
         }
-        self.atomic_metadata_writes = Some(writes);
-        self.atomic_metadata_preconditions.extend(preconditions);
-        self.await_durable_commit = true;
-        Ok(())
+        Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "upload target is already bound to a different file identity",
+        ))
     }
 
     fn opening_read(&self) -> SharedStorageAdapterRead<StorageImpl::Read<'static>> {
         self.opening_read.clone()
+    }
+
+    /// Creates the opaque ForkTree operation owner from this transaction's
+    /// already-retained opening read. This does not acquire or refresh a
+    /// storage read and does not expose the underlying handle.
+    pub(crate) fn forktree_read_facade(
+        &self,
+    ) -> ForkTreeReadFacade<SharedStorageAdapterRead<StorageImpl::Read<'static>>> {
+        ForkTreeReadFacade::new(self.opening_read())
+    }
+
+    /// Exposes the transaction's committed authenticated view without
+    /// acquiring another storage read. Staged rows are added by the
+    /// transaction overlay owner before a consumer asks for the combined
+    /// `TransactionStateView`.
+    pub(crate) async fn committed_state_view(
+        &mut self,
+    ) -> Result<ForkTreeStateView<SharedStorageAdapterRead<StorageImpl::Read<'static>>>, LixError>
+    {
+        let read = self.opening_read();
+        let branch_id = self.active_branch_id.clone();
+        ForkTreeStateView::from_facade(ForkTreeReadFacade::new(read), &branch_id).await
+    }
+
+    /// Refreshes the native transaction read overlay from the same live write
+    /// buffer that commit will drain. The committed retained view is reused;
+    /// this never opens a statement-local read or a second authority.
+    fn refresh_state_view_from_staging(&mut self, bump_epoch: bool) -> Result<(), LixError> {
+        let staged = self
+            .staged_writes
+            .state_overlay_rows(&self.active_branch_id)?;
+        self.state_view = self.state_view.with_staged_rows(staged)?;
+        if bump_epoch {
+            self.filesystem_path_index_epoch
+                .fetch_add(1, Ordering::SeqCst);
+            self.filesystem_path_index_cache.clear();
+        }
+        Ok(())
     }
 
     async fn reconcile_stale_disjoint_writes<S>(
@@ -852,11 +838,11 @@ where
         prepared_writes: &mut PreparedWriteSet,
     ) -> Result<(), LixError>
     where
-        S: StorageAdapterRead,
+        S: StorageAdapterRead + Clone,
     {
-        let current_revision =
-            StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(read).await?;
-        if current_revision == self.opening_tracked_mutation_revision {
+        let current_selector_fence =
+            load_forktree_selector_fence(read, &self.active_branch_id).await?;
+        if current_selector_fence == self.opening_selector_fence {
             return Ok(());
         }
 
@@ -882,7 +868,7 @@ where
             ));
         }
 
-        let branch_reader = self.branch_ctx.ref_reader(read);
+        let branch_reader = BranchRefStoreReader::new(read);
         let current_global_head = branch_reader.load_head_commit_id(GLOBAL_BRANCH_ID).await?;
         let current_active_head = branch_reader
             .load_head_commit_id(&self.active_branch_id)
@@ -899,7 +885,7 @@ where
             ));
         }
         if current_active_head == self.opening_active_branch_head {
-            self.opening_tracked_mutation_revision = current_revision;
+            self.opening_selector_fence = current_selector_fence;
             return Ok(());
         }
         let Some(opening_head) = self.opening_active_branch_head else {
@@ -921,16 +907,17 @@ where
         // retain the zero-reconstruction direct path.
         let journal_descriptors = prepared_writes.ordered_mutation_journal_descriptors();
         if !journal_descriptors.is_empty() {
-            let base = self
-                .hot_state
-                .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+            // `opening_read` is rebound to the commit-boundary read before
+            // reconciliation begins. Keep predecessor hydration on the same
+            // operation-owned ForkTree facade as the stale classifier.
+            let forktree = self.forktree_read_facade();
             let mut predecessors_by_commit = BTreeMap::new();
             for descriptor in journal_descriptors {
                 let predecessors = load_immutable_mutation_predecessors(
-                    &base,
+                    &forktree,
                     &descriptor.schema_key,
                     &descriptor.branch_id,
-                    &descriptor.row_pk_chunks,
+                    &descriptor.entity_pk_chunks,
                 )
                 .await?;
                 predecessors_by_commit.insert(descriptor.commit_id, predecessors);
@@ -938,66 +925,56 @@ where
             prepared_writes.hydrate_and_lower_ordered_mutation_journals(predecessors_by_commit)?;
         }
 
-        let mut tracked = self.tracked_state.reader(read);
-        let opening_head_text = opening_head.to_string();
-        let current_head_text = current_head.to_string();
-        let generation_write_set = tracked
-            .changed_identities_in_first_parent_interval(&opening_head_text, &current_head_text)
+        let facade = self.forktree_read_facade();
+        let concurrent_payload = facade
+            .diff_state_rows_between_commits(opening_head, current_head)
             .instrument(tracing::debug_span!(
                 target: "lix_transaction",
-                "lix.transaction.stale.generation_write_set"
+                "lix.transaction.stale.forktree_diff"
             ))
             .await?;
-        let (plan, concurrent_change_count, discovery) = match generation_write_set {
-            Some(identities) => {
-                let count = identities.len();
-                let plan = {
-                    let span = tracing::debug_span!(
-                        target: "lix_transaction",
-                        "lix.transaction.stale.classify",
-                        prepared_rows = prepared_writes.state_rows.len(),
-                        concurrent_changes = count,
-                    );
-                    let _entered = span.enter();
-                    classify_stale_commit(
-                        prepared_writes,
-                        identities.iter().map(|identity| identity.as_key_ref()),
-                    )
-                };
-                (plan, count, "generation_write_set")
-            }
-            None => {
-                let concurrent = tracked
-                    .diff_commits(
-                        &opening_head_text,
-                        &current_head_text,
-                        &TrackedStateDiffRequest::default(),
-                    )
-                    .instrument(tracing::debug_span!(
-                        target: "lix_transaction",
-                        "lix.transaction.stale.general_diff"
-                    ))
-                    .await?;
-                let count = concurrent.entries.len();
-                let plan = {
-                    let span = tracing::debug_span!(
-                        target: "lix_transaction",
-                        "lix.transaction.stale.classify",
-                        prepared_rows = prepared_writes.state_rows.len(),
-                        concurrent_changes = count,
-                    );
-                    let _entered = span.enter();
-                    classify_stale_commit(
-                        prepared_writes,
-                        concurrent
-                            .entries
-                            .iter()
-                            .map(|entry| entry.identity.as_key_ref()),
-                    )
-                };
-                (plan, count, "general_diff")
-            }
+        let mut concurrent_keys = concurrent_payload
+            .into_iter()
+            .filter_map(|entry| entry.after.or(entry.before))
+            .map(|row| StateKey {
+                schema_key: row.key.schema_key,
+                file_id: row.key.file_id,
+                entity_pk: row.key.entity_pk,
+            })
+            .collect::<Vec<_>>();
+        let concurrent_identity = facade
+            .touched_state_identities_between_commits(opening_head, current_head)
+            .instrument(tracing::debug_span!(
+                target: "lix_transaction",
+                "lix.transaction.stale.forktree_identity"
+            ))
+            .await?;
+        concurrent_keys.extend(concurrent_identity.into_iter().map(|change| StateKey {
+            schema_key: change.key.schema_key,
+            file_id: change.key.file_id,
+            entity_pk: change.key.entity_pk,
+        }));
+        concurrent_keys.sort();
+        concurrent_keys.dedup();
+        let concurrent_change_count = concurrent_keys.len();
+        let plan = {
+            let span = tracing::debug_span!(
+                target: "lix_transaction",
+                "lix.transaction.stale.classify",
+                prepared_rows = prepared_writes.state_rows.len(),
+                concurrent_changes = concurrent_change_count,
+            );
+            let _entered = span.enter();
+            classify_stale_commit(
+                prepared_writes,
+                concurrent_keys.iter().map(|key| StateKeyRef {
+                    schema_key: key.schema_key.as_str(),
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                }),
+            )
         };
+        let discovery = "forktree_diff";
         tracing::debug!(
             target: "lix_transaction",
             plan = plan.kind(),
@@ -1007,12 +984,28 @@ where
             "classified stale transaction commit"
         );
         match plan {
-            StaleCommitPlan::Direct | StaleCommitPlan::RevalidateOrdinaryInsert => {}
+            StaleCommitPlan::Direct => {}
+            StaleCommitPlan::RevalidateOrdinaryInsert => {
+                // The concurrent branch head is now the authoritative
+                // validation snapshot.  Reuse the commit-boundary read that
+                // produced the stale classification; do not reopen storage
+                // or silently accept the INSERT race.
+                let committed = self.committed_state_view().await?;
+                let current_state = TransactionStateView::new(committed, Vec::new())?;
+                validate_prepared_writes_by_branch(
+                    &current_state,
+                    &self.active_branch_id,
+                    &self.sql_schema_snapshot,
+                    prepared_writes,
+                    self.trust_filesystem_planner,
+                )
+                .await?;
+            }
             StaleCommitPlan::ReconcilePlugin(plan) => {
                 let file_count = plan.file_ids.len();
                 let semantic_conflict_count = plan.semantic_conflict_indices.len();
                 self.reconcile_stale_plugin_writes(
-                    read,
+                    &facade,
                     prepared_writes,
                     plan,
                     opening_head,
@@ -1028,31 +1021,31 @@ where
             }
             StaleCommitPlan::Unsafe => {
                 return Err(conflict(
-                    "concurrent transaction changed an overlapping row outside a stable plugin-owned file",
+                    "concurrent transaction changed an overlapping entity outside a stable plugin-owned file",
                 ));
             }
         }
 
         self.opening_active_branch_head = Some(current_head);
-        self.opening_tracked_mutation_revision = current_revision;
+        self.opening_selector_fence = current_selector_fence;
         Ok(())
     }
 
-    async fn reconcile_stale_plugin_writes<S>(
+    async fn reconcile_stale_plugin_writes<R>(
         &mut self,
-        read: &S,
+        facade: &ForkTreeReadFacade<R>,
         prepared_writes: &mut PreparedWriteSet,
         plan: StalePluginReconciliationPlan,
         opening_head: CommitId,
         current_head: CommitId,
     ) -> Result<(), LixError>
     where
-        S: StorageAdapterRead,
+        R: StorageAdapterRead,
     {
         let conflict_error = || {
             LixError::new(
                 LixError::CODE_TRANSACTION_CONFLICT,
-                "concurrent transaction changed an overlapping row outside a stable plugin-owned file",
+                "concurrent transaction changed an overlapping entity outside a stable plugin-owned file",
             )
             .with_hint("Retry the transaction against the latest committed state.")
         };
@@ -1063,96 +1056,83 @@ where
 
         let owner_keys = file_ids
             .iter()
-            .map(|file_id| TrackedStateKey {
+            .map(|file_id| StateKey {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
                 file_id: Some(file_id.clone()),
-                row_pk: RowPk::single(PLUGIN_OWNER_KEY),
+                entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
             })
             .collect::<Vec<_>>();
-        let registry_key = TrackedStateKey {
+        let registry_key = StateKey {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
             file_id: None,
-            row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
+            entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
         };
-        let mut tracked = self.tracked_state.reader(read);
-        let base_owners = tracked
-            .load_projected_batch_at_commit(
-                &opening_head.to_string(),
-                &owner_keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let current_owners = tracked
-            .load_projected_batch_at_commit(
-                &current_head.to_string(),
-                &owner_keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let base_registry = tracked
-            .load_projected_batch_at_commit(
-                &opening_head.to_string(),
-                std::slice::from_ref(&registry_key),
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let current_registry = tracked
-            .load_projected_batch_at_commit(
-                &current_head.to_string(),
-                std::slice::from_ref(&registry_key),
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let base_registry_row = base_registry.row(0);
-        let current_registry_row = current_registry.row(0);
-        if base_registry_row.map(|row| row.change_id())
-            != current_registry_row.map(|row| row.change_id())
+        let base_owners = load_historical_rows_at_commit(facade, opening_head, &owner_keys).await?;
+        let current_owners =
+            load_historical_rows_at_commit(facade, current_head, &owner_keys).await?;
+        let base_registry = load_historical_rows_at_commit(
+            facade,
+            opening_head,
+            std::slice::from_ref(&registry_key),
+        )
+        .await?;
+        let current_registry = load_historical_rows_at_commit(
+            facade,
+            current_head,
+            std::slice::from_ref(&registry_key),
+        )
+        .await?;
+        let base_registry_row = base_registry.first().and_then(Option::as_ref);
+        let current_registry_row = current_registry.first().and_then(Option::as_ref);
+        if base_registry_row.map(|row| row.change_id)
+            != current_registry_row.map(|row| row.change_id)
+            || base_registry_row.is_none()
+            || current_registry_row.is_none()
         {
             return Err(conflict_error());
         }
         let registry_snapshot = current_registry_row
-            .filter(|row| !row.deleted())
-            .and_then(|row| row.snapshot_content())
-            .map(|snapshot| serde_json::from_str(snapshot.as_str()))
-            .transpose()
-            .map_err(|error| {
+            .filter(|row| !row.deleted)
+            .and_then(|row| row.snapshot_content.as_ref())
+            .ok_or_else(conflict_error)
+            .and_then(|snapshot| {
+                serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!("plugin registry snapshot is invalid JSON: {error}"),
+                    )
+                })
+            })?;
+        let registry =
+            PluginRegistry::from_optional_snapshot(Some(&registry_snapshot)).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
-                    format!("plugin registry snapshot is invalid JSON: {error}"),
+                    format!("plugin registry snapshot is invalid: {error}"),
                 )
             })?;
-        let registry = PluginRegistry::from_optional_snapshot(registry_snapshot.as_ref())?;
 
-        let path_index = self
-            .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
-                self.active_branch_id.clone(),
-            ]))
-            .await?;
         let mut groups = BTreeMap::<String, StalePluginConflictGroup>::new();
         for (owner_index, file_id) in file_ids.iter().enumerate() {
-            let base_owner_row = base_owners.row(owner_index);
-            let current_owner_row = current_owners.row(owner_index);
-            if base_owner_row.map(|row| row.change_id())
-                != current_owner_row.map(|row| row.change_id())
+            let base_owner_row = base_owners[owner_index].as_ref();
+            let current_owner_row = current_owners[owner_index].as_ref();
+            if base_owner_row.map(|row| row.change_id) != current_owner_row.map(|row| row.change_id)
+                || base_owner_row.is_none()
+                || current_owner_row.is_none()
             {
                 return Err(conflict_error());
             }
-            let owner = current_owner_row
-                .filter(|row| !row.deleted())
-                .map(PluginFileOwner::from_tracked_state_row_ref)
-                .transpose()?
-                .flatten()
-                .ok_or_else(conflict_error)?;
+            let owner = PluginFileOwner::from_historical_state_row(
+                current_owner_row.expect("checked above"),
+            )?
+            .ok_or_else(conflict_error)?;
             let plugin = registry
                 .plugin(owner.plugin_key())
                 .filter(|plugin| plugin.schema_keys() == owner.schema_keys())
                 .cloned()
                 .ok_or_else(conflict_error)?;
-            let paths = path_index.exact_file_id_entries(file_id);
-            let path = paths
-                .iter()
-                .find(|entry| entry.key.branch_id() == self.active_branch_id)
-                .map(|entry| entry.path.clone())
+            let path = self
+                .plugin_file_path(&self.active_branch_id.clone(), file_id)
+                .await?
                 .ok_or_else(conflict_error)?;
             groups.insert(
                 file_id.clone(),
@@ -1174,27 +1154,17 @@ where
             .iter()
             .map(|&index| {
                 let row = prepared_writes.state_rows.row(index);
-                TrackedStateKey {
+                StateKey {
                     schema_key: row.schema_key.to_string(),
                     file_id: row.file_id.map(|file_id| file_id.to_string()),
-                    row_pk: row.row_pk.clone(),
+                    entity_pk: row.entity_pk.clone(),
                 }
             })
             .collect::<Vec<_>>();
-        let base_rows = tracked
-            .load_projected_batch_at_commit(
-                &opening_head.to_string(),
-                &candidate_keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let current_rows = tracked
-            .load_projected_batch_at_commit(
-                &current_head.to_string(),
-                &candidate_keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
+        let base_rows =
+            load_historical_rows_at_commit(facade, opening_head, &candidate_keys).await?;
+        let current_rows =
+            load_historical_rows_at_commit(facade, current_head, &candidate_keys).await?;
         for (slot, &row_index) in candidate_indices.iter().enumerate() {
             let source = prepared_writes.state_rows.row(row_index);
             let file_id = source.file_id.expect("candidate has file id").to_string();
@@ -1207,14 +1177,14 @@ where
             {
                 return Err(conflict_error());
             }
-            let target = current_rows.row(slot);
+            let target = current_rows[slot].as_ref();
             let source_payload = source.snapshot.map(|snapshot| StaleConflictPayload {
                 snapshot: snapshot.materialize_shared(),
                 metadata: source
                     .metadata
                     .map(|metadata| metadata.materialize_shared()),
             });
-            let target_payload = stale_payload_from_tracked(target);
+            let target_payload = stale_payload_from_historical(target);
             let source_change_id = source.change_id.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -1222,8 +1192,7 @@ where
                 )
             })?;
             let source_rank = ConflictRank::new(source.updated_at, source_change_id);
-            let target_rank =
-                target.map(|row| ConflictRank::new(row.updated_at(), row.change_id()));
+            let target_rank = target.map(|row| ConflictRank::new(row.updated_at, row.change_id));
             let (a, b) = if target_rank.is_some_and(|rank| rank < source_rank) {
                 (target_payload, source_payload)
             } else {
@@ -1231,7 +1200,7 @@ where
             };
             group.conflicts.push(StaleSemanticConflict {
                 key: candidate_keys[slot].clone(),
-                base: stale_payload_from_tracked(base_rows.row(slot)),
+                base: stale_payload_from_historical(base_rows[slot].as_ref()),
                 a,
                 b,
             });
@@ -1265,16 +1234,16 @@ where
                 .iter()
                 .enumerate()
                 .map(|(ordinal, conflict)| {
-                    Ok(WasmRowConflict {
+                    Ok(WasmEntityConflict {
                         ordinal: u32::try_from(ordinal).map_err(|_| {
                             LixError::new(
                                 LixError::CODE_INVALID_PLUGIN,
                                 "plugin conflict batch exceeds the u32 ordinal limit",
                             )
                         })?,
-                        key: WasmRowKey::from_owned_parts(
+                        key: WasmEntityKey::from_owned_parts(
                             conflict.key.schema_key.clone(),
-                            conflict.key.row_pk.clone().into_parts(),
+                            conflict.key.entity_pk.clone().into_parts(),
                         ),
                         base: stale_conflict_bytes(conflict.base.as_ref()),
                         a: stale_conflict_bytes(conflict.a.as_ref()),
@@ -1321,7 +1290,7 @@ where
                 .entry(file_id.to_owned())
                 .or_insert_with(RawWriteBatch::new)
                 .push_parts(
-                    Some(row.row_pk.clone()),
+                    Some(row.entity_pk.clone()),
                     row.schema_key.clone(),
                     row.file_id.cloned(),
                     row.snapshot.map(|snapshot| {
@@ -1390,145 +1359,12 @@ where
         Ok(())
     }
 
-    async fn resolve_pending_branch_checkpoint_replacements<S>(
-        &mut self,
-        read: &S,
-        prepared_writes: &PreparedWriteSet,
-    ) -> Result<BTreeMap<String, CheckpointRecoveryRef>, LixError>
-    where
-        S: StorageAdapterRead + Clone + Send + Sync,
-    {
-        let requests = std::mem::take(&mut self.pending_branch_checkpoint_replacements);
-        let mut branch_checkpoint_bridges = BTreeMap::new();
-        for (branch_id, source_commit_id) in requests {
-            let Some(replacement) =
-                crate::gc::resolve_pending_checkpoint_replacement(read, source_commit_id).await?
-            else {
-                continue;
-            };
-            let checkpoint_commit_id = replacement.checkpoint_commit_id;
-            if checkpoint_commit_id == source_commit_id {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "checkpoint replacement cannot point to its recovered head",
-                ));
-            }
-
-            // The queue authenticates the root/control transition. Reading
-            // the complete semantic diff on this same snapshot additionally
-            // proves both manifests/roots are present and that compaction did
-            // not change any public tracked fact.
-            let mut tracked = self.tracked_state.reader(read.clone());
-            let diff = tracked
-                .diff_commits(
-                    &source_commit_id.to_string(),
-                    &checkpoint_commit_id.to_string(),
-                    &TrackedStateDiffRequest::default(),
-                )
-                .await?;
-            if let Some(entry) = diff.entries.iter().find(|entry| {
-                entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
-            }) {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "pending checkpoint replacement changes public tracked identity '{}'",
-                        entry.identity.schema_key()
-                    ),
-                ));
-            }
-            if replacement.checkpoint_branch_id.is_empty() {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "pending checkpoint replacement has no authenticated source branch",
-                ));
-            }
-            if prepared_writes
-                .checkpoint_publications
-                .iter()
-                .any(|publication| publication.recovery_ref.branch_id == branch_id)
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("branch '{branch_id}' already staged checkpoint serving context"),
-                ));
-            }
-            branch_checkpoint_bridges.insert(
-                branch_id.clone(),
-                CheckpointRecoveryRef {
-                    branch_id,
-                    recovered_head_commit_id: source_commit_id,
-                    checkpoint_commit_id,
-                    interval_has_commits: true,
-                },
-            );
-        }
-        Ok(branch_checkpoint_bridges)
-    }
-
-    async fn attach_checkpoint_branch_parents<S>(
-        read: &S,
-        prepared_writes: &mut PreparedWriteSet,
-        commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
-    ) -> Result<(), LixError>
-    where
-        S: StorageAdapterRead + Clone + Send + Sync,
-    {
-        let branch_ids = prepared_writes
-            .commit_change_refs_by_branch
-            .keys()
-            .filter(|branch_id| {
-                !prepared_writes
-                    .checkpoint_publications
-                    .iter()
-                    .any(|publication| publication.recovery_ref.branch_id == branch_id.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let controls = BranchHeadControlContext::new()
-            .reader(read.clone())
-            .load_many(&branch_ids)
-            .await?;
-        for (branch_id, control) in branch_ids.into_iter().zip(controls) {
-            let Some(control) = control else {
-                continue;
-            };
-            let Some(parent_head) = commit_parent_heads.get(&branch_id).copied().flatten() else {
-                continue;
-            };
-            let Some(checkpoint_parent) = crate::gc::resolve_checkpoint_branch_parent(
-                read,
-                &branch_id,
-                parent_head,
-                control.working_diff_checkpoint_commit_id,
-            )
-            .await?
-            else {
-                continue;
-            };
-            let parents = prepared_writes
-                .extra_commit_parents_by_branch
-                .entry(branch_id)
-                .or_default();
-            if !parents.contains(&checkpoint_parent) {
-                // The compacted checkpoint is the canonical ancestry bridge,
-                // so it precedes any merge parent already staged by callers.
-                parents.insert(0, checkpoint_parent);
-            }
-        }
-        Ok(())
-    }
-
     /// Opens an execution-scoped staging area for SQL/provider hooks.
     async fn open<T, F>(
-        session_branch: &SessionBranch,
+        mode: &SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        hot_state: Arc<HotStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
-        binary_cas: Arc<BinaryCasContext>,
         plugin_host: PluginRuntimeHost,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         session_file_views: SessionFileViews,
@@ -1546,42 +1382,30 @@ where
         let opening_read = SharedStorageAdapterRead::new(read);
         let read = opening_read.clone();
         let setup_result = async {
-            let active_branch_id = session_branch.get()?;
-            let runtime_functions =
-                FunctionContext::prepare(&read, Some(hot_state.global_key_value_rows())).await?;
+            let active_branch_id = resolve_active_branch_id(mode, &read).await?;
+            let runtime_functions = FunctionContext::prepare(&read).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
             let functions = runtime_functions.provider();
-            // Transaction open needs the catalog revision and the tracked
-            // mutation fence from the same pinned snapshot. Both live in the
-            // one revision space, so one batched point read over two adjacent
-            // keys replaces two independent lookups.
-            let [catalog_revision, opening_tracked_mutation_revision] =
-                load_revisions(&read, [REVISION_KEY_CATALOG, REVISION_KEY_TRACKED_MUTATION])
-                    .await?;
-            let catalog_revision = catalog_revision.map(CatalogRevision::from_storage_bytes);
-            let (sql_schema_catalog, tracked_schema_catalog) = {
-                let visible_hot_state = hot_state.reader(&read);
-                let sql_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_open(
-                        &visible_hot_state,
-                        &Domain::schema_catalog(active_branch_id.clone(), true),
-                        catalog_revision.as_ref(),
-                    )
-                    .await?;
-                // SQL planning needs the untracked-visible catalog, while
-                // normal tracked mutations normalize against the tracked
-                // catalog. Pin both under the same revision at open so the
-                // first write never falls back to a catalog scan.
-                let tracked_schema_catalog = catalog_context
-                    .compiled_catalog_for_transaction_open(
-                        &visible_hot_state,
-                        &Domain::schema_catalog(active_branch_id.clone(), false),
-                        catalog_revision.as_ref(),
-                    )
-                    .await?;
-                (sql_schema_catalog, tracked_schema_catalog)
-            };
-            let branch_reader = branch_ctx.ref_reader(&read);
+            let opening_state_view = ForkTreeStateView::from_facade(
+                ForkTreeReadFacade::new(read.clone()),
+                &active_branch_id,
+            )
+            .await?;
+            let opening_transaction_state_view =
+                TransactionStateView::new(opening_state_view.clone(), Vec::new())?;
+            // Untracked state is no longer a public or durable lane. SQL
+            // planning and tracked mutation normalization therefore consume
+            // the same authenticated schema catalog instead of compiling two
+            // synthetic visibility variants from the same retained roots.
+            let sql_schema_catalog = catalog_context
+                .compiled_catalog_for_transaction_state(
+                    &opening_transaction_state_view,
+                    &Domain::schema_catalog(active_branch_id.clone(), false),
+                )
+                .await?;
+            let opening_selector_fence =
+                load_forktree_selector_fence(&read, &active_branch_id).await?;
+            let branch_reader = BranchRefStoreReader::new(&read);
             let opening_active_branch_head =
                 branch_reader.load_head_commit_id(&active_branch_id).await?;
             let opening_global_branch_head = if active_branch_id == GLOBAL_BRANCH_ID {
@@ -1594,10 +1418,10 @@ where
                 runtime_functions,
                 functions,
                 sql_schema_catalog,
-                tracked_schema_catalog,
-                opening_tracked_mutation_revision,
+                opening_selector_fence,
                 opening_active_branch_head,
                 opening_global_branch_head,
+                opening_transaction_state_view,
                 runtime_boundary_result,
             ))
         }
@@ -1607,10 +1431,10 @@ where
             runtime_functions,
             functions,
             sql_schema_catalog,
-            tracked_schema_catalog,
-            opening_tracked_mutation_revision,
+            opening_selector_fence,
             opening_active_branch_head,
             opening_global_branch_head,
+            opening_state_view,
             runtime_boundary_result,
         ) = match setup_result {
             Ok(result) => result,
@@ -1621,59 +1445,44 @@ where
         drop(read);
         let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
         schema_resolver.remember_compiled_catalog(
-            &Domain::schema_catalog(active_branch_id.clone(), true),
+            &Domain::schema_catalog(active_branch_id.clone(), false),
             Arc::clone(&sql_schema_catalog),
         );
-        schema_resolver.remember_compiled_catalog(
-            &Domain::schema_catalog(active_branch_id.clone(), false),
-            tracked_schema_catalog,
-        );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
+        let state_view = opening_state_view;
         Ok((
             OpenTransaction {
                 transaction: Self {
-                    write_context_liveness: crate::sql2::WriteContextLiveness::new(),
                     active_branch_id,
                     active_account_id,
-                    hot_state,
-                    tracked_state,
-                    binary_cas,
                     plugin_host,
-                    branch_ctx,
                     schema_resolver,
                     sql_schema_snapshot: sql_schema_catalog,
                     sql_planning_cache,
                     prepared_mutation_program: None,
-                    prepared_mutation_membership: PreparedMutationMembership::Unprepared,
-                    prepared_mutation_overlay_empty: false,
                     prepared_mutation_timestamp: None,
                     mutation_journal: None,
-                    mutation_journal_compressor: None,
-                    mutation_journal_sealed_rows: 0,
-                    mutation_journal_seal_prefix_open: true,
                     mutation_journal_terminal_error: None,
                     staged_writes,
                     filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                     filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
-                    branch_head_control_cache: Arc::new(BranchHeadControlCache::default()),
                     opening_read,
+                    state_view,
                     storage,
                     functions,
-                    current_timestamp: None,
-                    opening_tracked_mutation_revision,
+                    opening_selector_fence,
                     opening_active_branch_head,
                     opening_global_branch_head,
                     commit_boundary: None,
                     trust_filesystem_planner: false,
                     origin_key: None,
                     idempotency_receipt: None,
-                    atomic_metadata_writes: None,
-                    atomic_metadata_preconditions: Vec::new(),
+                    pending_forktree_publication: None,
                     await_durable_commit: false,
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
+                    pending_plugin_wasm_by_owner: BTreeMap::new(),
                     pending_plugin_actor_publications: Vec::new(),
-                    pending_branch_checkpoint_replacements: BTreeMap::new(),
                     plugin_generation_read_guard: None,
                     plugin_generation_upgrade_guard: None,
                 },
@@ -1686,7 +1495,7 @@ where
     /// Commits prepared writes, runtime function state, and the storage transaction.
     ///
     /// Commit owns the execution boundary: prepared rows become changelog
-    /// facts, branch-ref updates, and visible hot_state rows before the
+    /// facts, branch-ref updates, and visible state rows before the
     /// storage transaction is committed.
     pub(crate) async fn commit(
         self,
@@ -1712,24 +1521,11 @@ where
         runtime_functions: &FunctionContext,
         mut prepared_writes: PreparedWriteSet,
     ) -> Result<TransactionCommitOutcome, LixError> {
-        #[cfg(feature = "storage-benches")]
-        let _phase =
-            crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_COMMIT);
         let transaction = &mut self;
         let commit_boundary = transaction.commit_boundary.clone();
         transaction
             .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
             .await;
-        let tracked_state_changed = prepared_writes.state_rows.iter().any(|row| !row.untracked)
-            || !prepared_writes.commit_change_refs_by_branch.is_empty()
-            || !prepared_writes.extra_commit_parents_by_branch.is_empty();
-        let has_untracked_state_writes = prepared_writes.state_rows.iter().any(|row| row.untracked);
-        // Untracked rows are mutable current state, but their validation can read
-        // tracked schemas, parents, uniqueness owners, or filesystem state.
-        // Fence that snapshot without rotating the tracked revision: normal
-        // tracked transactions remain independent of untracked-only commits.
-        let requires_tracked_snapshot_fence = tracked_state_changed || has_untracked_state_writes;
-        let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         if let Err(error) = check_commit_boundary(commit_boundary.as_ref()) {
             transaction
@@ -1747,7 +1543,7 @@ where
         // SAFETY: `commit_read_storage` is an `Arc` retained through commit,
         // and the transaction drops this read before its storage field.
         let commit_read = unsafe { assume_static_storage_read::<StorageImpl>(commit_read) };
-        let mut read = SharedStorageAdapterRead::new(commit_read);
+        let read = SharedStorageAdapterRead::new(commit_read);
         // Commit-time reconciliation and validation must all observe this
         // current coherent snapshot, while user statements above observed the
         // snapshot retained from transaction open.
@@ -1765,11 +1561,16 @@ where
                 .await;
             return Err(error);
         }
-        let branch_checkpoint_bridges = match transaction
-            .resolve_pending_branch_checkpoint_replacements(&read, &prepared_writes)
-            .await
-        {
-            Ok(branch_checkpoint_bridges) => branch_checkpoint_bridges,
+        let validation_state = match transaction.committed_state_view().await {
+            Ok(committed) => match TransactionStateView::new(committed, Vec::new()) {
+                Ok(state) => state,
+                Err(error) => {
+                    transaction
+                        .discard_pending_plugin_actor_publications()
+                        .await;
+                    return Err(error);
+                }
+            },
             Err(error) => {
                 transaction
                     .discard_pending_plugin_actor_publications()
@@ -1777,27 +1578,26 @@ where
                 return Err(error);
             }
         };
-        let commit_parent_heads = match commit::resolve_prepared_commit_parent_heads(
-            transaction.branch_ctx.as_ref(),
-            &read,
+        if let Err(error) = validation_state
+            .validate_active_account(&transaction.active_account_id)
+            .await
+        {
+            transaction
+                .discard_pending_plugin_actor_publications()
+                .await;
+            return Err(error);
+        }
+        if let Err(error) = validate_prepared_writes_by_branch(
+            &validation_state,
+            &transaction.active_branch_id,
+            &transaction.sql_schema_snapshot,
             &prepared_writes,
-            true,
+            transaction.trust_filesystem_planner,
         )
-        .await
-        {
-            Ok(commit_parent_heads) => commit_parent_heads,
-            Err(error) => {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = Self::attach_checkpoint_branch_parents(
-            &read,
-            &mut prepared_writes,
-            &commit_parent_heads,
-        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_native_validation"
+        ))
         .await
         {
             transaction
@@ -1805,67 +1605,10 @@ where
                 .await;
             return Err(error);
         }
-        if let Err(error) = transaction
-            .validate_prepared_writes_by_branch(&read, &mut prepared_writes)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.transaction_validation"
-            ))
-            .await
-        {
-            transaction
-                .discard_pending_plugin_actor_publications()
-                .await;
-            return Err(error);
-        }
-        // The delta itself is projected out of the commit below, once
-        // addressable rows hold their final commit-delta change ids. Only its
-        // *projectability* is decided here, because the revision the cached
-        // views are keyed on has to be read before the commit publishes its
-        // successor.
-        let stages_projectable_filesystem_rows =
-            prepared_writes_stage_filesystem_rows(&prepared_writes)
-                && !prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
-        // A failed revision read must not collapse into "no revision yet".
-        // `None` is itself a live cache key — the state before the first
-        // filesystem commit — so treating an error as `None` would rekey
-        // entries built at an unknown revision onto this commit's successor and
-        // make a stale index reachable. The outer `Option` is "the read
-        // succeeded"; only that licenses a projection.
-        let loaded_filesystem_revision = if stages_projectable_filesystem_rows {
-            load_path_index_revision(&read).await.ok()
-        } else {
-            None
-        };
-        let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
-        let previous_filesystem_revision = loaded_filesystem_revision.flatten();
-        let (mut writes, materialization_preconditions, filesystem_delta_rows) =
-            match commit::commit_prepared_writes_with_parent_heads(
-                &transaction.binary_cas,
-                &transaction.tracked_state,
-                Some(transaction.sql_schema_snapshot.as_ref()),
-                Some(runtime_functions),
-                &transaction.active_account_id,
-                &commit_parent_heads,
-                &mut read,
-                &branch_checkpoint_bridges,
-                prepared_writes,
-            )
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.transaction_materialization"
-            ))
-            .await
+        let commit_parent_heads =
+            match commit::resolve_prepared_commit_parent_heads(&read, &prepared_writes, true).await
             {
-                Ok(commit) => (
-                    commit.writes,
-                    commit.preconditions,
-                    if filesystem_delta_projectable {
-                        commit.filesystem_delta_rows
-                    } else {
-                        Vec::new()
-                    },
-                ),
+                Ok(commit_parent_heads) => commit_parent_heads,
                 Err(error) => {
                     transaction
                         .discard_pending_plugin_actor_publications()
@@ -1873,30 +1616,42 @@ where
                     return Err(error);
                 }
             };
-        if catalog_revision_changed {
-            stage_catalog_revision(&mut writes);
-        }
-        if tracked_state_changed {
-            StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
-        }
-        if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
-            writes.extend(metadata_writes);
-        }
+        let rebuild_filesystem_path_index =
+            prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
+        let prepared_forktree_plan = match commit::prepare_forktree_publication_with_parent_heads(
+            &transaction.active_account_id,
+            &commit_parent_heads,
+            runtime_functions.deterministic_sequence_checkpoint(),
+            read.clone(),
+            prepared_writes,
+            transaction.pending_forktree_publication.take(),
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_forktree_publication"
+        ))
+        .await
+        {
+            Ok(publication) => publication,
+            Err(error) => {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(error);
+            }
+        };
+        // ForkTree never commits independently. Its authenticated objects,
+        // selectors, untracked rows, and exact CAS fences are lowered once
+        // into the transaction-owned in-memory plan. Runtime metadata and the
+        // idempotency receipt are appended below before the sole backend
+        // prepare/commit boundary.
+        let (mut writes, materialization_preconditions) =
+            prepared_forktree_plan.into_storage_plan()?;
         let mut write_options = StorageWriteOptions::default();
         write_options.await_durable = transaction.await_durable_commit;
         write_options
             .preconditions
             .extend(materialization_preconditions);
-        write_options
-            .preconditions
-            .append(&mut transaction.atomic_metadata_preconditions);
-        if requires_tracked_snapshot_fence {
-            write_options.preconditions.push(
-                StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
-                    transaction.opening_tracked_mutation_revision.clone(),
-                ),
-            );
-        }
         if let Some((key, value)) = transaction.idempotency_receipt.take() {
             writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
             // The mutation and this receipt share one atomic storage commit.
@@ -1952,21 +1707,8 @@ where
             "lix.perf.transaction_storage_commit"
         ))
         .await?;
-        let post_commit_read_storage = transaction.storage.clone();
-        if !filesystem_delta_rows.is_empty()
-            && incremental_filesystem_index_enabled()
-            && let Ok(next_read) = post_commit_read_storage
-                .begin_read(StorageReadOptions::default())
-                .await
-        {
-            let next_read = SharedStorageAdapterRead::new(next_read);
-            if let Ok(next_revision) = load_path_index_revision(&next_read).await {
-                transaction.hot_state.advance_filesystem_path_indexes(
-                    previous_filesystem_revision.as_deref(),
-                    next_revision.as_deref(),
-                    &filesystem_delta_rows,
-                );
-            }
+        if rebuild_filesystem_path_index {
+            transaction.filesystem_path_index_cache.clear();
         }
         for publication in std::mem::take(&mut transaction.pending_plugin_actor_publications) {
             let session_key = publication.session_key().clone();
@@ -2095,6 +1837,7 @@ where
             staged_writes: self.staged_writes.checkpoint()?,
             filesystem_path_index_epoch: self.filesystem_path_index_epoch.load(Ordering::SeqCst),
             pending_file_view_mutations: self.pending_file_view_mutations.clone(),
+            pending_plugin_wasm_by_owner: self.pending_plugin_wasm_by_owner.clone(),
             trust_filesystem_planner: self.trust_filesystem_planner,
         })
     }
@@ -2109,15 +1852,18 @@ where
             staged_writes,
             filesystem_path_index_epoch,
             pending_file_view_mutations,
+            pending_plugin_wasm_by_owner,
             trust_filesystem_planner,
         } = checkpoint;
         self.staged_writes.restore(staged_writes)?;
+        self.refresh_state_view_from_staging(false)?;
         self.filesystem_path_index_epoch
             .store(filesystem_path_index_epoch, Ordering::SeqCst);
         // The cache is derived from the discarded post-image. Evict it rather
         // than cloning potentially large indexes solely for this error path.
         self.filesystem_path_index_cache.clear();
         self.pending_file_view_mutations = pending_file_view_mutations;
+        self.pending_plugin_wasm_by_owner = pending_plugin_wasm_by_owner;
         self.trust_filesystem_planner = trust_filesystem_planner;
         // A failed statement may have chained a predecessor actor successor.
         // Its prior document can no longer be restored byte-for-byte, so
@@ -2172,7 +1918,9 @@ where
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        Box::pin(self.stage_write_inner(write, None)).await
+        let outcome = Box::pin(self.stage_write_inner(write, None)).await?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     async fn stage_parameter_batch_insert(
@@ -2180,7 +1928,9 @@ where
         write: TransactionWrite,
         statement_indices: Vec<u32>,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        Box::pin(self.stage_write_inner(write, Some(statement_indices))).await
+        let outcome = Box::pin(self.stage_write_inner(write, Some(statement_indices))).await?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     /// Stages the fixed-shape public parameter INSERT proof without routing it
@@ -2202,13 +1952,10 @@ where
         let first = rows.row(0);
         let branch_id = first.branch_id.clone();
         let schema_key = first.schema_key.clone();
-        let staged = self.staged_writes.staging_overlay()?;
-        if StagedHotStateRows::collection_replaced(
-            &staged,
-            branch_id.as_str(),
-            schema_key.as_str(),
-            None,
-        )? {
+        if self
+            .staged_writes
+            .collection_replaced(branch_id.as_str(), schema_key.as_str(), None)?
+        {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 format!("collection '{schema_key}' was deleted earlier in this transaction"),
@@ -2223,35 +1970,40 @@ where
             crate::storage_bench::record_transaction_rows_staged(row_count);
             crate::storage_bench::record_transaction_untracked_rows(0);
         }
-        let prepared = self
+        let tracked_certified_rows = rows.iter().all(|row| !row.untracked);
+        let mut prepared = self
             .prepare_transaction_rows(rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.transaction_prepare_rows"
             ))
             .await?;
+        if tracked_certified_rows {
+            assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+        }
         if prepared.len() != row_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "certified parameter INSERT preparation changed row cardinality",
             ));
         }
-        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
-            || {
+        let outcome = tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage")
+            .in_scope(|| {
                 self.staged_writes.stage_certified_parameter_batch_insert(
                     PreparedTransactionWrite::Rows {
                         mode: TransactionWriteMode::Insert,
                         rows: prepared,
                     },
                 )
-            },
-        )
+            })?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     /// Stages a certified dense replacement without re-entering plugin,
     /// storage-scope, or filesystem-path preparation for every logical SQL
     /// statement. The producer only issues this certificate for existing,
-    /// ordinary tracked, unfiled rows in one active-branch row collection.
+    /// ordinary tracked, unfiled rows in one active-branch entity collection.
     async fn stage_certified_parameter_batch_replace(
         &mut self,
         rows: RawWriteBatch,
@@ -2268,28 +2020,33 @@ where
             crate::storage_bench::record_transaction_rows_staged(row_count);
             crate::storage_bench::record_transaction_untracked_rows(0);
         }
-        let prepared = self
+        let tracked_certified_rows = rows.iter().all(|row| !row.untracked);
+        let mut prepared = self
             .prepare_transaction_rows(rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.transaction_prepare_rows"
             ))
             .await?;
+        if tracked_certified_rows {
+            assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+        }
         if prepared.len() != row_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "certified parameter replacement preparation changed row cardinality",
             ));
         }
-        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
-            || {
+        let outcome = tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage")
+            .in_scope(|| {
                 self.staged_writes
                     .stage_write(PreparedTransactionWrite::Rows {
                         mode: TransactionWriteMode::Replace,
                         rows: prepared,
                     })
-            },
-        )
+            })?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     async fn stage_write_inner(
@@ -2352,7 +2109,7 @@ where
             }
         };
         if let Some(statement_indices) = &statement_indices
-            && statement_indices.len() != prepared_transaction_write_rows(&write).len()
+            && statement_indices.len() != prepared_transaction_write_row_count(&write)
         {
             discard_plugin_actor_publications(actor_publications).await;
             return Err(LixError::new(
@@ -2360,8 +2117,6 @@ where
                 "parameter batch normalization changed row cardinality",
             ));
         }
-        let (affects_filesystem_path_index, mut filesystem_delta_rows) =
-            prepared_transaction_write_filesystem_index_impact(&write);
         let stage_result = tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.transaction_buffer_stage"
@@ -2379,42 +2134,9 @@ where
                 return Err(error);
             }
         };
-        if affects_filesystem_path_index {
-            let tracked_branch_ids = filesystem_delta_rows
-                .iter()
-                .filter(|row| !row.untracked)
-                .map(|row| row.branch_id.to_string())
-                .collect::<BTreeSet<_>>();
-            let mut commit_ids = BTreeMap::new();
-            for branch_id in tracked_branch_ids {
-                commit_ids.insert(
-                    branch_id.clone(),
-                    self.staged_writes.commit_id_for_branch(&branch_id)?,
-                );
-            }
-            for row in &mut filesystem_delta_rows {
-                row.commit_id = if row.untracked {
-                    None
-                } else {
-                    commit_ids.get(row.branch_id.as_ref()).copied().flatten()
-                };
-            }
-            let previous_epoch = self
-                .filesystem_path_index_epoch
-                .fetch_add(1, Ordering::SeqCst);
-            let next_epoch = previous_epoch.wrapping_add(1);
-            if incremental_filesystem_index_enabled() && !filesystem_delta_rows.is_empty() {
-                self.filesystem_path_index_cache.advance_revisions(
-                    &filesystem_delta_rows,
-                    |revision| {
-                        advance_transaction_path_index_cache_revision(
-                            revision,
-                            previous_epoch,
-                            next_epoch,
-                        )
-                    },
-                );
-            }
+        if let Err(error) = self.refresh_state_view_from_staging(true) {
+            discard_plugin_actor_publications(actor_publications).await;
+            return Err(error);
         }
         self.pending_file_view_mutations.extend(file_view_mutations);
         self.pending_plugin_actor_publications
@@ -2430,7 +2152,6 @@ where
             TransactionWrite::Rows { rows, .. }
             | TransactionWrite::RowsWithFileContent { rows, .. } => rows,
         };
-        let staged = self.staged_writes.staging_overlay()?;
         let mut first_checked_scope = None;
         let mut additional_checked_scopes = None;
         for row in rows.iter() {
@@ -2457,8 +2178,7 @@ where
             if already_checked {
                 continue;
             }
-            if StagedHotStateRows::collection_replaced(
-                &staged,
+            if self.staged_writes.collection_replaced(
                 row.branch_id,
                 row.schema_key,
                 row.file_id.map(SharedStr::as_str),
@@ -2476,658 +2196,6 @@ where
             }
         }
         Ok(())
-    }
-
-    /// Runs the stateless conflict resolver for one pinned component plugin
-    /// generation. Unlike normal file mutation this creates no persistent
-    /// document actor: a merge may need to resolve one row from a large file,
-    /// and the resulting rows are rendered once by the ordinary staged-write
-    /// reconciliation path.
-    ///
-    /// The caller supplies a registry entry loaded from the historical merge
-    /// roots, not the mutable current registry. This keeps `b` selection
-    /// and plugin code selection deterministic across merge direction and
-    /// retries.
-    pub(crate) async fn resolve_plugin_conflicts(
-        &mut self,
-        plugin: &PluginRegistryEntry,
-        descriptor: WasmFileDescriptor,
-        conflicts: Vec<WasmRowConflict<WasmHostBytes>>,
-    ) -> Result<ValidatedConflictTransition, LixError> {
-        self.ensure_plugin_generation_read_guard().await;
-        let expected_count = conflicts.len();
-        let limits = conflict_resolution_limits(expected_count)?;
-        let source = VecRowConflictSource::new(conflicts, limits)?;
-        let wasm_hash = BlobId::from_hex(plugin.wasm_blob_hash())?;
-        let factory = match self
-            .plugin_host
-            .cached_plugin_factory(plugin.key(), wasm_hash)?
-        {
-            Some(factory) => factory,
-            None => {
-                let read = SharedStorageAdapterRead::new(
-                    self.storage
-                        .begin_read(StorageReadOptions::default())
-                        .await?,
-                );
-                let reader = self.binary_cas.reader(read);
-                let wasm = load_transaction_blob_bytes(&reader, &self.staged_writes, &[wasm_hash])
-                    .await?
-                    .into_vec()
-                    .into_iter()
-                    .next()
-                    .flatten()
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            format!(
-                                "plugin registry references missing WASM blob '{}'",
-                                wasm_hash.to_hex()
-                            ),
-                        )
-                    })?;
-                let installed = plugin.to_installed_plugin(wasm)?;
-                self.plugin_host
-                    .load_or_compile_factory(&installed)
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.plugin_conflict_factory_compile"
-                    ))
-                    .await?
-            }
-        };
-
-        // Static conflict resolution is short lived, but it still owns a
-        // Wasmtime Store and must honor the same repository-wide admission
-        // bound as retained document actors.
-        let permit = self.plugin_host.actor_cache().admit_store()?;
-        let actor = factory
-            .instantiate_actor()
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.plugin_conflict_actor_instantiate"
-            ))
-            .await?;
-        let mut store = PluginActorStore::new(actor, permit);
-        let transition = match store
-            .actor_mut()
-            .resolve_conflicts(
-                limits,
-                WasmConflictUpdate {
-                    descriptor,
-                    conflicts: Box::new(source),
-                },
-            )
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.plugin_resolve_conflicts"
-            ))
-            .await
-        {
-            Ok(transition) => transition,
-            Err(error) => {
-                let _ = store.actor_mut().retire().await;
-                return Err(error);
-            }
-        };
-        let validated = match drain_conflict_transition_resolutions(
-            store.actor_mut(),
-            transition,
-            expected_count,
-            limits,
-        )
-        .await
-        {
-            Ok(validated) => validated,
-            Err(error) => {
-                let _ = store.actor_mut().retire().await;
-                return Err(error);
-            }
-        };
-        store.actor_mut().retire().await?;
-        self.plugin_host
-            .record_transition_counters(validated.counters);
-        Ok(validated)
-    }
-
-    async fn scan_visible_hot_state_batch(
-        &mut self,
-        request: &HotStateScanRequest,
-    ) -> Result<MaterializedHotStateBatch, LixError> {
-        let staged = self.staged_writes.staging_overlay()?;
-        let read = self.opening_read();
-        let base = self
-            .hot_state
-            .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
-        overlay_scan_batch(&base, &staged, request).await
-    }
-
-    async fn visible_materialization(
-        &mut self,
-        key: &PluginFileWriteKey,
-    ) -> Result<Option<VisibleMaterialization>, LixError> {
-        let rows = self
-            .scan_visible_hot_state_batch(&HotStateScanRequest {
-                filter: HotStateFilter {
-                    schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
-                    row_pks: vec![validated_uuid_row_pk(&key.file_id)?],
-                    branch_ids: vec![key.branch_id.clone()],
-                    file_ids: vec![NullableKeyFilter::Value(key.file_id.clone())],
-                    untracked: Some(key.untracked),
-                    ..Default::default()
-                },
-                projection: plugin_registry_hot_state_projection(),
-                ..Default::default()
-            })
-            .await?;
-        if rows.len() > 1 {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "component materialization lookup returned duplicate rows for file '{}'",
-                    key.file_id
-                ),
-            ));
-        }
-        rows.get(0)
-            .map(|row| decode_visible_materialization_ref(row, &key.file_id))
-            .transpose()
-    }
-
-    async fn cold_open_semantic_actor(
-        &mut self,
-        actor_key: &PluginActorKey,
-        file_key: &PluginFileWriteKey,
-        plugin: &PluginRegistryEntry,
-        descriptor: WasmFileDescriptor,
-        factory: Arc<dyn WasmComponentFactory>,
-        current_publications: &mut Vec<PendingPluginActorPublication>,
-    ) -> Result<PluginObservation, LixError> {
-        let cache = self.plugin_host.actor_cache();
-        let _cold_open_guard = cache.cold_open_guard().await;
-        let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let base = self.hot_state.reader(read.clone());
-        let blob_rows = overlay_scan_batch(
-            &base,
-            &staged,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
-                    schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
-                    row_pks: vec![validated_uuid_row_pk(&actor_key.file_id)?],
-                    branch_ids: vec![actor_key.branch_id.clone()],
-                    file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
-                    untracked: Some(file_key.untracked),
-                    ..Default::default()
-                },
-                projection: plugin_registry_hot_state_projection(),
-                ..Default::default()
-            },
-        )
-        .await?;
-        if blob_rows.len() != 1 {
-            return Err(LixError::new(
-                LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                format!(
-                    "owned component plugin file '{}' must have exactly one visible materialization; found {}",
-                    actor_key.file_id,
-                    blob_rows.len()
-                ),
-            ));
-        }
-        let materialization =
-            decode_visible_materialization_ref(blob_rows.row(0), &actor_key.file_id)?;
-        if !matches!(
-            &materialization.bytes,
-            VisibleMaterializationBytes::Blob { .. }
-        ) {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!(
-                    "owned component plugin file '{}' materialization does not match plugin '{}' contract",
-                    actor_key.file_id,
-                    plugin.key()
-                ),
-            ));
-        }
-        let semantic_root = materialization.semantic_root.clone();
-        let cold_open = cache.prepare_cold_open(actor_key, &semantic_root).await?;
-        let mut cold_install: PluginActorColdInstall = match cold_open {
-            PluginActorColdOpen::Ready(observation) => return Ok(observation),
-            PluginActorColdOpen::Build(cold_install) => cold_install,
-        };
-        let store_permit = loop {
-            match cache.admit_cold_store(&mut cold_install) {
-                Ok(permit) => break permit,
-                Err(error) if error.code == LixError::CODE_PLUGIN_RESOURCE_LIMIT => {
-                    if retire_oldest_completed_actor(current_publications).await
-                        || retire_oldest_completed_actor(
-                            &mut self.pending_plugin_actor_publications,
-                        )
-                        .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        let limits = WasmTransitionLimits::default();
-        let mut actor = factory.instantiate_actor().await?;
-        let cold_open_hydrates_without_render = actor.cold_open_hydrates_without_render();
-        let rows = if actor.cold_open_requires_rows() {
-            overlay_scan_batch(
-                &base,
-                &staged,
-                &HotStateScanRequest {
-                    filter: HotStateFilter {
-                        schema_keys: plugin.schema_keys().to_vec(),
-                        branch_ids: vec![actor_key.branch_id.clone()],
-                        file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
-                        untracked: Some(file_key.untracked),
-                        ..Default::default()
-                    },
-                    projection: plugin_state_hot_state_projection(),
-                    ..Default::default()
-                },
-            )
-            .await?
-        } else {
-            MaterializedHotStateBatch::default()
-        };
-        let row_ordinals =
-            v2_host_row_ordinals_from_live_batch(&rows, file_key, plugin.schema_keys())?;
-        let row_authorities =
-            plugin_row_authorities_from_live_batch(plugin, &rows, &row_ordinals);
-        let row_count = row_ordinals.len();
-        let VisibleMaterializationBytes::Blob { hash } = materialization.bytes;
-        let base_blob_reader = self.binary_cas.reader(read);
-        let materialized_bytes: crate::Blob = load_transaction_blob_bytes(
-            &base_blob_reader,
-            &self.staged_writes,
-            &[hash],
-        )
-        .await?
-        .into_vec()
-        .into_iter()
-        .next()
-        .flatten()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!(
-                    "owned component plugin file '{}' references missing materialized blob '{}'",
-                    actor_key.file_id,
-                    hash.to_hex()
-                ),
-            )
-        })?
-        .into();
-        let source = LiveBatchRowSource::new(rows, row_ordinals, limits)?;
-        let transition = match actor
-            .open_rows(
-                limits,
-                WasmOpenRowsInput {
-                    descriptor,
-                    rows: Box::new(source),
-                    accepted: Some(Arc::new(ArcByteSource::new(materialized_bytes.clone()))),
-                },
-            )
-            .await
-        {
-            Ok(transition) => transition,
-            Err(error) => {
-                let _ = actor.retire().await;
-                return Err(error);
-            }
-        };
-        let validated = match drain_row_transition_edits(
-            actor.as_mut(),
-            transition,
-            materialized_bytes.as_ref(),
-            Some(materialized_bytes.clone()),
-            None,
-            limits,
-        )
-        .await
-        {
-            Ok(validated) => validated,
-            Err(error) => {
-                let _ = actor.retire().await;
-                return Err(error);
-            }
-        };
-        let materialized_bytes = validated.bytes.clone();
-        let materialized_bytes_sha256 = validated.bytes_sha256;
-        let mut counters = validated.counters;
-        counters.full_state_semantic_rows_materialized =
-            u64::try_from(row_count).unwrap_or(u64::MAX);
-        counters.full_document_reparses = 1;
-        counters.full_renderer_invocations = u64::from(!cold_open_hydrates_without_render);
-        self.plugin_host.record_transition_counters(counters);
-        cache
-            .install_cold_if_absent_with_authorities(
-                cold_install,
-                actor_key.clone(),
-                PluginActorStore::new(actor, store_permit),
-                validated.document,
-                materialized_bytes,
-                materialized_bytes_sha256,
-                Arc::<str>::from(semantic_root),
-                row_authorities,
-            )
-            .await
-    }
-
-    /// Leases an acknowledged actor, cold-opening only when cache eviction is
-    /// the sole reason the observation no longer resolves.
-    ///
-    /// The durable semantic root must still exactly match the root delivered
-    /// with the observation. A concurrent committed transition therefore
-    /// remains stale and cannot be mistaken for benign working-set eviction.
-    async fn lease_or_reopen_observed_actor(
-        &mut self,
-        observation: &PluginObservation,
-        actor_key: &PluginActorKey,
-        file_key: &PluginFileWriteKey,
-        plugin: &PluginRegistryEntry,
-        descriptor: WasmFileDescriptor,
-        factory: Arc<dyn WasmComponentFactory>,
-        current_publications: &mut Vec<PendingPluginActorPublication>,
-    ) -> Result<PluginActorLease, LixError> {
-        let cache = self.plugin_host.actor_cache();
-        match cache.lease_for_transition(observation).await {
-            Ok(lease) => return Ok(lease),
-            Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => {
-                let Some(visible_materialization) = self.visible_materialization(file_key).await?
-                else {
-                    return Err(error);
-                };
-                if visible_materialization.semantic_root != observation.semantic_root() {
-                    return Err(error);
-                }
-            }
-            Err(error) => return Err(error),
-        }
-
-        let reopened = self
-            .cold_open_semantic_actor(
-                actor_key,
-                file_key,
-                plugin,
-                descriptor,
-                factory,
-                current_publications,
-            )
-            .await?;
-        cache.lease_for_transition(&reopened).await
-    }
-
-    async fn load_visible_exact_hot_state_batch(
-        &mut self,
-        request: &HotStateExactBatchRequest,
-    ) -> Result<MaterializedHotStateExactBatch, LixError> {
-        let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let base = self
-            .hot_state
-            .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
-        overlay_load_exact_batch(&base, &staged, request).await
-    }
-
-    /// Drops `format-only` upserts that are semantically identical to the
-    /// currently accepted durable row. The exact-row lookup keeps this
-    /// proportional to the sparse format-only output instead of hydrating the
-    /// complete file graph.
-    async fn suppress_format_only_noops(
-        &mut self,
-        plugin: &PluginRegistryEntry,
-        changes: WasmHostRowChanges,
-        file_key: &PluginFileWriteKey,
-    ) -> Result<(WasmHostRowChanges, BTreeSet<WasmRowKey>), LixError> {
-        let format_only_keys = changes
-            .changes
-            .iter()
-            .filter_map(|change| match change {
-                WasmRowChange::Upsert {
-                    row,
-                    effect: WasmChangeEffect::FormatOnly,
-                } => Some(row.key.clone()),
-                WasmRowChange::Create { .. }
-                | WasmRowChange::Upsert { .. }
-                | WasmRowChange::Delete(_) => None,
-            })
-            .collect::<Vec<_>>();
-        if format_only_keys.is_empty() {
-            return Ok((changes, BTreeSet::new()));
-        }
-
-        let requests = format_only_keys
-            .iter()
-            .map(|key| {
-                Ok(HotStateExactRowRequest {
-                    schema_key: key.schema_key.to_string(),
-                    branch_id: file_key.branch_id.clone(),
-                    row_pk: plugin_row_pk(plugin, key)?,
-                    file_id: Some(file_key.file_id.clone()),
-                })
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
-        let current = self
-            .load_visible_exact_hot_state_batch(&HotStateExactBatchRequest {
-                rows: requests,
-                projection: plugin_state_hot_state_projection(),
-                untracked: Some(file_key.untracked),
-                include_tombstones: false,
-            })
-            .await?;
-        let observed_existing = format_only_keys
-            .iter()
-            .enumerate()
-            .filter(|(slot, _)| current.row(*slot).is_some())
-            .map(|(_, key)| key.clone())
-            .collect();
-        Ok((
-            suppress_format_only_noops_against_batch(changes, &format_only_keys, &current)?,
-            observed_existing,
-        ))
-    }
-
-    /// Materializes keyless creates and returns the one durable mutation
-    /// reservation row when this transition creates at least one row.
-    /// Existing keyed updates are checked with exact sparse authority reads.
-    async fn v2_create_rows(
-        &mut self,
-        plugin: &PluginRegistryEntry,
-        changes: &mut WasmHostRowChanges,
-        bound: BoundCreateContext,
-        file_key: &PluginFileWriteKey,
-        existing_reservation: Option<&MaterializedHotStateRow>,
-        known_existing_authorities: Option<&PluginRowAuthorities>,
-    ) -> Result<RawWriteBatch, LixError> {
-        let mut validation = validate_create_changes(plugin, changes)?;
-        if let Some(known) = known_existing_authorities {
-            validation
-                .existing_authorities
-                .retain(|key| !known.contains(key));
-        }
-        materialize_keyless_creates(changes, bound.creates())?;
-        if !validation.requires_reservation && validation.existing_authorities.is_empty() {
-            return Ok(RawWriteBatch::new());
-        }
-
-        let exact_rows = validation
-            .existing_authorities
-            .iter()
-            .map(|key| {
-                let [id] = key.row_pk.as_slice() else {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!(
-                            "creatable schema '{}' requires one UUID primary-key component",
-                            key.schema_key
-                        ),
-                    ));
-                };
-                Ok(HotStateExactRowRequest {
-                    schema_key: key.schema_key.to_string(),
-                    branch_id: file_key.branch_id.clone(),
-                    row_pk: RowPk::uuid_from_canonical(id).map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            format!("component plugin emitted invalid row_pk: {error}"),
-                        )
-                    })?,
-                    file_id: Some(file_key.file_id.clone()),
-                })
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
-        let loaded = if exact_rows.is_empty() {
-            MaterializedHotStateExactBatch::default()
-        } else {
-            self.load_visible_exact_hot_state_batch(&HotStateExactBatchRequest {
-                rows: exact_rows,
-                projection: plugin_state_hot_state_projection(),
-                untracked: Some(file_key.untracked),
-                include_tombstones: false,
-            })
-            .await?
-        };
-        require_existing_id_authorities(
-            plugin,
-            &validation.existing_authorities,
-            &loaded,
-            &file_key.file_id,
-            &file_key.branch_id,
-            file_key.untracked,
-        )?;
-
-        let mut rows = RawWriteBatch::with_capacity(usize::from(validation.requires_reservation));
-        if validation.requires_reservation {
-            if let Some(row) = reserve_create_row(
-                existing_reservation,
-                bound,
-                &file_key.file_id,
-                &file_key.branch_id,
-                file_key.untracked,
-            )? {
-                rows.push(row);
-            }
-        }
-        Ok(rows)
-    }
-
-    async fn preflight_create(
-        &mut self,
-        bound: BoundCreateContext,
-        file_key: &PluginFileWriteKey,
-    ) -> Result<Option<MaterializedHotStateRow>, LixError> {
-        self.preflight_creates(&[(bound, file_key.clone())])
-            .await
-            .map(|mut rows| rows.pop().expect("one preflight produces one result"))
-    }
-
-    async fn preflight_creates(
-        &mut self,
-        requests: &[(BoundCreateContext, PluginFileWriteKey)],
-    ) -> Result<Vec<Option<MaterializedHotStateRow>>, LixError> {
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Lane is a property of each requested file, but `HotStateExactBatchRequest`
-        // carries one lane for the whole batch. Both lanes now reach plugin
-        // reconciliation, so the batch is partitioned by lane and the results are
-        // scattered back into caller order. Reading every reservation under a
-        // single constant lane would miss an existing reservation in the other
-        // lane and silently re-reserve over it.
-        let mut existing_rows: Vec<Option<MaterializedHotStateRow>> =
-            (0..requests.len()).map(|_| None).collect();
-        for lane in [false, true] {
-            let slots = requests
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, file_key))| file_key.untracked == lane)
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if slots.is_empty() {
-                continue;
-            }
-            let loaded = self
-                .load_visible_exact_hot_state_batch(&HotStateExactBatchRequest {
-                    rows: slots
-                        .iter()
-                        .map(|&index| {
-                            let (bound, file_key) = &requests[index];
-                            HotStateExactRowRequest {
-                                schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-                                branch_id: file_key.branch_id.clone(),
-                                row_pk: RowPk::single(bound.reservation_key()),
-                                file_id: Some(file_key.file_id.clone()),
-                            }
-                        })
-                        .collect(),
-                    projection: plugin_state_hot_state_projection(),
-                    untracked: Some(lane),
-                    include_tombstones: false,
-                })
-                .await?;
-            for (slot, &index) in slots.iter().enumerate() {
-                existing_rows[index] = loaded.row(slot).map(MaterializedHotStateRowRef::to_owned);
-            }
-        }
-        for (index, (bound, file_key)) in requests.iter().enumerate() {
-            validate_create_reservation(
-                existing_rows[index].as_ref(),
-                *bound,
-                &file_key.file_id,
-                &file_key.branch_id,
-                file_key.untracked,
-            )?;
-        }
-        Ok(existing_rows)
-    }
-
-    async fn v2_id_reservation_tombstones(
-        &mut self,
-        file_key: &PluginFileWriteKey,
-    ) -> Result<RawWriteBatch, LixError> {
-        let rows = self
-            .scan_visible_hot_state_batch(&HotStateScanRequest {
-                filter: HotStateFilter {
-                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-                    branch_ids: vec![file_key.branch_id.clone()],
-                    file_ids: vec![NullableKeyFilter::Value(file_key.file_id.clone())],
-                    untracked: Some(file_key.untracked),
-                    ..Default::default()
-                },
-                projection: plugin_registry_hot_state_projection(),
-                ..Default::default()
-            })
-            .await?;
-        let mut tombstones = RawWriteBatch::with_capacity(rows.len());
-        for row in rows.iter() {
-            let Ok(key) = row.row_pk().as_single_string() else {
-                continue;
-            };
-            if is_reservation_key(key) {
-                tombstones.push(reservation_tombstone_row(
-                    key,
-                    &file_key.file_id,
-                    &file_key.branch_id,
-                    file_key.untracked,
-                )?);
-            }
-        }
-        Ok(tombstones)
     }
 
     async fn reconcile_plugin_write(
@@ -3168,14 +2236,21 @@ where
                         })?;
                     BlobRefRowInput {
                         file_id: file_key.file_id.clone(),
-                        blob_hash: payload.blob_hash().unwrap_or_else(|| {
-                            BlobId::from_content(
-                                payload
-                                    .inline_data()
-                                    .expect("plugin materializations require inline file content"),
+                        blob_hash: payload.blob_hash().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "plugin materialization payload has no authenticated Merkle BlobId",
                             )
-                        }),
+                        })?,
                         size_bytes: payload.len(),
+                        plugin_checkpoint: payload.plugin_checkpoint().map(|checkpoint| {
+                            BlobRefPluginCheckpoint {
+                                generation: checkpoint.generation.clone(),
+                                semantic_root: checkpoint.semantic_root.clone(),
+                                runtime: checkpoint.runtime.as_ref().to_vec(),
+                                authority: checkpoint.authority.as_ref().to_vec(),
+                            }
+                        }),
                         context: FilesystemRowContext {
                             branch_id: file_key.branch_id.clone(),
                             global: file_key.global,
@@ -3252,14 +2327,21 @@ where
                         })?;
                     BlobRefRowInput {
                         file_id: file_key.file_id.clone(),
-                        blob_hash: payload.blob_hash().unwrap_or_else(|| {
-                            BlobId::from_content(
-                                payload
-                                    .inline_data()
-                                    .expect("plugin materializations require inline file content"),
+                        blob_hash: payload.blob_hash().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "plugin materialization payload has no authenticated Merkle BlobId",
                             )
-                        }),
+                        })?,
                         size_bytes: payload.len(),
+                        plugin_checkpoint: payload.plugin_checkpoint().map(|checkpoint| {
+                            BlobRefPluginCheckpoint {
+                                generation: checkpoint.generation.clone(),
+                                semantic_root: checkpoint.semantic_root.clone(),
+                                runtime: checkpoint.runtime.as_ref().to_vec(),
+                                authority: checkpoint.authority.as_ref().to_vec(),
+                            }
+                        }),
                         context: FilesystemRowContext {
                             branch_id: file_key.branch_id.clone(),
                             global: file_key.global,
@@ -3286,7 +2368,7 @@ where
                         if retain_payload {
                             return Some(write);
                         }
-                        if write.certified_row_batches().is_empty() {
+                        if write.certified_entity_batches().is_empty() {
                             return None;
                         }
                         write.retain_certified_batches_only();
@@ -3305,6 +2387,750 @@ where
                 ))
             }
         }
+    }
+
+    async fn plugin_state_points(
+        &mut self,
+        branch_id: &str,
+        keys: &[StateKey],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<StateRow>>, LixError> {
+        let encoded = keys
+            .iter()
+            .map(|key| {
+                encode_state_key(StateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.state_view
+            .branch_points(branch_id, &encoded, include_tombstones)
+            .await
+    }
+
+    async fn plugin_state_schema_rows(
+        &mut self,
+        branch_id: &str,
+        schema_keys: &[String],
+        file_id: Option<&str>,
+    ) -> Result<Vec<StateRow>, LixError> {
+        let mut rows = Vec::new();
+        for schema_key in schema_keys {
+            let (lower, upper) = plugin_schema_key_bounds(schema_key);
+            for row in self
+                .state_view
+                .branch_range(branch_id, Some(&lower), upper.as_deref(), None, false)
+                .await?
+            {
+                let key = crate::forktree::decode_state_key(&row.key)?;
+                if key.schema_key == *schema_key && key.file_id.as_deref() == file_id {
+                    rows.push(row);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn plugin_state_schema_all_rows(
+        &mut self,
+        branch_id: &str,
+        schema_keys: &[String],
+    ) -> Result<Vec<StateRow>, LixError> {
+        let mut rows = Vec::new();
+        for schema_key in schema_keys {
+            let (lower, upper) = plugin_schema_key_bounds(schema_key);
+            for row in self
+                .state_view
+                .branch_range(branch_id, Some(&lower), upper.as_deref(), None, false)
+                .await?
+            {
+                if decode_state_key(&row.key)?.schema_key == *schema_key {
+                    rows.push(row);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn plugin_file_path(
+        &mut self,
+        branch_id: &str,
+        file_id: &str,
+    ) -> Result<Option<String>, LixError> {
+        let mut rows = self
+            .plugin_state_points(
+                branch_id,
+                &[StateKey {
+                    schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                    entity_pk: validated_uuid_entity_pk(file_id)?,
+                    file_id: Some(file_id.to_owned()),
+                }],
+                false,
+            )
+            .await?;
+        let Some(file_row) = rows.pop().flatten() else {
+            return Ok(None);
+        };
+        let StateCell::Value(file_snapshot) = &file_row.value.cell else {
+            return Ok(None);
+        };
+        let file_snapshot: JsonValue =
+            serde_json::from_str(file_snapshot.as_str()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("authenticated file descriptor '{file_id}' is malformed: {error}"),
+                )
+            })?;
+        if file_snapshot.get("id").and_then(JsonValue::as_str) != Some(file_id) {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("authenticated file descriptor '{file_id}' has a mismatched identity"),
+            ));
+        }
+        let name = file_snapshot
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("authenticated file descriptor '{file_id}' has no name"),
+                )
+            })?;
+        let mut directory_id = file_snapshot
+            .get("directory_id")
+            .and_then(|value| (!value.is_null()).then(|| value.as_str()).flatten())
+            .map(str::to_owned);
+        let mut directory_names = Vec::new();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = directory_id {
+            if !visited.insert(id.clone()) {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!(
+                        "authenticated directory ancestry for file '{file_id}' contains a cycle"
+                    ),
+                ));
+            }
+            let mut rows = self
+                .plugin_state_points(
+                    branch_id,
+                    &[StateKey {
+                        schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                        entity_pk: validated_uuid_entity_pk(&id)?,
+                        file_id: None,
+                    }],
+                    false,
+                )
+                .await?;
+            let row = rows.pop().flatten().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("authenticated directory descriptor '{id}' is missing"),
+                )
+            })?;
+            let StateCell::Value(snapshot) = &row.value.cell else {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("authenticated directory descriptor '{id}' is deleted"),
+                ));
+            };
+            let snapshot: JsonValue = serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("authenticated directory descriptor '{id}' is malformed: {error}"),
+                )
+            })?;
+            if snapshot.get("id").and_then(JsonValue::as_str) != Some(id.as_str()) {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("authenticated directory descriptor '{id}' has a mismatched identity"),
+                ));
+            }
+            directory_names.push(
+                snapshot
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!("authenticated directory descriptor '{id}' has no name"),
+                        )
+                    })?
+                    .to_owned(),
+            );
+            directory_id = snapshot
+                .get("parent_id")
+                .and_then(|value| (!value.is_null()).then(|| value.as_str()).flatten())
+                .map(str::to_owned);
+        }
+        let mut directory_path = None;
+        for directory_name in directory_names.iter().rev() {
+            directory_path = Some(compose_directory_path(
+                directory_path.as_deref(),
+                directory_name,
+            )?);
+        }
+        compose_file_path(directory_path.as_deref(), name).map(Some)
+    }
+
+    async fn visible_materialization(
+        &mut self,
+        key: &PluginFileWriteKey,
+    ) -> Result<Option<VisibleMaterialization>, LixError> {
+        if key.global || key.untracked {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "plugin materialization must be tracked and branch-local",
+            ));
+        }
+        let rows = self
+            .plugin_state_points(
+                &key.branch_id,
+                &[plugin_materialization_state_key(&key.file_id)],
+                false,
+            )
+            .await?;
+        rows.first()
+            .and_then(Option::as_ref)
+            .map(|row| decode_visible_materialization_ref(row, &key.file_id))
+            .transpose()
+    }
+
+    async fn cold_open_semantic_actor(
+        &mut self,
+        actor_key: &PluginActorKey,
+        plugin: &PluginRegistryEntry,
+        descriptor: WasmFileDescriptor,
+        factory: Arc<dyn WasmComponentFactory>,
+        current_publications: &mut Vec<PendingPluginActorPublication>,
+    ) -> Result<PluginObservation, LixError> {
+        let cache = self.plugin_host.actor_cache();
+        let _cold_open_guard = cache.cold_open_guard().await;
+        let read = self.opening_read();
+        let file_key = PluginFileWriteKey {
+            branch_id: actor_key.branch_id.clone(),
+            global: false,
+            untracked: false,
+            file_id: actor_key.file_id.clone(),
+        };
+        let blob_rows = self
+            .plugin_state_points(
+                &actor_key.branch_id,
+                &[plugin_materialization_state_key(&actor_key.file_id)],
+                false,
+            )
+            .await?;
+        let blob_row = blob_rows.first().and_then(Option::as_ref).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                format!(
+                    "owned component plugin file '{}' must have one visible materialization",
+                    actor_key.file_id
+                ),
+            )
+        })?;
+        if blob_rows.len() != 1 {
+            return Err(LixError::new(
+                LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                format!(
+                    "owned component plugin file '{}' must have exactly one visible materialization; found {}",
+                    actor_key.file_id,
+                    blob_rows.iter().filter(|row| row.is_some()).count()
+                ),
+            ));
+        }
+        let materialization = decode_visible_materialization_ref(blob_row, &actor_key.file_id)?;
+        if !matches!(
+            &materialization.bytes,
+            VisibleMaterializationBytes::Blob { .. }
+        ) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "owned component plugin file '{}' materialization does not match plugin '{}' contract",
+                    actor_key.file_id,
+                    plugin.key()
+                ),
+            ));
+        }
+        let semantic_root = materialization.semantic_root.clone();
+        let cold_open = cache.prepare_cold_open(actor_key, &semantic_root).await?;
+        let mut cold_install: PluginActorColdInstall = match cold_open {
+            PluginActorColdOpen::Ready(observation) => return Ok(observation),
+            PluginActorColdOpen::Build(cold_install) => cold_install,
+        };
+        let store_permit = loop {
+            match cache.admit_cold_store(&mut cold_install) {
+                Ok(permit) => break permit,
+                Err(error) if error.code == LixError::CODE_PLUGIN_RESOURCE_LIMIT => {
+                    if retire_oldest_completed_actor(current_publications).await
+                        || retire_oldest_completed_actor(
+                            &mut self.pending_plugin_actor_publications,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let limits = WasmTransitionLimits::default();
+        let mut actor = factory.instantiate_actor().await?;
+        let cold_open_hydrates_without_render = actor.cold_open_hydrates_without_render();
+        let rows = if actor.cold_open_requires_entities() {
+            self.plugin_state_schema_rows(
+                &actor_key.branch_id,
+                plugin.schema_keys(),
+                Some(&actor_key.file_id),
+            )
+            .await?
+        } else {
+            Vec::<StateRow>::default()
+        };
+        let entity_ordinals =
+            v2_host_entity_ordinals_from_live_batch(&rows, &file_key, plugin.schema_keys())?;
+        let entity_authorities =
+            plugin_entity_authorities_from_live_batch(plugin, &rows, &entity_ordinals);
+        let entity_count = entity_ordinals.len();
+        let VisibleMaterializationBytes::Blob { hash } = materialization.bytes;
+        let materialized_bytes: crate::Blob = load_transaction_authenticated_plugin_bytes(
+            &read,
+            &actor_key.branch_id,
+            &self.staged_writes,
+            &self.pending_plugin_wasm_by_owner,
+            &[(plugin_materialization_state_key(&actor_key.file_id), hash)],
+        )
+        .await?
+        .into_blob_vec()
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "owned component plugin file '{}' references missing materialized blob '{}'",
+                    actor_key.file_id,
+                    hash.to_hex()
+                ),
+            )
+        })?;
+        let source = StateRowEntitySource::new(rows, entity_ordinals, limits)?;
+        let transition = match actor
+            .open_entities(
+                limits,
+                WasmOpenEntitiesInput {
+                    descriptor,
+                    entities: Box::new(source),
+                    accepted: Some(Arc::new(ArcByteSource::new(materialized_bytes.clone()))),
+                },
+            )
+            .await
+        {
+            Ok(transition) => transition,
+            Err(error) => {
+                let _ = actor.retire().await;
+                return Err(error);
+            }
+        };
+        let validated = match drain_entity_transition_edits(
+            actor.as_mut(),
+            transition,
+            materialized_bytes.as_ref(),
+            Some(materialized_bytes.clone()),
+            None,
+            limits,
+        )
+        .await
+        {
+            Ok(validated) => validated,
+            Err(error) => {
+                let _ = actor.retire().await;
+                return Err(error);
+            }
+        };
+        let materialized_bytes = validated.bytes.clone();
+        let materialized_bytes_sha256 = validated.bytes_sha256;
+        let mut counters = validated.counters;
+        counters.full_state_semantic_rows_materialized =
+            u64::try_from(entity_count).unwrap_or(u64::MAX);
+        counters.full_document_reparses = 1;
+        counters.full_renderer_invocations = u64::from(!cold_open_hydrates_without_render);
+        self.plugin_host.record_transition_counters(counters);
+        cache
+            .install_cold_if_absent_with_authorities(
+                cold_install,
+                actor_key.clone(),
+                PluginActorStore::new(actor, store_permit),
+                validated.document,
+                materialized_bytes,
+                materialized_bytes_sha256,
+                Arc::<str>::from(semantic_root),
+                entity_authorities,
+            )
+            .await
+    }
+
+    /// Leases an acknowledged actor, cold-opening only when cache eviction is
+    /// the sole reason the observation no longer resolves.
+    ///
+    /// The durable semantic root must still exactly match the root delivered
+    /// with the observation. A concurrent committed transition therefore
+    /// remains stale and cannot be mistaken for benign working-set eviction.
+    async fn lease_or_reopen_observed_actor(
+        &mut self,
+        observation: &PluginObservation,
+        actor_key: &PluginActorKey,
+        plugin: &PluginRegistryEntry,
+        descriptor: WasmFileDescriptor,
+        factory: Arc<dyn WasmComponentFactory>,
+        current_publications: &mut Vec<PendingPluginActorPublication>,
+    ) -> Result<PluginActorLease, LixError> {
+        let cache = self.plugin_host.actor_cache();
+        match cache.lease_for_transition(observation).await {
+            Ok(lease) => return Ok(lease),
+            Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => {
+                let file_key = PluginFileWriteKey {
+                    branch_id: actor_key.branch_id.clone(),
+                    global: false,
+                    untracked: false,
+                    file_id: actor_key.file_id.clone(),
+                };
+                let Some(visible_materialization) = self.visible_materialization(&file_key).await?
+                else {
+                    return Err(error);
+                };
+                if visible_materialization.semantic_root != observation.semantic_root() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+
+        let reopened = self
+            .cold_open_semantic_actor(actor_key, plugin, descriptor, factory, current_publications)
+            .await?;
+        cache.lease_for_transition(&reopened).await
+    }
+
+    /// Drops `format-only` upserts that are semantically identical to the
+    /// currently accepted durable entity. The exact-row lookup keeps this
+    /// proportional to the sparse format-only output instead of hydrating the
+    /// complete file graph.
+    async fn suppress_format_only_noops(
+        &mut self,
+        plugin: &PluginRegistryEntry,
+        changes: WasmHostEntityChanges,
+        file_key: &PluginFileWriteKey,
+    ) -> Result<(WasmHostEntityChanges, BTreeSet<WasmEntityKey>), LixError> {
+        let format_only_keys = changes
+            .changes
+            .iter()
+            .filter_map(|change| match change {
+                WasmEntityChange::Upsert {
+                    entity,
+                    effect: WasmChangeEffect::FormatOnly,
+                } => Some(entity.key.clone()),
+                WasmEntityChange::Create { .. }
+                | WasmEntityChange::Upsert { .. }
+                | WasmEntityChange::Delete(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if format_only_keys.is_empty() {
+            return Ok((changes, BTreeSet::new()));
+        }
+
+        let keys = format_only_keys
+            .iter()
+            .map(|key| {
+                Ok(StateKey {
+                    schema_key: key.schema_key.to_string(),
+                    entity_pk: plugin_entity_pk(plugin, key)?,
+                    file_id: Some(file_key.file_id.clone()),
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let current = self
+            .plugin_state_points(&file_key.branch_id, &keys, false)
+            .await?;
+        let observed_existing = format_only_keys
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| current.get(*slot).is_some_and(Option::is_some))
+            .map(|(_, key)| key.clone())
+            .collect();
+        Ok((
+            suppress_format_only_noops_against_batch(changes, &format_only_keys, &current)?,
+            observed_existing,
+        ))
+    }
+
+    /// Materializes keyless creates and returns the one durable mutation
+    /// reservation row when this transition creates at least one entity.
+    /// Existing keyed updates are checked with exact sparse authority reads.
+    async fn v2_create_rows(
+        &mut self,
+        plugin: &PluginRegistryEntry,
+        changes: &mut WasmHostEntityChanges,
+        bound: BoundCreateContext,
+        file_key: &PluginFileWriteKey,
+        existing_reservation: Option<&StateRow>,
+        known_existing_authorities: Option<&PluginEntityAuthorities>,
+    ) -> Result<RawWriteBatch, LixError> {
+        let mut validation = validate_create_changes(plugin, changes)?;
+        if let Some(known) = known_existing_authorities {
+            validation
+                .existing_authorities
+                .retain(|key| !known.contains(key));
+        }
+        materialize_keyless_creates(changes, bound.creates())?;
+        if !validation.requires_reservation && validation.existing_authorities.is_empty() {
+            return Ok(RawWriteBatch::new());
+        }
+
+        let exact_keys = validation
+            .existing_authorities
+            .iter()
+            .map(|key| {
+                let [id] = key.entity_pk.as_slice() else {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "creatable schema '{}' requires one UUID primary-key component",
+                            key.schema_key
+                        ),
+                    ));
+                };
+                Ok(StateKey {
+                    schema_key: key.schema_key.to_string(),
+                    entity_pk: EntityPk::uuid_from_canonical(id).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!("component plugin emitted invalid entity_pk: {error}"),
+                        )
+                    })?,
+                    file_id: Some(file_key.file_id.clone()),
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let loaded = if exact_keys.is_empty() {
+            Vec::<Option<StateRow>>::default()
+        } else {
+            self.plugin_state_points(&file_key.branch_id, &exact_keys, false)
+                .await?
+        };
+        require_existing_id_authorities(
+            plugin,
+            &validation.existing_authorities,
+            &loaded,
+            &file_key.file_id,
+            &file_key.branch_id,
+        )?;
+
+        let mut rows = RawWriteBatch::with_capacity(usize::from(validation.requires_reservation));
+        if validation.requires_reservation {
+            if let Some(row) = reserve_create_row(
+                existing_reservation,
+                bound,
+                &file_key.file_id,
+                &file_key.branch_id,
+            )? {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn preflight_create(
+        &mut self,
+        bound: BoundCreateContext,
+        file_key: &PluginFileWriteKey,
+    ) -> Result<Option<StateRow>, LixError> {
+        self.preflight_creates(&[(bound, file_key.clone())])
+            .await
+            .map(|mut rows| rows.pop().expect("one preflight produces one result"))
+    }
+
+    async fn preflight_creates(
+        &mut self,
+        requests: &[(BoundCreateContext, PluginFileWriteKey)],
+    ) -> Result<Vec<Option<StateRow>>, LixError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut loaded = Vec::with_capacity(requests.len());
+        for (bound, file_key) in requests {
+            let mut rows = self
+                .plugin_state_points(
+                    &file_key.branch_id,
+                    &[StateKey {
+                        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+                        entity_pk: EntityPk::single(bound.reservation_key()),
+                        file_id: Some(file_key.file_id.clone()),
+                    }],
+                    false,
+                )
+                .await?;
+            loaded.push(rows.pop().unwrap_or(None));
+        }
+        let mut existing_rows = Vec::with_capacity(requests.len());
+        for (index, (bound, file_key)) in requests.iter().enumerate() {
+            let existing = loaded.get(index).cloned().flatten();
+            validate_create_reservation(
+                existing.as_ref(),
+                *bound,
+                &file_key.file_id,
+                &file_key.branch_id,
+            )?;
+            existing_rows.push(existing);
+        }
+        Ok(existing_rows)
+    }
+
+    async fn v2_id_reservation_tombstones(
+        &mut self,
+        file_key: &PluginFileWriteKey,
+    ) -> Result<RawWriteBatch, LixError> {
+        let rows = self
+            .plugin_state_schema_rows(
+                &file_key.branch_id,
+                &[KEY_VALUE_SCHEMA_KEY.to_string()],
+                Some(&file_key.file_id),
+            )
+            .await?;
+        let mut tombstones = RawWriteBatch::with_capacity(rows.len());
+        for row in rows.iter() {
+            let state_key = crate::forktree::decode_state_key(&row.key)?;
+            let Ok(key) = state_key.entity_pk.as_single_string() else {
+                continue;
+            };
+            if is_reservation_key(key) {
+                tombstones.push(reservation_tombstone_row(
+                    key,
+                    &file_key.file_id,
+                    &file_key.branch_id,
+                )?);
+            }
+        }
+        Ok(tombstones)
+    }
+
+    /// Runs the stateless conflict resolver for one pinned component plugin
+    /// generation. Unlike normal file mutation this creates no persistent
+    /// document actor: a merge may need to resolve one row from a large file,
+    /// and the resulting rows are rendered once by the ordinary staged-write
+    /// reconciliation path.
+    ///
+    /// The caller supplies a registry entry loaded from the historical merge
+    /// roots, not the mutable current registry. This keeps `b` selection
+    /// and plugin code selection deterministic across merge direction and
+    /// retries.
+    pub(crate) async fn resolve_plugin_conflicts(
+        &mut self,
+        plugin: &PluginRegistryEntry,
+        descriptor: WasmFileDescriptor,
+        conflicts: Vec<WasmEntityConflict<WasmHostBytes>>,
+    ) -> Result<ValidatedConflictTransition, LixError> {
+        self.ensure_plugin_generation_read_guard().await;
+        let expected_count = conflicts.len();
+        let limits = conflict_resolution_limits(expected_count)?;
+        let source = VecEntityConflictSource::new(conflicts, limits)?;
+        let wasm_hash = BlobId::from_hex(plugin.wasm_blob_hash())?;
+        let factory = match self
+            .plugin_host
+            .cached_plugin_factory(plugin.key(), wasm_hash)?
+        {
+            Some(factory) => factory,
+            None => {
+                let read = self.opening_read();
+                let wasm_key = plugin_wasm_state_key(&self.active_branch_id, plugin.key());
+                let wasm = load_transaction_authenticated_plugin_bytes(
+                    &read,
+                    &self.active_branch_id,
+                    &self.staged_writes,
+                    &self.pending_plugin_wasm_by_owner,
+                    &[(wasm_key, wasm_hash)],
+                )
+                .await?
+                .into_vec()
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "plugin registry references missing WASM blob '{}'",
+                            wasm_hash.to_hex()
+                        ),
+                    )
+                })?;
+                let installed = plugin.to_installed_plugin(wasm)?;
+                self.plugin_host
+                    .load_or_compile_factory(&installed)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_conflict_factory_compile"
+                    ))
+                    .await?
+            }
+        };
+
+        // Static conflict resolution is short lived, but it still owns a
+        // Wasmtime Store and must honor the same workspace-wide admission
+        // bound as retained document actors.
+        let permit = self.plugin_host.actor_cache().admit_store()?;
+        let actor = factory
+            .instantiate_actor()
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_conflict_actor_instantiate"
+            ))
+            .await?;
+        let mut store = PluginActorStore::new(actor, permit);
+        let transition = match store
+            .actor_mut()
+            .resolve_conflicts(
+                limits,
+                WasmConflictUpdate {
+                    descriptor,
+                    conflicts: Box::new(source),
+                },
+            )
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_resolve_conflicts"
+            ))
+            .await
+        {
+            Ok(transition) => transition,
+            Err(error) => {
+                let _ = store.actor_mut().retire().await;
+                return Err(error);
+            }
+        };
+        let validated = match drain_conflict_transition_resolutions(
+            store.actor_mut(),
+            transition,
+            expected_count,
+            limits,
+        )
+        .await
+        {
+            Ok(validated) => validated,
+            Err(error) => {
+                let _ = store.actor_mut().retire().await;
+                return Err(error);
+            }
+        };
+        store.actor_mut().retire().await?;
+        self.plugin_host
+            .record_transition_counters(validated.counters);
+        Ok(validated)
     }
 
     fn acknowledged_session_plugin_view(
@@ -3372,13 +3198,6 @@ where
         Ok(())
     }
 
-    /// Reconciles plugin lifecycle, ownership, and state for one logical write
-    /// batch against one storage snapshot.
-    ///
-    /// The first and only mandatory current-state lookup is the small durable
-    /// registry row. An empty registry returns before owner, filesystem,
-    /// matcher, state, archive, CAS, or WASM work. Non-empty registries use
-    /// batched owner/state/CAS reads and execute plugin calls in input order.
     async fn plugin_write_reconciliation(
         &mut self,
         rows: &mut RawWriteBatch,
@@ -3392,6 +3211,9 @@ where
         let mut current_install_schema_definitions =
             BTreeMap::<PluginLifecycleKey, BTreeMap<String, JsonValue>>::new();
         let mut current_install_wasm = BTreeMap::<BlobId, Vec<u8>>::new();
+        let mut current_install_plugin_wasm =
+            BTreeMap::<(String, String), (BlobId, Vec<u8>)>::new();
+        let mut wasm_owner_payloads = Vec::<TransactionFileContent>::new();
         let mut branch_ids = BTreeSet::<String>::new();
 
         // Parse each archive exactly once. The original ZIP remains the file
@@ -3407,13 +3229,13 @@ where
                         "prepared CAS content cannot install a plugin archive",
                     ));
                 }
-                if !write.global {
+                if !write.global && !write.untracked {
                     branch_ids.insert(write.branch_id.clone());
                 }
                 continue;
             };
             if !is_plugin_storage_path(path) {
-                if !write.global {
+                if !write.global && !write.untracked {
                     branch_ids.insert(write.branch_id.clone());
                 }
                 continue;
@@ -3448,7 +3270,7 @@ where
             } = plan;
             let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
                 key: plugin_key.clone(),
-                runtime: crate::plugin::runtime::PluginRuntime::WasmComponent,
+                runtime: crate::plugin::PluginRuntime::WasmComponent,
                 api_version: WASM_COMPONENT_API_VERSION.to_owned(),
                 path_glob: parsed.manifest.file_match.path_glob.clone(),
                 content: parsed.manifest.file_match.content,
@@ -3471,13 +3293,54 @@ where
             {
                 return Err(duplicate_plugin_lifecycle_mutation());
             }
+            let wasm_file_id = plugin_storage_wasm_file_id(&lifecycle_key.plugin_key);
+            FileDescriptorWriteIntent {
+                id: Some(wasm_file_id.clone()),
+                directory_id: None,
+                name: format!("{}.wasm", lifecycle_key.plugin_key),
+                context: FilesystemRowContext {
+                    branch_id: write.branch_id.clone(),
+                    global: false,
+                    untracked: false,
+                    file_id: None,
+                    metadata: None,
+                },
+            }
+            .append_to(rows);
+            BlobRefRowInput {
+                file_id: wasm_file_id.clone(),
+                blob_hash: parsed.wasm_hash,
+                size_bytes: parsed.wasm_bytes.len() as u64,
+                plugin_checkpoint: None,
+                context: FilesystemRowContext {
+                    branch_id: write.branch_id.clone(),
+                    global: false,
+                    untracked: false,
+                    file_id: None,
+                    metadata: None,
+                },
+            }
+            .append_to(rows)?;
+            // Keep the extracted component as an independently published
+            // payload. The BlobRef row above is its sole durable owner; the
+            // archive's auxiliary-payload side channel is intentionally not a
+            // second, hash-only authority.
+            wasm_owner_payloads.push(TransactionFileContent::new(
+                wasm_file_id.clone(),
+                None,
+                None,
+                write.branch_id.clone(),
+                false,
+                false,
+                crate::transaction::types::FileContent::inline(parsed.wasm_bytes.clone()),
+            ));
             let schema_definitions = schema_rows
                 .iter()
                 .map(|row| {
                     let schema_key = row
-                        .row_pk
+                        .entity_pk
                         .as_ref()
-                        .and_then(|row_pk| row_pk.as_single_string().ok())
+                        .and_then(|entity_pk| entity_pk.as_single_string().ok())
                         .ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
@@ -3485,23 +3348,17 @@ where
                             )
                         })?
                         .to_string();
-                    let snapshot = row
+                    let definition = row
                         .snapshot
                         .as_ref()
+                        .and_then(|snapshot| snapshot.get("value"))
+                        .cloned()
                         .ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
-                                "plugin schema row is missing its snapshot",
+                                "plugin schema row is missing its definition",
                             )
                         })?;
-                    let (snapshot_key, definition) =
-                        crate::schema::schema_from_registered_snapshot(snapshot)?;
-                    if snapshot_key.schema_key != schema_key {
-                        return Err(LixError::new(
-                            LixError::CODE_SCHEMA_DEFINITION,
-                            "plugin schema row identity does not match schema_key",
-                        ));
-                    }
                     Ok((schema_key, definition))
                 })
                 .collect::<Result<BTreeMap<_, _>, LixError>>()?;
@@ -3509,7 +3366,14 @@ where
             current_install_wasm
                 .entry(parsed.wasm_hash)
                 .or_insert_with(|| parsed.wasm_bytes.clone());
-            write.add_auxiliary_payload(parsed.wasm_bytes);
+            current_install_plugin_wasm.insert(
+                (write.branch_id.clone(), lifecycle_key.plugin_key.clone()),
+                (parsed.wasm_hash, parsed.wasm_bytes.clone()),
+            );
+            self.pending_plugin_wasm_by_owner.insert(
+                (write.branch_id.clone(), wasm_file_id),
+                (parsed.wasm_hash, parsed.wasm_bytes.clone()),
+            );
             lifecycle_schema_keys.extend(std::iter::repeat_n(
                 lifecycle_key.clone(),
                 schema_rows.len(),
@@ -3517,6 +3381,7 @@ where
             lifecycle_schema_rows.append(schema_rows);
             branch_ids.insert(write.branch_id.clone());
         }
+        file_content.extend(wasm_owner_payloads);
 
         // A canonical archive descriptor tombstone is the uninstall signal.
         // Other descriptor tombstones are ownership cleanup candidates.
@@ -3526,9 +3391,9 @@ where
                 continue;
             }
             let Some(file_id) = row
-                .row_pk
+                .entity_pk
                 .as_ref()
-                .and_then(|row_pk| row_pk.as_single_string_owned().ok())
+                .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
             else {
                 continue;
             };
@@ -3554,15 +3419,13 @@ where
                 branch_ids.insert(row.branch_id.to_string());
                 continue;
             }
-            if row.global {
+            if row.global || row.untracked {
                 continue;
             }
-            // Deleting an untracked plugin-owned file must clean up its owner
-            // and rows the same way a tracked deletion does.
             let key = PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: row.untracked,
+                untracked: false,
                 file_id,
             };
             deleted_file_keys
@@ -3581,13 +3444,12 @@ where
             }
         }
 
-        // Ordinary semantic DML carries no filesystem payload. A file-scoped
-        // row may nevertheless belong to an active plugin and therefore needs
-        // the small branch registry lookup before the host can decide whether
-        // a row-to-file transition is required. Lane is irrelevant to that
-        // decision: the registry is branch-global either way.
+        // Ordinary semantic DML carries no filesystem payload. A tracked,
+        // file-scoped row may nevertheless belong to an active plugin and
+        // therefore needs the small branch registry lookup before the host can
+        // decide whether an entity-to-file transition is required.
         for row in rows.iter().take(input_row_count) {
-            if !row.global && row.file_id.is_some() {
+            if !row.global && !row.untracked && row.file_id.is_some() {
                 branch_ids.insert(row.branch_id.to_string());
             }
         }
@@ -3606,22 +3468,18 @@ where
             self.ensure_plugin_generation_upgrade_guard().await?;
         }
 
-        let staged = self.staged_writes.staging_overlay()?;
-        let storage = self.storage.clone();
-        let read =
-            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-        let base = self.hot_state.reader(read.clone());
+        let read = self.opening_read();
 
         if !lifecycle_schema_rows.is_empty() {
-            let mut desired_schemas = BTreeMap::<(String, RowPk), (String, JsonValue)>::new();
+            let mut desired_schemas = BTreeMap::<(String, EntityPk), (String, JsonValue)>::new();
             for (lifecycle_key, row) in lifecycle_schema_keys
                 .iter()
                 .zip(lifecycle_schema_rows.iter())
             {
-                let row_pk = row.row_pk.cloned().ok_or_else(|| {
+                let entity_pk = row.entity_pk.cloned().ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "plugin schema row is missing its row identity",
+                        "plugin schema row is missing its entity identity",
                     )
                 })?;
                 let snapshot = row.snapshot.ok_or_else(|| {
@@ -3630,7 +3488,7 @@ where
                         "plugin schema row is missing its definition",
                     )
                 })?;
-                let identity = (row.branch_id.to_string(), row_pk);
+                let identity = (row.branch_id.to_string(), entity_pk);
                 let definition = snapshot.value().clone();
                 if let Some((other_plugin, other_definition)) = desired_schemas.get(&identity)
                     && other_definition != &definition
@@ -3644,47 +3502,41 @@ where
                 desired_schemas.insert(identity, (lifecycle_key.plugin_key.clone(), definition));
             }
 
-            let schema_rows = overlay_scan_batch(
-                &base,
-                &staged,
-                &HotStateScanRequest {
-                    filter: HotStateFilter {
-                        schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                        row_pks: desired_schemas
-                            .keys()
-                            .map(|(_, row_pk)| row_pk.clone())
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .collect(),
-                        branch_ids: desired_schemas
-                            .keys()
-                            .map(|(branch_id, _)| branch_id.clone())
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .collect(),
-                        file_ids: vec![NullableKeyFilter::Null],
-                        untracked: Some(false),
-                        ..Default::default()
-                    },
-                    projection: plugin_registry_hot_state_projection(),
-                    ..Default::default()
-                },
-            )
-            .await?;
-            let mut existing_schemas = BTreeMap::<(String, RowPk), JsonValue>::new();
-            for row in schema_rows.iter() {
-                let Some(snapshot) = row.snapshot_content().map(|content| content.as_str()) else {
-                    continue;
-                };
-                existing_schemas.insert(
-                    (row.branch_id().to_string(), row.row_pk().clone()),
-                    serde_json::from_str(snapshot).map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_SCHEMA_DEFINITION,
-                            format!("invalid existing registered schema snapshot: {error}"),
-                        )
-                    })?,
-                );
+            let mut existing_schemas = BTreeMap::<(String, EntityPk), JsonValue>::new();
+            let mut desired_by_branch = BTreeMap::<String, Vec<EntityPk>>::new();
+            for branch_entity in desired_schemas.keys() {
+                desired_by_branch
+                    .entry(branch_entity.0.clone())
+                    .or_default()
+                    .push(branch_entity.1.clone());
+            }
+            for (branch_id, entity_pks) in desired_by_branch {
+                let keys = entity_pks
+                    .iter()
+                    .map(|entity_pk| StateKey {
+                        schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+                        file_id: None,
+                        entity_pk: entity_pk.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                for (entity_pk, row) in entity_pks
+                    .into_iter()
+                    .zip(self.plugin_state_points(&branch_id, &keys, false).await?)
+                {
+                    let Some(row) = row else { continue };
+                    let StateCell::Value(snapshot) = row.value.cell else {
+                        continue;
+                    };
+                    existing_schemas.insert(
+                        (branch_id.clone(), entity_pk),
+                        serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_SCHEMA_DEFINITION,
+                                format!("invalid existing registered schema snapshot: {error}"),
+                            )
+                        })?,
+                    );
+                }
             }
             // Programmatic writes may pair a schema mutation with a plugin
             // archive in one transaction batch. Model those rows after the
@@ -3697,10 +3549,10 @@ where
                 {
                     continue;
                 }
-                let Some(row_pk) = row.row_pk.cloned() else {
+                let Some(entity_pk) = row.entity_pk.cloned() else {
                     continue;
                 };
-                let identity = (row.branch_id.to_string(), row_pk);
+                let identity = (row.branch_id.to_string(), entity_pk);
                 if !desired_schemas.contains_key(&identity) {
                     continue;
                 }
@@ -3723,48 +3575,27 @@ where
             rows.append(lifecycle_schema_rows);
         }
 
-        let registry_rows = overlay_load_exact_batch(
-            &base,
-            &staged,
-            &HotStateExactBatchRequest {
-                rows: branch_ids
-                    .iter()
-                    .map(|branch_id| HotStateExactRowRequest {
-                        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-                        branch_id: branch_id.clone(),
-                        row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
-                        file_id: None,
-                    })
-                    .collect(),
-                projection: plugin_registry_hot_state_projection(),
-                untracked: Some(false),
-                include_tombstones: false,
-            },
-        )
-        .await?;
         let mut registries = BTreeMap::<String, PluginRegistry>::new();
         let mut changed_registry_branches = BTreeSet::<String>::new();
         let mut generation_upgrades = Vec::<PluginGenerationUpgrade>::new();
-        if registry_rows.len() != branch_ids.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "durable plugin registry lookup expected {} aligned slots, got {}",
-                    branch_ids.len(),
-                    registry_rows.len()
-                ),
-            ));
-        }
-        for (slot, branch_id) in branch_ids.iter().enumerate() {
-            // Registry decoding is the terminal plugin-parser boundary. Keep
-            // the exact batch owner alive and materialize at most this one
-            // scalar DTO while the parser validates it.
-            let row = registry_rows
-                .row(slot)
-                .map(MaterializedHotStateRowRef::to_owned);
+        for branch_id in &branch_ids {
+            let mut loaded = self
+                .plugin_state_points(
+                    branch_id,
+                    &[StateKey {
+                        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+                        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
+                        file_id: None,
+                    }],
+                    false,
+                )
+                .await?;
             registries.insert(
                 branch_id.clone(),
-                PluginRegistry::from_optional_hot_state_row(row.as_ref(), branch_id)?,
+                PluginRegistry::from_required_state_row(
+                    loaded.pop().unwrap_or(None).as_ref(),
+                    branch_id,
+                )?,
             );
         }
         for (key, mutation) in lifecycle {
@@ -3786,6 +3617,20 @@ where
                 }
                 None => {
                     registry.remove(&key.plugin_key)?;
+                    let wasm_file_id = plugin_storage_wasm_file_id(&key.plugin_key);
+                    append_blob_ref_tombstone_row(
+                        rows,
+                        wasm_file_id.clone(),
+                        FilesystemRowContext {
+                            branch_id: key.branch_id.clone(),
+                            global: false,
+                            untracked: false,
+                            file_id: None,
+                            metadata: None,
+                        },
+                    );
+                    self.pending_plugin_wasm_by_owner
+                        .remove(&(key.branch_id.clone(), wasm_file_id));
                 }
             }
             changed_registry_branches.insert(key.branch_id);
@@ -3795,9 +3640,9 @@ where
                 continue;
             }
             let Some(schema_key) = row
-                .row_pk
+                .entity_pk
                 .as_ref()
-                .and_then(|row_pk| row_pk.as_single_string().ok())
+                .and_then(|entity_pk| entity_pk.as_single_string().ok())
             else {
                 continue;
             };
@@ -3818,13 +3663,10 @@ where
             ));
         }
         if !generation_upgrades.is_empty() {
-            let base_blob_reader = self.binary_cas.reader(read.clone());
+            let plugin_host = self.plugin_host.clone();
             preflight_owned_generation_upgrades(
-                &self.plugin_host,
-                &base,
-                &staged,
-                &base_blob_reader,
-                &self.staged_writes,
+                &plugin_host,
+                self,
                 &generation_upgrades,
                 &current_install_wasm,
                 &current_install_schema_definitions,
@@ -3854,6 +3696,7 @@ where
         if active_branch_ids.is_empty() && deleted_file_keys.is_empty() {
             for write in file_content.iter().filter(|write| {
                 !write.global
+                    && !write.untracked
                     && write
                         .path
                         .as_deref()
@@ -3871,6 +3714,7 @@ where
         let mut candidate_file_keys = BTreeSet::<PluginFileWriteKey>::new();
         for write in file_content.iter() {
             if write.global
+                || write.untracked
                 || !active_branch_ids.contains(&write.branch_id)
                 || write.path.as_deref().is_none_or(is_plugin_storage_path)
             {
@@ -3886,6 +3730,7 @@ where
         }
         for row in rows.iter().take(input_row_count) {
             if row.global
+                || row.untracked
                 || !active_branch_ids.contains(row.branch_id.as_str())
                 || row.file_id.is_none()
             {
@@ -3894,7 +3739,7 @@ where
             candidate_file_keys.insert(PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: row.untracked,
+                untracked: false,
                 file_id: row
                     .file_id
                     .as_ref()
@@ -3907,71 +3752,36 @@ where
             return Ok(reconciliation);
         }
 
-        // Owner rows are file-scoped, so each one lives in its own file's lane.
-        // `HotStateExactBatchRequest` carries one lane per batch, so the
-        // candidates are partitioned by lane and each partition is read under
-        // its own lane. A single constant lane here would report an untracked
-        // file as unowned and re-own it from scratch on every write.
         let mut owners = BTreeMap::<PluginFileWriteKey, PluginFileOwner>::new();
         let mut owner_change_ids = BTreeMap::<PluginFileWriteKey, String>::new();
-        for lane in [false, true] {
-            let lane_keys = candidate_file_keys
-                .iter()
-                .filter(|key| key.untracked == lane)
-                .collect::<Vec<_>>();
-            if lane_keys.is_empty() {
+        for candidate in &candidate_file_keys {
+            let mut loaded = self
+                .plugin_state_points(
+                    &candidate.branch_id,
+                    &[StateKey {
+                        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+                        entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+                        file_id: Some(candidate.file_id.clone()),
+                    }],
+                    false,
+                )
+                .await?;
+            let Some(owner_row) = loaded.pop().unwrap_or(None) else {
                 continue;
+            };
+            let Some(owner) = PluginFileOwner::from_state_row(&owner_row, &candidate.branch_id)?
+            else {
+                continue;
+            };
+            let owner_change_id = owner_row.value.change_id;
+            let key = candidate.clone();
+            if owners.insert(key.clone(), owner).is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "durable plugin owner lookup returned duplicate file rows",
+                ));
             }
-            let owner_rows = overlay_load_exact_batch(
-                &base,
-                &staged,
-                &HotStateExactBatchRequest {
-                    rows: lane_keys
-                        .iter()
-                        .map(|key| HotStateExactRowRequest {
-                            schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-                            branch_id: key.branch_id.clone(),
-                            row_pk: RowPk::single(PLUGIN_OWNER_KEY),
-                            file_id: Some(key.file_id.clone()),
-                        })
-                        .collect(),
-                    projection: plugin_registry_hot_state_projection(),
-                    untracked: Some(lane),
-                    include_tombstones: false,
-                },
-            )
-            .await?;
-            for row in (0..owner_rows.len()).filter_map(|slot| owner_rows.row(slot)) {
-                let branch_id = row.branch_id().to_string();
-                let owner_row = row.to_owned();
-                let Some(owner) =
-                    PluginFileOwner::from_hot_state_row(&owner_row, &branch_id, lane)?
-                else {
-                    continue;
-                };
-                let owner_change_id = row.change_id().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "durable plugin owner for file '{}' on branch '{branch_id}' is missing change_id",
-                            owner.file_id()
-                        ),
-                    )
-                })?;
-                let key = PluginFileWriteKey {
-                    branch_id,
-                    global: false,
-                    untracked: lane,
-                    file_id: owner.file_id().to_string(),
-                };
-                if owners.insert(key.clone(), owner).is_some() {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        "durable plugin owner lookup returned duplicate file rows",
-                    ));
-                }
-                owner_change_ids.insert(key, owner_change_id.to_string());
-            }
+            owner_change_ids.insert(key, owner_change_id.to_string());
         }
 
         let mut catalogs = BTreeMap::<String, Arc<CompiledPluginCatalog>>::new();
@@ -3995,7 +3805,7 @@ where
             let Some(file_id) = row.file_id.as_deref() else {
                 continue;
             };
-            if row.global || !active_branch_ids.contains(row.branch_id.as_str()) {
+            if row.global || row.untracked || !active_branch_ids.contains(row.branch_id.as_str()) {
                 continue;
             }
             let registry = registries
@@ -4013,7 +3823,7 @@ where
             let file_key = PluginFileWriteKey {
                 branch_id: row.branch_id.to_string(),
                 global: false,
-                untracked: row.untracked,
+                untracked: false,
                 file_id: file_id.to_string(),
             };
             let owner = owners.get(&file_key).ok_or_else(|| {
@@ -4058,16 +3868,16 @@ where
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "one write batch cannot mutate both bytes and semantic rows for component plugin file '{file_id}'"
+                        "one write batch cannot mutate both bytes and semantic entities for component plugin file '{file_id}'"
                     ),
                 )
-                .with_hint("submit either the byte mutation or the resolved row mutations"));
+                .with_hint("submit either the byte mutation or the resolved entity mutations"));
             }
             if deleted_file_keys.contains_key(&file_key) {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "one write batch cannot delete component plugin file '{file_id}' and mutate its semantic rows"
+                        "one write batch cannot delete component plugin file '{file_id}' and mutate its semantic entities"
                     ),
                 ));
             }
@@ -4095,48 +3905,29 @@ where
 
         let mut semantic_groups = BTreeMap::<PluginFileWriteKey, PluginSemanticWriteGroup>::new();
         if !unresolved_semantic_groups.is_empty() {
-            let request = FilesystemPathIndexRequest::new(
-                unresolved_semantic_groups
-                    .keys()
-                    .map(|key| key.branch_id.clone())
-                    .collect(),
-            );
-            let path_index = self.filesystem_path_index(&request).await?;
             for (file_key, (plugin, owner_change_id, row_indices)) in unresolved_semantic_groups {
-                let entries = path_index
-                    .exact_file_id_entries(&file_key.file_id)
-                    .into_iter()
-                    .filter(|entry| {
-                        let live = entry.live_row();
-                        entry.kind == FilesystemPathKind::File
-                            && entry.id() == file_key.file_id
-                            && live.branch_id.as_ref() == file_key.branch_id
-                            && !live.global
-                            // Path uniqueness is per lane, so the descriptor is
-                            // matched in the same lane as its semantic rows.
-                            && live.untracked == file_key.untracked
-                    })
-                    .collect::<Vec<_>>();
-                let [entry] = entries.as_slice() else {
-                    return Err(LixError::new(
-                        LixError::CODE_CONSTRAINT_VIOLATION,
-                        format!(
-                            "owned component plugin file '{}' must resolve to exactly one path in its own lane; found {}",
-                            file_key.file_id,
-                            entries.len()
-                        ),
-                    ));
-                };
+                let path = self
+                    .plugin_file_path(&file_key.branch_id, &file_key.file_id)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_CONSTRAINT_VIOLATION,
+                            format!(
+                                "owned component plugin file '{}' has no tracked descriptor",
+                                file_key.file_id
+                            ),
+                        )
+                    })?;
                 let catalog = catalogs
                     .get(&file_key.branch_id)
                     .expect("semantic-write branch has a compiled plugin catalog");
-                if !catalog.matches_plugin(plugin.key(), &entry.path) {
+                if !catalog.matches_plugin(plugin.key(), &path) {
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
                             "owned component plugin '{}' no longer matches file path '{}'",
                             plugin.key(),
-                            entry.path
+                            path
                         ),
                     ));
                 }
@@ -4144,8 +3935,12 @@ where
                     file_key,
                     PluginSemanticWriteGroup {
                         plugin,
-                        path: entry.path.clone(),
-                        filename: entry.name.clone(),
+                        filename: path
+                            .rsplit('/')
+                            .next()
+                            .expect("validated file path has a final segment")
+                            .to_owned(),
+                        path,
                         owner_change_id,
                         row_indices,
                     },
@@ -4165,6 +3960,7 @@ where
                 continue;
             };
             if write.global
+                || write.untracked
                 || is_plugin_storage_path(path)
                 || !active_branch_ids.contains(&write.branch_id)
             {
@@ -4206,7 +4002,7 @@ where
                     Some(PluginContentMatcher::Text) => {
                         write.splice_provenance().is_some_and(|provenance| {
                             observation.bytes_sha256().is_some_and(|digest| {
-                                digest.matches_lower_hex(provenance.base_sha256())
+                                digest.matches_lower_hex(provenance.transport_base_digest_hex())
                             }) && transport_splice_preserves_utf8(write_data, provenance)
                         })
                     }
@@ -4215,7 +4011,7 @@ where
                         bytes: scan_bytes,
                     }) => write.splice_provenance().is_some_and(|provenance| {
                         observation.bytes_sha256().is_some_and(|digest| {
-                            digest.matches_lower_hex(provenance.base_sha256())
+                            digest.matches_lower_hex(provenance.transport_base_digest_hex())
                         }) && transport_splice_preserves_prefix_exclusion(
                             write_data, provenance, byte, scan_bytes,
                         )
@@ -4243,7 +4039,7 @@ where
         for (key, owner) in &owners {
             // Descriptor deletion cascades file-scoped current state in the
             // head materializer. Avoid hydrating the full plugin graph only
-            // to persist one historical tombstone per semantic row.
+            // to persist one historical tombstone per semantic entity.
             if deleted_file_keys.contains_key(key) {
                 continue;
             }
@@ -4261,10 +4057,6 @@ where
             }
             let group_key = PluginStateGroupKey {
                 branch_id: key.branch_id.clone(),
-                // Each scan below reads one lane, so groups are keyed by lane
-                // too. Merging lanes into one group would read a file's rows
-                // from the wrong lane and tombstone the wrong rows.
-                untracked: key.untracked,
                 plugin_key: owner.plugin_key().to_string(),
             };
             let group = state_groups.entry(group_key).or_default();
@@ -4280,30 +4072,28 @@ where
                     .extend(selected.schema_keys().iter().cloned());
             }
         }
-        let mut state_batches = Vec::<MaterializedHotStateBatch>::with_capacity(state_groups.len());
+        let mut state_batches = Vec::<Vec<StateRow>>::with_capacity(state_groups.len());
         let mut state_group_keys = Vec::<PluginStateGroupKey>::with_capacity(state_groups.len());
         for (group_key, group) in state_groups {
-            let rows = overlay_scan_batch(
-                &base,
-                &staged,
-                &HotStateScanRequest {
-                    filter: HotStateFilter {
-                        schema_keys: group.schema_keys.into_iter().collect(),
-                        branch_ids: vec![group_key.branch_id.clone()],
-                        file_ids: group
-                            .file_ids
-                            .iter()
-                            .cloned()
-                            .map(NullableKeyFilter::Value)
-                            .collect(),
-                        untracked: Some(group_key.untracked),
-                        ..Default::default()
-                    },
-                    projection: plugin_state_hot_state_projection(),
-                    ..Default::default()
-                },
-            )
-            .await?;
+            let schema_keys = group.schema_keys.into_iter().collect::<Vec<_>>();
+            let mut rows = Vec::new();
+            for file_id in &group.file_ids {
+                rows.extend(
+                    self.plugin_state_schema_rows(
+                        &group_key.branch_id,
+                        &schema_keys,
+                        Some(file_id),
+                    )
+                    .await?,
+                );
+            }
+            rows.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+            if rows.windows(2).any(|pair| pair[0].key == pair[1].key) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin reconciliation state lookup returned duplicate keys",
+                ));
+            }
             u32::try_from(state_batches.len()).map_err(|_| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -4319,16 +4109,13 @@ where
             state_group_keys.push(group_key);
             state_batches.push(rows);
         }
-        let state_row_count = state_batches
-            .iter()
-            .map(MaterializedHotStateBatch::len)
-            .sum();
+        let state_row_count = state_batches.iter().map(Vec::<StateRow>::len).sum();
         let mut state_rows = Vec::<PluginStateBatchRow>::with_capacity(state_row_count);
         for (batch_index, batch) in state_batches.iter().enumerate() {
             let batch_index =
                 u32::try_from(batch_index).expect("plugin state batch count was checked");
             for (row_index, row) in batch.iter().enumerate() {
-                if row.file_id().is_some() {
+                if decode_state_key(&row.key)?.file_id.is_some() {
                     state_rows.push(PluginStateBatchRow {
                         batch_index,
                         row_index: u32::try_from(row_index)
@@ -4339,15 +4126,19 @@ where
         }
         state_rows.sort_unstable_by(|left, right| {
             left.batch_index.cmp(&right.batch_index).then_with(|| {
-                let left = state_batches[left.batch_index as usize]
-                    .row(left.row_index as usize)
-                    .file_id()
-                    .expect("selected plugin state row carries file_id");
-                let right = state_batches[right.batch_index as usize]
-                    .row(right.row_index as usize)
-                    .file_id()
-                    .expect("selected plugin state row carries file_id");
-                left.cmp(right)
+                let left = decode_state_key(
+                    &state_batches[left.batch_index as usize][left.row_index as usize].key,
+                )
+                .expect("authenticated plugin state key was decoded above")
+                .file_id
+                .expect("selected plugin state row carries file_id");
+                let right = decode_state_key(
+                    &state_batches[right.batch_index as usize][right.row_index as usize].key,
+                )
+                .expect("authenticated plugin state key was decoded above")
+                .file_id
+                .expect("selected plugin state row carries file_id");
+                left.cmp(&right)
             })
         });
         let mut state_by_file =
@@ -4357,25 +4148,30 @@ where
         let mut selection_start = 0;
         while selection_start < state_rows.len() {
             let selected = state_rows[selection_start];
-            let file_id = state_batches[selected.batch_index as usize]
-                .row(selected.row_index as usize)
-                .file_id()
-                .expect("selected plugin state row carries file_id");
+            let file_id = decode_state_key(
+                &state_batches[selected.batch_index as usize][selected.row_index as usize].key,
+            )?
+            .file_id
+            .expect("selected plugin state row carries file_id");
             let mut selection_end = selection_start + 1;
             while selection_end < state_rows.len() {
                 let candidate = state_rows[selection_end];
                 if candidate.batch_index != selected.batch_index
-                    || state_batches[candidate.batch_index as usize]
-                        .row(candidate.row_index as usize)
-                        .file_id()
-                        != Some(file_id)
+                    || decode_state_key(
+                        &state_batches[candidate.batch_index as usize]
+                            [candidate.row_index as usize]
+                            .key,
+                    )?
+                    .file_id
+                    .as_deref()
+                        != Some(file_id.as_str())
                 {
                     break;
                 }
                 selection_end += 1;
             }
             state_by_file[selected.batch_index as usize]
-                .insert(file_id.to_owned(), selection_start..selection_end);
+                .insert(file_id, selection_start..selection_end);
             selection_start = selection_end;
         }
 
@@ -4414,34 +4210,46 @@ where
         }
 
         let mut wasm_by_hash = current_install_wasm;
-        let mut missing_hashes = Vec::<BlobId>::new();
-        for entry in cold_entries.values() {
+        for (key, entry) in &cold_entries {
             let hash = BlobId::from_hex(entry.wasm_blob_hash())?;
-            if !wasm_by_hash.contains_key(&hash) && !missing_hashes.contains(&hash) {
-                missing_hashes.push(hash);
-            }
-        }
-        if !missing_hashes.is_empty() {
-            let base_blob_reader = self.binary_cas.reader(read.clone());
-            let loaded = load_transaction_blob_bytes(
-                &base_blob_reader,
-                &self.staged_writes,
-                &missing_hashes,
-            )
-            .await?
-            .into_vec();
-            for (hash, bytes) in missing_hashes.into_iter().zip(loaded) {
-                let bytes = bytes.ok_or_else(|| {
-                    LixError::new(
+            if let Some((installed_hash, bytes)) =
+                current_install_plugin_wasm.get(&(key.branch_id.clone(), entry.key().to_owned()))
+            {
+                if *installed_hash != hash || BlobId::from_canonical_content(bytes) != hash {
+                    return Err(LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
-                            "plugin registry references missing WASM blob '{}'",
-                            hash.to_hex()
+                            "staged plugin '{}' WASM owner identity does not match its registry entry",
+                            entry.key()
                         ),
-                    )
-                })?;
-                wasm_by_hash.insert(hash, bytes);
+                    ));
+                }
+                wasm_by_hash.insert(hash, bytes.clone());
+                continue;
             }
+            let wasm_key = plugin_wasm_state_key(&key.branch_id, entry.key());
+            let bytes = load_transaction_authenticated_plugin_bytes(
+                &read,
+                &key.branch_id,
+                &self.staged_writes,
+                &self.pending_plugin_wasm_by_owner,
+                &[(wasm_key, hash)],
+            )
+            .await?
+            .into_vec()
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "plugin registry references missing WASM blob '{}'",
+                        hash.to_hex()
+                    ),
+                )
+            })?;
+            wasm_by_hash.insert(hash, bytes);
         }
         for (key, entry) in cold_entries {
             let hash = BlobId::from_hex(entry.wasm_blob_hash())?;
@@ -4473,6 +4281,7 @@ where
             .filter_map(|(index, write)| {
                 let path = write.path.as_deref()?;
                 if write.global
+                    || write.untracked
                     || is_plugin_storage_path(path)
                     || !active_branch_ids.contains(&write.branch_id)
                 {
@@ -4511,7 +4320,7 @@ where
                 let desired_owner =
                     PluginFileOwner::from_registry_entry(write.file_id.clone(), &selected)?;
                 let owner_change_id = self.functions.call_uuid_v7().to_string();
-                let mut owner_row = desired_owner.write_row(&write.branch_id, write.untracked)?;
+                let mut owner_row = desired_owner.write_row(&write.branch_id)?;
                 owner_row.change_id = Some(owner_change_id.clone());
                 let actor_key = PluginActorKey {
                     branch_id: write.branch_id.clone(),
@@ -4641,7 +4450,6 @@ where
                     } = prepared;
                     let source_bytes = submitted_bytes.clone();
                     let creates = create_context.creates();
-                    let file_untracked = file_key.untracked;
                     let task = tokio::spawn(async move {
                         let mut actor = factory
                             .instantiate_actor()
@@ -4657,7 +4465,7 @@ where
                                     descriptor,
                                     file: Arc::new(ArcByteSource::new(source_bytes)),
                                     creates,
-                                    certified_packets_available: !file_untracked,
+                                    certified_packets_available: true,
                                 },
                             )
                             .instrument(tracing::debug_span!(
@@ -4677,11 +4485,7 @@ where
                             "lix.perf.plugin_open_file_drain"
                         ))
                         .await?;
-                        crate::plugin::runtime::certify_dense_fresh_file(
-                            &mut validated,
-                            creates,
-                            &schemas,
-                        )?;
+                        crate::plugin::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
                         Ok((actor, validated))
                     });
                     PendingFreshPluginOpen {
@@ -4741,6 +4545,15 @@ where
                     .map(|batch| batch.row_count)
                     .sum::<u64>();
                 let mut changes = validated.changes;
+                let schemas = SchemaAllowlist::from_catalog(
+                    pending.selected.schema_keys(),
+                    Arc::clone(&self.sql_schema_snapshot),
+                )?;
+                append_certified_entity_changes(
+                    &mut changes,
+                    &validated.certified_batches,
+                    &schemas,
+                )?;
                 let create_rows = self
                     .v2_create_rows(
                         &pending.selected,
@@ -4751,20 +4564,20 @@ where
                         None,
                     )
                     .await?;
-                let row_authorities = plugin_row_authorities_from_transition(
+                let entity_authorities = plugin_entity_authorities_from_transition(
                     &pending.selected,
                     &changes,
                     &validated.certified_batches,
                 )?;
                 file_content[pending.file_index]
-                    .set_certified_row_batches(validated.certified_batches);
+                    .set_certified_entity_batches(validated.certified_batches);
                 let mut counters = validated.counters;
                 counters.host_content_classification_bytes = content_classification_bytes
                     .get(&pending.file_key)
                     .copied()
                     .unwrap_or(0);
                 counters.full_document_reparses = 1;
-                counters.durable_semantic_changes = u64::try_from(changes.row_change_count())
+                counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
                     .unwrap_or(u64::MAX)
                     .saturating_add(certified_row_count);
                 self.plugin_host.record_transition_counters(counters);
@@ -4775,7 +4588,7 @@ where
                 let context = FilesystemRowContext {
                     branch_id: write.branch_id.clone(),
                     global: false,
-                    untracked: write.untracked,
+                    untracked: false,
                     file_id: None,
                     metadata: None,
                 };
@@ -4803,7 +4616,7 @@ where
                         document: validated.document,
                         bytes: pending.submitted_bytes,
                         semantic_root: Arc::from(pending.materialization_version),
-                        row_authorities,
+                        entity_authorities,
                         view: pending.view,
                     });
                 reconciled_file_keys.insert(pending.file_key);
@@ -4815,6 +4628,7 @@ where
                 continue;
             };
             if write.global
+                || write.untracked
                 || is_plugin_storage_path(path)
                 || !active_branch_ids.contains(&write.branch_id)
             {
@@ -4829,7 +4643,7 @@ where
             let context = FilesystemRowContext {
                 branch_id: write.branch_id.clone(),
                 global: false,
-                untracked: write.untracked,
+                untracked: false,
                 file_id: None,
                 metadata: None,
             };
@@ -4841,7 +4655,6 @@ where
                                 .branch_id
                                 .as_str()
                                 .cmp(write.branch_id.as_str())
-                                .then_with(|| group.untracked.cmp(&write.untracked))
                                 .then_with(|| group.plugin_key.as_str().cmp(owner.plugin_key()))
                         })
                         .ok()?;
@@ -4871,7 +4684,6 @@ where
                     rows.push(PluginFileOwner::delete_row(
                         write.file_id.clone(),
                         &write.branch_id,
-                        write.untracked,
                     )?);
                 }
                 reconciled_file_keys.insert(file_key);
@@ -4895,7 +4707,7 @@ where
             let owner_needs_write = plugin_owner_needs_write(owner, &desired_owner);
             let owner_change_id = if owner_needs_write {
                 let owner_change_id = self.functions.call_uuid_v7().to_string();
-                let mut owner_row = desired_owner.write_row(&write.branch_id, write.untracked)?;
+                let mut owner_row = desired_owner.write_row(&write.branch_id)?;
                 owner_row.change_id = Some(owner_change_id.clone());
                 rows.push(owner_row);
                 owner_change_id
@@ -5024,13 +4836,7 @@ where
                         if let PluginActorColdOpen::Build(mut cold_install) = cold_open
                             && observation_matches_visible_root
                         {
-                            let staged = self.staged_writes.staging_overlay()?;
-                            let read = SharedStorageAdapterRead::new(
-                                self.storage
-                                    .begin_read(StorageReadOptions::default())
-                                    .await?,
-                            );
-                            let base = self.hot_state.reader(read.clone());
+                            let read = self.opening_read();
                             let (
                                 cold_before,
                                 checkpoint_accepted_bytes,
@@ -5043,13 +4849,20 @@ where
                                 let VisibleMaterializationBytes::Blob { hash } =
                                     visible_materialization.bytes;
                                 let before_bytes: crate::Blob =
-                                        load_transaction_blob_bytes(
-                                            &self.binary_cas.reader(read.clone()),
+                                        load_transaction_authenticated_plugin_bytes(
+                                            &read,
+                                            &actor_key.branch_id,
                                             &self.staged_writes,
-                                            &[hash],
+                                            &self.pending_plugin_wasm_by_owner,
+                                            &[(
+                                                plugin_materialization_state_key(
+                                                    &actor_key.file_id,
+                                                ),
+                                                hash,
+                                            )],
                                         )
                                         .await?
-                                        .into_vec()
+                                        .into_blob_vec()
                                         .into_iter()
                                         .next()
                                         .flatten()
@@ -5062,8 +4875,7 @@ where
                                                     hash.to_hex()
                                                 ),
                                             )
-                                        })?
-                                        .into();
+                                        })?;
                                 let built_splices = tracing::debug_span!(
                                     target: "lix_perf",
                                     "lix.perf.plugin_splice_discovery"
@@ -5102,35 +4914,19 @@ where
                             let decoded_checkpoint = cold_before.as_ref().and_then(|_| {
                                 cache.checkpoint(&actor_key, &visible_materialization.semantic_root)
                             });
-                            let mut durable_checkpoint = if decoded_checkpoint.is_none() {
-                                if let Some(checkpoint_blob_hash) = checkpoint_blob_hash {
-                                    crate::transaction::plugin_checkpoint::load_current_plugin_checkpoint(
-                                        &read,
-                                        &actor_key.branch_id,
-                                        &actor_key.file_id,
-                                        &actor_key.plugin_generation,
-                                        &visible_materialization.semantic_root,
-                                        checkpoint_blob_hash,
-                                    )
-                                    .await?
-                                    .and_then(|checkpoint| {
-                                        Some(DecodedDurablePluginCheckpoint {
-                                            runtime: WasmDurableDocumentCheckpoint::decode(
-                                                &checkpoint.runtime,
-                                            )
-                                            .ok()?,
-                                            authorities: PluginRowAuthorities::decode_checkpoint(
-                                                &checkpoint.authority,
-                                            )
-                                            .ok()?,
-                                        })
-                                    })
-                                } else {
-                                    None
+                            let _ = checkpoint_blob_hash;
+                            let durable_checkpoint =
+                                visible_materialization.durable_checkpoint.clone();
+                            if let Some(checkpoint) = durable_checkpoint.as_ref() {
+                                if checkpoint.semantic_root != visible_materialization.semantic_root
+                                    || checkpoint.generation != actor_key.plugin_generation
+                                {
+                                    return Err(LixError::new(
+                                        LixError::CODE_INVALID_PLUGIN,
+                                        "durable plugin checkpoint identity does not match its authenticated file owner",
+                                    ));
                                 }
-                            } else {
-                                None
-                            };
+                            }
                             let store_permit = loop {
                                 match cache.admit_cold_store(&mut cold_install) {
                                     Ok(permit) => break permit,
@@ -5172,17 +4968,9 @@ where
                                         .await
                                     {
                                         Ok(document) => Some(document),
-                                        Err(_) => {
+                                        Err(error) => {
                                             let _ = actor.retire().await;
-                                            actor = factory
-                                                .instantiate_actor()
-                                                .instrument(tracing::debug_span!(
-                                                    target: "lix_perf",
-                                                    "lix.perf.plugin_actor_reinstantiate_after_checkpoint_miss"
-                                                ))
-                                                .await?;
-                                            durable_checkpoint = None;
-                                            None
+                                            return Err(error);
                                         }
                                     }
                                 } else {
@@ -5193,10 +4981,9 @@ where
                             };
                             let restored_checkpoint =
                                 decoded_checkpoint.is_some() || durable_document.is_some();
-                            let mut cold_base_authorities: PluginRowAuthorities =
-                                PluginRowAuthorities::empty();
+                            let mut cold_base_authorities: PluginEntityAuthorities =
+                                PluginEntityAuthorities::empty();
                             let transition_result = if let Some(checkpoint) = decoded_checkpoint {
-                                drop(base);
                                 drop(read);
                                 let document = actor.restore_document(&checkpoint).await?;
                                 actor
@@ -5226,7 +5013,6 @@ where
                                 let checkpoint = durable_checkpoint
                                     .expect("a restored durable document retains its authority");
                                 cold_base_authorities = checkpoint.authorities;
-                                drop(base);
                                 drop(read);
                                 actor
                                     .file_changed(
@@ -5252,41 +5038,29 @@ where
                                     .await
                                     .map(|transition| (transition, 0))
                             } else {
-                                let rows = overlay_scan_batch(
-                                    &base,
-                                    &staged,
-                                    &HotStateScanRequest {
-                                        filter: HotStateFilter {
-                                            schema_keys: selected.schema_keys().to_vec(),
-                                            branch_ids: vec![actor_key.branch_id.clone()],
-                                            file_ids: vec![NullableKeyFilter::Value(
-                                                actor_key.file_id.clone(),
-                                            )],
-                                            untracked: Some(file_key.untracked),
-                                            ..Default::default()
-                                        },
-                                        projection: plugin_state_hot_state_projection(),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await?;
-                                let row_ordinals = v2_host_row_ordinals_from_live_batch(
-                                    &rows,
+                                let entity_rows = self
+                                    .plugin_state_schema_rows(
+                                        &actor_key.branch_id,
+                                        selected.schema_keys(),
+                                        Some(&actor_key.file_id),
+                                    )
+                                    .await?;
+                                let entity_ordinals = v2_host_entity_ordinals_from_live_batch(
+                                    &entity_rows,
                                     &file_key,
                                     selected.schema_keys(),
                                 )?;
-                                let row_count = row_ordinals.len();
-                                cold_base_authorities = plugin_row_authorities_from_live_batch(
+                                let entity_count = entity_ordinals.len();
+                                cold_base_authorities = plugin_entity_authorities_from_live_batch(
                                     selected,
-                                    &rows,
-                                    &row_ordinals,
+                                    &entity_rows,
+                                    &entity_ordinals,
                                 );
-                                let row_source = LiveBatchRowSource::new(
-                                    rows,
-                                    row_ordinals,
+                                let entity_source = StateRowEntitySource::new(
+                                    entity_rows,
+                                    entity_ordinals,
                                     cold_limits,
                                 )?;
-                                drop(base);
                                 drop(read);
                                 actor
                                     .cold_file_changed(
@@ -5300,7 +5074,7 @@ where
                                                 submitted_bytes.clone(),
                                             )),
                                             creates,
-                                            rows: Box::new(row_source),
+                                            entities: Box::new(entity_source),
                                         },
                                     )
                                     .instrument(tracing::debug_span!(
@@ -5308,9 +5082,9 @@ where
                                         "lix.perf.plugin_cold_file_changed"
                                     ))
                                     .await
-                                    .map(|transition| (transition, row_count))
+                                    .map(|transition| (transition, entity_count))
                             };
-                            let (transition, row_count) = match transition_result {
+                            let (transition, entity_count) = match transition_result {
                                 Ok(transition) => transition,
                                 Err(error) => {
                                     let _ = actor.retire().await;
@@ -5341,14 +5115,19 @@ where
                                 .iter()
                                 .map(|batch| batch.row_count)
                                 .sum::<u64>();
-                            write.set_certified_row_batches(validated.certified_batches);
+                            write.set_certified_entity_batches(validated.certified_batches);
                             let mut changes = validated.changes;
+                            append_certified_entity_changes(
+                                &mut changes,
+                                write.certified_entity_batches(),
+                                &schemas,
+                            )?;
                             let (filtered, observed_existing_authorities) = self
                                 .suppress_format_only_noops(selected, changes, &file_key)
                                 .await?;
                             changes = filtered;
                             let observed_existing_authorities =
-                                PluginRowAuthorities::from_keys(observed_existing_authorities);
+                                PluginEntityAuthorities::from_keys(observed_existing_authorities);
                             let create_rows = self
                                 .v2_create_rows(
                                     selected,
@@ -5359,11 +5138,11 @@ where
                                     Some(&observed_existing_authorities),
                                 )
                                 .await?;
-                            let row_authorities = plugin_row_authorities_after_transition(
+                            let entity_authorities = plugin_entity_authorities_after_transition(
                                 selected,
                                 &cold_base_authorities,
                                 &changes,
-                                write.certified_row_batches(),
+                                write.certified_entity_batches(),
                             )?;
                             let mut counters = validated.counters;
                             counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
@@ -5373,12 +5152,12 @@ where
                                     .copied()
                                     .unwrap_or(0);
                             counters.full_state_semantic_rows_materialized =
-                                u64::try_from(row_count).unwrap_or(u64::MAX);
+                                u64::try_from(entity_count).unwrap_or(u64::MAX);
                             counters.private_document_cache_hits = u64::from(restored_checkpoint);
                             counters.full_document_reparses = u64::from(!restored_checkpoint);
                             counters.full_renderer_invocations = 0;
                             counters.durable_semantic_changes =
-                                u64::try_from(changes.row_change_count())
+                                u64::try_from(changes.entity_change_count())
                                     .unwrap_or(u64::MAX)
                                     .saturating_add(certified_row_count);
                             self.plugin_host.record_transition_counters(counters);
@@ -5397,7 +5176,7 @@ where
                                     document: validated.document,
                                     bytes: submitted_bytes.clone(),
                                     semantic_root: Arc::from(materialization_version.clone()),
-                                    row_authorities,
+                                    entity_authorities,
                                     view,
                                 },
                                 submitted_bytes.clone(),
@@ -5412,7 +5191,6 @@ where
                             None => {
                                 self.cold_open_semantic_actor(
                                     &actor_key,
-                                    &file_key,
                                     selected,
                                     descriptor.clone(),
                                     Arc::clone(&factory),
@@ -5437,7 +5215,6 @@ where
                         None => {
                             self.cold_open_semantic_actor(
                                 &actor_key,
-                                &file_key,
                                 selected,
                                 descriptor.clone(),
                                 Arc::clone(&factory),
@@ -5463,7 +5240,6 @@ where
                         .lease_or_reopen_observed_actor(
                             &observation,
                             &actor_key,
-                            &file_key,
                             selected,
                             descriptor.clone(),
                             Arc::clone(&factory),
@@ -5560,12 +5336,12 @@ where
                         .iter()
                         .map(|batch| batch.row_count)
                         .sum::<u64>();
-                    write.set_certified_row_batches(
+                    write.set_certified_entity_batches(
                         detected_transition.certified_batches.clone(),
                     );
                     let detection_document = detected_transition.document;
                     let mut counters = detected_transition.counters;
-                    let accepted_row_authorities = lease.accepted_row_authorities().clone();
+                    let accepted_entity_authorities = lease.accepted_entity_authorities().clone();
                     let (mut changes, _observed_existing_authorities) = match self
                         .suppress_format_only_noops(
                             selected,
@@ -5588,6 +5364,11 @@ where
                             return Err(lease.handle_guest_call_error(error));
                         }
                     };
+                    append_certified_entity_changes(
+                        &mut changes,
+                        &detected_transition.certified_batches,
+                        &schemas,
+                    )?;
                     let create_rows = match self
                         .v2_create_rows(
                             selected,
@@ -5595,7 +5376,7 @@ where
                             create_context,
                             &file_key,
                             existing_create_reservation.as_ref(),
-                            Some(&accepted_row_authorities),
+                            Some(&accepted_entity_authorities),
                         )
                         .instrument(tracing::debug_span!(
                             target: "lix_perf",
@@ -5613,9 +5394,9 @@ where
                             return Err(lease.handle_guest_call_error(error));
                         }
                     };
-                    let successor_row_authorities = plugin_row_authorities_after_transition(
+                    let successor_entity_authorities = plugin_entity_authorities_after_transition(
                         selected,
-                        &accepted_row_authorities,
+                        &accepted_entity_authorities,
                         &changes,
                         &detected_transition.certified_batches,
                     )?;
@@ -5643,7 +5424,7 @@ where
                             // Detection happened against a historical session
                             // document. Apply its sparse merge-resolved delta to
                             // the actor's current accepted document so concurrent
-                            // different-row edits compose and same-row edits
+                            // different-entity edits compose and same-entity edits
                             // obey transaction commit order.
                             if let Err(error) =
                                 lease.actor_mut().drop_document(detection_document).await
@@ -5653,7 +5434,7 @@ where
                             let current_document = lease.accepted_document();
                             let current_bytes = lease.accepted_bytes();
                             let change_source =
-                                match VecRowChangeSource::new(changes.clone(), limits) {
+                                match VecEntityChangeSource::new(changes.clone(), limits) {
                                     Ok(source) => source,
                                     Err(error) => {
                                         return Err(lease.handle_guest_call_error(error));
@@ -5666,10 +5447,10 @@ where
                                 };
                             let renderer_transition = match lease
                                 .actor_mut()
-                                .rows_changed(
+                                .entities_changed(
                                     renderer_input,
                                     limits,
-                                    WasmRowUpdate {
+                                    WasmEntityUpdate {
                                         before_descriptor,
                                         after_descriptor,
                                         before: Arc::new(ArcByteSource::new(current_bytes.clone())),
@@ -5681,7 +5462,7 @@ where
                                 Ok(transition) => transition,
                                 Err(error) => return Err(lease.handle_guest_call_error(error)),
                             };
-                            let rendered_transition = match drain_row_transition_edits(
+                            let rendered_transition = match drain_entity_transition_edits(
                                 lease.actor_mut(),
                                 renderer_transition,
                                 &current_bytes,
@@ -5714,7 +5495,7 @@ where
                         .unwrap_or(0);
                     counters.private_document_cache_hits = 1;
                     counters.durable_semantic_changes =
-                        u64::try_from(changes.row_change_count())
+                        u64::try_from(changes.entity_change_count())
                             .unwrap_or(u64::MAX)
                             .saturating_add(certified_row_count);
                     self.plugin_host.record_transition_counters(counters);
@@ -5733,7 +5514,7 @@ where
                         materialized_bytes_sha256,
                         materialization_version.clone(),
                     )?;
-                    lease.set_successor_row_authorities(successor_row_authorities)?;
+                    lease.set_successor_entity_authorities(successor_entity_authorities)?;
                     (
                         changes,
                         PendingPluginActorPublication::Existing {
@@ -5767,7 +5548,7 @@ where
                             descriptor,
                             file: Arc::new(source),
                             creates,
-                            certified_packets_available: !file_key.untracked,
+                            certified_packets_available: true,
                         },
                     )
                     .instrument(tracing::debug_span!(
@@ -5787,17 +5568,18 @@ where
                     "lix.perf.plugin_open_file_drain"
                 ))
                 .await?;
-                crate::plugin::runtime::certify_dense_fresh_file(
-                    &mut validated,
-                    creates,
-                    &schemas,
-                )?;
+                crate::plugin::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
                 let certified_row_count = validated
                     .certified_batches
                     .iter()
                     .map(|batch| batch.row_count)
                     .sum::<u64>();
                 let mut changes = validated.changes;
+                append_certified_entity_changes(
+                    &mut changes,
+                    &validated.certified_batches,
+                    &schemas,
+                )?;
                 let create_rows = self
                     .v2_create_rows(
                         selected,
@@ -5812,19 +5594,19 @@ where
                         "lix.perf.plugin_create_rows"
                     ))
                     .await?;
-                let row_authorities = plugin_row_authorities_from_transition(
+                let entity_authorities = plugin_entity_authorities_from_transition(
                     selected,
                     &changes,
                     &validated.certified_batches,
                 )?;
-                write.set_certified_row_batches(validated.certified_batches);
+                write.set_certified_entity_batches(validated.certified_batches);
                 let mut counters = validated.counters;
                 counters.host_content_classification_bytes = content_classification_bytes
                     .get(&file_key)
                     .copied()
                     .unwrap_or(0);
                 counters.full_document_reparses = 1;
-                counters.durable_semantic_changes = u64::try_from(changes.row_change_count())
+                counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
                     .unwrap_or(u64::MAX)
                     .saturating_add(certified_row_count);
                 self.plugin_host.record_transition_counters(counters);
@@ -5838,7 +5620,7 @@ where
                         document: validated.document,
                         bytes: submitted_bytes.clone(),
                         semantic_root: Arc::from(materialization_version.clone()),
-                        row_authorities,
+                        entity_authorities,
                         view,
                     },
                     submitted_bytes.clone(),
@@ -5966,9 +5748,7 @@ where
                 row.branch_id.as_str() != file_key.branch_id
                     || row.file_id.map(SharedStr::as_str) != Some(file_key.file_id.as_str())
                     || row.global
-                    // Semantic rows stay in their file's lane, not the tracked
-                    // lane: an untracked file's rows are untracked.
-                    || row.untracked != file_key.untracked
+                    || row.untracked
                     || group
                         .plugin
                         .schema_keys()
@@ -5984,12 +5764,11 @@ where
                 ));
             }
             let limits = WasmTransitionLimits::default();
-            let changes =
-                v2_host_changes_from_prepared_rows(&prepared, limits, file_key.untracked)?;
-            if changes.row_change_count() == 0 {
+            let changes = v2_host_changes_from_prepared_rows(&prepared, limits)?;
+            if changes.entity_change_count() == 0 {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
-                    "component semantic write batch must contain at least one row change",
+                    "component semantic write batch must contain at least one entity change",
                 ));
             }
             let view = PendingPluginActorView {
@@ -6026,11 +5805,11 @@ where
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
-                            "semantic row writes cannot follow a byte or identity transition for component plugin file '{}' in the same transaction",
+                            "semantic entity writes cannot follow a byte or identity transition for component plugin file '{}' in the same transaction",
                             file_key.file_id
                         ),
                     )
-                    .with_hint("commit the byte transition before editing semantic rows"));
+                    .with_hint("commit the byte transition before editing semantic entities"));
                 }
                 None => {
                     let cache = self.plugin_host.actor_cache().clone();
@@ -6059,7 +5838,6 @@ where
                             drop(cold_install);
                             self.cold_open_semantic_actor(
                                 &actor_key,
-                                &file_key,
                                 &group.plugin,
                                 descriptor.clone(),
                                 factory,
@@ -6169,7 +5947,6 @@ where
                 group.path,
                 group.filename,
                 file_key.branch_id.clone(),
-                file_key.untracked,
                 hash,
                 rendered_bytes,
                 same_length_output_splice,
@@ -6210,11 +5987,8 @@ where
                 &file_key.branch_id,
                 &file_key.file_id,
             ));
-            let owner_tombstone = PluginFileOwner::delete_row(
-                file_key.file_id,
-                &file_key.branch_id,
-                file_key.untracked,
-            )?;
+            let owner_tombstone =
+                PluginFileOwner::delete_row(file_key.file_id, &file_key.branch_id)?;
             if let Some(rows) = &mut reconciled_rows {
                 rows.push_raw(owner_tombstone);
             } else {
@@ -6231,6 +6005,13 @@ where
         Ok(reconciliation)
     }
 
+    /// Reconciles plugin lifecycle, ownership, and state for one logical write
+    /// batch against one storage snapshot.
+    ///
+    /// The first and only mandatory current-state lookup is the small durable
+    /// registry row. An empty registry returns before owner, filesystem,
+    /// matcher, state, archive, CAS, or WASM work. Non-empty registries use
+    /// batched owner/state/CAS reads and execute plugin calls in input order.
     async fn prepare_transaction_write(
         &mut self,
         write: ReconciledTransactionWrite,
@@ -6271,7 +6052,6 @@ where
                         "transaction preparation observed an unfilled semantic slot",
                     ));
                 }
-
                 let raw_count = mixed
                     .slots
                     .iter()
@@ -6294,7 +6074,6 @@ where
                         "raw transaction preparation changed the reconciled row count",
                     ));
                 }
-
                 let raw_base = mixed.prepared.len();
                 mixed.prepared.append(prepared_raw_rows);
                 let mut next_raw = 0usize;
@@ -6308,11 +6087,9 @@ where
                             source_by_destination.push(raw_base + next_raw);
                             next_raw += 1;
                         }
-                        ReconciledRowSlot::Raw(_) => {
-                            unreachable!(
-                                "all raw reconciled slots were extracted before preparation"
-                            )
-                        }
+                        ReconciledRowSlot::Raw(_) => unreachable!(
+                            "all raw reconciled slots were extracted before preparation"
+                        ),
                     }
                 }
                 if next_raw != raw_count {
@@ -6365,35 +6142,24 @@ where
             && let Some(certificate) = certified_preparation
         {
             let timestamp = self.functions.call_timestamp();
-            return rows.into_certified_prepared(
-                certificate,
-                self.origin_key.as_ref(),
-                timestamp,
-                &self.functions,
-            );
+            return rows.into_certified_prepared(certificate, self.origin_key.as_ref(), timestamp);
         }
-        let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let hot_state = self.hot_state.reader(&read);
         if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
             let catalog = self
                 .schema_resolver
-                .catalog_for_row_normalization(&hot_state, &staged, &domain)
+                .catalog_for_row_normalization(&self.state_view, &domain)
                 .await?;
             let mut scalar_facts = PreparedScalarBatch::with_capacity(rows.len());
             for index in 0..rows.len() {
-                let normalized = normalize_raw_write_row_in_place(
-                    &mut rows,
-                    index,
-                    catalog,
-                    functions.clone(),
-                    &mut default_timestamp,
-                )?;
+                let normalized =
+                    normalize_raw_write_row_in_place(
+                        &mut rows,
+                        index,
+                        catalog,
+                        functions.clone(),
+                        &mut default_timestamp,
+                    )?;
                 scalar_facts.push(plan_prepared_row_scalars(
                     rows.row(index),
                     normalized,
@@ -6457,7 +6223,7 @@ where
             let functions = self.functions.clone();
             let catalog = self
                 .schema_resolver
-                .catalog_for_row_normalization(&hot_state, &staged, &domain)
+                .catalog_for_row_normalization(&self.state_view, &domain)
                 .await?;
             for &index in &row_indices {
                 let row = rows.row(index);
@@ -6537,101 +6303,7 @@ where
         Ok(prepared_rows)
     }
 
-    /// Validates the drained write set and, on the way through, hands the
-    /// batch its indexed-column extraction.
-    ///
-    /// Takes `&mut` only for that hand-off: validation itself reads. The two
-    /// certificate early-returns below leave the extraction empty, which is
-    /// the safe value — no entries and no witnesses means every read of those
-    /// collections keeps scanning. Both are reachable only by rows that
-    /// provably declare no indexed column or provably did not change one; see
-    /// `declared_column_rows_never_bypass_extraction`.
-    async fn validate_prepared_writes_by_branch(
-        &mut self,
-        read: &(impl StorageAdapterRead + ?Sized),
-        prepared_writes: &mut PreparedWriteSet,
-    ) -> Result<(), LixError> {
-        if prepared_tracked_rows_have_row_local_certificates(&prepared_writes.state_rows) {
-            // Row-local certificates avoid rebuilding the O(rows) validation
-            // index, but they do not prove that a public INSERT identity is
-            // absent from committed state.
-            if !prepared_writes.insert_selection.is_empty() {
-                #[cfg(feature = "storage-benches")]
-                crate::storage_bench::record_transaction_validation_branch();
-                let hot_state = self.hot_state.reader(read);
-                validate_certified_tracked_insert_identities(&hot_state, prepared_writes)
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.validation.insert_identities"
-                    ))
-                    .await?;
-            }
-            return Ok(());
-        }
-        if self.trust_filesystem_planner
-            && let Some(certificate) = fresh_plugin_file_import_certificate(prepared_writes)
-        {
-            // The certificate proves that every omitted file-scoped row has
-            // completed row-local validation, has no transaction-wide schema
-            // constraint, and is owned by this exact pending planner-created
-            // descriptor. Keep public INSERT absence validation against this
-            // coherent commit snapshot before skipping the O(rows) index.
-            #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_transaction_validation_branch();
-            let hot_state = self.hot_state.reader(read);
-            validate_certified_fresh_plugin_file_import(&hot_state, certificate).await?;
-            return Ok(());
-        }
-        let staged = self.staged_writes.staging_overlay()?;
-        let staged_commit_ids = prepared_writes
-            .commit_change_refs_by_branch
-            .values()
-            .map(|refs| refs.commit_id)
-            .chain(
-                prepared_writes
-                    .intermediate_commits
-                    .iter()
-                    .map(|commit| commit.change_refs.commit_id),
-            )
-            .collect::<BTreeSet<_>>();
-        // `validation_index()` holds an immutable borrow of the write set for
-        // the whole loop, so the extraction accumulates into a local and is
-        // published once the borrow ends.
-        let mut staged_index_values = StagedIndexValues::default();
-        {
-            let validation_index = prepared_writes.validation_index();
-            for scope in validation_index.schema_scopes() {
-                #[cfg(feature = "storage-benches")]
-                crate::storage_bench::record_transaction_validation_branch();
-                let branch_prepared_writes =
-                    validation_index.validation_set_for_schema_scope(scope);
-                let hot_state = self.hot_state.reader(read);
-                let schema_catalog = self
-                    .schema_resolver
-                    .catalog_for_validation(&hot_state, &staged, scope)
-                    .await?;
-                let mut validation_input = TransactionValidationInput::new(
-                    &branch_prepared_writes,
-                    schema_catalog,
-                    &hot_state,
-                )
-                .with_staged_commit_ids(staged_commit_ids.clone());
-                if self.trust_filesystem_planner {
-                    validation_input = validation_input.with_trusted_filesystem_planner();
-                }
-                staged_index_values.absorb(validate_prepared_writes(validation_input).await?);
-            }
-        }
-        if !staged_index_values.is_empty() {
-            prepared_writes
-                .state_rows
-                .set_staged_index_values(staged_index_values);
-        }
-        Ok(())
-    }
-
     /// Convenience helper for programmatic APIs that only stage state rows.
-    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_rows(
         &mut self,
         rows: RawWriteBatch,
@@ -6643,30 +6315,11 @@ where
         .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn stage_engine_test_rows(
-        &mut self,
-        rows: RawWriteBatch,
-    ) -> Result<TransactionWriteOutcome, LixError> {
-        self.ensure_plugin_generation_read_guard().await;
-        let prepared = self.prepare_transaction_rows(rows).await?;
-        self.staged_writes
-            .stage_write(PreparedTransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows: prepared,
-            })
-    }
-
     async fn require_existing_transaction_write_branch_ids(
         &mut self,
         write: &TransactionWrite,
     ) -> Result<(), LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let reader = self.branch_ctx.ref_reader(read);
+        let reader = self.branch_ref_reader_on_opening_read();
         for branch_id in transaction_write_branch_ids(write) {
             if branch_id == GLOBAL_BRANCH_ID {
                 continue;
@@ -6685,31 +6338,6 @@ where
     /// Returns the active branch resolved inside this write transaction.
     pub(crate) fn active_branch_id(&self) -> &str {
         &self.active_branch_id
-    }
-
-    /// Defers explicit historical-source branchability to the commit boundary.
-    ///
-    /// Ordinary reachable commits need no bridge. A compacted source is
-    /// accepted only through one pending authenticated GC transition observed
-    /// by the same read whose queue row fences branch publication.
-    pub(crate) fn stage_branch_checkpoint_replacement_resolution(
-        &mut self,
-        branch_id: String,
-        source_commit_id: CommitId,
-    ) -> Result<(), LixError> {
-        if self
-            .pending_branch_checkpoint_replacements
-            .insert(branch_id.clone(), source_commit_id)
-            .is_some()
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "branch '{branch_id}' staged more than one checkpoint replacement resolution"
-                ),
-            ));
-        }
-        Ok(())
     }
 
     /// Stages the protocol replay receipt into this transaction's final
@@ -6798,65 +6426,16 @@ where
                 "prepared mutation order barrier was not flushed before statement checkpoint",
             ));
         }
-        if matches!(
-            self.prepared_mutation_membership,
-            PreparedMutationMembership::Unprepared
-        ) {
-            let read = self.opening_read();
-            let base = self
-                .hot_state
-                .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
-            self.prepared_mutation_membership = match base
-                .prepare_packed_identity_membership(&self.active_branch_id, &program.schema_key)
-                .await?
-            {
-                Some(membership) => PreparedMutationMembership::Packed(membership),
-                None => PreparedMutationMembership::Unavailable,
-            };
-        }
-        if !self.prepared_mutation_overlay_empty {
-            let row_pk = RowPk::single(primary_key.to_owned());
-            if self.staged_writes.staged_identity_may_affect(
-                &self.active_branch_id,
-                &program.schema_key,
-                None,
-                &row_pk,
-            )? {
-                // A transaction-local predecessor is part of the mutable
-                // overlay, not durable history. Keep dependent statements on
-                // the generic executor so INSERT/UPDATE/DELETE coalescing
-                // retains lifecycle and constraint semantics.
-                return Ok(None);
-            }
-            self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
-        }
-        let opening_read = self.opening_read();
-        let cached_membership = match &mut self.prepared_mutation_membership {
-            PreparedMutationMembership::Packed(membership) => {
-                membership
-                    .contains_single_string(&opening_read, primary_key)
-                    .await?
-            }
-            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
-                None
-            }
+        let Some(row) =
+            crate::sql2::prepare_path_value_replacement_row(self, &program, params).await?
+        else {
+            return Ok(Some(crate::sql2::SqlWriteResult::affected(0)));
         };
-        let fallback_row = match cached_membership {
-            Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
-            Some(true) => None,
-            None => {
-                let Some(row) =
-                    crate::sql2::prepare_path_value_replacement_row(self, &program, params).await?
-                else {
-                    return Ok(Some(crate::sql2::SqlWriteResult::affected(0)));
-                };
-                Some(row)
-            }
-        };
+        let fallback_row = Some(row);
         debug_assert!(
             fallback_row
                 .as_ref()
-                .is_none_or(|row| row.row_pk.as_single_string().ok() == Some(primary_key))
+                .is_none_or(|row| row.entity_pk.as_single_string().ok() == Some(primary_key))
         );
         let origin_key = self.origin_key.clone();
         let functions = self.functions.clone();
@@ -6909,142 +6488,6 @@ where
             .is_some_and(|(cached_sql, _)| cached_sql.as_ref() == sql)
     }
 
-    pub(crate) fn prepared_literal_mutation_shape(&self) -> Option<(&str, usize)> {
-        let (shape, program) = self.prepared_mutation_program.as_ref()?;
-        Some((shape, program.parameter_count()))
-    }
-
-    /// Appends one shape-certified literal UPDATE without constructing public
-    /// `Value` DTOs. The explicit transaction has already admitted this plan;
-    /// borrowed literal slices flow directly into identity and snapshot
-    /// columns. Non-packed or dependent state returns to the generic path.
-    pub(crate) async fn try_execute_cached_literal_prepared_mutation(
-        &mut self,
-        next_origin_key: Option<&str>,
-        params: &[impl AsRef<str>],
-    ) -> Result<Option<crate::sql2::SqlWriteResult>, LixError> {
-        if let Some(error) = &self.mutation_journal_terminal_error {
-            return Err(error.clone());
-        }
-        let (primary_key, replacement_value) = {
-            let Some((_, program)) = self.prepared_mutation_program.as_ref() else {
-                return Ok(None);
-            };
-            (
-                program.primary_key_text(params)?,
-                program.replacement_value_text(params)?,
-            )
-        };
-
-        let same_origin = self
-            .mutation_journal
-            .as_ref()
-            .is_none_or(|journal| journal.origin_key.as_deref() == next_origin_key);
-        let ordered_append = same_origin
-            && self
-                .mutation_journal
-                .as_ref()
-                .and_then(TransactionMutationJournal::last_identity)
-                .is_none_or(|last| last < primary_key);
-        let chunk_has_capacity = self
-            .mutation_journal
-            .as_ref()
-            .is_none_or(|journal| journal.len() < 4_096);
-        if !same_origin || !ordered_append || !chunk_has_capacity {
-            self.flush_mutation_journal().await?;
-        }
-        if !same_origin || !ordered_append {
-            self.lower_provisional_mutations_to_prepared().await?;
-            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-            self.prepared_mutation_overlay_empty = false;
-        }
-
-        if !matches!(
-            self.prepared_mutation_membership,
-            PreparedMutationMembership::Packed(_)
-        ) {
-            return Ok(None);
-        }
-        if !self.prepared_mutation_overlay_empty {
-            let row_pk = RowPk::single(primary_key.to_owned());
-            let schema_key = &self
-                .prepared_mutation_program
-                .as_ref()
-                .expect("packed literal mutation retains its prepared program")
-                .1
-                .schema_key;
-            if self.staged_writes.staged_identity_may_affect(
-                &self.active_branch_id,
-                schema_key,
-                None,
-                &row_pk,
-            )? {
-                return Ok(None);
-            }
-            self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
-        }
-        let opening_read = self.opening_read();
-        let PreparedMutationMembership::Packed(membership) = &mut self.prepared_mutation_membership
-        else {
-            unreachable!("packed literal mutation membership was checked above")
-        };
-        match membership
-            .contains_single_string(&opening_read, primary_key)
-            .await?
-        {
-            Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
-            Some(true) => {}
-            None => return Ok(None),
-        }
-
-        let origin_key = next_origin_key.map(SharedStr::from);
-        let journal_program = self.mutation_journal.is_none().then(|| {
-            Arc::clone(
-                &self
-                    .prepared_mutation_program
-                    .as_ref()
-                    .expect("packed literal mutation retains its prepared program")
-                    .1,
-            )
-        });
-        let timestamp = match self.prepared_mutation_timestamp {
-            Some(timestamp) => timestamp,
-            None => {
-                let timestamp = self.functions.call_timestamp();
-                self.prepared_mutation_timestamp = Some(timestamp);
-                timestamp
-            }
-        };
-        let journal = self
-            .mutation_journal
-            .get_or_insert_with(|| TransactionMutationJournal {
-                program: journal_program
-                    .expect("new mutation journal retains its prepared program"),
-                origin_key: origin_key.clone(),
-                identity_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
-                identity_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
-                snapshot_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
-                snapshot_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
-                timestamp: None,
-            });
-        debug_assert_eq!(journal.origin_key, origin_key);
-        let snapshot_offset = crate::sql2::append_path_value_replacement_snapshot_text(
-            primary_key,
-            Some(replacement_value),
-            &mut journal.snapshot_arena,
-        )?;
-        journal.append_identity(primary_key);
-        journal.snapshot_offsets.push(snapshot_offset);
-        #[cfg(feature = "storage-benches")]
-        journal.record_row_ownership(
-            primary_key.len(),
-            snapshot_offset.1.saturating_sub(snapshot_offset.0),
-        );
-        let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
-        debug_assert_eq!(*journal_timestamp, timestamp);
-        Ok(Some(crate::sql2::SqlWriteResult::affected(1)))
-    }
-
     pub(crate) fn remember_prepared_mutation(
         &mut self,
         sql: &str,
@@ -7056,16 +6499,12 @@ where
             .has_staged_schema_catalog_change(&domain)?
         {
             self.prepared_mutation_program = None;
-            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-            self.prepared_mutation_overlay_empty = false;
             self.prepared_mutation_timestamp = None;
             return Ok(());
         }
         self.prepared_mutation_program =
             crate::sql2::prepare_path_value_replacement_program(self, plan)
                 .map(|program| (Arc::<str>::from(sql), Arc::new(program)));
-        self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-        self.prepared_mutation_overlay_empty = false;
         self.prepared_mutation_timestamp = None;
         Ok(())
     }
@@ -7074,12 +6513,11 @@ where
         if let Some(error) = &self.mutation_journal_terminal_error {
             return Err(error.clone());
         }
-        let generation_seed = self.prepared_mutation_collection_generation_seed();
+        let generation_seed = None;
+        let forktree = self.forktree_read_facade();
         let mut complete_generation = resolve_prepared_mutation_collection_generation(
             generation_seed,
-            self.opening_read(),
-            Arc::clone(&self.hot_state),
-            Arc::clone(&self.branch_head_control_cache),
+            &forktree,
             self.active_branch_id.clone(),
         )
         .await?
@@ -7126,8 +6564,6 @@ where
             self.lower_provisional_mutations_to_prepared().await?;
         }
         self.prepared_mutation_program = None;
-        self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-        self.prepared_mutation_overlay_empty = false;
         self.prepared_mutation_timestamp = None;
         Ok(())
     }
@@ -7138,13 +6574,12 @@ where
     /// `PreparedStateBatch`.
     pub(crate) async fn flush_prepared_mutations_for_read(&mut self) -> Result<(), LixError> {
         self.flush_mutation_journal().await?;
-        let generation_seed = self.prepared_mutation_collection_generation_seed();
+        let generation_seed = None;
+        let forktree = self.forktree_read_facade();
         let Some((schema_key, (live_count, ordered_identity_digest))) =
             resolve_prepared_mutation_collection_generation(
                 generation_seed,
-                self.opening_read(),
-                Arc::clone(&self.hot_state),
-                Arc::clone(&self.branch_head_control_cache),
+                &forktree,
                 self.active_branch_id.clone(),
             )
             .await?
@@ -7170,23 +6605,6 @@ where
         Ok(())
     }
 
-    fn prepared_mutation_collection_generation_seed(
-        &self,
-    ) -> Option<(String, Option<(u64, [u8; 32])>)> {
-        let Some((_, program)) = &self.prepared_mutation_program else {
-            return None;
-        };
-        let generation = match &self.prepared_mutation_membership {
-            PreparedMutationMembership::Packed(membership) => {
-                Some(membership.complete_generation())
-            }
-            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
-                None
-            }
-        };
-        Some((program.schema_key.clone(), generation))
-    }
-
     pub(crate) async fn flush_prepared_mutation_barrier(
         &mut self,
         next_sql: &str,
@@ -7205,11 +6623,11 @@ where
             self.prepared_mutation_program
                 .as_ref()
                 .and_then(|(_, program)| program.primary_key(params).ok())
-                .is_none_or(|row_pk| {
+                .is_none_or(|entity_pk| {
                     self.mutation_journal
                         .as_ref()
                         .and_then(TransactionMutationJournal::last_identity)
-                        .is_none_or(|last| last < row_pk)
+                        .is_none_or(|last| last < entity_pk)
                 })
         } else {
             false
@@ -7223,13 +6641,9 @@ where
         }
         if !same_program || !same_origin || !ordered_append {
             self.lower_provisional_mutations_to_prepared().await?;
-            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-            self.prepared_mutation_overlay_empty = false;
         }
         if !same_program {
             self.prepared_mutation_program = None;
-            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
-            self.prepared_mutation_overlay_empty = false;
             self.prepared_mutation_timestamp = None;
         }
         Ok(())
@@ -7257,7 +6671,7 @@ where
         result
     }
 
-    async fn flush_mutation_journal_inner(&mut self, finalize_tail: bool) -> Result<(), LixError> {
+    async fn flush_mutation_journal_inner(&mut self, _finalize_tail: bool) -> Result<(), LixError> {
         let Some(journal) = self.mutation_journal.take() else {
             return Ok(());
         };
@@ -7305,7 +6719,7 @@ where
                 "non-empty transaction mutation journal has no lifecycle timestamp",
             )
         })?;
-        let mut chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
             journal.program.schema_plan_id,
             journal.program.schema_key.as_str().into(),
             self.active_branch_id.clone().into(),
@@ -7337,35 +6751,6 @@ where
                 0,
             );
         }
-        let eager_collection_is_bounded = match &self.prepared_mutation_membership {
-            PreparedMutationMembership::Packed(membership) => {
-                usize::try_from(membership.complete_generation().0)
-                    .is_ok_and(|rows| rows <= MUTATION_JOURNAL_EAGER_SEAL_MAX_ROWS)
-            }
-            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
-                false
-            }
-        };
-        if !eager_collection_is_bounded {
-            self.mutation_journal_seal_prefix_open = false;
-        }
-        if self.mutation_journal_seal_prefix_open {
-            let eager_row_count = self
-                .mutation_journal_sealed_rows
-                .checked_add(chunk.len())
-                .filter(|&rows| rows <= MUTATION_JOURNAL_EAGER_SEAL_MAX_ROWS);
-            if let Some(eager_row_count) = eager_row_count {
-                chunk
-                    .seal_replacement_parts(finalize_tail, &mut self.mutation_journal_compressor)?;
-                if chunk.sealed_replacement_parts().is_some() {
-                    self.mutation_journal_sealed_rows = eager_row_count;
-                } else {
-                    self.mutation_journal_seal_prefix_open = false;
-                }
-            } else {
-                self.mutation_journal_seal_prefix_open = false;
-            }
-        }
         match self.staged_writes.stage_immutable_mutation_chunk(chunk)? {
             ImmutableMutationChunkStage::Staged => {}
             ImmutableMutationChunkStage::RequiresGeneric(chunk) => {
@@ -7378,6 +6763,7 @@ where
                     })?;
             }
         }
+        self.refresh_state_view_from_staging(true)?;
         Ok(())
     }
 
@@ -7399,56 +6785,33 @@ where
         let schema_key = descriptor.schema_key().to_owned();
         let branch_id = descriptor.branch_id().to_owned();
         let row_count = descriptor
-            .row_pk_chunks()
+            .entity_pk_chunks()
             .iter()
             .map(|chunk| chunk.len())
             .sum();
         let mut predecessors = Vec::with_capacity(row_count);
-        for row_pks in descriptor.row_pk_chunks() {
-            let request = HotStateExactBatchRequest {
-                rows: row_pks
-                    .iter()
-                    .cloned()
-                    .map(|row_pk| HotStateExactRowRequest {
-                        schema_key: schema_key.clone(),
-                        branch_id: branch_id.clone(),
-                        row_pk,
-                        file_id: None,
-                    })
-                    .collect(),
-                projection: HotStateProjection::default(),
-                untracked: Some(false),
-                include_tombstones: false,
-            };
-            let current = load_opening_exact_hot_state_batch(
-                self.opening_read(),
-                Arc::clone(&self.hot_state),
-                Arc::clone(&self.branch_head_control_cache),
-                &request,
-            )
-            .await?;
-            for (slot, expected_row_pk) in row_pks.iter().enumerate() {
-                let row = current.row(slot).ok_or_else(|| {
+        let forktree = self.forktree_read_facade();
+        for entity_pks in descriptor.entity_pk_chunks() {
+            let current =
+                load_opening_state_points(&forktree, &schema_key, &branch_id, entity_pks).await?;
+            for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
+                let row = current.get(slot).and_then(Option::as_ref).ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         "partial immutable mutation lost its current-state predecessor",
                     )
                 })?;
-                if row.schema_key() != schema_key
-                    || row.branch_id() != branch_id
-                    || row.row_pk() != expected_row_pk
+                let decoded_key = crate::forktree::decode_state_key(&row.key)?;
+                if decoded_key.schema_key != schema_key
+                    || decoded_key.entity_pk != *expected_entity_pk
+                    || matches!(row.value.cell, StateCell::Tombstone)
                 {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         "partial immutable mutation predecessor order changed",
                     ));
                 }
-                predecessors.push(row.durable_predecessor().cloned().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "partial immutable mutation predecessor lacks durable evidence",
-                    )
-                })?);
+                predecessors.push(CertifiedStatePredecessor::new(row.value.created_at));
             }
         }
         self.staged_writes
@@ -7460,52 +6823,34 @@ where
         &mut self,
         mut chunk: ImmutableMutationJournalChunk,
     ) -> Result<ImmutableMutationJournalChunk, LixError> {
-        let row_pks = chunk.materialized_row_pks();
-        let request = HotStateExactBatchRequest {
-            rows: row_pks
-                .iter()
-                .cloned()
-                .map(|row_pk| HotStateExactRowRequest {
-                    schema_key: chunk.schema_key().to_owned(),
-                    branch_id: chunk.branch_id().to_owned(),
-                    row_pk,
-                    file_id: None,
-                })
-                .collect(),
-            projection: HotStateProjection::default(),
-            untracked: Some(false),
-            include_tombstones: false,
-        };
-        let current = load_opening_exact_hot_state_batch(
-            self.opening_read(),
-            Arc::clone(&self.hot_state),
-            Arc::clone(&self.branch_head_control_cache),
-            &request,
+        let entity_pks = chunk.materialized_entity_pks();
+        let forktree = self.forktree_read_facade();
+        let current = load_opening_state_points(
+            &forktree,
+            chunk.schema_key(),
+            chunk.branch_id(),
+            &entity_pks,
         )
         .await?;
-        let mut predecessors = Vec::with_capacity(row_pks.len());
-        for (slot, expected_row_pk) in row_pks.iter().enumerate() {
-            let row = current.row(slot).ok_or_else(|| {
+        let mut predecessors = Vec::with_capacity(entity_pks.len());
+        for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
+            let row = current.get(slot).and_then(Option::as_ref).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "mixed immutable mutation lost its current-state predecessor",
                 )
             })?;
-            if row.schema_key() != chunk.schema_key()
-                || row.branch_id() != chunk.branch_id()
-                || row.row_pk() != expected_row_pk
+            let decoded_key = crate::forktree::decode_state_key(&row.key)?;
+            if decoded_key.schema_key != chunk.schema_key()
+                || decoded_key.entity_pk != *expected_entity_pk
+                || matches!(row.value.cell, StateCell::Tombstone)
             {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "mixed immutable mutation predecessor order changed",
                 ));
             }
-            predecessors.push(row.durable_predecessor().cloned().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "mixed immutable mutation predecessor lacks durable evidence",
-                )
-            })?);
+            predecessors.push(CertifiedStatePredecessor::new(row.value.created_at));
         }
         chunk.attach_durable_predecessors(predecessors)?;
         Ok(chunk)
@@ -7527,17 +6872,14 @@ where
         params: Vec<Value>,
     ) -> Result<SqlQueryResult, LixError> {
         let read_store = self.opening_read();
+        let forktree = ForkTreeReadFacade::new(read_store.clone());
         let active_branch_id = self.active_branch_id.clone();
-        let hot_state = Arc::clone(&self.hot_state);
-        let binary_cas = Arc::clone(&self.binary_cas);
-        let branch_ctx = Arc::clone(&self.branch_ctx);
+        let state_view =
+            ForkTreeStateView::from_facade(forktree.clone(), &active_branch_id).await?;
         let visible_schemas = self.sql_visible_schemas();
         let functions = self.functions.clone();
-        let staged = self.staged_writes.staging_overlay()?;
-        let staged_writes = Arc::clone(&self.staged_writes);
         let filesystem_path_index_cache = Arc::clone(&self.filesystem_path_index_cache);
         let filesystem_path_index_epoch = Arc::clone(&self.filesystem_path_index_epoch);
-        let branch_head_control_cache = Arc::clone(&self.branch_head_control_cache);
         let plugin_host = self.plugin_host.clone();
         let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
         let sql_catalog_fingerprint = self.sql_catalog_fingerprint().clone();
@@ -7546,16 +6888,12 @@ where
             active_branch_id,
             active_account_id: self.active_account_id.clone(),
             read_store,
-            hot_state,
-            binary_cas,
-            branch_ctx,
+            forktree,
+            state_view,
             visible_schemas,
             functions,
-            staged,
-            staged_writes,
             filesystem_path_index_cache,
             filesystem_path_index_epoch,
-            branch_head_control_cache,
             plugin_host,
             sql_planning_cache,
             sql_catalog_fingerprint,
@@ -7578,23 +6916,33 @@ where
             .collect()
     }
 
-    /// Advances a branch ref without staging tracked rows.
-    ///
-    /// Fast-forward merges use this path because the commit graph already
-    /// contains the source head; the target ref only needs to move to it.
+    /// Stages a moving branch-head intent for the selector publication owner.
+    /// No `lix_branch_ref` live-state row is created; the intent is consumed
+    /// after the transaction's coherent read is retained and lowered into the
+    /// same PreparedPublication and backend commit.
+    pub(crate) fn stage_branch_ref_intent(
+        &mut self,
+        branch_id: &str,
+        commit_id: Option<CommitId>,
+        create: bool,
+    ) -> Result<(), LixError> {
+        self.staged_writes
+            .stage_branch_ref_intent(BranchRefPublicationIntent {
+                branch_id: branch_id.to_owned(),
+                commit_id,
+                create,
+                change_id: ChangeId::from(self.functions.call_uuid_v7()),
+                updated_at: self.functions.call_timestamp(),
+            })
+    }
+
+    /// Advances a branch selector without staging tracked rows.
     pub(crate) async fn advance_branch_ref(
         &mut self,
         branch_id: &str,
         commit_id: CommitId,
     ) -> Result<(), LixError> {
-        let mut rows = RawWriteBatch::with_capacity(1);
-        rows.push(branch_ref_stage_row(branch_id, &commit_id));
-        self.stage_write(TransactionWrite::Rows {
-            mode: TransactionWriteMode::Replace,
-            rows,
-        })
-        .await?;
-        Ok(())
+        self.stage_branch_ref_intent(branch_id, Some(commit_id), false)
     }
 
     pub(crate) fn stage_merge_commit(
@@ -7617,13 +6965,11 @@ where
         previous_checkpoint_commit_id: CommitId,
         recovered_head_commit_id: CommitId,
         interval_has_commits: bool,
-        gc_state: CheckpointGcState,
         selected_changes: StagedCommitChangeBatch,
     ) -> Result<String, LixError> {
         let commit_id = self
             .staged_writes
             .stage_selected_commit_change_refs(branch_id.clone(), selected_changes)?;
-        let checkpoint_commit_id = CommitId::parse_lix(&commit_id, "staged checkpoint commit id")?;
         self.staged_writes
             .set_first_commit_parent(branch_id.clone(), previous_checkpoint_commit_id)?;
         self.staged_writes
@@ -7631,114 +6977,35 @@ where
                 recovery_ref: CheckpointRecoveryRef {
                     branch_id,
                     recovered_head_commit_id,
-                    checkpoint_commit_id,
                     interval_has_commits,
                 },
-                gc_state,
             })?;
         Ok(commit_id)
     }
 
-    /// Loads the branch-local recovery root and repository-global maintenance
-    /// state from one storage snapshot.
+    /// Loads the branch-local recovery root from one retained storage snapshot.
     pub(crate) async fn checkpoint_publication_state(
         &mut self,
         branch_id: &str,
-    ) -> Result<(Option<CheckpointRecoveryRef>, CheckpointGcState), LixError> {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await?;
-        let recovery_ref = load_recovery_ref(&read, branch_id).await?;
-        let gc_state = load_checkpoint_gc_state(&read).await?;
-        Ok((recovery_ref, gc_state))
-    }
-
-    /// Creates a branch-ref reader scoped to this write transaction.
-    pub(crate) async fn branch_ref_reader(&mut self) -> impl BranchRefReader + '_ {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        self.branch_ctx
-            .ref_reader(SharedStorageAdapterRead::new(read))
-    }
-
-    /// Creates a tracked-state reader scoped to this write transaction.
-    pub(crate) async fn tracked_state_reader(
-        &mut self,
-    ) -> TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        self.tracked_state
-            .reader(SharedStorageAdapterRead::new(read))
-    }
-
-    /// Attempts the current branch's checkpoint-relative direct diff from one
-    /// transaction-scoped snapshot. A missing or stale accelerator is an
-    /// ordinary `None`; callers retain the historical tracked-state oracle.
-    pub(crate) async fn working_diff_at_head(
-        &mut self,
-        branch_id: &str,
-        head_commit_id: CommitId,
-        request: &TrackedStateDiffRequest,
-    ) -> Result<Option<TrackedWorkingDiff>, LixError> {
+    ) -> Result<Option<CheckpointRecoveryRef>, LixError> {
         let read = self.opening_read();
-        let Some(control) = BranchHeadControlContext::new()
-            .reader(read.clone())
-            .load(branch_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        if control.head_commit_id != head_commit_id {
-            return Ok(None);
-        }
-        TrackedHeadContext::new()
-            .reader(read)
-            .working_diff_for_control(branch_id, control, request)
-            .await
+        load_checkpoint_publication_state(&read, branch_id).await
     }
 
-    /// Returns the private compaction cursor bound to this transaction's
-    /// retained opening read and the caller-observed branch head.
-    pub(crate) async fn checkpoint_commit_id_at_head(
-        &mut self,
-        branch_id: &str,
-        head_commit_id: CommitId,
-    ) -> Result<CommitId, LixError> {
-        checkpoint_commit_id_at_head(self.opening_read(), branch_id, head_commit_id).await
+    /// Creates a branch-ref reader over this transaction's retained opening
+    /// read. Merge planning must not acquire a second snapshot just to resolve
+    /// branch selectors.
+    pub(crate) fn branch_ref_reader_on_opening_read(&self) -> impl BranchRefReader + '_ {
+        BranchRefStoreReader::new(&self.opening_read)
     }
 
-    pub(crate) async fn is_current_checkpoint_commit(
-        &mut self,
-        branch_id: &str,
-        commit_id: CommitId,
-    ) -> Result<bool, LixError> {
-        let control = BranchHeadControlContext::new()
-            .reader(self.opening_read())
-            .load(branch_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::branch_not_found(branch_id, "resolve undo checkpoint boundary", "branch")
-            })?;
-        Ok(control.working_diff_checkpoint_commit_id == Some(commit_id))
-    }
-
-    /// Creates a commit-graph reader scoped to this write transaction.
-    pub(crate) async fn commit_graph_reader(
-        &mut self,
-    ) -> CommitGraphStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
+    /// Creates a commit-graph reader over the same immutable read that opened
+    /// this transaction. The graph reader owns its positive topology cache and
+    /// cannot refresh the transaction's view.
+    pub(crate) fn commit_graph_reader_on_opening_read(
+        &self,
+    ) -> CommitGraphStoreReader<&SharedStorageAdapterRead<StorageImpl::Read<'static>>> {
+        CommitGraphStoreReader::new(&self.opening_read)
     }
 
     /// Applies a tracked-state transition resolved from two immutable commits.
@@ -7748,12 +7015,33 @@ where
     /// strings. The transaction's coherent opening head certifies the current
     /// side, so undo/redo does not need to reload visible live state after it
     /// has already read that exact historical root.
-    pub(crate) async fn execute_tracked_state_transition(
+    #[cfg(test)]
+    pub(crate) async fn execute_state_transition(
         &mut self,
         current_commit_id: CommitId,
         desired_commit_id: CommitId,
-        keys: Vec<TrackedStateKey>,
+        keys: Vec<StateKey>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        let facade = self.forktree_read_facade();
+        self.execute_state_transition_with_facade(
+            &facade,
+            current_commit_id,
+            desired_commit_id,
+            keys,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_state_transition_with_facade<R>(
+        &mut self,
+        facade: &ForkTreeReadFacade<R>,
+        current_commit_id: CommitId,
+        desired_commit_id: CommitId,
+        keys: Vec<StateKey>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError>
+    where
+        R: StorageAdapterRead,
+    {
         let branch_id = self.active_branch_id.clone();
         if self.opening_active_branch_head != Some(current_commit_id) {
             return Err(LixError::new(
@@ -7778,36 +7066,32 @@ where
         if unique.len() != keys.len() {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
-                "typed tracked-state transition contains more than one row for the same row",
+                "typed tracked-state transition contains more than one row for the same entity",
             ));
         }
 
-        let (current_rows, desired_rows) = {
-            let mut tracked = self.tracked_state_reader().await;
-            let current_rows = tracked
-                .load_projected_batch_at_commit(
-                    &current_commit_id.to_string(),
-                    &keys,
-                    &ChangeRecordProjection::identity_only(),
-                )
-                .await?;
-            let desired_rows = tracked
-                .load_projected_batch_at_commit(
-                    &desired_commit_id.to_string(),
-                    &keys,
-                    &ChangeRecordProjection::full(),
-                )
-                .await?;
-            (current_rows, desired_rows)
-        };
+        let state_keys = keys
+            .iter()
+            .map(|identity| StateKey {
+                schema_key: identity.schema_key.clone(),
+                file_id: identity.file_id.clone(),
+                entity_pk: identity.entity_pk.clone(),
+            })
+            .collect::<Vec<_>>();
+        let current_rows = facade
+            .load_state_rows_at_commit(&current_commit_id.to_string(), &state_keys)
+            .await?;
+        let desired_rows = facade
+            .load_state_rows_at_commit(&desired_commit_id.to_string(), &state_keys)
+            .await?;
         let mut transitions = Vec::with_capacity(keys.len());
         for (index, identity) in keys.into_iter().enumerate() {
-            let current = current_rows.row(index).filter(|row| !row.deleted());
-            let desired = desired_rows.row(index).filter(|row| !row.deleted());
+            let current = current_rows[index].as_ref().filter(|row| !row.deleted);
+            let desired = desired_rows[index].as_ref().filter(|row| !row.deleted);
             for row in [current, desired].into_iter().flatten() {
-                if row.schema_key() != identity.schema_key
-                    || row.file_id() != identity.file_id.as_deref()
-                    || row.row_pk() != &identity.row_pk
+                if row.key.schema_key != identity.schema_key
+                    || row.key.file_id != identity.file_id
+                    || row.key.entity_pk != identity.entity_pk
                 {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -7815,11 +7099,13 @@ where
                     ));
                 }
             }
-            let expected_change_id = current.map(|row| row.change_id());
+            let expected_change_id = current.map(|row| row.change_id);
             let target = desired.map(|row| TypedStateTransitionTarget {
-                change_id: row.change_id(),
-                snapshot_content: row.snapshot_content().cloned(),
-                metadata: row.metadata().cloned(),
+                change_id: row.change_id,
+                snapshot_content: row.snapshot_content.clone(),
+                metadata: row.metadata.clone(),
+                global: row.global,
+                blob_manifest_object_ids: row.blob_manifest_object_ids.clone(),
             });
             if expected_change_id != target.as_ref().map(|target| target.change_id) {
                 transitions.push(TypedStateTransition {
@@ -7845,6 +7131,7 @@ where
         let branch_id = self.active_branch_id.clone();
         let rows_affected = transitions.len() as u64;
         let mut rows = RawWriteBatch::with_capacity(transitions.len());
+        let mut historical_blob_manifest_edges = HistoricalBlobManifestEdges::new();
         for transition in transitions {
             if transition.expected_change_id
                 == transition.target.as_ref().map(|target| target.change_id)
@@ -7854,21 +7141,36 @@ where
                     "typed tracked-state transition contains an unchanged row",
                 ));
             }
-            let (snapshot, metadata) = match transition.target {
-                Some(target) => (
-                    parse_materialized_diff_json(
-                        target.snapshot_content,
-                        "typed state transition target",
-                    )?,
-                    parse_materialized_diff_json(
-                        target.metadata,
-                        "typed state transition target metadata",
-                    )?,
-                ),
-                None => (None, None),
+            let (snapshot, metadata, global) = match transition.target {
+                Some(target) => {
+                    let global = target.global;
+                    if !target.blob_manifest_object_ids.is_empty() {
+                        let owner = if target.global {
+                            GLOBAL_BRANCH_ID
+                        } else {
+                            branch_id.as_str()
+                        };
+                        historical_blob_manifest_edges.insert(
+                            (owner.to_owned(), transition.identity.clone()),
+                            target.blob_manifest_object_ids,
+                        );
+                    }
+                    (
+                        parse_materialized_diff_json(
+                            target.snapshot_content,
+                            "typed state transition target",
+                        )?,
+                        parse_materialized_diff_json(
+                            target.metadata,
+                            "typed state transition target metadata",
+                        )?,
+                        global,
+                    )
+                }
+                None => (None, None, false),
             };
             rows.push(TransactionWriteRow {
-                row_pk: Some(transition.identity.row_pk),
+                entity_pk: Some(transition.identity.entity_pk),
                 schema_key: transition.identity.schema_key.into(),
                 file_id: transition.identity.file_id.map(Into::into),
                 snapshot,
@@ -7876,7 +7178,7 @@ where
                 origin: None,
                 created_at: None,
                 updated_at: None,
-                global: false,
+                global,
                 change_id: None,
                 commit_id: None,
                 untracked: false,
@@ -7888,6 +7190,8 @@ where
             rows,
         })
         .await?;
+        self.staged_writes
+            .stage_historical_blob_manifest_edges(historical_blob_manifest_edges)?;
         Ok(crate::sql2::DiffCommandOutcome {
             rows_affected,
             commit_id: self
@@ -7905,7 +7209,7 @@ where
         let selections = diff_ids
             .iter()
             .map(|diff_id| {
-                crate::tracked_state::decode_diff_id(diff_id)
+                crate::state::decode_diff_id(diff_id)
                     .map(|sides| (diff_id.as_str(), sides))
                     .map_err(|_| stale_or_unknown_diff_id())
             })
@@ -7915,36 +7219,16 @@ where
             .flat_map(|(_, sides)| [sides.before, sides.after])
             .flatten()
             .collect::<BTreeSet<_>>();
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let packed_records =
-            futures_util::future::try_join_all(change_ids.iter().copied().map(|change_id| {
-                let read = &read;
-                async move {
-                    crate::tracked_state::load_change_record_by_id(read, change_id)
-                        .await
-                        .map(|record| (change_id, record))
-                }
-            }))
-            .await?;
-        let mut records = packed_records
-            .into_iter()
-            .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
-            .collect::<HashMap<_, _>>();
-        let missing = change_ids
-            .into_iter()
-            .filter(|change_id| !records.contains_key(change_id))
-            .collect::<Vec<_>>();
-        records.extend(load_change_records(&read, missing.into_iter()).await?);
+        let read = self.opening_read();
+        let records = load_change_records(&read, change_ids.into_iter()).await?;
+        let mut forktree_reader = ForkTreeReadFacade::new(read.clone());
         let mut payloads = materialize_known_change_payloads(
-            &read,
+            &mut forktree_reader,
             records.values().cloned(),
             ChangeRecordProjection::full(),
         )
         .await?;
+        drop(forktree_reader);
         drop(read);
         let branch_id = self.active_branch_id.clone();
         let mut identities = BTreeSet::new();
@@ -7969,13 +7253,13 @@ where
             {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    format!("diff_id '{diff_id}' joins changes for different rows"),
+                    format!("diff_id '{diff_id}' joins changes for different entities"),
                 ));
             }
             if !identities.insert(identity.clone()) {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "diff command selection contains more than one row for the same row",
+                    "diff command selection contains more than one row for the same entity",
                 ));
             }
             let (expected, target) = match command {
@@ -7985,37 +7269,38 @@ where
             };
             plans.push((diff_id, identity, expected, target));
         }
-        let request = HotStateExactBatchRequest {
-            rows: plans
-                .iter()
-                .map(
-                    |(_, (schema_key, row_pk, file_id), _, _)| HotStateExactRowRequest {
-                        schema_key: schema_key.clone(),
-                        branch_id: branch_id.clone(),
-                        row_pk: row_pk.clone(),
-                        file_id: file_id.clone(),
-                    },
+        let state_keys = plans
+            .iter()
+            .map(|(_, (schema_key, entity_pk, file_id), _, _)| {
+                encode_state_key(StateKeyRef {
+                    schema_key,
+                    file_id: file_id.as_deref(),
+                    entity_pk,
+                })
+            })
+            .collect::<Vec<_>>();
+        let current_tracked = self
+            .state_view
+            .points(&state_keys, true)
+            .await
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("diff command state lookup failed: {error}"),
                 )
-                .collect(),
-            projection: HotStateProjection::default(),
-            untracked: Some(false),
-            include_tombstones: true,
-        };
-        let current = self
-            .load_visible_exact_hot_state_batch(&request)
-            .await?
-            .into_rows();
+            })?;
         let mut target_change_ids = Vec::new();
         let mut rows = RawWriteBatch::with_capacity(plans.len());
-        for ((diff_id, (schema_key, row_pk, file_id), expected, target), current) in
-            plans.into_iter().zip(current)
+        for ((diff_id, (schema_key, entity_pk, file_id), expected, target), current_tracked) in
+            plans.into_iter().zip(current_tracked)
         {
             let current_matches = match expected {
-                Some(expected) => current
+                Some(expected) => current_tracked
                     .as_ref()
-                    .and_then(|row| row.change_id)
-                    .is_some_and(|change_id| change_id == expected),
-                None => current.as_ref().is_none_or(|row| row.deleted),
+                    .is_some_and(|row| row.value.change_id == expected),
+                None => current_tracked
+                    .as_ref()
+                    .is_none_or(|row| row.value.cell == StateCell::Tombstone),
             };
             if !current_matches {
                 return Err(stale_or_unknown_diff_id());
@@ -8025,7 +7310,7 @@ where
                 target_change_ids.push(target);
             } else {
                 rows.push(TransactionWriteRow {
-                    row_pk: Some(row_pk),
+                    entity_pk: Some(entity_pk),
                     schema_key: schema_key.into(),
                     file_id: file_id.map(Into::into),
                     snapshot: None,
@@ -8056,7 +7341,7 @@ where
                     )
                 })?;
                 rows.push(TransactionWriteRow {
-                    row_pk: Some(identity.row_pk),
+                    entity_pk: Some(identity.entity_pk),
                     schema_key: identity.schema_key.into(),
                     file_id: identity.file_id.map(Into::into),
                     snapshot: parse_materialized_diff_json(
@@ -8099,25 +7384,17 @@ where
         diff_ids: Vec<String>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let branch_id = self.active_branch_id.clone();
-        let (previous_recovery, mut gc_state) =
-            self.checkpoint_publication_state(&branch_id).await?;
-        let head_commit_id = self
-            .load_branch_head(&branch_id)
-            .await?
-            .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
-        let previous_checkpoint_commit_id = self
-            .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
+        let _previous_recovery = self.checkpoint_publication_state(&branch_id).await?;
+        let baseline = self
+            .forktree_read_facade()
+            .checkpoint_baseline_for_branch(&branch_id)
             .await?;
-        let diff = {
-            let mut tracked = self.tracked_state_reader().await;
-            tracked
-                .diff_commits(
-                    &previous_checkpoint_commit_id.to_string(),
-                    &head_commit_id.to_string(),
-                    &TrackedStateDiffRequest::default(),
-                )
-                .await?
-        };
+        let head_commit_id = baseline.head_commit_id;
+        let previous_checkpoint_commit_id = baseline.checkpoint_commit_id;
+        let diff = self
+            .forktree_read_facade()
+            .diff_branch_state_rows_between_commits(previous_checkpoint_commit_id, head_commit_id)
+            .await?;
         let requested = diff_ids.iter().cloned().collect::<BTreeSet<_>>();
         if requested.len() != diff_ids.len() {
             return Err(LixError::new(
@@ -8126,28 +7403,43 @@ where
             ));
         }
         let mut matched = BTreeSet::new();
-        let mut selected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
-        let mut unselected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
+        let mut selected = StagedCommitChangeBatchBuilder::with_capacity(diff.len());
+        let mut unselected = StagedCommitChangeBatchBuilder::with_capacity(diff.len());
         let mut selected_source_membership_exact = true;
         let mut unselected_source_membership_exact = true;
-        for entry in diff.entries.into_iter().filter(|entry| {
-            entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
-                && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+        for entry in diff.into_iter().filter(|entry| {
+            entry
+                .before
+                .as_ref()
+                .or(entry.after.as_ref())
+                .is_some_and(|row| {
+                    row.key.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
+                        && row.key.schema_key != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                })
         }) {
-            let diff_id = entry.diff_id()?;
+            let diff_id = crate::state::encode_diff_id(
+                entry.before.as_ref().map(|row| row.change_id),
+                entry.after.as_ref().map(|row| row.change_id),
+            )?;
             let target = entry.after.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("working diff '{diff_id}' has no target row"),
                 )
             })?;
+            let created_at =
+                if entry.before.as_ref().is_none_or(|before| before.deleted) && !target.deleted {
+                    target.updated_at
+                } else {
+                    target.created_at
+                };
             if requested.contains(&diff_id) {
                 matched.insert(diff_id);
                 selected_source_membership_exact &=
-                    push_checkpoint_selected_change(&mut selected, target, entry.kind);
+                    push_checkpoint_selected_change(&mut selected, target, created_at);
             } else {
                 unselected_source_membership_exact &=
-                    push_checkpoint_selected_change(&mut unselected, target, entry.kind);
+                    push_checkpoint_selected_change(&mut unselected, target, created_at);
             }
         }
         let selected = if selected_source_membership_exact {
@@ -8164,24 +7456,19 @@ where
             return Err(stale_or_unknown_diff_id());
         }
         let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
-        gc_state.checkpoint_sequence =
-            gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "checkpoint sequence overflow",
-                )
-            })?;
-        if let Some(previous_recovery) = previous_recovery {
-            gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
-        }
-
         let checkpoint_commit_id = if unselected.is_empty() {
+            let mut marker_rows = RawWriteBatch::with_capacity(1);
+            marker_rows.push(checkpoint_marker_stage_row(&branch_id));
+            self.stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: marker_rows,
+            })
+            .await?;
             self.stage_checkpoint_commit(
                 branch_id.clone(),
                 previous_checkpoint_commit_id,
                 head_commit_id,
                 interval_has_commits,
-                gc_state,
                 selected,
             )?
         } else {
@@ -8190,6 +7477,11 @@ where
                 previous_checkpoint_commit_id,
                 selected,
             )?;
+            let mut marker_rows = RawWriteBatch::with_capacity(1);
+            marker_rows.push(checkpoint_marker_stage_row(&branch_id));
+            let marker = self.prepare_transaction_rows(marker_rows).await?;
+            self.staged_writes
+                .stage_intermediate_rows(checkpoint_commit_id, marker)?;
             self.staged_writes
                 .stage_selected_commit_change_refs(branch_id.clone(), unselected)?;
             self.staged_writes
@@ -8199,24 +7491,12 @@ where
                     recovery_ref: CheckpointRecoveryRef {
                         branch_id: branch_id.clone(),
                         recovered_head_commit_id: head_commit_id,
-                        checkpoint_commit_id,
                         interval_has_commits,
                     },
-                    gc_state,
                 })?;
             checkpoint_commit_id.to_string()
         };
-        let checkpoint_commit = CommitId::parse_lix(&checkpoint_commit_id, "checkpoint commit id")?;
-        let mut checkpoint_rows = RawWriteBatch::with_capacity(1);
-        checkpoint_rows.push(checkpoint_stage_row(
-            &checkpoint_commit,
-            self.functions.call_uuid_v7().to_string(),
-        ));
-        self.stage_write(TransactionWrite::Rows {
-            mode: TransactionWriteMode::Replace,
-            rows: checkpoint_rows,
-        })
-        .await?;
+        self.refresh_state_view_from_staging(true)?;
         Ok(crate::sql2::DiffCommandOutcome {
             rows_affected: diff_ids.len() as u64,
             commit_id: Some(checkpoint_commit_id),
@@ -8262,56 +7542,35 @@ where
     }
 }
 
-async fn load_immutable_mutation_predecessors<R>(
-    reader: &R,
+async fn load_immutable_mutation_predecessors(
+    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + Clone + 'static>,
     schema_key: &str,
     branch_id: &str,
-    row_pk_chunks: &[Arc<[RowPk]>],
-) -> Result<Vec<CertifiedCurrentStatePredecessor>, LixError>
-where
-    R: HotStateReader + ?Sized,
-{
-    let row_count = row_pk_chunks.iter().map(|chunk| chunk.len()).sum();
+    entity_pk_chunks: &[Arc<[EntityPk]>],
+) -> Result<Vec<CertifiedStatePredecessor>, LixError> {
+    let row_count = entity_pk_chunks.iter().map(|chunk| chunk.len()).sum();
     let mut predecessors = Vec::with_capacity(row_count);
-    for row_pks in row_pk_chunks {
-        let request = HotStateExactBatchRequest {
-            rows: row_pks
-                .iter()
-                .cloned()
-                .map(|row_pk| HotStateExactRowRequest {
-                    schema_key: schema_key.to_owned(),
-                    branch_id: branch_id.to_owned(),
-                    row_pk,
-                    file_id: None,
-                })
-                .collect(),
-            projection: HotStateProjection::default(),
-            untracked: Some(false),
-            include_tombstones: false,
-        };
-        let current = reader.load_exact_batch(&request).await?;
-        for (slot, expected_row_pk) in row_pks.iter().enumerate() {
-            let row = current.row(slot).ok_or_else(|| {
+    for entity_pks in entity_pk_chunks {
+        let current =
+            load_opening_state_points(forktree, schema_key, branch_id, entity_pks).await?;
+        for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
+            let row = current.get(slot).and_then(Option::as_ref).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "immutable mutation lost its current-state predecessor",
                 )
             })?;
-            if row.schema_key() != schema_key
-                || row.branch_id() != branch_id
-                || row.row_pk() != expected_row_pk
+            let decoded_key = crate::forktree::decode_state_key(&row.key)?;
+            if decoded_key.schema_key != schema_key
+                || decoded_key.entity_pk != *expected_entity_pk
+                || matches!(row.value.cell, StateCell::Tombstone)
             {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "immutable mutation predecessor order changed",
                 ));
             }
-            predecessors.push(row.durable_predecessor().cloned().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "immutable mutation predecessor lacks durable evidence",
-                )
-            })?);
+            predecessors.push(CertifiedStatePredecessor::new(row.value.created_at));
         }
     }
     Ok(predecessors)
@@ -8361,44 +7620,18 @@ fn empty_state_transition(current: CommitId, desired: CommitId) -> LixError {
 }
 
 async fn opening_parent_complete_lifecycle_created_at(
-    read: &(impl StorageAdapterRead + ?Sized),
-    parent_commit_id: Option<CommitId>,
-    schema_key: &str,
-    live_count: u64,
-    ordered_identity_digest: [u8; 32],
+    _read: &(impl StorageAdapterRead + ?Sized),
+    _parent_commit_id: Option<CommitId>,
+    _schema_key: &str,
+    _live_count: u64,
+    _ordered_identity_digest: [u8; 32],
 ) -> Result<Option<LixTimestamp>, LixError> {
-    let Some(parent_commit_id) = parent_commit_id else {
-        return Ok(None);
-    };
-    let Some(metadata) =
-        crate::tracked_state::load_commit_delta_replay_metadata(read, parent_commit_id).await?
-    else {
-        return Ok(None);
-    };
-    let expected_scope = crate::tracked_state::CommitDeltaReplacementScope {
-        schema_key: schema_key.to_owned(),
-        file_id: None,
-    };
-    if metadata.member_count != u32::try_from(live_count).unwrap_or(u32::MAX)
-        || metadata.single_partition.as_ref() != Some(&expected_scope)
-    {
-        return Ok(None);
-    }
-    Ok(metadata
-        .lifecycle_summary
-        .as_ref()
-        .filter(|summary| {
-            summary.scope == expected_scope
-                && summary.ordered_identity_digest == ordered_identity_digest
-        })
-        .map(|summary| summary.uniform_created_at))
+    Ok(None)
 }
 
 async fn resolve_prepared_mutation_collection_generation(
     seed: Option<(String, Option<(u64, [u8; 32])>)>,
-    read: impl StorageAdapterRead + Send,
-    hot_state: Arc<HotStateContext>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
+    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + 'static>,
     branch_id: String,
 ) -> Result<Option<(String, (u64, [u8; 32]))>, LixError> {
     let Some((schema_key, generation)) = seed else {
@@ -8407,8 +7640,7 @@ async fn resolve_prepared_mutation_collection_generation(
     if let Some(generation) = generation {
         return Ok(Some((schema_key, generation)));
     }
-    let base = hot_state.transaction_reader(read, branch_head_control_cache);
-    let generation = base
+    let Some(generation) = forktree
         .collection_generation(
             &branch_id,
             crate::collection_generation::CollectionScopeRef {
@@ -8417,28 +7649,50 @@ async fn resolve_prepared_mutation_collection_generation(
             },
         )
         .await?
-        .and_then(|generation| {
-            generation
-                .ordered_identity_digest
-                .map(|digest| (generation.live_count, digest))
-        });
-    Ok(generation.map(|generation| (schema_key, generation)))
+    else {
+        return Ok(None);
+    };
+    if generation.live_count == crate::collection_generation::DEFERRED_LIVE_COUNT
+        || generation.live_count == 0
+    {
+        return Ok(None);
+    }
+    let ordered_identity_digest = generation.ordered_identity_digest.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "authenticated collection generation is missing its ordered identity digest",
+        )
+    })?;
+    Ok(Some((
+        schema_key,
+        (generation.live_count, ordered_identity_digest),
+    )))
 }
 
-async fn load_opening_exact_hot_state_batch(
-    read: impl StorageAdapterRead + Send,
-    hot_state: Arc<HotStateContext>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
-    request: &HotStateExactBatchRequest,
-) -> Result<MaterializedHotStateExactBatch, LixError> {
-    let base = hot_state.transaction_reader(read, branch_head_control_cache);
-    base.load_exact_batch(request).await
+async fn load_opening_state_points(
+    forktree: &ForkTreeReadFacade<impl StorageAdapterRead + Clone + 'static>,
+    schema_key: &str,
+    branch_id: &str,
+    entity_pks: &[EntityPk],
+) -> Result<Vec<Option<crate::state::StateRow>>, LixError> {
+    let view = ForkTreeStateView::from_facade((*forktree).clone(), branch_id).await?;
+    let keys = entity_pks
+        .iter()
+        .map(|entity_pk| {
+            encode_state_key(StateKeyRef {
+                schema_key,
+                file_id: None,
+                entity_pk,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(view.points(&keys, true).await?)
 }
 
-fn diff_record_identity(record: &ChangeRecord) -> (String, RowPk, Option<String>) {
+fn diff_record_identity(record: &ChangeRecord) -> (String, EntityPk, Option<String>) {
     (
         record.schema_key.clone(),
-        record.row_pk.clone(),
+        record.entity_pk.clone(),
         record.file_id.clone(),
     )
 }
@@ -8461,16 +7715,12 @@ fn parse_materialized_diff_json(
 
 fn push_checkpoint_selected_change(
     selected: &mut StagedCommitChangeBatchBuilder,
-    row: crate::tracked_state::TrackedStateDiffRow,
-    kind: TrackedStateDiffKind,
+    row: HistoricalStateRow,
+    created_at: LixTimestamp,
 ) -> bool {
-    let created_at = match kind {
-        TrackedStateDiffKind::Added => row.updated_at,
-        TrackedStateDiffKind::Modified | TrackedStateDiffKind::Removed => row.created_at,
-    };
     let source_membership_exact = created_at == row.created_at;
     selected.push(
-        row.identity,
+        row.key,
         row.commit_id,
         row.change_id,
         row.deleted,
@@ -8492,19 +7742,46 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     active_branch_id: String,
     active_account_id: String,
     read_store: SharedStorageAdapterRead<R>,
-    hot_state: Arc<HotStateContext>,
-    binary_cas: Arc<BinaryCasContext>,
-    branch_ctx: Arc<BranchContext>,
+    forktree: ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
+    state_view: ForkTreeStateView<SharedStorageAdapterRead<R>>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
-    staged: PreparedStateRowOverlay,
-    staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
-    branch_head_control_cache: Arc<BranchHeadControlCache>,
     plugin_host: PluginRuntimeHost,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     sql_catalog_fingerprint: CatalogFingerprint,
+}
+
+impl<R> TransactionSqlReadExecutionContext<R>
+where
+    R: crate::storage_adapter::StorageRead,
+{
+    pub(crate) fn state_view(&self) -> &ForkTreeStateView<SharedStorageAdapterRead<R>> {
+        &self.state_view
+    }
+}
+
+impl<R> Clone for TransactionSqlReadExecutionContext<R>
+where
+    R: crate::storage_adapter::StorageRead,
+{
+    fn clone(&self) -> Self {
+        Self {
+            active_branch_id: self.active_branch_id.clone(),
+            active_account_id: self.active_account_id.clone(),
+            read_store: self.read_store.clone(),
+            forktree: self.forktree.clone(),
+            state_view: self.state_view.clone(),
+            visible_schemas: self.visible_schemas.clone(),
+            functions: self.functions.clone(),
+            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
+            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
+            plugin_host: self.plugin_host.clone(),
+            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+            sql_catalog_fingerprint: self.sql_catalog_fingerprint.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -8514,6 +7791,10 @@ where
 {
     type ReadStore = SharedStorageAdapterRead<R>;
 
+    fn state_view(&self) -> &ForkTreeStateView<Self::ReadStore> {
+        &self.state_view
+    }
+
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
     }
@@ -8522,7 +7803,7 @@ where
         self.sql_planning_cache.datafusion_session()
     }
 
-    fn datafusion_read_session(&self) -> crate::sql2::PooledReadSession {
+    fn datafusion_read_session(&self) -> datafusion::prelude::SessionContext {
         self.sql_planning_cache.datafusion_read_session()
     }
 
@@ -8545,70 +7826,33 @@ where
         &self.active_account_id
     }
 
-    fn hot_state(&self) -> Arc<dyn HotStateReader> {
-        Arc::new(TransactionReadHotStateReader {
-            base: self.hot_state.transaction_reader(
-                self.read_store.clone(),
-                Arc::clone(&self.branch_head_control_cache),
-            ),
-            read_store: self.read_store.clone(),
-            staged: self.staged.clone(),
-            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
-            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
-        })
-    }
-
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
-        Arc::new(TransactionReadHotStateReader {
-            base: self.hot_state.transaction_reader(
-                self.read_store.clone(),
-                Arc::clone(&self.branch_head_control_cache),
-            ),
-            read_store: self.read_store.clone(),
-            staged: self.staged.clone(),
-            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
-            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
-        })
+        Arc::new(self.clone())
     }
 
     fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
     }
 
-    fn history_query_source(
-        &self,
-        default_as_of_commit_id: String,
-    ) -> SqlHistoryQuerySource<Self::ReadStore> {
-        HistoryQuerySource {
-            store: self.read_store.clone(),
-            json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
-            certified_history_reader: Some(Arc::new(CertifiedHistoryStoreReader::new(
-                self.read_store.clone(),
-            ))),
-            default_as_of_commit_id,
-        }
-    }
-
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            store: self.read_store.clone(),
-            json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
+            forktree_reader: ForkTreeReadFacade::new(self.read_store.clone()),
         }
     }
 
     fn commit_graph(&self) -> Box<dyn crate::commit_graph::CommitGraphReader> {
-        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
+        Box::new(CommitGraphStoreReader::new(self.read_store.clone()))
     }
 
     fn branch_ref(&self) -> Arc<dyn BranchRefReader> {
-        Arc::new(self.branch_ctx.ref_reader(self.read_store.clone()))
+        Arc::new(BranchRefStoreReader::new(self.read_store.clone()))
     }
 
-    fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::new(TransactionBlobDataReader {
-            base: Arc::new(self.binary_cas.reader(self.read_store.clone())),
-            staged_writes: Arc::clone(&self.staged_writes),
-        })
+    fn authenticated_blob_reader(&self) -> Result<Arc<dyn AuthenticatedBlobReader>, LixError> {
+        Ok(Arc::new(crate::forktree::blob_reader_on_read(
+            self.read_store.clone(),
+            &self.active_branch_id,
+        )?))
     }
 
     async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
@@ -8620,85 +7864,8 @@ where
     }
 }
 
-struct TransactionBlobDataReader {
-    base: Arc<dyn BlobDataReader>,
-    staged_writes: Arc<TransactionWriteBuffer>,
-}
-
 #[async_trait]
-impl BlobDataReader for TransactionBlobDataReader {
-    async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-        load_transaction_blob_bytes(self.base.as_ref(), &self.staged_writes, hashes).await
-    }
-}
-
-async fn load_transaction_blob_bytes(
-    base: &dyn BlobDataReader,
-    staged_writes: &TransactionWriteBuffer,
-    hashes: &[BlobId],
-) -> Result<BlobBytesBatch, LixError> {
-    let mut entries = staged_writes
-        .load_staged_file_bytes_many(hashes)?
-        .into_vec();
-    let mut missing_indices = Vec::new();
-    let mut missing_hashes = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.is_none() {
-            missing_indices.push(index);
-            missing_hashes.push(hashes[index]);
-        }
-    }
-    if missing_hashes.is_empty() {
-        return Ok(BlobBytesBatch::new(entries));
-    }
-
-    let base_entries = base.load_bytes_many(&missing_hashes).await?.into_vec();
-    if base_entries.len() != missing_indices.len() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "transaction blob read expected {} fallback rows, got {}",
-                missing_indices.len(),
-                base_entries.len()
-            ),
-        ));
-    }
-    for (index, entry) in missing_indices.into_iter().zip(base_entries) {
-        entries[index] = entry;
-    }
-    Ok(BlobBytesBatch::new(entries))
-}
-
-struct TransactionReadHotStateReader<R: crate::storage_adapter::StorageRead> {
-    base: crate::hot_state::HotStateContextReader<SharedStorageAdapterRead<R>>,
-    read_store: SharedStorageAdapterRead<R>,
-    staged: PreparedStateRowOverlay,
-    filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
-    filesystem_path_index_epoch: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl<R> HotStateReader for TransactionReadHotStateReader<R>
-where
-    R: crate::storage_adapter::StorageRead + 'static,
-{
-    async fn scan_batch(
-        &self,
-        request: &HotStateScanRequest,
-    ) -> Result<MaterializedHotStateBatch, LixError> {
-        overlay_scan_batch(&self.base, &self.staged, request).await
-    }
-
-    async fn load_exact_batch(
-        &self,
-        request: &HotStateExactBatchRequest,
-    ) -> Result<MaterializedHotStateExactBatch, LixError> {
-        overlay_load_exact_batch(&self.base, &self.staged, request).await
-    }
-}
-
-#[async_trait]
-impl<R> FilesystemPathIndexReader for TransactionReadHotStateReader<R>
+impl<R> FilesystemPathIndexReader for TransactionSqlReadExecutionContext<R>
 where
     R: crate::storage_adapter::StorageRead + Send + 'static,
 {
@@ -8706,60 +7873,101 @@ where
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
-        if descriptor_epoch == 0 {
-            return self.base.path_index(request).await;
-        }
-        // The revision probe is only a cache-freshness optimization. Preserve the
-        // pre-cache overlay behavior if a storage fault affects that single key.
-        let cache_revision = load_path_index_revision(&self.read_store)
-            .await
-            .ok()
-            .map(|revision| transaction_path_index_cache_revision(revision, descriptor_epoch));
-        if let Some(cache_revision) = cache_revision.as_deref()
-            && let Some(index) = self
-                .filesystem_path_index_cache
-                .get(request, Some(cache_revision))
-        {
-            return Ok(index);
-        }
-        let rows =
-            overlay_scan_batch(&self.base, &self.staged, &request.hot_state_request()).await?;
-        #[cfg(test)]
-        record_transaction_path_index_build(rows.len());
-        let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
-        Ok(match cache_revision {
-            Some(cache_revision) => {
-                self.filesystem_path_index_cache
-                    .insert(request, Some(&cache_revision), index)
-            }
-            None => index,
-        })
+        crate::filesystem::build_path_index(&self.state_view, request).await
     }
 }
 
-/// Erases the storage borrow lifetime for scoped transaction SQL execution.
-///
-/// # Safety
-///
-/// The returned read scope must not outlive the storage value that produced
-/// `read`, and it must be dropped before that value.
-unsafe fn assume_static_storage_read<StorageImpl>(
-    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
-) -> StorageAdapterReadScope<StorageImpl::Read<'static>>
+/// Loads plugin WASM and materialized component payloads through their exact
+/// authenticated BlobRef owners.  Staged bytes are still allowed before the
+/// transaction is published, but their semantic BlobId is checked against
+/// the caller-owned StateKey request and committed bytes are resolved only by
+/// the retained ForkTree read.  The old hash-only BinaryCas reader is not a
+/// valid plugin payload source.
+async fn load_transaction_authenticated_plugin_bytes<R>(
+    read: &SharedStorageAdapterRead<R>,
+    branch_id: &str,
+    staged_writes: &TransactionWriteBuffer,
+    pending_plugin_wasm_by_owner: &BTreeMap<(String, String), (BlobId, Vec<u8>)>,
+    requests: &[(StateKey, BlobId)],
+) -> Result<BlobBytesBatch, LixError>
 where
-    StorageImpl: Storage + 'static,
+    R: crate::storage_adapter::StorageRead,
 {
-    let read = std::mem::ManuallyDrop::new(read);
-    unsafe {
-        std::ptr::read(
-            std::ptr::from_ref(&*read)
-                .cast::<StorageAdapterReadScope<StorageImpl::Read<'static>>>(),
-        )
+    if requests.is_empty() {
+        return Ok(BlobBytesBatch::new(Vec::new()));
     }
+    let mut entries: Vec<Option<crate::Blob>> = vec![None; requests.len()];
+    let mut missing = Vec::new();
+    for (index, (key, expected)) in requests.iter().enumerate() {
+        let staged = key
+            .file_id
+            .as_deref()
+            .map(|file_id| {
+                staged_writes.load_staged_file_bytes_for_owner(branch_id, file_id, *expected)
+            })
+            .transpose()?
+            .flatten();
+        if let Some(bytes) = staged {
+            if BlobId::from_canonical_content(&bytes) != *expected {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "staged plugin payload does not match its authenticated BlobRef identity",
+                ));
+            }
+            entries[index] = Some(bytes.into());
+        } else if let Some(file_id) = key.file_id.as_deref()
+            && let Some((actual, bytes)) =
+                pending_plugin_wasm_by_owner.get(&(branch_id.to_owned(), file_id.to_owned()))
+        {
+            if *actual != *expected || BlobId::from_canonical_content(bytes) != *expected {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "staged plugin payload owner does not match its authenticated BlobRef identity",
+                ));
+            }
+            entries[index] = Some(bytes.clone().into());
+        } else {
+            missing.push((index, requests[index].0.clone(), *expected));
+        }
+    }
+    if !missing.is_empty() {
+        let reader = crate::forktree::blob_reader_on_read(read.clone(), branch_id)?;
+        let keys = missing
+            .iter()
+            .map(|(_, key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let fetched = reader.load_bytes_for_rows(&keys).await?.into_blob_vec();
+        if fetched.len() != missing.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "authenticated plugin payload batch length mismatch",
+            ));
+        }
+        for ((index, _, expected), bytes) in missing.into_iter().zip(fetched) {
+            let bytes = bytes.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "authenticated plugin BlobRef owner has no payload",
+                )
+            })?;
+            if BlobId::from_canonical_content(bytes.as_ref()) != expected {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "authenticated plugin BlobRef payload identity does not match the requested owner",
+                ));
+            }
+            entries[index] = Some(bytes);
+        }
+    }
+    Ok(BlobBytesBatch::from_blobs(entries))
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Runs validation-only derived projections through the caller-owned facade.
+///
+/// One request-local graph reader borrows this facade directly, so it cannot
+/// acquire a storage read or become a second current-state owner. Ordinary
+/// rows, commit rows, commit edges, and branch refs all remain bound to the
+/// same opening read and its authenticated ForkTree identity.
 struct PreparedScalarRow {
     schema_plan_id: SchemaPlanId,
     facts: PreparedRowFacts,
@@ -8839,10 +8047,10 @@ fn plan_prepared_row_scalars(
         Some(created_at) => parse_prepared_timestamp("created_at", created_at)?,
         None => updated_at,
     };
-    if row.row_pk.is_none() {
+    if row.entity_pk.is_none() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "normalized transaction write row is missing row_pk",
+            "normalized transaction write row is missing entity_pk",
         ));
     }
     let addressable_change_id = row.change_id.is_none();
@@ -8863,6 +8071,127 @@ fn plan_prepared_row_scalars(
         addressable_change_id,
         commit_id,
     })
+}
+
+fn assign_certified_tracked_change_ids(
+    prepared: &mut PreparedStateBatch,
+    functions: &FunctionProviderHandle,
+) {
+    for index in 0..prepared.len() {
+        if prepared.row(index).change_id == Some(ChangeId::default()) {
+            prepared.set_change_id(index, Some(ChangeId::from(functions.call_uuid_v7())));
+        }
+    }
+}
+
+#[cfg(test)]
+mod certified_change_id_tests {
+    use super::*;
+
+    fn prepared_rows() -> PreparedStateBatch {
+        let certificate = CertifiedRawWriteBatchPreparation {
+            schema_plan_id: SchemaPlanId::for_test(902),
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: None,
+        };
+        CertifiedParameterReplacementBatch::new(
+            vec![
+                EntityPk::single("row-a"),
+                EntityPk::single("row-b"),
+                EntityPk::single("row-c"),
+            ],
+            ["a", "b", "c"]
+                .into_iter()
+                .map(|value| {
+                    TransactionJson::from_certified_shared_normalized_row_content(
+                        format!(r#"{{"value":"{value}"}}"#).into(),
+                    )
+                })
+                .collect(),
+            "catalog_test".into(),
+            "main".into(),
+            certificate,
+        )
+        .expect("certified rows should construct")
+        .into_dense_prepared(
+            None,
+            LixTimestamp::expect_parse("timestamp", "2026-08-08T00:00:00.000Z"),
+        )
+        .expect("certified rows should prepare")
+    }
+
+    #[test]
+    fn certified_tracked_rows_get_distinct_ids_once_in_input_order() {
+        let functions = FunctionProviderHandle::system();
+        let mut prepared = prepared_rows();
+        assert!(
+            prepared
+                .iter()
+                .all(|row| row.change_id == Some(ChangeId::default()))
+        );
+
+        assign_certified_tracked_change_ids(&mut prepared, &functions);
+        let first_ids = prepared
+            .iter()
+            .map(|row| row.change_id.expect("assigned change id"))
+            .collect::<Vec<_>>();
+        assert!(
+            first_ids
+                .iter()
+                .all(|change_id| *change_id != ChangeId::default())
+        );
+        assert_eq!(
+            first_ids.iter().copied().collect::<BTreeSet<_>>().len(),
+            first_ids.len()
+        );
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|row| row.entity_pk.as_single_string().expect("single key"))
+                .collect::<Vec<_>>(),
+            vec!["row-a", "row-b", "row-c"]
+        );
+
+        // Retry/idempotency: the authoritative staging boundary assigns only
+        // placeholders, so a repeated call cannot regenerate published IDs.
+        assign_certified_tracked_change_ids(&mut prepared, &functions);
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|row| row.change_id.expect("assigned change id"))
+                .collect::<Vec<_>>(),
+            first_ids
+        );
+    }
+
+    #[test]
+    fn certified_tracked_rows_preserve_supplied_ids_at_common_boundary() {
+        let functions = FunctionProviderHandle::system();
+        let supplied = ChangeId::for_test_label("supplied");
+        let mut prepared = prepared_rows();
+        prepared.set_change_id(1, Some(supplied));
+
+        assign_certified_tracked_change_ids(&mut prepared, &functions);
+
+        assert_eq!(prepared.row(1).change_id, Some(supplied));
+        assert!(
+            prepared
+                .iter()
+                .all(|row| row.change_id.is_some_and(|id| id != ChangeId::default()))
+        );
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|row| row.change_id.expect("assigned change id"))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            prepared.len()
+        );
+    }
 }
 
 fn push_prepared_state_row_from_planned_parts(
@@ -8888,16 +8217,16 @@ fn push_prepared_state_row_from_planned_parts(
         .take_metadata(row_index)
         .map(|value| stage_json_from_value(value, "prepared row metadata"))
         .transpose()?;
-    let row_pk = rows.take_row_pk(row_index).ok_or_else(|| {
+    let entity_pk = rows.take_entity_pk(row_index).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "normalized transaction write row is missing row_pk",
+            "normalized transaction write row is missing entity_pk",
         )
     })?;
     prepared.push_parts_with_change_addressability(
         scalar.schema_plan_id,
         scalar.facts,
-        row_pk,
+        entity_pk,
         schema_key,
         file_id,
         snapshot,
@@ -8918,7 +8247,7 @@ fn push_prepared_state_row_from_planned_parts(
 }
 
 /// Returns the sole schema-catalog scope for a straightforward statement
-/// batch. The SQL path normally reaches this with one row schema and one
+/// batch. The SQL path normally reaches this with one entity schema and one
 /// durability, so it can normalize rows in input order without allocating the
 /// generic scope/reordering maps. Schema registration stays on the generic
 /// path because registrations can change the catalog for later rows.
@@ -8946,51 +8275,10 @@ fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestam
     })
 }
 
-fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
-    prepared_writes.state_rows.iter().any(|row| {
-        matches!(
-            row.schema_key.as_str(),
-            REGISTERED_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY
-        )
-    }) || prepared_writes
-        .commit_change_refs_by_branch
-        .values()
-        .flat_map(
-            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
-        )
-        .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
-}
-
-/// Whether this commit's staged filesystem rows are an incomplete description
-/// of how the visible filesystem changed, so cached path indexes must be
-/// rebuilt from hot state rather than advanced by a delta.
-///
-/// Three shapes are incomplete, and all are about *which rows exist*, not about
-/// when their identities are assigned:
-///
-/// * a **branch ref move** republishes the branch's entire visible filesystem;
-///   the difference is between two commits, not between staged rows;
-/// * a **change selected into this commit from another commit** (merge,
-///   checkpoint, cherry-pick) enters the branch's visible filesystem without
-///   appearing in `state_rows` at all;
-/// * a **global or untracked filesystem row** changes visibility in every
-///   branch at once, so a single-branch delta cannot describe it.
-///
-/// The last one is also the only shape whose staged rows can be *dropped*
-/// between here and the capture point: `retain_untracked_rows_not_superseded_by_engine`
-/// removes untracked rows that an engine row supersedes. Deciding it here, off
-/// the complete pre-materialization row set, is what keeps the capture point
-/// from silently projecting a delta that lost a row. `advance_committed`
-/// evicts on the same condition, but it can only see the rows it is handed.
-///
-/// An ordinary create, rename, delete, or content write is fully described by
-/// its staged rows and is therefore projectable. Those rows are read back out
-/// of the commit once materialization has assigned their final change ids —
-/// see [`commit::MaterializedCommit::filesystem_delta_rows`].
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
     prepared_writes.state_rows.iter().any(|row| {
         row.schema_key == BRANCH_REF_SCHEMA_KEY
-            || ((row.global || row.untracked)
+            || (row.addressable_change_id
                 && matches!(
                     row.schema_key.as_str(),
                     "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
@@ -8998,9 +8286,7 @@ fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWr
     }) || prepared_writes
         .commit_change_refs_by_branch
         .values()
-        .flat_map(
-            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
-        )
+        .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
         .any(|change_ref| {
             matches!(
                 change_ref.schema_key(),
@@ -9009,30 +8295,16 @@ fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWr
         })
 }
 
-/// Whether this commit stages any row that the cached path index projects.
-fn prepared_writes_stage_filesystem_rows(prepared_writes: &PreparedWriteSet) -> bool {
-    prepared_writes.state_rows.iter().any(|row| {
-        matches!(
-            row.schema_key.as_str(),
-            "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
-        )
-    })
-}
-
 pub(crate) struct OpenTransaction<StorageImpl: Storage + 'static = Memory> {
     pub(crate) transaction: Transaction<StorageImpl>,
     pub(crate) runtime_functions: FunctionContext,
 }
 
 pub(crate) async fn open_transaction<StorageImpl>(
-    session_branch: &SessionBranch,
+    mode: &SessionMode,
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
-    hot_state: Arc<HotStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
-    binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
-    branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     session_file_views: SessionFileViews,
@@ -9041,14 +8313,10 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let (opened, ()) = Transaction::open(
-        session_branch,
+        mode,
         active_account_id,
         storage,
-        hot_state,
-        tracked_state,
-        binary_cas,
         plugin_host,
-        branch_ctx,
         catalog_context,
         sql_planning_cache,
         session_file_views,
@@ -9059,14 +8327,10 @@ where
 }
 
 pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
-    session_branch: &SessionBranch,
+    mode: &SessionMode,
     active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
-    hot_state: Arc<HotStateContext>,
-    tracked_state: Arc<TrackedStateContext>,
-    binary_cas: Arc<BinaryCasContext>,
     plugin_host: PluginRuntimeHost,
-    branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     session_file_views: SessionFileViews,
@@ -9077,14 +8341,10 @@ where
     F: for<'runtime> AsyncFnOnce(&'runtime FunctionContext) -> Result<T, LixError>,
 {
     Transaction::open(
-        session_branch,
+        mode,
         active_account_id,
         storage,
-        hot_state,
-        tracked_state,
-        binary_cas,
         plugin_host,
-        branch_ctx,
         catalog_context,
         sql_planning_cache,
         session_file_views,
@@ -9098,10 +8358,12 @@ impl<StorageImpl> SqlWriteExecutionContext for Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    type ReadStore = SharedStorageAdapterRead<StorageImpl::Read<'static>>;
 
-    fn write_context_liveness(&self) -> crate::sql2::WriteContextLiveness {
-        self.write_context_liveness.clone()
+    fn state_view(&self) -> &TransactionStateView<Self::ReadStore> {
+        &self.state_view
     }
+
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
     }
@@ -9116,12 +8378,6 @@ where
 
     fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
-    }
-
-    fn current_timestamp(&mut self) -> LixTimestamp {
-        *self
-            .current_timestamp
-            .get_or_insert_with(|| self.functions.call_timestamp())
     }
 
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
@@ -9147,76 +8403,51 @@ where
         None
     }
 
-    async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let base = self.binary_cas.reader(read);
-        load_transaction_blob_bytes(&base, &self.staged_writes, hashes).await
+    fn authenticated_blob_reader(&self) -> Result<Arc<dyn AuthenticatedBlobReader>, LixError> {
+        Ok(Arc::new(crate::forktree::blob_reader_on_read(
+            self.opening_read(),
+            &self.active_branch_id,
+        )?))
     }
 
-    async fn scan_hot_state_batch(
-        &mut self,
-        request: &HotStateScanRequest,
-    ) -> Result<MaterializedHotStateBatch, LixError> {
-        self.scan_visible_hot_state_batch(request).await
-    }
-
-    async fn load_exact_hot_state_batch(
-        &mut self,
-        request: &HotStateExactBatchRequest,
-    ) -> Result<MaterializedHotStateExactBatch, LixError> {
-        self.load_visible_exact_hot_state_batch(request).await
+    fn load_staged_file_bytes_for_owner(
+        &self,
+        branch_id: &str,
+        file_id: &str,
+        expected: BlobId,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        self.staged_writes
+            .load_staged_file_bytes_for_owner(branch_id, file_id, expected)
     }
 
     async fn filesystem_path_index(
         &mut self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        let read = self.opening_read();
-        let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
-        if descriptor_epoch == 0 {
-            return self
-                .hot_state
-                .snapshot_reader(read)
-                .path_index(request)
-                .await;
-        }
-        // The revision probe is only a cache-freshness optimization. Preserve the
-        // pre-cache overlay behavior if a storage fault affects that single key.
-        let cache_revision = load_path_index_revision(&read)
-            .await
-            .ok()
-            .map(|revision| transaction_path_index_cache_revision(revision, descriptor_epoch));
-        if let Some(cache_revision) = cache_revision.as_deref()
-            && let Some(index) = self
-                .filesystem_path_index_cache
-                .get(request, Some(cache_revision))
+        let revision = self
+            .filesystem_path_index_epoch
+            .load(Ordering::SeqCst)
+            .to_be_bytes();
+        if let Some(index) = self
+            .filesystem_path_index_cache
+            .get(request, Some(&revision))
         {
             return Ok(index);
         }
-        let staged = self.staged_writes.staging_overlay()?;
-        let base = self.hot_state.snapshot_reader(read);
-        let rows = overlay_scan_batch(&base, &staged, &request.hot_state_request()).await?;
-        #[cfg(test)]
-        record_transaction_path_index_build(rows.len());
-        let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
-        Ok(match cache_revision {
-            Some(cache_revision) => {
-                self.filesystem_path_index_cache
-                    .insert(request, Some(&cache_revision), index)
-            }
-            None => index,
-        })
+        // Keep transaction overlay semantics while entering through the
+        // filesystem owner's public(crate) boundary. The source is still the
+        // transaction state view, so staged rows remain visible; callers do
+        // not reach into the sealed `path_index` implementation module.
+        let index = crate::filesystem::build_path_index(&self.state_view, request).await?;
+        Ok(self
+            .filesystem_path_index_cache
+            .insert(request, Some(&revision), index))
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
         let read = self.opening_read();
 
-        self.branch_ctx
-            .ref_reader(read)
+        BranchRefStoreReader::new(read)
             .load_head_commit_id(branch_id)
             .await
     }
@@ -9226,32 +8457,9 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let Some(control) = BranchHeadControlContext::new()
-            .reader(read.clone())
-            .load(branch_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let mut generation = TrackedHeadContext::new()
-            .reader(read)
-            .collection_generation(branch_id, control.tracked_generation, scope)
-            .await?;
-        let staged = self.staged_writes.staging_overlay()?;
-        if StagedHotStateRows::collection_replaced(
-            &staged,
-            branch_id,
-            scope.schema_key,
-            scope.file_id,
-        )? {
-            generation.live_count = 0;
-        }
-        Ok(Some(generation))
+        self.forktree_read_facade()
+            .collection_generation(branch_id, scope)
+            .await
     }
 
     async fn load_exact_collection_live_count(
@@ -9259,23 +8467,36 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<u64>, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
+        if let Some(generation) = self.load_collection_generation(branch_id, scope).await?
+            && generation.live_count != crate::collection_generation::DEFERRED_LIVE_COUNT
+        {
+            return Ok(Some(generation.live_count));
+        }
+        let view = ForkTreeStateView::from_facade(self.forktree_read_facade(), branch_id).await?;
+        let bounds = crate::forktree::encode_state_entity_prefix_bounds(
+            scope.schema_key,
+            &EntityPk::empty(),
         );
-        let Some(control) = BranchHeadControlContext::new()
-            .reader(read.clone())
-            .load(branch_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        TrackedHeadContext::new()
-            .reader(read)
-            .exact_collection_live_count(branch_id, control.tracked_generation, scope)
+        let rows = view
+            .range(Some(&bounds.lower), bounds.upper.as_deref(), None, false)
             .await
-            .map(Some)
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("collection state range failed: {error}"),
+                )
+            })?;
+        let count = rows
+            .into_iter()
+            .filter_map(|row| crate::forktree::decode_state_key(&row.key).ok())
+            .filter(|key| {
+                key.schema_key == scope.schema_key
+                    && scope
+                        .file_id
+                        .is_none_or(|file_id| key.file_id.as_deref() == Some(file_id))
+            })
+            .count();
+        Ok(Some(u64::try_from(count).unwrap_or(u64::MAX)))
     }
 
     fn has_staged_collection_rows(
@@ -9283,24 +8504,8 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<bool, LixError> {
-        let staged = self.staged_writes.staging_overlay()?;
-        let file_ids = scope
-            .file_id
-            .map(|file_id| vec![NullableKeyFilter::Value(file_id.to_string())])
-            .unwrap_or_default();
-        Ok(!staged
-            .staged_batch(&HotStateScanRequest {
-                filter: HotStateFilter {
-                    schema_keys: vec![scope.schema_key.to_string()],
-                    branch_ids: vec![branch_id.to_string()],
-                    file_ids,
-                    include_tombstones: true,
-                    ..Default::default()
-                },
-                limit: Some(1),
-                ..Default::default()
-            })?
-            .is_empty())
+        self.staged_writes
+            .has_staged_collection_rows(branch_id, scope)
     }
 
     async fn stage_write(
@@ -9308,6 +8513,15 @@ where
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
         Self::stage_write(self, write).await
+    }
+
+    async fn stage_branch_ref_intent(
+        &mut self,
+        branch_id: &str,
+        commit_id: Option<CommitId>,
+        create: bool,
+    ) -> Result<(), LixError> {
+        self.stage_branch_ref_intent(branch_id, commit_id, create)
     }
 
     async fn stage_parameter_batch_insert(
@@ -9350,8 +8564,10 @@ where
 
         let branch_id = rows.schema_scope_branch_id().to_owned();
         let schema_key = rows.schema_key().to_owned();
-        let staged = self.staged_writes.staging_overlay()?;
-        if StagedHotStateRows::collection_replaced(&staged, &branch_id, &schema_key, None)? {
+        if self
+            .staged_writes
+            .collection_replaced(&branch_id, &schema_key, None)?
+        {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 format!("collection '{schema_key}' was deleted earlier in this transaction"),
@@ -9368,6 +8584,7 @@ where
                 row_count * usize::from(rows.untracked()),
             );
         }
+        let tracked_certified_rows = !rows.untracked();
         let domain = Domain::schema_catalog(branch_id, rows.untracked());
         let prepared = if self
             .staged_writes
@@ -9382,22 +8599,27 @@ where
         } else {
             rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
         };
+        let mut prepared = prepared;
+        if tracked_certified_rows {
+            assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+        }
         if prepared.len() != row_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "certified parameter INSERT preparation changed row cardinality",
             ));
         }
-        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
-            || {
+        let outcome = tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage")
+            .in_scope(|| {
                 self.staged_writes.stage_certified_parameter_batch_insert(
                     PreparedTransactionWrite::Rows {
                         mode: TransactionWriteMode::Insert,
                         rows: prepared,
                     },
                 )
-            },
-        )
+            })?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     async fn stage_parameter_batch_replace(
@@ -9433,6 +8655,7 @@ where
                 row_count * usize::from(rows.untracked()),
             );
         }
+        let tracked_certified_rows = !rows.untracked();
         let domain =
             Domain::schema_catalog(rows.schema_scope_branch_id().to_string(), rows.untracked());
         let prepared = if self
@@ -9448,21 +8671,26 @@ where
         } else {
             rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
         };
+        let mut prepared = prepared;
+        if tracked_certified_rows {
+            assign_certified_tracked_change_ids(&mut prepared, &self.functions);
+        }
         if prepared.len() != row_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "certified replacement preparation changed row cardinality",
             ));
         }
-        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
-            || {
+        let outcome = tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage")
+            .in_scope(|| {
                 self.staged_writes
                     .stage_write(PreparedTransactionWrite::Rows {
                         mode: TransactionWriteMode::Replace,
                         rows: prepared,
                     })
-            },
-        )
+            })?;
+        self.refresh_state_view_from_staging(true)?;
+        Ok(outcome)
     }
 
     async fn stage_typed_mutation_journal_replace(
@@ -9485,21 +8713,25 @@ where
                 "typed mutation journals require a stable schema and direct transaction origin",
             ));
         }
-        if opening_parent_complete_lifecycle_created_at(
-            &self.opening_read(),
-            self.opening_active_branch_head,
-            rows.schema_key.as_str(),
-            u64::try_from(row_count).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "typed mutation journal row count exceeds u64",
+        let authenticated_created_at = match rows.authenticated_uniform_created_at {
+            Some(created_at) => Some(created_at),
+            None => {
+                opening_parent_complete_lifecycle_created_at(
+                    &self.opening_read(),
+                    self.opening_active_branch_head,
+                    rows.schema_key.as_str(),
+                    u64::try_from(row_count).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "typed mutation journal row count exceeds u64",
+                        )
+                    })?,
+                    rows.expected_ordered_identity_digest,
                 )
-            })?,
-            rows.expected_ordered_identity_digest,
-        )
-        .await?
-        .is_none()
-        {
+                .await?
+            }
+        };
+        if authenticated_created_at.is_none() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "typed mutation journal lacks complete parent lifecycle authority",
@@ -9544,6 +8776,9 @@ where
                         "typed mutation journal lost its complete replacement scope",
                     ));
                 }
+                self.staged_writes.set_ordered_mutation_overlay_created_at(
+                    authenticated_created_at.expect("authenticated lifecycle is present"),
+                )?;
             }
             ImmutableMutationChunkStage::RequiresGeneric(_) => {
                 return Err(LixError::new(
@@ -9552,6 +8787,7 @@ where
                 ));
             }
         }
+        self.refresh_state_view_from_staging(true)?;
         Ok(TransactionWriteOutcome {
             count: u64::try_from(row_count).expect("typed mutation journal row count fits u64"),
         })
@@ -9602,64 +8838,144 @@ where
     }
 }
 
-fn prepared_transaction_write_filesystem_index_impact(
-    write: &PreparedTransactionWrite,
-) -> (bool, Vec<MaterializedHotStateRow>) {
-    let mut affects_index = false;
-    let mut delta_rows = Vec::new();
-    for row in prepared_transaction_write_rows(write).iter() {
-        match row.schema_key.as_str() {
-            FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
-                affects_index = true;
-                delta_rows.push(MaterializedHotStateRow::from(row));
-            }
-            BRANCH_REF_SCHEMA_KEY => affects_index = true,
-            _ => {}
-        }
-    }
-    (affects_index, delta_rows)
-}
-
-fn prepared_transaction_write_rows(write: &PreparedTransactionWrite) -> &PreparedStateBatch {
+fn prepared_transaction_write_row_count(write: &PreparedTransactionWrite) -> usize {
     match write {
         PreparedTransactionWrite::Rows { rows, .. }
-        | PreparedTransactionWrite::RowsWithFileContent { rows, .. } => rows,
+        | PreparedTransactionWrite::RowsWithFileContent { rows, .. } => rows.len(),
     }
 }
 
-fn transaction_path_index_cache_revision(
-    filesystem_revision: Option<Vec<u8>>,
-    descriptor_epoch: usize,
-) -> Vec<u8> {
-    let mut cache_revision = b"transaction-path-index-v1".to_vec();
-    cache_revision.extend_from_slice(&descriptor_epoch.to_be_bytes());
-    match filesystem_revision {
-        Some(revision) => {
-            cache_revision.push(1);
-            cache_revision.extend_from_slice(&revision.len().to_be_bytes());
-            cache_revision.extend_from_slice(&revision);
+/// The durable identity and blob reference of one plugin materialization.
+#[derive(Debug, Clone)]
+struct VisibleMaterialization {
+    semantic_root: String,
+    bytes: VisibleMaterializationBytes,
+    durable_checkpoint: Option<DecodedDurablePluginCheckpoint>,
+}
+
+#[derive(Debug, Clone)]
+enum VisibleMaterializationBytes {
+    Blob { hash: BlobId },
+}
+
+fn decode_visible_materialization_ref(
+    row: &StateRow,
+    file_id: &str,
+) -> Result<VisibleMaterialization, LixError> {
+    let key = crate::forktree::decode_state_key(&row.key)?;
+    let snapshot = match &row.value.cell {
+        StateCell::Value(value) => Some(value.as_str()),
+        StateCell::Null | StateCell::Tombstone => None,
+    };
+    decode_visible_materialization_parts(
+        &key.schema_key,
+        Some(row.value.change_id),
+        snapshot,
+        file_id,
+    )
+}
+
+fn decode_visible_materialization_parts(
+    schema_key: &str,
+    change_id: Option<ChangeId>,
+    snapshot_content: Option<&str>,
+    file_id: &str,
+) -> Result<VisibleMaterialization, LixError> {
+    let semantic_root = change_id.map(|root| root.to_string()).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("component materialization root for file '{file_id}' is missing change_id"),
+        )
+    })?;
+    let snapshot = snapshot_content.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "owned component plugin file '{file_id}' materialization is missing its durable proof"
+            ),
+        )
+    })?;
+    let bytes = match schema_key {
+        BLOB_REF_SCHEMA_KEY => {
+            let snapshot: PluginUpgradeBlobRefSnapshot =
+                serde_json::from_str(snapshot).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "owned component plugin file '{file_id}' has an invalid blob reference: {error}"
+                        ),
+                    )
+                })?;
+            if snapshot.id != file_id {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "owned component plugin file '{file_id}' materialization identity does not match its file scope"
+                    ),
+                ));
+            }
+            VisibleMaterializationBytes::Blob {
+                hash: BlobId::from_hex(&snapshot.blob_hash)?,
+            }
         }
-        None => cache_revision.push(0),
-    }
-    cache_revision
-}
-
-fn advance_transaction_path_index_cache_revision(
-    revision: &[u8],
-    previous_epoch: usize,
-    next_epoch: usize,
-) -> Option<Vec<u8>> {
-    const PREFIX: &[u8] = b"transaction-path-index-v1";
-    let epoch_end = PREFIX.len().checked_add(size_of::<usize>())?;
-    if revision.len() < epoch_end
-        || !revision.starts_with(PREFIX)
-        || revision[PREFIX.len()..epoch_end] != previous_epoch.to_be_bytes()
-    {
-        return None;
-    }
-    let mut next_revision = revision.to_vec();
-    next_revision[PREFIX.len()..epoch_end].copy_from_slice(&next_epoch.to_be_bytes());
-    Some(next_revision)
+        schema_key => {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "owned component plugin file '{file_id}' materialization uses unsupported schema '{schema_key}'"
+                ),
+            ));
+        }
+    };
+    let durable_checkpoint = if schema_key == BLOB_REF_SCHEMA_KEY {
+        let snapshot: PluginUpgradeBlobRefSnapshot =
+            serde_json::from_str(snapshot).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!("invalid authenticated blob reference: {error}"),
+                )
+            })?;
+        snapshot
+            .plugin_checkpoint
+            .map(|checkpoint| {
+                let runtime = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(checkpoint.runtime)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!("invalid durable plugin checkpoint runtime: {error}"),
+                        )
+                    })?;
+                let runtime = WasmDurableDocumentCheckpoint::decode(&runtime).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!("invalid durable plugin checkpoint envelope: {error}"),
+                    )
+                })?;
+                let authority = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(checkpoint.authority)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!("invalid durable plugin checkpoint authority: {error}"),
+                        )
+                    })?;
+                Ok::<DecodedDurablePluginCheckpoint, LixError>(DecodedDurablePluginCheckpoint {
+                    generation: checkpoint.generation,
+                    semantic_root: checkpoint.semantic_root,
+                    runtime: runtime.into(),
+                    authorities: PluginEntityAuthorities::decode_checkpoint(&authority)?,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(VisibleMaterialization {
+        semantic_root,
+        bytes,
+        durable_checkpoint,
+    })
 }
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -9667,6 +8983,20 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const V2_FORMAT_ONLY_METADATA_JSON: &str = r#"{"impact":"format"}"#;
+
+fn plugin_schema_key_bounds(schema_key: &str) -> (Vec<u8>, Option<Vec<u8>>) {
+    let mut lower = Vec::with_capacity(schema_key.len() + 2);
+    for byte in schema_key.bytes() {
+        if byte == 0 {
+            lower.extend_from_slice(&[0, 0xff]);
+        } else {
+            lower.push(byte);
+        }
+    }
+    lower.extend_from_slice(&[0, 0]);
+    let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
+    (lower, upper)
+}
 
 fn v2_format_only_metadata() -> TransactionJson {
     TransactionJson::from_certified_shared_normalized_metadata(SharedStr::from_static(
@@ -9708,83 +9038,10 @@ fn v2_actor_key_is_descriptor_successor(
         && observed.plugin_generation == desired.plugin_generation
 }
 
-#[cfg(test)]
-fn v2_create_context(
-    seed: [u8; 16],
-    actor_key: &PluginActorKey,
-) -> crate::plugin::runtime::WasmCreateContext {
-    BoundCreateContext::bind(local_mutation_identity(seed), actor_key)
-        .expect("local mutation seeds are generated as UUIDv7")
-        .creates()
-}
-
-fn suppress_format_only_noops_against_batch(
-    changes: WasmHostRowChanges,
-    keys: &[WasmRowKey],
-    accepted: &MaterializedHotStateExactBatch,
-) -> Result<WasmHostRowChanges, LixError> {
-    if keys.len() != accepted.len() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "format-only lookup returned the wrong cardinality",
-        ));
-    }
-    let accepted = keys
-        .iter()
-        .enumerate()
-        .map(|(slot, key)| (key, accepted.row(slot)))
-        .collect::<BTreeMap<_, _>>();
-    let mut effective = Vec::with_capacity(changes.changes.len());
-    for change in changes.changes {
-        let is_noop = match &change {
-            WasmRowChange::Upsert {
-                row,
-                effect: WasmChangeEffect::FormatOnly,
-            } => {
-                let Some(Some(base)) = accepted.get(&row.key) else {
-                    effective.push(change);
-                    continue;
-                };
-                let Some(base_snapshot) = base.snapshot_content() else {
-                    effective.push(change);
-                    continue;
-                };
-                let canonical = match &row.snapshot_content {
-                    WasmHostBytes::CanonicalJson(json) => json,
-                    WasmHostBytes::Inline(_) | WasmHostBytes::Source(_) => {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "validated component guest changes must own parsed canonical snapshots",
-                        ));
-                    }
-                };
-                let candidate = canonical.normalized();
-                if candidate == base_snapshot.as_str() {
-                    true
-                } else {
-                    // New writes retain exact canonical bytes, so equality is
-                    // normally one slice comparison. Historical rows may use
-                    // a different key order or equivalent escape spelling;
-                    // canonicalize that base exactly once only on mismatch.
-                    candidate.as_bytes()
-                        == canonicalize_snapshot(base_snapshot.as_bytes())?.as_slice()
-                }
-            }
-            WasmRowChange::Create { .. }
-            | WasmRowChange::Upsert { .. }
-            | WasmRowChange::Delete(_) => false,
-        };
-        if !is_noop {
-            effective.push(change);
-        }
-    }
-    Ok(WasmHostRowChanges { changes: effective })
-}
-
 fn append_plugin_change_rows(
     rows: &mut RawWriteBatch,
     plugin: &PluginRegistryEntry,
-    changes: WasmHostRowChanges,
+    changes: WasmHostEntityChanges,
     file_id: &str,
     context: &FilesystemRowContext,
 ) -> Result<(), LixError> {
@@ -9793,7 +9050,7 @@ fn append_plugin_change_rows(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    rows.reserve(changes.row_change_count());
+    rows.reserve(changes.entity_change_count());
     let mut interned_schema_keys = BTreeMap::<SharedStr, SharedStr>::new();
     let file_id = SharedStr::from(file_id);
     let branch_id = SharedStr::from(context.branch_id.as_str());
@@ -9803,15 +9060,15 @@ fn append_plugin_change_rows(
     let format_only_metadata = v2_format_only_metadata();
     for change in changes.changes {
         let (key, snapshot_content, effect) = match change {
-            WasmRowChange::Create { .. } => {
+            WasmEntityChange::Create { .. } => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "keyless create was not materialized before transaction staging",
                 ));
             }
-            WasmRowChange::Delete(key) => (key, None, WasmChangeEffect::Content),
-            WasmRowChange::Upsert { row, effect } => {
-                let snapshot = match row.snapshot_content {
+            WasmEntityChange::Delete(key) => (key, None, WasmChangeEffect::Content),
+            WasmEntityChange::Upsert { entity, effect } => {
+                let snapshot = match entity.snapshot_content {
                     WasmHostBytes::CanonicalJson(json) => {
                         TransactionJson::from_canonical_batch(json)
                     }
@@ -9822,10 +9079,10 @@ fn append_plugin_change_rows(
                         ));
                     }
                 };
-                (row.key, Some(snapshot), effect)
+                (entity.key, Some(snapshot), effect)
             }
         };
-        let row_pk = plugin_row_pk(plugin, &key)?;
+        let entity_pk = plugin_entity_pk(plugin, &key)?;
         let schema_key = interned_schema_keys
             .entry(key.schema_key)
             .or_insert_with_key(|key| key.as_str().into())
@@ -9841,7 +9098,7 @@ fn append_plugin_change_rows(
             ));
         }
         rows.push_parts(
-            Some(row_pk),
+            Some(entity_pk),
             schema_key,
             Some(file_id.clone()),
             snapshot_content,
@@ -9859,16 +9116,29 @@ fn append_plugin_change_rows(
     Ok(())
 }
 
-fn plugin_row_pk(
+fn append_certified_entity_changes(
+    changes: &mut WasmHostEntityChanges,
+    batches: &[WasmCertifiedEntityBatch],
+    schemas: &SchemaAllowlist,
+) -> Result<(), LixError> {
+    for batch in batches {
+        changes
+            .changes
+            .extend(crate::plugin::materialize_certified_entity_batch(batch, schemas)?.changes);
+    }
+    changes.validate()
+}
+
+fn plugin_entity_pk(
     plugin: &PluginRegistryEntry,
-    key: &WasmRowKey,
-) -> Result<RowPk, LixError> {
+    key: &WasmEntityKey,
+) -> Result<EntityPk, LixError> {
     let result = if plugin
         .create_schema_keys()
         .binary_search_by(|candidate| candidate.as_str().cmp(key.schema_key.as_str()))
         .is_ok()
     {
-        let [id] = key.row_pk.as_slice() else {
+        let [id] = key.entity_pk.as_slice() else {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
                 format!(
@@ -9877,14 +9147,14 @@ fn plugin_row_pk(
                 ),
             ));
         };
-        RowPk::uuid_from_canonical(id)
+        EntityPk::uuid_from_canonical(id)
     } else {
-        RowPk::from_shared_parts(key.row_pk.iter().cloned())
+        EntityPk::from_shared_parts(key.entity_pk.iter().cloned())
     };
     result.map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
-            format!("component plugin emitted invalid row_pk: {error}"),
+            format!("component plugin emitted invalid entity_pk: {error}"),
         )
     })
 }
@@ -9896,55 +9166,55 @@ fn plugin_schema_is_creatable(plugin: &PluginRegistryEntry, schema_key: &str) ->
         .is_ok()
 }
 
-fn plugin_row_authorities_after_changes(
+fn plugin_entity_authorities_after_changes(
     plugin: &PluginRegistryEntry,
-    base: &PluginRowAuthorities,
-    changes: &WasmHostRowChanges,
-) -> PluginRowAuthorities {
+    base: &PluginEntityAuthorities,
+    changes: &WasmHostEntityChanges,
+) -> PluginEntityAuthorities {
     let mut inserted = BTreeSet::new();
     let mut removed = BTreeSet::new();
     for change in &changes.changes {
         match change {
-            WasmRowChange::Upsert { row, .. }
-                if plugin_schema_is_creatable(plugin, &row.key.schema_key) =>
+            WasmEntityChange::Upsert { entity, .. }
+                if plugin_schema_is_creatable(plugin, &entity.key.schema_key) =>
             {
-                removed.remove(&row.key);
-                inserted.insert(row.key.clone());
+                removed.remove(&entity.key);
+                inserted.insert(entity.key.clone());
             }
-            WasmRowChange::Delete(key)
+            WasmEntityChange::Delete(key)
                 if plugin_schema_is_creatable(plugin, &key.schema_key) =>
             {
                 inserted.remove(key);
                 removed.insert(key.clone());
             }
-            WasmRowChange::Create { .. }
-            | WasmRowChange::Upsert { .. }
-            | WasmRowChange::Delete(_) => {}
+            WasmEntityChange::Create { .. }
+            | WasmEntityChange::Upsert { .. }
+            | WasmEntityChange::Delete(_) => {}
         }
     }
     base.with_delta(inserted, removed)
 }
 
-fn plugin_row_authorities_from_transition(
+fn plugin_entity_authorities_from_transition(
     plugin: &PluginRegistryEntry,
-    changes: &WasmHostRowChanges,
-    certified_batches: &[WasmCertifiedRowBatch],
-) -> Result<PluginRowAuthorities, LixError> {
-    plugin_row_authorities_after_transition(
+    changes: &WasmHostEntityChanges,
+    certified_batches: &[WasmCertifiedEntityBatch],
+) -> Result<PluginEntityAuthorities, LixError> {
+    plugin_entity_authorities_after_transition(
         plugin,
-        &PluginRowAuthorities::empty(),
+        &PluginEntityAuthorities::empty(),
         changes,
         certified_batches,
     )
 }
 
-fn plugin_row_authorities_after_transition(
+fn plugin_entity_authorities_after_transition(
     plugin: &PluginRegistryEntry,
-    prior: &PluginRowAuthorities,
-    changes: &WasmHostRowChanges,
-    certified_batches: &[WasmCertifiedRowBatch],
-) -> Result<PluginRowAuthorities, LixError> {
-    let empty = PluginRowAuthorities::empty();
+    prior: &PluginEntityAuthorities,
+    changes: &WasmHostEntityChanges,
+    certified_batches: &[WasmCertifiedEntityBatch],
+) -> Result<PluginEntityAuthorities, LixError> {
+    let empty = PluginEntityAuthorities::empty();
     let base = if certified_batches
         .iter()
         .any(|batch| batch.complete_file_state)
@@ -9953,14 +9223,14 @@ fn plugin_row_authorities_after_transition(
     } else {
         prior
     };
-    let base = plugin_row_authorities_after_changes(plugin, base, changes);
+    let base = plugin_entity_authorities_after_changes(plugin, base, changes);
     let mut ranges = Vec::new();
     for batch in certified_batches {
         for range in &batch.create_ranges {
             if !plugin_schema_is_creatable(plugin, &range.schema_key) {
                 continue;
             }
-            ranges.push(PluginRowAuthorityRange::new(
+            ranges.push(PluginEntityAuthorityRange::new(
                 range.schema_key.clone(),
                 batch.creates,
                 range.first_local_ref,
@@ -9971,33 +9241,31 @@ fn plugin_row_authorities_after_transition(
     Ok(base.with_ranges(ranges))
 }
 
-fn plugin_row_authorities_from_live_batch(
+fn plugin_entity_authorities_from_live_batch(
     plugin: &PluginRegistryEntry,
-    rows: &MaterializedHotStateBatch,
+    rows: &Vec<StateRow>,
     ordinals: &[u32],
-) -> PluginRowAuthorities {
-    PluginRowAuthorities::from_keys(
+) -> PluginEntityAuthorities {
+    PluginEntityAuthorities::from_keys(
         ordinals
             .iter()
             .filter_map(|ordinal| {
-                let row = rows.row(*ordinal as usize);
-                plugin_schema_is_creatable(plugin, row.schema_key()).then(|| {
-                    WasmRowKey::from_owned_parts(
-                        row.schema_key().to_owned(),
-                        row.row_pk().clone().into_parts(),
-                    )
+                let row = rows.get(*ordinal as usize)?;
+                let key = decode_state_key(&row.key).ok()?;
+                plugin_schema_is_creatable(plugin, &key.schema_key).then(|| {
+                    WasmEntityKey::from_owned_parts(key.schema_key, key.entity_pk.into_parts())
                 })
             })
             .collect(),
     )
 }
 
-fn v2_host_rows_from_live_batch_ordinals(
-    rows: &MaterializedHotStateBatch,
+fn v2_host_entities_from_live_batch_ordinals(
+    rows: &Vec<StateRow>,
     ordinals: &[u32],
     limits: WasmTransitionLimits,
-) -> Result<Vec<WasmHostRow>, LixError> {
-    let mut host_rows = Vec::with_capacity(ordinals.len());
+) -> Result<Vec<WasmHostEntity>, LixError> {
+    let mut entities = Vec::with_capacity(ordinals.len());
     for ordinal in ordinals {
         let row = rows.get(*ordinal as usize).ok_or_else(|| {
             LixError::new(
@@ -10005,51 +9273,47 @@ fn v2_host_rows_from_live_batch_ordinals(
                 "plugin state selection references a row outside its batch owner",
             )
         })?;
-        let Some(snapshot_content) = row.snapshot_content() else {
-            continue;
+        let snapshot_content = match &row.value.cell {
+            StateCell::Value(value) => value,
+            StateCell::Null | StateCell::Tombstone => continue,
         };
-        host_rows.push(host_row_with_lazy_snapshot(
-            WasmRowKey::from_owned_parts(
-                row.schema_key().to_owned(),
-                row.row_pk().clone().into_parts(),
-            ),
-            snapshot_content.clone().into_bytes(),
+        let key = decode_state_key(&row.key)?;
+        entities.push(host_entity_with_lazy_snapshot(
+            WasmEntityKey::from_owned_parts(key.schema_key, key.entity_pk.into_parts()),
+            snapshot_content.as_bytes().to_vec().into(),
             limits,
         )?);
     }
-    host_rows.sort_by(|left, right| left.key.cmp(&right.key));
-    for pair in host_rows.windows(2) {
+    entities.sort_by(|left, right| left.key.cmp(&right.key));
+    for pair in entities.windows(2) {
         if pair[0].key == pair[1].key {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "durable component row hydration returned duplicate keys",
+                "durable component entity hydration returned duplicate keys",
             ));
         }
     }
-    Ok(host_rows)
+    Ok(entities)
 }
 
-fn v2_host_row_ordinals_from_live_batch(
-    rows: &MaterializedHotStateBatch,
+fn v2_host_entity_ordinals_from_live_batch(
+    rows: &Vec<StateRow>,
     file_key: &PluginFileWriteKey,
     schema_keys: &[String],
 ) -> Result<Vec<u32>, LixError> {
     let mut ordinals = rows
         .iter()
         .enumerate()
-        .filter(|(_, row)| {
-            row.branch_id() == file_key.branch_id
-                && row.file_id() == Some(file_key.file_id.as_str())
-                && !row.global()
-                // A file's rows live in the file's own lane. Pinning this
-                // to tracked would hydrate an untracked file as if it were empty.
-                && row.untracked() == file_key.untracked
-                && row.snapshot_content().is_some()
+        .filter_map(|(ordinal, row)| {
+            let key = decode_state_key(&row.key).ok()?;
+            (key.file_id.as_deref() == Some(file_key.file_id.as_str())
+                && matches!(row.value.cell, StateCell::Value(_))
                 && schema_keys
-                    .binary_search_by(|schema_key| schema_key.as_str().cmp(row.schema_key()))
-                    .is_ok()
+                    .binary_search_by(|schema_key| schema_key.as_str().cmp(&key.schema_key))
+                    .is_ok())
+            .then_some(ordinal)
         })
-        .map(|(ordinal, _)| {
+        .map(|ordinal| {
             u32::try_from(ordinal).map_err(|_| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -10059,44 +9323,95 @@ fn v2_host_row_ordinals_from_live_batch(
         })
         .collect::<Result<Vec<_>, _>>()?;
     ordinals.sort_unstable_by(|left, right| {
-        let left = rows.row(*left as usize);
-        let right = rows.row(*right as usize);
-        left.schema_key()
-            .cmp(right.schema_key())
-            .then_with(|| left.row_pk().cmp(right.row_pk()))
+        let left = decode_state_key(&rows[*left as usize].key)
+            .expect("authenticated state key was decoded during selection");
+        let right = decode_state_key(&rows[*right as usize].key)
+            .expect("authenticated state key was decoded during selection");
+        left.schema_key
+            .cmp(&right.schema_key)
+            .then_with(|| left.entity_pk.cmp(&right.entity_pk))
     });
     for pair in ordinals.windows(2) {
-        let left = rows.row(pair[0] as usize);
-        let right = rows.row(pair[1] as usize);
-        if left.schema_key() == right.schema_key() && left.row_pk() == right.row_pk() {
+        let left = decode_state_key(&rows[pair[0] as usize].key)?;
+        let right = decode_state_key(&rows[pair[1] as usize].key)?;
+        if left.schema_key == right.schema_key && left.entity_pk == right.entity_pk {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "durable component row hydration returned duplicate keys",
+                "durable component entity hydration returned duplicate keys",
             ));
         }
     }
     Ok(ordinals)
 }
 
+fn suppress_format_only_noops_against_batch(
+    changes: WasmHostEntityChanges,
+    keys: &[WasmEntityKey],
+    accepted: &[Option<StateRow>],
+) -> Result<WasmHostEntityChanges, LixError> {
+    if keys.len() != accepted.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "format-only lookup returned the wrong cardinality",
+        ));
+    }
+    let accepted = keys.iter().zip(accepted).collect::<BTreeMap<_, _>>();
+    let mut effective = Vec::with_capacity(changes.changes.len());
+    for change in changes.changes {
+        let is_noop = match &change {
+            WasmEntityChange::Upsert {
+                entity,
+                effect: WasmChangeEffect::FormatOnly,
+            } => {
+                let Some(Some(base)) = accepted.get(&entity.key) else {
+                    effective.push(change);
+                    continue;
+                };
+                let StateCell::Value(base_snapshot) = &base.value.cell else {
+                    effective.push(change);
+                    continue;
+                };
+                let canonical = match &entity.snapshot_content {
+                    WasmHostBytes::CanonicalJson(json) => json,
+                    WasmHostBytes::Inline(_) | WasmHostBytes::Source(_) => {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "validated component guest changes must own parsed canonical snapshots",
+                        ));
+                    }
+                };
+                let candidate = canonical.normalized();
+                candidate == base_snapshot.as_str()
+                    || candidate.as_bytes()
+                        == canonicalize_snapshot(base_snapshot.as_bytes())?.as_slice()
+            }
+            WasmEntityChange::Create { .. }
+            | WasmEntityChange::Upsert { .. }
+            | WasmEntityChange::Delete(_) => false,
+        };
+        if !is_noop {
+            effective.push(change);
+        }
+    }
+    Ok(WasmHostEntityChanges { changes: effective })
+}
+
 fn v2_host_changes_from_prepared_rows(
     rows: &PreparedStateBatch,
     limits: WasmTransitionLimits,
-    untracked: bool,
-) -> Result<WasmHostRowChanges, LixError> {
+) -> Result<WasmHostEntityChanges, LixError> {
     let mut changes = rows
         .iter()
         .map(|row| {
-            // Rendering is lane-agnostic; the rows only have to agree with the
-            // lane of the file being rendered.
-            if row.global || row.untracked != untracked || row.file_id.is_none() {
+            if row.global || row.untracked || row.file_id.is_none() {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "component semantic rendering requires branch-local, file-scoped rows in the file's own lane",
+                    "component semantic rendering requires tracked, branch-local, file-scoped rows",
                 ));
             }
-            let key = WasmRowKey::from_owned_parts(
+            let key = WasmEntityKey::from_owned_parts(
                 row.schema_key.clone(),
-                row.row_pk.clone().into_parts(),
+                row.entity_pk.clone().into_parts(),
             );
             match row.snapshot {
                 Some(snapshot) => {
@@ -10108,27 +9423,27 @@ fn v2_host_changes_from_prepared_rows(
                     } else {
                         WasmChangeEffect::Content
                     };
-                    host_row_change_with_lazy_snapshot(
+                    host_entity_change_with_lazy_snapshot(
                         key,
                         snapshot.materialize_shared().into_bytes().into(),
                         effect,
                         limits,
                     )
                 }
-                None => Ok(WasmRowChange::Delete(key)),
+                None => Ok(WasmEntityChange::Delete(key)),
             }
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    changes.sort_by(|left, right| left.row_key().cmp(&right.row_key()));
+    changes.sort_by(|left, right| left.entity_key().cmp(&right.entity_key()));
     for pair in changes.windows(2) {
-        if pair[0].row_key() == pair[1].row_key() {
+        if pair[0].entity_key() == pair[1].entity_key() {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
-                "one component semantic write batch cannot contain the same row key more than once",
+                "one component semantic write batch cannot contain the same entity key more than once",
             ));
         }
     }
-    Ok(WasmHostRowChanges { changes })
+    Ok(WasmHostEntityChanges { changes })
 }
 
 fn reject_external_plugin_registry_rows(rows: &RawWriteBatch) -> Result<(), LixError> {
@@ -10136,14 +9451,14 @@ fn reject_external_plugin_registry_rows(rows: &RawWriteBatch) -> Result<(), LixE
         if row.schema_key != KEY_VALUE_SCHEMA_KEY {
             continue;
         }
-        let row_key = row
-            .row_pk
-            .and_then(|row_pk| row_pk.as_single_string().ok());
+        let entity_key = row
+            .entity_pk
+            .and_then(|entity_pk| entity_pk.as_single_string().ok());
         let snapshot_key = row
             .snapshot
             .and_then(|snapshot| snapshot.get("key"))
             .and_then(JsonValue::as_str);
-        let reserved = [row_key, snapshot_key]
+        let reserved = [entity_key, snapshot_key]
             .into_iter()
             .flatten()
             .find(|key| {
@@ -10491,7 +9806,7 @@ struct PreparedFreshPluginOpen {
     materialization_version: String,
     submitted_bytes: crate::Blob,
     create_context: BoundCreateContext,
-    existing_create_reservation: Option<MaterializedHotStateRow>,
+    existing_create_reservation: Option<StateRow>,
     factory: Arc<dyn WasmComponentFactory>,
     descriptor: WasmFileDescriptor,
     schemas: SchemaAllowlist,
@@ -10508,7 +9823,7 @@ struct PendingFreshPluginOpen {
     materialization_version: String,
     submitted_bytes: crate::Blob,
     create_context: BoundCreateContext,
-    existing_create_reservation: Option<MaterializedHotStateRow>,
+    existing_create_reservation: Option<StateRow>,
     store_permit: PluginActorStorePermit,
     task: Option<
         tokio::task::JoinHandle<
@@ -10517,9 +9832,23 @@ struct PendingFreshPluginOpen {
     >,
 }
 
+#[derive(Clone)]
 struct DecodedDurablePluginCheckpoint {
+    generation: String,
+    semantic_root: String,
     runtime: crate::Blob,
-    authorities: PluginRowAuthorities,
+    authorities: PluginEntityAuthorities,
+}
+
+impl fmt::Debug for DecodedDurablePluginCheckpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecodedDurablePluginCheckpoint")
+            .field("generation", &self.generation)
+            .field("semantic_root", &self.semantic_root)
+            .field("runtime_bytes", &self.runtime.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PluginWriteReconciliation {
@@ -10566,16 +9895,6 @@ impl PluginWriteReconciliation {
                         ),
                     )
                 })?;
-            // Lane does not gate the checkpoint. `PLUGIN_CHECKPOINT_SPACE` is a
-            // dedicated mutable side space keyed by `branch_id ++ file_id` with
-            // no lane column, no commit link and no changelog entry, and its
-            // validity is content-addressed: a load only returns a checkpoint
-            // whose generation, blob hash and semantic root all still match, so
-            // a stale one degrades into the cold rebuild it was accelerating.
-            // Its lifetime already matches untracked state — the branch's
-            // prefix range is reclaimed when the branch is deleted, and the
-            // file's key is dropped with the file. Withholding it for untracked
-            // files bought no invariant and cost every session a full re-parse.
             write.set_plugin_checkpoint(generation, semantic_root, checkpoint.bytes(), authority);
         }
         Ok(())
@@ -10616,7 +9935,7 @@ enum PendingPluginActorPublication {
         checkpoint: Option<WasmDocumentCheckpoint>,
         bytes: crate::Blob,
         semantic_root: Arc<str>,
-        row_authorities: PluginRowAuthorities,
+        entity_authorities: PluginEntityAuthorities,
         view: PendingPluginActorView,
     },
     /// The plugin transition has already produced its durable rows, but the
@@ -10630,7 +9949,7 @@ enum PendingPluginActorPublication {
         checkpoint: Option<PluginActorStagedCheckpoint>,
         semantic_root: Option<Arc<str>>,
         durable_checkpoint: Option<WasmDurableDocumentCheckpoint>,
-        row_authorities: PluginRowAuthorities,
+        entity_authorities: PluginEntityAuthorities,
     },
 }
 
@@ -10650,10 +9969,10 @@ impl PendingPluginActorPublication {
                 let semantic_root = successor_checkpoint
                     .as_ref()
                     .map(|(_, semantic_root, _)| Arc::clone(semantic_root));
-                let row_authorities = lease
-                    .successor_row_authorities()
+                let entity_authorities = lease
+                    .successor_entity_authorities()
                     .cloned()
-                    .unwrap_or_else(PluginRowAuthorities::empty);
+                    .unwrap_or_else(PluginEntityAuthorities::empty);
                 let checkpoint =
                     lease
                         .successor_checkpoint()
@@ -10667,7 +9986,7 @@ impl PendingPluginActorPublication {
                     checkpoint,
                     semantic_root,
                     durable_checkpoint,
-                    row_authorities,
+                    entity_authorities,
                 }
             }
             Self::New {
@@ -10677,7 +9996,7 @@ impl PendingPluginActorPublication {
                 document,
                 checkpoint,
                 semantic_root,
-                row_authorities,
+                entity_authorities,
                 view,
                 ..
             } => {
@@ -10694,7 +10013,7 @@ impl PendingPluginActorPublication {
                     checkpoint: staged_checkpoint,
                     semantic_root: Some(semantic_root),
                     durable_checkpoint,
-                    row_authorities,
+                    entity_authorities,
                 }
             }
             publication @ Self::Uncached { .. } => publication,
@@ -10740,7 +10059,7 @@ impl PendingPluginActorPublication {
                 checkpoint,
                 bytes,
                 semantic_root,
-                row_authorities,
+                entity_authorities,
                 view,
             } => {
                 let path = key.path.clone();
@@ -10752,7 +10071,7 @@ impl PendingPluginActorPublication {
                         document,
                         bytes,
                         semantic_root,
-                        row_authorities,
+                        entity_authorities,
                     )),
                     view,
                     path,
@@ -10798,7 +10117,7 @@ impl PendingPluginActorPublication {
         &str,
         Arc<str>,
         WasmDurableDocumentCheckpoint,
-        &PluginRowAuthorities,
+        &PluginEntityAuthorities,
     )> {
         match self {
             Self::Existing {
@@ -10809,7 +10128,7 @@ impl PendingPluginActorPublication {
                 let (_, semantic_root, checkpoint) = lease.successor_checkpoint()?;
                 checkpoint
                     .and_then(|checkpoint| checkpoint.durable_checkpoint())
-                    .zip(lease.successor_row_authorities())
+                    .zip(lease.successor_entity_authorities())
                     .map(|(bytes, authorities)| {
                         (
                             successor_key.branch_id.as_str(),
@@ -10825,7 +10144,7 @@ impl PendingPluginActorPublication {
                 key,
                 checkpoint,
                 semantic_root,
-                row_authorities,
+                entity_authorities,
                 ..
             } => checkpoint
                 .as_ref()
@@ -10837,14 +10156,14 @@ impl PendingPluginActorPublication {
                         key.plugin_generation.as_str(),
                         Arc::clone(semantic_root),
                         bytes,
-                        row_authorities,
+                        entity_authorities,
                     )
                 }),
             Self::Uncached {
                 key,
                 semantic_root,
                 durable_checkpoint,
-                row_authorities,
+                entity_authorities,
                 ..
             } => durable_checkpoint.clone().zip(semantic_root.clone()).map(
                 |(bytes, semantic_root)| {
@@ -10854,7 +10173,7 @@ impl PendingPluginActorPublication {
                         key.plugin_generation.as_str(),
                         semantic_root,
                         bytes,
-                        row_authorities,
+                        entity_authorities,
                     )
                 },
             ),
@@ -10899,20 +10218,17 @@ fn semantic_rendered_file_content(
     path: String,
     filename: String,
     branch_id: String,
-    untracked: bool,
     base_blob_hash: BlobId,
     rendered_bytes: crate::Blob,
     same_length_output_splice: Option<ValidatedSameLengthOutputSplice>,
 ) -> TransactionFileContent {
-    // The re-rendered payload replaces the file in its own lane. Keying it as
-    // tracked would leave an untracked file's materialization unmatched.
     let mut rendered_file = TransactionFileContent::new(
         file_id,
         Some(path),
         Some(filename),
         branch_id,
         false,
-        untracked,
+        false,
         rendered_bytes,
     )
     .with_had_blob_ref(true)
@@ -10933,7 +10249,7 @@ async fn render_semantic_changes_with_lease(
     successor_key: PluginActorKey,
     view: PendingPluginActorView,
     descriptor: WasmFileDescriptor,
-    changes: WasmHostRowChanges,
+    changes: WasmHostEntityChanges,
     visible_root: &str,
     materialization_version: &str,
     limits: WasmTransitionLimits,
@@ -10958,7 +10274,7 @@ async fn render_semantic_changes_with_lease(
             retain_large_import_actor: view.retain_large_import_actor,
         },
     };
-    let change_count = u64::try_from(changes.row_change_count()).unwrap_or(u64::MAX);
+    let change_count = u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
     let call = match lease.begin_pending_guest_call() {
         Ok(call) => call,
         Err(error) => return Err((error, publication(lease))),
@@ -10971,9 +10287,9 @@ async fn render_semantic_changes_with_lease(
         let error = lease.handle_pending_guest_call_error(call, error);
         return Err((error, publication(lease)));
     }
-    let successor_row_authorities =
-        plugin_row_authorities_after_changes(plugin, call.row_authorities(), &changes);
-    let change_source = match VecRowChangeSource::new(changes, limits) {
+    let successor_entity_authorities =
+        plugin_entity_authorities_after_changes(plugin, call.entity_authorities(), &changes);
+    let change_source = match VecEntityChangeSource::new(changes, limits) {
         Ok(source) => source,
         Err(error) => {
             let error = lease.handle_pending_guest_call_error(call, error);
@@ -10991,10 +10307,10 @@ async fn render_semantic_changes_with_lease(
     };
     let renderer_transition = match lease
         .actor_mut()
-        .rows_changed(
+        .entities_changed(
             renderer_input,
             limits,
-            WasmRowUpdate {
+            WasmEntityUpdate {
                 before_descriptor: descriptor.clone(),
                 after_descriptor: descriptor,
                 before: Arc::new(ArcByteSource::new(base_bytes.clone())),
@@ -11009,7 +10325,7 @@ async fn render_semantic_changes_with_lease(
             return Err((error, publication(lease)));
         }
     };
-    let rendered = match drain_row_transition_edits(
+    let rendered = match drain_entity_transition_edits(
         lease.actor_mut(),
         renderer_transition,
         &base_bytes,
@@ -11058,7 +10374,7 @@ async fn render_semantic_changes_with_lease(
     {
         return Err((error, publication(lease)));
     }
-    if let Err(error) = lease.set_successor_row_authorities(successor_row_authorities) {
+    if let Err(error) = lease.set_successor_entity_authorities(successor_entity_authorities) {
         return Err((error, publication(lease)));
     }
     Ok((
@@ -11092,55 +10408,49 @@ struct PluginGenerationUpgrade {
 struct PluginUpgradeBlobRefSnapshot {
     id: String,
     blob_hash: String,
+    #[serde(default)]
+    plugin_checkpoint: Option<DurableBlobCheckpointSnapshot>,
 }
 
-async fn preflight_owned_generation_upgrades(
+#[derive(Debug, serde::Deserialize)]
+struct DurableBlobCheckpointSnapshot {
+    generation: String,
+    semantic_root: String,
+    runtime: String,
+    authority: String,
+}
+
+async fn preflight_owned_generation_upgrades<StorageImpl>(
     host: &PluginRuntimeHost,
-    base: &dyn HotStateReader,
-    staged: &impl StagedHotStateRows,
-    base_blob_reader: &dyn BlobDataReader,
-    staged_writes: &TransactionWriteBuffer,
+    transaction: &mut Transaction<StorageImpl>,
     upgrades: &[PluginGenerationUpgrade],
     install_wasm: &BTreeMap<BlobId, Vec<u8>>,
     install_schema_definitions: &BTreeMap<PluginLifecycleKey, BTreeMap<String, JsonValue>>,
-) -> Result<(), LixError> {
-    // KNOWN LANE GAP, deliberate and scoped out of the unskip.
-    //
-    // Every scan below is pinned to the tracked lane, so a plugin generation
-    // upgrade re-renders and validates only the tracked files that plugin owns.
-    // An untracked owned file is not validated against the replacement plugin.
-    //
-    // This is a validation gap, not a loss: the preflight writes no rows. An
-    // untracked owned file keeps its old-generation owner row, and the next
-    // write to it takes the ordinary `plugin_owner_needs_write` path, which
-    // rewrites the owner and re-reconciles under the new generation. The only
-    // consequence is that a replacement plugin which cannot render that file
-    // fails at the next write rather than at upgrade time.
-    //
-    // Closing it means lane-partitioning four scans and two path filters here
-    // with their own coverage, which belongs with the enforcement work.
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let branch_ids = upgrades
         .iter()
         .map(|upgrade| upgrade.branch_id.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let owner_rows = overlay_scan_batch(
-        base,
-        staged,
-        &HotStateScanRequest {
-            filter: HotStateFilter {
-                schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-                row_pks: vec![RowPk::single(PLUGIN_OWNER_KEY)],
-                branch_ids: branch_ids.clone(),
-                untracked: Some(false),
-                ..Default::default()
-            },
-            projection: plugin_registry_hot_state_projection(),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let mut owner_rows = Vec::<(String, StateRow)>::new();
+    for branch_id in &branch_ids {
+        owner_rows.extend(
+            transaction
+                .plugin_state_schema_all_rows(branch_id, &[KEY_VALUE_SCHEMA_KEY.to_string()])
+                .await?
+                .into_iter()
+                .filter_map(|row| {
+                    let key = decode_state_key(&row.key).ok()?;
+                    (key.file_id.is_some()
+                        && key.entity_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY))
+                    .then_some((branch_id.clone(), row))
+                }),
+        );
+    }
 
     let upgrade_indexes = upgrades
         .iter()
@@ -11156,16 +10466,12 @@ async fn preflight_owned_generation_upgrades(
         })
         .collect::<BTreeMap<_, _>>();
     let mut owners_by_upgrade = vec![Vec::<PluginFileOwner>::new(); upgrades.len()];
-    for row in owner_rows.iter() {
-        let branch_id = row.branch_id().to_string();
-        let owner_row = row.to_owned();
-        // This preflight is tracked-pinned; see the lane-gap note above.
-        let Some(owner) = PluginFileOwner::from_hot_state_row(&owner_row, &branch_id, false)?
-        else {
+    for (branch_id, row) in &owner_rows {
+        let Some(owner) = PluginFileOwner::from_state_row(row, branch_id)? else {
             continue;
         };
         let Some(index) = upgrade_indexes
-            .get(&(branch_id.to_string(), owner.plugin_key().to_string()))
+            .get(&(branch_id.clone(), owner.plugin_key().to_string()))
             .copied()
         else {
             continue;
@@ -11190,14 +10496,6 @@ async fn preflight_owned_generation_upgrades(
         return Ok(());
     }
 
-    let descriptor_rows = overlay_scan_batch(
-        base,
-        staged,
-        &FilesystemPathIndexRequest::new(branch_ids).hot_state_request(),
-    )
-    .await?;
-    let path_index = FilesystemPathIndex::from_live_batch(&descriptor_rows)?;
-
     let owned_schema_keys = upgrades
         .iter()
         .zip(&owners_by_upgrade)
@@ -11205,62 +10503,59 @@ async fn preflight_owned_generation_upgrades(
         .flat_map(|(upgrade, _)| upgrade.previous.schema_keys().iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .map(RowPk::single)
+        .map(EntityPk::single)
         .collect::<Vec<_>>();
-    let registered_schema_rows = overlay_scan_batch(
-        base,
-        staged,
-        &HotStateScanRequest {
-            filter: HotStateFilter {
-                schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                row_pks: owned_schema_keys,
-                branch_ids: upgrades
-                    .iter()
-                    .zip(&owners_by_upgrade)
-                    .filter(|(_, owners)| !owners.is_empty())
-                    .map(|(upgrade, _)| upgrade.branch_id.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect(),
-                file_ids: vec![NullableKeyFilter::Null],
-                untracked: Some(false),
-                ..Default::default()
-            },
-            projection: plugin_registry_hot_state_projection(),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let mut registered_schema_rows = Vec::new();
+    let schema_branches = upgrades
+        .iter()
+        .zip(&owners_by_upgrade)
+        .filter(|(_, owners)| !owners.is_empty())
+        .map(|(upgrade, _)| upgrade.branch_id.clone())
+        .collect::<BTreeSet<_>>();
+    for branch_id in schema_branches {
+        let keys = owned_schema_keys
+            .iter()
+            .map(|entity_pk| StateKey {
+                schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+                entity_pk: entity_pk.clone(),
+                file_id: None,
+            })
+            .collect::<Vec<_>>();
+        registered_schema_rows.extend(
+            transaction
+                .plugin_state_points(&branch_id, &keys, false)
+                .await?
+                .into_iter()
+                .flatten()
+                .map(|row| (branch_id.clone(), row)),
+        );
+    }
     let mut registered_schema_definitions = BTreeMap::<(String, String), JsonValue>::new();
-    for row in registered_schema_rows.iter() {
-        let schema_key = row.row_pk().as_single_string().map_err(|error| {
+    for (branch_id, row) in &registered_schema_rows {
+        let key = decode_state_key(&row.key)?;
+        let schema_key = key.entity_pk.as_single_string().map_err(|error| {
             LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!("active plugin schema has an invalid identity: {error}"),
             )
         })?;
-        let Some(snapshot) = row.snapshot_content().map(|content| content.as_str()) else {
+        let StateCell::Value(snapshot) = &row.value.cell else {
             continue;
         };
-        let snapshot: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
+        let snapshot: JsonValue = serde_json::from_str(snapshot.as_str()).map_err(|error| {
             LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!("active plugin schema snapshot is invalid JSON: {error}"),
             )
         })?;
-        let (snapshot_key, definition) =
-            crate::schema::schema_from_registered_snapshot(&snapshot)?;
-        if snapshot_key.schema_key != schema_key {
-            return Err(LixError::new(
+        let definition = snapshot.get("value").cloned().ok_or_else(|| {
+            LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
-                format!("active plugin schema '{schema_key}' has mismatched snapshot identity"),
-            ));
-        }
-        if registered_schema_definitions
-            .insert(
-                (row.branch_id().to_string(), schema_key.to_string()),
-                definition,
+                format!("active plugin schema '{schema_key}' is missing its definition"),
             )
+        })?;
+        if registered_schema_definitions
+            .insert((branch_id.clone(), schema_key.to_string()), definition)
             .is_some()
         {
             return Err(LixError::new(
@@ -11316,40 +10611,29 @@ async fn preflight_owned_generation_upgrades(
             .iter()
             .map(|owner| owner.file_id().to_string())
             .collect::<Vec<_>>();
-        let file_id_filters = file_ids
-            .iter()
-            .cloned()
-            .map(NullableKeyFilter::Value)
-            .collect::<Vec<_>>();
-        let state_rows = overlay_scan_batch(
-            base,
-            staged,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
-                    schema_keys: upgrade.previous.schema_keys().to_vec(),
-                    branch_ids: vec![upgrade.branch_id.clone()],
-                    file_ids: file_id_filters.clone(),
-                    untracked: Some(false),
-                    ..Default::default()
-                },
-                projection: plugin_state_hot_state_projection(),
-                ..Default::default()
-            },
-        )
-        .await?;
+        let mut state_rows = Vec::new();
+        for file_id in &file_ids {
+            state_rows.extend(
+                transaction
+                    .plugin_state_schema_rows(
+                        &upgrade.branch_id,
+                        upgrade.previous.schema_keys(),
+                        Some(file_id),
+                    )
+                    .await?,
+            );
+        }
         let mut state_ordinals = Vec::<u32>::with_capacity(state_rows.len());
         for (ordinal, row) in state_rows.iter().enumerate() {
-            let Some(file_id) = row.file_id() else {
+            let key = decode_state_key(&row.key)?;
+            let Some(file_id) = key.file_id.as_deref() else {
                 continue;
             };
-            if row.branch_id() == upgrade.branch_id
-                && !row.global()
-                && !row.untracked()
-                && row.snapshot_content().is_some()
+            if matches!(row.value.cell, StateCell::Value(_))
                 && upgrade
                     .previous
                     .schema_keys()
-                    .binary_search_by(|schema_key| schema_key.as_str().cmp(row.schema_key()))
+                    .binary_search_by(|schema_key| schema_key.as_str().cmp(&key.schema_key))
                     .is_ok()
                 && file_ids
                     .binary_search_by(|candidate| candidate.as_str().cmp(file_id))
@@ -11364,63 +10648,61 @@ async fn preflight_owned_generation_upgrades(
             }
         }
         state_ordinals.sort_unstable_by(|left, right| {
-            let left = state_rows.row(*left as usize);
-            let right = state_rows.row(*right as usize);
-            left.file_id()
-                .cmp(&right.file_id())
-                .then_with(|| left.schema_key().cmp(right.schema_key()))
-                .then_with(|| left.row_pk().cmp(right.row_pk()))
+            let left = decode_state_key(&state_rows[*left as usize].key)
+                .expect("authenticated state key was decoded during selection");
+            let right = decode_state_key(&state_rows[*right as usize].key)
+                .expect("authenticated state key was decoded during selection");
+            left.file_id
+                .cmp(&right.file_id)
+                .then_with(|| left.schema_key.cmp(&right.schema_key))
+                .then_with(|| left.entity_pk.cmp(&right.entity_pk))
         });
         let mut state_by_file = BTreeMap::<String, std::ops::Range<usize>>::new();
         let mut start = 0;
         while start < state_ordinals.len() {
-            let file_id = state_rows
-                .row(state_ordinals[start] as usize)
-                .file_id()
+            let file_id = decode_state_key(&state_rows[state_ordinals[start] as usize].key)?
+                .file_id
                 .expect("selected plugin upgrade state row carries file_id");
             let mut end = start + 1;
             while end < state_ordinals.len()
-                && state_rows.row(state_ordinals[end] as usize).file_id() == Some(file_id)
+                && decode_state_key(&state_rows[state_ordinals[end] as usize].key)?
+                    .file_id
+                    .as_deref()
+                    == Some(file_id.as_str())
             {
                 end += 1;
             }
-            state_by_file.insert(file_id.to_owned(), start..end);
+            state_by_file.insert(file_id, start..end);
             start = end;
         }
 
-        let blob_rows = overlay_scan_batch(
-            base,
-            staged,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
-                    schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
-                    row_pks: file_ids
-                        .iter()
-                        .map(|file_id| validated_uuid_row_pk(file_id))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    branch_ids: vec![upgrade.branch_id.clone()],
-                    file_ids: file_id_filters,
-                    untracked: Some(false),
-                    ..Default::default()
-                },
-                projection: plugin_registry_hot_state_projection(),
-                ..Default::default()
-            },
-        )
-        .await?;
+        let blob_keys = file_ids
+            .iter()
+            .map(|file_id| {
+                Ok(StateKey {
+                    schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                    entity_pk: validated_uuid_entity_pk(file_id)?,
+                    file_id: Some(file_id.clone()),
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let blob_rows = transaction
+            .plugin_state_points(&upgrade.branch_id, &blob_keys, false)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         let mut materialized_hash_by_file = BTreeMap::<String, BlobId>::new();
         for row in blob_rows.iter() {
-            let Some(file_id) = row.file_id() else {
+            let key = decode_state_key(&row.key)?;
+            let Some(file_id) = key.file_id.as_deref() else {
                 continue;
             };
-            if row.branch_id() != upgrade.branch_id || row.global() || row.untracked() {
-                continue;
-            }
-            let Some(snapshot) = row.snapshot_content().map(|content| content.as_str()) else {
+            let StateCell::Value(snapshot) = &row.value.cell else {
                 continue;
             };
-            let snapshot: PluginUpgradeBlobRefSnapshot =
-                serde_json::from_str(snapshot).map_err(|error| {
+            let snapshot: PluginUpgradeBlobRefSnapshot = serde_json::from_str(snapshot.as_str())
+                .map_err(|error| {
                     plugin_upgrade_error(
                         upgrade,
                         file_id,
@@ -11457,12 +10739,13 @@ async fn preflight_owned_generation_upgrades(
             }
         }
 
-        let hashes = owners
+        let requests = owners
             .iter()
             .map(|owner| {
                 materialized_hash_by_file
                     .get(owner.file_id())
                     .copied()
+                    .map(|hash| (plugin_materialization_state_key(owner.file_id()), hash))
                     .ok_or_else(|| {
                         plugin_upgrade_error(
                             upgrade,
@@ -11475,10 +10758,15 @@ async fn preflight_owned_generation_upgrades(
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let materialized_bytes =
-            load_transaction_blob_bytes(base_blob_reader, staged_writes, &hashes)
-                .await?
-                .into_vec();
+        let materialized_bytes = load_transaction_authenticated_plugin_bytes(
+            &transaction.opening_read(),
+            &upgrade.branch_id,
+            &transaction.staged_writes,
+            &BTreeMap::new(),
+            &requests,
+        )
+        .await?
+        .into_blob_vec();
         if materialized_bytes.len() != owners.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -11501,45 +10789,31 @@ async fn preflight_owned_generation_upgrades(
         let limits = WasmTransitionLimits::default();
 
         for (owner, expected) in owners.iter().zip(materialized_bytes) {
-            let expected: crate::Blob = expected
+            let expected = expected.ok_or_else(|| {
+                plugin_upgrade_error(
+                    upgrade,
+                    owner.file_id(),
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        "owned component file references a missing materialized blob",
+                    ),
+                )
+            })?;
+            let path = transaction
+                .plugin_file_path(&upgrade.branch_id, owner.file_id())
+                .await?
                 .ok_or_else(|| {
                     plugin_upgrade_error(
                         upgrade,
                         owner.file_id(),
                         LixError::new(
                             LixError::CODE_INVALID_PLUGIN,
-                            "owned component file references a missing materialized blob",
+                            "owned component file has no tracked descriptor",
                         ),
                     )
-                })?
-                .into();
-            let matches = path_index
-                .exact_file_id_entries(owner.file_id())
-                .into_iter()
-                .filter(|entry| {
-                    let row = entry.live_row();
-                    entry.kind == FilesystemPathKind::File
-                        && entry.id() == owner.file_id()
-                        && row.branch_id.as_ref() == upgrade.branch_id
-                        && !row.global
-                        && !row.untracked
-                })
-                .collect::<Vec<_>>();
-            let [entry] = matches.as_slice() else {
-                return Err(plugin_upgrade_error(
-                    upgrade,
-                    owner.file_id(),
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!(
-                            "owned component file must resolve to exactly one tracked descriptor, found {}",
-                            matches.len()
-                        ),
-                    ),
-                ));
-            };
+                })?;
             let range = state_by_file.get(owner.file_id()).cloned().unwrap_or(0..0);
-            let rows = v2_host_rows_from_live_batch_ordinals(
+            let entities = v2_host_entities_from_live_batch_ordinals(
                 &state_rows,
                 &state_ordinals[range],
                 limits,
@@ -11556,13 +10830,13 @@ async fn preflight_owned_generation_upgrades(
             let verified = preflight_rendered_file(
                 store.actor_mut(),
                 WasmFileDescriptor {
-                    path: Some(entry.path.clone()),
+                    path: Some(path),
                     plugin: WasmPluginSelection {
                         plugin_key: upgrade.replacement.key().to_string(),
                         generation: upgrade.replacement.archive_blob_hash().to_string(),
                     },
                 },
-                rows,
+                entities,
                 expected,
                 limits,
             )
@@ -11579,23 +10853,23 @@ async fn preflight_owned_generation_upgrades(
 async fn preflight_rendered_file(
     actor: &mut dyn WasmComponentActor,
     descriptor: WasmFileDescriptor,
-    rows: Vec<WasmHostRow>,
+    entities: Vec<WasmHostEntity>,
     expected: crate::Blob,
     limits: WasmTransitionLimits,
 ) -> Result<(), LixError> {
-    let source = VecRowSource::new(rows, limits)?;
+    let source = VecEntitySource::new(entities, limits)?;
     let accepted = Arc::new(ArcByteSource::new(expected.clone()));
     let transition = actor
-        .open_rows(
+        .open_entities(
             limits,
-            WasmOpenRowsInput {
+            WasmOpenEntitiesInput {
                 descriptor,
-                rows: Box::new(source),
+                entities: Box::new(source),
                 accepted: Some(accepted),
             },
         )
         .await?;
-    let validated = drain_row_transition_edits(
+    let validated = drain_entity_transition_edits(
         actor,
         transition,
         expected.as_ref(),
@@ -11650,7 +10924,6 @@ fn plugin_upgrade_error(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PluginStateGroupKey {
     branch_id: String,
-    untracked: bool,
     plugin_key: String,
 }
 
@@ -11706,10 +10979,10 @@ fn duplicate_plugin_lifecycle_mutation() -> LixError {
 
 fn plugin_schema_collision_error(
     plugin_key: &str,
-    row_pk: &RowPk,
+    entity_pk: &EntityPk,
     other_plugin: Option<&String>,
 ) -> LixError {
-    let schema_key = row_pk
+    let schema_key = entity_pk
         .as_single_string()
         .unwrap_or("<invalid schema identity>");
     let owner = other_plugin.map_or_else(
@@ -11732,11 +11005,6 @@ fn plugin_reconciliation_origin() -> TransactionWriteOrigin {
     }
 }
 
-#[cfg(test)]
-fn mark_plugin_reconciliation_row(row: &mut TransactionWriteRow) {
-    row.origin = Some(plugin_reconciliation_origin());
-}
-
 fn mark_plugin_reconciliation_batch(
     rows: &mut RawWriteBatch,
     source_index: usize,
@@ -11754,24 +11022,20 @@ fn mark_plugin_reconciliation_batch(
     Ok(())
 }
 
-fn plugin_registry_hot_state_projection() -> HotStateProjection {
-    HotStateProjection {
-        columns: vec!["snapshot_content".to_string()],
-    }
-}
-
 fn plugin_state_tombstone_batch(
     active_state: &[PluginStateBatchRow],
-    state_batches: &[MaterializedHotStateBatch],
+    state_batches: &[Vec<StateRow>],
     file_id: &str,
     context: &FilesystemRowContext,
 ) -> RawWriteBatch {
     let mut rows = RawWriteBatch::with_capacity(active_state.len());
     for selected in active_state {
-        let row = state_batches[selected.batch_index as usize].row(selected.row_index as usize);
+        let row = &state_batches[selected.batch_index as usize][selected.row_index as usize];
+        let key = decode_state_key(&row.key)
+            .expect("authenticated plugin state key was decoded during selection");
         rows.push_parts(
-            Some(row.row_pk().clone()),
-            row.schema_key().into(),
+            Some(key.entity_pk),
+            key.schema_key.into(),
             Some(file_id.into()),
             None,
             context.metadata.clone(),
@@ -11825,8 +11089,8 @@ fn transaction_write_has_plugin_lifecycle_candidate(write: &TransactionWrite) ->
             row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
                 && row.snapshot.is_none()
                 && row
-                    .row_pk
-                    .and_then(|row_pk| row_pk.as_single_string_owned().ok())
+                    .entity_pk
+                    .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
                     .zip(
                         row.origin.and_then(|origin| {
                             plugin_key_from_archive_delete_origin(&origin.surface)
@@ -11913,2897 +11177,48 @@ fn require_valid_storage_scope(branch_id: &str, global: bool) -> Result<(), LixE
     Ok(())
 }
 
-fn validated_uuid_row_pk(value: &str) -> Result<RowPk, LixError> {
-    RowPk::uuid_from_canonical(value).map_err(|error| {
+async fn resolve_active_branch_id(
+    mode: &SessionMode,
+    read: &(impl StorageAdapterRead + ?Sized),
+) -> Result<String, LixError> {
+    match mode {
+        SessionMode::Pinned { branch_id } => branch_id
+            .read()
+            .map(|branch_id| branch_id.clone())
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "session branch selector is poisoned",
+                )
+            }),
+        SessionMode::Workspace { branch_id } => {
+            let branch_id = branch_id
+                .read()
+                .map(|branch_id| branch_id.clone())
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "workspace branch selector cache is poisoned",
+                    )
+                })?;
+            let branch_ref = BranchRefStoreReader::new(read);
+            BranchLifecycle::new(&branch_ref)
+                .require_existing_ref(
+                    &branch_id,
+                    BranchOperation::LoadDefaultBranch,
+                    BranchReferenceRole::DefaultBranch,
+                )
+                .await?;
+            Ok(branch_id.clone())
+        }
+    }
+}
+
+fn validated_uuid_entity_pk(value: &str) -> Result<EntityPk, LixError> {
+    EntityPk::uuid_from_canonical(value).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("validated identity is not a canonical UUID: {error}"),
         )
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
-
-    use serde_json::json;
-
-    use super::*;
-    use crate::GLOBAL_BRANCH_ID;
-    use crate::NullableKeyFilter;
-    use crate::branch::BranchContext;
-    use crate::engine::Engine;
-    use crate::functions::{DeterministicFunctionProvider, FunctionProvider};
-    use crate::plugin::runtime::WasmRow;
-    use crate::storage_adapter::{Memory, StorageReadOptions};
-    use crate::tracked_state::{
-        TrackedStateDiffIdentity, TrackedStateKey, TrackedStateScanRequest,
-    };
-    use crate::transaction::staged_commit_changes::{
-        StagedCommitChangeBatchBuilder, StagedCommitChangeRefs,
-    };
-    use crate::transaction_types::TransactionJson;
-
-    fn raw_write_rows(rows: Vec<TransactionWriteRow>) -> RawWriteBatch {
-        RawWriteBatch::from_test_rows(rows)
-    }
-
-    fn hot_state_context() -> HotStateContext {
-        HotStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
-    }
-
-    const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
-
-    #[test]
-    fn semantic_conflict_limits_scale_host_owned_records_but_not_bytes_or_deadline() {
-        let defaults = WasmTransitionLimits::default();
-        let limits = conflict_resolution_limits(5_000).expect("conflict count should fit");
-
-        assert_eq!(limits.max_attachment_refs, 15_000);
-        assert_eq!(limits.max_pages, 5_001);
-        assert_eq!(limits.max_record_bytes, defaults.max_record_bytes);
-        assert_eq!(limits.max_page_bytes, defaults.max_page_bytes);
-        assert_eq!(limits.max_total_bytes, defaults.max_total_bytes);
-        assert_eq!(
-            limits.total_deadline_nanoseconds,
-            defaults.total_deadline_nanoseconds
-        );
-    }
-
-    #[test]
-    fn cold_successor_deadline_scales_with_submitted_file_size() {
-        let file_bytes = 10 * 1024 * 1024;
-        let limits = cold_successor_transition_limits(file_bytes);
-
-        assert_eq!(
-            limits,
-            WasmTransitionLimits::for_cold_file_bytes(file_bytes as u64)
-        );
-        assert!(
-            limits.total_deadline_nanoseconds
-                > WasmTransitionLimits::default().total_deadline_nanoseconds
-        );
-    }
-
-    #[test]
-    fn reconciliation_rows_share_one_static_surface_across_mark_calls() {
-        let mut first = key_value_stage_row("first", "value", false);
-        let mut second = key_value_stage_row("second", "value", false);
-
-        mark_plugin_reconciliation_row(&mut first);
-        mark_plugin_reconciliation_row(&mut second);
-
-        let first_surface = &first.origin.as_ref().expect("first origin").surface;
-        let second_surface = &second.origin.as_ref().expect("second origin").surface;
-        assert!(first_surface.shares_buffer_with(second_surface));
-        assert_eq!(
-            first_surface.as_bytes().as_ptr(),
-            second_surface.as_bytes().as_ptr()
-        );
-    }
-
-    #[test]
-    fn format_only_plugin_rows_share_one_certified_metadata_buffer() {
-        const ROW_COUNT: usize = 10_000;
-
-        let metadata = v2_format_only_metadata();
-        let mut rows = RawWriteBatch::with_capacity(ROW_COUNT);
-        for _ in 0..ROW_COUNT {
-            rows.push_parts(
-                None,
-                SharedStr::from_static("format_only_probe"),
-                None,
-                None,
-                Some(metadata.clone()),
-                None,
-                None,
-                None,
-                false,
-                None,
-                None,
-                false,
-                SharedStr::from_static("main"),
-            );
-        }
-
-        let first = rows
-            .row(0)
-            .metadata
-            .expect("format-only row carries metadata");
-        assert!(first.metadata_content_certified());
-        assert_eq!(first.normalized(), V2_FORMAT_ONLY_METADATA_JSON);
-        let first_pointer = first.normalized().as_ptr();
-        assert!(rows.iter().all(|row| {
-            let metadata = row.metadata.expect("format-only row carries metadata");
-            metadata.metadata_content_certified()
-                && metadata.normalized().as_ptr() == first_pointer
-                && metadata.normalized() == V2_FORMAT_ONLY_METADATA_JSON
-        }));
-    }
-
-    #[test]
-    fn selected_blob_ref_change_requires_filesystem_index_rebuild() {
-        let mut selected_changes = StagedCommitChangeRefs::default();
-        let mut batch = StagedCommitChangeBatchBuilder::with_capacity(1);
-        batch.push(
-            TrackedStateDiffIdentity::from_key(TrackedStateKey {
-                schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                file_id: Some("file-a".to_string()),
-                row_pk: RowPk::single("file-a"),
-            }),
-            CommitId::default(),
-            ChangeId::default(),
-            false,
-            LixTimestamp::from_unix_millis_utc_lossy(0),
-            LixTimestamp::from_unix_millis_utc_lossy(0),
-        );
-        selected_changes.add_selected_change_batch(batch.finish());
-        let prepared_writes = PreparedWriteSet {
-            state_rows: PreparedStateBatch::new(),
-            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
-            commit_change_refs_by_branch: BTreeMap::from([("main".to_string(), selected_changes)]),
-            first_commit_parent_override_by_branch: BTreeMap::new(),
-            checkpoint_publications: Vec::new(),
-            extra_commit_parents_by_branch: BTreeMap::new(),
-            intermediate_commits: Vec::new(),
-            file_content_writes: Vec::new(),
-        };
-
-        assert!(prepared_writes_require_filesystem_index_rebuild(
-            &prepared_writes
-        ));
-    }
-
-    /// An addressable filesystem row carries a provisional change id into
-    /// materialization, which is why the delta is projected out of the commit
-    /// rather than out of the caller's `PreparedWriteSet`. Addressability alone
-    /// says nothing about whether the staged rows describe the whole change,
-    /// so it must not force a rebuild — that is what made every file *create*
-    /// discard the cached path index.
-    #[test]
-    fn addressable_filesystem_row_does_not_require_index_rebuild() {
-        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
-        let mut state_rows = PreparedStateBatch::with_capacity(1);
-        state_rows.push_parts_with_change_addressability(
-            SchemaPlanId::for_test(0),
-            PreparedRowFacts::default(),
-            RowPk::single("file-a"),
-            BLOB_REF_SCHEMA_KEY.into(),
-            Some("file-a".into()),
-            None,
-            None,
-            None,
-            None,
-            timestamp,
-            timestamp,
-            false,
-            Some(ChangeId::for_test_label("provisional")),
-            true,
-            Some(CommitId::for_test_label("commit")),
-            false,
-            "main".into(),
-        );
-        let prepared_writes = PreparedWriteSet {
-            state_rows,
-            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
-            commit_change_refs_by_branch: BTreeMap::new(),
-            first_commit_parent_override_by_branch: BTreeMap::new(),
-            checkpoint_publications: Vec::new(),
-            extra_commit_parents_by_branch: BTreeMap::new(),
-            intermediate_commits: Vec::new(),
-            file_content_writes: Vec::new(),
-        };
-
-        assert!(prepared_writes_stage_filesystem_rows(&prepared_writes));
-        assert!(!prepared_writes_require_filesystem_index_rebuild(
-            &prepared_writes
-        ));
-    }
-
-    /// A branch ref move republishes the branch's whole visible filesystem, so
-    /// the staged rows cannot describe the difference.
-    #[test]
-    fn branch_ref_write_requires_filesystem_index_rebuild() {
-        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
-        let mut state_rows = PreparedStateBatch::with_capacity(1);
-        state_rows.push_parts_with_change_addressability(
-            SchemaPlanId::for_test(0),
-            PreparedRowFacts::default(),
-            RowPk::single("main"),
-            BRANCH_REF_SCHEMA_KEY.into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            timestamp,
-            timestamp,
-            true,
-            Some(ChangeId::for_test_label("branch-ref")),
-            false,
-            Some(CommitId::for_test_label("commit")),
-            false,
-            "main".into(),
-        );
-        let prepared_writes = PreparedWriteSet {
-            state_rows,
-            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
-            commit_change_refs_by_branch: BTreeMap::new(),
-            first_commit_parent_override_by_branch: BTreeMap::new(),
-            checkpoint_publications: Vec::new(),
-            extra_commit_parents_by_branch: BTreeMap::new(),
-            intermediate_commits: Vec::new(),
-            file_content_writes: Vec::new(),
-        };
-
-        assert!(prepared_writes_require_filesystem_index_rebuild(
-            &prepared_writes
-        ));
-    }
-
-    /// A global or untracked filesystem row changes visibility in every branch,
-    /// which a single-branch delta cannot describe. It is also the only staged
-    /// filesystem row that can be dropped before the delta is captured, by
-    /// `retain_untracked_rows_not_superseded_by_engine`, so the rebuild has to
-    /// be decided here rather than left to `advance_committed`'s own eviction —
-    /// that only sees the rows it is handed.
-    #[test]
-    fn global_or_untracked_filesystem_row_requires_index_rebuild() {
-        for (global, untracked) in [(true, false), (false, true), (true, true)] {
-            let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
-            let mut state_rows = PreparedStateBatch::with_capacity(1);
-            state_rows.push_parts_with_change_addressability(
-                SchemaPlanId::for_test(0),
-                PreparedRowFacts::default(),
-                RowPk::single("file-a"),
-                "lix_file_descriptor".into(),
-                Some("file-a".into()),
-                None,
-                None,
-                None,
-                None,
-                timestamp,
-                timestamp,
-                global,
-                Some(ChangeId::for_test_label("provisional")),
-                true,
-                Some(CommitId::for_test_label("commit")),
-                untracked,
-                "main".into(),
-            );
-            let prepared_writes = PreparedWriteSet {
-                state_rows,
-                insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
-                commit_change_refs_by_branch: BTreeMap::new(),
-                first_commit_parent_override_by_branch: BTreeMap::new(),
-                checkpoint_publications: Vec::new(),
-                extra_commit_parents_by_branch: BTreeMap::new(),
-                intermediate_commits: Vec::new(),
-                file_content_writes: Vec::new(),
-            };
-
-            assert!(
-                prepared_writes_require_filesystem_index_rebuild(&prepared_writes),
-                "global={global} untracked={untracked} must force a rebuild"
-            );
-        }
-    }
-
-    #[test]
-    fn visible_materialization_requires_a_matching_blob_ref_identity() {
-        let blob_hash = BlobId::from_content(b"base");
-        let row = |snapshot_id: &str| MaterializedHotStateRow {
-            row_pk: RowPk::single("01920000-0000-7000-8000-0000000000a2"),
-            schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-            file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
-            snapshot_content: Some(
-                serde_json::json!({
-                    "id": snapshot_id,
-                    "blob_hash": blob_hash.to_hex(),
-                })
-                .to_string()
-                .into(),
-            ),
-            metadata: None,
-            deleted: false,
-            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            global: false,
-            change_id: Some(ChangeId::default()),
-            commit_id: None,
-            untracked: false,
-            branch_id: "main".into(),
-        };
-
-        let visible = decode_visible_materialization(
-            &row("01920000-0000-7000-8000-0000000000a2"),
-            "01920000-0000-7000-8000-0000000000a2",
-        )
-        .expect("matching materialization should decode");
-        assert!(matches!(
-            visible.bytes,
-            VisibleMaterializationBytes::Blob { hash, .. } if hash == blob_hash
-        ));
-        let error = decode_visible_materialization(
-            &row("other-file"),
-            "01920000-0000-7000-8000-0000000000a2",
-        )
-        .expect_err("mismatched blob-ref identity must not authorize a cached actor base");
-        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-    }
-
-    #[test]
-    fn semantic_renderer_splice_provenance_is_bound_to_its_visible_blob() {
-        let base_blob_hash = BlobId::from_content(b"abcdef");
-        let rendered = semantic_rendered_file_content(
-            "01920000-0000-7000-8000-0000000000a2".to_string(),
-            "/document.md".to_string(),
-            "document.md".to_string(),
-            "main".to_string(),
-            false,
-            base_blob_hash,
-            b"abXYef".as_slice().into(),
-            Some(ValidatedSameLengthOutputSplice {
-                offset: 2,
-                length: 2,
-            }),
-        );
-
-        assert_eq!(rendered.base_blob_hash(), Some(base_blob_hash));
-        assert_eq!(
-            rendered.same_length_blob_splice(),
-            Some(crate::binary_cas::BlobSameLengthSplice::new(
-                base_blob_hash,
-                2,
-                2,
-            ))
-        );
-
-        let malformed = semantic_rendered_file_content(
-            "01920000-0000-7000-8000-0000000000a2".to_string(),
-            "/document.md".to_string(),
-            "document.md".to_string(),
-            "main".to_string(),
-            false,
-            base_blob_hash,
-            b"abXYef".as_slice().into(),
-            Some(ValidatedSameLengthOutputSplice {
-                offset: 6,
-                length: 1,
-            }),
-        );
-        assert_eq!(malformed.base_blob_hash(), Some(base_blob_hash));
-        assert_eq!(
-            malformed.same_length_blob_splice(),
-            None,
-            "transaction-side bounds checks must force malformed metadata through the ordinary CAS path"
-        );
-    }
-
-    #[test]
-    fn format_only_equal_snapshots_are_semantic_noops() {
-        let key = |id: &str| WasmRowKey::from_owned_parts("plugin_note", vec![id.to_string()]);
-        let live = |id: &str, snapshot_content: &str| MaterializedHotStateRow {
-            row_pk: RowPk::single(id),
-            schema_key: "plugin_note".to_string(),
-            file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
-            snapshot_content: Some(snapshot_content.to_string().into()),
-            metadata: None,
-            deleted: false,
-            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            global: false,
-            change_id: None,
-            commit_id: None,
-            untracked: false,
-            branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
-        };
-        let upsert = |id: &str, snapshot: &[u8], effect| {
-            let value = serde_json::from_slice::<JsonValue>(snapshot)
-                .expect("test snapshot must contain valid JSON");
-            let normalized_len = u32::try_from(snapshot.len()).expect("test snapshot fits u32");
-            let canonical = crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(
-                vec![value],
-                snapshot.to_vec(),
-                vec![(0, normalized_len)],
-                1,
-                1,
-            )
-            .expect("test canonical batch must be valid")
-            .pop()
-            .expect("test canonical batch has one row");
-            WasmRowChange::Upsert {
-                row: WasmRow {
-                    key: key(id),
-                    snapshot_content: WasmHostBytes::CanonicalJson(canonical),
-                },
-                effect,
-            }
-        };
-        let changes = WasmHostRowChanges {
-            changes: vec![
-                upsert(
-                    "equal",
-                    r#"{"id":"equal","text":"é"}"#.as_bytes(),
-                    WasmChangeEffect::FormatOnly,
-                ),
-                upsert(
-                    "changed",
-                    br#"{"id":"changed","text":"new"}"#,
-                    WasmChangeEffect::FormatOnly,
-                ),
-                upsert(
-                    "content",
-                    br#"{"id":"content","text":"same"}"#,
-                    WasmChangeEffect::Content,
-                ),
-                WasmRowChange::Delete(key("deleted")),
-            ],
-        };
-        let accepted = [
-            (
-                key("equal"),
-                Some(live("equal", r#"{"text":"\u00e9","id":"equal"}"#)),
-            ),
-            (
-                key("changed"),
-                Some(live("changed", r#"{"id":"changed","text":"old"}"#)),
-            ),
-            (
-                key("content"),
-                Some(live("content", r#"{"id":"content","text":"same"}"#)),
-            ),
-        ];
-        let accepted_keys = accepted
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        let accepted = MaterializedHotStateExactBatch::from_rows(
-            accepted.into_iter().map(|(_, row)| row).collect(),
-        );
-
-        let effective =
-            suppress_format_only_noops_against_batch(changes, &accepted_keys, &accepted)
-                .expect("number-free normalized snapshots should compare");
-        assert_eq!(effective.changes.len(), 3);
-        assert_eq!(effective.changes[0].row_key(), Some(&key("changed")));
-        assert_eq!(effective.changes[1].row_key(), Some(&key("content")));
-        assert_eq!(effective.changes[2].row_key(), Some(&key("deleted")));
-    }
-
-    #[test]
-    fn plugin_owner_is_only_rewritten_when_its_durable_contract_changes() {
-        let current = PluginFileOwner::new(
-            "01920000-0000-7000-8000-0000000000a2",
-            "plugin-a",
-            vec!["schema-a".to_string()],
-        )
-        .expect("current owner should be valid");
-        assert!(!plugin_owner_needs_write(Some(&current), &current));
-        assert!(plugin_owner_needs_write(None, &current));
-
-        for desired in [
-            PluginFileOwner::new(
-                "01920000-0000-7000-8000-0000000000a2",
-                "plugin-b",
-                vec!["schema-a".to_string()],
-            )
-            .expect("changed plugin owner should be valid"),
-            PluginFileOwner::new(
-                "01920000-0000-7000-8000-0000000000a2",
-                "plugin-a",
-                vec!["schema-b".to_string()],
-            )
-            .expect("changed schema owner should be valid"),
-        ] {
-            assert!(plugin_owner_needs_write(Some(&current), &desired));
-        }
-    }
-
-    #[test]
-    fn active_branch_write_gate_ignores_global_companion_rows_and_files() {
-        let mut active_row = key_value_stage_row("active-row", "value", false);
-        active_row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
-        active_row.global = false;
-        let mut global_row = key_value_stage_row("global-row", "value", false);
-        global_row.branch_id = GLOBAL_BRANCH_ID.into();
-        global_row.global = true;
-        let global_file = TransactionFileContent::new(
-            "global-file".to_string(),
-            None,
-            None,
-            GLOBAL_BRANCH_ID.to_string(),
-            true,
-            false,
-            Vec::new(),
-        );
-
-        assert!(
-            !transaction_write_targets_non_active_branch(
-                &TransactionWrite::RowsWithFileContent {
-                    mode: TransactionWriteMode::Replace,
-                    rows: raw_write_rows(vec![active_row.clone(), global_row]),
-                    file_content: vec![global_file],
-                    count: 1,
-                },
-                "01920000-0000-7000-8000-0000000000a1",
-            ),
-            "normal local writes commonly carry global bookkeeping rows"
-        );
-
-        active_row.branch_id = "01920000-0000-7000-8000-0000000000b1".into();
-        assert!(transaction_write_targets_non_active_branch(
-            &TransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows: raw_write_rows(vec![active_row]),
-            },
-            "01920000-0000-7000-8000-0000000000a1",
-        ));
-    }
-
-    enum UpgradePreflightBehavior {
-        Render(Vec<u8>),
-        Trap,
-    }
-
-    struct UpgradePreflightActor {
-        behavior: UpgradePreflightBehavior,
-        emitted: bool,
-        discarded: bool,
-        accepted_len: u64,
-    }
-
-    impl UpgradePreflightActor {
-        fn rendering(bytes: &[u8]) -> Self {
-            Self {
-                behavior: UpgradePreflightBehavior::Render(bytes.to_vec()),
-                emitted: false,
-                discarded: false,
-                accepted_len: 0,
-            }
-        }
-
-        fn trapping() -> Self {
-            Self {
-                behavior: UpgradePreflightBehavior::Trap,
-                emitted: false,
-                discarded: false,
-                accepted_len: 0,
-            }
-        }
-    }
-
-    fn unused_upgrade_actor_method() -> LixError {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "unused upgrade preflight actor method",
-        )
-    }
-
-    #[async_trait::async_trait]
-    impl WasmComponentActor for UpgradePreflightActor {
-        async fn fork_document(
-            &mut self,
-            document: WasmDocumentHandle,
-        ) -> Result<WasmDocumentHandle, LixError> {
-            Ok(document)
-        }
-
-        async fn open_file(
-            &mut self,
-            _limits: WasmTransitionLimits,
-            _input: WasmOpenFileInput,
-        ) -> Result<crate::plugin::runtime::WasmFileTransition, LixError> {
-            Err(unused_upgrade_actor_method())
-        }
-
-        async fn open_rows(
-            &mut self,
-            _limits: WasmTransitionLimits,
-            input: WasmOpenRowsInput,
-        ) -> Result<crate::plugin::runtime::WasmRowTransition, LixError> {
-            self.accepted_len = input.accepted.as_ref().map_or(0, |accepted| accepted.len());
-            match &self.behavior {
-                UpgradePreflightBehavior::Render(_) => {
-                    Ok(crate::plugin::runtime::WasmRowTransition {
-                        transition: crate::plugin::runtime::WasmTransitionHandle(1),
-                        document: WasmDocumentHandle(2),
-                        edits: crate::plugin::runtime::WasmEditCursorHandle(3),
-                    })
-                }
-                UpgradePreflightBehavior::Trap => Err(LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    "synthetic replacement trap",
-                )),
-            }
-        }
-
-        async fn file_changed(
-            &mut self,
-            _document: WasmDocumentHandle,
-            _limits: WasmTransitionLimits,
-            _update: WasmFileUpdate,
-        ) -> Result<crate::plugin::runtime::WasmFileTransition, LixError> {
-            Err(unused_upgrade_actor_method())
-        }
-
-        async fn rows_changed(
-            &mut self,
-            _document: WasmDocumentHandle,
-            _limits: WasmTransitionLimits,
-            _update: WasmRowUpdate,
-        ) -> Result<crate::plugin::runtime::WasmRowTransition, LixError> {
-            Err(unused_upgrade_actor_method())
-        }
-
-        async fn next_change_page(
-            &mut self,
-            _transition: crate::plugin::runtime::WasmTransitionHandle,
-            _cursor: crate::plugin::runtime::WasmChangeCursorHandle,
-            _max_bytes: u32,
-        ) -> Result<Option<crate::plugin::runtime::WasmChangePage>, LixError> {
-            Err(unused_upgrade_actor_method())
-        }
-
-        async fn next_edit_page(
-            &mut self,
-            _transition: crate::plugin::runtime::WasmTransitionHandle,
-            _cursor: crate::plugin::runtime::WasmEditCursorHandle,
-            _max_edits: u32,
-            _max_inline_bytes: u32,
-        ) -> Result<Option<crate::plugin::runtime::WasmEditPage>, LixError> {
-            if self.emitted {
-                return Ok(None);
-            }
-            self.emitted = true;
-            let UpgradePreflightBehavior::Render(bytes) = &self.behavior else {
-                return Err(unused_upgrade_actor_method());
-            };
-            Ok(Some(crate::plugin::runtime::WasmEditPage {
-                edits: vec![crate::plugin::runtime::WasmOutputSplice {
-                    offset: 0,
-                    delete_len: self.accepted_len,
-                    insert: crate::plugin::runtime::WasmGuestBytes::Inline(bytes.clone().into()),
-                }],
-                outputs: None,
-            }))
-        }
-
-        async fn output_len(
-            &mut self,
-            _transition: crate::plugin::runtime::WasmTransitionHandle,
-            _outputs: crate::plugin::runtime::WasmByteOutputsHandle,
-            _index: u32,
-        ) -> Result<u64, LixError> {
-            Err(unused_upgrade_actor_method())
-        }
-
-        async fn read_output(
-            &mut self,
-            _transition: crate::plugin::runtime::WasmTransitionHandle,
-            _outputs: crate::plugin::runtime::WasmByteOutputsHandle,
-            _index: u32,
-            _offset: u64,
-            _length: u32,
-        ) -> Result<Vec<u8>, LixError> {
-            Err(unused_upgrade_actor_method())
-        }
-
-        async fn finish_transition(
-            &mut self,
-            _transition: crate::plugin::runtime::WasmTransitionHandle,
-        ) -> Result<crate::plugin::runtime::WasmTransitionCounters, LixError> {
-            Ok(crate::plugin::runtime::WasmTransitionCounters::default())
-        }
-
-        async fn discard_transition(
-            &mut self,
-            _transition: crate::plugin::runtime::WasmTransitionHandle,
-        ) -> Result<(), LixError> {
-            self.discarded = true;
-            Ok(())
-        }
-
-        fn is_retired(&self) -> bool {
-            false
-        }
-    }
-
-    fn upgrade_preflight_descriptor() -> WasmFileDescriptor {
-        WasmFileDescriptor {
-            path: Some("/owned.csv".to_string()),
-            plugin: WasmPluginSelection {
-                plugin_key: "plugin_csv".to_string(),
-                generation: "replacement".to_string(),
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn owned_component_upgrade_preflight_accepts_only_byte_stable_renderer() {
-        let expected: crate::Blob = b"first,one\n".as_slice().into();
-        let mut compatible = UpgradePreflightActor::rendering(expected.as_ref());
-        preflight_rendered_file(
-            &mut compatible,
-            upgrade_preflight_descriptor(),
-            Vec::new(),
-            expected.clone(),
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .expect("byte-stable replacement should pass preflight");
-
-        let mut output_changing = UpgradePreflightActor::rendering(b"changed\n");
-        let error = preflight_rendered_file(
-            &mut output_changing,
-            upgrade_preflight_descriptor(),
-            Vec::new(),
-            expected.clone(),
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .expect_err("output-changing replacement must fail preflight");
-        assert!(error.message.contains("expected bytes"), "{error:?}");
-        assert!(
-            output_changing.discarded,
-            "host rejection must discard the prospective transition"
-        );
-
-        let mut trapping = UpgradePreflightActor::trapping();
-        let error = preflight_rendered_file(
-            &mut trapping,
-            upgrade_preflight_descriptor(),
-            Vec::new(),
-            expected,
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .expect_err("trapping replacement must fail preflight");
-        assert!(error.message.contains("synthetic replacement trap"));
-    }
-
-    fn upgrade_test_entry(hash_byte: char) -> PluginRegistryEntry {
-        let hash = std::iter::repeat_n(hash_byte, 64).collect::<String>();
-        PluginRegistryEntry::new(PluginRegistryEntryInput {
-            key: "plugin_csv".to_string(),
-            runtime: crate::plugin::runtime::PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
-            path_glob: "*.csv".to_string(),
-            content: Some(PluginContentMatcher::Text),
-            entry: "plugin.wasm".to_string(),
-            schema_keys: vec!["csv_row".to_string()],
-            create_schema_keys: vec!["csv_row".to_string()],
-            manifest_json: r#"{"entry":"plugin.wasm","key":"plugin_csv","match":{"content":"text","path_glob":"*.csv"},"schemas":["schema/csv_row.json"]}"#.to_string(),
-            archive_file_id: crate::plugin::runtime::plugin_storage_archive_file_id("plugin_csv"),
-            archive_path: "/.lix/plugins/plugin_csv.lixplugin".to_string(),
-            archive_blob_hash: hash.clone(),
-            wasm_blob_hash: hash,
-        })
-        .expect("upgrade test registry entry should be valid")
-    }
-
-    #[test]
-    fn owned_component_upgrade_rejects_schema_definition_change_before_authority_swap() {
-        let previous = upgrade_test_entry('a');
-        let upgrade = PluginGenerationUpgrade {
-            branch_id: "main".to_string(),
-            previous: previous.clone(),
-            replacement: upgrade_test_entry('b'),
-        };
-        let definition = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "csv_row",
-            "columns": [{ "name": "id", "type": "text", "nullable": false }],
-            "primary_key": ["id"],
-        });
-        let current = BTreeMap::from([(
-            ("main".to_string(), "csv_row".to_string()),
-            definition.clone(),
-        )]);
-        validate_owned_upgrade_schema_definitions(
-            &upgrade,
-            "owned-file",
-            &current,
-            &BTreeMap::from([("csv_row".to_string(), definition)]),
-        )
-        .expect("identical schema definitions should be compatible");
-
-        let error = validate_owned_upgrade_schema_definitions(
-            &upgrade,
-            "owned-file",
-            &current,
-            &BTreeMap::from([(
-                "csv_row".to_string(),
-                json!({
-                    "$schema": "https://lix.dev/schema-v1.json",
-                    "key": "csv_row",
-                    "columns": [
-                        { "name": "extra", "type": "text", "nullable": false },
-                    ],
-                    "primary_key": ["extra"],
-                }),
-            )]),
-        )
-        .expect_err("schema definition change must fail before the registry write is staged");
-        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert!(error.message.contains("schema definition 'csv_row'"));
-        assert_eq!(
-            previous.archive_blob_hash(),
-            std::iter::repeat_n('a', 64).collect::<String>(),
-            "the previously loaded authoritative entry remains untouched on rejection"
-        );
-    }
-
-    #[test]
-    fn complete_certified_transition_replaces_prior_row_authority() {
-        let plugin = upgrade_test_entry('a');
-        let prior_key =
-            WasmRowKey::from_owned_parts("csv_row".to_owned(), vec!["removed-row".to_owned()]);
-        let prior = PluginRowAuthorities::from_keys(BTreeSet::from([prior_key.clone()]));
-        let creates = crate::plugin::runtime::WasmCreateContext {
-            high: 0x019a_0000_0000_7000,
-            low: 0x8000_0000,
-        };
-        let replacement_key = WasmRowKey::from_owned_parts(
-            "csv_row".to_owned(),
-            creates.row_pk(7).expect("replacement identity"),
-        );
-        let certified = WasmCertifiedRowBatch {
-            format: 1,
-            schema_keys: vec!["csv_row".to_owned()],
-            row_count: 1,
-            creates,
-            create_ranges: vec![crate::plugin::runtime::WasmCertifiedCreateRange {
-                schema_key: "csv_row".to_owned(),
-                first_local_ref: 7,
-                last_local_ref: 7,
-            }],
-            complete_file_state: true,
-            pages: vec![Bytes::new()],
-        };
-
-        let successor = plugin_row_authorities_after_transition(
-            &plugin,
-            &prior,
-            &WasmHostRowChanges {
-                changes: Vec::new(),
-            },
-            &[certified],
-        )
-        .expect("complete certified authority should rebuild");
-
-        assert!(!successor.contains(&prior_key));
-        assert!(successor.contains(&replacement_key));
-    }
-
-    /// Mechanism probe for the `lix_file` content-update scaling defect.
-    ///
-    /// A content-only update changes no descriptor -- same path, same name,
-    /// same parent -- so the visible filesystem path index is unchanged by it.
-    /// This measures how many times that index is nevertheless rebuilt from
-    /// scratch, and how many descriptor rows each rebuild reads, so the cost
-    /// can be attributed to repository size rather than inferred from timings.
-    ///
-    /// The counter lives inside `build_path_index`, the only full-rebuild site,
-    /// which is a different layer from the timing instrument that first showed
-    /// the slope.
-    #[tokio::test]
-    async fn content_updates_hit_the_path_index_cache_and_do_not_rebuild_it() {
-        async fn measure(files: usize, updates: usize) -> (usize, usize, usize, usize) {
-            let storage = Memory::new();
-            Engine::initialize(storage.clone())
-                .await
-                .expect("storage should initialize");
-            let engine = Engine::new(storage)
-                .await
-                .expect("engine should open initialized storage");
-            let session = engine.open_session().await.expect("session should open");
-
-            let values = (0..files)
-                .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            session
-                .execute(
-                    &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
-                    &[],
-                )
-                .await
-                .expect("fixture files should commit");
-
-            let rows = session
-                .execute("SELECT id FROM lix_file ORDER BY path", &[])
-                .await
-                .expect("file ids should read back");
-            let ids = rows
-                .rows()
-                .iter()
-                .map(|row| {
-                    row.get::<String>("id")
-                        .expect("file row should carry an id")
-                })
-                .collect::<Vec<_>>();
-            assert!(ids.len() >= updates, "fixture must cover every update");
-
-            crate::filesystem::reset_full_rebuild_stats();
-            for id in ids.iter().take(updates) {
-                session
-                    .execute(
-                        "UPDATE lix_file SET content = $1 WHERE id = $2",
-                        &[
-                            Value::Blob(b"byte-02".to_vec().into()),
-                            Value::Text(id.clone()),
-                        ],
-                    )
-                    .await
-                    .expect("content update should commit");
-            }
-            let (builds, rows) = crate::filesystem::full_rebuild_stats();
-            let (hits, misses) = crate::filesystem::path_index_cache_stats();
-            (builds, rows, hits, misses)
-        }
-
-        let updates = 10;
-        let (small_builds, small_rows, small_hits, small_misses) = measure(50, updates).await;
-        let (large_builds, large_rows, large_hits, large_misses) = measure(500, updates).await;
-        println!(
-            "PATHINDEX files=50 builds={small_builds} rebuilt_rows={small_rows} hits={small_hits} misses={small_misses}"
-        );
-        println!(
-            "PATHINDEX files=500 builds={large_builds} rebuilt_rows={large_rows} hits={large_hits} misses={large_misses}"
-        );
-
-        // Connectivity: the lane really is exercised, so a zero rebuild count
-        // below is a positive result and not an instrument pointed elsewhere.
-        assert!(
-            small_hits >= updates && large_hits >= updates,
-            "each content update must consult the path-index cache: {small_hits} / {large_hits}"
-        );
-
-        // The measured result: content updates HIT this cache. The visible
-        // filesystem path index is NOT rebuilt per statement, so it is not the
-        // source of the per-statement cost that scales with repository size.
-        assert_eq!(
-            small_builds, 0,
-            "50-file repository rebuilt the path index {small_builds} times"
-        );
-        assert_eq!(
-            large_builds, 0,
-            "500-file repository rebuilt the path index {large_builds} times"
-        );
-        assert_eq!(small_rows, 0, "no rebuild should read descriptor rows");
-        assert_eq!(large_rows, 0, "no rebuild should read descriptor rows");
-    }
-
-    /// Does the single-row blob-ref probe every `lix_file` content update
-    /// issues push `row_pks` down to a seek, or scan the branch's whole
-    /// blob-ref collection and filter in memory?
-    ///
-    /// `rows_scanned` is what the hot-state scan handed back before visibility
-    /// resolution -- what storage actually read. `rows_returned` is what the
-    /// update consumed. If the pushdown works these track each other; if not,
-    /// `rows_scanned` tracks the repository size while `rows_returned` stays 1.
-    #[tokio::test]
-    async fn content_update_blob_ref_probe_scans_only_its_own_row() {
-        async fn measure(files: usize, updates: usize) -> (usize, usize, usize) {
-            let storage = Memory::new();
-            Engine::initialize(storage.clone())
-                .await
-                .expect("storage should initialize");
-            let engine = Engine::new(storage)
-                .await
-                .expect("engine should open initialized storage");
-            let session = engine.open_session().await.expect("session should open");
-
-            let values = (0..files)
-                .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            session
-                .execute(
-                    &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
-                    &[],
-                )
-                .await
-                .expect("fixture files should commit");
-
-            let rows = session
-                .execute("SELECT id FROM lix_file ORDER BY path", &[])
-                .await
-                .expect("file ids should read back");
-            let ids = rows
-                .rows()
-                .iter()
-                .map(|row| {
-                    row.get::<String>("id")
-                        .expect("file row should carry an id")
-                })
-                .collect::<Vec<_>>();
-            assert!(ids.len() >= updates, "fixture must cover every update");
-
-            crate::hot_state::reset_blob_ref_probe_stats();
-            for id in ids.iter().take(updates) {
-                session
-                    .execute(
-                        "UPDATE lix_file SET content = $1 WHERE id = $2",
-                        &[
-                            Value::Blob(b"byte-02".to_vec().into()),
-                            Value::Text(id.clone()),
-                        ],
-                    )
-                    .await
-                    .expect("content update should commit");
-            }
-            crate::hot_state::blob_ref_probe_stats()
-        }
-
-        let updates = 10;
-        let (small_calls, small_scanned, small_returned) = measure(50, updates).await;
-        let (large_calls, large_scanned, large_returned) = measure(500, updates).await;
-        println!(
-            "BLOBPROBE files=50 calls={small_calls} scanned={small_scanned} returned={small_returned}"
-        );
-        println!(
-            "BLOBPROBE files=500 calls={large_calls} scanned={large_scanned} returned={large_returned}"
-        );
-
-        // Connectivity: the probe really is issued once per content update, so
-        // a low scanned count below means the pushdown works rather than that
-        // this counter never ran.
-        assert_eq!(
-            small_calls, updates,
-            "each content update should issue exactly one blob-ref probe"
-        );
-        assert_eq!(
-            large_calls, updates,
-            "each content update should issue exactly one blob-ref probe"
-        );
-
-        // Each probe consumes exactly its own row, at both repository sizes.
-        assert_eq!(small_returned, updates, "one blob-ref row per update");
-        assert_eq!(large_returned, updates, "one blob-ref row per update");
-
-        // The claim under test: what storage READ must not grow with the
-        // repository. A 10x larger repository must not make this probe read
-        // 10x more rows.
-        assert!(
-            large_scanned < small_scanned * 5,
-            "blob-ref probe reads scale with repository size: \
-             50 files scanned {small_scanned}, 500 files scanned {large_scanned}"
-        );
-    }
-
-    /// The by-id content update must reach its blob-ref row by a point read,
-    /// never by walking the branch's blob-ref collection.
-    ///
-    /// This asserts on counters taken INSIDE `hot_scan_entries`, at the loop
-    /// that decodes each storage key. The predecessor of this test counted
-    /// `scan_batch`'s return value instead, which is already post
-    /// `matches_filter` and therefore reads identically under a seek and under
-    /// a full-prefix walk -- it reported "already a seek" for what was a walk
-    /// over every file in the branch. `entries_decoded` is the number that can
-    /// tell those apart, and `calls` makes a zero readable as "this arm did not
-    /// run" rather than "the counter did not run".
-    #[cfg(feature = "storage-benches")]
-    #[tokio::test]
-    async fn content_update_blob_ref_probe_takes_the_point_route() {
-        async fn measure(files: usize, updates: usize) -> (u64, u64, u64, u64, u64) {
-            let storage = Memory::new();
-            Engine::initialize(storage.clone())
-                .await
-                .expect("storage should initialize");
-            let engine = Engine::new(storage)
-                .await
-                .expect("engine should open initialized storage");
-            let session = engine.open_session().await.expect("session should open");
-
-            let values = (0..files)
-                .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            session
-                .execute(
-                    &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
-                    &[],
-                )
-                .await
-                .expect("fixture files should commit");
-
-            let rows = session
-                .execute("SELECT id FROM lix_file ORDER BY path", &[])
-                .await
-                .expect("file ids should read back");
-            let ids = rows
-                .rows()
-                .iter()
-                .map(|row| {
-                    row.get::<String>("id")
-                        .expect("file row should carry an id")
-                })
-                .collect::<Vec<_>>();
-            assert!(ids.len() >= updates, "fixture must cover every update");
-
-            let _ = crate::storage_bench::take_hot_blob_ref_scan_accounting();
-            for id in ids.iter().take(updates) {
-                session
-                    .execute(
-                        "UPDATE lix_file SET content = $1 WHERE id = $2",
-                        &[
-                            Value::Blob(b"byte-02".to_vec().into()),
-                            Value::Text(id.clone()),
-                        ],
-                    )
-                    .await
-                    .expect("content update should commit");
-            }
-            let (calls, point_batch, file_prefix, fallback, decoded, matched) =
-                crate::storage_bench::take_hot_blob_ref_scan_accounting();
-
-            // The update must actually have landed, or a cheap route would be
-            // cheap for the wrong reason.
-            for id in ids.iter().take(updates) {
-                let read = session
-                    .execute("SELECT content FROM lix_file WHERE id = $1", &[
-                        Value::Text(id.clone()),
-                    ])
-                    .await
-                    .expect("content should read back");
-                let row = read.rows().first().expect("updated file should be visible");
-                let content = read
-                    .get(row, "content")
-                    .expect("content column should be present");
-                assert!(
-                    matches!(content, Value::Blob(bytes) if bytes.as_ref() == b"byte-02"),
-                    "content update must be visible after the pinned probe"
-                );
-            }
-            let _ = crate::storage_bench::take_hot_blob_ref_scan_accounting();
-            let _ = (file_prefix, matched);
-            (calls, point_batch, fallback, decoded, matched)
-        }
-
-        let updates = 10;
-        let (small_calls, small_point, small_fallback, small_decoded, _) =
-            measure(50, updates).await;
-        let (large_calls, large_point, large_fallback, large_decoded, _) =
-            measure(500, updates).await;
-        println!(
-            "BLOBROUTE files=50 calls={small_calls} point={small_point} \
-fallback={small_fallback} decoded={small_decoded}"
-        );
-        println!(
-            "BLOBROUTE files=500 calls={large_calls} point={large_point} \
-fallback={large_fallback} decoded={large_decoded}"
-        );
-
-        // Connectivity: the probe really is issued, so the zeros below are
-        // readable as "that arm did not run".
-        assert!(
-            small_calls >= updates as u64 && large_calls >= updates as u64,
-            "every content update should issue a blob-ref probe: \
-             50 files {small_calls} calls, 500 files {large_calls} calls"
-        );
-
-        // The claim under test: the point route runs and the walk does not.
-        assert_eq!(small_fallback, 0, "50-file update must not walk the branch");
-        assert_eq!(large_fallback, 0, "500-file update must not walk the branch");
-        assert!(
-            small_point >= updates as u64 && large_point >= updates as u64,
-            "the point route must serve every probe"
-        );
-
-        // The number that distinguishes a seek from a walk, at both sizes. A
-        // 10x larger repository must not decode 10x more keys.
-        assert_eq!(
-            small_decoded, 0,
-            "a pinned probe decodes no scanned keys at 50 files"
-        );
-        assert_eq!(
-            large_decoded, 0,
-            "a pinned probe decodes no scanned keys at 500 files"
-        );
-    }
-
-    /// A blob-ref tombstone must not be mistaken for the live row, and must not
-    /// hide it.
-    ///
-    /// `append_blob_ref_tombstone_row` (reached here by deleting the file)
-    /// writes the tombstone with its `file_id` set from the same value as its
-    /// row PK, so pinning the file id cannot change which rows are visible.
-    /// A filter that missed the live row would look like a large speedup rather
-    /// than a bug, so this is asserted rather than argued: the file is deleted,
-    /// recreated under the SAME id so a tombstone and a live blob ref share one
-    /// file id, and then updated through the pinned by-id route.
-    #[tokio::test]
-    async fn content_update_after_blob_ref_tombstone_still_resolves() {
-        const ID: &str = "01920000-0000-7000-8000-0000000004a1";
-        const OTHER: &str = "01920000-0000-7000-8000-0000000004a2";
-
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("storage should initialize");
-        let engine = Engine::new(storage)
-            .await
-            .expect("engine should open initialized storage");
-        let session = engine.open_session().await.expect("session should open");
-
-        session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_file (id, path, content) VALUES \
-                     ('{ID}', '/a.md', CAST('one' AS BYTEA)), \
-                     ('{OTHER}', '/b.md', CAST('keep' AS BYTEA))"
-                ),
-                &[],
-            )
-            .await
-            .expect("fixture should commit");
-
-        // Deleting the file tombstones its blob ref.
-        session
-            .execute(
-                &format!("DELETE FROM lix_file WHERE id = '{ID}'"),
-                &[],
-            )
-            .await
-            .expect("delete should commit");
-
-        // Recreate under the same id, so one file id now owns both a blob-ref
-        // tombstone and a live blob ref.
-        session
-            .execute(
-                &format!(
-                    "INSERT INTO lix_file (id, path, content) VALUES \
-                     ('{ID}', '/a.md', CAST('two' AS BYTEA))"
-                ),
-                &[],
-            )
-            .await
-            .expect("recreate should commit");
-
-        let affected = session
-            .execute(
-                "UPDATE lix_file SET content = $1 WHERE id = $2",
-                &[
-                    Value::Blob(b"three".to_vec().into()),
-                    Value::Text(ID.to_string()),
-                ],
-            )
-            .await
-            .expect("content rewrite should commit");
-        assert_eq!(
-            affected.rows_affected(),
-            1,
-            "the pinned probe must still resolve a file whose id also owns a tombstone"
-        );
-
-        let read = session
-            .execute(
-                "SELECT content FROM lix_file WHERE id = $1",
-                &[Value::Text(ID.to_string())],
-            )
-            .await
-            .expect("content should read back");
-        let row = read.rows().first().expect("file should be visible");
-        let content = read
-            .get(row, "content")
-            .expect("content column should be present");
-        assert!(
-            matches!(content, Value::Blob(bytes) if bytes.as_ref() == b"three"),
-            "a rewrite over a tombstoned blob ref must resolve through the pinned probe, got {content:?}"
-        );
-
-        // The untouched sibling must be unaffected by pinning another file id.
-        let other = session
-            .execute("SELECT content FROM lix_file WHERE path = '/b.md'", &[])
-            .await
-            .expect("sibling should read back");
-        let other_row = other.rows().first().expect("sibling should be visible");
-        let other_content = other
-            .get(other_row, "content")
-            .expect("sibling content should be present");
-        assert!(
-            matches!(other_content, Value::Blob(bytes) if bytes.as_ref() == b"keep"),
-            "pinning one file id must not disturb another file"
-        );
-
-        // A file that is only tombstoned must match nothing, not a stale row.
-        session
-            .execute(
-                &format!("DELETE FROM lix_file WHERE id = '{OTHER}'"),
-                &[],
-            )
-            .await
-            .expect("second delete should commit");
-        let missing = session
-            .execute(
-                "UPDATE lix_file SET content = $1 WHERE id = $2",
-                &[
-                    Value::Blob(b"nope".to_vec().into()),
-                    Value::Text(OTHER.to_string()),
-                ],
-            )
-            .await
-            .expect("update against a deleted file should not error");
-        assert_eq!(
-            missing.rows_affected(),
-            0,
-            "a deleted file must not be resurrected by the pinned probe"
-        );
-    }
-
-    #[tokio::test]
-    async fn staged_descriptor_batches_advance_transaction_path_index() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("storage should initialize");
-        let engine = Engine::new(storage)
-            .await
-            .expect("engine should open initialized storage");
-        let session = engine.open_session().await.expect("session should open");
-
-        let values = (0..32)
-            .map(|index| format!("('/seed-{index:02}.md', CAST('byte-01' AS BYTEA))"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        session
-            .execute(
-                &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
-                &[],
-            )
-            .await
-            .expect("fixture files should commit");
-
-        let mut transaction = session
-            .begin_transaction()
-            .await
-            .expect("transaction should begin");
-        reset_transaction_path_index_build_stats();
-        for index in 0..5 {
-            transaction
-                .execute(
-                    &format!(
-                        "INSERT INTO lix_file (path, content) VALUES ('/staged-{index}.md', CAST('byte-02' AS BYTEA))"
-                    ),
-                    &[],
-                )
-                .await
-                .expect("descriptor batch should stage");
-            transaction
-                .execute(
-                    "UPDATE lix_file SET content = CAST('byte-03' AS BYTEA) WHERE path = '/seed-00.md'",
-                    &[],
-                )
-                .await
-                .expect("path lookup after the staged descriptor should succeed");
-            let rows = transaction
-                .execute(
-                    &format!(
-                        "SELECT lixcol_commit_id FROM lix_file WHERE path = '/staged-{index}.md'"
-                    ),
-                    &[],
-                )
-                .await
-                .expect("the advanced path-index row should remain queryable");
-            rows.rows()[0]
-                .get::<String>("lixcol_commit_id")
-                .expect("the advanced descriptor must retain its staged commit id");
-        }
-
-        let stats = transaction_path_index_build_stats();
-        assert_eq!(
-            stats.builds, 2,
-            "the data and metadata projections may each build once; later revisions must advance by delta"
-        );
-        assert!(
-            stats.descriptor_rows > 0,
-            "the regression must exercise a real transaction path-index build"
-        );
-        transaction
-            .rollback()
-            .await
-            .expect("transaction should roll back");
-    }
-
-    #[tokio::test]
-    #[ignore = "release-only transaction path-index benchmark probe"]
-    #[allow(clippy::large_futures)] // Boxing would add allocation to the measured execute path.
-    async fn transaction_path_index_benchmark_probe() {
-        let file_count = std::env::var("LIX_PATH_INDEX_BENCH_FILES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1_000);
-        let rounds = std::env::var("LIX_PATH_INDEX_BENCH_ROUNDS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(24);
-        let warmup_rounds = 4_usize;
-
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("storage should initialize");
-        let engine = Engine::new(storage)
-            .await
-            .expect("engine should open initialized storage");
-        let session = engine.open_session().await.expect("session should open");
-
-        let values = (0..file_count)
-            .map(|index| format!("('/seed-{index:05}.md', CAST('byte-01' AS BYTEA))"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        session
-            .execute(
-                &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
-                &[],
-            )
-            .await
-            .expect("fixture files should commit");
-
-        let mut transaction = session
-            .begin_transaction()
-            .await
-            .expect("transaction should begin");
-        transaction
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/transaction-anchor.md', CAST('byte-01' AS BYTEA))",
-                &[],
-            )
-            .await
-            .expect("transaction anchor descriptor should stage");
-
-        reset_transaction_path_index_build_stats();
-        let sql =
-            "UPDATE lix_file SET content = CAST('byte-02' AS BYTEA) WHERE path = '/seed-00000.md'";
-        for _ in 0..warmup_rounds {
-            transaction
-                .execute(sql, &[])
-                .await
-                .expect("warm transaction path update should succeed");
-        }
-
-        let mut samples = Vec::with_capacity(rounds);
-        for _ in 0..rounds {
-            let started = Instant::now();
-            transaction
-                .execute(sql, &[])
-                .await
-                .expect("timed transaction path update should succeed");
-            samples.push(started.elapsed());
-        }
-        samples.sort_unstable();
-        let percentile = |numerator: usize, denominator: usize| {
-            samples[(samples.len() - 1) * numerator / denominator]
-        };
-        let stats = transaction_path_index_build_stats();
-        println!(
-            "transaction_path_index_probe files={file_count} rounds={rounds} \
-             builds={} descriptor_rows={} p50_us={} p95_us={}",
-            stats.builds,
-            stats.descriptor_rows,
-            percentile(50, 100).as_micros(),
-            percentile(95, 100).as_micros(),
-        );
-        assert_eq!(
-            stats.builds, 1,
-            "repeated data-only path updates should reuse one transaction-visible index"
-        );
-        assert_eq!(
-            stats.descriptor_rows,
-            file_count + 1,
-            "the one cached build should include the staged anchor and committed files"
-        );
-
-        transaction
-            .rollback()
-            .await
-            .expect("benchmark transaction should roll back");
-    }
-
-    #[tokio::test]
-    #[ignore = "release-only committed filesystem index benchmark probe"]
-    async fn committed_filesystem_path_index_benchmark_probe() {
-        let file_count = std::env::var("LIX_PATH_INDEX_BENCH_FILES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1_000);
-        let rounds = std::env::var("LIX_PATH_INDEX_BENCH_ROUNDS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(24);
-        let warmup_rounds = 4_usize;
-
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("storage should initialize");
-        let engine = Engine::new(storage)
-            .await
-            .expect("engine should open initialized storage");
-        let session = engine.open_session().await.expect("session should open");
-
-        let values = (0..file_count)
-            .map(|index| {
-                format!("('file-{index:05}', '/seed-{index:05}.md', CAST('byte-01' AS BYTEA))")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        session
-            .execute(
-                &format!("INSERT INTO lix_file (id, path, content) VALUES {values}"),
-                &[],
-            )
-            .await
-            .expect("fixture files should commit");
-        session
-            .execute("SELECT id FROM lix_file WHERE path = '/seed-00000.md'", &[])
-            .await
-            .expect("fixture path index should warm");
-        crate::filesystem::reset_full_rebuild_stats();
-
-        let mut samples = Vec::with_capacity(rounds);
-        for iteration in 0..warmup_rounds.saturating_add(rounds) {
-            let path = if iteration % 2 == 0 {
-                "/renamed-00000.md"
-            } else {
-                "/seed-00000.md"
-            };
-            session
-                .execute(
-                    &format!("UPDATE lix_file SET path = '{path}' WHERE id = 'file-00000'"),
-                    &[],
-                )
-                .await
-                .expect("descriptor invalidation fixture should commit");
-            let started = Instant::now();
-            session
-                .execute(
-                    &format!("UPDATE lix_file SET content = CAST('byte-02' AS BYTEA) WHERE path = '{path}'"),
-                    &[],
-                )
-                .await
-                .expect("singleton write after descriptor commit should succeed");
-            let elapsed = started.elapsed();
-            if iteration >= warmup_rounds {
-                samples.push(elapsed);
-            }
-        }
-        samples.sort_unstable();
-        let percentile = |numerator: usize, denominator: usize| {
-            samples[(samples.len() - 1) * numerator / denominator]
-        };
-        println!(
-            "committed_filesystem_path_index_probe files={file_count} rounds={rounds} \
-             rebuilds={} descriptor_rows={} p50_us={} p95_us={}",
-            crate::filesystem::full_rebuild_stats().0,
-            crate::filesystem::full_rebuild_stats().1,
-            percentile(50, 100).as_micros(),
-            percentile(95, 100).as_micros(),
-        );
-        if incremental_filesystem_index_enabled() {
-            assert_eq!(
-                crate::filesystem::full_rebuild_stats(),
-                (0, 0),
-                "committed singleton updates must not rebuild or rescan descriptors"
-            );
-        }
-    }
-
-    /// Creating a file must advance the cached path index, not discard it.
-    ///
-    /// This is the create analogue of the `(0, 0)` assertion in
-    /// `committed_filesystem_path_index_benchmark_probe`, and it is a
-    /// *deterministic* statement of the property: a rebuild count does not
-    /// depend on machine, store shape, or fixture size, so it holds where a
-    /// timing comparison would be contaminated by the fixture — seeding this
-    /// workload runs through the very path the fix changes.
-    ///
-    /// Each insert also has to chain: the index advanced to revision N is what
-    /// insert N+1 must find, otherwise only the first create would be cheap.
-    #[tokio::test]
-    async fn committed_file_creates_advance_the_path_index_without_rebuilding() {
-        if !incremental_filesystem_index_enabled() {
-            return;
-        }
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("storage should initialize");
-        let engine = Engine::new(storage)
-            .await
-            .expect("engine should open initialized storage");
-        let session = engine.open_session().await.expect("session should open");
-
-        session
-            .execute(
-                "INSERT INTO lix_file (path, content) \
-                 VALUES ('/seed.md', CAST('byte-01' AS BYTEA))",
-                &[],
-            )
-            .await
-            .expect("seed file should commit");
-        session
-            .execute("SELECT id FROM lix_file WHERE path = '/seed.md'", &[])
-            .await
-            .expect("path index should warm");
-        crate::filesystem::reset_full_rebuild_stats();
-
-        // Reading after each create is what makes this discriminating. A create
-        // that fails to advance the index leaves the cache keyed on the
-        // superseded revision; nothing observes that until the next read
-        // arrives at the new revision, misses, and rebuilds.
-        for index in 0..8 {
-            session
-                .execute(
-                    &format!(
-                        "INSERT INTO lix_file (path, content) \
-                         VALUES ('/created-{index:02}.md', CAST('byte-01' AS BYTEA))"
-                    ),
-                    &[],
-                )
-                .await
-                .expect("created file should commit");
-            // The advanced index must be *correct*, not merely present: an
-            // under-projected delta that lost a row shows up here as a missing
-            // path rather than as a slow read.
-            let result = session
-                .execute(
-                    &format!("SELECT id FROM lix_file WHERE path = '/created-{index:02}.md'"),
-                    &[],
-                )
-                .await
-                .expect("created path should resolve through the advanced index");
-            assert_eq!(
-                result.len(),
-                1,
-                "created path /created-{index:02}.md must resolve after the index advanced"
-            );
-        }
-
-        assert_eq!(
-            crate::filesystem::full_rebuild_stats(),
-            (0, 0),
-            "committed file creates must advance the cached path index, not rebuild it"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_routes_tracked_and_untracked_rows_without_sql() {
-        let storage = Memory::new();
-        let storage = StorageAdapter::new(storage.clone());
-        let hot_state = Arc::new(hot_state_context());
-        seed_visible_schema_rows(storage.clone()).await;
-        let binary_cas = Arc::new(BinaryCasContext::new());
-        let tracked_state = Arc::new(TrackedStateContext::new());
-        let branch_ctx = Arc::new(BranchContext::new());
-        let catalog_context = Arc::new(CatalogContext::new());
-        let opened = open_transaction(
-            &SessionBranch::new(GLOBAL_BRANCH_ID.to_string()),
-            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            storage.clone(),
-            Arc::clone(&hot_state),
-            Arc::clone(&tracked_state),
-            Arc::clone(&binary_cas),
-            PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
-            Arc::clone(&branch_ctx),
-            Arc::clone(&catalog_context),
-            Arc::new(SqlPlanningCache::default()),
-            SessionFileViews::default(),
-        )
-        .await
-        .expect("transaction should open");
-        let mut transaction = opened.transaction;
-        let runtime_functions = opened.runtime_functions;
-
-        transaction
-            .stage_rows(raw_write_rows(vec![
-                key_value_stage_row("tracked-programmatic", "tracked", false),
-                key_value_stage_row("untracked-programmatic", "untracked", true),
-            ]))
-            .await
-            .expect("programmatic rows should stage");
-        let staged = transaction
-            .scan_hot_state_batch(&HotStateScanRequest {
-                filter: HotStateFilter {
-                    schema_keys: vec!["lix_key_value".to_string()],
-                    row_pks: vec![RowPk::single("tracked-programmatic")],
-                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
-                    file_ids: vec![NullableKeyFilter::Null],
-                    untracked: Some(false),
-                    ..Default::default()
-                },
-                limit: Some(1),
-                ..Default::default()
-            })
-            .await
-            .expect("staged tracked row should scan");
-        assert_eq!(staged.len(), 1, "staged tracked row should be visible");
-        let staged = staged.row(0);
-        assert_eq!(
-            staged.change_id(),
-            None,
-            "provisional engine-generated change IDs must not escape before commit"
-        );
-        transaction
-            .commit(&runtime_functions)
-            .await
-            .expect("transaction should commit");
-
-        let tracked_row = hot_state
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .load_row(&HotStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                row_pk: RowPk::single("tracked-programmatic"),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await
-            .expect("tracked row should load")
-            .expect("tracked row should exist");
-        let tracked_change_id = tracked_row
-            .change_id
-            .as_ref()
-            .expect("tracked row should have a change id")
-            .clone();
-        let packed_read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("packed payload read should open");
-        let inventory = crate::tracked_state::scan_commit_delta_inventory(&packed_read)
-            .await
-            .expect("packed authority should scan");
-        assert!(
-            inventory
-                .commits
-                .values()
-                .any(|entry| entry
-                    .members
-                    .iter()
-                    .any(|member| member.change.change_id == tracked_change_id
-                        && member.change.row_pk.as_single_string_owned().as_deref()
-                            == Ok("tracked-programmatic"))),
-            "tracked staged row should be authoritative in a packed commit delta"
-        );
-
-        let head_commit_id = branch_ctx
-            .ref_reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .load_head_commit_id(GLOBAL_BRANCH_ID)
-            .await
-            .expect("branch ref should load")
-            .expect("tracked commit should advance the global branch ref");
-        assert_eq!(
-            &tracked_change_id.as_uuid().as_bytes()[..12],
-            &head_commit_id.as_uuid().as_bytes()[..12],
-            "fresh tracked changes should carry their commit-delta address"
-        );
-        assert_eq!(
-            &head_commit_id.as_uuid().as_bytes()[12..],
-            &[0; 4],
-            "fresh commit ids should reserve the packed change address suffix"
-        );
-        let addressed_change =
-            crate::tracked_state::load_change_record_by_id(&packed_read, tracked_change_id)
-                .await
-                .expect("direct change address should load")
-                .expect("direct change address should exist");
-        assert_eq!(
-            addressed_change
-                .row_pk
-                .as_single_string_owned()
-                .as_deref(),
-            Ok("tracked-programmatic")
-        );
-
-        let tracked_row = TrackedStateContext::new()
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .load_batch_at_commit(
-                &head_commit_id.to_string(),
-                &[TrackedStateKey {
-                    schema_key: "lix_key_value".to_string(),
-                    row_pk: RowPk::single("tracked-programmatic"),
-                    file_id: None,
-                }],
-            )
-            .await
-            .expect("tracked state should load")
-            .into_rows()
-            .pop()
-            .flatten()
-            .expect("tracked row should be present in tracked state");
-        assert_eq!(tracked_row.commit_id, head_commit_id);
-        assert_eq!(
-            tracked_row.snapshot_content.as_deref(),
-            Some(r#"{"key":"tracked-programmatic","value":"tracked"}"#)
-        );
-
-        let live_untracked_row = hot_state
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .load_row(&HotStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                row_pk: RowPk::single("untracked-programmatic"),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await
-            .expect("live state should load")
-            .expect("untracked row should be visible through live state");
-        assert!(live_untracked_row.untracked);
-        assert!(live_untracked_row.global);
-        assert_eq!(live_untracked_row.branch_id.as_ref(), GLOBAL_BRANCH_ID);
-        assert_eq!(
-            live_untracked_row.snapshot_content.as_deref(),
-            Some(r#"{"key":"untracked-programmatic","value":"untracked"}"#)
-        );
-        // A change id is identity, not changelog membership. This assertion
-        // used to read `change_id == None` and stand in for "not in the
-        // changelog", which only worked while untracked rows had no id at all.
-        // Exclusion is asserted directly against tracked state below; here we
-        // assert the identity the row is now required to carry. The id is a
-        // freshly drawn v7 and therefore differs per run, so assert the
-        // property rather than recording a literal.
-        let untracked_change_id = live_untracked_row
-            .change_id
-            .expect("ordinary untracked rows must carry a change id");
-        assert!(
-            !untracked_change_id.as_uuid().is_nil(),
-            "an untracked row's change id must be a real minted id, not a nil placeholder"
-        );
-        assert_eq!(
-            live_untracked_row.commit_id, None,
-            "ordinary untracked rows must not enter the commit graph"
-        );
-
-        let tracked_rows = TrackedStateContext::new()
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .scan_batch_at_commit(
-                &head_commit_id.to_string(),
-                &TrackedStateScanRequest::default(),
-            )
-            .await
-            .expect("tracked state should scan")
-            .into_rows();
-        assert!(
-            tracked_rows
-                .iter()
-                .all(|row| row.row_pk.as_single_string_owned().as_deref()
-                    != Ok("untracked-programmatic")),
-            "untracked staged rows should not be written into tracked state"
-        );
-    }
-
-    #[tokio::test]
-    async fn transaction_open_prewarms_tracked_and_sql_schema_catalogs() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, transaction) =
-            open_test_transaction(&storage).await;
-
-        assert!(
-            transaction
-                .schema_resolver
-                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID, true))
-        );
-        assert!(
-            transaction
-                .schema_resolver
-                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID, false))
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_accepts_lossy_iso_timestamps_without_sql() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-
-        let mut row = key_value_stage_row("lossy-timestamp", "value", true);
-        row.created_at = Some("1969-12-31T23:59:59.999999Z".to_string());
-        row.updated_at = Some("2026-04-23T00:00:00.123456Z".to_string());
-
-        let outcome = transaction
-            .stage_rows(raw_write_rows(vec![row]))
-            .await
-            .expect("valid ISO timestamps should stage after lossy normalization");
-        assert_eq!(outcome.count, 1);
-
-        let rows = transaction
-            .scan_hot_state_batch(&HotStateScanRequest {
-                filter: HotStateFilter {
-                    schema_keys: vec!["lix_key_value".to_string()],
-                    row_pks: vec![RowPk::single("lossy-timestamp")],
-                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
-                    file_ids: vec![NullableKeyFilter::Null],
-                    untracked: Some(true),
-                    ..Default::default()
-                },
-                limit: Some(1),
-                ..Default::default()
-            })
-            .await
-            .expect("staged row should scan through transaction live state");
-
-        assert_eq!(rows.len(), 1);
-        assert!(
-            rows.row(0).change_id().is_some(),
-            "prepared untracked rows must receive a real change id"
-        );
-        assert_eq!(
-            rows.row(0).created_at().to_string(),
-            "1970-01-01T00:00:00.000Z"
-        );
-        assert_eq!(
-            rows.row(0).updated_at().to_string(),
-            "2026-04-23T00:00:00.123Z"
-        );
-    }
-
-    #[test]
-    fn explicit_row_timestamps_do_not_advance_deterministic_sequence() {
-        let mut row = key_value_stage_row("explicit-timestamps", "value", true);
-        row.created_at = Some("2026-04-23T00:00:00.123Z".to_string());
-        row.updated_at = Some("2026-04-24T00:00:00.456Z".to_string());
-        row.change_id = Some(ChangeId::for_test_label("explicit-change").to_string());
-        let rows = raw_write_rows(vec![row]);
-        let functions =
-            FunctionProviderHandle::shared(Box::new(DeterministicFunctionProvider::new(0, false)));
-        let mut default_timestamp = None;
-
-        let planned = plan_prepared_row_scalars(
-            rows.row(0),
-            NormalizedRowFacts {
-                schema_plan_id: SchemaPlanId::for_test(0),
-                facts: PreparedRowFacts::default(),
-            },
-            &functions,
-            &mut default_timestamp,
-        )
-        .expect("explicit row timestamps should plan");
-
-        assert_eq!(planned.created_at.to_string(), "2026-04-23T00:00:00.123Z");
-        assert_eq!(planned.updated_at.to_string(), "2026-04-24T00:00:00.456Z");
-        assert_eq!(default_timestamp, None);
-        assert_eq!(
-            functions.deterministic_sequence_persist_highest_seen(),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_validates_row_content_before_persistence() {
-        let storage = Memory::new();
-        let storage = StorageAdapter::new(storage.clone());
-        let hot_state = Arc::new(hot_state_context());
-        seed_visible_schema_rows(storage.clone()).await;
-        let binary_cas = Arc::new(BinaryCasContext::new());
-        let branch_ctx = Arc::new(BranchContext::new());
-        let catalog_context = Arc::new(CatalogContext::new());
-        let opened = open_transaction(
-            &SessionBranch::new(GLOBAL_BRANCH_ID.to_string()),
-            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            storage.clone(),
-            Arc::clone(&hot_state),
-            Arc::new(TrackedStateContext::new()),
-            Arc::clone(&binary_cas),
-            PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
-            Arc::clone(&branch_ctx),
-            Arc::clone(&catalog_context),
-            Arc::new(SqlPlanningCache::default()),
-            SessionFileViews::default(),
-        )
-        .await
-        .expect("transaction should open");
-        let mut transaction = opened.transaction;
-
-        let mut invalid_row = key_value_stage_row("invalid-programmatic", "invalid", false);
-        invalid_row.snapshot = Some(TransactionJson::from_value_for_test(
-            json!({"key": "invalid-programmatic", "extra": true}),
-        ));
-        let error = transaction
-            .stage_rows(raw_write_rows(vec![invalid_row]))
-            .await
-            .expect_err("row-local validation should reject while staging");
-        assert!(
-            error.message.contains("snapshot_content validation failed"),
-            "validation error should explain the rejected schema data: {error:?}"
-        );
-
-        let head = branch_ctx
-            .ref_reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .load_head_commit_id(GLOBAL_BRANCH_ID)
-            .await
-            .expect("branch ref should load after failed commit");
-        assert_eq!(
-            head,
-            Some(CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID)),
-            "validation failure must not advance the branch ref"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_rejects_non_object_metadata_without_sql() {
-        let storage = Memory::new();
-        let (hot_state, _binary_cas, branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-        let storage = StorageAdapter::new(storage);
-
-        let mut row = key_value_stage_row("invalid-metadata", "value", false);
-        row.metadata = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
-        let error = transaction
-            .stage_rows(raw_write_rows(vec![row]))
-            .await
-            .expect_err("non-object metadata should fail statement validation");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(
-            error.message.contains("metadata") && error.message.contains("JSON object"),
-            "error should explain metadata object validation: {error:?}"
-        );
-        assert_no_persistence_after_validation_failure(
-            storage.clone(),
-            &hot_state,
-            &branch_ref,
-            "invalid-metadata",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn stage_rows_rejects_unknown_schema_key_without_sql() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-
-        let mut row = key_value_stage_row("unknown-schema", "value", false);
-        row.schema_key = "missing_schema".into();
-
-        let error = transaction
-            .stage_rows(raw_write_rows(vec![row]))
-            .await
-            .expect_err("unknown schema should be rejected while staging");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error
-                .message
-                .contains("schema 'missing_schema' is not visible"),
-            "error should explain missing schema visibility: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_rejects_missing_branch_without_sql() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-
-        let mut row = key_value_stage_row("ghost-branch-row", "value", false);
-        row.branch_id = "ghost-branch".into();
-        row.global = false;
-
-        let error = transaction
-            .stage_rows(raw_write_rows(vec![row]))
-            .await
-            .expect_err("missing branch should be rejected before staging");
-
-        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
-        assert!(
-            error
-                .message
-                .contains("branch 'ghost-branch' was not found"),
-            "error should explain missing branch: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_rejects_invalid_storage_scope_without_sql() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-
-        let mut row = key_value_stage_row("invalid-storage-scope", "value", false);
-        row.branch_id = GLOBAL_BRANCH_ID.into();
-        row.global = false;
-
-        let error = transaction
-            .stage_rows(raw_write_rows(vec![row]))
-            .await
-            .expect_err("invalid storage scope should be rejected before staging");
-
-        assert_eq!(error.code, LixError::CODE_INVALID_STORAGE_SCOPE);
-        assert!(
-            error
-                .message
-                .contains("branch_id='ffffffff-ffff-7fff-bfff-ffffffffffff', global=false"),
-            "error should explain invalid storage scope: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_rejects_invalid_snapshot_json_without_sql() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-
-        let mut row = key_value_stage_row("invalid-json", "value", false);
-        row.snapshot = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
-
-        let error = transaction
-            .stage_rows(raw_write_rows(vec![row]))
-            .await
-            .expect_err("non-object snapshot should be rejected while staging");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(
-            error.message.contains("must be a JSON object"),
-            "error should explain invalid snapshot shape: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_rejects_snapshot_with_unknown_schema_v1_column_without_sql() {
-        let storage = Memory::new();
-        let (hot_state, _binary_cas, branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-        let storage = StorageAdapter::new(storage);
-
-        let mut row = key_value_stage_row("schema-mismatch", "value", false);
-        row.snapshot = Some(TransactionJson::from_value_for_test(
-            json!({"key": "schema-mismatch", "extra": true}),
-        ));
-        let error = transaction
-            .stage_rows(raw_write_rows(vec![row]))
-            .await
-            .expect_err("unknown Schema v1 column should fail statement validation");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(
-            error.message.contains("snapshot_content validation failed"),
-            "error should explain JSON Schema validation: {error:?}"
-        );
-        assert_no_persistence_after_validation_failure(
-            storage.clone(),
-            &hot_state,
-            &branch_ref,
-            "schema-mismatch",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn stage_rows_rejects_malformed_registered_schema_without_sql() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-
-        let mut row = key_value_stage_row("malformed-registered-schema", "value", false);
-        row.schema_key = "lix_registered_schema".into();
-        row.snapshot = Some(TransactionJson::from_value_for_test(json!({
-            "value": {
-                "$schema": "https://lix.dev/schema-v1.json",
-                "key": "malformed_registered_schema",
-                "columns": [{ "name": "id", "type": "text", "nullable": false }],
-                "primary_key": ["missing"]
-            }
-        })));
-        row.row_pk = None;
-
-        let error = transaction
-            .stage_rows(raw_write_rows(vec![row]))
-            .await
-            .expect_err("malformed registered schema should be rejected while staging");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error.message.contains("unknown column 'missing'"),
-            "error should explain malformed registered schema: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_rejects_primary_key_row_pk_mismatch_without_sql() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-
-        let mut row = key_value_stage_row("right-id", "value", false);
-        row.row_pk = Some(RowPk::single("wrong-id"));
-
-        let error = transaction
-            .stage_rows(raw_write_rows(vec![row]))
-            .await
-            .expect_err("row pk mismatch should be rejected while staging");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(
-            error
-                .message
-                .contains("does not match primary_key-derived row_pk"),
-            "error should explain row pk mismatch: {error:?}"
-        );
-    }
-
-    #[derive(Clone)]
-    struct CountingPreparationProvider {
-        uuid_calls: Arc<AtomicUsize>,
-        timestamp_calls: Arc<AtomicUsize>,
-    }
-
-    impl FunctionProvider for CountingPreparationProvider {
-        fn uuid_v7(&mut self) -> uuid::Uuid {
-            let call = self.uuid_calls.fetch_add(1, Ordering::SeqCst) + 1;
-            counting_preparation_uuid(call)
-        }
-
-        fn timestamp(&mut self) -> LixTimestamp {
-            self.timestamp_calls.fetch_add(1, Ordering::SeqCst);
-            LixTimestamp::expect_parse("test timestamp", "2026-01-01T00:00:00.000Z")
-        }
-    }
-
-    fn counting_preparation_uuid(call: usize) -> uuid::Uuid {
-        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000_u128 + call as u128)
-    }
-
-    fn install_counting_preparation_provider(
-        transaction: &mut Transaction,
-    ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let uuid_calls = Arc::new(AtomicUsize::new(0));
-        let timestamp_calls = Arc::new(AtomicUsize::new(0));
-        transaction.functions =
-            FunctionProviderHandle::shared(Box::new(CountingPreparationProvider {
-                uuid_calls: Arc::clone(&uuid_calls),
-                timestamp_calls: Arc::clone(&timestamp_calls),
-            }));
-        (uuid_calls, timestamp_calls)
-    }
-
-    fn account_stage_row(name: &str) -> TransactionWriteRow {
-        TransactionWriteRow {
-            row_pk: None,
-            schema_key: "lix_account".into(),
-            file_id: None,
-            snapshot: Some(TransactionJson::from_value_for_test(
-                json!({ "name": name, "kind": "human", "status": "active" }),
-            )),
-            metadata: None,
-            origin: None,
-            created_at: Some("2026-01-01T00:00:00.000Z".to_string()),
-            updated_at: Some("2026-01-01T00:00:00.000Z".to_string()),
-            global: true,
-            change_id: None,
-            commit_id: None,
-            untracked: true,
-            branch_id: GLOBAL_BRANCH_ID.into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn homogeneous_preparation_preserves_per_row_function_call_order() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-        let (uuid_calls, _timestamp_calls) =
-            install_counting_preparation_provider(&mut transaction);
-
-        let prepared = transaction
-            .prepare_transaction_rows(raw_write_rows(vec![
-                account_stage_row("Ada"),
-                account_stage_row("Grace"),
-            ]))
-            .await
-            .expect("accounts should prepare");
-
-        assert_eq!(
-            prepared.row(0).row_pk,
-            &RowPk::uuid_from_canonical(&counting_preparation_uuid(1).to_string())
-                .expect("UUID pk")
-        );
-        assert_eq!(
-            prepared.row(0).change_id,
-            Some(ChangeId::from(counting_preparation_uuid(2)))
-        );
-        assert_eq!(
-            prepared.row(1).row_pk,
-            &RowPk::uuid_from_canonical(&counting_preparation_uuid(3).to_string())
-                .expect("UUID pk")
-        );
-        assert_eq!(
-            prepared.row(1).change_id,
-            Some(ChangeId::from(counting_preparation_uuid(4)))
-        );
-        assert_eq!(uuid_calls.load(Ordering::SeqCst), 4);
-    }
-
-    #[tokio::test]
-    async fn homogeneous_preparation_reports_earlier_scalar_error_before_later_schema_error() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-        let mut scalar_invalid = key_value_stage_row("scalar-invalid", "value", false);
-        scalar_invalid.updated_at = Some("not-a-timestamp".to_string());
-        let mut schema_invalid = key_value_stage_row("schema-invalid", "value", false);
-        schema_invalid.snapshot =
-            Some(TransactionJson::from_value_for_test(json!("not-an-object")));
-
-        let error = transaction
-            .prepare_transaction_rows(raw_write_rows(vec![scalar_invalid, schema_invalid]))
-            .await
-            .expect_err("the first row's scalar error should retain precedence");
-        assert!(
-            error.message.contains("invalid updated_at timestamp"),
-            "unexpected preparation error: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn mixed_reconciliation_normalizes_all_raw_rows_before_scalar_provider_calls() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-        let prepared_source = key_value_stage_row("prepared", "value", false);
-        let prepared = transaction
-            .prepare_transaction_rows(raw_write_rows(vec![prepared_source.clone()]))
-            .await
-            .expect("prepared semantic slot");
-        let raw_valid = key_value_stage_row("raw-valid", "value", false);
-        let mut raw_invalid = key_value_stage_row("raw-invalid", "value", false);
-        raw_invalid.snapshot = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
-        let mut rows = ReconciledRowBatch::raw(raw_write_rows(vec![
-            prepared_source,
-            raw_valid,
-            raw_invalid,
-        ]));
-        rows.take_raw_rows_at(&[0])
-            .expect("semantic source should extract");
-        rows.put_prepared_batch_at(&[0], prepared)
-            .expect("prepared source should fill its slot");
-        let (uuid_calls, timestamp_calls) = install_counting_preparation_provider(&mut transaction);
-
-        let error = transaction
-            .prepare_reconciled_rows(rows)
-            .await
-            .expect_err("later raw normalization should fail");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert_eq!(uuid_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(timestamp_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn mixed_reconciliation_preserves_normalization_error_precedence_over_scalar_error() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-        let prepared_source = key_value_stage_row("prepared", "value", false);
-        let prepared = transaction
-            .prepare_transaction_rows(raw_write_rows(vec![prepared_source.clone()]))
-            .await
-            .expect("prepared semantic slot");
-        let mut scalar_invalid = key_value_stage_row("raw-scalar-invalid", "value", false);
-        scalar_invalid.updated_at = Some("not-a-timestamp".to_string());
-        let mut schema_invalid = key_value_stage_row("raw-schema-invalid", "value", false);
-        schema_invalid.snapshot =
-            Some(TransactionJson::from_value_for_test(json!("not-an-object")));
-        let mut rows = ReconciledRowBatch::raw(raw_write_rows(vec![
-            prepared_source,
-            scalar_invalid,
-            schema_invalid,
-        ]));
-        rows.take_raw_rows_at(&[0])
-            .expect("semantic source should extract");
-        rows.put_prepared_batch_at(&[0], prepared)
-            .expect("prepared source should fill its slot");
-
-        let error = transaction
-            .prepare_reconciled_rows(rows)
-            .await
-            .expect_err("normalization must finish before scalar planning");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(
-            !error.message.contains("invalid updated_at timestamp"),
-            "generic mixed preparation must preserve normalization precedence: {error:?}"
-        );
-    }
-
-    async fn open_test_transaction(
-        storage: &Memory,
-    ) -> (
-        Arc<HotStateContext>,
-        Arc<BinaryCasContext>,
-        Arc<BranchContext>,
-        FunctionContext,
-        Transaction,
-    ) {
-        let storage = StorageAdapter::new(storage.clone());
-        let hot_state = Arc::new(hot_state_context());
-        seed_visible_schema_rows(storage.clone()).await;
-        let binary_cas = Arc::new(BinaryCasContext::new());
-        let branch_ctx = Arc::new(BranchContext::new());
-        let catalog_context = Arc::new(CatalogContext::new());
-        let opened = open_transaction(
-            &SessionBranch::new(GLOBAL_BRANCH_ID.to_string()),
-            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            storage,
-            Arc::clone(&hot_state),
-            Arc::new(TrackedStateContext::new()),
-            Arc::clone(&binary_cas),
-            PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
-            Arc::clone(&branch_ctx),
-            catalog_context,
-            Arc::new(SqlPlanningCache::default()),
-            SessionFileViews::default(),
-        )
-        .await
-        .expect("transaction should open");
-        let transaction = opened.transaction;
-        let runtime_functions = opened.runtime_functions;
-
-        (
-            hot_state,
-            binary_cas,
-            branch_ctx,
-            runtime_functions,
-            transaction,
-        )
-    }
-
-    async fn seed_visible_schema_rows(storage: StorageAdapter) {
-        let rows = crate::schema::seed_schema_definitions()
-            .into_iter()
-            .map(|schema| {
-                let key = crate::schema::schema_key_from_definition(schema)
-                    .expect("seed schema key should derive");
-                let snapshot_content = json!({
-                    "schema_key": key.schema_key.clone(),
-                    "value": schema,
-                })
-                .to_string();
-                crate::tracked_state::MaterializedTrackedStateRow {
-                    row_pk: crate::schema::registered_schema_row_pk(&key.schema_key)
-                        .expect("registered schema identity should derive"),
-                    schema_key: "lix_registered_schema".to_string(),
-                    file_id: None,
-                    snapshot_content: Some(snapshot_content.into()),
-                    metadata: None,
-                    deleted: false,
-                    created_at: "1970-01-01T00:00:00.000Z".to_string(),
-                    updated_at: "1970-01-01T00:00:00.000Z".to_string(),
-                    change_id: ChangeId::for_test_label(&format!(
-                        "schema-fixture-{}",
-                        key.schema_key
-                    )),
-                    commit_id: CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
-                }
-            })
-            .collect::<Vec<_>>();
-        crate::test_support::seed_branch_head_with_rows(
-            storage,
-            GLOBAL_BRANCH_ID,
-            SCHEMA_FIXTURE_COMMIT_ID,
-            &rows,
-        )
-        .await;
-    }
-
-    async fn assert_no_persistence_after_validation_failure(
-        storage: StorageAdapter,
-        hot_state: &HotStateContext,
-        branch_ctx: &BranchContext,
-        rejected_row_pk: &str,
-    ) {
-        let head = branch_ctx
-            .ref_reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .load_head_commit_id(GLOBAL_BRANCH_ID)
-            .await
-            .expect("branch ref should load after failed commit");
-        assert_eq!(
-            head,
-            Some(CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID)),
-            "validation failure must not advance the branch ref"
-        );
-        let row = hot_state
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            )
-            .load_row(&HotStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                row_pk: RowPk::single(rejected_row_pk),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await
-            .expect("live state should load after failed commit");
-        assert_eq!(
-            row, None,
-            "validation failure must happen before live-state persistence"
-        );
-    }
-
-    #[test]
-    fn v2_create_contexts_are_retry_stable_and_file_incarnation_scoped() {
-        let seed = uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000007")
-            .expect("fixture UUIDv7")
-            .into_bytes();
-        let key = PluginActorKey {
-            branch_id: "main".to_string(),
-            file_id: "01920000-0000-7000-8000-0000000000a2".to_string(),
-            path: "/data.csv".to_string(),
-            owner_change_id: "incarnation-a".to_string(),
-            plugin_key: "plugin_csv".to_string(),
-            plugin_generation: "generation-a".to_string(),
-        };
-        assert_eq!(v2_create_context(seed, &key), v2_create_context(seed, &key));
-
-        let mut other_file = key.clone();
-        other_file.file_id = "01920000-0000-7000-8000-0000000000b2".to_string();
-        assert_ne!(
-            v2_create_context(seed, &key),
-            v2_create_context(seed, &other_file)
-        );
-
-        let mut other_incarnation = key.clone();
-        other_incarnation.owner_change_id = "incarnation-b".to_string();
-        assert_ne!(
-            v2_create_context(seed, &key),
-            v2_create_context(seed, &other_incarnation)
-        );
-    }
-
-    fn key_value_stage_row(key: &str, value: &str, untracked: bool) -> TransactionWriteRow {
-        TransactionWriteRow {
-            row_pk: Some(RowPk::single(key)),
-            schema_key: "lix_key_value".into(),
-            file_id: None,
-            snapshot: Some(TransactionJson::from_value_for_test(json!({
-                "key": key,
-                "value": value,
-            }))),
-            metadata: None,
-            origin: None,
-            created_at: None,
-            updated_at: None,
-            global: true,
-            change_id: None,
-            commit_id: None,
-            untracked,
-            branch_id: GLOBAL_BRANCH_ID.into(),
-        }
-    }
-    #[tokio::test]
-    async fn reconciled_prepared_slot_freezes_nondeterministic_defaults_for_staging() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-        let source = TransactionWriteRow {
-            row_pk: None,
-            schema_key: "lix_account".into(),
-            file_id: None,
-            snapshot: Some(TransactionJson::from_value_for_test(json!({
-                "name": "Ada",
-                "kind": "human",
-                "status": "active",
-            }))),
-            metadata: None,
-            origin: None,
-            created_at: None,
-            updated_at: None,
-            global: true,
-            change_id: None,
-            commit_id: None,
-            untracked: true,
-            branch_id: GLOBAL_BRANCH_ID.into(),
-        };
-        let rendered = transaction
-            .prepare_transaction_rows(raw_write_rows(vec![source.clone()]))
-            .await
-            .expect("the semantic row should normalize once");
-        let independently_reprepared = transaction
-            .prepare_transaction_rows(raw_write_rows(vec![source.clone()]))
-            .await
-            .expect("a second normalization should also succeed");
-        assert_ne!(
-            rendered.row(0).row_pk,
-            independently_reprepared.row(0).row_pk,
-            "the fixture must prove its UUID default is nondeterministic"
-        );
-
-        let mut reconciled_rows = ReconciledRowBatch::raw(raw_write_rows(vec![source]));
-        reconciled_rows
-            .take_raw_rows_at(&[0])
-            .expect("the semantic source should move out exactly once");
-        reconciled_rows
-            .put_prepared_batch_at(&[0], rendered.clone())
-            .expect("the exact rendered row should fill its typed slot");
-        let PreparedTransactionWrite::Rows { rows, .. } = transaction
-            .prepare_transaction_write(ReconciledTransactionWrite::Rows {
-                mode: TransactionWriteMode::Insert,
-                rows: reconciled_rows,
-            })
-            .await
-            .expect("final preparation should reuse the prepared slot")
-        else {
-            panic!("row-only input should stay row-only");
-        };
-        assert_eq!(
-            rows, rendered,
-            "durable staging must receive the exact row supplied to rows_changed"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconciled_prepared_slots_follow_raw_row_compaction_in_order() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-        let first_source = key_value_stage_row("semantic-first", "first", true);
-        let second_source = key_value_stage_row("semantic-second", "second", true);
-        let prepared = transaction
-            .prepare_transaction_rows(raw_write_rows(vec![
-                first_source.clone(),
-                second_source.clone(),
-            ]))
-            .await
-            .expect("semantic sources should prepare");
-        let mut first_prepared = prepared.clone();
-        first_prepared.select_rows(&[0]);
-        let mut second_prepared = prepared;
-        second_prepared.select_rows(&[1]);
-
-        // Two independently prepared semantic groups remain in their original
-        // relative order while stale raw rows before and between them are
-        // compacted and a new engine row is appended.
-        let mut rows = ReconciledRowBatch::raw(raw_write_rows(vec![
-            key_value_stage_row("remove-before-semantic", "stale", true),
-            first_source,
-            key_value_stage_row("remove-between-semantic", "stale", true),
-            second_source,
-            key_value_stage_row("appended-reconciliation", "new", true),
-        ]));
-        rows.take_raw_rows_at(&[1])
-            .expect("first semantic source should move once");
-        rows.put_prepared_batch_at(&[1], first_prepared.clone())
-            .expect("first prepared slot should retain its position");
-        rows.take_raw_rows_at(&[3])
-            .expect("second semantic source should move once");
-        rows.put_prepared_batch_at(&[3], second_prepared.clone())
-            .expect("second prepared slot should retain its position");
-        rows.retain_raw(|row| {
-            !matches!(
-                row.row_pk
-                    .and_then(|row_pk| row_pk.as_single_string().ok()),
-                Some("remove-before-semantic" | "remove-between-semantic")
-            )
-        })
-        .expect("raw row compaction should preserve typed prepared slots");
-
-        let prepared = transaction
-            .prepare_reconciled_rows(rows)
-            .await
-            .expect("mixed reconciled rows should prepare once in batch order");
-        assert_eq!(prepared.len(), 3);
-        assert_eq!(prepared.row(0), first_prepared.row(0));
-        assert_eq!(prepared.row(1), second_prepared.row(0));
-        assert_eq!(
-            prepared
-                .row(2)
-                .row_pk
-                .as_single_string()
-                .expect("appended key should stay scalar"),
-            "appended-reconciliation",
-            "the raw appended row should follow both prepared semantic groups"
-        );
-    }
-
-    #[test]
-    fn reconciled_raw_ordinals_move_canonical_owners_without_row_materialization() {
-        let mut values = Vec::new();
-        let mut normalized = Vec::new();
-        let mut offsets = Vec::new();
-        for index in 0..3 {
-            let value = json!({"key": format!("canonical-{index}"), "value": index});
-            let encoded = serde_json::to_vec(&value).expect("canonical fixture");
-            let start = u32::try_from(normalized.len()).expect("canonical offset");
-            normalized.extend_from_slice(&encoded);
-            let end = u32::try_from(normalized.len()).expect("canonical offset");
-            values.push(value);
-            offsets.push((start, end));
-        }
-        let canonical = crate::plugin::runtime::WasmCanonicalJson::from_batch_parts(
-            values, normalized, offsets, 3, 3,
-        )
-        .expect("canonical raw batch");
-        let arena_probe = canonical[0].clone();
-        let rows = canonical
-            .into_iter()
-            .enumerate()
-            .map(|(index, snapshot)| {
-                let mut row = key_value_stage_row(&format!("canonical-{index}"), "value", true);
-                row.snapshot = Some(TransactionJson::from_canonical_batch(snapshot));
-                row
-            })
-            .collect::<Vec<_>>();
-        let mut reconciled = ReconciledRowBatch::raw(raw_write_rows(rows));
-
-        let moved = reconciled
-            .take_raw_rows_at(&[2, 0])
-            .expect("noncontiguous raw ordinals should move in requested order");
-        assert_eq!(moved.len(), 2);
-        assert_eq!(
-            moved
-                .row(0)
-                .row_pk
-                .expect("moved identity")
-                .as_single_string()
-                .expect("scalar identity"),
-            "canonical-2"
-        );
-        let moved_first = moved
-            .row(0)
-            .snapshot
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("moved canonical owner");
-        let moved_second = moved
-            .row(1)
-            .snapshot
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("moved canonical owner");
-        assert!(moved_first.shares_batch_with(moved_second));
-        assert!(moved_second.shares_batch_with(&arena_probe));
-
-        let remaining = reconciled
-            .take_raw_rows_at(&[1])
-            .expect("unmoved raw ordinal must remain addressable");
-        let remaining = remaining
-            .row(0)
-            .snapshot
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("remaining canonical owner");
-        assert!(remaining.shares_batch_with(&arena_probe));
-    }
-
-    #[tokio::test]
-    async fn direct_semantic_rendering_pages_oversized_snapshot_as_lazy_attachment() {
-        let storage = Memory::new();
-        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&storage).await;
-        let limits = WasmTransitionLimits::default();
-        let large_value = "x".repeat(limits.max_record_bytes as usize + 32);
-        let prepared = transaction
-            .prepare_transaction_rows(raw_write_rows(vec![key_value_stage_row(
-                "large-semantic-row",
-                &large_value,
-                true,
-            )]))
-            .await
-            .expect("large semantic row should normalize");
-        let expected = prepared
-            .row(0)
-            .snapshot
-            .expect("semantic upsert should carry a snapshot")
-            .materialize_shared();
-
-        // Semantic normalization is domain-aware. Normalize against the
-        // seeded global catalog first, then shape the already-prepared row as
-        // the branch-local, file-scoped plugin output this renderer consumes.
-        // This preserves the original fixture's boundary without teaching
-        // normalization that the synthetic, unseeded `main` branch is valid.
-        let source = prepared.row(0);
-        assert!(source.global);
-        assert!(source.untracked);
-        assert!(source.file_id.is_none());
-        let mut semantic_rows = PreparedStateBatch::with_capacity(1);
-        semantic_rows.push_parts(
-            source.schema_plan_id,
-            source.facts,
-            source.row_pk.clone(),
-            source.schema_key.clone(),
-            Some("large-file".into()),
-            source.snapshot.cloned(),
-            source.metadata.cloned(),
-            source.origin.cloned(),
-            source.origin_key,
-            source.created_at,
-            source.updated_at,
-            false,
-            source.change_id,
-            source.commit_id,
-            false,
-            "main".into(),
-        );
-
-        let changes = v2_host_changes_from_prepared_rows(&semantic_rows, limits, false)
-            .expect("direct semantic rendering should select a lazy snapshot source");
-        let WasmRowChange::Upsert { row, .. } = &changes.changes[0] else {
-            panic!("prepared semantic snapshot should become an upsert")
-        };
-        let WasmHostBytes::Source(slice) = &row.snapshot_content else {
-            panic!("an oversized direct semantic snapshot must not be packet-inline")
-        };
-        assert_eq!(slice.range.offset, 0);
-        assert_eq!(slice.range.length, expected.len() as u64);
-        assert_eq!(
-            slice.source.read(0, 64).expect("lazy prefix should read"),
-            expected.as_bytes()[..64]
-        );
-
-        let mut source = VecRowChangeSource::new(changes, limits)
-            .expect("lazy semantic change should fit the packet bounds");
-        let page = crate::plugin::runtime::WasmRowChangeSource::next_page(
-            &mut source,
-            limits.max_page_bytes,
-        )
-        .expect("semantic renderer packet should page")
-        .expect("one semantic change page should be emitted");
-        assert_eq!(page.changes.len(), 1);
-        assert!(matches!(
-            page.changes[0],
-            WasmRowChange::Upsert {
-                row: WasmRow {
-                    snapshot_content: WasmHostBytes::Source(_),
-                    ..
-                },
-                ..
-            }
-        ));
-    }
 }

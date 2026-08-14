@@ -166,7 +166,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_commit_is_plain_global_row_not_active_reachability_view,
+    lix_commit_is_plain_global_entity_not_active_reachability_view,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -251,7 +251,148 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_commit_derived_by_branch_surfaces_match_commit_row_projection,
+    lix_commit_global_surfaces_deduplicate_shared_history_and_apply_limit_after_ordering,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('global-dedup-main', 'main')",
+            &[],
+        )
+        .await
+        .expect("main write should succeed");
+        let main_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        let branch_a_id = "01930000-0000-7000-8000-000000000009";
+        let branch_b_id = "01930000-0000-7000-8000-00000000000a";
+        for (branch_id, name) in [
+            (branch_a_id, "Shared history A"),
+            (branch_b_id, "Shared history B"),
+        ] {
+            main.create_branch(CreateBranchOptions {
+                id: Some(branch_id.to_string()),
+                name: name.to_string(),
+                from_commit_id: Some(sim.initial_commit_id().to_string()),
+            })
+            .await
+            .expect("branch should be created from the shared initial history");
+        }
+
+        let branch_a = sim.wrap_session(
+            engine
+                .open_session(branch_a_id)
+                .await
+                .expect("branch A should open"),
+            &engine,
+        );
+        branch_a
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('global-dedup-a', 'a')",
+                &[],
+            )
+            .await
+            .expect("branch A write should succeed");
+        let branch_a_head = engine
+            .load_branch_head_commit_id(branch_a_id)
+            .await
+            .expect("branch A head should load")
+            .expect("branch A head should exist");
+
+        let branch_b = sim.wrap_session(
+            engine
+                .open_session(branch_b_id)
+                .await
+                .expect("branch B should open"),
+            &engine,
+        );
+        branch_b
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('global-dedup-b', 'b')",
+                &[],
+            )
+            .await
+            .expect("branch B write should succeed");
+        let branch_b_head = engine
+            .load_branch_head_commit_id(branch_b_id)
+            .await
+            .expect("branch B head should load")
+            .expect("branch B head should exist");
+
+        let commit_rows = select_rows(&main, "SELECT id FROM lix_commit ORDER BY id").await;
+        let commit_ids = commit_rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Text(id) => id.clone(),
+                value => panic!("commit id should be text, got {value:?}"),
+            })
+            .collect::<Vec<_>>();
+        let unique_commit_ids = commit_ids.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            commit_ids.len(),
+            unique_commit_ids.len(),
+            "global lix_commit must not duplicate shared history per branch"
+        );
+        for expected_head in [main_head, branch_a_head, branch_b_head] {
+            assert_eq!(
+                commit_ids
+                    .iter()
+                    .filter(|id| id.as_str() == expected_head)
+                    .count(),
+                1,
+                "global lix_commit should contain each branch head exactly once"
+            );
+        }
+
+        let limited_rows =
+            select_rows(&main, "SELECT id FROM lix_commit ORDER BY id LIMIT 3").await;
+        assert_eq!(
+            limited_rows,
+            commit_rows[..3].to_vec(),
+            "global LIMIT must apply after the deduplicated ordered stream"
+        );
+
+        let edge_rows = select_rows(
+            &main,
+            "SELECT child_id, parent_order FROM lix_commit_edge ORDER BY child_id, parent_order",
+        )
+        .await;
+        let edge_keys = edge_rows
+            .iter()
+            .map(|row| format!("{:?}", row))
+            .collect::<Vec<_>>();
+        let unique_edge_keys = edge_keys.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            edge_keys.len(),
+            unique_edge_keys.len(),
+            "global lix_commit_edge must not duplicate shared history per branch"
+        );
+        let limited_edge_rows = select_rows(
+            &main,
+            "SELECT child_id, parent_order FROM lix_commit_edge \
+             ORDER BY child_id, parent_order LIMIT 3",
+        )
+        .await;
+        assert_eq!(
+            limited_edge_rows,
+            edge_rows[..3].to_vec(),
+            "global edge LIMIT must apply after the deduplicated ordered stream"
+        );
+    }
+);
+
+simulation_test!(
+    lix_commit_derived_by_branch_surfaces_match_commit_entity_projection,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(

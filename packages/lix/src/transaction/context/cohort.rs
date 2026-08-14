@@ -86,11 +86,9 @@ where
         transaction.active_branch_id == leader.active_branch_id
             && transaction.opening_active_branch_head == leader.opening_active_branch_head
             && transaction.opening_global_branch_head == leader.opening_global_branch_head
-            && transaction.opening_tracked_mutation_revision
-                == leader.opening_tracked_mutation_revision
+            && transaction.opening_selector_fence == leader.opening_selector_fence
             && transaction.idempotency_receipt.is_none()
-            && transaction.atomic_metadata_writes.is_none()
-            && transaction.atomic_metadata_preconditions.is_empty()
+            && transaction.pending_forktree_publication.is_none()
             && !transaction.await_durable_commit
     })
 }
@@ -207,29 +205,6 @@ where
         merged_writes.replace_reconciled_file_writes(replacement, &affected_file_ids);
     }
 
-    let validation_storage = leader.transaction.storage.clone();
-    let validation_read = match validation_storage
-        .begin_read(StorageReadOptions::default())
-        .await
-    {
-        Ok(read) => read,
-        Err(_) => {
-            let mut individual = vec![leader];
-            individual.extend(members);
-            return commit_prepared_individually(individual).await;
-        }
-    };
-    let validation_read = SharedStorageAdapterRead::new(validation_read);
-    if leader
-        .transaction
-        .validate_prepared_writes_by_branch(&validation_read, &mut merged_writes)
-        .await
-        .is_err()
-    {
-        let mut individual = vec![leader];
-        individual.extend(members);
-        return commit_prepared_individually(individual).await;
-    }
     for member in &mut members {
         member
             .transaction
@@ -321,7 +296,7 @@ struct CohortSemanticCandidate {
 struct CohortPluginGroup {
     plugin: PluginRegistryEntry,
     descriptor: WasmFileDescriptor,
-    candidates: BTreeMap<TrackedStateKey, Vec<CohortSemanticCandidate>>,
+    candidates: BTreeMap<StateKey, Vec<CohortSemanticCandidate>>,
 }
 
 async fn reconcile_cohort_files<'a, StorageImpl>(
@@ -339,8 +314,9 @@ where
             "rootless branch transactions cannot join a semantic commit cohort",
         )
     })?;
-    let read = transaction.opening_read();
-    let mut groups = load_cohort_plugin_groups(transaction, &read, opening_head, file_ids).await?;
+    let facade = transaction.forktree_read_facade();
+    let mut groups =
+        load_cohort_plugin_groups(transaction, &facade, opening_head, file_ids).await?;
     for writes in prepared {
         for row in &writes.state_rows {
             let Some(file_id) = row.file_id.map(SharedStr::as_str) else {
@@ -363,7 +339,7 @@ where
                     "cohort semantic row is missing change_id",
                 )
             })?;
-            let key = TrackedStateKey {
+            let key = StateKey {
                 schema_key: row.schema_key.to_string(),
                 file_id: Some(file_id.to_string()),
                 row_pk: row.row_pk.clone(),
@@ -383,18 +359,11 @@ where
     }
 
     let mut replay_batches = BTreeMap::<String, RawWriteBatch>::new();
-    let mut tracked = transaction.tracked_state.reader(&read);
     for (file_id, group) in &mut groups {
         let keys = group.candidates.keys().cloned().collect::<Vec<_>>();
-        let base_rows = tracked
-            .load_projected_batch_at_commit(
-                &opening_head.to_string(),
-                &keys,
-                &ChangeRecordProjection::full(),
-            )
-            .await?;
-        let mut frontiers = BTreeMap::<TrackedStateKey, Vec<Option<StaleConflictPayload>>>::new();
-        let mut bases = BTreeMap::<TrackedStateKey, Option<StaleConflictPayload>>::new();
+        let base_rows = load_historical_rows_at_commit(&facade, opening_head, &keys).await?;
+        let mut frontiers = BTreeMap::<StateKey, Vec<Option<StaleConflictPayload>>>::new();
+        let mut bases = BTreeMap::<StateKey, Option<StaleConflictPayload>>::new();
         let rows = replay_batches
             .entry(file_id.clone())
             .or_insert_with(|| RawWriteBatch::with_capacity(keys.len()));
@@ -404,7 +373,7 @@ where
                 .get_mut(key)
                 .expect("candidate key originates from group");
             candidates.sort_by_key(|candidate| candidate.rank);
-            let base = stale_payload_from_tracked(base_rows.row(slot));
+            let base = stale_payload_from_historical(base_rows[slot].as_ref());
             candidates.retain(|candidate| candidate.payload != base);
             let mut seen = BTreeSet::new();
             candidates.retain(|candidate| seen.insert(candidate.payload.clone()));
@@ -424,8 +393,7 @@ where
         while frontiers.values().any(|frontier| frontier.len() > 1) {
             let mut conflicts = Vec::new();
             let mut semantic_conflicts = Vec::new();
-            let mut next_frontiers =
-                BTreeMap::<TrackedStateKey, Vec<Option<StaleConflictPayload>>>::new();
+            let mut next_frontiers = BTreeMap::<StateKey, Vec<Option<StaleConflictPayload>>>::new();
             for key in &keys {
                 let Some(frontier) = frontiers.get(key) else {
                     continue;
@@ -518,7 +486,7 @@ where
 
 pub(super) fn push_cohort_payload(
     rows: &mut RawWriteBatch,
-    key: &TrackedStateKey,
+    key: &StateKey,
     payload: Option<&StaleConflictPayload>,
     branch_id: &str,
 ) {
@@ -546,57 +514,62 @@ pub(super) fn push_cohort_payload(
     );
 }
 
-async fn load_cohort_plugin_groups<StorageImpl, S>(
+async fn load_cohort_plugin_groups<StorageImpl, R>(
     transaction: &mut Transaction<StorageImpl>,
-    read: &S,
+    facade: &ForkTreeReadFacade<R>,
     opening_head: CommitId,
     file_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, CohortPluginGroup>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
-    S: StorageAdapterRead,
+    R: StorageAdapterRead,
 {
     let owner_keys = file_ids
         .iter()
-        .map(|file_id| TrackedStateKey {
+        .map(|file_id| StateKey {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
             file_id: Some(file_id.clone()),
             row_pk: RowPk::single(PLUGIN_OWNER_KEY),
         })
         .collect::<Vec<_>>();
-    let registry_key = TrackedStateKey {
+    let registry_key = StateKey {
         schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
         file_id: None,
         row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
     };
-    let mut tracked = transaction.tracked_state.reader(read);
-    let owners = tracked
-        .load_projected_batch_at_commit(
-            &opening_head.to_string(),
-            &owner_keys,
-            &ChangeRecordProjection::full(),
-        )
-        .await?;
-    let registry_rows = tracked
-        .load_projected_batch_at_commit(
-            &opening_head.to_string(),
-            std::slice::from_ref(&registry_key),
-            &ChangeRecordProjection::full(),
-        )
-        .await?;
-    let registry_snapshot = registry_rows
-        .row(0)
-        .filter(|row| !row.deleted())
-        .and_then(|row| row.snapshot_content())
-        .map(|snapshot| serde_json::from_str(snapshot.as_str()))
-        .transpose()
-        .map_err(|error| {
+    let owners = load_historical_rows_at_commit(facade, opening_head, &owner_keys).await?;
+    let registry_rows =
+        load_historical_rows_at_commit(facade, opening_head, std::slice::from_ref(&registry_key))
+            .await?;
+    let registry_row = registry_rows
+        .first()
+        .and_then(Option::as_ref)
+        .ok_or_else(|| {
             LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!("plugin registry snapshot is invalid JSON: {error}"),
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "cohort plugin registry row is missing",
             )
         })?;
-    let registry = PluginRegistry::from_optional_snapshot(registry_snapshot.as_ref())?;
+    if registry_row.deleted || registry_row.snapshot_content.is_none() {
+        return Err(LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "cohort plugin registry row is not an authenticated value",
+        ));
+    }
+    let registry_snapshot: serde_json::Value = serde_json::from_str(
+        registry_row
+            .snapshot_content
+            .as_ref()
+            .expect("checked above")
+            .as_str(),
+    )
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("plugin registry snapshot is invalid JSON: {error}"),
+        )
+    })?;
+    let registry = PluginRegistry::from_optional_snapshot(Some(&registry_snapshot))?;
     let path_index = transaction
         .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
             transaction.active_branch_id.clone(),
@@ -604,18 +577,18 @@ where
         .await?;
     let mut groups = BTreeMap::new();
     for (owner_index, file_id) in file_ids.iter().enumerate() {
-        let owner = owners
-            .row(owner_index)
-            .filter(|row| !row.deleted())
-            .map(PluginFileOwner::from_tracked_state_row_ref)
-            .transpose()?
-            .flatten()
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_TRANSACTION_CONFLICT,
-                    "cohort file is not owned by a stable plugin generation",
-                )
-            })?;
+        let owner_row = owners[owner_index].as_ref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "cohort plugin owner row is missing",
+            )
+        })?;
+        let owner = PluginFileOwner::from_historical_state_row(owner_row)?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "cohort file is not owned by a stable plugin generation",
+            )
+        })?;
         let plugin = registry
             .plugin(owner.plugin_key())
             .filter(|plugin| plugin.schema_keys() == owner.schema_keys())

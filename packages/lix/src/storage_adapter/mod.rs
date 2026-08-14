@@ -35,26 +35,18 @@ pub use crate::storage::{
     ReadDurability as StorageReadDurability, ReadEntry as StorageReadEntry,
     ReadOptions as StorageReadOptions, ScanChunk as StorageScanChunk,
     ScanCursor as StorageScanCursor, ScanOrder as StorageScanOrder, SpaceId as StorageSpaceId,
-    Storage, StorageError, StorageRead, StorageSpace, StoredValue as StorageValue, ValueIntegrity,
-    ValueSemantics, WriteOptions as StorageWriteOptions,
+    Storage, StorageError, StorageRead, StorageSpace, StoredValue as StorageValue, ValueSemantics,
+    WriteOptions as StorageWriteOptions,
 };
-pub(crate) use crate::storage::{PutBatch, PutEntry};
 
 pub use context::StorageAdapter;
 pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
 pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
-pub(crate) use spaces::{
-    REVISION_KEY_ACCOUNT, REVISION_KEY_BINARY_CAS_PUBLICATION, REVISION_KEY_BINARY_CAS_RECLAMATION,
-    REVISION_KEY_CATALOG, REVISION_KEY_FILESYSTEM_PATH, REVISION_KEY_JSON_STORE_PUBLICATION,
-    REVISION_KEY_JSON_STORE_RECLAMATION, REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE,
-    load_revision, load_revisions, revision_key,
-};
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
 };
 #[cfg(any(test, feature = "storage-benches"))]
 pub use write_set::StorageWriteSetArenaStats;
-pub(crate) use write_set::{DeferredFinalPutPage, DeferredFinalPutSource};
 pub use write_set::{StorageWriteSet, StorageWriteSetError};

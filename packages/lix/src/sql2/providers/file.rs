@@ -15,6 +15,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::arrow::array::{
     ArrayRef, BooleanArray, LargeBinaryArray, RecordBatchOptions, StringArray,
 };
@@ -31,28 +32,25 @@ use datafusion::prelude::SessionContext;
 use futures_util::{FutureExt, future::try_join_all};
 use serde::Deserialize;
 
-use crate::binary_cas::{BlobDataReader, BlobId, BlobRangeBytes};
+#[cfg(test)]
+use crate::binary_cas::BlobDataReader;
+use crate::binary_cas::{BlobId, BlobRangeBytes};
 use crate::branch::BranchRefReader;
-use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
-use crate::row_pk::RowPk;
-use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
+use crate::common::{
+    LixPath, MutationIdentity, RequestBlobSpliceProvenance, SharedStr, compose_file_path,
+};
+use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
     FilesystemPathSelection,
 };
+use crate::filesystem::{FilesystemStateRow, FilesystemStateRows, filesystem_schema_keys};
 use crate::functions::FunctionProviderHandle;
-#[cfg(test)]
-use crate::hot_state::MaterializedHotStateRow;
-use crate::hot_state::{
-    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
-    HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
-    MaterializedHotStateBatchBuilder, MaterializedHotStateRowRef,
-};
-use crate::plugin::runtime::{
+use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
     PluginRegistry, PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
-    plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
-    plugin_storage_archive_file_id,
+    is_reservation_key, plugin_archive_delete_origin, plugin_archive_file_id_matches,
+    plugin_key_from_archive_path, plugin_storage_archive_file_id,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -69,9 +67,9 @@ use crate::sql2::write_normalization::{
     scalar_is_binary_or_null,
 };
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
-#[cfg(test)]
-use crate::transaction_types::TransactionWriteRow;
-use crate::transaction_types::{RawWriteBatch, TransactionJson};
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
+use crate::storage_adapter::StorageAdapterRead;
+use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 use crate::{
     GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
     serialize_row_metadata,
@@ -85,18 +83,15 @@ use crate::filesystem::{
     BlobRefRowInput, DirectoryPathRecord, DirectoryPathResolver, FileDeleteInput,
     FileDescriptorWriteInput, FileDescriptorWriteIntent, FilesystemBlobRefKey,
     FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
-    append_blob_ref_tombstone_row, derive_directory_paths, directory_path_resolvers_for_paths,
-    directory_path_resolvers_from_hot_state, directory_path_resolvers_from_path_index,
-    directory_path_resolvers_from_state_batch, filesystem_storage_scope_key, plan_file_delete,
-    plan_file_descriptor_write, plan_parsed_file_path_update_with_resolvers,
-    plan_parsed_file_path_write_with_resolvers,
+    append_blob_ref_tombstone_row, derive_directory_paths,
+    directory_path_resolvers_from_path_index, directory_path_resolvers_from_state_batch,
+    filesystem_storage_scope_key, plan_file_delete, plan_file_descriptor_write,
+    plan_parsed_file_path_update_with_resolvers, plan_parsed_file_path_write_with_resolvers,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::session::SqlWriteSessionOptions;
-use crate::sql2::{
-    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextHotStateReader,
-};
-use crate::transaction_types::{
+use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext, WriteAccess};
+use crate::transaction::types::{
     FileContent, LogicalPrimaryKey, TransactionFileContent, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin,
 };
@@ -111,28 +106,649 @@ use super::upsert::{
     materialize_omitted_column, materialize_omitted_insert_default, validate_target_columns,
 };
 
-pub(super) async fn register_lix_file_active_provider(
+#[derive(Clone)]
+enum FileStateView<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    Committed(ForkTreeStateView<R>),
+    Transaction(TransactionStateView<R>),
+    #[cfg(test)]
+    TestNative {
+        views: BTreeMap<String, TransactionStateView<R>>,
+        scan_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+        scan_requests: Option<Arc<Mutex<Vec<FileQueryPlan>>>>,
+    },
+}
+
+/// Compile-time/provider planning data for one native ForkTree dispatch.
+/// These values are never serialized into a runtime reader request and never
+/// lower through a compatibility row batch.
+#[derive(Clone, Debug, Default)]
+struct FileQueryFilter {
+    schema_keys: Vec<String>,
+    branch_ids: Vec<String>,
+    entity_pks: Vec<EntityPk>,
+    file_ids: Vec<crate::NullableKeyFilter<String>>,
+    untracked: Option<bool>,
+    include_tombstones: bool,
+}
+
+/// Compile-time projection metadata retained until the final Arrow boundary.
+#[derive(Clone, Debug, Default)]
+struct FileQueryProjection {
+    columns: Vec<String>,
+}
+
+/// Native point/range plan. `full_surface` is deliberately explicit so a
+/// schema-scoped request cannot accidentally widen to an unbounded tree scan.
+#[derive(Clone, Debug, Default)]
+struct FileQueryPlan {
+    filter: FileQueryFilter,
+    projection: FileQueryProjection,
+    limit: Option<usize>,
+    /// Only the explicit `FileIdConstraint::All` surface may set this. All
+    /// other native scans must carry at least one schema and use its bounded
+    /// canonical prefix range.
+    full_surface: bool,
+}
+
+#[derive(Clone, Debug)]
+struct FileExactKeyPlan {
+    branch_id: String,
+    schema_key: String,
+    entity_pk: EntityPk,
+    file_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FileExactBatchPlan {
+    rows: Vec<FileExactKeyPlan>,
+    projection: FileQueryProjection,
+    untracked: Option<bool>,
+    include_tombstones: bool,
+}
+
+type FilesystemStateRowRef<'a> = &'a FilesystemStateRow;
+
+/// The only owned filesystem-row builder in this provider. It is the final
+/// schema-specific projection boundary before descriptor/path parsing and
+/// Arrow/DataFusion output; it is not a second state authority or a generic
+/// compatibility batch.
+#[derive(Debug, Default)]
+struct FilesystemRowsBuilder(Vec<FilesystemStateRow>);
+
+impl FilesystemRowsBuilder {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn push_owned(&mut self, row: FilesystemStateRow) {
+        self.0.push(row);
+    }
+
+    fn push_ref(&mut self, row: &FilesystemStateRow, _handle: Option<StateRowHandle>) {
+        self.0.push(row.clone());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_materialized_ref(
+        &mut self,
+        entity_pk: &EntityPk,
+        schema_key: &str,
+        file_id: Option<&str>,
+        snapshot_content: Option<crate::common::SharedStr>,
+        metadata: Option<crate::common::SharedStr>,
+        deleted: bool,
+        created_at: crate::common::LixTimestamp,
+        updated_at: crate::common::LixTimestamp,
+        global: bool,
+        change_id: Option<crate::changelog::ChangeId>,
+        commit_id: Option<crate::changelog::CommitId>,
+        untracked: bool,
+        branch_id: &str,
+    ) {
+        self.0.push(FilesystemStateRow {
+            entity_pk: entity_pk.clone(),
+            schema_key: schema_key.to_string(),
+            file_id: file_id.map(str::to_string),
+            snapshot_content,
+            metadata,
+            deleted,
+            created_at,
+            updated_at,
+            global,
+            change_id,
+            commit_id,
+            untracked,
+            branch_id: branch_id.to_string(),
+        });
+    }
+
+    fn finish(self) -> FilesystemStateRows {
+        FilesystemStateRows::from_rows(self.0)
+    }
+}
+
+impl FileQueryPlan {
+    fn tracked_schema(mut self, schema_keys: impl IntoIterator<Item = &'static str>) -> Self {
+        self.filter.schema_keys = schema_keys.into_iter().map(str::to_string).collect();
+        self
+    }
+}
+
+impl<R> FileStateView<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    fn branch_id(&self) -> Option<String> {
+        match self {
+            Self::Committed(view) => Some(view.branch_id().to_string()),
+            Self::Transaction(view) => Some(view.branch_id()),
+            #[cfg(test)]
+            Self::TestNative { .. } => None,
+        }
+    }
+
+    async fn points(
+        &self,
+        keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<StateRow>>, LixError> {
+        match self {
+            Self::Committed(view) => view
+                .points(keys, include_tombstones)
+                .await
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string())),
+            Self::Transaction(view) => view
+                .points(keys, include_tombstones)
+                .await
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string())),
+            #[cfg(test)]
+            Self::TestNative { .. } => unreachable!("test native points use a branch binding"),
+        }
+    }
+
+    async fn range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<Vec<StateRow>, LixError> {
+        match self {
+            Self::Committed(view) => view
+                .range(lower, upper, limit, include_tombstones)
+                .await
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string())),
+            Self::Transaction(view) => view
+                .range(lower, upper, limit, include_tombstones)
+                .await
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string())),
+            #[cfg(test)]
+            Self::TestNative { .. } => unreachable!("test native ranges use a branch binding"),
+        }
+    }
+
+    async fn points_for_branch(
+        &self,
+        branch_id: &str,
+        keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<StateRow>>, LixError> {
+        #[cfg(test)]
+        if let Self::TestNative {
+            views, scan_count, ..
+        } = self
+        {
+            if let Some(scan_count) = scan_count {
+                scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let view = views.get(branch_id).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("native test state has no branch '{branch_id}'"),
+                )
+            })?;
+            return view
+                .points(keys, include_tombstones)
+                .await
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()));
+        }
+        match self {
+            Self::Committed(view) => {
+                view.branch_points(branch_id, keys, include_tombstones)
+                    .await
+            }
+            Self::Transaction(view) => {
+                view.branch_points(branch_id, keys, include_tombstones)
+                    .await
+            }
+            #[cfg(test)]
+            Self::TestNative { .. } => unreachable!("test native points use a branch binding"),
+        }
+    }
+
+    async fn range_for_branch(
+        &self,
+        branch_id: &str,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<Vec<StateRow>, LixError> {
+        #[cfg(test)]
+        if let Self::TestNative {
+            views, scan_count, ..
+        } = self
+        {
+            if let Some(scan_count) = scan_count {
+                scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let view = views.get(branch_id).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("native test state has no branch '{branch_id}'"),
+                )
+            })?;
+            return view
+                .range(lower, upper, limit, include_tombstones)
+                .await
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()));
+        }
+        match self {
+            Self::Committed(view) => {
+                view.branch_range(branch_id, lower, upper, limit, include_tombstones)
+                    .await
+            }
+            Self::Transaction(view) => {
+                view.branch_range(branch_id, lower, upper, limit, include_tombstones)
+                    .await
+            }
+            #[cfg(test)]
+            Self::TestNative { .. } => unreachable!("test native ranges use a branch binding"),
+        }
+    }
+
+    async fn scan_rows(
+        &self,
+        request: &FileQueryPlan,
+    ) -> Result<Vec<FilesystemStateRow>, LixError> {
+        #[cfg(test)]
+        if let Self::TestNative {
+            scan_requests: Some(scan_requests),
+            ..
+        } = self
+        {
+            scan_requests
+                .lock()
+                .expect("native test scan request mutex should not be poisoned")
+                .push(request.clone());
+        }
+        let branch_ids = if request.filter.branch_ids.is_empty() {
+            vec![self.branch_id().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "file state view requires one resolved branch id",
+                )
+            })?]
+        } else {
+            request.filter.branch_ids.clone()
+        };
+        let schemas = if request.filter.schema_keys.is_empty() {
+            if request.full_surface {
+                filesystem_schema_keys()
+            } else {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "native file scan requires a schema or explicit full surface",
+                ));
+            }
+        } else {
+            request.filter.schema_keys.clone()
+        };
+        if request.filter.untracked == Some(true) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "untracked state is no longer supported",
+            ));
+        }
+        let mut rows = Vec::new();
+        for branch_id in branch_ids {
+            let include_tombstones = request.filter.include_tombstones;
+            if request.filter.entity_pks.is_empty() {
+                for schema_key in &schemas {
+                    let bounds = schema_range_bounds(schema_key);
+                    rows.extend(
+                        FilesystemStateRows::from_view_rows(
+                            self.range_for_branch(
+                                &branch_id,
+                                Some(&bounds.0),
+                                bounds.1.as_deref(),
+                                None,
+                                include_tombstones,
+                            )
+                            .await?,
+                            &branch_id,
+                            false,
+                        )?
+                        .into_iter(),
+                    );
+                }
+            } else {
+                let mut keys = Vec::new();
+                for schema_key in &schemas {
+                    for entity_pk in &request.filter.entity_pks {
+                        let file_ids = if request.filter.file_ids.is_empty() {
+                            vec![crate::NullableKeyFilter::Any]
+                        } else {
+                            request.filter.file_ids.clone()
+                        };
+                        for file_id in file_ids {
+                            let file_id = match file_id {
+                                crate::NullableKeyFilter::Any | crate::NullableKeyFilter::Null => {
+                                    None
+                                }
+                                crate::NullableKeyFilter::Value(file_id) => Some(file_id),
+                            };
+                            keys.push(crate::forktree::encode_state_key(
+                                crate::forktree::StateKeyRef {
+                                    schema_key,
+                                    file_id: file_id.as_deref(),
+                                    entity_pk,
+                                },
+                            ));
+                        }
+                    }
+                }
+                rows.extend(
+                    FilesystemStateRows::from_view_rows(
+                        self.points_for_branch(&branch_id, &keys, include_tombstones)
+                            .await?
+                            .into_iter()
+                            .flatten()
+                            .collect(),
+                        &branch_id,
+                        false,
+                    )?
+                    .into_iter(),
+                );
+            }
+        }
+        rows.retain(|row| {
+            (request.filter.schema_keys.is_empty()
+                || request
+                    .filter
+                    .schema_keys
+                    .iter()
+                    .any(|schema| schema == &row.schema_key))
+                && (request.filter.entity_pks.is_empty()
+                    || request
+                        .filter
+                        .entity_pks
+                        .iter()
+                        .any(|pk| pk == &row.entity_pk))
+                && (request.filter.file_ids.is_empty()
+                    || request.filter.file_ids.iter().any(|file_id| match file_id {
+                        crate::NullableKeyFilter::Any => true,
+                        crate::NullableKeyFilter::Null => row.file_id.is_none(),
+                        crate::NullableKeyFilter::Value(file_id) => {
+                            row.file_id.as_deref() == Some(file_id.as_str())
+                        }
+                    }))
+        });
+        let mut deduplicated = BTreeMap::new();
+        for row in rows {
+            let key = (
+                crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                }),
+                row.schema_key.clone(),
+                row.branch_id.clone(),
+            );
+            deduplicated.insert(key, row);
+        }
+        let mut rows = deduplicated.into_values().collect::<Vec<_>>();
+        if !request.filter.include_tombstones {
+            rows.retain(|row| !row.deleted);
+        }
+        if let Some(limit) = request.limit {
+            rows.truncate(limit);
+        }
+        Ok(rows)
+    }
+
+    async fn scan_file_plan(
+        &self,
+        request: &FileQueryPlan,
+    ) -> Result<FilesystemStateRows, LixError> {
+        Ok(FilesystemStateRows::from_rows(
+            self.scan_rows(request).await?,
+        ))
+    }
+
+    async fn file_owned_rows(
+        &self,
+        branch_id: &str,
+        schema_keys: Vec<String>,
+        file_ids: &[String],
+    ) -> Result<FilesystemStateRows, LixError> {
+        if schema_keys.is_empty() || file_ids.is_empty() {
+            return Ok(FilesystemStateRows::default());
+        }
+        self.scan_file_plan(&FileQueryPlan {
+            filter: FileQueryFilter {
+                schema_keys,
+                branch_ids: vec![branch_id.to_owned()],
+                file_ids: file_ids
+                    .iter()
+                    .cloned()
+                    .map(crate::NullableKeyFilter::Value)
+                    .collect(),
+                untracked: Some(false),
+                include_tombstones: false,
+                ..FileQueryFilter::default()
+            },
+            projection: FileQueryProjection::default(),
+            limit: None,
+            full_surface: false,
+        })
+        .await
+    }
+
+    async fn load_exact_batch(
+        &self,
+        request: &FileExactBatchPlan,
+    ) -> Result<Vec<Option<FilesystemStateRow>>, LixError> {
+        let mut groups = BTreeMap::<String, Vec<(usize, Vec<u8>)>>::new();
+        for (index, row) in request.rows.iter().enumerate() {
+            groups.entry(row.branch_id.clone()).or_default().push((
+                index,
+                crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                }),
+            ));
+        }
+        let mut output = (0..request.rows.len()).map(|_| None).collect::<Vec<_>>();
+        for (branch_id, slots) in groups {
+            let keys = slots.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+            if request.untracked == Some(true) {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "untracked state is no longer supported",
+                ));
+            }
+            let tracked = self
+                .points_for_branch(&branch_id, &keys, request.include_tombstones)
+                .await?;
+            for (ordinal, (slot, _)) in slots.into_iter().enumerate() {
+                if let Some(row) = tracked[ordinal].clone() {
+                    output[slot] =
+                        Some(FilesystemStateRow::from_state_row(row, &branch_id, false)?);
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
+#[cfg(test)]
+fn test_filesystem_row_to_state_row(row: &FilesystemStateRow) -> Result<StateRow, LixError> {
+    let change_id = row.change_id.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "native file-state fixture is missing change_id",
+        )
+    })?;
+    let commit_id = row.commit_id.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "native file-state fixture is missing commit_id",
+        )
+    })?;
+    let cell = if row.deleted {
+        crate::forktree::StateCell::Tombstone
+    } else if let Some(snapshot_content) = &row.snapshot_content {
+        crate::forktree::StateCell::Value(snapshot_content.clone())
+    } else {
+        crate::forktree::StateCell::Null
+    };
+    Ok(StateRow {
+        key: crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+            schema_key: &row.schema_key,
+            file_id: row.file_id.as_deref(),
+            entity_pk: &row.entity_pk,
+        }),
+        value: crate::forktree::StateValue {
+            change_id,
+            commit_id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            cell,
+            metadata: row.metadata.clone(),
+            origin_key: None,
+            blob_manifest_object_ids: Vec::new(),
+        },
+        source: if row.global {
+            crate::state::StateRowSource::Global
+        } else {
+            crate::state::StateRowSource::Branch
+        },
+    })
+}
+
+async fn directory_path_resolvers_from_transaction_state_view<R>(
+    state_view: &TransactionStateView<R>,
+    branch_binding: Option<&str>,
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let branch_id = branch_binding
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| state_view.branch_id());
+    directory_path_resolvers_from_transaction_state_view_for_branches(state_view, &[branch_id])
+        .await
+}
+
+async fn directory_path_resolvers_from_transaction_state_view_for_branches<R>(
+    state_view: &TransactionStateView<R>,
+    branch_ids: &[String],
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    if branch_ids.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "filesystem path resolution requires at least one branch scope",
+        ));
+    }
+    let mut rows = Vec::new();
+    for branch_id in branch_ids {
+        for schema_key in filesystem_schema_keys() {
+            let bounds = schema_range_bounds(&schema_key);
+            let tracked = state_view
+                .branch_range(branch_id, Some(&bounds.0), bounds.1.as_deref(), None, true)
+                .await
+                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
+            rows.extend(FilesystemStateRows::from_view_rows(
+                tracked, branch_id, false,
+            )?);
+        }
+    }
+    let rows = crate::filesystem::merge_filesystem_state_rows(rows, false);
+    let mut resolvers = directory_path_resolvers_from_state_batch(&rows)?;
+    for branch_id in branch_ids {
+        resolvers
+            .entry(filesystem_storage_scope_key(branch_id, false, false, None))
+            .or_default();
+    }
+    Ok(resolvers)
+}
+
+#[cfg(test)]
+async fn directory_path_resolvers_from_state_view<R>(
+    state_view: Arc<FileStateView<R>>,
+    branch_binding: Option<&str>,
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let branch_id = branch_binding.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "filesystem path resolution requires a branch-bound state view",
+        )
+    })?;
+    let rows = state_view
+        .scan_file_plan(&FileQueryPlan {
+            filter: FileQueryFilter {
+                schema_keys: filesystem_schema_keys(),
+                branch_ids: vec![branch_id.to_string()],
+                include_tombstones: true,
+                ..FileQueryFilter::default()
+            },
+            ..FileQueryPlan::default()
+        })
+        .await?;
+    let rows = FilesystemStateRows::from_rows(rows.into_iter().collect());
+    directory_path_resolvers_from_state_batch(&rows)
+}
+
+pub(super) async fn register_lix_file_active_provider<R>(
     session: &SessionContext,
     surface_name: &str,
     active_branch_id: &str,
-    hot_state: Arc<dyn HotStateReader>,
+    state_view: &ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
+    authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
     session_file_views: Option<SessionFileViews>,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     register_spec_table(
         session,
         surface_name,
         Arc::new(
             LixFileSpec::active_branch(
                 active_branch_id,
-                hot_state,
+                state_view.clone(),
                 filesystem_path_index,
                 branch_ref,
-                blob_reader,
+                authenticated_blob_reader,
                 plugin_host,
                 functions,
             )
@@ -142,26 +758,29 @@ pub(super) async fn register_lix_file_active_provider(
     )
 }
 
-pub(super) async fn register_lix_file_by_branch_provider(
+pub(super) async fn register_lix_file_by_branch_provider<R>(
     session: &SessionContext,
     surface_name: &str,
-    hot_state: Arc<dyn HotStateReader>,
+    state_view: &ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
+    authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
     session_file_views: Option<SessionFileViews>,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     register_spec_table(
         session,
         surface_name,
         Arc::new(
             LixFileSpec::by_branch(
-                hot_state,
+                state_view.clone(),
                 filesystem_path_index,
                 branch_ref,
-                blob_reader,
+                authenticated_blob_reader,
                 plugin_host,
                 functions,
             )
@@ -171,13 +790,16 @@ pub(super) async fn register_lix_file_by_branch_provider(
     )
 }
 
-pub(super) async fn register_by_branch_write_provider(
+pub(super) async fn register_by_branch_write_provider<R>(
     session: &SessionContext,
     surface_name: &str,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     register_spec_table(
         session,
         surface_name,
@@ -185,18 +807,21 @@ pub(super) async fn register_by_branch_write_provider(
             write_ctx.clone(),
             branch_ref,
             options,
-        )),
+        )?),
         WriteAccess::write(write_ctx),
     )
 }
 
-pub(super) async fn register_active_write_provider(
+pub(super) async fn register_active_write_provider<R>(
     session: &SessionContext,
     surface_name: &str,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     register_spec_table(
         session,
         surface_name,
@@ -204,23 +829,69 @@ pub(super) async fn register_active_write_provider(
             write_ctx.clone(),
             branch_ref,
             options,
-        )),
+        )?),
         WriteAccess::write(write_ctx),
     )
 }
 
 #[derive(Clone)]
-struct LixFileSpec {
+struct LixFileSpec<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     schema: SchemaRef,
-    hot_state: Arc<dyn HotStateReader>,
+    state_view: FileStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
+    blob_reader: LixFilePayloadReader,
+    /// The transaction's retained opening-read capability for pre-image
+    /// payload validation. Write-side staging remains separate because it may
+    /// contain unpublished bytes that are not in the opening view.
+    authenticated_blob_reader: Option<Arc<dyn crate::forktree::AuthenticatedBlobReader>>,
+    /// The live transaction owner, when this is a write provider. It is
+    /// retained so statement scans observe the current TransactionStateView
+    /// after each staged write or rollback rather than the constructor
+    /// snapshot.
+    write_ctx: Option<SqlWriteContext<R>>,
     plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
     options: SqlWriteSessionOptions,
     session_file_views: Option<SessionFileViews>,
+}
+
+#[derive(Clone)]
+enum LixFilePayloadReader {
+    Authenticated(Arc<dyn crate::forktree::AuthenticatedBlobReader>),
+}
+
+impl LixFilePayloadReader {
+    fn authenticated_reader(&self) -> &dyn crate::forktree::AuthenticatedBlobReader {
+        match self {
+            Self::Authenticated(reader) => reader.as_ref(),
+        }
+    }
+
+    async fn record_batch(
+        &self,
+        schema: &SchemaRef,
+        plugin_render: Option<PluginRenderContext>,
+        load_data: bool,
+        prepared: PreparedLixFileRows,
+    ) -> Result<RecordBatch, LixError> {
+        match self {
+            Self::Authenticated(reader) => {
+                lix_file_record_batch_from_prepared_authenticated(
+                    schema,
+                    reader.as_ref(),
+                    plugin_render,
+                    load_data,
+                    prepared,
+                )
+                .await
+            }
+        }
+    }
 }
 
 struct LixFileDmlSourceState {
@@ -244,6 +915,7 @@ struct LixFileDmlSourceOptions {
     needs_data: bool,
     needs_plugin_ownership: bool,
     capture_path_resolver_rows: bool,
+    use_authenticated_blob_reader: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,10 +941,13 @@ pub(crate) enum ExactLixFileReadSelector {
 
 type SharedLixFileDmlSourceState = Arc<Mutex<Option<LixFileDmlSourceState>>>;
 
-impl LixFileSpec {
+impl<R> LixFileSpec<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     async fn indexed_dml_matches(
         &self,
-        request: &HotStateScanRequest,
+        request: &FileQueryPlan,
         filters: &[Expr],
         target_file_ids: &FileIdConstraint,
     ) -> Result<Option<FilesystemPathSelection>> {
@@ -301,19 +976,64 @@ impl LixFileSpec {
 
     fn active_branch(
         active_branch_id: impl Into<String>,
-        hot_state: Arc<dyn HotStateReader>,
+        state_view: ForkTreeStateView<R>,
         filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
         branch_ref: Arc<dyn BranchRefReader>,
-        blob_reader: Arc<dyn BlobDataReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
+        plugin_host: PluginRuntimeHost,
+        functions: FunctionProviderHandle,
+    ) -> Self {
+        Self::active_branch_with_state(
+            active_branch_id,
+            FileStateView::Committed(state_view),
+            filesystem_path_index,
+            branch_ref,
+            authenticated_blob_reader,
+            plugin_host,
+            functions,
+        )
+    }
+
+    #[cfg(test)]
+    fn active_branch_test(
+        active_branch_id: impl Into<String>,
+        state_view: FileStateView<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
+        plugin_host: PluginRuntimeHost,
+        functions: FunctionProviderHandle,
+    ) -> Self {
+        Self::active_branch_with_state(
+            active_branch_id,
+            state_view,
+            filesystem_path_index,
+            branch_ref,
+            authenticated_blob_reader,
+            plugin_host,
+            functions,
+        )
+    }
+
+    fn active_branch_with_state(
+        active_branch_id: impl Into<String>,
+        state_view: FileStateView<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
         plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_file_schema(),
-            hot_state,
+            state_view,
             filesystem_path_index,
             branch_ref,
-            blob_reader,
+            blob_reader: LixFilePayloadReader::Authenticated(Arc::clone(
+                &authenticated_blob_reader,
+            )),
+            authenticated_blob_reader: Some(authenticated_blob_reader),
+            write_ctx: None,
             plugin_host,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -323,45 +1043,90 @@ impl LixFileSpec {
     }
 
     fn active_branch_with_write(
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         branch_ref: Arc<dyn BranchRefReader>,
         options: SqlWriteSessionOptions,
-    ) -> Self {
+    ) -> Result<Self, LixError> {
         let active_branch_id = write_ctx.active_branch_id();
         let functions = write_ctx.functions();
-        let hot_state = Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
-        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = hot_state.clone();
-        let blob_reader = write_ctx.blob_reader();
+        let state_view = FileStateView::Transaction(write_ctx.state_view().clone());
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = Arc::new(write_ctx.clone());
+        let authenticated_blob_reader = write_ctx.authenticated_blob_reader()?;
         let plugin_host = write_ctx.plugin_host();
         let session_file_views = write_ctx.session_file_views();
-        Self {
+        Ok(Self {
             schema: lix_file_schema(),
-            hot_state,
+            state_view,
             filesystem_path_index,
             branch_ref,
-            blob_reader,
+            blob_reader: LixFilePayloadReader::Authenticated(Arc::clone(
+                &authenticated_blob_reader,
+            )),
+            authenticated_blob_reader: Some(authenticated_blob_reader),
+            write_ctx: Some(write_ctx.clone()),
             plugin_host,
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
             options,
             session_file_views,
-        }
+        })
     }
 
     fn by_branch(
-        hot_state: Arc<dyn HotStateReader>,
+        state_view: ForkTreeStateView<R>,
         filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
         branch_ref: Arc<dyn BranchRefReader>,
-        blob_reader: Arc<dyn BlobDataReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
+        plugin_host: PluginRuntimeHost,
+        functions: FunctionProviderHandle,
+    ) -> Self {
+        Self::by_branch_with_state(
+            FileStateView::Committed(state_view),
+            filesystem_path_index,
+            branch_ref,
+            authenticated_blob_reader,
+            plugin_host,
+            functions,
+        )
+    }
+
+    #[cfg(test)]
+    fn by_branch_test(
+        state_view: FileStateView<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
+        plugin_host: PluginRuntimeHost,
+        functions: FunctionProviderHandle,
+    ) -> Self {
+        Self::by_branch_with_state(
+            state_view,
+            filesystem_path_index,
+            branch_ref,
+            authenticated_blob_reader,
+            plugin_host,
+            functions,
+        )
+    }
+
+    fn by_branch_with_state(
+        state_view: FileStateView<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
         plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_file_by_branch_schema(),
-            hot_state,
+            state_view,
             filesystem_path_index,
             branch_ref,
-            blob_reader,
+            blob_reader: LixFilePayloadReader::Authenticated(Arc::clone(
+                &authenticated_blob_reader,
+            )),
+            authenticated_blob_reader: Some(authenticated_blob_reader),
+            write_ctx: None,
             plugin_host,
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -371,28 +1136,32 @@ impl LixFileSpec {
     }
 
     fn by_branch_with_write(
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         branch_ref: Arc<dyn BranchRefReader>,
         options: SqlWriteSessionOptions,
-    ) -> Self {
+    ) -> Result<Self, LixError> {
         let functions = write_ctx.functions();
-        let hot_state = Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
-        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = hot_state.clone();
-        let blob_reader = write_ctx.blob_reader();
+        let state_view = FileStateView::Transaction(write_ctx.state_view().clone());
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = Arc::new(write_ctx.clone());
+        let authenticated_blob_reader = write_ctx.authenticated_blob_reader()?;
         let plugin_host = write_ctx.plugin_host();
         let session_file_views = write_ctx.session_file_views();
-        Self {
+        Ok(Self {
             schema: lix_file_by_branch_schema(),
-            hot_state,
+            state_view,
             filesystem_path_index,
             branch_ref,
-            blob_reader,
+            blob_reader: LixFilePayloadReader::Authenticated(Arc::clone(
+                &authenticated_blob_reader,
+            )),
+            authenticated_blob_reader: Some(authenticated_blob_reader),
+            write_ctx: Some(write_ctx.clone()),
             plugin_host,
             functions,
             branch_binding: BranchBinding::explicit(),
             options,
             session_file_views,
-        }
+        })
     }
 
     fn with_session_file_views(mut self, session_file_views: Option<SessionFileViews>) -> Self {
@@ -401,12 +1170,12 @@ impl LixFileSpec {
     }
 
     /// Build the unprojected candidate-row source for UPDATE/DELETE: scan the
-    /// scoped live-state rows, then render the full `lix_file` batch the
+    /// scoped native state rows, then render the full `lix_file` batch the
     /// statement filters run against.
     fn dml_source(
         &self,
-        write_ctx: &SqlWriteContext,
-        request: HotStateScanRequest,
+        write_ctx: &SqlWriteContext<R>,
+        request: FileQueryPlan,
         target_file_ids: FileIdConstraint,
         indexed_matches: Option<FilesystemPathSelection>,
         options: LixFileDmlSourceOptions,
@@ -415,7 +1184,8 @@ impl LixFileSpec {
         row_source(
             (
                 write_ctx.clone(),
-                Arc::clone(&self.blob_reader),
+                self.blob_reader.clone(),
+                self.authenticated_blob_reader.clone(),
                 self.plugin_host.clone(),
                 Arc::clone(&self.schema),
                 request,
@@ -428,6 +1198,7 @@ impl LixFileSpec {
             |(
                 write_ctx,
                 blob_reader,
+                authenticated_blob_reader,
                 plugin_host,
                 table_schema,
                 request,
@@ -438,8 +1209,8 @@ impl LixFileSpec {
                 captured,
             )| async move {
                 *captured.lock().expect("lix_file DML source mutex poisoned") = None;
-                let hot_state: Arc<dyn HotStateReader> =
-                    Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
+                let state_view =
+                    Arc::new(FileStateView::Transaction(write_ctx.state_view().clone()));
                 let (prepared, path_resolvers, path_index) = if let Some(indexed_matches) =
                     indexed_matches.as_ref()
                 {
@@ -447,7 +1218,11 @@ impl LixFileSpec {
                         // Exact DML must still validate a targeted blob ref
                         // when its descriptor is missing from the path index.
                         FileIdConstraint::Ids(file_ids) => {
-                            scan_exact_file_blob_batch(hot_state.clone(), &request, file_ids).await
+                            #[cfg(test)]
+                            write_ctx.record_file_exact_batch(&file_exact_batch_plan(
+                                &request, file_ids,
+                            ));
+                            scan_exact_file_blob_batch(state_view.clone(), &request, file_ids).await
                         }
                         FileIdConstraint::All | FileIdConstraint::None => {
                             scan_indexed_file_batch(indexed_matches, true)
@@ -462,8 +1237,10 @@ impl LixFileSpec {
                             .then(|| indexed_matches.clone()),
                     )
                 } else {
+                    #[cfg(test)]
+                    write_ctx.record_file_scan();
                     let rows =
-                        scan_lix_file_live_batch(hot_state.clone(), &request, &target_file_ids)
+                        scan_lix_file_native_batch(state_view.clone(), &request, &target_file_ids)
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
                     let path_resolvers = options
@@ -482,7 +1259,7 @@ impl LixFileSpec {
                     || (options.needs_plugin_ownership && !prepared.file_rows.is_empty())
                 {
                     plugin_render_context_for_lix_file_scan(
-                        Arc::clone(&hot_state),
+                        Arc::clone(&state_view),
                         &request,
                         plugin_host,
                         &prepared,
@@ -499,14 +1276,33 @@ impl LixFileSpec {
                     None
                 };
                 let blob_ref_keys = prepared.blob_rows.keys().cloned().collect();
-                let source_batch = lix_file_record_batch_from_prepared(
-                    &table_schema,
-                    &blob_reader,
-                    plugin_render.clone(),
-                    options.needs_data,
-                    prepared,
-                )
-                .await
+                let source_batch = if options.use_authenticated_blob_reader {
+                    let authenticated_blob_reader =
+                        authenticated_blob_reader.as_ref().ok_or_else(|| {
+                            DataFusionError::Execution(
+                            "authenticated ForkTree blob reader is unavailable for this transaction"
+                                .to_string(),
+                        )
+                        })?;
+                    lix_file_record_batch_from_prepared_authenticated_transaction(
+                        &table_schema,
+                        authenticated_blob_reader.as_ref(),
+                        &write_ctx,
+                        plugin_render.clone(),
+                        options.needs_data,
+                        prepared,
+                    )
+                    .await
+                } else {
+                    blob_reader
+                        .record_batch(
+                            &table_schema,
+                            plugin_render.clone(),
+                            options.needs_data,
+                            prepared,
+                        )
+                        .await
+                }
                 .map_err(lix_error_to_datafusion_error)?;
                 *captured.lock().expect("lix_file DML source mutex poisoned") =
                     Some(LixFileDmlSourceState {
@@ -561,7 +1357,7 @@ impl LixFileSpec {
     /// `RETURNING *` stale or incomplete.
     async fn returning_post_image(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         keys: &[FileReturningKey],
         needs_data: bool,
     ) -> Result<RecordBatch> {
@@ -595,6 +1391,12 @@ impl LixFileSpec {
                 needs_data,
                 needs_plugin_ownership: false,
                 capture_path_resolver_rows: false,
+                // RETURNING reads the transaction post-image. Keep staged
+                // payload ownership on the same write context while falling
+                // back to the retained authenticated reader for committed
+                // rows; committed storage cannot see unpublished BlobRef
+                // owners.
+                use_authenticated_blob_reader: true,
             },
             captured,
         );
@@ -632,17 +1434,21 @@ impl LixFileSpec {
 /// loading and plugin rendering stay on the regular `lix_file` provider
 /// helpers below. Durable materialized reads do not hydrate a Wasm actor;
 /// mutation state is opened lazily by the first write.
-pub(crate) async fn execute_exact_lix_file_read(
+pub(crate) async fn execute_exact_lix_file_read<R>(
     active_branch_id: &str,
-    hot_state: Arc<dyn HotStateReader>,
+    state_view: ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
+    authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
     plugin_host: PluginRuntimeHost,
     session_file_views: Option<SessionFileViews>,
     selector: &ExactLixFileReadSelector,
     column: ExactLixFileReadColumn,
-) -> Result<SqlQueryResult, LixError> {
+) -> Result<SqlQueryResult, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let state_view = Arc::new(FileStateView::Committed(state_view));
     let base_schema = lix_file_schema();
     let column_index = base_schema.index_of(column.name()).map_err(|error| {
         LixError::new(
@@ -665,8 +1471,10 @@ pub(crate) async fn execute_exact_lix_file_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(column == ExactLixFileReadColumn::Content),
+                // Public payloads are loaded through the operation-owned
+                // authenticated StateKey reader; this request only selects
+                // descriptor/blob-ref rows and never hydrates a payload cache.
+                .with_blob_refs(true),
         )
         .await?;
     let matches = match selector {
@@ -689,7 +1497,7 @@ pub(crate) async fn execute_exact_lix_file_read(
     let acknowledge_plugin_data = load_data && session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
         plugin_render_context_for_lix_file_scan(
-            Arc::clone(&hot_state),
+            Arc::clone(&state_view),
             &request,
             plugin_host,
             &prepared,
@@ -700,9 +1508,9 @@ pub(crate) async fn execute_exact_lix_file_read(
     } else {
         None
     };
-    let batch = lix_file_record_batch_from_prepared(
+    let batch = lix_file_record_batch_from_prepared_authenticated(
         &schema,
-        &blob_reader,
+        authenticated_blob_reader.as_ref(),
         plugin_render,
         load_data,
         prepared,
@@ -782,18 +1590,21 @@ pub(crate) async fn execute_exact_lix_file_root_listing(
 /// DataFusion catalog, plan, or Arrow result batch. Keep this separate from
 /// the established point-read path so unrelated file queries remain
 /// byte-for-byte on their existing implementation.
-pub(crate) async fn execute_exact_lix_file_batch_read(
+pub(crate) async fn execute_exact_lix_file_batch_read<R>(
     active_branch_id: &str,
-    hot_state: Arc<dyn HotStateReader>,
+    state_view: ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
+    authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
     plugin_host: PluginRuntimeHost,
     session_file_views: Option<SessionFileViews>,
-    plugin_cache_snapshot: Option<u128>,
     paths: &BTreeSet<String>,
     data_range: Option<Range<u64>>,
-) -> Result<SqlQueryResult, LixError> {
+) -> Result<SqlQueryResult, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let state_view = Arc::new(FileStateView::Committed(state_view));
     let base_schema = lix_file_schema();
     let schema = Arc::new(Schema::new(vec![
         base_schema
@@ -817,8 +1628,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(data_range.is_none()),
+                .with_blob_refs(true),
         )
         .await?;
     let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
@@ -826,13 +1636,12 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let acknowledge_plugin_data = session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
-        plugin_render_context_for_lix_file_scan_cached(
-            Arc::clone(&hot_state),
+        plugin_render_context_for_lix_file_scan(
+            Arc::clone(&state_view),
             &request,
             plugin_host,
             &prepared,
             acknowledge_plugin_data,
-            plugin_cache_snapshot,
         )
         .await?
         .map(|context| context.with_session_file_views(session_file_views))
@@ -844,7 +1653,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     // blobs into the result instead of packing them into Arrow only for
     // DataFusion to copy them back into row values.
     let rows = exact_path_data_rows_from_prepared(
-        &blob_reader,
+        authenticated_blob_reader.as_ref(),
         plugin_render,
         prepared,
         data_range.as_ref(),
@@ -860,7 +1669,11 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
             "content_identity".to_string(),
         ]
     } else {
-        vec!["path".to_string(), "content".to_string()]
+        vec![
+            "path".to_string(),
+            "content".to_string(),
+            "content_identity".to_string(),
+        ]
     };
     Ok(SqlQueryResult {
         columns,
@@ -873,16 +1686,20 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
 /// constructing a DataFusion catalog or plan. This is the multi-row analogue
 /// of [`execute_exact_lix_file_read`] for callers that need to verify durable
 /// file identity, bytes, and metadata together.
-pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
+pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read<R>(
     active_branch_id: &str,
-    hot_state: Arc<dyn HotStateReader>,
+    state_view: ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
+    authenticated_blob_reader: Arc<dyn crate::forktree::AuthenticatedBlobReader>,
     plugin_host: PluginRuntimeHost,
     session_file_views: Option<SessionFileViews>,
     file_ids: &BTreeSet<String>,
-) -> Result<SqlQueryResult, LixError> {
+) -> Result<SqlQueryResult, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let state_view = Arc::new(FileStateView::Committed(state_view));
     let base_schema = lix_file_schema();
     let schema = Arc::new(Schema::new(
         ["id", "path", "content", "lixcol_metadata"]
@@ -907,8 +1724,7 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(true),
+                .with_blob_refs(true),
         )
         .await?;
     let matches = indexed_file_id_matches(index, file_ids, &FilePathPredicate::All);
@@ -917,7 +1733,7 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
     let acknowledge_plugin_data = session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
         plugin_render_context_for_lix_file_scan(
-            Arc::clone(&hot_state),
+            Arc::clone(&state_view),
             &request,
             plugin_host,
             &prepared,
@@ -928,9 +1744,14 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
     } else {
         None
     };
-    let batch =
-        lix_file_record_batch_from_prepared(&schema, &blob_reader, plugin_render, true, prepared)
-            .await?;
+    let batch = lix_file_record_batch_from_prepared_authenticated(
+        &schema,
+        authenticated_blob_reader.as_ref(),
+        plugin_render,
+        true,
+        prepared,
+    )
+    .await?;
     crate::sql2::exec::datafusion::query_result_from_batches(
         &schema
             .fields()
@@ -955,12 +1776,15 @@ fn lix_file_dml_source_state(
 }
 
 #[async_trait]
-impl TableSpec for LixFileSpec {
+impl<R> TableSpec<R> for LixFileSpec<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn table_name(&self) -> &str {
         "lix_file"
     }
 
-    fn upsert_support(&self) -> Option<&dyn UpsertSupport> {
+    fn upsert_support(&self) -> Option<&dyn UpsertSupport<R>> {
         Some(self)
     }
 
@@ -1026,7 +1850,7 @@ impl TableSpec for LixFileSpec {
         // The path index carries every descriptor column, not just `path`.
         // Prefer it for all descriptor-only scans so queries such as
         // `SELECT id FROM lix_file` and `COUNT(*)` do not materialize the
-        // complete descriptor/directory live-state domain on every request.
+        // complete descriptor/directory native state domain on every request.
         // Scans that need file content or the blob revision still load blob rows.
         // A path predicate or exact file/directory ids can narrow those loads
         // to matching cached descriptors instead of scanning complete state.
@@ -1042,8 +1866,7 @@ impl TableSpec for LixFileSpec {
                 .filesystem_path_index
                 .path_index(
                     &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                        .with_blob_refs(needs_blob_rows)
-                        .with_cached_blob_data(needs_data),
+                        .with_blob_refs(needs_blob_rows),
                 )
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
@@ -1100,8 +1923,9 @@ impl TableSpec for LixFileSpec {
             source: scan_row_source(
                 Arc::clone(&projected_schema),
                 (
-                    Arc::clone(&self.hot_state),
-                    Arc::clone(&self.blob_reader),
+                    self.write_ctx.clone(),
+                    Arc::new(self.state_view.clone()),
+                    self.blob_reader.clone(),
                     self.plugin_host.clone(),
                     Arc::clone(&self.schema),
                     Arc::clone(&projected_schema),
@@ -1118,7 +1942,8 @@ impl TableSpec for LixFileSpec {
                     limit,
                 ),
                 |(
-                    hot_state,
+                    write_ctx,
+                    state_view,
                     blob_reader,
                     plugin_host,
                     batch_schema,
@@ -1135,6 +1960,12 @@ impl TableSpec for LixFileSpec {
                     needs_required_blob_rows,
                     limit,
                 )| async move {
+                    let state_view = write_ctx
+                        .as_ref()
+                        .map(|write_ctx| {
+                            Arc::new(FileStateView::Transaction(write_ctx.state_view().clone()))
+                        })
+                        .unwrap_or(state_view);
                     if let Some(indexed_matches) = indexed_matches.as_ref()
                         && !needs_required_blob_rows
                     {
@@ -1180,8 +2011,8 @@ impl TableSpec for LixFileSpec {
                             })?;
                         prepare_indexed_lix_file_rows(indexed_matches, rows)
                     } else {
-                        let rows = scan_lix_file_live_batch(
-                            Arc::clone(&hot_state),
+                        let rows = scan_lix_file_native_batch(
+                            Arc::clone(&state_view),
                             &request,
                             &target_file_ids,
                         )
@@ -1203,7 +2034,7 @@ impl TableSpec for LixFileSpec {
                         || acknowledge_plugin_data
                     {
                         plugin_render_context_for_lix_file_scan(
-                            Arc::clone(&hot_state),
+                            Arc::clone(&state_view),
                             &request,
                             plugin_host,
                             &prepared,
@@ -1220,14 +2051,21 @@ impl TableSpec for LixFileSpec {
                     } else {
                         None
                     };
-                    let batch = lix_file_record_batch_from_prepared(
-                        &batch_schema,
-                        &blob_reader,
-                        plugin_render,
-                        needs_data,
-                        prepared,
-                    )
-                    .await
+                    let batch = if let Some(write_ctx) = write_ctx.as_ref() {
+                        lix_file_record_batch_from_prepared_authenticated_transaction(
+                            &batch_schema,
+                            blob_reader.authenticated_reader(),
+                            write_ctx,
+                            plugin_render,
+                            needs_data,
+                            prepared,
+                        )
+                        .await
+                    } else {
+                        blob_reader
+                            .record_batch(&batch_schema, plugin_render, needs_data, prepared)
+                            .await
+                    }
                     .map_err(|error| {
                         DataFusionError::Context(
                             "sql2 lix_file batch build failed".to_string(),
@@ -1242,7 +2080,7 @@ impl TableSpec for LixFileSpec {
 
     async fn plan_insert(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         input: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<InsertApply>> {
         let insert_intents = InsertColumnIntents::from_input(input);
@@ -1274,7 +2112,7 @@ impl TableSpec for LixFileSpec {
 
     async fn plan_insert_with_returning(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         input: &Arc<dyn ExecutionPlan>,
         returning: DmlReturning,
     ) -> Result<InsertApply> {
@@ -1309,8 +2147,7 @@ impl TableSpec for LixFileSpec {
                     }
                     if path_resolvers.is_none() {
                         path_resolvers = Some(
-                            directory_path_resolvers_from_hot_state(
-                                Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
+                            directory_path_resolvers_from_transaction_state_view(write_ctx.state_view(),
                                 spec.branch_binding.active_branch_id(),
                             )
                             .await
@@ -1395,7 +2232,7 @@ impl TableSpec for LixFileSpec {
 
     async fn plan_delete(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
         self.plan_delete_with_options(write_ctx, filters, DmlPlanOptions::default())
@@ -1404,7 +2241,7 @@ impl TableSpec for LixFileSpec {
 
     async fn plan_delete_with_options(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         filters: &[Expr],
         options: DmlPlanOptions,
     ) -> Result<PlannedDml> {
@@ -1436,8 +2273,9 @@ impl TableSpec for LixFileSpec {
             indexed_matches,
             LixFileDmlSourceOptions {
                 needs_data,
-                needs_plugin_ownership: false,
+                needs_plugin_ownership: true,
                 capture_path_resolver_rows: false,
+                use_authenticated_blob_reader: false,
             },
             Arc::clone(&captured),
         );
@@ -1455,6 +2293,65 @@ impl TableSpec for LixFileSpec {
                     &source_state.blob_ref_keys,
                     plugin_archive_delete_target.as_deref(),
                 )?;
+                let mut staged = staged;
+                let mut file_ids_by_branch = BTreeMap::<String, BTreeSet<String>>::new();
+                for row_index in 0..matched_batch.num_rows() {
+                    let branch_id = match branch_binding.active_branch_id() {
+                        Some(branch_id) => branch_id.to_owned(),
+                        None => {
+                            required_string_value(&matched_batch, row_index, "lixcol_branch_id")?
+                        }
+                    };
+                    file_ids_by_branch
+                        .entry(branch_id)
+                        .or_default()
+                        .insert(required_string_value(&matched_batch, row_index, "id")?);
+                }
+                if !file_ids_by_branch.is_empty() {
+                    let schema_keys = write_ctx
+                        .visible_schema_keys()
+                        .map_err(lix_error_to_datafusion_error)?;
+                    let state_view = FileStateView::Transaction(write_ctx.state_view().clone());
+                    for (branch_id, file_ids) in file_ids_by_branch {
+                        let dependency_rows = state_view
+                            .file_owned_rows(
+                                &branch_id,
+                                schema_keys.clone(),
+                                &file_ids.iter().cloned().collect::<Vec<_>>(),
+                            )
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                        for row in dependency_rows {
+                            if row.deleted
+                                || row.global
+                                || row.untracked
+                                || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                                || row.schema_key == BLOB_REF_SCHEMA_KEY
+                                || is_plugin_owned_delete_row(
+                                    source_state.plugin_render.as_ref(),
+                                    &row,
+                                )
+                            {
+                                continue;
+                            }
+                            staged.state_rows.push(TransactionWriteRow {
+                                entity_pk: Some(row.entity_pk),
+                                schema_key: row.schema_key.into(),
+                                file_id: row.file_id.map(Into::into),
+                                snapshot: None,
+                                metadata: None,
+                                origin: None,
+                                created_at: None,
+                                updated_at: None,
+                                global: false,
+                                change_id: None,
+                                commit_id: None,
+                                untracked: false,
+                                branch_id: row.branch_id.into(),
+                            });
+                        }
+                    }
+                }
                 let count = staged.count;
 
                 if count > 0 {
@@ -1476,7 +2373,7 @@ impl TableSpec for LixFileSpec {
 
     async fn plan_update(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
@@ -1486,7 +2383,7 @@ impl TableSpec for LixFileSpec {
 
     async fn plan_update_with_returning(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
         returning: DmlReturning,
@@ -1496,19 +2393,56 @@ impl TableSpec for LixFileSpec {
     }
 }
 
-impl LixFileSpec {
+fn is_plugin_owned_delete_row(
+    plugin_render: Option<&PluginRenderContext>,
+    row: &FilesystemStateRow,
+) -> bool {
+    let Some(file_id) = row.file_id.as_deref() else {
+        return false;
+    };
+    let key = FilesystemDescriptorKey::from_context(
+        &FilesystemRowContext {
+            branch_id: row.branch_id.clone(),
+            global: row.global,
+            untracked: row.untracked,
+            file_id: None,
+            metadata: None,
+        },
+        file_id,
+    );
+    let Some(owner) = plugin_render.and_then(|render| render.owner_for_file(&key)) else {
+        return false;
+    };
+    if row.schema_key == "lix_key_value" {
+        return row
+            .entity_pk
+            .as_single_string()
+            .is_ok_and(|key| key == PLUGIN_OWNER_KEY || is_reservation_key(key));
+    }
+    owner
+        .schema_keys()
+        .binary_search_by(|schema_key| schema_key.as_str().cmp(&row.schema_key))
+        .is_ok()
+}
+
+impl<R> LixFileSpec<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     async fn plan_update_with_post_image(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
         returning: Option<DmlReturning>,
     ) -> Result<PlannedDml> {
+        let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
         let needs_data = filters
             .iter()
             .any(|filter| contains_column(filter, "content"))
             || assignments.iter().any(|(column_name, expr)| {
-                column_name == "path" || physical_expr_contains_column(expr, "content")
+                (column_name == "path" && !update_columns.data)
+                    || physical_expr_contains_column(expr, "content")
             })
             || returning
                 .as_ref()
@@ -1527,7 +2461,6 @@ impl LixFileSpec {
             .indexed_dml_matches(&request, filters, &target_file_ids)
             .await?;
 
-        let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
         let capture_path_resolver_rows = update_columns.requires_path_resolver()
             && matches!(
                 (&self.branch_binding, &target_file_ids),
@@ -1543,6 +2476,8 @@ impl LixFileSpec {
                 needs_data,
                 needs_plugin_ownership: update_columns.updates_path() && !update_columns.data,
                 capture_path_resolver_rows,
+                use_authenticated_blob_reader: update_columns.updates_path()
+                    && !update_columns.data,
             },
             Arc::clone(&captured),
         );
@@ -1603,8 +2538,8 @@ impl LixFileSpec {
                         }
                         path_resolvers
                     } else {
-                        directory_path_resolvers_from_hot_state(
-                            Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
+                        directory_path_resolvers_from_transaction_state_view(
+                            write_ctx.state_view(),
                             branch_binding.active_branch_id(),
                         )
                         .await
@@ -1669,7 +2604,10 @@ const LIX_FILE_PATH_IDENTITY: &[&str] = &["path"];
 const LIX_FILE_BY_BRANCH_PATH_IDENTITY: &[&str] = &["path", "lixcol_branch_id"];
 
 #[async_trait]
-impl UpsertSupport for LixFileSpec {
+impl<R> UpsertSupport<R> for LixFileSpec<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn conflict_identity_columns(&self) -> &[&'static str] {
         LIX_FILE_IDENTITY
     }
@@ -1705,7 +2643,7 @@ impl UpsertSupport for LixFileSpec {
 
     async fn insert_staged_rows(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         batch: &RecordBatch,
     ) -> Result<StagedUpsert> {
         // Reuse the plain-INSERT staging the file insert sink performs, for a
@@ -1716,8 +2654,8 @@ impl UpsertSupport for LixFileSpec {
         let branch_binding = self.branch_binding.active_branch_id();
         let include_data_writes = record_batch_has_non_null_column(batch, "content")?;
 
-        let mut path_resolvers = directory_path_resolvers_from_hot_state(
-            Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
+        let mut path_resolvers = directory_path_resolvers_from_transaction_state_view(
+            write_ctx.state_view(),
             branch_binding,
         )
         .await
@@ -1758,12 +2696,6 @@ impl UpsertSupport for LixFileSpec {
                 "lixcol_global",
                 "INSERT into lix_file",
             )?;
-            defaultable_bool_insert_value(
-                batch,
-                row_index,
-                "lixcol_untracked",
-                "INSERT into lix_file",
-            )?;
             if !insert_column_is_omitted(batch, "content") {
                 insert_optional_binary_value(batch, row_index, "content")?;
             }
@@ -1773,7 +2705,7 @@ impl UpsertSupport for LixFileSpec {
 
     async fn materialize_excluded_defaults(
         &self,
-        _write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
         proposed: &RecordBatch,
     ) -> Result<RecordBatch> {
         let materialized = if insert_column_is_omitted(proposed, "id") {
@@ -1797,16 +2729,12 @@ impl UpsertSupport for LixFileSpec {
             "lixcol_global",
             Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
         )?;
-        materialize_omitted_column(
-            &materialized,
-            "lixcol_untracked",
-            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
-        )
+        Ok(materialized)
     }
 
     async fn materialize_returning_insert_defaults(
         &self,
-        _write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
         proposed: &RecordBatch,
     ) -> Result<RecordBatch> {
         LixFileSpec::materialize_returning_insert_defaults(self, proposed)
@@ -1814,7 +2742,7 @@ impl UpsertSupport for LixFileSpec {
 
     async fn capture_upsert_returning(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         affected_rows: Vec<UpsertReturningRow>,
         returning: DmlReturning,
     ) -> Result<()> {
@@ -1835,7 +2763,7 @@ impl UpsertSupport for LixFileSpec {
 
     async fn scan_conflict_candidates(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         proposed: &RecordBatch,
         target: &UpsertConflictTarget,
     ) -> Result<RecordBatch> {
@@ -1883,15 +2811,16 @@ impl UpsertSupport for LixFileSpec {
                 .await?
         };
 
-        let hot_state: Arc<dyn HotStateReader> =
-            Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
+        let state_view = Arc::new(FileStateView::Transaction(write_ctx.state_view().clone()));
         let prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
             // Conflict probes only need the proposed exact IDs or paths. Use
             // the visible filesystem index for descriptor matching, then fetch
             // correlated blob refs solely for those files.
             let rows = match &target_file_ids {
                 FileIdConstraint::Ids(file_ids) => {
-                    scan_exact_file_blob_batch(hot_state.clone(), &request, file_ids).await
+                    #[cfg(test)]
+                    write_ctx.record_file_exact_batch(&file_exact_batch_plan(&request, file_ids));
+                    scan_exact_file_blob_batch(state_view.clone(), &request, file_ids).await
                 }
                 FileIdConstraint::All | FileIdConstraint::None => {
                     scan_indexed_file_batch(indexed_matches, true)
@@ -1900,7 +2829,7 @@ impl UpsertSupport for LixFileSpec {
             .map_err(lix_error_to_datafusion_error)?;
             prepare_indexed_lix_file_rows(indexed_matches, rows)
         } else {
-            let rows = scan_lix_file_live_batch(hot_state.clone(), &request, &target_file_ids)
+            let rows = scan_lix_file_native_batch(state_view.clone(), &request, &target_file_ids)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             prepare_lix_file_rows(rows, &FilePathPredicate::All)
@@ -1908,7 +2837,7 @@ impl UpsertSupport for LixFileSpec {
         .map_err(lix_error_to_datafusion_error)?;
         let plugin_render = if prepared.needs_plugin_render(true) {
             plugin_render_context_for_lix_file_scan(
-                Arc::clone(&hot_state),
+                Arc::clone(&state_view),
                 &request,
                 self.plugin_host.clone(),
                 &prepared,
@@ -1923,9 +2852,17 @@ impl UpsertSupport for LixFileSpec {
         } else {
             None
         };
-        lix_file_record_batch_from_prepared(
+        let authenticated_blob_reader =
+            self.authenticated_blob_reader.as_ref().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "authenticated ForkTree blob reader is unavailable for this transaction"
+                        .to_string(),
+                )
+            })?;
+        lix_file_record_batch_from_prepared_authenticated_transaction(
             &self.schema,
-            &self.blob_reader,
+            authenticated_blob_reader.as_ref(),
+            write_ctx,
             plugin_render,
             true,
             prepared,
@@ -1945,27 +2882,12 @@ impl UpsertSupport for LixFileSpec {
         if target.kind() != UpsertConflictKind::Path {
             return Ok(());
         }
-        let existing_untracked =
-            optional_bool_value(existing, existing_row, "lixcol_untracked")?.unwrap_or(false);
-        let proposed_untracked =
-            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
-        if existing_untracked == proposed_untracked {
-            return Ok(());
-        }
-        let path = required_string_value(proposed, proposed_row, "path")?;
-        Err(lix_error_to_datafusion_error(LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!(
-                "INSERT ON CONFLICT (path) on lix_file cannot write {} path {path:?} over existing {} file",
-                lane_name(proposed_untracked),
-                lane_name(existing_untracked)
-            ),
-        )))
+        Ok(())
     }
 
     async fn apply_conflict_update(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         augmented: &RecordBatch,
         assignments: &[(String, Arc<dyn PhysicalExpr>)],
     ) -> Result<StagedUpsert> {
@@ -1991,18 +2913,19 @@ impl UpsertSupport for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
 
-        let hot_state: Arc<dyn HotStateReader> =
-            Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
+        let state_view = Arc::new(FileStateView::Transaction(write_ctx.state_view().clone()));
         // The augmented conflict batch already carries the selected
         // descriptors. Recover only their correlated blob refs; rebuilding
         // the path index here would duplicate the conflict probe's topology
         // read, especially for path-based upserts.
         let rows = match &target_file_ids {
             FileIdConstraint::Ids(file_ids) => {
-                scan_exact_file_blob_batch(hot_state.clone(), &request, file_ids).await
+                #[cfg(test)]
+                write_ctx.record_file_exact_batch(&file_exact_batch_plan(&request, file_ids));
+                scan_exact_file_blob_batch(state_view.clone(), &request, file_ids).await
             }
             FileIdConstraint::All | FileIdConstraint::None => {
-                scan_lix_file_live_batch(hot_state.clone(), &request, &target_file_ids).await
+                scan_lix_file_native_batch(state_view.clone(), &request, &target_file_ids).await
             }
         }
         .map_err(lix_error_to_datafusion_error)?;
@@ -2012,7 +2935,7 @@ impl UpsertSupport for LixFileSpec {
         let plugin_rewrite_file_ids = if update_columns.updates_path() && !update_columns.data {
             let plugin_host = self.plugin_host.clone();
             let branches =
-                load_plugin_render_branches(Arc::clone(&hot_state), &request, &plugin_host, None)
+                load_plugin_render_branches(Arc::clone(&state_view), &request, &plugin_host)
                     .await
                     .map_err(|error| {
                         DataFusionError::Execution(format!(
@@ -2023,7 +2946,7 @@ impl UpsertSupport for LixFileSpec {
                 None
             } else {
                 plugin_render_context_with_branches(
-                    hot_state.clone(),
+                    state_view.clone(),
                     plugin_host,
                     branches,
                     plugin_owner_candidates_from_batch(augmented, branch_binding)?,
@@ -2049,8 +2972,8 @@ impl UpsertSupport for LixFileSpec {
         let mut path_resolvers = None;
         if update_columns.requires_path_resolver() {
             path_resolvers = Some(
-                directory_path_resolvers_from_hot_state(
-                    Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
+                directory_path_resolvers_from_transaction_state_view(
+                    write_ctx.state_view(),
                     branch_binding,
                 )
                 .await
@@ -2159,23 +3082,32 @@ fn lane_name(untracked: bool) -> &'static str {
     if untracked { "untracked" } else { "tracked" }
 }
 
-struct LixFileInsertSink {
-    write_ctx: SqlWriteContext,
+struct LixFileInsertSink<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    write_ctx: SqlWriteContext<R>,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
     surface_name: &'static str,
     include_data_writes: bool,
 }
 
-impl std::fmt::Debug for LixFileInsertSink {
+impl<R> std::fmt::Debug for LixFileInsertSink<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixFileInsertSink").finish()
     }
 }
 
-impl LixFileInsertSink {
+impl<R> LixFileInsertSink<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn new(
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         functions: FunctionProviderHandle,
         branch_binding: BranchBinding,
         include_data_writes: bool,
@@ -2191,7 +3123,10 @@ impl LixFileInsertSink {
     }
 }
 
-impl DisplayAs for LixFileInsertSink {
+impl<R> DisplayAs for LixFileInsertSink<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -2203,7 +3138,10 @@ impl DisplayAs for LixFileInsertSink {
 }
 
 #[async_trait]
-impl InsertSink for LixFileInsertSink {
+impl<R> InsertSink for LixFileInsertSink<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     async fn write_batches(
         &self,
         batches: Vec<RecordBatch>,
@@ -2219,8 +3157,8 @@ impl InsertSink for LixFileInsertSink {
         for batch in batches {
             if path_resolvers.is_none() {
                 path_resolvers = Some(
-                    directory_path_resolvers_from_hot_state(
-                        Arc::new(WriteContextHotStateReader::new(self.write_ctx.clone())),
+                    directory_path_resolvers_from_transaction_state_view(
+                        self.write_ctx.state_view(),
                         self.branch_binding.active_branch_id(),
                     )
                     .await
@@ -2290,35 +3228,35 @@ fn lix_file_surface_name(branch_binding: &BranchBinding) -> &'static str {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HotStateRowHandle {
+struct StateRowHandle {
     batch: u32,
     row: u32,
 }
 
 #[derive(Debug, Default)]
-struct HotStateBatchOwners {
-    batches: Vec<MaterializedHotStateBatch>,
+struct StateRowOwners {
+    batches: Vec<FilesystemStateRows>,
 }
 
-impl HotStateBatchOwners {
-    fn push(&mut self, batch: MaterializedHotStateBatch) -> u32 {
+impl StateRowOwners {
+    fn push(&mut self, batch: FilesystemStateRows) -> u32 {
         let ordinal =
             u32::try_from(self.batches.len()).expect("lix_file live batch count exceeds u32");
         self.batches.push(batch);
         ordinal
     }
 
-    fn row(&self, handle: HotStateRowHandle) -> MaterializedHotStateRowRef<'_> {
+    fn row(&self, handle: StateRowHandle) -> FilesystemStateRowRef<'_> {
         self.batches[handle.batch as usize].row(handle.row as usize)
     }
 
-    fn batch(&self, ordinal: u32) -> &MaterializedHotStateBatch {
+    fn batch(&self, ordinal: u32) -> &FilesystemStateRows {
         &self.batches[ordinal as usize]
     }
 }
 
-fn hot_state_row_handle(batch: u32, row: usize) -> HotStateRowHandle {
-    HotStateRowHandle {
+fn state_row_handle(batch: u32, row: usize) -> StateRowHandle {
+    StateRowHandle {
         batch,
         row: u32::try_from(row).expect("lix_file live batch row count exceeds u32"),
     }
@@ -2330,16 +3268,16 @@ struct FileDescriptorRecord {
     directory_id: Option<String>,
     name: String,
     key: FilesystemDescriptorKey,
-    live: HotStateRowHandle,
+    live: StateRowHandle,
 }
 
 impl FileDescriptorRecord {
-    fn row_context(&self, owners: &HotStateBatchOwners) -> FilesystemRowContext {
+    fn row_context(&self, owners: &StateRowOwners) -> FilesystemRowContext {
         let live = owners.row(self.live);
         FilesystemRowContext {
             branch_id: live.branch_id().to_owned(),
             global: live.global(),
-            untracked: live.untracked(),
+            untracked: false,
             file_id: live.file_id().map(str::to_owned),
             metadata: None,
         }
@@ -2353,7 +3291,7 @@ impl FileDescriptorRecord {
         keys
     }
 
-    fn blob_ref_key(&self, owners: &HotStateBatchOwners) -> FilesystemBlobRefKey {
+    fn blob_ref_key(&self, owners: &StateRowOwners) -> FilesystemBlobRefKey {
         FilesystemBlobRefKey::from_context(&self.row_context(owners), &self.id)
     }
 }
@@ -2395,8 +3333,10 @@ impl PluginRenderContext {
 #[derive(Debug, Clone)]
 struct BlobRefRecord {
     blob_hash: String,
+    #[cfg(test)]
     inline_data: Option<Vec<u8>>,
-    live: HotStateRowHandle,
+    live: StateRowHandle,
+    state_key: crate::forktree::StateKey,
 }
 
 #[derive(Debug, Clone)]
@@ -2444,9 +3384,9 @@ struct BlobRefSnapshot {
     blob_hash: String,
 }
 
-fn blob_ref_record_from_live_row(
-    row: MaterializedHotStateRowRef<'_>,
-    handle: HotStateRowHandle,
+fn blob_ref_record_from_state_row(
+    row: FilesystemStateRowRef<'_>,
+    handle: StateRowHandle,
 ) -> Result<Option<(FilesystemBlobRefKey, BlobRefRecord)>, LixError> {
     if row.schema_key() != BLOB_REF_SCHEMA_KEY {
         return Ok(None);
@@ -2460,13 +3400,19 @@ fn blob_ref_record_from_live_row(
             format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
         )
     })?;
-    let key = FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id);
+    let key = FilesystemBlobRefKey::from_state_row_ref(row, snapshot.id);
     Ok(Some((
         key,
         BlobRefRecord {
             blob_hash: snapshot.blob_hash,
+            #[cfg(test)]
             inline_data: None,
             live: handle,
+            state_key: crate::forktree::StateKey {
+                schema_key: row.schema_key().to_owned(),
+                file_id: row.file_id().map(str::to_owned),
+                entity_pk: row.entity_pk().clone(),
+            },
         },
     )))
 }
@@ -2569,8 +3515,8 @@ impl FastLixFilePathWriteConflict {
     }
 }
 
-pub(crate) async fn execute_fast_lix_file_path_writes(
-    ctx: &mut dyn SqlWriteExecutionContext,
+pub(crate) async fn execute_fast_lix_file_path_writes<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     writes: Vec<(
         String,
         crate::Blob,
@@ -2579,13 +3525,17 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
     )>,
     conflict: FastLixFilePathWriteConflict,
     mutation_identity: Option<MutationIdentity>,
-) -> Result<Option<u64>, LixError> {
+) -> Result<Option<u64>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     execute_fast_lix_file_id_path_writes_inner(
         ctx,
         writes
             .into_iter()
             .map(|(path, data, metadata, splice)| {
-                (None, path, FileContent::inline(data), metadata, splice)
+                let content = file_content_from_request_splice(data, splice.as_ref());
+                (None, path, content, metadata, splice)
             })
             .collect(),
         conflict,
@@ -2594,8 +3544,8 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
     .await
 }
 
-pub(crate) async fn execute_fast_lix_file_id_path_writes(
-    ctx: &mut dyn SqlWriteExecutionContext,
+pub(crate) async fn execute_fast_lix_file_id_path_writes<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     writes: Vec<(
         Option<String>,
         String,
@@ -2605,13 +3555,17 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
     )>,
     conflict: FastLixFilePathWriteConflict,
     mutation_identity: Option<MutationIdentity>,
-) -> Result<Option<u64>, LixError> {
+) -> Result<Option<u64>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     execute_fast_lix_file_id_path_writes_inner(
         ctx,
         writes
             .into_iter()
             .map(|(id, path, data, metadata, splice)| {
-                (id, path, FileContent::inline(data), metadata, splice)
+                let content = file_content_from_request_splice(data, splice.as_ref());
+                (id, path, content, metadata, splice)
             })
             .collect(),
         conflict,
@@ -2620,11 +3574,14 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
     .await
 }
 
-pub(crate) async fn execute_fast_lix_file_prepared_path_write(
-    ctx: &mut dyn SqlWriteExecutionContext,
+pub(crate) async fn execute_fast_lix_file_prepared_path_write<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     path: String,
     receipt: crate::binary_cas::BlobWriteReceipt,
-) -> Result<Option<u64>, LixError> {
+) -> Result<Option<u64>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     execute_fast_lix_file_id_path_writes_inner(
         ctx,
         vec![(None, path, FileContent::PreparedCas(receipt), None, None)],
@@ -2634,8 +3591,8 @@ pub(crate) async fn execute_fast_lix_file_prepared_path_write(
     .await
 }
 
-async fn execute_fast_lix_file_id_path_writes_inner(
-    ctx: &mut dyn SqlWriteExecutionContext,
+async fn execute_fast_lix_file_id_path_writes_inner<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     writes: Vec<(
         Option<String>,
         String,
@@ -2645,7 +3602,10 @@ async fn execute_fast_lix_file_id_path_writes_inner(
     )>,
     conflict: FastLixFilePathWriteConflict,
     mutation_identity: Option<MutationIdentity>,
-) -> Result<Option<u64>, LixError> {
+) -> Result<Option<u64>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     if writes.is_empty() {
         return Ok(Some(0));
     }
@@ -2653,229 +3613,29 @@ async fn execute_fast_lix_file_id_path_writes_inner(
     let active_branch_id = ctx.active_branch_id().to_string();
     let parsed_writes = parse_fast_lix_file_path_writes(writes)?;
 
-    // Boxed: this function keeps the whole-branch fallback below live in the
-    // same state machine, so inlining the indexed route's futures here makes
-    // one `lix_file` write frame large enough to overflow libtest's 2 MiB
-    // worker stack in a debug build.
     let indexed = if conflict.targets_id() {
-        Box::pin(indexed_file_id_writes(
-            ctx,
-            &active_branch_id,
-            &parsed_writes,
-        ))
-        .await?
-    } else if conflict.updates_existing() || conflict == FastLixFilePathWriteConflict::None {
-        // A plain INSERT is a create; it needs the same path lookup an upsert
-        // does and nothing more. Routing it through the path index removes the
-        // whole-branch descriptor scan the fallback below performs.
-        Box::pin(indexed_file_path_writes(
-            ctx,
-            &active_branch_id,
-            &parsed_writes,
-            conflict,
-        ))
-        .await?
+        indexed_file_id_writes(ctx, &active_branch_id, &parsed_writes).await?
     } else {
-        None
+        indexed_file_path_writes(ctx, &active_branch_id, &parsed_writes).await?
     };
     if let Some(indexed) = indexed {
-        return Box::pin(stage_indexed_file_path_writes(
+        return stage_indexed_file_path_writes(
             ctx,
             &active_branch_id,
             parsed_writes,
             indexed,
             conflict,
             mutation_identity,
-        ))
+        )
         .await
         .map(Some);
     }
 
-    // Extracted and boxed so the whole-branch fallback's locals are not part of
-    // this function's poll frame. At `opt-level = 0` a single async fn keeps a
-    // stack slot for every local across every branch, and holding both routes
-    // in one frame overflows libtest's 2 MiB worker stack.
-    Box::pin(stage_scanning_file_path_writes(
-        ctx,
-        &active_branch_id,
-        parsed_writes,
-        conflict,
-        mutation_identity,
-    ))
-    .await
-}
-
-/// The canonical fallback: rebuild the branch's filesystem view from a
-/// whole-branch descriptor scan. Taken only when the path index cannot answer
-/// the write (occupied path on a plain INSERT, ambiguous multi-scope entry,
-/// constraint violation while seeding resolvers).
-async fn stage_scanning_file_path_writes(
-    ctx: &mut dyn SqlWriteExecutionContext,
-    active_branch_id: &str,
-    parsed_writes: Vec<FastLixFilePathWrite>,
-    conflict: FastLixFilePathWriteConflict,
-    mutation_identity: Option<MutationIdentity>,
-) -> Result<Option<u64>, LixError> {
-    let live_rows = ctx
-        .scan_hot_state_batch(&HotStateScanRequest {
-            filter: HotStateFilter {
-                schema_keys: filesystem_schema_keys(),
-                branch_ids: vec![active_branch_id.to_string()],
-                include_tombstones: false,
-                ..HotStateFilter::default()
-            },
-            ..HotStateScanRequest::default()
-        })
-        .await?;
-    let filesystem = match FilesystemIndex::from_live_batch(&live_rows) {
-        Ok(filesystem) => filesystem,
-        // The legacy write index intentionally rejects visible path collisions
-        // across storage scopes, while the general provider can disambiguate
-        // them. No writes have been staged yet, so decline the fast route and
-        // let the caller execute the original DataFusion plan.
-        Err(error) if error.code == LixError::CODE_CONSTRAINT_VIOLATION => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let mut path_resolvers = directory_path_resolvers_from_state_batch(&live_rows)?;
-    let resolver_key = filesystem_storage_scope_key(active_branch_id, false, false, None);
-    path_resolvers.entry(resolver_key).or_default();
-    let mut staged = LixFileStagedBatch::with_row_capacity(parsed_writes.len().saturating_mul(3));
-
-    for write in parsed_writes {
-        let content = write.data.clone();
-        if let Some(existing) = filesystem.file_entry(&write.parsed.path).cloned() {
-            let base_blob_hash = existing
-                .blob_hash
-                .as_deref()
-                .and_then(|hash| BlobId::from_hex(hash).ok());
-            if conflict != FastLixFilePathWriteConflict::None {
-                validate_fast_lix_file_path_conflict_pair(
-                    existing.scope.untracked,
-                    &write.parsed.path,
-                )?;
-            }
-            match conflict {
-                FastLixFilePathWriteConflict::None => {
-                    let file_id = fast_file_write_id(&write, ctx);
-                    let context = FilesystemRowContext {
-                        branch_id: active_branch_id.to_string(),
-                        global: false,
-                        untracked: false,
-                        file_id: None,
-                        metadata: write.metadata,
-                    };
-                    let plan = plan_parsed_file_path_write_with_resolvers(
-                        &mut path_resolvers,
-                        write.parsed.parsed_path,
-                        Some(file_id),
-                        Some(content.clone()),
-                        context,
-                        &mut || ctx.functions().call_uuid_v7().to_string(),
-                    )?;
-                    staged.extend_filesystem_plan(plan)?;
-                }
-                FastLixFilePathWriteConflict::DoNothing
-                | FastLixFilePathWriteConflict::IdDoNothing => {}
-                FastLixFilePathWriteConflict::UpdateContent
-                | FastLixFilePathWriteConflict::IdUpdateContent => {
-                    let mut context = existing.scope.context(Some(existing.id.clone()));
-                    if context.global {
-                        context.branch_id = GLOBAL_BRANCH_ID.to_string();
-                    }
-                    let file_content_start = staged.file_content_writes.len();
-                    stage_lix_file_content_update_write(
-                        &mut staged,
-                        existing.id.clone(),
-                        Some(write.parsed.path),
-                        Some(existing.name.clone()),
-                        content.clone(),
-                        context,
-                        existing.blob_hash.is_some(),
-                        base_blob_hash,
-                        None,
-                    )
-                    .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-                    attach_fast_file_write_metadata(
-                        &mut staged.file_content_writes[file_content_start..],
-                        write.splice_provenance,
-                        mutation_identity,
-                    );
-                    staged.add_count(1)?;
-                }
-                FastLixFilePathWriteConflict::UpdateContentAndMetadata
-                | FastLixFilePathWriteConflict::IdUpdateContentAndMetadata => {
-                    let mut context = existing.scope.context(None);
-                    if context.global {
-                        context.branch_id = GLOBAL_BRANCH_ID.to_string();
-                    }
-                    context.metadata = write.metadata;
-                    FileDescriptorWriteIntent {
-                        id: Some(existing.id.clone()),
-                        directory_id: existing.directory_id.clone(),
-                        name: existing.name.clone(),
-                        context: context.clone(),
-                    }
-                    .append_to(&mut staged.state_rows);
-                    let file_content_start = staged.file_content_writes.len();
-                    stage_lix_file_content_update_write(
-                        &mut staged,
-                        existing.id.clone(),
-                        Some(write.parsed.path),
-                        Some(existing.name.clone()),
-                        content.clone(),
-                        context,
-                        existing.blob_hash.is_some(),
-                        base_blob_hash,
-                        None,
-                    )
-                    .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-                    attach_fast_file_write_metadata(
-                        &mut staged.file_content_writes[file_content_start..],
-                        write.splice_provenance,
-                        mutation_identity,
-                    );
-                    staged.add_count(1)?;
-                }
-            }
-        } else {
-            let file_id = fast_file_write_id(&write, ctx);
-            let context = FilesystemRowContext {
-                branch_id: active_branch_id.to_string(),
-                global: false,
-                untracked: false,
-                file_id: None,
-                metadata: write.metadata,
-            };
-            let mut plan = plan_parsed_file_path_write_with_resolvers(
-                &mut path_resolvers,
-                write.parsed.parsed_path,
-                Some(file_id.clone()),
-                Some(content),
-                context,
-                &mut || ctx.functions().call_uuid_v7().to_string(),
-            )?;
-            attach_fast_file_write_metadata(
-                &mut plan.file_content,
-                write.splice_provenance,
-                mutation_identity,
-            );
-            attach_lix_file_insert_origin(&mut plan.rows, "lix_file", &file_id);
-            staged.extend_filesystem_plan(plan)?;
-        }
-    }
-
-    let mode = match conflict {
-        FastLixFilePathWriteConflict::None => TransactionWriteMode::Insert,
-        FastLixFilePathWriteConflict::DoNothing
-        | FastLixFilePathWriteConflict::UpdateContent
-        | FastLixFilePathWriteConflict::UpdateContentAndMetadata
-        | FastLixFilePathWriteConflict::IdDoNothing
-        | FastLixFilePathWriteConflict::IdUpdateContent
-        | FastLixFilePathWriteConflict::IdUpdateContentAndMetadata => TransactionWriteMode::Replace,
-    };
-    Box::pin(stage_lix_file_fast_batch(ctx, mode, staged))
-        .await
-        .map(Some)
+    // Never reopen a full FileStateView or hand a public file upsert back to
+    // the legacy DataFusion topology. A native index that cannot route the
+    // exact write has already returned a typed error, and the remaining ID
+    // shape errors are intentionally fail-closed here.
+    Ok(None)
 }
 
 struct IndexedFilePathWrites {
@@ -2883,18 +3643,44 @@ struct IndexedFilePathWrites {
     path_resolvers: Option<BTreeMap<String, DirectoryPathResolver>>,
 }
 
-async fn indexed_file_path_writes(
-    ctx: &mut dyn SqlWriteExecutionContext,
+fn native_path_scope_collision_error(path: &str, entries: &[Arc<FilesystemPathEntry>]) -> LixError {
+    if entries.iter().any(|entry| entry.key.is_untracked()) {
+        return LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!(
+                "INSERT ON CONFLICT (path) on lix_file cannot write tracked path {path:?} over existing untracked file"
+            ),
+        );
+    }
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!("filesystem path {path:?} is visible in multiple storage scopes"),
+    )
+}
+
+fn native_file_id_collision_error(id: &str, entries: &[Arc<FilesystemPathEntry>]) -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "lix_file id {id:?} is visible in multiple storage scopes ({} entries)",
+            entries.len()
+        ),
+    )
+}
+
+async fn indexed_file_path_writes<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     active_branch_id: &str,
     writes: &[FastLixFilePathWrite],
-    conflict: FastLixFilePathWriteConflict,
-) -> Result<Option<IndexedFilePathWrites>, LixError> {
-    let index = Box::pin(
-        ctx.filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+) -> Result<Option<IndexedFilePathWrites>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let index = ctx
+        .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
             active_branch_id.to_string(),
-        ])),
-    )
-    .await?;
+        ]))
+        .await?;
     let mut existing = Vec::with_capacity(writes.len());
     for write in writes {
         let entries = index.exact_entries(&write.parsed.path);
@@ -2905,20 +3691,34 @@ async fn indexed_file_path_writes(
                         .exact_entries(&format!("{}/", write.parsed.path))
                         .is_empty()
                 {
-                    return Ok(None);
+                    return Err(LixError::new(
+                        LixError::CODE_UNIQUE,
+                        format!(
+                            "lix_file path {:?} conflicts with an existing directory",
+                            write.parsed.path
+                        ),
+                    ));
                 }
                 existing.push(None);
             }
             [entry] if entry.kind == FilesystemPathKind::File => {
-                // A plain INSERT onto an occupied path must raise the unique
-                // violation the whole-branch route already produces. Decline
-                // rather than duplicate that error construction here.
-                if conflict == FastLixFilePathWriteConflict::None {
-                    return Ok(None);
-                }
                 existing.push(Some(Arc::clone(entry)));
             }
-            _ => return Ok(None),
+            [entry] if entry.kind == FilesystemPathKind::Directory => {
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "lix_file path {:?} conflicts with an existing directory",
+                        write.parsed.path
+                    ),
+                ));
+            }
+            entries => {
+                return Err(native_path_scope_collision_error(
+                    &write.parsed.path,
+                    entries,
+                ));
+            }
         }
     }
     let has_missing = existing.iter().any(Option::is_none);
@@ -2927,14 +3727,8 @@ async fn indexed_file_path_writes(
         .zip(&existing)
         .any(|(write, entry)| entry.is_none() && write.parsed.parsed_path.segments().count() > 1);
     let path_resolvers = if has_missing_nested {
-        let missing_paths = writes
-            .iter()
-            .zip(&existing)
-            .filter(|(_, entry)| entry.is_none())
-            .map(|(write, _)| &write.parsed.parsed_path);
-        match directory_path_resolvers_for_paths(&index, missing_paths, Some(active_branch_id)) {
+        match directory_path_resolvers_from_path_index(&index, Some(active_branch_id)) {
             Ok(resolvers) => Some(resolvers),
-            Err(error) if error.code == LixError::CODE_CONSTRAINT_VIOLATION => return Ok(None),
             Err(error) => return Err(error),
         }
     } else if has_missing {
@@ -2951,47 +3745,49 @@ async fn indexed_file_path_writes(
     }))
 }
 
-async fn indexed_file_id_writes(
-    ctx: &mut dyn SqlWriteExecutionContext,
+async fn indexed_file_id_writes<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     active_branch_id: &str,
     writes: &[FastLixFilePathWrite],
-) -> Result<Option<IndexedFilePathWrites>, LixError> {
-    let index = Box::pin(
-        ctx.filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+) -> Result<Option<IndexedFilePathWrites>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let index = ctx
+        .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
             active_branch_id.to_string(),
-        ])),
-    )
-    .await?;
+        ]))
+        .await?;
     let mut unique_ids = BTreeSet::new();
     let mut existing = Vec::with_capacity(writes.len());
     for write in writes {
         let Some(id) = write.id.as_deref() else {
-            return Ok(None);
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "lix_file id conflict target requires a non-null id",
+            ));
         };
         if !unique_ids.insert(id) {
-            return Ok(None);
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!("lix_file id {id:?} is repeated in one write"),
+            ));
         }
         match index.exact_file_id_entries(id).as_slice() {
             [] => existing.push(None),
             [entry] if entry.kind == FilesystemPathKind::File => {
                 existing.push(Some(Arc::clone(entry)));
             }
-            _ => return Ok(None),
+            entries => return Err(native_file_id_collision_error(id, entries)),
         }
     }
     let has_missing = existing.iter().any(Option::is_none);
-    // An ID miss says nothing about path availability. Seed the resolver with
-    // the proposed paths' own leaves even at root level, so a different file
-    // already at a proposed path still raises the normal uniqueness error.
+    // An ID miss says nothing about path availability. Seed the resolver from
+    // the complete index even for root paths so a different file already at a
+    // proposed path still raises the normal uniqueness error.
     let path_resolvers = if has_missing {
-        let missing_paths = writes
-            .iter()
-            .zip(&existing)
-            .filter(|(_, entry)| entry.is_none())
-            .map(|(write, _)| &write.parsed.parsed_path);
-        match directory_path_resolvers_for_paths(&index, missing_paths, Some(active_branch_id)) {
+        match directory_path_resolvers_from_path_index(&index, Some(active_branch_id)) {
             Ok(resolvers) => Some(resolvers),
-            Err(error) if error.code == LixError::CODE_CONSTRAINT_VIOLATION => return Ok(None),
             Err(error) => return Err(error),
         }
     } else {
@@ -3003,31 +3799,24 @@ async fn indexed_file_id_writes(
     }))
 }
 
-async fn stage_indexed_file_path_writes(
-    ctx: &mut dyn SqlWriteExecutionContext,
+async fn stage_indexed_file_path_writes<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     active_branch_id: &str,
     writes: Vec<FastLixFilePathWrite>,
     mut indexed: IndexedFilePathWrites,
     conflict: FastLixFilePathWriteConflict,
     mutation_identity: Option<MutationIdentity>,
-) -> Result<u64, LixError> {
+) -> Result<u64, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     debug_assert_eq!(writes.len(), indexed.existing.len());
     debug_assert!(
-        conflict.updates_existing()
+        conflict == FastLixFilePathWriteConflict::None
+            || conflict == FastLixFilePathWriteConflict::DoNothing
+            || conflict.updates_existing()
             || conflict == FastLixFilePathWriteConflict::IdDoNothing
-            || conflict == FastLixFilePathWriteConflict::None
     );
-    // `indexed_file_path_writes` declines every plain INSERT that would collide,
-    // so a `None` conflict reaching here is a pure create and stages as one.
-    debug_assert!(
-        conflict != FastLixFilePathWriteConflict::None
-            || indexed.existing.iter().all(Option::is_none)
-    );
-    let write_mode = if conflict == FastLixFilePathWriteConflict::None {
-        TransactionWriteMode::Insert
-    } else {
-        TransactionWriteMode::Replace
-    };
     for (write, entry) in writes.iter().zip(&indexed.existing) {
         if !conflict.targets_id()
             && let Some(entry) = entry
@@ -3036,6 +3825,12 @@ async fn stage_indexed_file_path_writes(
                 entry.key.is_untracked(),
                 &write.parsed.path,
             )?;
+            if conflict == FastLixFilePathWriteConflict::None {
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!("lix_file path {:?} already exists", write.parsed.path),
+                ));
+            }
         }
     }
     let existing = if conflict.updates_existing() {
@@ -3047,14 +3842,18 @@ async fn stage_indexed_file_path_writes(
     } else {
         Vec::new()
     };
-    let existing_materializations =
-        Box::pin(load_exact_existing_materializations(ctx, &existing)).await?;
+    let (_, existing_materializations) =
+        load_exact_existing_materializations(ctx, existing.iter().map(|entry| entry.as_ref()))
+            .await?;
     let mut staged = LixFileStagedBatch::with_row_capacity(writes.len().saturating_mul(3));
 
     for (write, entry) in writes.into_iter().zip(indexed.existing) {
         let content = write.data.clone();
         if let Some(entry) = entry {
-            if conflict == FastLixFilePathWriteConflict::IdDoNothing {
+            if matches!(
+                conflict,
+                FastLixFilePathWriteConflict::DoNothing | FastLixFilePathWriteConflict::IdDoNothing
+            ) {
                 continue;
             }
             let materialization = existing_materializations
@@ -3082,13 +3881,16 @@ async fn stage_indexed_file_path_writes(
                         != write.metadata.as_ref().map(TransactionJson::normalized);
                     context.metadata = write.metadata;
                     if metadata_changed {
-                        FileDescriptorWriteIntent {
-                            id: Some(entry.id().to_string()),
-                            directory_id: entry.parent_id.clone(),
-                            name: entry.name.clone(),
-                            context: context.clone(),
-                        }
-                        .append_to(&mut staged.state_rows);
+                        append_file_descriptor_write(
+                            &mut staged.state_rows,
+                            FileDescriptorWriteIntent {
+                                id: Some(entry.id().to_string()),
+                                directory_id: entry.parent_id.clone(),
+                                name: entry.name.clone(),
+                                context: context.clone(),
+                            },
+                            Some(entry.created_at()),
+                        );
                     }
                 }
                 FastLixFilePathWriteConflict::None
@@ -3151,7 +3953,12 @@ async fn stage_indexed_file_path_writes(
         }
     }
 
-    Box::pin(stage_lix_file_fast_batch(ctx, write_mode, staged)).await
+    let mode = if conflict == FastLixFilePathWriteConflict::None {
+        TransactionWriteMode::Insert
+    } else {
+        TransactionWriteMode::Replace
+    };
+    stage_lix_file_fast_batch(ctx, mode, staged).await
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3160,73 +3967,121 @@ struct ExistingFileMaterialization {
     blob_hash: Option<BlobId>,
 }
 
-async fn load_exact_existing_materializations(
-    ctx: &mut dyn SqlWriteExecutionContext,
-    entries: &[Arc<FilesystemPathEntry>],
-) -> Result<BTreeMap<FilesystemDescriptorKey, ExistingFileMaterialization>, LixError> {
+async fn load_exact_existing_materializations<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
+    entries: impl IntoIterator<Item = &'_ FilesystemPathEntry>,
+) -> Result<
+    (
+        FilesystemStateRows,
+        BTreeMap<FilesystemDescriptorKey, ExistingFileMaterialization>,
+    ),
+    LixError,
+>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let entries = entries.into_iter().collect::<Vec<_>>();
     if entries.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok((FilesystemStateRows::default(), BTreeMap::new()));
     }
     let unique = entries
         .iter()
-        .map(|entry| (entry.key.clone(), Arc::clone(entry)))
+        .map(|entry| (entry.key.clone(), *entry))
         .collect::<BTreeMap<_, _>>();
-    let blob_requests = unique
-        .iter()
-        .map(|(key, entry)| {
-            Ok((
-                key.clone(),
-                HotStateExactRowRequest {
-                    branch_id: entry.key.branch_id().to_string(),
-                    schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                    row_pk: file_id_row_pk(entry.id())?,
-                    file_id: Some(entry.id().to_string()),
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    let request = HotStateExactBatchRequest {
-        rows: blob_requests
-            .iter()
-            .map(|(_, request)| request.clone())
-            .collect(),
-        projection: HotStateProjection::default(),
-        untracked: Some(false),
-        include_tombstones: false,
-    };
-    let rows = ctx.load_exact_hot_state_batch(&request).await?;
+
+    let mut exact_batches = Vec::new();
     let mut materializations =
         BTreeMap::<FilesystemDescriptorKey, ExistingFileMaterialization>::new();
-    for (row_index, (key, request)) in blob_requests.into_iter().enumerate() {
-        let Some(row) = rows.row(row_index) else {
-            continue;
-        };
-        let tracking_mismatch = row.untracked() ^ key.is_untracked();
-        if row.branch_id() != key.branch_id() || row.global() != key.global() || tracking_mismatch {
+
+    // Exact requests carry one untracked mode for the whole batch. Keep
+    // tracked and untracked entries in separate aligned batches so neither
+    // scope can shadow the other while still using the same transaction-owned
+    // reader and staged overlay.
+    for untracked in [false, true] {
+        let blob_requests = unique
+            .iter()
+            .filter(|(_, entry)| entry.key.is_untracked() == untracked)
+            .map(|(key, entry)| {
+                Ok((
+                    key.clone(),
+                    FileExactKeyPlan {
+                        branch_id: entry.key.branch_id().to_string(),
+                        schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                        entity_pk: file_id_entity_pk(entry.id())?,
+                        file_id: Some(entry.id().to_string()),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        if blob_requests.is_empty() {
             continue;
         }
-        let materialization = materializations.entry(key).or_default();
-        // A malformed old snapshot still proves that a blob row must be
-        // replaced; only the optional CAS-reuse shortcut is lost.
-        materialization.has_blob_ref = true;
-        materialization.blob_hash = row
-            .snapshot_content()
-            .map(|snapshot| snapshot.as_str())
-            .and_then(|snapshot| serde_json::from_str::<BlobRefSnapshot>(snapshot).ok())
-            .filter(|snapshot| snapshot.id == request.file_id.as_deref().unwrap_or_default())
-            .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
+        let request = FileExactBatchPlan {
+            rows: blob_requests
+                .iter()
+                .map(|(_, request)| request.clone())
+                .collect(),
+            projection: FileQueryProjection::default(),
+            untracked: Some(untracked),
+            include_tombstones: false,
+        };
+        #[cfg(test)]
+        ctx.record_file_exact_batch(&request);
+        let rows = FileStateView::Transaction(ctx.state_view().clone())
+            .load_exact_batch(&request)
+            .await?;
+        for (row_index, (key, request)) in blob_requests.into_iter().enumerate() {
+            let Some(row) = rows.get(row_index).and_then(Option::as_ref) else {
+                continue;
+            };
+            let tracking_mismatch = row.untracked() ^ key.is_untracked();
+            if row.branch_id() != key.branch_id()
+                || row.global() != key.global()
+                || tracking_mismatch
+            {
+                continue;
+            }
+            let materialization = materializations.entry(key).or_default();
+            // A malformed old snapshot still proves that a blob row must be
+            // replaced; only the optional CAS-reuse shortcut is lost.
+            materialization.has_blob_ref = true;
+            materialization.blob_hash = row
+                .snapshot_content()
+                .map(|snapshot| snapshot.as_str())
+                .and_then(|snapshot| serde_json::from_str::<BlobRefSnapshot>(snapshot).ok())
+                .filter(|snapshot| snapshot.id == request.file_id.as_deref().unwrap_or_default())
+                .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
+        }
+        exact_batches.push(FilesystemStateRows::from_rows(
+            rows.into_iter().flatten().collect(),
+        ));
     }
 
-    Ok(materializations)
+    let exact_rows = if exact_batches.len() == 1 {
+        exact_batches
+            .pop()
+            .expect("one exact request produced one exact batch")
+    } else {
+        FilesystemStateRows::from_rows(
+            exact_batches
+                .into_iter()
+                .flat_map(IntoIterator::into_iter)
+                .collect(),
+        )
+    };
+    Ok((exact_rows, materializations))
 }
 
-pub(crate) async fn execute_fast_lix_file_content_update_by_id(
-    ctx: &mut dyn SqlWriteExecutionContext,
+pub(crate) async fn execute_fast_lix_file_content_update_by_id<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     file_id: Option<String>,
     data: crate::Blob,
     splice_provenance: Option<RequestBlobSpliceProvenance>,
     mutation_identity: Option<MutationIdentity>,
-) -> Result<u64, LixError> {
+) -> Result<u64, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     execute_fast_lix_file_content_update_by_id_impl(
         ctx,
         file_id,
@@ -3238,14 +4093,17 @@ pub(crate) async fn execute_fast_lix_file_content_update_by_id(
     .await
 }
 
-pub(crate) async fn execute_fast_lix_file_content_update_by_id_with_metadata(
-    ctx: &mut dyn SqlWriteExecutionContext,
+pub(crate) async fn execute_fast_lix_file_content_update_by_id_with_metadata<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     file_id: Option<String>,
     data: crate::Blob,
     metadata: Option<TransactionJson>,
     splice_provenance: Option<RequestBlobSpliceProvenance>,
     mutation_identity: Option<MutationIdentity>,
-) -> Result<u64, LixError> {
+) -> Result<u64, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     execute_fast_lix_file_content_update_by_id_impl(
         ctx,
         file_id,
@@ -3257,14 +4115,17 @@ pub(crate) async fn execute_fast_lix_file_content_update_by_id_with_metadata(
     .await
 }
 
-async fn execute_fast_lix_file_content_update_by_id_impl(
-    ctx: &mut dyn SqlWriteExecutionContext,
+async fn execute_fast_lix_file_content_update_by_id_impl<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     file_id: Option<String>,
     data: crate::Blob,
     metadata_update: Option<Option<TransactionJson>>,
     splice_provenance: Option<RequestBlobSpliceProvenance>,
     mutation_identity: Option<MutationIdentity>,
-) -> Result<u64, LixError> {
+) -> Result<u64, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let active_branch_id = ctx.active_branch_id().to_string();
     ctx.load_branch_head(&active_branch_id)
         .await?
@@ -3289,30 +4150,18 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
     let target_file_ids = BTreeSet::from([file_id.clone()]);
     let indexed_matches = indexed_file_id_matches(index, &target_file_ids, &FilePathPredicate::All);
 
-    // Blob references are not part of the descriptor index and can change
-    // without a path-index revision.
-    let mut blob_request = lix_file_scan_request(Some(&active_branch_id), None, None);
-    blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
-    blob_request.filter.row_pks = vec![file_id_row_pk(&file_id)?];
-    // Pin the file id too. The hot index key is file-first, so a row PK on
-    // its own cannot form a point key: `hot_scan_entries` refuses the MultiGet
-    // route for any schema with file-backed members -- a null-file point key
-    // would miss the real row -- and `hot_file_scan_prefixes` requires a file
-    // id. Without this the request fell through to walking every
-    // `lix_binary_blob_ref` row in the branch and filtering in memory, which is
-    // O(files) *per statement* and cost ~0.20 us per file in the branch.
-    //
-    // The pin cannot reject the row it is looking for, because for this schema
-    // the file id and the row PK are the same value by construction: both
-    // producers in `filesystem::planner` (`BlobRefRowInput::append_to` and
-    // `append_blob_ref_tombstone_row`, tombstones included) set the row's
-    // row PK and its `file_id` from one variable, and `lix_binary_blob_ref`
-    // is a read-only public surface, so no caller can supply a divergent pair.
-    // The exact-batch route below already pairs them the same way.
-    blob_request.filter.file_ids = vec![crate::NullableKeyFilter::Value(file_id.clone())];
-    let rows = ctx.scan_hot_state_batch(&blob_request).await?;
+    // The path index supplies only the descriptor/path projection. BlobRef
+    // ownership is loaded from the same authenticated transaction view so a
+    // stale derived index cannot become a second payload authority.
+    let (rows, _) = load_exact_existing_materializations(
+        ctx,
+        indexed_matches
+            .entries()
+            .filter(|entry| entry.kind == FilesystemPathKind::File),
+    )
+    .await?;
 
-    let prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows_without_indexed_blob_refs(&indexed_matches, rows)?;
 
     let PreparedLixFileRows {
         live_rows,
@@ -3351,20 +4200,25 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
         }
         if let Some(metadata) = &metadata_update {
             context.metadata.clone_from(metadata);
-            FileDescriptorWriteIntent {
-                id: Some(existing.id.clone()),
-                directory_id: existing.directory_id.clone(),
-                name: existing.name.clone(),
-                context: context.clone(),
-            }
-            .append_to(&mut staged.state_rows);
+            let created_at = live_rows.row(existing.live).created_at().to_string();
+            append_file_descriptor_write(
+                &mut staged.state_rows,
+                FileDescriptorWriteIntent {
+                    id: Some(existing.id.clone()),
+                    directory_id: existing.directory_id.clone(),
+                    name: existing.name.clone(),
+                    context: context.clone(),
+                },
+                Some(&created_at),
+            );
         }
+        let content = file_content_from_request_splice(data.clone(), splice_provenance.as_ref());
         stage_lix_file_content_update_write(
             &mut staged,
             existing.id,
             Some(path),
             Some(existing.name),
-            data.clone(),
+            content,
             context,
             has_blob_ref,
             base_blob_hash,
@@ -3378,6 +4232,23 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
         staged.add_count(1)?;
     }
     stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
+}
+
+fn file_content_from_request_splice(
+    data: crate::Blob,
+    provenance: Option<&RequestBlobSpliceProvenance>,
+) -> FileContent {
+    if let Some(provenance) = provenance.filter(|provenance| provenance.matches_result(&data)) {
+        // The request boundary already authenticated these exact immutable
+        // result bytes and computed their canonical Merkle identity. Reuse
+        // that proof locally; publication still validates the resulting
+        // manifest and StateKey binding before persisting any BlobRef.
+        return FileContent::inline_with_blob_id(data, provenance.result_blob_id());
+    }
+    // Without an exact validated provenance match, retain the ordinary
+    // canonical identity derivation. Transport metadata is never an
+    // independent BlobRef/manifest authority.
+    FileContent::inline(data)
 }
 
 struct FastLixFilePathWrite {
@@ -3421,7 +4292,13 @@ fn parse_fast_lix_file_path_writes(
         .collect()
 }
 
-fn fast_file_write_id(write: &FastLixFilePathWrite, ctx: &dyn SqlWriteExecutionContext) -> String {
+fn fast_file_write_id<R>(
+    write: &FastLixFilePathWrite,
+    ctx: &dyn SqlWriteExecutionContext<ReadStore = R>,
+) -> String
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     write
         .id
         .clone()
@@ -3464,11 +4341,14 @@ fn validate_fast_lix_file_path_conflict_pair(
     ))
 }
 
-async fn stage_lix_file_fast_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
+async fn stage_lix_file_fast_batch<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     mode: TransactionWriteMode,
     staged: LixFileStagedBatch,
-) -> Result<u64, LixError> {
+) -> Result<u64, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let count = staged.count;
     if staged.state_rows.is_empty() && staged.file_content_writes.is_empty() {
         return Ok(count);
@@ -3591,7 +4471,7 @@ fn rejected_plugin_archive_delete_error(path: Option<&str>, file_id: &str) -> Da
 }
 
 fn blob_ref_keys_from_live_rows(
-    rows: &MaterializedHotStateBatch,
+    rows: &FilesystemStateRows,
 ) -> std::result::Result<BTreeSet<FilesystemBlobRefKey>, LixError> {
     let mut keys = BTreeSet::new();
     for row in rows.iter() {
@@ -3608,7 +4488,7 @@ fn blob_ref_keys_from_live_rows(
                     format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
                 )
             })?;
-        keys.insert(FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id));
+        keys.insert(FilesystemBlobRefKey::from_state_row_ref(row, snapshot.id));
     }
     Ok(keys)
 }
@@ -3689,8 +4569,6 @@ fn lix_file_existing_update_stage_from_batch(
             let directory_id =
                 update_optional_string_value(batch, assignment_values, row_index, "directory_id")?;
             let name = update_required_string_value(batch, assignment_values, row_index, "name")?;
-            crate::common::validate_lix_path_segment(&name)
-                .map_err(lix_error_to_datafusion_error)?;
             data_filename = Some(name.clone());
             if let Some(path_resolvers) = path_resolvers.as_deref_mut() {
                 let resolver = path_resolvers
@@ -3703,13 +4581,17 @@ fn lix_file_existing_update_stage_from_batch(
                     .file_path(directory_id.as_deref(), &name)
                     .map_err(lix_error_to_datafusion_error)?;
             }
-            FileDescriptorWriteIntent {
-                id: Some(id.clone()),
-                directory_id,
-                name,
-                context: context.clone(),
-            }
-            .append_to(&mut staged.state_rows);
+            let created_at = optional_string_value(batch, row_index, "lixcol_created_at")?;
+            append_file_descriptor_write(
+                &mut staged.state_rows,
+                FileDescriptorWriteIntent {
+                    id: Some(id.clone()),
+                    directory_id,
+                    name,
+                    context: context.clone(),
+                },
+                created_at.as_deref(),
+            );
         }
 
         if include_data_writes {
@@ -3952,7 +4834,7 @@ fn lix_file_path_update_stage_from_batch(
             None
         };
 
-        let plan = plan_parsed_file_path_update_with_resolvers(
+        let mut plan = plan_parsed_file_path_update_with_resolvers(
             path_resolvers,
             id.clone(),
             parsed_path,
@@ -3960,6 +4842,9 @@ fn lix_file_path_update_stage_from_batch(
             generate_directory_id,
         )
         .map_err(lix_error_to_datafusion_error)?;
+        let created_at = optional_string_value(batch, row_index, "lixcol_created_at")?;
+        preserve_file_descriptor_created_at(&mut plan.rows, &id, created_at.as_deref())
+            .map_err(lix_error_to_datafusion_error)?;
         staged
             .extend_filesystem_plan(plan)
             .map_err(lix_error_to_datafusion_error)?;
@@ -4078,7 +4963,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_row_pk")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_entity_pk")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_change_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_created_at")?;
@@ -4144,8 +5029,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         let directory_id = optional_string_value(batch, row_index, "directory_id")?;
         let name = required_string_value(batch, row_index, "name")?;
-        crate::common::validate_lix_path_segment(&name)
-            .map_err(lix_error_to_datafusion_error)?;
         let mut data_path = None;
 
         let id = if data.is_some() {
@@ -4323,6 +5206,7 @@ fn stage_lix_file_content_blob_ref_write(
             .blob_hash()
             .expect("non-empty payload should have blob hash"),
         size_bytes: file_content.len(),
+        plugin_checkpoint: None,
         context: FilesystemRowContext {
             file_id: None,
             metadata: None,
@@ -4345,9 +5229,46 @@ fn attach_lix_file_insert_origin(rows: &mut RawWriteBatch, surface_name: &str, f
     }
 }
 
+fn append_file_descriptor_write(
+    rows: &mut RawWriteBatch,
+    intent: FileDescriptorWriteIntent,
+    created_at: Option<&str>,
+) {
+    let row_index = rows.len();
+    intent.append_to(rows);
+    if let Some(created_at) = created_at {
+        rows.set_created_at(row_index, Some(SharedStr::from(created_at)));
+    }
+}
+
+fn preserve_file_descriptor_created_at(
+    rows: &mut RawWriteBatch,
+    file_id: &str,
+    created_at: Option<&str>,
+) -> std::result::Result<(), LixError> {
+    let Some(created_at) = created_at else {
+        return Ok(());
+    };
+    let row_index = (0..rows.len()).find(|&index| {
+        let row = rows.row(index);
+        row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+            && row
+                .file_id
+                .is_some_and(|candidate| candidate.as_str() == file_id)
+    });
+    let Some(row_index) = row_index else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("file path update did not stage descriptor for file {file_id}"),
+        ));
+    };
+    rows.set_created_at(row_index, Some(SharedStr::from(created_at)));
+    Ok(())
+}
+
 fn lix_file_insert_origin(surface_name: &str, file_id: &str) -> TransactionWriteOrigin {
     TransactionWriteOrigin {
-        surface: crate::transaction_types::shared_origin_surface(surface_name),
+        surface: crate::transaction::types::shared_origin_surface(surface_name),
         operation: TransactionWriteOperation::Insert,
         primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(file_id))),
     }
@@ -4370,13 +5291,7 @@ fn file_row_context_from_batch(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: defaultable_bool_insert_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "INSERT into lix_file",
-        )?
-        .unwrap_or(false),
+        untracked: false,
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_file")?,
     })
@@ -4405,7 +5320,7 @@ fn file_row_context_from_update(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        untracked: false,
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: update_optional_metadata_value(
             batch,
@@ -4435,10 +5350,10 @@ async fn lix_file_record_batch(
     blob_reader: &Arc<dyn BlobDataReader>,
     plugin_render: Option<PluginRenderContext>,
     load_data: bool,
-    rows: Vec<MaterializedHotStateRow>,
+    rows: Vec<FilesystemStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let prepared = prepare_lix_file_rows(
-        MaterializedHotStateBatch::from_rows(rows),
+        FilesystemStateRows::from_rows(rows),
         &FilePathPredicate::All,
     )?;
     lix_file_record_batch_from_prepared(schema, blob_reader, plugin_render, load_data, prepared)
@@ -4446,7 +5361,7 @@ async fn lix_file_record_batch(
 }
 
 struct PreparedLixFileRows {
-    live_rows: HotStateBatchOwners,
+    live_rows: StateRowOwners,
     file_rows: BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
     file_paths: BTreeMap<FilesystemDescriptorKey, String>,
@@ -4504,17 +5419,17 @@ fn plugin_owner_candidates_from_batch(
 }
 
 fn prepare_lix_file_rows(
-    rows: impl Into<MaterializedHotStateBatch>,
+    rows: impl Into<FilesystemStateRows>,
     path_predicate: &FilePathPredicate,
 ) -> Result<PreparedLixFileRows, LixError> {
-    let mut live_rows = HotStateBatchOwners::default();
+    let mut live_rows = StateRowOwners::default();
     let batch = live_rows.push(rows.into());
     let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
     let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
 
     for row_index in 0..live_rows.batch(batch).len() {
-        let handle = hot_state_row_handle(batch, row_index);
+        let handle = state_row_handle(batch, row_index);
         let row = live_rows.row(handle);
         match row.schema_key() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
@@ -4529,7 +5444,7 @@ fn prepare_lix_file_rows(
                             format!("invalid lix_file_descriptor snapshot JSON: {error}"),
                         )
                     })?;
-                let key = FilesystemDescriptorKey::from_file_descriptor_live_row_ref(
+                let key = FilesystemDescriptorKey::from_file_descriptor_state_row_ref(
                     row,
                     snapshot.id.clone(),
                 );
@@ -4545,7 +5460,7 @@ fn prepare_lix_file_rows(
                 );
             }
             BLOB_REF_SCHEMA_KEY => {
-                if let Some((key, record)) = blob_ref_record_from_live_row(row, handle)? {
+                if let Some((key, record)) = blob_ref_record_from_state_row(row, handle)? {
                     blob_rows.insert(key, record);
                 }
             }
@@ -4562,7 +5477,7 @@ fn prepare_lix_file_rows(
                         )
                     })?;
                 directory_rows.push(DirectoryDescriptorRecord {
-                    key: FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone()),
+                    key: FilesystemDescriptorKey::from_state_row_ref(row, snapshot.id.clone()),
                     parent_id: snapshot.parent_id,
                     name: snapshot.name,
                 });
@@ -4618,24 +5533,37 @@ fn prepare_lix_file_rows(
 
 fn prepare_indexed_lix_file_rows(
     matches: &FilesystemPathSelection,
-    rows: impl Into<MaterializedHotStateBatch>,
+    rows: impl Into<FilesystemStateRows>,
 ) -> Result<PreparedLixFileRows, LixError> {
-    let mut live_rows = HotStateBatchOwners::default();
+    prepare_indexed_lix_file_rows_with_blob_authority(matches, rows, true)
+}
+
+fn prepare_indexed_lix_file_rows_without_indexed_blob_refs(
+    matches: &FilesystemPathSelection,
+    rows: impl Into<FilesystemStateRows>,
+) -> Result<PreparedLixFileRows, LixError> {
+    prepare_indexed_lix_file_rows_with_blob_authority(matches, rows, false)
+}
+
+fn prepare_indexed_lix_file_rows_with_blob_authority(
+    matches: &FilesystemPathSelection,
+    rows: impl Into<FilesystemStateRows>,
+    include_indexed_blob_refs: bool,
+) -> Result<PreparedLixFileRows, LixError> {
+    let mut live_rows = StateRowOwners::default();
     let scanned_batch = live_rows.push(rows.into());
     let indexed_batch =
         u32::try_from(live_rows.batches.len()).expect("lix_file live batch count exceeds u32");
-    let mut indexed_builder =
-        MaterializedHotStateBatchBuilder::with_capacity(matches.len().saturating_mul(2));
+    let mut indexed_builder = FilesystemRowsBuilder::with_capacity(matches.len().saturating_mul(2));
     let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
     let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
     let mut file_paths = BTreeMap::<FilesystemDescriptorKey, String>::new();
     let mut path_ordered_file_keys = Vec::with_capacity(matches.len());
-    let mut inline_data_by_row = BTreeMap::<u32, Vec<u8>>::new();
     for entry in matches.entries() {
         if entry.kind != FilesystemPathKind::File {
             continue;
         }
-        let descriptor_row = entry.live_row();
+        let descriptor_row = entry.state_row();
         let descriptor_row_index = indexed_builder.len();
         indexed_builder.push_owned(descriptor_row);
         let key = entry.key.clone();
@@ -4648,12 +5576,12 @@ fn prepare_indexed_lix_file_rows(
                 directory_id: entry.parent_id.clone(),
                 name: entry.name.clone(),
                 key,
-                live: hot_state_row_handle(indexed_batch, descriptor_row_index),
+                live: state_row_handle(indexed_batch, descriptor_row_index),
             },
         );
-        if let Some(blob_ref) = entry.blob_ref_live_row() {
-            let row_index = indexed_builder.push_materialized_ref(
-                &blob_ref.row_pk,
+        if include_indexed_blob_refs && let Some(blob_ref) = entry.blob_ref_state_row() {
+            indexed_builder.push_materialized_ref(
+                &blob_ref.entity_pk,
                 &blob_ref.schema_key,
                 blob_ref.file_id.as_deref(),
                 blob_ref.snapshot_content.clone(),
@@ -4667,12 +5595,6 @@ fn prepare_indexed_lix_file_rows(
                 blob_ref.untracked,
                 &blob_ref.branch_id,
             );
-            if let Some(data) = entry.cached_blob_data() {
-                inline_data_by_row.insert(
-                    u32::try_from(row_index).expect("indexed lix_file row count exceeds u32"),
-                    data.as_ref().to_vec(),
-                );
-            }
         }
     }
     let pushed_indexed_batch = live_rows.push(indexed_builder.finish());
@@ -4680,14 +5602,11 @@ fn prepare_indexed_lix_file_rows(
 
     for batch in [indexed_batch, scanned_batch] {
         for row_index in 0..live_rows.batch(batch).len() {
-            let handle = hot_state_row_handle(batch, row_index);
+            let handle = state_row_handle(batch, row_index);
             let row = live_rows.row(handle);
             match row.schema_key() {
                 BLOB_REF_SCHEMA_KEY => {
-                    if let Some((key, mut record)) = blob_ref_record_from_live_row(row, handle)? {
-                        if batch == indexed_batch {
-                            record.inline_data = inline_data_by_row.remove(&handle.row);
-                        }
+                    if let Some((key, record)) = blob_ref_record_from_state_row(row, handle)? {
                         blob_rows.entry(key).or_insert(record);
                     }
                 }
@@ -4744,11 +5663,11 @@ fn lix_file_record_batch_from_path_selection(
             "content" => Arc::new(LargeBinaryArray::from(
                 entries.iter().map(|_| Some(&[][..])).collect::<Vec<_>>(),
             )),
-            "lixcol_row_pk" => Arc::new(StringArray::from(
+            "lixcol_entity_pk" => Arc::new(StringArray::from(
                 entries
                     .iter()
                     .map(|entry| {
-                        file_id_row_pk(entry.id())?
+                        file_id_entity_pk(entry.id())?
                             .as_json_array_text()
                             .map(Some)
                     })
@@ -4796,12 +5715,6 @@ fn lix_file_record_batch_from_path_selection(
                     .map(|entry| entry.commit_id().map(|id| id.to_string()))
                     .collect::<Vec<_>>(),
             )),
-            "lixcol_untracked" => Arc::new(BooleanArray::from(
-                entries
-                    .iter()
-                    .map(|entry| Some(entry.key.is_untracked()))
-                    .collect::<Vec<_>>(),
-            )),
             "lixcol_metadata" => Arc::new(StringArray::from(
                 entries
                     .iter()
@@ -4837,8 +5750,8 @@ struct LixFileRecordBatchRow {
     path: String,
     directory_id: Option<String>,
     name: String,
-    data: Option<Vec<u8>>,
-    row_pk: String,
+    data: Option<Bytes>,
+    entity_pk: String,
     file_id: Option<String>,
     global: bool,
     change_id: Option<String>,
@@ -4856,8 +5769,8 @@ struct LixFileRecordBatchColumns {
     paths: Vec<Option<String>>,
     directory_ids: Vec<Option<String>>,
     names: Vec<Option<String>>,
-    data_values: Vec<Option<Vec<u8>>>,
-    row_pks: Vec<Option<String>>,
+    data_values: Vec<Option<Bytes>>,
+    entity_pks: Vec<Option<String>>,
     schema_keys: Vec<Option<String>>,
     file_ids: Vec<Option<String>>,
     globals: Vec<Option<bool>>,
@@ -4865,7 +5778,6 @@ struct LixFileRecordBatchColumns {
     created_ats: Vec<Option<String>>,
     updated_ats: Vec<Option<String>>,
     commit_ids: Vec<Option<String>>,
-    untracked_values: Vec<Option<bool>>,
     metadata_values: Vec<Option<String>>,
     branch_ids: Vec<Option<String>>,
 }
@@ -4877,7 +5789,7 @@ impl LixFileRecordBatchColumns {
         self.directory_ids.push(row.directory_id);
         self.names.push(Some(row.name));
         self.data_values.push(row.data);
-        self.row_pks.push(Some(row.row_pk));
+        self.entity_pks.push(Some(row.entity_pk));
         self.schema_keys
             .push(Some(FILE_DESCRIPTOR_SCHEMA_KEY.to_string()));
         self.file_ids.push(row.file_id);
@@ -4886,7 +5798,6 @@ impl LixFileRecordBatchColumns {
         self.created_ats.push(Some(row.created_at));
         self.updated_ats.push(Some(row.updated_at));
         self.commit_ids.push(row.commit_id);
-        self.untracked_values.push(Some(row.untracked));
         self.metadata_values.push(row.metadata);
         self.branch_ids.push(Some(row.branch_id));
     }
@@ -4899,7 +5810,7 @@ impl LixFileRecordBatchColumns {
             directory_ids,
             names,
             data_values,
-            row_pks,
+            entity_pks,
             schema_keys,
             file_ids,
             globals,
@@ -4907,7 +5818,6 @@ impl LixFileRecordBatchColumns {
             created_ats,
             updated_ats,
             commit_ids,
-            untracked_values,
             metadata_values,
             branch_ids,
         } = self;
@@ -4918,10 +5828,10 @@ impl LixFileRecordBatchColumns {
         let data_values: ArrayRef = Arc::new(LargeBinaryArray::from(
             data_values
                 .iter()
-                .map(|value| value.as_deref())
+                .map(|value| value.as_ref().map(|bytes| bytes.as_ref()))
                 .collect::<Vec<_>>(),
         ));
-        let row_pks: ArrayRef = Arc::new(StringArray::from(row_pks));
+        let entity_pks: ArrayRef = Arc::new(StringArray::from(entity_pks));
         let schema_keys: ArrayRef = Arc::new(StringArray::from(schema_keys));
         let file_ids: ArrayRef = Arc::new(StringArray::from(file_ids));
         let globals: ArrayRef = Arc::new(BooleanArray::from(globals));
@@ -4929,7 +5839,6 @@ impl LixFileRecordBatchColumns {
         let created_ats: ArrayRef = Arc::new(StringArray::from(created_ats));
         let updated_ats: ArrayRef = Arc::new(StringArray::from(updated_ats));
         let commit_ids: ArrayRef = Arc::new(StringArray::from(commit_ids));
-        let untracked_values: ArrayRef = Arc::new(BooleanArray::from(untracked_values));
         let metadata_values: ArrayRef = Arc::new(StringArray::from(metadata_values));
         let branch_ids: ArrayRef = Arc::new(StringArray::from(branch_ids));
 
@@ -4941,7 +5850,7 @@ impl LixFileRecordBatchColumns {
                 "directory_id" => Arc::clone(&directory_ids),
                 "name" => Arc::clone(&names),
                 "content" => Arc::clone(&data_values),
-                "lixcol_row_pk" => Arc::clone(&row_pks),
+                "lixcol_entity_pk" => Arc::clone(&entity_pks),
                 "lixcol_schema_key" => Arc::clone(&schema_keys),
                 "lixcol_file_id" => Arc::clone(&file_ids),
                 "lixcol_global" => Arc::clone(&globals),
@@ -4949,7 +5858,6 @@ impl LixFileRecordBatchColumns {
                 "lixcol_created_at" => Arc::clone(&created_ats),
                 "lixcol_updated_at" => Arc::clone(&updated_ats),
                 "lixcol_commit_id" => Arc::clone(&commit_ids),
-                "lixcol_untracked" => Arc::clone(&untracked_values),
                 "lixcol_metadata" => Arc::clone(&metadata_values),
                 "lixcol_branch_id" => Arc::clone(&branch_ids),
                 other => {
@@ -4974,12 +5882,126 @@ impl LixFileRecordBatchColumns {
     }
 }
 
+#[cfg(test)]
 async fn lix_file_record_batch_from_prepared(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
     plugin_render: Option<PluginRenderContext>,
     load_data: bool,
     prepared: PreparedLixFileRows,
+) -> Result<RecordBatch, LixError> {
+    let projected_columns = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    let needs_data = load_data && projected_columns.contains(&"content");
+    let mut blob_bytes = if needs_data {
+        load_blob_bytes_for_files(
+            blob_reader,
+            &prepared.live_rows,
+            &prepared.file_rows,
+            &prepared.blob_rows,
+        )
+        .await?
+    } else {
+        LoadedBlobBytes::default()
+    };
+    lix_file_record_batch_from_prepared_with_blob_bytes(
+        schema,
+        plugin_render,
+        load_data,
+        prepared,
+        &mut blob_bytes,
+    )
+    .await
+}
+
+async fn lix_file_record_batch_from_prepared_authenticated(
+    schema: &SchemaRef,
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
+    plugin_render: Option<PluginRenderContext>,
+    load_data: bool,
+    prepared: PreparedLixFileRows,
+) -> Result<RecordBatch, LixError> {
+    let projected_columns = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    let needs_data = load_data && projected_columns.contains(&"content");
+    let mut blob_bytes = if needs_data {
+        load_authenticated_blob_bytes_for_files(
+            authenticated_blob_reader,
+            &prepared.live_rows,
+            &prepared.file_rows,
+            &prepared.blob_rows,
+        )
+        .await?
+    } else {
+        LoadedBlobBytes::default()
+    };
+    lix_file_record_batch_from_prepared_with_blob_bytes(
+        schema,
+        plugin_render,
+        load_data,
+        prepared,
+        &mut blob_bytes,
+    )
+    .await
+}
+
+/// Transaction variant of the authenticated file materializer. The state
+/// rows and path selection come from the live TransactionStateView; inline
+/// unpublished bytes are resolved only through that same transaction's write
+/// owner and are accepted only when their canonical BlobId matches the
+/// selected BlobRef row. All other payloads stay on the retained authenticated
+/// ForkTree reader.
+async fn lix_file_record_batch_from_prepared_authenticated_transaction<R>(
+    schema: &SchemaRef,
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
+    write_ctx: &SqlWriteContext<R>,
+    plugin_render: Option<PluginRenderContext>,
+    load_data: bool,
+    prepared: PreparedLixFileRows,
+) -> Result<RecordBatch, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let projected_columns = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    let needs_data = load_data && projected_columns.contains(&"content");
+    let mut blob_bytes = if needs_data {
+        load_authenticated_blob_bytes_for_files_with_staged(
+            authenticated_blob_reader,
+            write_ctx,
+            &prepared.live_rows,
+            &prepared.file_rows,
+            &prepared.blob_rows,
+        )
+        .await?
+    } else {
+        LoadedBlobBytes::default()
+    };
+    lix_file_record_batch_from_prepared_with_blob_bytes(
+        schema,
+        plugin_render,
+        load_data,
+        prepared,
+        &mut blob_bytes,
+    )
+    .await
+}
+
+async fn lix_file_record_batch_from_prepared_with_blob_bytes(
+    schema: &SchemaRef,
+    plugin_render: Option<PluginRenderContext>,
+    load_data: bool,
+    prepared: PreparedLixFileRows,
+    blob_bytes: &mut LoadedBlobBytes,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
         .fields()
@@ -4995,11 +6017,6 @@ async fn lix_file_record_batch_from_prepared(
         path_ordered_file_keys,
     } = prepared;
     let mut columns = LixFileRecordBatchColumns::default();
-    let mut blob_bytes = if needs_data {
-        load_blob_bytes_for_files(blob_reader, &live_rows, &file_rows, &blob_rows).await?
-    } else {
-        LoadedBlobBytes::default()
-    };
 
     let file_keys =
         path_ordered_file_keys.unwrap_or_else(|| file_rows.keys().cloned().collect::<Vec<_>>());
@@ -5007,7 +6024,6 @@ async fn lix_file_record_batch_from_prepared(
         Some(plugin_render) if needs_data => {
             render_plugin_files_for_sql(
                 plugin_render,
-                blob_reader,
                 &live_rows,
                 &file_keys,
                 &file_rows,
@@ -5030,12 +6046,12 @@ async fn lix_file_record_batch_from_prepared(
             match blob_bytes.take(&blob_key) {
                 Some(data) => data,
                 None => match rendered_plugin_bytes.remove(&key) {
-                    Some(data) => Some(data),
-                    None => Some(Vec::new()),
+                    Some(data) => Some(data.into()),
+                    None => Some(Bytes::new()),
                 },
             }
         } else {
-            Some(Vec::new())
+            Some(Bytes::new())
         };
         let projected_change_id = blob_rows
             .get(&blob_key)
@@ -5057,14 +6073,14 @@ async fn lix_file_record_batch_from_prepared(
             directory_id,
             name,
             data,
-            row_pk: live.row_pk().as_json_array_text()?,
+            entity_pk: live.entity_pk().as_json_array_text()?,
             file_id: live.file_id().map(str::to_owned),
             global: live.global(),
             change_id: projected_change_id.map(|id| id.to_string()),
             created_at: live.created_at().to_string(),
             updated_at: content_live.unwrap_or(live).updated_at().to_string(),
             commit_id: live.commit_id().map(|id| id.to_string()),
-            untracked: live.untracked(),
+            untracked: false,
             metadata: live.metadata().map(|value| serialize_row_metadata(value)),
             branch_id: live.branch_id().to_owned(),
         });
@@ -5074,7 +6090,7 @@ async fn lix_file_record_batch_from_prepared(
 }
 
 async fn exact_path_data_rows_from_prepared(
-    blob_reader: &Arc<dyn BlobDataReader>,
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
     plugin_render: Option<PluginRenderContext>,
     prepared: PreparedLixFileRows,
     data_range: Option<&Range<u64>>,
@@ -5087,14 +6103,20 @@ async fn exact_path_data_rows_from_prepared(
         path_ordered_file_keys,
     } = prepared;
     let mut blob_bytes = if data_range.is_none() {
-        load_blob_bytes_for_files(blob_reader, &live_rows, &file_rows, &blob_rows).await?
+        load_authenticated_blob_bytes_for_files(
+            authenticated_blob_reader,
+            &live_rows,
+            &file_rows,
+            &blob_rows,
+        )
+        .await?
     } else {
         LoadedBlobBytes::default()
     };
     let mut blob_ranges = match data_range {
         Some(range) => {
-            load_blob_ranges_for_files(
-                blob_reader,
+            load_authenticated_blob_ranges_for_files(
+                authenticated_blob_reader,
                 &live_rows,
                 &file_rows,
                 &blob_rows,
@@ -5111,7 +6133,6 @@ async fn exact_path_data_rows_from_prepared(
         Some(plugin_render) => {
             render_plugin_files_for_sql(
                 plugin_render,
-                blob_reader,
                 &live_rows,
                 &file_keys,
                 &file_rows,
@@ -5174,16 +6195,27 @@ async fn exact_path_data_rows_from_prepared(
                 Value::Text(content_identity),
             ]);
         } else {
+            let content_identity = blob_rows
+                .get(&blob_key)
+                .map(|blob_ref| blob_ref.blob_hash.clone())
+                .or_else(|| {
+                    live_rows
+                        .row(file.live)
+                        .change_id()
+                        .map(|change_id| change_id.to_string())
+                })
+                .unwrap_or_else(|| file.id.clone());
             let data = match blob_bytes.take(&blob_key) {
                 Some(data) => data,
                 None => match rendered_plugin_bytes.remove(&key) {
-                    Some(data) => Some(data),
-                    None => Some(Vec::new()),
+                    Some(data) => Some(data.into()),
+                    None => Some(Bytes::new()),
                 },
             };
             rows.push(vec![
                 Value::Text(path),
                 data.map_or(Value::Null, |data| Value::Blob(data.into())),
+                Value::Text(content_identity),
             ]);
         }
     }
@@ -5199,7 +6231,7 @@ fn materialize_vec_range(data: Vec<u8>, requested: Range<u64>) -> Result<BlobRan
     // file from a missing path without materializing an unbounded read first.
     if total_size == 0 && requested.start == 0 {
         return Ok(BlobRangeBytes {
-            bytes: Vec::new(),
+            bytes: Bytes::new(),
             total_size,
             range: 0..0,
         });
@@ -5216,7 +6248,7 @@ fn materialize_vec_range(data: Vec<u8>, requested: Range<u64>) -> Result<BlobRan
     let end = usize::try_from(range.end)
         .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "file range is too large"))?;
     Ok(BlobRangeBytes {
-        bytes: data[start..end].to_vec(),
+        bytes: data[start..end].to_vec().into(),
         total_size,
         range,
     })
@@ -5224,12 +6256,12 @@ fn materialize_vec_range(data: Vec<u8>, requested: Range<u64>) -> Result<BlobRan
 
 #[derive(Default)]
 struct LoadedBlobBytes {
-    bytes_by_key: BTreeMap<FilesystemBlobRefKey, Option<Vec<u8>>>,
+    bytes_by_key: BTreeMap<FilesystemBlobRefKey, Option<Bytes>>,
     remaining_by_key: BTreeMap<FilesystemBlobRefKey, usize>,
 }
 
 impl LoadedBlobBytes {
-    fn take(&mut self, key: &FilesystemBlobRefKey) -> Option<Option<Vec<u8>>> {
+    fn take(&mut self, key: &FilesystemBlobRefKey) -> Option<Option<Bytes>> {
         match self.remaining_by_key.get_mut(key) {
             Some(remaining) if *remaining > 1 => {
                 *remaining -= 1;
@@ -5266,9 +6298,9 @@ impl LoadedBlobRanges {
     }
 }
 
-async fn load_blob_ranges_for_files(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    live_rows: &HotStateBatchOwners,
+async fn load_authenticated_blob_ranges_for_files(
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
+    live_rows: &StateRowOwners,
     file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
     range: Range<u64>,
@@ -5285,21 +6317,25 @@ async fn load_blob_ranges_for_files(
         if let Some(row) = blob_rows.get(&key) {
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
-                if let Some(data) = &row.inline_data {
-                    bytes_by_key.insert(
-                        key.clone(),
-                        Some(materialize_vec_range(data.clone(), range.clone())?),
-                    );
-                } else {
-                    keys.push(key);
-                    requests.push((BlobId::from_hex(&row.blob_hash)?, range.clone()));
-                }
+                let live = live_rows.row(row.live);
+                keys.push(key);
+                requests.push((
+                    crate::forktree::AuthenticatedBlobStateKey {
+                        state_key: row.state_key.clone(),
+                        branch_id: parse_blob_scope_branch_id(live.branch_id())?,
+                        global: live.global(),
+                    },
+                    range.clone(),
+                ));
             }
             *remaining += 1;
         }
     }
     if !keys.is_empty() {
-        let values = blob_reader.load_ranges_many(&requests).await?.into_vec();
+        let values = authenticated_blob_reader
+            .load_ranges_for_scoped_rows(&requests)
+            .await?
+            .into_vec();
         if values.len() != keys.len() {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -5318,9 +6354,150 @@ async fn load_blob_ranges_for_files(
     })
 }
 
+async fn load_authenticated_blob_bytes_for_files(
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
+    live_rows: &StateRowOwners,
+    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+) -> Result<LoadedBlobBytes, LixError> {
+    if file_rows.is_empty() || blob_rows.is_empty() {
+        return Ok(LoadedBlobBytes::default());
+    }
+    let mut keys = Vec::new();
+    let mut rows = Vec::new();
+    let mut bytes_by_key = BTreeMap::new();
+    let mut remaining_by_key = BTreeMap::<FilesystemBlobRefKey, usize>::new();
+    for file in file_rows.values() {
+        let key = file.blob_ref_key(live_rows);
+        if let Some(row) = blob_rows.get(&key) {
+            let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
+            if *remaining == 0 {
+                let live = live_rows.row(row.live);
+                keys.push(key);
+                rows.push(crate::forktree::AuthenticatedBlobStateKey {
+                    state_key: row.state_key.clone(),
+                    branch_id: parse_blob_scope_branch_id(live.branch_id())?,
+                    global: live.global(),
+                });
+            }
+            *remaining += 1;
+        }
+    }
+    if !keys.is_empty() {
+        let values = authenticated_blob_reader
+            .load_bytes_for_scoped_rows(&rows)
+            .await?
+            .into_shared_vec();
+        if values.len() != keys.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "authenticated blob reader returned {} values for {} requested rows",
+                    values.len(),
+                    keys.len()
+                ),
+            ));
+        }
+        bytes_by_key.extend(keys.into_iter().zip(values));
+    }
+    Ok(LoadedBlobBytes {
+        bytes_by_key,
+        remaining_by_key,
+    })
+}
+
+async fn load_authenticated_blob_bytes_for_files_with_staged<R>(
+    authenticated_blob_reader: &dyn crate::forktree::AuthenticatedBlobReader,
+    write_ctx: &SqlWriteContext<R>,
+    live_rows: &StateRowOwners,
+    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+) -> Result<LoadedBlobBytes, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    if file_rows.is_empty() || blob_rows.is_empty() {
+        return Ok(LoadedBlobBytes::default());
+    }
+    let mut keys = Vec::new();
+    let mut rows = Vec::new();
+    let mut bytes_by_key = BTreeMap::new();
+    let mut remaining_by_key = BTreeMap::<FilesystemBlobRefKey, usize>::new();
+    for file in file_rows.values() {
+        let key = file.blob_ref_key(live_rows);
+        if let Some(row) = blob_rows.get(&key) {
+            let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
+            if *remaining == 0 {
+                let expected = BlobId::from_hex(&row.blob_hash)?;
+                let live = live_rows.row(row.live);
+                let staged_owner = if live.global() {
+                    GLOBAL_BRANCH_ID
+                } else {
+                    live.branch_id()
+                };
+                let staged = live
+                    .file_id()
+                    .map(|file_id| {
+                        write_ctx.load_staged_file_bytes_for_owner(staged_owner, file_id, expected)
+                    })
+                    .transpose()?
+                    .flatten();
+                if let Some(bytes) = staged {
+                    bytes_by_key.insert(key.clone(), Some(bytes.into()));
+                } else {
+                    let live = live_rows.row(row.live);
+                    keys.push(key);
+                    rows.push(crate::forktree::AuthenticatedBlobStateKey {
+                        state_key: row.state_key.clone(),
+                        branch_id: parse_blob_scope_branch_id(live.branch_id())?,
+                        global: live.global(),
+                    });
+                }
+            }
+            *remaining += 1;
+        }
+    }
+    if !keys.is_empty() {
+        let values = authenticated_blob_reader
+            .load_bytes_for_scoped_rows(&rows)
+            .await?
+            .into_shared_vec();
+        if values.len() != keys.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "authenticated blob reader returned {} values for {} requested rows",
+                    values.len(),
+                    keys.len()
+                ),
+            ));
+        }
+        bytes_by_key.extend(keys.into_iter().zip(values));
+    }
+    Ok(LoadedBlobBytes {
+        bytes_by_key,
+        remaining_by_key,
+    })
+}
+
+fn parse_blob_scope_branch_id(
+    branch_id: &str,
+) -> Result<crate::forktree::CanonicalBranchId, LixError> {
+    let uuid = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("BlobRef owner branch ID must be a UUID: {error}"),
+        )
+    })?;
+    Ok(crate::forktree::CanonicalBranchId::from_bytes(
+        *uuid.as_bytes(),
+    ))
+}
+
+#[cfg(test)]
 async fn load_blob_bytes_for_files(
     blob_reader: &Arc<dyn BlobDataReader>,
-    live_rows: &HotStateBatchOwners,
+    live_rows: &StateRowOwners,
     file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
 ) -> Result<LoadedBlobBytes, LixError> {
@@ -5337,7 +6514,7 @@ async fn load_blob_bytes_for_files(
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
                 if let Some(data) = &row.inline_data {
-                    bytes_by_key.insert(key.clone(), Some(data.clone()));
+                    bytes_by_key.insert(key.clone(), Some(data.clone().into()));
                 } else {
                     keys.push(key);
                     hashes.push(BlobId::from_hex(&row.blob_hash)?);
@@ -5347,7 +6524,10 @@ async fn load_blob_bytes_for_files(
         }
     }
     if !keys.is_empty() {
-        let values = blob_reader.load_bytes_many(&hashes).await?.into_vec();
+        let values = blob_reader
+            .load_bytes_many(&hashes)
+            .await?
+            .into_shared_vec();
         if values.len() != keys.len() {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -5368,8 +6548,7 @@ async fn load_blob_bytes_for_files(
 
 async fn render_plugin_files_for_sql(
     plugin_render: &PluginRenderContext,
-    blob_reader: &Arc<dyn BlobDataReader>,
-    live_rows: &HotStateBatchOwners,
+    live_rows: &StateRowOwners,
     file_keys: &[FilesystemDescriptorKey],
     file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
@@ -5415,7 +6594,6 @@ async fn render_plugin_files_for_sql(
     for file_key in materialized_file_keys {
         acknowledge_materialized_file(
             plugin_render,
-            blob_reader,
             live_rows,
             &file_key,
             file_rows,
@@ -5429,8 +6607,7 @@ async fn render_plugin_files_for_sql(
 
 async fn acknowledge_materialized_file(
     plugin_render: &PluginRenderContext,
-    _blob_reader: &Arc<dyn BlobDataReader>,
-    live_rows: &HotStateBatchOwners,
+    live_rows: &StateRowOwners,
     file_key: &FilesystemDescriptorKey,
     file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
@@ -5491,40 +6668,23 @@ async fn acknowledge_materialized_file(
     Ok(())
 }
 
-async fn plugin_render_context_for_lix_file_scan(
-    hot_state: Arc<dyn HotStateReader>,
-    request: &HotStateScanRequest,
+async fn plugin_render_context_for_lix_file_scan<R>(
+    state_view: Arc<FileStateView<R>>,
+    request: &FileQueryPlan,
     host: PluginRuntimeHost,
     prepared: &PreparedLixFileRows,
     include_blob_backed_candidates: bool,
-) -> Result<Option<PluginRenderContext>, LixError> {
-    plugin_render_context_for_lix_file_scan_cached(
-        hot_state,
-        request,
-        host,
-        prepared,
-        include_blob_backed_candidates,
-        None,
-    )
-    .await
-}
-
-async fn plugin_render_context_for_lix_file_scan_cached(
-    hot_state: Arc<dyn HotStateReader>,
-    request: &HotStateScanRequest,
-    host: PluginRuntimeHost,
-    prepared: &PreparedLixFileRows,
-    include_blob_backed_candidates: bool,
-    cache_snapshot: Option<u128>,
-) -> Result<Option<PluginRenderContext>, LixError> {
+) -> Result<Option<PluginRenderContext>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let candidates = prepared.plugin_owner_candidates(include_blob_backed_candidates);
     if candidates.is_empty() {
         return Ok(None);
     }
-    let branches =
-        load_plugin_render_branches(Arc::clone(&hot_state), request, &host, cache_snapshot).await?;
+    let branches = load_plugin_render_branches(Arc::clone(&state_view), request, &host).await?;
     plugin_render_context_with_branches(
-        hot_state,
+        state_view,
         host,
         branches,
         candidates,
@@ -5533,12 +6693,14 @@ async fn plugin_render_context_for_lix_file_scan_cached(
     .await
 }
 
-async fn load_plugin_render_branches(
-    hot_state: Arc<dyn HotStateReader>,
-    request: &HotStateScanRequest,
+async fn load_plugin_render_branches<R>(
+    state_view: Arc<FileStateView<R>>,
+    request: &FileQueryPlan,
     host: &PluginRuntimeHost,
-    cache_snapshot: Option<u128>,
-) -> Result<BTreeMap<String, BranchPluginRenderContext>, LixError> {
+) -> Result<BTreeMap<String, BranchPluginRenderContext>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let branch_ids = request
         .filter
         .branch_ids
@@ -5546,54 +6708,53 @@ async fn load_plugin_render_branches(
         .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
         .cloned()
         .collect::<BTreeSet<_>>();
-    let cached = match cache_snapshot {
-        Some(snapshot) => host.cached_plugin_registries(snapshot, &branch_ids)?,
-        None => None,
-    };
-    let registries = match cached {
-        Some(registries) => registries,
-        None => {
-            let registry_reads = branch_ids.iter().cloned().map(|branch_id| {
-                let hot_state = Arc::clone(&hot_state);
-                async move {
-                    let rows = hot_state
-                        .scan_tracked_batch(&HotStateScanRequest {
-                            filter: HotStateFilter {
-                                schema_keys: vec!["lix_key_value".to_string()],
-                                row_pks: vec![RowPk::single(PLUGIN_REGISTRY_KEY)],
-                                branch_ids: vec![branch_id.clone()],
-                                file_ids: vec![crate::NullableKeyFilter::Null],
-                                untracked: Some(false),
-                                ..HotStateFilter::default()
-                            },
-                            projection: plugin_control_hot_state_projection(),
-                            limit: Some(1),
-                        })
-                        .await?;
-                    let row = rows.iter().find(|row| {
-                        row.schema_key() == "lix_key_value"
-                            && row.row_pk().as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
-                            && row.file_id().is_none()
-                            && row.branch_id() == branch_id.as_str()
-                            && !row.global()
-                            && !row.untracked()
-                    });
-                    let row = row.map(MaterializedHotStateRowRef::to_owned);
-                    let registry =
-                        PluginRegistry::from_optional_hot_state_row(row.as_ref(), &branch_id)?;
-                    Ok::<_, LixError>((branch_id, registry))
-                }
+    let registry_reads = branch_ids.iter().cloned().map(|branch_id| {
+        let state_view = Arc::clone(&state_view);
+        async move {
+            let rows = state_view
+                .scan_file_plan(&FileQueryPlan {
+                    filter: FileQueryFilter {
+                        schema_keys: vec!["lix_key_value".to_string()],
+                        entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+                        branch_ids: vec![branch_id.clone()],
+                        file_ids: vec![crate::NullableKeyFilter::Null],
+                        untracked: Some(false),
+                        ..FileQueryFilter::default()
+                    },
+                    projection: plugin_control_state_projection(),
+                    limit: Some(1),
+                    full_surface: false,
+                })
+                .await?;
+            let row = rows.iter().find(|row| {
+                row.schema_key() == "lix_key_value"
+                    && row.entity_pk().as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
+                    && row.file_id().is_none()
+                    && row.branch_id() == branch_id.as_str()
+                    && !row.global()
+                    && !row.untracked()
             });
-            let registries = try_join_all(registry_reads)
-                .await?
-                .into_iter()
-                .collect::<BTreeMap<_, _>>();
-            if let Some(snapshot) = cache_snapshot {
-                host.cache_plugin_registries(snapshot, &registries)?;
-            }
-            registries
+            let registry = match row {
+                Some(row) if !row.deleted() => {
+                    let snapshot = row.snapshot_content().ok_or_else(|| {
+                        invalid_plugin_read_state("plugin registry row is missing its snapshot")
+                    })?;
+                    let snapshot = serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                        invalid_plugin_read_state(format!(
+                            "plugin registry snapshot is invalid JSON: {error}"
+                        ))
+                    })?;
+                    PluginRegistry::from_optional_snapshot(Some(&snapshot))?
+                }
+                _ => PluginRegistry::empty(),
+            };
+            Ok::<_, LixError>((branch_id, registry))
         }
-    };
+    });
+    let registries = try_join_all(registry_reads)
+        .await?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
 
     let mut branches = BTreeMap::<String, BranchPluginRenderContext>::new();
     for (branch_id, registry) in registries {
@@ -5609,13 +6770,16 @@ async fn load_plugin_render_branches(
     Ok(branches)
 }
 
-async fn plugin_render_context_with_branches(
-    hot_state: Arc<dyn HotStateReader>,
+async fn plugin_render_context_with_branches<R>(
+    state_view: Arc<FileStateView<R>>,
     host: PluginRuntimeHost,
     branches: BTreeMap<String, BranchPluginRenderContext>,
     candidates: Vec<FilesystemDescriptorKey>,
     keep_catalog_without_owners: bool,
-) -> Result<Option<PluginRenderContext>, LixError> {
+) -> Result<Option<PluginRenderContext>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -5640,15 +6804,15 @@ async fn plugin_render_context_with_branches(
     let owner_reads = candidate_keys_by_branch
         .iter()
         .map(|(branch_id, candidate_keys)| {
-            let hot_state = Arc::clone(&hot_state);
+            let state_view = Arc::clone(&state_view);
             let branch_id = branch_id.clone();
             let file_ids = candidate_keys.keys().cloned().collect::<BTreeSet<_>>();
             async move {
-                let rows = hot_state
-                    .scan_tracked_batch(&HotStateScanRequest {
-                        filter: HotStateFilter {
+                let rows = state_view
+                    .scan_file_plan(&FileQueryPlan {
+                        filter: FileQueryFilter {
                             schema_keys: vec!["lix_key_value".to_string()],
-                            row_pks: vec![RowPk::single(PLUGIN_OWNER_KEY)],
+                            entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
                             branch_ids: vec![branch_id.clone()],
                             file_ids: file_ids
                                 .iter()
@@ -5656,10 +6820,11 @@ async fn plugin_render_context_with_branches(
                                 .map(crate::NullableKeyFilter::Value)
                                 .collect(),
                             untracked: Some(false),
-                            ..HotStateFilter::default()
+                            ..FileQueryFilter::default()
                         },
-                        projection: plugin_control_hot_state_projection(),
+                        projection: plugin_control_state_projection(),
                         limit: None,
+                        full_surface: false,
                     })
                     .await?;
                 Ok::<_, LixError>((branch_id, file_ids, rows))
@@ -5674,7 +6839,7 @@ async fn plugin_render_context_with_branches(
                 continue;
             };
             if row.schema_key() != "lix_key_value"
-                || row.row_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
+                || row.entity_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
                 || row.branch_id() != branch_id.as_str()
                 || row.global()
                 || row.untracked()
@@ -5682,18 +6847,21 @@ async fn plugin_render_context_with_branches(
             {
                 continue;
             }
-            let owned_row = row.to_owned();
-            // KNOWN LANE GAP: this render context resolves owners through
-            // `scan_tracked_batch`, a tracked-only reader, so untracked
-            // plugin-owned files are not rendered from rows here. They do
-            // not need to be - an untracked file's bytes round-trip through its
-            // stored content blob, which is asserted by the lane-parity tests.
-            // Extending this to both lanes means changing the reader and
-            // belongs with the read-path work, not the unskip.
-            let Some(owner) = PluginFileOwner::from_hot_state_row(&owned_row, &branch_id, false)?
-            else {
-                continue;
+            let Some(snapshot_content) = row.snapshot_content() else {
+                if row.deleted() {
+                    continue;
+                }
+                return Err(invalid_plugin_read_state(format!(
+                    "branch '{branch_id}' plugin owner for file id '{file_id}' is missing its snapshot"
+                )));
             };
+            if row.deleted() {
+                continue;
+            }
+            let snapshot = serde_json::from_str(snapshot_content.as_str()).map_err(|error| {
+                invalid_plugin_read_state(format!("plugin owner snapshot is invalid JSON: {error}"))
+            })?;
+            let owner = PluginFileOwner::from_snapshot(file_id, &snapshot)?;
             let candidate_key = candidate_keys_by_branch
                 .get(&branch_id)
                 .and_then(|candidate_keys| candidate_keys.get(file_id))
@@ -5761,8 +6929,8 @@ fn plugin_unavailable_error(
     }))
 }
 
-fn plugin_control_hot_state_projection() -> HotStateProjection {
-    HotStateProjection {
+fn plugin_control_state_projection() -> FileQueryProjection {
+    FileQueryProjection {
         columns: vec!["snapshot_content".to_string()],
     }
 }
@@ -5865,9 +7033,9 @@ fn lix_file_scan_request(
     branch_binding: Option<&str>,
     projected_schema: Option<&Schema>,
     limit: Option<usize>,
-) -> HotStateScanRequest {
-    HotStateScanRequest {
-        filter: HotStateFilter {
+) -> FileQueryPlan {
+    FileQueryPlan {
+        filter: FileQueryFilter {
             schema_keys: vec![
                 FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 BLOB_REF_SCHEMA_KEY.to_string(),
@@ -5876,16 +7044,17 @@ fn lix_file_scan_request(
             branch_ids: branch_binding
                 .map(|branch_id| vec![branch_id.to_string()])
                 .unwrap_or_default(),
-            ..HotStateFilter::default()
+            ..FileQueryFilter::default()
         },
-        projection: lix_file_hot_state_projection(projected_schema),
+        projection: lix_file_projection(projected_schema),
         limit,
+        full_surface: false,
     }
 }
 
-fn lix_file_hot_state_projection(projected_schema: Option<&Schema>) -> HotStateProjection {
+fn lix_file_projection(projected_schema: Option<&Schema>) -> FileQueryProjection {
     let Some(schema) = projected_schema else {
-        return HotStateProjection::default();
+        return FileQueryProjection::default();
     };
     let mut columns = vec!["snapshot_content".to_string()];
     if schema
@@ -5895,17 +7064,24 @@ fn lix_file_hot_state_projection(projected_schema: Option<&Schema>) -> HotStateP
     {
         columns.push("metadata".to_string());
     }
-    HotStateProjection { columns }
+    FileQueryProjection { columns }
 }
 
-async fn scan_lix_file_live_batch(
-    hot_state: Arc<dyn HotStateReader>,
-    request: &HotStateScanRequest,
+async fn scan_lix_file_native_batch<R>(
+    state_view: Arc<FileStateView<R>>,
+    request: &FileQueryPlan,
     target_file_ids: &FileIdConstraint,
-) -> std::result::Result<MaterializedHotStateBatch, LixError> {
+) -> std::result::Result<FilesystemStateRows, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let target_file_ids = match target_file_ids {
-        FileIdConstraint::All => return hot_state.scan_batch(request).await,
-        FileIdConstraint::None => return Ok(MaterializedHotStateBatch::default()),
+        FileIdConstraint::All => {
+            let mut full_request = request.clone();
+            full_request.full_surface = true;
+            return state_view.scan_file_plan(&full_request).await;
+        }
+        FileIdConstraint::None => return Ok(FilesystemStateRows::default()),
         FileIdConstraint::Ids(target_file_ids) => target_file_ids,
     };
 
@@ -5914,64 +7090,150 @@ async fn scan_lix_file_live_batch(
         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
         BLOB_REF_SCHEMA_KEY.to_string(),
     ];
-    // Bound this read on the file id, not the row PK.
-    //
-    // The hot index key is file-first -- `scope(branch, generation) ++
-    // schema_key ++ file_id ++ row_pk` -- so a row PK on its own names
-    // neither a point key nor a prefix. With `row_pks` set and `file_ids`
-    // empty, `hot_exact_identity_batches` returns a batch but
-    // `may_use_null_point_batch` refuses it (both schema keys here have
-    // file-backed members, and a null-file point key would miss the real row),
-    // `hot_file_scan_prefixes` declines for want of a file id, and the request
-    // lands on the widest arm: a full walk of every `lix_file_descriptor` and
-    // every `lix_binary_blob_ref` row in the branch, filtered in memory. That
-    // is O(files in branch) per statement.
-    //
-    // Pinning `file_ids` *instead of* `row_pks` -- not in addition to --
-    // routes to `hot_file_scan_prefixes`, one tight `(branch, generation,
-    // schema_key, file_id)` prefix seek per target file. Adding the pin while
-    // keeping `row_pks` would be much worse than the walk it replaces:
-    // `FiniteHotIdentityBatchRef::new` builds the *cross product*
-    // `row_pks.len() * file_ids.len()`, so N target files would encode N^2
-    // point keys per schema key.
-    //
-    // Dropping `row_pks` cannot widen the answer, because `file_id ==
-    // row_pk` holds by construction for both of these schema keys:
-    // `transaction::normalization::canonicalize_descriptor_file_id` *derives*
-    // the descriptor row's `file_id` from its row PK on every normalized
-    // write, and both `lix_binary_blob_ref` producers in `filesystem::planner`
-    // (`BlobRefRowInput::append_to` and `append_blob_ref_tombstone_row`,
-    // tombstones included) set the pair from one variable. Both surfaces are
-    // read-only, so no caller can supply a divergent pair.
-    // `scan_exact_file_blob_batch` below already pairs them the same way.
-    file_request.filter.row_pks.clear();
-    file_request.filter.file_ids = target_file_ids
-        .iter()
-        .map(|file_id| crate::NullableKeyFilter::Value(file_id.clone()))
+    // Descriptors use the NULL file-id lane while blob references use the
+    // entity's file id. Keep the bounded exact request aligned with both
+    // authenticated rows so RETURNING can observe the complete post-image.
+    file_request.filter.file_ids = std::iter::once(crate::NullableKeyFilter::Null)
+        .chain(
+            target_file_ids
+                .iter()
+                .cloned()
+                .map(crate::NullableKeyFilter::Value),
+        )
         .collect();
-    // Preserve the canonical-UUID validation the row-PK projection used to
-    // perform, so a malformed file id stays an error instead of becoming a
-    // silently empty answer.
-    for file_id in target_file_ids {
-        file_id_row_pk(file_id)?;
-    }
+    file_request.filter.entity_pks = target_file_ids
+        .iter()
+        .map(|file_id| file_id_entity_pk(file_id))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let file_rows = hot_state.scan_batch(&file_request).await?;
+    let file_rows = state_view.scan_file_plan(&file_request).await?;
 
-    let mut directory_request = request.clone();
-    directory_request.filter.schema_keys = vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()];
-    directory_request.filter.row_pks.clear();
-    directory_request.limit = None;
-    let directory_rows = hot_state.scan_batch(&directory_request).await?;
-    Ok(concatenate_hot_state_batches([file_rows, directory_rows]))
+    let directory_rows = load_directory_rows_for_files(
+        Arc::clone(&state_view),
+        &file_rows,
+        request.filter.branch_ids.first().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "exact file scan requires a resolved branch id",
+            )
+        })?,
+        request.filter.include_tombstones,
+    )
+    .await?;
+    Ok(concatenate_state_rows([file_rows, directory_rows]))
 }
 
-fn concatenate_hot_state_batches(
-    batches: impl IntoIterator<Item = MaterializedHotStateBatch>,
-) -> MaterializedHotStateBatch {
+fn schema_range_bounds(schema_key: &str) -> (Vec<u8>, Option<Vec<u8>>) {
+    // The empty entity-PK encoding is the canonical lower prefix immediately
+    // before every non-empty typed PK. The shared ForkTree codec therefore
+    // gives this provider a schema-only half-open range without reimplementing
+    // key geometry or introducing a side index.
+    let empty_entity_pk = EntityPk {
+        components: crate::entity_pk::EntityPkComponents::Empty,
+    };
+    let lower = crate::forktree::encode_state_entity_prefix(schema_key, &empty_entity_pk);
+    let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
+    (lower, upper)
+}
+
+async fn load_directory_rows_for_files<R>(
+    state_view: Arc<FileStateView<R>>,
+    file_rows: &FilesystemStateRows,
+    branch_id: &str,
+    include_tombstones: bool,
+) -> Result<FilesystemStateRows, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    let mut pending = BTreeSet::new();
+    for row in file_rows
+        .iter()
+        .filter(|row| row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && !row.deleted)
+    {
+        let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "file descriptor row is missing its snapshot while resolving directories",
+            )
+        })?;
+        let snapshot =
+            serde_json::from_str::<FileDescriptorSnapshot>(snapshot_content).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "invalid file descriptor snapshot while resolving directories: {error}"
+                    ),
+                )
+            })?;
+        if let Some(directory_id) = snapshot.directory_id {
+            pending.insert(directory_id);
+        }
+    }
+    let mut requested = BTreeSet::new();
+    let mut directories = Vec::new();
+
+    while !pending.is_empty() {
+        let ids = pending
+            .iter()
+            .filter(|id| requested.insert((*id).clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        pending.clear();
+        if ids.is_empty() {
+            break;
+        }
+        let rows = state_view
+            .load_exact_batch(&FileExactBatchPlan {
+                rows: ids
+                    .iter()
+                    .map(|id| {
+                        Ok(FileExactKeyPlan {
+                            branch_id: branch_id.to_string(),
+                            schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                            entity_pk: file_id_entity_pk(id)?,
+                            file_id: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LixError>>()?,
+                include_tombstones,
+                ..FileExactBatchPlan::default()
+            })
+            .await?;
+        let present = rows.into_iter().flatten().collect::<Vec<_>>();
+        for row in present
+            .iter()
+            .filter(|row| row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY && !row.deleted)
+        {
+            let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "directory descriptor row is missing its snapshot while resolving parents",
+                )
+            })?;
+            let snapshot = serde_json::from_str::<DirectoryDescriptorSnapshot>(snapshot_content)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "invalid directory descriptor snapshot while resolving parents: {error}"
+                        ),
+                    )
+                })?;
+            if let Some(parent_id) = snapshot.parent_id {
+                pending.insert(parent_id);
+            }
+        }
+        directories.extend(present);
+    }
+    Ok(FilesystemStateRows::from_rows(directories))
+}
+
+fn concatenate_state_rows(
+    batches: impl IntoIterator<Item = FilesystemStateRows>,
+) -> FilesystemStateRows {
     let batches = batches.into_iter().collect::<Vec<_>>();
-    let row_count = batches.iter().map(MaterializedHotStateBatch::len).sum();
-    let mut builder = MaterializedHotStateBatchBuilder::with_capacity(row_count);
+    let row_count = batches.iter().map(FilesystemStateRows::len).sum();
+    let mut builder = FilesystemRowsBuilder::with_capacity(row_count);
     for batch in &batches {
         for row in batch.iter() {
             builder.push_ref(row, None);
@@ -5983,18 +7245,18 @@ fn concatenate_hot_state_batches(
 fn scan_indexed_file_batch(
     matches: &FilesystemPathSelection,
     needs_blob_rows: bool,
-) -> Result<MaterializedHotStateBatch, LixError> {
+) -> Result<FilesystemStateRows, LixError> {
     if matches.is_empty() || !needs_blob_rows {
-        return Ok(MaterializedHotStateBatch::default());
+        return Ok(FilesystemStateRows::default());
     }
-    let mut builder = MaterializedHotStateBatchBuilder::with_capacity(matches.len());
+    let mut builder = FilesystemRowsBuilder::with_capacity(matches.len());
     for row in matches
         .entries()
         .filter(|entry| entry.kind == FilesystemPathKind::File)
-        .filter_map(FilesystemPathEntry::blob_ref_live_row)
+        .filter_map(FilesystemPathEntry::blob_ref_state_row)
     {
         builder.push_materialized_ref(
-            &row.row_pk,
+            &row.entity_pk,
             &row.schema_key,
             row.file_id.as_deref(),
             row.snapshot_content.clone(),
@@ -6012,13 +7274,16 @@ fn scan_indexed_file_batch(
     Ok(builder.finish())
 }
 
-async fn scan_exact_file_blob_batch(
-    hot_state: Arc<dyn HotStateReader>,
-    request: &HotStateScanRequest,
+async fn scan_exact_file_blob_batch<R>(
+    state_view: Arc<FileStateView<R>>,
+    request: &FileQueryPlan,
     file_ids: &BTreeSet<String>,
-) -> Result<MaterializedHotStateBatch, LixError> {
+) -> Result<FilesystemStateRows, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     if file_ids.is_empty() {
-        return Ok(MaterializedHotStateBatch::default());
+        return Ok(FilesystemStateRows::default());
     }
     if request.filter.branch_ids.is_empty() {
         return Err(LixError::new(
@@ -6033,24 +7298,52 @@ async fn scan_exact_file_blob_batch(
         .iter()
         .flat_map(|branch_id| {
             file_ids.iter().map(move |file_id| {
-                Ok(HotStateExactRowRequest {
+                Ok(FileExactKeyPlan {
                     branch_id: branch_id.clone(),
                     schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                    row_pk: file_id_row_pk(file_id)?,
+                    entity_pk: file_id_entity_pk(file_id)?,
                     file_id: Some(file_id.clone()),
                 })
             })
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    let rows = hot_state
-        .load_exact_batch(&HotStateExactBatchRequest {
+    let rows = state_view
+        .load_exact_batch(&FileExactBatchPlan {
             rows: exact_rows,
             projection: request.projection.clone(),
             untracked: request.filter.untracked,
             include_tombstones: request.filter.include_tombstones,
         })
         .await?;
-    Ok(rows.into_present_batch())
+    Ok(FilesystemStateRows::from_rows(
+        rows.into_iter().flatten().collect(),
+    ))
+}
+
+#[cfg(test)]
+fn file_exact_batch_plan(
+    request: &FileQueryPlan,
+    file_ids: &BTreeSet<String>,
+) -> FileExactBatchPlan {
+    FileExactBatchPlan {
+        rows: request
+            .filter
+            .branch_ids
+            .iter()
+            .flat_map(|branch_id| {
+                file_ids.iter().map(move |file_id| FileExactKeyPlan {
+                    branch_id: branch_id.clone(),
+                    schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                    entity_pk: file_id_entity_pk(file_id)
+                        .expect("test file IDs should encode as entity PKs"),
+                    file_id: Some(file_id.clone()),
+                })
+            })
+            .collect(),
+        projection: request.projection.clone(),
+        untracked: request.filter.untracked,
+        include_tombstones: request.filter.include_tombstones,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6305,7 +7598,7 @@ pub(super) fn indexed_path_matches(
             FilePathPredicate::In(values) => values
                 .iter()
                 .flat_map(|value| index.exact_entries(value))
-                .collect(),
+                .collect::<Vec<_>>(),
             FilePathPredicate::LowercaseContains(_) => index.entries(),
             FilePathPredicate::And(left, right) => {
                 let left = entries(index, left, kind);
@@ -6974,7 +8267,7 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
         Field::new("content", DataType::LargeBinary, false),
-        json_field("lixcol_row_pk", false),
+        json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -6982,7 +8275,6 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]))
 }
@@ -7001,8 +8293,8 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)
 }
 
-fn file_id_row_pk(file_id: &str) -> Result<RowPk, LixError> {
-    RowPk::uuid_from_canonical(file_id).map_err(|error| {
+fn file_id_entity_pk(file_id: &str) -> Result<EntityPk, LixError> {
+    EntityPk::uuid_from_canonical(file_id).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("validated file ID is not a canonical UUID: {error}"),
@@ -7040,39 +8332,54 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use crate::binary_cas::{
-        BlobBytesBatch, BlobDataReader, BlobId, BlobLayout, BlobWriteReceipt, ChunkHash,
+        BlobBytesBatch, BlobDataReader, BlobId, BlobLayout, BlobRangeBytes, BlobRangeBytesBatch,
+        BlobWriteReceipt,
     };
     use crate::branch::{BranchHead, BranchRefReader};
-    use crate::changelog::{ChangeId, CommitId};
+    use crate::changelog::{ChangeId, ChangeRecord, CommitId};
     use crate::common::LixTimestamp;
     use crate::filesystem::{
         FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemPathIndex,
         FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemRowContext,
     };
-    use crate::functions::FunctionProviderHandle;
-    use crate::hot_state::{
-        HotStateExactBatchRequest, HotStateFilter, HotStateReader, HotStateScanRequest,
-        MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
+    use crate::forktree::{
+        AuthenticatedBlobReader, BranchStateTransition, ChangeCatalogEntry, ChangeCatalogOwner,
+        ChangeObjectV1, CommitCatalogEntry, CommitChangePageV2, CommitObjectV1, ForkTreeReadFacade,
+        PreparedPublication, RepositoryRootV1, StateCell, StateKey, StateMutationAudit,
+        StateTreeMutation, StateValue, StateValueRef, encode_current_state_packs, encode_state_key,
+        encode_state_value,
     };
-    use crate::plugin::runtime::{
+    use crate::functions::FunctionProviderHandle;
+    use crate::json_store::JsonSlot;
+    use crate::plugin::{
         PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentMatcher, PluginFileOwner,
         PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
         PluginRuntimeHost, plugin_storage_archive_file_id, plugin_storage_archive_path,
     };
     use crate::sql2::dml::InsertSink;
     use crate::sql2::providers::upsert::UpsertConflictTarget;
-    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext, WriteContextBranchRefReader};
-    use crate::transaction_types::{
+    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
+    use crate::state::{ForkTreeStateView, TransactionStateView};
+    use crate::storage::{Memory, MemoryRead};
+    use crate::storage_adapter::{
+        SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteOptions,
+        StorageWriteSet,
+    };
+    use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
     use crate::plugin::runtime::UnsupportedWasmRuntime;
-    use crate::{LixError, NullableKeyFilter};
+    use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
+    use futures_util::FutureExt;
+
+    type TestRead = SharedStorageAdapterRead<MemoryRead>;
 
     use super::{
-        BranchBinding, DirectoryDescriptorRecord, LixFileInsertSink, LixFileSpec, TableSpec,
-        UpsertSupport, derive_directory_paths, lix_file_delete_stage_from_batch,
-        lix_file_insert_stage_from_batch, lix_file_insert_stage_from_batch_with_path_resolvers,
-        lix_file_write_rows_from_batch,
+        BranchBinding, DirectoryDescriptorRecord, FileExactBatchPlan, FileQueryFilter,
+        FileQueryPlan, FileStateView, FilesystemRowsBuilder, FilesystemStateRow,
+        FilesystemStateRows, LixFileInsertSink, LixFileSpec, TableSpec, UpsertSupport,
+        derive_directory_paths, lix_file_delete_stage_from_batch, lix_file_insert_stage_from_batch,
+        lix_file_insert_stage_from_batch_with_path_resolvers, lix_file_write_rows_from_batch,
     };
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
@@ -7080,19 +8387,480 @@ mod tests {
         move || ids.next().expect("test id should exist").to_string()
     }
 
-    fn uuid_pk(value: &str) -> crate::row_pk::RowPk {
-        crate::row_pk::RowPk::uuid_from_canonical(value)
+    fn uuid_pk(value: &str) -> crate::entity_pk::EntityPk {
+        crate::entity_pk::EntityPk::uuid_from_canonical(value)
             .expect("fixture ID should be a canonical UUID")
     }
 
     fn path_index_from_rows(
-        rows: Vec<MaterializedHotStateRow>,
+        rows: Vec<FilesystemStateRow>,
     ) -> Result<FilesystemPathIndex, LixError> {
-        FilesystemPathIndex::from_live_batch(&MaterializedHotStateBatch::from_rows(rows))
+        FilesystemPathIndex::from_state_rows(&FilesystemStateRows::from_rows(rows))
     }
 
     fn test_functions() -> FunctionProviderHandle {
         FunctionProviderHandle::system()
+    }
+
+    fn test_transaction_state_view() -> TransactionStateView<SharedStorageAdapterRead<MemoryRead>> {
+        test_transaction_state_view_for_branch(GLOBAL_BRANCH_ID, &[])
+    }
+
+    fn test_global_state_member(
+        row: &FilesystemStateRow,
+    ) -> (Vec<u8>, crate::forktree::CommitMemberV1) {
+        let change_id = row
+            .change_id
+            .expect("global native fixture row should have a ChangeId");
+        let fork_change_id = crate::forktree::ChangeId::from_bytes(*change_id.as_uuid().as_bytes());
+        let snapshot = if row.deleted {
+            JsonSlot::None
+        } else if let Some(snapshot) = &row.snapshot_content {
+            JsonSlot::Inline(snapshot.to_string().into_boxed_str())
+        } else {
+            JsonSlot::Inline("null".into())
+        };
+        let metadata = row
+            .metadata
+            .as_ref()
+            .map(|metadata| JsonSlot::Inline(metadata.to_string().into_boxed_str()))
+            .unwrap_or(JsonSlot::None);
+        let payload = crate::changelog::encode_forktree_change_payload(&ChangeRecord {
+            format_version: 2,
+            change_id,
+            account_id: "native-file-fixture".to_owned(),
+            schema_key: row.schema_key.clone(),
+            entity_pk: row.entity_pk.clone(),
+            file_id: row.file_id.clone(),
+            snapshot,
+            metadata,
+            created_at: row.created_at,
+            origin_key: None,
+        })
+        .expect("global native fixture change payload");
+        let key = encode_state_key(crate::forktree::StateKeyRef {
+            schema_key: &row.schema_key,
+            file_id: row.file_id.as_deref(),
+            entity_pk: &row.entity_pk,
+        });
+        (
+            key,
+            crate::forktree::CommitMemberV1::introduced(
+                fork_change_id,
+                payload,
+                true,
+                row.updated_at,
+                Vec::new(),
+            ),
+        )
+    }
+
+    fn publish_global_fixture_rows(
+        initial_view: &crate::forktree::CoherentView<TestRead>,
+        backend: &Memory,
+        rows: &[FilesystemStateRow],
+    ) {
+        let mut entries = rows
+            .iter()
+            .filter(|row| row.global && !row.untracked)
+            .map(test_global_state_member)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return;
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let commit_id = crate::forktree::CommitId::from_bytes([0x6a; 16]);
+        let members = entries
+            .iter()
+            .map(|(_, member)| member.clone())
+            .collect::<Vec<_>>();
+        let pages = CommitChangePageV2::encode_pages(commit_id, &members)
+            .expect("global native fixture member pages");
+        let packs = encode_current_state_packs(
+            commit_id,
+            true,
+            entries
+                .iter()
+                .zip(&pages.member_locations)
+                .map(|((key, member), location)| {
+                    let (payload, _, updated_at, manifests) = member
+                        .introduced_payload()
+                        .expect("global fixture member is introduced");
+                    let change_id =
+                        ChangeId::new(uuid::Uuid::from_bytes(*member.change_id().as_bytes()));
+                    let record =
+                        crate::changelog::decode_forktree_change_payload(payload, change_id)
+                            .expect("global fixture payload");
+                    let cell = match record.snapshot {
+                        JsonSlot::None => StateCell::Tombstone,
+                        JsonSlot::Inline(value) if value.as_ref() == "null" => StateCell::Null,
+                        JsonSlot::Inline(value) => StateCell::Value(value.into()),
+                        JsonSlot::ForkTreeObject(_) => {
+                            panic!("global fixture payload must be inline")
+                        }
+                    };
+                    let metadata = match record.metadata {
+                        JsonSlot::None => None,
+                        JsonSlot::Inline(value) => Some(value.into()),
+                        JsonSlot::ForkTreeObject(_) => {
+                            panic!("global fixture metadata must be inline")
+                        }
+                    };
+                    (
+                        key.clone(),
+                        StateValue {
+                            change_id,
+                            commit_id: CommitId::new(uuid::Uuid::from_bytes(*commit_id.as_bytes())),
+                            created_at: record.created_at,
+                            updated_at,
+                            cell,
+                            metadata,
+                            origin_key: record.origin_key,
+                            blob_manifest_object_ids: manifests.to_vec(),
+                        },
+                        *location,
+                    )
+                })
+                .collect(),
+        )
+        .expect("global native fixture current-state packs");
+        let mutations = entries
+            .iter()
+            .map(|(key, _)| {
+                let location = packs.locations.get(key).expect("global fixture pack row");
+                StateTreeMutation::insert_bound(
+                    key.clone(),
+                    encode_state_value(StateValueRef {
+                        pack_object_id: location.pack_object_id,
+                        pack_ordinal: location.pack_ordinal,
+                    })
+                    .expect("global native fixture state value"),
+                    StateMutationAudit {
+                        commit_id: *commit_id.as_bytes(),
+                        tombstone: false,
+                        blob_manifest_object_ids: Vec::new(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state_edit = initial_view
+            .edit_state_tree(initial_view.repository_root().global_state_root, mutations)
+            .now_or_never()
+            .expect("global native fixture state edit should not yield")
+            .expect("global native fixture state edit");
+        state_edit
+            .stage_objects(packs.objects)
+            .expect("global native fixture pack staging");
+        let parent_id = initial_view
+            .branch_snapshot()
+            .semantic_head_commit_object_id;
+        let parent_bytes = initial_view
+            .load_object_bytes(parent_id)
+            .now_or_never()
+            .expect("global native fixture parent read should not yield")
+            .expect("global native fixture parent commit");
+        let parent = CommitObjectV1::decode(parent_id, &parent_bytes)
+            .expect("global native fixture parent commit should authenticate");
+        let semantic_commit = CommitObjectV1 {
+            commit_id,
+            generation: parent.generation.saturating_add(1),
+            parent_commit_object_ids: vec![parent_id],
+            members,
+            member_page_object_ids: pages.objects.iter().map(|(id, _)| *id).collect(),
+            global_state_root: state_edit.root,
+            local_state_root: initial_view.branch_snapshot().local_state_root,
+            checkpoint_cursor: crate::forktree::CheckpointCursorV1::after_first_parent(
+                parent_id,
+                &parent,
+                initial_view.branch_id(),
+                false,
+            )
+            .expect("global native fixture checkpoint cursor"),
+            metadata: b"native-file-fixture-global".to_vec(),
+        };
+        let (commit_object_id, _) = semantic_commit
+            .encode()
+            .expect("global native fixture commit should encode");
+        let commit_catalog_edit = initial_view
+            .put_commit_catalog_entries(
+                initial_view.repository_root().commit_catalog_root,
+                &[(commit_id, CommitCatalogEntry { commit_object_id })],
+            )
+            .now_or_never()
+            .expect("global native fixture commit catalog should not yield")
+            .expect("global native fixture commit catalog");
+        let ref_change_id = crate::forktree::ChangeId::from_bytes([0x6b; 16]);
+        let branch_ref = ChangeObjectV1::BranchRef {
+            change_id: ref_change_id,
+            updated_at: LixTimestamp::expect_parse(
+                "native fixture global timestamp",
+                "2026-04-23T00:00:01Z",
+            ),
+            branch_id: initial_view.branch_id(),
+            before_semantic_head_commit_object_id: Some(parent_id),
+            after_semantic_head_commit_object_id: Some(commit_object_id),
+            previous_ref_change_object_id: initial_view
+                .branch_snapshot()
+                .latest_ref_change_object_id,
+            payload: b"native-file-fixture-global".to_vec(),
+            json_payload_object_ids: Vec::new(),
+        };
+        let (ref_object_id, _) = branch_ref
+            .encode()
+            .expect("global native fixture branch ref should encode");
+        let mut change_entries = semantic_commit
+            .members
+            .iter()
+            .enumerate()
+            .map(|(ordinal, member)| {
+                (
+                    member.change_id(),
+                    ChangeCatalogEntry {
+                        owner: ChangeCatalogOwner::CommitMember {
+                            commit_object_id,
+                            ordinal: u32::try_from(ordinal)
+                                .expect("global native fixture member ordinal"),
+                        },
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        change_entries.push((
+            ref_change_id,
+            ChangeCatalogEntry {
+                owner: ChangeCatalogOwner::BranchRef {
+                    ref_change_object_id: ref_object_id,
+                    branch_id: initial_view.branch_id(),
+                },
+            },
+        ));
+        change_entries.sort_by_key(|(id, _)| *id.as_bytes());
+        let change_catalog_edit = initial_view
+            .put_change_catalog_entries(
+                initial_view.repository_root().change_catalog_root,
+                &change_entries,
+            )
+            .now_or_never()
+            .expect("global native fixture change catalog should not yield")
+            .expect("global native fixture change catalog");
+        let global_state_root = state_edit.root;
+        let commit_catalog_root = commit_catalog_edit.root;
+        let change_catalog_root = change_catalog_edit.root;
+        let branch_snapshot = crate::forktree::BranchSnapshotV1 {
+            branch_id: initial_view.branch_id(),
+            local_state_root: initial_view.branch_snapshot().local_state_root,
+            semantic_head_commit_object_id: commit_object_id,
+            latest_ref_change_object_id: Some(ref_object_id),
+            historical_global_state_root: state_edit.root,
+        };
+        let transition = BranchStateTransition {
+            state_edit,
+            commit_catalog_edit,
+            change_catalog_edit,
+            semantic_commit,
+            changes: vec![branch_ref],
+            branch_snapshot,
+            repository_root: RepositoryRootV1 {
+                global_state_root,
+                commit_catalog_root,
+                change_catalog_root,
+            },
+        };
+        let mut publication = PreparedPublication::from_branch_view(initial_view)
+            .expect("global native fixture publication should bind the source view");
+        publication
+            .publish_state_transition(initial_view, transition)
+            .now_or_never()
+            .expect("global native fixture publication should not yield")
+            .expect("global native fixture publication");
+        let (writes, preconditions) = publication
+            .into_storage_plan()
+            .expect("global native fixture publication should lower");
+        StorageWriteSet::commit(
+            writes,
+            backend,
+            StorageWriteOptions {
+                preconditions,
+                ..StorageWriteOptions::default()
+            },
+        )
+        .now_or_never()
+        .expect("global native fixture publication should not yield")
+        .expect("global native fixture publication should commit");
+    }
+
+    fn test_transaction_state_view_for_branch(
+        branch_id: &str,
+        rows: &[FilesystemStateRow],
+    ) -> TransactionStateView<SharedStorageAdapterRead<MemoryRead>> {
+        let backend = Memory::new();
+        let receipt = crate::integration::Engine::initialize(backend.clone())
+            .now_or_never()
+            .expect("in-memory repository initialization should complete")
+            .expect("in-memory repository initialization should succeed");
+        let storage = StorageAdapter::new(backend.clone());
+        let global_rows = rows
+            .iter()
+            .filter(|row| row.global && !row.untracked)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !global_rows.is_empty() {
+            let initial_read = storage
+                .begin_read(StorageReadOptions::default())
+                .now_or_never()
+                .expect("initial global fixture read should complete without yielding")
+                .expect("initial global fixture read should open");
+            let initial_view = ForkTreeReadFacade::new(SharedStorageAdapterRead::new(initial_read))
+                .into_branch(&receipt.main_branch_id)
+                .now_or_never()
+                .expect("initial global fixture branch view should complete without yielding")
+                .expect("initial global fixture branch view should open");
+            publish_global_fixture_rows(&initial_view, &backend, &global_rows);
+        }
+        if branch_id != GLOBAL_BRANCH_ID {
+            let initial_read = storage
+                .begin_read(StorageReadOptions::default())
+                .now_or_never()
+                .expect("initial in-memory read should complete without yielding")
+                .expect("initial in-memory read should open");
+            let initial_view = ForkTreeReadFacade::new(SharedStorageAdapterRead::new(initial_read))
+                .into_branch(&receipt.main_branch_id)
+                .now_or_never()
+                .expect("initial ForkTree branch view should complete without yielding")
+                .expect("initialized main branch view should open");
+            let branch_uuid = uuid::Uuid::parse_str(branch_id)
+                .expect("native fixture branch ID should be a canonical UUID");
+            let branch = crate::forktree::CanonicalBranchId::from_bytes(*branch_uuid.as_bytes());
+            let source_commit_object_id = initial_view
+                .branch_snapshot()
+                .semantic_head_commit_object_id;
+            let source_commit_bytes = initial_view
+                .load_object_bytes(source_commit_object_id)
+                .now_or_never()
+                .expect("native fixture source commit should complete without yielding")
+                .expect("native fixture source commit should be present");
+            let source_commit = crate::forktree::CommitObjectV1::decode(
+                source_commit_object_id,
+                &source_commit_bytes,
+            )
+            .expect("native fixture source commit should authenticate");
+            let mut publication = PreparedPublication::from_branch_view(&initial_view)
+                .expect("native fixture publication should bind the source view");
+            publication
+                .publish_new_branch_selector(
+                    &initial_view,
+                    branch,
+                    &source_commit,
+                    crate::forktree::ChangeId::from_bytes([0x5b; 16]),
+                    LixTimestamp::expect_parse("fixture branch timestamp", "2026-04-23T00:00:00Z"),
+                )
+                .now_or_never()
+                .expect("native fixture selector publication should complete without yielding")
+                .expect("native fixture selector publication should succeed");
+            let (writes, preconditions) = publication
+                .into_storage_plan()
+                .expect("native fixture publication should lower");
+            StorageWriteSet::commit(
+                writes,
+                &backend,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .now_or_never()
+            .expect("native fixture selector write should complete without yielding")
+            .expect("native fixture selector write should succeed");
+        }
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .now_or_never()
+            .expect("in-memory read should complete without yielding")
+            .expect("in-memory read should open");
+        let read = SharedStorageAdapterRead::new(read);
+        let committed_branch_id = if branch_id == GLOBAL_BRANCH_ID {
+            GLOBAL_BRANCH_ID
+        } else {
+            branch_id
+        };
+        let committed =
+            ForkTreeStateView::from_facade(ForkTreeReadFacade::new(read), committed_branch_id)
+                .now_or_never()
+                .expect("ForkTree branch view should complete without yielding")
+                .expect("initialized main branch view should open");
+        let mut selected = BTreeMap::<Vec<u8>, crate::state::StateRow>::new();
+        for row in rows
+            .iter()
+            .filter(|row| row.branch_id == branch_id && !row.global)
+        {
+            let native = super::test_filesystem_row_to_state_row(row)
+                .expect("native filesystem fixture should be encodable");
+            let replace = row.branch_id == branch_id;
+            if replace || !selected.contains_key(&native.key) {
+                selected.insert(native.key.clone(), native);
+            }
+        }
+        let staged = selected
+            .into_values()
+            .map(|row| crate::state::StagedStateRow::new(row.key, row.value))
+            .collect();
+        TransactionStateView::new(committed, staged)
+            .expect("native transaction overlay should be valid")
+    }
+
+    fn test_native_state_views(
+        rows: &[FilesystemStateRow],
+    ) -> BTreeMap<String, TransactionStateView<TestRead>> {
+        let mut branches = rows
+            .iter()
+            .filter(|row| row.branch_id != GLOBAL_BRANCH_ID)
+            .map(|row| row.branch_id.clone())
+            .collect::<BTreeSet<_>>();
+        if branches.is_empty() {
+            branches.insert(GLOBAL_BRANCH_ID.to_string());
+        }
+        // Some native fixtures intentionally contain no rows (for example an
+        // empty plugin registry) but still query the explicit active branch.
+        // Keep that branch addressable without introducing synthetic state.
+        branches.insert("01920000-0000-7000-8000-0000000000b1".to_string());
+        branches
+            .into_iter()
+            .map(|branch_id| {
+                (
+                    branch_id.clone(),
+                    test_transaction_state_view_for_branch(&branch_id, rows),
+                )
+            })
+            .collect()
+    }
+
+    impl FileStateView<TestRead> {
+        fn test_rows(rows: Vec<FilesystemStateRow>) -> Self {
+            Self::TestNative {
+                views: test_native_state_views(&rows),
+                scan_count: None,
+                scan_requests: None,
+            }
+        }
+
+        fn test_rejecting(scan_count: Arc<AtomicUsize>) -> Self {
+            Self::TestNative {
+                views: test_native_state_views(&[]),
+                scan_count: Some(scan_count),
+                scan_requests: None,
+            }
+        }
+
+        fn test_recording(
+            rows: Vec<FilesystemStateRow>,
+            scan_requests: Arc<Mutex<Vec<FileQueryPlan>>>,
+        ) -> Self {
+            Self::TestNative {
+                views: test_native_state_views(&rows),
+                scan_count: None,
+                scan_requests: Some(scan_requests),
+            }
+        }
     }
 
     #[test]
@@ -7605,7 +9373,7 @@ mod tests {
 
     #[tokio::test]
     async fn descriptor_only_scan_materializes_index_columns_without_live_rows() {
-        let hot_state_scans = Arc::new(AtomicUsize::new(0));
+        let state_view_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let mut file = live_file_row(
             "01920000-0000-7000-8000-0000000000d2",
@@ -7624,11 +9392,9 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(RejectingHotStateReader {
-                scan_count: Arc::clone(&hot_state_scans),
-            }),
+            FileStateView::test_rejecting(Arc::clone(&state_view_scans)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -7643,7 +9409,7 @@ mod tests {
             "path",
             "directory_id",
             "name",
-            "lixcol_row_pk",
+            "lixcol_entity_pk",
             "lixcol_schema_key",
             "lixcol_commit_id",
             "lixcol_metadata",
@@ -7683,7 +9449,7 @@ mod tests {
         );
         assert_eq!(string_value("name"), "readme.md");
         assert_eq!(
-            string_value("lixcol_row_pk"),
+            string_value("lixcol_entity_pk"),
             "[\"01920000-0000-7000-8000-0000000000d2\"]"
         );
         assert_eq!(
@@ -7696,12 +9462,12 @@ mod tests {
         );
         assert_eq!(string_value("lixcol_metadata"), r#"{"source":"index"}"#);
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(hot_state_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(state_view_scans.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn filter_free_descriptor_scan_pushes_projection_and_limit_into_path_selection() {
-        let hot_state_scans = Arc::new(AtomicUsize::new(0));
+        let state_view_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
             path_index_from_rows(vec![
@@ -7723,11 +9489,9 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(RejectingHotStateReader {
-                scan_count: Arc::clone(&hot_state_scans),
-            }),
+            FileStateView::test_rejecting(Arc::clone(&state_view_scans)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -7781,19 +9545,18 @@ mod tests {
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 2);
-        assert_eq!(hot_state_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(state_view_scans.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn by_branch_descriptor_scan_keeps_scope_columns_and_residual_filtering() {
-        let hot_state_scans = Arc::new(AtomicUsize::new(0));
+        let state_view_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let mut target = live_file_row(
             "01920000-0000-7000-8000-000000000522",
             "01920000-0000-7000-8000-0000000000b1",
             r#"{"id":"01920000-0000-7000-8000-000000000522","directory_id":null,"name":"readme.md"}"#,
         );
-        target.untracked = true;
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_file_row(
@@ -7805,10 +9568,8 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::by_branch(
-            Arc::new(RejectingHotStateReader {
-                scan_count: Arc::clone(&hot_state_scans),
-            }),
+        let spec = LixFileSpec::by_branch_test(
+            FileStateView::test_rejecting(Arc::clone(&state_view_scans)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -7822,7 +9583,6 @@ mod tests {
             "id",
             "lixcol_file_id",
             "lixcol_global",
-            "lixcol_untracked",
             "lixcol_created_at",
             "lixcol_updated_at",
             "lixcol_branch_id",
@@ -7858,21 +9618,11 @@ mod tests {
                 .expect("descriptor column should be string data")
                 .value(0)
         };
-        let boolean_value = |column_name: &str| {
-            batch
-                .column(batch.schema().index_of(column_name).unwrap())
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("descriptor column should be boolean data")
-                .value(0)
-        };
         assert_eq!(string_value("id"), "01920000-0000-7000-8000-000000000522");
         assert_eq!(
             string_value("lixcol_file_id"),
             "01920000-0000-7000-8000-000000000522"
         );
-        assert!(!boolean_value("lixcol_global"));
-        assert!(boolean_value("lixcol_untracked"));
         assert_eq!(
             string_value("lixcol_created_at"),
             "2026-04-23T00:00:00.000Z"
@@ -7886,13 +9636,13 @@ mod tests {
             "01920000-0000-7000-8000-0000000000b1"
         );
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(hot_state_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(state_view_scans.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn file_id_data_scan_uses_indexed_descriptor_and_blob_rows() {
         let data = b"readme contents".to_vec();
-        let hot_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let state_view_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
             path_index_from_rows(vec![
@@ -7905,18 +9655,15 @@ mod tests {
                     "01920000-0000-7000-8000-0000000000d2",
                     "01920000-0000-7000-8000-0000000000b1",
                     "01920000-0000-7000-8000-0000000000d2",
-                    &BlobId::from_content(&data).to_hex(),
+                    &BlobId::from_canonical_content(&data).to_hex(),
                     data.len(),
                 ),
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(RecordingHotStateReader {
-                rows: Vec::new(),
-                scan_requests: Arc::clone(&hot_state_requests),
-            }),
+            FileStateView::test_recording(Vec::new(), Arc::clone(&state_view_requests)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -7946,9 +9693,9 @@ mod tests {
             .expect("data column should be binary data");
         assert_eq!(values.value(0), data.as_slice());
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
-        let requests = hot_state_requests
+        let requests = state_view_requests
             .lock()
-            .expect("live-state request mutex should not be poisoned");
+            .expect("native-state request mutex should not be poisoned");
         assert!(requests.is_empty());
     }
 
@@ -7956,13 +9703,13 @@ mod tests {
     async fn lower_path_contains_scan_loads_blob_rows_only_for_the_matching_find_files_projection()
     {
         let selected_data = b"selected contents".to_vec();
-        let selected_blob_hash = BlobId::from_content(&selected_data).to_hex();
+        let selected_blob_hash = BlobId::from_canonical_content(&selected_data).to_hex();
         let changelog_data = b"changelog contents".to_vec();
-        let changelog_blob_hash = BlobId::from_content(&changelog_data).to_hex();
+        let changelog_blob_hash = BlobId::from_canonical_content(&changelog_data).to_hex();
         let outside_data = b"outside contents".to_vec();
-        let outside_blob_hash = BlobId::from_content(&outside_data).to_hex();
+        let outside_blob_hash = BlobId::from_canonical_content(&outside_data).to_hex();
         let selected_change_id = ChangeId::for_test_label("selected-search-blob");
-        let hot_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let state_view_requests = Arc::new(Mutex::new(Vec::new()));
         let mut selected_blob = live_blob_ref_row(
             "01920000-0000-7000-8000-0000000000e2",
             "01920000-0000-7000-8000-0000000000b1",
@@ -8028,8 +9775,8 @@ mod tests {
             "the range and contains predicates should exclude both the local non-match and outside root",
         );
 
-        let _hot_state: Arc<dyn HotStateReader> = Arc::new(RecordingHotStateReader {
-            rows: vec![
+        let _state_view: Arc<FileStateView<TestRead>> = Arc::new(FileStateView::test_recording(
+            vec![
                 selected_blob,
                 live_blob_ref_row(
                     "01920000-0000-7000-8000-000000000432",
@@ -8046,8 +9793,8 @@ mod tests {
                     outside_data.len(),
                 ),
             ],
-            scan_requests: Arc::clone(&hot_state_requests),
-        });
+            Arc::clone(&state_view_requests),
+        ));
         let base_schema = super::lix_file_schema();
         let find_files_projection = vec![
             base_schema.index_of("path").expect("path column"),
@@ -8105,19 +9852,19 @@ mod tests {
         assert_eq!(names.value(0), "README.md");
         assert_eq!(change_ids.value(0), selected_change_id.to_string());
 
-        let requests = hot_state_requests
+        let requests = state_view_requests
             .lock()
-            .expect("live-state request mutex should not be poisoned");
+            .expect("native-state request mutex should not be poisoned");
         assert!(requests.is_empty());
     }
 
     #[tokio::test]
     async fn file_directory_id_scan_uses_indexed_descriptors_and_blob_rows() {
         let data = b"docs contents".to_vec();
-        let blob_hash = BlobId::from_content(&data).to_hex();
+        let blob_hash = BlobId::from_canonical_content(&data).to_hex();
         let other_data = b"other contents".to_vec();
-        let other_blob_hash = BlobId::from_content(&other_data).to_hex();
-        let hot_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let other_blob_hash = BlobId::from_canonical_content(&other_data).to_hex();
+        let state_view_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
             path_index_from_rows(vec![
@@ -8158,12 +9905,9 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(RecordingHotStateReader {
-                rows: Vec::new(),
-                scan_requests: Arc::clone(&hot_state_requests),
-            }),
+            FileStateView::test_recording(Vec::new(), Arc::clone(&state_view_requests)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -8212,21 +9956,207 @@ mod tests {
             BTreeSet::from(["/docs/other.md".to_string(), "/docs/readme.md".to_string()])
         );
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
-        let requests = hot_state_requests
+        let requests = state_view_requests
             .lock()
-            .expect("live-state request mutex should not be poisoned");
+            .expect("native-state request mutex should not be poisoned");
         assert!(requests.is_empty());
+    }
+
+    fn duplicate_blob_owner_rows() -> (Vec<FilesystemStateRow>, Vec<u8>, Vec<u8>) {
+        let first_id = "01920000-0000-7000-8000-0000000000a1";
+        let second_id = "01920000-0000-7000-8000-0000000000b2";
+        let branch_id = "01920000-0000-7000-8000-0000000000b1";
+        let first = b"owner-a".to_vec();
+        let second = b"owner-b".to_vec();
+        let claimed_blob_id = BlobId::from_canonical_content(&first).to_hex();
+        (
+            vec![
+                live_file_row(
+                    first_id,
+                    branch_id,
+                    &format!(r#"{{"id":"{first_id}","directory_id":null,"name":"a.txt"}}"#),
+                ),
+                live_blob_ref_row(first_id, branch_id, first_id, &claimed_blob_id, first.len()),
+                live_file_row(
+                    second_id,
+                    branch_id,
+                    &format!(r#"{{"id":"{second_id}","directory_id":null,"name":"b.txt"}}"#),
+                ),
+                live_blob_ref_row(
+                    second_id,
+                    branch_id,
+                    second_id,
+                    &claimed_blob_id,
+                    second.len(),
+                ),
+            ],
+            first,
+            second,
+        )
+    }
+
+    fn exact_state_key_blob_reader(
+        prepared: &super::PreparedLixFileRows,
+        first: &[u8],
+        second: &[u8],
+    ) -> (ExactStateKeyBlobReader, Arc<Mutex<Vec<Vec<StateKey>>>>) {
+        let bytes_by_key = prepared
+            .blob_rows
+            .values()
+            .map(|row| {
+                let bytes = match row.state_key.file_id.as_deref() {
+                    Some("01920000-0000-7000-8000-0000000000a1") => first.to_vec(),
+                    Some("01920000-0000-7000-8000-0000000000b2") => second.to_vec(),
+                    other => panic!("unexpected duplicate-owner state key: {other:?}"),
+                };
+                (row.state_key.clone(), bytes)
+            })
+            .collect();
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        (
+            ExactStateKeyBlobReader {
+                bytes_by_key,
+                requested: Arc::clone(&requested),
+            },
+            requested,
+        )
+    }
+
+    #[tokio::test]
+    async fn exact_point_blob_projection_binds_same_blob_id_to_selected_state_key() {
+        let (rows, first, second) = duplicate_blob_owner_rows();
+        let prepared = super::prepare_lix_file_rows(
+            rows,
+            &super::FilePathPredicate::Comparison {
+                operation: super::FilePathComparison::Equal,
+                value: "/a.txt".to_string(),
+            },
+        )
+        .expect("point row should prepare");
+        let (reader, requested) = exact_state_key_blob_reader(&prepared, &first, &second);
+        let base_schema = super::lix_file_schema();
+        let content = base_schema
+            .field_with_name("content")
+            .expect("content column should exist")
+            .clone();
+        let schema = Arc::new(Schema::new(vec![content]));
+        let batch = super::lix_file_record_batch_from_prepared_authenticated(
+            &schema, &reader, None, true, prepared,
+        )
+        .await
+        .expect("point content should load through authenticated state key");
+        let content = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("point content should be large binary");
+        assert_eq!(content.value(0), first.as_slice());
+        assert_eq!(
+            requested
+                .lock()
+                .expect("authenticated blob requests should not be poisoned")
+                .as_slice(),
+            &[vec![StateKey {
+                schema_key: super::BLOB_REF_SCHEMA_KEY.to_string(),
+                file_id: Some("01920000-0000-7000-8000-0000000000a1".to_string()),
+                entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(
+                    "01920000-0000-7000-8000-0000000000a1",
+                )
+                .expect("point entity key"),
+            }]]
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_id_manifest_blob_projection_binds_duplicate_blob_ids_per_state_key() {
+        let (rows, first, second) = duplicate_blob_owner_rows();
+        let prepared = super::prepare_lix_file_rows(rows, &super::FilePathPredicate::All)
+            .expect("manifest rows should prepare");
+        let (reader, requested) = exact_state_key_blob_reader(&prepared, &first, &second);
+        let base_schema = super::lix_file_schema();
+        let schema = Arc::new(Schema::new(
+            ["id", "path", "content", "lixcol_metadata"]
+                .into_iter()
+                .map(|name| {
+                    base_schema
+                        .field_with_name(name)
+                        .expect("manifest column should exist")
+                        .clone()
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let batch = super::lix_file_record_batch_from_prepared_authenticated(
+            &schema, &reader, None, true, prepared,
+        )
+        .await
+        .expect("manifest content should load through authenticated state keys");
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("manifest ids should be strings");
+        let content = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("manifest content should be large binary");
+        assert_eq!(ids.value(0), "01920000-0000-7000-8000-0000000000a1");
+        assert_eq!(ids.value(1), "01920000-0000-7000-8000-0000000000b2");
+        assert_eq!(content.value(0), first.as_slice());
+        assert_eq!(content.value(1), second.as_slice());
+        let requested = requested
+            .lock()
+            .expect("authenticated blob requests should not be poisoned");
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].len(), 2);
+        assert_eq!(
+            requested[0]
+                .iter()
+                .map(|key| key.file_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("01920000-0000-7000-8000-0000000000a1"),
+                Some("01920000-0000-7000-8000-0000000000b2"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_lix_file_projection_uses_the_same_authenticated_state_key_reader() {
+        let (rows, first, second) = duplicate_blob_owner_rows();
+        let prepared = super::prepare_lix_file_rows(rows, &super::FilePathPredicate::All)
+            .expect("generic rows should prepare");
+        let (reader, requested) = exact_state_key_blob_reader(&prepared, &first, &second);
+        let base_schema = super::lix_file_schema();
+        let schema = Arc::new(Schema::new(vec![
+            base_schema
+                .field_with_name("content")
+                .expect("content column should exist")
+                .clone(),
+        ]));
+        let payload_reader = super::LixFilePayloadReader::Authenticated(Arc::new(reader));
+        let batch = payload_reader
+            .record_batch(&schema, None, true, prepared)
+            .await
+            .expect("generic content should use the authenticated reader");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            requested
+                .lock()
+                .expect("authenticated blob requests should not be poisoned")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn exact_blob_batch_requires_resolved_branch_ids_without_scanning() {
         let scan_count = Arc::new(AtomicUsize::new(0));
-        let hot_state: Arc<dyn HotStateReader> = Arc::new(RejectingHotStateReader {
-            scan_count: Arc::clone(&scan_count),
-        });
+        let state_view: Arc<FileStateView<TestRead>> =
+            Arc::new(FileStateView::test_rejecting(Arc::clone(&scan_count)));
         let error = super::scan_exact_file_blob_batch(
-            hot_state,
-            &HotStateScanRequest::default(),
+            state_view,
+            &FileQueryPlan::default(),
             &BTreeSet::from(["01920000-0000-7000-8000-0000000000a2".to_string()]),
         )
         .await
@@ -8278,7 +10208,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000122",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000122",
-            &BlobId::from_content(&tracked_data).to_hex(),
+            &BlobId::from_canonical_content(&tracked_data).to_hex(),
             tracked_data.len(),
         );
         tracked_blob.change_id = Some(ChangeId::for_test_label("tracked-blob"));
@@ -8287,7 +10217,7 @@ mod tests {
             // Path-index rows are already projected into the requested branch.
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000112",
-            &BlobId::from_content(&global_data).to_hex(),
+            &BlobId::from_canonical_content(&global_data).to_hex(),
             global_data.len(),
         );
         global_blob.global = true;
@@ -8296,18 +10226,18 @@ mod tests {
             "01920000-0000-7000-8000-000000000132",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000132",
-            &BlobId::from_content(&untracked_data).to_hex(),
+            &BlobId::from_canonical_content(&untracked_data).to_hex(),
             untracked_data.len(),
         );
         untracked_blob.untracked = true;
         untracked_blob.change_id = Some(ChangeId::for_test_label("untracked-blob"));
-        // A malformed `(row=01920000-0000-7000-8000-000000000122, file=different-file-id)` row must
+        // A malformed `(entity=01920000-0000-7000-8000-000000000122, file=different-file-id)` row must
         // never be fetched for the exact descriptor identity.
         let mut misplaced_blob = live_blob_ref_row(
             "01920000-0000-7000-8000-000000000122",
             "01920000-0000-7000-8000-0000000000b1",
             "different-file-id",
-            &BlobId::from_content(&misplaced_data).to_hex(),
+            &BlobId::from_canonical_content(&misplaced_data).to_hex(),
             misplaced_data.len(),
         );
         misplaced_blob.change_id = Some(ChangeId::for_test_label("misplaced-blob"));
@@ -8321,11 +10251,11 @@ mod tests {
             Arc::new(path_index_from_rows(index_rows).expect("filesystem path index should build"));
         let matches =
             super::indexed_file_matches(Arc::clone(&index), &super::FilePathPredicate::All);
-        let hot_state_requests = Arc::new(Mutex::new(Vec::new()));
-        let _hot_state: Arc<dyn HotStateReader> = Arc::new(RecordingHotStateReader {
-            rows: Vec::new(),
-            scan_requests: Arc::clone(&hot_state_requests),
-        });
+        let state_view_requests = Arc::new(Mutex::new(Vec::new()));
+        let _state_view: Arc<FileStateView<TestRead>> = Arc::new(FileStateView::test_recording(
+            Vec::new(),
+            Arc::clone(&state_view_requests),
+        ));
         let base_schema = super::lix_file_schema();
         let projection = vec![
             base_schema.index_of("path").expect("path column"),
@@ -8399,19 +10329,19 @@ mod tests {
             Some(&ChangeId::for_test_label("misplaced-blob").to_string()),
             "the exact live-state tuple must reject a mismatched file-id"
         );
-        let requests = hot_state_requests
+        let requests = state_view_requests
             .lock()
-            .expect("live-state request mutex should not be poisoned");
+            .expect("native-state request mutex should not be poisoned");
         assert!(requests.is_empty());
     }
 
     #[tokio::test]
     async fn file_root_directory_scan_uses_indexed_descriptors_and_root_blob_rows() {
         let root_data = b"root contents".to_vec();
-        let root_blob_hash = BlobId::from_content(&root_data).to_hex();
+        let root_blob_hash = BlobId::from_canonical_content(&root_data).to_hex();
         let nested_data = b"nested contents".to_vec();
-        let nested_blob_hash = BlobId::from_content(&nested_data).to_hex();
-        let hot_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let nested_blob_hash = BlobId::from_canonical_content(&nested_data).to_hex();
+        let state_view_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
             path_index_from_rows(vec![
@@ -8447,12 +10377,9 @@ mod tests {
             ])
             .expect("filesystem path index should build"),
         );
-        let spec = LixFileSpec::active_branch(
+        let spec = LixFileSpec::active_branch_test(
             "01920000-0000-7000-8000-0000000000b1",
-            Arc::new(RecordingHotStateReader {
-                rows: Vec::new(),
-                scan_requests: Arc::clone(&hot_state_requests),
-            }),
+            FileStateView::test_recording(Vec::new(), Arc::clone(&state_view_requests)),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -8499,9 +10426,9 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(paths.value(0), "/root.md");
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
-        let requests = hot_state_requests
+        let requests = state_view_requests
             .lock()
-            .expect("live-state request mutex should not be poisoned");
+            .expect("native-state request mutex should not be poisoned");
         assert!(requests.is_empty());
     }
 
@@ -8606,21 +10533,51 @@ mod tests {
         )
     }
 
-    #[derive(Default)]
     struct CapturingWriteContext {
-        rows: Vec<MaterializedHotStateRow>,
+        state_view: TransactionStateView<TestRead>,
+        rows: Vec<FilesystemStateRow>,
         blob_bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
         writes: Vec<TransactionWrite>,
         scan_count: usize,
         path_index_count: usize,
-        exact_load_requests: Vec<HotStateExactBatchRequest>,
+        exact_load_requests: Vec<FileExactBatchPlan>,
+    }
+
+    impl Default for CapturingWriteContext {
+        fn default() -> Self {
+            Self {
+                state_view: test_transaction_state_view(),
+                rows: Vec::new(),
+                blob_bytes_by_hash: BTreeMap::new(),
+                writes: Vec::new(),
+                scan_count: 0,
+                path_index_count: 0,
+                exact_load_requests: Vec::new(),
+            }
+        }
+    }
+
+    impl CapturingWriteContext {
+        fn with_rows(rows: Vec<FilesystemStateRow>) -> Self {
+            let state_view = test_transaction_state_view_for_branch(
+                "01920000-0000-7000-8000-0000000000b1",
+                &rows,
+            );
+            Self {
+                state_view,
+                rows,
+                ..Self::default()
+            }
+        }
     }
 
     struct IndexedFileContentUpdateWriteContext {
+        state_view: TransactionStateView<TestRead>,
         index: Arc<FilesystemPathIndex>,
-        blob_rows: Vec<MaterializedHotStateRow>,
+        blob_rows: Vec<FilesystemStateRow>,
         writes: Vec<TransactionWrite>,
-        scan_requests: Arc<Mutex<Vec<HotStateScanRequest>>>,
+        scan_requests: Arc<Mutex<Vec<FileQueryPlan>>>,
+        exact_load_requests: Arc<Mutex<Vec<FileExactBatchPlan>>>,
         path_index_requests: Arc<AtomicUsize>,
     }
 
@@ -8633,12 +10590,89 @@ mod tests {
         bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
     }
 
+    struct ExactStateKeyBlobReader {
+        bytes_by_key: BTreeMap<StateKey, Vec<u8>>,
+        requested: Arc<Mutex<Vec<Vec<StateKey>>>>,
+    }
+
+    /// Test-only authenticated owner for native write-context fixtures.
+    ///
+    /// The fixture mirrors the production contract: a payload request is
+    /// authorized by the exact BlobRef StateKey first, and the semantic
+    /// BlobId is only used to validate the fixture's in-memory bytes. It does
+    /// not provide a hash-only or fallback read path.
+    struct FixtureAuthenticatedBlobReader {
+        blob_ids_by_key: BTreeMap<StateKey, BlobId>,
+        bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
+    }
+
+    impl FixtureAuthenticatedBlobReader {
+        fn from_rows(
+            rows: &[FilesystemStateRow],
+            bytes_by_hash: &BTreeMap<BlobId, Vec<u8>>,
+        ) -> Result<Self, LixError> {
+            let mut blob_ids_by_key = BTreeMap::new();
+            for row in rows {
+                if row.schema_key != super::BLOB_REF_SCHEMA_KEY || row.deleted {
+                    continue;
+                }
+                let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+                    continue;
+                };
+                let snapshot: super::BlobRefSnapshot = serde_json::from_str(snapshot_content)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!("invalid fixture BlobRef snapshot: {error}"),
+                        )
+                    })?;
+                let blob_id = BlobId::from_hex(&snapshot.blob_hash)?;
+                let state_key = StateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                };
+                if let Some(previous) = blob_ids_by_key.insert(state_key, blob_id)
+                    && previous != blob_id
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "fixture contains conflicting BlobRef owners for one StateKey",
+                    ));
+                }
+            }
+            Ok(Self {
+                blob_ids_by_key,
+                bytes_by_hash: bytes_by_hash.clone(),
+            })
+        }
+
+        fn bytes_for_key(&self, key: &StateKey) -> Result<Option<Vec<u8>>, LixError> {
+            let Some(blob_id) = self.blob_ids_by_key.get(key) else {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "fixture BlobRef owner is absent for the requested StateKey",
+                ));
+            };
+            let Some(bytes) = self.bytes_by_hash.get(blob_id) else {
+                return Ok(None);
+            };
+            if !bytes.is_empty() && BlobId::from_canonical_content(bytes) != *blob_id {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "fixture BlobRef bytes do not match the authenticated BlobId",
+                ));
+            }
+            Ok(Some(bytes.clone()))
+        }
+    }
+
     impl StaticBlobReader {
         fn from_blobs(blobs: impl IntoIterator<Item = Vec<u8>>) -> Self {
             Self {
                 bytes_by_hash: blobs
                     .into_iter()
-                    .map(|bytes| (BlobId::from_content(&bytes), bytes))
+                    .map(|bytes| (BlobId::from_canonical_content(&bytes), bytes))
                     .collect(),
             }
         }
@@ -8657,6 +10691,83 @@ mod tests {
     }
 
     #[async_trait]
+    impl AuthenticatedBlobReader for FixtureAuthenticatedBlobReader {
+        async fn load_bytes_for_rows(&self, rows: &[StateKey]) -> Result<BlobBytesBatch, LixError> {
+            Ok(BlobBytesBatch::new(
+                rows.iter()
+                    .map(|key| self.bytes_for_key(key))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+
+        async fn load_ranges_for_rows(
+            &self,
+            requests: &[(StateKey, std::ops::Range<u64>)],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            let mut entries = Vec::with_capacity(requests.len());
+            for (key, range) in requests {
+                let Some(bytes) = self.bytes_for_key(key)? else {
+                    entries.push(None);
+                    continue;
+                };
+                let start = usize::try_from(range.start).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "fixture BlobRef range start overflows usize",
+                    )
+                })?;
+                let end = usize::try_from(range.end).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "fixture BlobRef range end overflows usize",
+                    )
+                })?;
+                if start > end || end > bytes.len() {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "fixture BlobRef range is outside the authenticated payload",
+                    ));
+                }
+                entries.push(Some(BlobRangeBytes {
+                    bytes: bytes[start..end].to_vec().into(),
+                    total_size: bytes.len() as u64,
+                    range: range.clone(),
+                }));
+            }
+            Ok(BlobRangeBytesBatch::new(entries))
+        }
+
+        async fn load_bytes_for_scoped_rows(
+            &self,
+            rows: &[crate::forktree::AuthenticatedBlobStateKey],
+        ) -> Result<BlobBytesBatch, LixError> {
+            self.load_bytes_for_rows(
+                &rows
+                    .iter()
+                    .map(|row| row.state_key.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        }
+
+        async fn load_ranges_for_scoped_rows(
+            &self,
+            requests: &[(
+                crate::forktree::AuthenticatedBlobStateKey,
+                std::ops::Range<u64>,
+            )],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            self.load_ranges_for_rows(
+                &requests
+                    .iter()
+                    .map(|(row, range)| (row.state_key.clone(), range.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        }
+    }
+
+    #[async_trait]
     impl BlobDataReader for StaticBlobReader {
         async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
             Ok(BlobBytesBatch::new(
@@ -8665,6 +10776,52 @@ mod tests {
                     .map(|hash| self.bytes_by_hash.get(hash).cloned())
                     .collect(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl AuthenticatedBlobReader for StaticBlobReader {
+        async fn load_bytes_for_rows(&self, rows: &[StateKey]) -> Result<BlobBytesBatch, LixError> {
+            let bytes = self.bytes_by_hash.values().next().cloned();
+            Ok(BlobBytesBatch::new(
+                rows.iter().map(|_| bytes.clone()).collect(),
+            ))
+        }
+
+        async fn load_ranges_for_rows(
+            &self,
+            _requests: &[(StateKey, std::ops::Range<u64>)],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            Ok(BlobRangeBytesBatch::new(Vec::new()))
+        }
+
+        async fn load_bytes_for_scoped_rows(
+            &self,
+            rows: &[crate::forktree::AuthenticatedBlobStateKey],
+        ) -> Result<BlobBytesBatch, LixError> {
+            self.load_bytes_for_rows(
+                &rows
+                    .iter()
+                    .map(|row| row.state_key.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        }
+
+        async fn load_ranges_for_scoped_rows(
+            &self,
+            requests: &[(
+                crate::forktree::AuthenticatedBlobStateKey,
+                std::ops::Range<u64>,
+            )],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            self.load_ranges_for_rows(
+                &requests
+                    .iter()
+                    .map(|(row, range)| (row.state_key.clone(), range.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .await
         }
     }
 
@@ -8682,7 +10839,81 @@ mod tests {
     }
 
     #[async_trait]
+    impl AuthenticatedBlobReader for ExactStateKeyBlobReader {
+        async fn load_bytes_for_rows(&self, rows: &[StateKey]) -> Result<BlobBytesBatch, LixError> {
+            self.requested
+                .lock()
+                .expect("authenticated blob requests should not be poisoned")
+                .push(rows.to_vec());
+            Ok(BlobBytesBatch::new(
+                rows.iter()
+                    .map(|key| self.bytes_by_key.get(key).cloned())
+                    .collect(),
+            ))
+        }
+
+        async fn load_ranges_for_rows(
+            &self,
+            _requests: &[(StateKey, std::ops::Range<u64>)],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            Ok(BlobRangeBytesBatch::new(Vec::new()))
+        }
+
+        async fn load_bytes_for_scoped_rows(
+            &self,
+            rows: &[crate::forktree::AuthenticatedBlobStateKey],
+        ) -> Result<BlobBytesBatch, LixError> {
+            self.load_bytes_for_rows(
+                &rows
+                    .iter()
+                    .map(|row| row.state_key.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        }
+
+        async fn load_ranges_for_scoped_rows(
+            &self,
+            requests: &[(
+                crate::forktree::AuthenticatedBlobStateKey,
+                std::ops::Range<u64>,
+            )],
+        ) -> Result<BlobRangeBytesBatch, LixError> {
+            self.load_ranges_for_rows(
+                &requests
+                    .iter()
+                    .map(|(row, range)| (row.state_key.clone(), range.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        }
+    }
+
+    #[async_trait]
     impl SqlWriteExecutionContext for CapturingWriteContext {
+        type ReadStore = TestRead;
+
+        fn state_view(&self) -> &TransactionStateView<Self::ReadStore> {
+            &self.state_view
+        }
+
+        fn authenticated_blob_reader(
+            &self,
+        ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+            Ok(Arc::new(FixtureAuthenticatedBlobReader::from_rows(
+                &self.rows,
+                &self.blob_bytes_by_hash,
+            )?))
+        }
+
+        fn record_file_exact_batch(&mut self, request: &FileExactBatchPlan) {
+            self.exact_load_requests.push(request.clone());
+        }
+
+        fn record_file_scan(&mut self) {
+            self.scan_count += 1;
+        }
+
         fn active_branch_id(&self) -> &str {
             "01920000-0000-7000-8000-0000000000b1"
         }
@@ -8693,63 +10924,6 @@ mod tests {
 
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(Vec::new().into())
-        }
-
-        async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            BlobDataReader::load_bytes_many(self, hashes).await
-        }
-
-        async fn scan_hot_state_batch(
-            &mut self,
-            _request: &HotStateScanRequest,
-        ) -> Result<MaterializedHotStateBatch, LixError> {
-            self.scan_count += 1;
-            Ok(MaterializedHotStateBatch::from_rows(self.rows.clone()))
-        }
-
-        async fn load_exact_hot_state_batch(
-            &mut self,
-            request: &HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            self.exact_load_requests.push(request.clone());
-            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
-                request
-                    .rows
-                    .iter()
-                    .map(|requested| {
-                        let matches = |row: &&MaterializedHotStateRow| {
-                            row.schema_key == requested.schema_key
-                                && row.row_pk == requested.row_pk
-                                && row.file_id == requested.file_id
-                                && request
-                                    .untracked
-                                    .is_none_or(|untracked| row.untracked == untracked)
-                        };
-                        let mut row =
-                            self.rows
-                                .iter()
-                                .filter(matches)
-                                .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
-                                .or_else(|| {
-                                    self.rows.iter().filter(matches).find(|row| {
-                                        row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
-                                    })
-                                })?
-                                .clone();
-                        if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
-                            && requested.branch_id != crate::GLOBAL_BRANCH_ID
-                        {
-                            row.branch_id = requested.branch_id.clone().into();
-                            row.global = true;
-                        }
-                        if row.deleted && !request.include_tombstones {
-                            None
-                        } else {
-                            Some(row)
-                        }
-                    })
-                    .collect(),
-            ))
         }
 
         async fn filesystem_path_index(
@@ -8782,7 +10956,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            _rows: crate::transaction_types::TypedMutationJournalBatch,
+            _rows: crate::transaction::types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
@@ -8802,6 +10976,35 @@ mod tests {
 
     #[async_trait]
     impl SqlWriteExecutionContext for IndexedFileContentUpdateWriteContext {
+        type ReadStore = TestRead;
+
+        fn state_view(&self) -> &TransactionStateView<Self::ReadStore> {
+            &self.state_view
+        }
+
+        fn authenticated_blob_reader(
+            &self,
+        ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+            Ok(Arc::new(FixtureAuthenticatedBlobReader::from_rows(
+                &self.blob_rows,
+                &BTreeMap::new(),
+            )?))
+        }
+
+        fn record_file_exact_batch(&mut self, request: &FileExactBatchPlan) {
+            self.exact_load_requests
+                .lock()
+                .expect("exact request mutex should not be poisoned")
+                .push(request.clone());
+        }
+
+        fn record_file_scan(&mut self) {
+            self.scan_requests
+                .lock()
+                .expect("scan request mutex should not be poisoned")
+                .push(FileQueryPlan::default());
+        }
+
         fn active_branch_id(&self) -> &str {
             "01920000-0000-7000-8000-0000000000b1"
         }
@@ -8812,44 +11015,6 @@ mod tests {
 
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(Vec::new().into())
-        }
-
-        async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            Ok(BlobBytesBatch::new(vec![None; hashes.len()]))
-        }
-
-        async fn scan_hot_state_batch(
-            &mut self,
-            request: &HotStateScanRequest,
-        ) -> Result<MaterializedHotStateBatch, LixError> {
-            self.scan_requests
-                .lock()
-                .expect("scan request mutex should not be poisoned")
-                .push(request.clone());
-            Ok(MaterializedHotStateBatch::from_rows(self.blob_rows.clone()))
-        }
-
-        async fn load_exact_hot_state_batch(
-            &mut self,
-            request: &HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
-                request
-                    .rows
-                    .iter()
-                    .map(|requested| {
-                        self.blob_rows
-                            .iter()
-                            .find(|row| {
-                                row.schema_key == requested.schema_key
-                                    && row.row_pk == requested.row_pk
-                                    && row.file_id == requested.file_id
-                                    && row.branch_id.as_ref() == requested.branch_id.as_str()
-                            })
-                            .cloned()
-                    })
-                    .collect(),
-            ))
         }
 
         async fn filesystem_path_index(
@@ -8887,7 +11052,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            _rows: crate::transaction_types::TypedMutationJournalBatch,
+            _rows: crate::transaction::types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
@@ -8902,146 +11067,6 @@ mod tests {
             _ordered_identity_digest: [u8; 32],
         ) -> Result<bool, LixError> {
             Ok(false)
-        }
-    }
-
-    #[derive(Default)]
-    struct RowsHotStateReader {
-        rows: Vec<MaterializedHotStateRow>,
-    }
-
-    struct RejectingHotStateReader {
-        scan_count: Arc<AtomicUsize>,
-    }
-
-    struct RecordingHotStateReader {
-        rows: Vec<MaterializedHotStateRow>,
-        scan_requests: Arc<Mutex<Vec<HotStateScanRequest>>>,
-    }
-
-    #[async_trait]
-    impl HotStateReader for RecordingHotStateReader {
-        async fn scan_batch(
-            &self,
-            request: &HotStateScanRequest,
-        ) -> Result<MaterializedHotStateBatch, LixError> {
-            self.scan_requests
-                .lock()
-                .expect("live-state request mutex should not be poisoned")
-                .push(request.clone());
-            Ok(self.rows.clone().into())
-        }
-
-        async fn load_exact_batch(
-            &self,
-            request: &HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            let mut recorded = HotStateScanRequest {
-                filter: HotStateFilter {
-                    branch_ids: request
-                        .rows
-                        .iter()
-                        .map(|row| row.branch_id.clone())
-                        .collect(),
-                    schema_keys: request
-                        .rows
-                        .iter()
-                        .map(|row| row.schema_key.clone())
-                        .collect(),
-                    row_pks: request
-                        .rows
-                        .iter()
-                        .map(|row| row.row_pk.clone())
-                        .collect(),
-                    file_ids: request
-                        .rows
-                        .iter()
-                        .map(|row| match &row.file_id {
-                            Some(file_id) => NullableKeyFilter::Value(file_id.clone()),
-                            None => NullableKeyFilter::Null,
-                        })
-                        .collect(),
-                    untracked: request.untracked,
-                    include_tombstones: request.include_tombstones,
-                    ..HotStateFilter::default()
-                },
-                projection: request.projection.clone(),
-                limit: None,
-            };
-            recorded.filter.branch_ids.sort();
-            recorded.filter.branch_ids.dedup();
-            recorded.filter.schema_keys.sort();
-            recorded.filter.schema_keys.dedup();
-            recorded.filter.row_pks.sort();
-            recorded.filter.row_pks.dedup();
-            recorded
-                .filter
-                .file_ids
-                .sort_by_key(|file_id| format!("{file_id:?}"));
-            recorded.filter.file_ids.dedup();
-            self.scan_requests
-                .lock()
-                .expect("live-state request mutex should not be poisoned")
-                .push(recorded);
-
-            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
-                request
-                    .rows
-                    .iter()
-                    .map(|requested| {
-                        let exact_match = |row: &&MaterializedHotStateRow| {
-                            row.schema_key == requested.schema_key
-                                && row.row_pk == requested.row_pk
-                                && row.file_id == requested.file_id
-                                && request
-                                    .untracked
-                                    .is_none_or(|untracked| row.untracked == untracked)
-                        };
-                        let mut row =
-                            self.rows
-                                .iter()
-                                .filter(exact_match)
-                                .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
-                                .or_else(|| {
-                                    self.rows.iter().filter(exact_match).find(|row| {
-                                        row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
-                                    })
-                                })?
-                                .clone();
-                        if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
-                            && requested.branch_id != crate::GLOBAL_BRANCH_ID
-                        {
-                            row.branch_id = requested.branch_id.clone().into();
-                            row.global = true;
-                        }
-                        if row.deleted && !request.include_tombstones {
-                            None
-                        } else {
-                            Some(row)
-                        }
-                    })
-                    .collect(),
-            ))
-        }
-    }
-
-    #[async_trait]
-    impl HotStateReader for RejectingHotStateReader {
-        async fn load_exact_batch(
-            &self,
-            request: &HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
-        }
-
-        async fn scan_batch(
-            &self,
-            _request: &HotStateScanRequest,
-        ) -> Result<MaterializedHotStateBatch, LixError> {
-            self.scan_count.fetch_add(1, Ordering::SeqCst);
-            Err(LixError::unknown(
-                "descriptor-only scan should not read live state",
-            ))
         }
     }
 
@@ -9077,30 +11102,13 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl HotStateReader for RowsHotStateReader {
-        async fn load_exact_batch(
-            &self,
-            request: &HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
-        }
-
-        async fn scan_batch(
-            &self,
-            _request: &HotStateScanRequest,
-        ) -> Result<MaterializedHotStateBatch, LixError> {
-            Ok(self.rows.clone().into())
-        }
-    }
-
     fn live_directory_row(
-        row_pk: &str,
+        entity_pk: &str,
         branch_id: &str,
         snapshot_content: &str,
-    ) -> MaterializedHotStateRow {
-        MaterializedHotStateRow {
-            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
+    ) -> FilesystemStateRow {
+        FilesystemStateRow {
+            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
                 .expect("fixture directory ID should be a UUID"),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
@@ -9108,8 +11116,8 @@ mod tests {
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -9118,26 +11126,26 @@ mod tests {
     }
 
     fn live_file_row(
-        row_pk: &str,
+        entity_pk: &str,
         branch_id: &str,
         snapshot_content: &str,
-    ) -> MaterializedHotStateRow {
-        let typed_row_pk = if matches!(row_pk, PLUGIN_REGISTRY_KEY | PLUGIN_OWNER_KEY) {
-            crate::row_pk::RowPk::single(row_pk)
+    ) -> FilesystemStateRow {
+        let typed_entity_pk = if matches!(entity_pk, PLUGIN_REGISTRY_KEY | PLUGIN_OWNER_KEY) {
+            crate::entity_pk::EntityPk::single(entity_pk)
         } else {
-            crate::row_pk::RowPk::uuid_from_canonical(row_pk)
+            crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
                 .expect("fixture file ID should be a UUID")
         };
-        MaterializedHotStateRow {
-            row_pk: typed_row_pk,
+        FilesystemStateRow {
+            entity_pk: typed_entity_pk,
             schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-            file_id: Some(row_pk.to_string()),
+            file_id: Some(entity_pk.to_string()),
             snapshot_content: Some(snapshot_content.into()),
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -9146,14 +11154,14 @@ mod tests {
     }
 
     fn live_blob_ref_row(
-        row_pk: &str,
+        entity_pk: &str,
         branch_id: &str,
         file_id: &str,
         blob_hash: &str,
         size_bytes: usize,
-    ) -> MaterializedHotStateRow {
+    ) -> FilesystemStateRow {
         let mut row = live_file_row(
-            row_pk,
+            entity_pk,
             branch_id,
             &format!(r#"{{"id":"{file_id}","blob_hash":"{blob_hash}","size_bytes":{size_bytes}}}"#),
         );
@@ -9162,7 +11170,7 @@ mod tests {
         row
     }
 
-    fn file_dml_rows() -> Vec<MaterializedHotStateRow> {
+    fn file_dml_rows() -> Vec<FilesystemStateRow> {
         vec![
             live_file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -9179,13 +11187,14 @@ mod tests {
         ]
     }
 
-    fn file_dml_spec(write_ctx: SqlWriteContext) -> LixFileSpec {
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
+    fn file_dml_spec(write_ctx: SqlWriteContext<TestRead>) -> LixFileSpec<TestRead> {
+        let branch_ref = Arc::new(write_ctx.clone());
         LixFileSpec::active_branch_with_write(
             write_ctx,
             branch_ref,
             super::SqlWriteSessionOptions::default(),
         )
+        .expect("test write context must expose an authenticated blob reader")
     }
 
     fn literal_assignment(
@@ -9237,8 +11246,9 @@ mod tests {
             manifest_json,
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
-            archive_blob_hash: BlobId::from_content(format!("archive-{key}").as_bytes()).to_hex(),
-            wasm_blob_hash: BlobId::from_content(wasm).to_hex(),
+            archive_blob_hash: BlobId::from_canonical_content(format!("archive-{key}").as_bytes())
+                .to_hex(),
+            wasm_blob_hash: BlobId::from_canonical_content(wasm).to_hex(),
         })
         .expect("test plugin registry entry should be valid")
     }
@@ -9246,7 +11256,7 @@ mod tests {
     fn live_plugin_registry_row(
         branch_id: &str,
         entries: Vec<PluginRegistryEntry>,
-    ) -> MaterializedHotStateRow {
+    ) -> FilesystemStateRow {
         let registry = PluginRegistry::new(entries).expect("test plugin registry should be valid");
         let mut row = live_file_row(
             PLUGIN_REGISTRY_KEY,
@@ -9266,7 +11276,7 @@ mod tests {
         file_id: &str,
         plugin_key: &str,
         schema_keys: Vec<String>,
-    ) -> MaterializedHotStateRow {
+    ) -> FilesystemStateRow {
         let owner = PluginFileOwner::new(file_id, plugin_key, schema_keys)
             .expect("test plugin owner should be valid");
         let mut row = live_file_row(
@@ -9294,13 +11304,15 @@ mod tests {
         );
         let schema_json = format!(
             r#"{{
-                "$schema": "https://lix.dev/schema-v1.json",
-                "key": "{schema_key}",
-                "columns": [
-                    {{ "name": "id", "type": "text", "nullable": false }},
-                    {{ "name": "value", "type": "text", "nullable": false }}
-                ],
-                "primary_key": ["id"]
+                "x-lix-key": "{schema_key}",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {{
+                    "id": {{ "type": "string" }},
+                    "value": {{ "type": "string" }}
+                }},
+                "required": ["id", "value"],
+                "additionalProperties": false
             }}"#
         );
 
@@ -9640,14 +11652,13 @@ mod tests {
         let branch_id = "01920000-0000-7000-8000-0000000000b1";
         let created_at = LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z");
         let updated_at = LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z");
-        let mut builder =
-            MaterializedHotStateBatchBuilder::with_capacity(FILE_COUNT.saturating_mul(2));
+        let mut builder = FilesystemRowsBuilder::with_capacity(FILE_COUNT.saturating_mul(2));
 
         for index in 0..FILE_COUNT {
             let file_id = format!("01920000-0000-7000-8000-{index:012x}");
-            let row_pk = uuid_pk(&file_id);
+            let entity_pk = uuid_pk(&file_id);
             builder.push_materialized_ref(
-                &row_pk,
+                &entity_pk,
                 super::FILE_DESCRIPTOR_SCHEMA_KEY,
                 None,
                 Some(
@@ -9667,7 +11678,7 @@ mod tests {
                 branch_id,
             );
             builder.push_materialized_ref(
-                &row_pk,
+                &entity_pk,
                 super::BLOB_REF_SCHEMA_KEY,
                 Some(&file_id),
                 Some(
@@ -9687,7 +11698,7 @@ mod tests {
         }
 
         let batch = builder.finish();
-        let row_column = batch.row_column_ptr();
+        let entity_column = batch.entity_column_ptr();
         let prepared = super::prepare_lix_file_rows(batch, &super::FilePathPredicate::All)
             .expect("bulk descriptor/blob batch should prepare");
 
@@ -9695,8 +11706,8 @@ mod tests {
         assert_eq!(prepared.blob_rows.len(), FILE_COUNT);
         assert_eq!(prepared.live_rows.batches.len(), 1);
         assert_eq!(
-            prepared.live_rows.batch(0).row_column_ptr(),
-            row_column,
+            prepared.live_rows.batch(0).entity_column_ptr(),
+            entity_column,
             "preparation should retain the source batch instead of rebuilding row DTOs"
         );
         assert!(
@@ -9718,7 +11729,7 @@ mod tests {
         let file_id = "01920000-0000-7000-8000-0000000000e2";
         let branch_id = "01920000-0000-7000-8000-0000000000b1";
         let data = b"indexed contents";
-        let blob_hash = BlobId::from_content(data);
+        let blob_hash = BlobId::from_canonical_content(data);
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_file_row(
@@ -9774,8 +11785,8 @@ mod tests {
     async fn file_path_predicate_filters_before_blob_and_plugin_hydration() {
         let selected_data = b"selected".to_vec();
         let other_data = b"other".to_vec();
-        let selected_hash = BlobId::from_content(&selected_data);
-        let other_hash = BlobId::from_content(&other_data);
+        let selected_hash = BlobId::from_canonical_content(&selected_data);
+        let other_hash = BlobId::from_canonical_content(&other_data);
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-0000000000e2",
@@ -9844,7 +11855,7 @@ mod tests {
     #[test]
     fn file_path_predicate_only_discovers_plugins_for_selected_blobless_files() {
         let blob_data = b"stored".to_vec();
-        let blob_hash = BlobId::from_content(&blob_data);
+        let blob_hash = BlobId::from_canonical_content(&blob_data);
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-000000000512",
@@ -9913,7 +11924,7 @@ mod tests {
     #[tokio::test]
     async fn file_projection_matches_blob_ref_by_descriptor_file_id() {
         let data = b"shared data".to_vec();
-        let blob_hash = BlobId::from_content(&data).to_hex();
+        let blob_hash = BlobId::from_canonical_content(&data).to_hex();
         let blob_reader =
             Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])) as Arc<dyn BlobDataReader>;
         let batch = super::lix_file_record_batch(
@@ -10003,9 +12014,9 @@ mod tests {
         )
         .expect("plugin candidates should prepare");
         let context = super::plugin_render_context_for_lix_file_scan(
-            Arc::new(RowsHotStateReader { rows }) as Arc<dyn HotStateReader>,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
+            Arc::new(FileStateView::test_rows(rows)) as Arc<FileStateView<TestRead>>,
+            &FileQueryPlan {
+                filter: FileQueryFilter {
                     branch_ids: vec![
                         "01920000-0000-7000-8000-0000000000a1".to_string(),
                         "01920000-0000-7000-8000-0000000000b1".to_string(),
@@ -10063,12 +12074,12 @@ mod tests {
         )
         .expect("blobless file should prepare");
         let context = super::plugin_render_context_for_lix_file_scan(
-            Arc::new(RecordingHotStateReader {
-                rows: Vec::new(),
-                scan_requests: Arc::clone(&requests),
-            }) as Arc<dyn HotStateReader>,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
+            Arc::new(FileStateView::test_recording(
+                Vec::new(),
+                Arc::clone(&requests),
+            )) as Arc<FileStateView<TestRead>>,
+            &FileQueryPlan {
+                filter: FileQueryFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
@@ -10086,8 +12097,8 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].filter.schema_keys, vec!["lix_key_value"]);
         assert_eq!(
-            requests[0].filter.row_pks,
-            vec![crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY)]
+            requests[0].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single(PLUGIN_REGISTRY_KEY)]
         );
         assert_eq!(
             requests[0].filter.branch_ids,
@@ -10097,8 +12108,8 @@ mod tests {
         assert_eq!(requests[0].filter.untracked, Some(false));
         assert_eq!(requests[0].limit, Some(1));
         assert_eq!(
-            requests[1].filter.row_pks,
-            vec![crate::row_pk::RowPk::single(PLUGIN_OWNER_KEY)]
+            requests[1].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single(PLUGIN_OWNER_KEY)]
         );
         assert_eq!(
             requests[1].filter.file_ids,
@@ -10122,8 +12133,8 @@ mod tests {
         )
         .expect("blobless raw file should prepare");
         let context = super::plugin_render_context_for_lix_file_scan(
-            Arc::new(RecordingHotStateReader {
-                rows: vec![live_plugin_registry_row(
+            Arc::new(FileStateView::test_recording(
+                vec![live_plugin_registry_row(
                     "01920000-0000-7000-8000-0000000000b1",
                     vec![test_plugin_registry_entry(
                         "plugin_sentinel",
@@ -10132,10 +12143,10 @@ mod tests {
                         wasm,
                     )],
                 )],
-                scan_requests: Arc::clone(&requests),
-            }) as Arc<dyn HotStateReader>,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
+                Arc::clone(&requests),
+            )) as Arc<FileStateView<TestRead>>,
+            &FileQueryPlan {
+                filter: FileQueryFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
@@ -10152,12 +12163,12 @@ mod tests {
         let requests = requests.lock().expect("scan request mutex");
         assert_eq!(requests.len(), 2, "registry and exact owner rows are read");
         assert_eq!(
-            requests[0].filter.row_pks,
-            vec![crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY)]
+            requests[0].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single(PLUGIN_REGISTRY_KEY)]
         );
         assert_eq!(
-            requests[1].filter.row_pks,
-            vec![crate::row_pk::RowPk::single(PLUGIN_OWNER_KEY)]
+            requests[1].filter.entity_pks,
+            vec![crate::entity_pk::EntityPk::single(PLUGIN_OWNER_KEY)]
         );
     }
 
@@ -10173,16 +12184,14 @@ mod tests {
         )
         .expect("owned blobless file should prepare");
         let context = super::plugin_render_context_for_lix_file_scan(
-            Arc::new(RowsHotStateReader {
-                rows: vec![live_plugin_owner_row(
-                    "01920000-0000-7000-8000-0000000000b1",
-                    "01920000-0000-7000-8000-000000000472",
-                    "plugin_sentinel",
-                    vec!["plugin_note".to_string()],
-                )],
-            }) as Arc<dyn HotStateReader>,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
+            Arc::new(FileStateView::test_rows(vec![live_plugin_owner_row(
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-000000000472",
+                "plugin_sentinel",
+                vec!["plugin_note".to_string()],
+            )])) as Arc<FileStateView<TestRead>>,
+            &FileQueryPlan {
+                filter: FileQueryFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
@@ -10227,27 +12236,25 @@ mod tests {
         )
         .expect("blobless file should prepare");
         let context = super::plugin_render_context_for_lix_file_scan(
-            Arc::new(RowsHotStateReader {
-                rows: vec![
-                    live_plugin_registry_row(
-                        "01920000-0000-7000-8000-0000000000b1",
-                        vec![test_plugin_registry_entry(
-                            "plugin_active",
-                            "*.active",
-                            "plugin_active_state",
-                            wasm,
-                        )],
-                    ),
-                    live_plugin_owner_row(
-                        "01920000-0000-7000-8000-0000000000b1",
-                        "01920000-0000-7000-8000-0000000000d2",
-                        "plugin_removed",
-                        vec!["plugin_removed_state".to_string()],
-                    ),
-                ],
-            }) as Arc<dyn HotStateReader>,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
+            Arc::new(FileStateView::test_rows(vec![
+                live_plugin_registry_row(
+                    "01920000-0000-7000-8000-0000000000b1",
+                    vec![test_plugin_registry_entry(
+                        "plugin_active",
+                        "*.active",
+                        "plugin_active_state",
+                        wasm,
+                    )],
+                ),
+                live_plugin_owner_row(
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "plugin_removed",
+                    vec!["plugin_removed_state".to_string()],
+                ),
+            ])) as Arc<FileStateView<TestRead>>,
+            &FileQueryPlan {
+                filter: FileQueryFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
@@ -10310,27 +12317,25 @@ mod tests {
         )
         .expect("blobless file should prepare");
         let context = super::plugin_render_context_for_lix_file_scan(
-            Arc::new(RowsHotStateReader {
-                rows: vec![
-                    live_plugin_registry_row(
-                        "01920000-0000-7000-8000-0000000000b1",
-                        vec![test_plugin_registry_entry(
-                            "plugin_csv",
-                            "*.csv",
-                            "csv_row",
-                            wasm,
-                        )],
-                    ),
-                    live_plugin_owner_row(
-                        "01920000-0000-7000-8000-0000000000b1",
-                        "01920000-0000-7000-8000-0000000000d2",
+            Arc::new(FileStateView::test_rows(vec![
+                live_plugin_registry_row(
+                    "01920000-0000-7000-8000-0000000000b1",
+                    vec![test_plugin_registry_entry(
                         "plugin_csv",
-                        vec!["csv_row".to_string()],
-                    ),
-                ],
-            }) as Arc<dyn HotStateReader>,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
+                        "*.csv",
+                        "csv_row",
+                        wasm,
+                    )],
+                ),
+                live_plugin_owner_row(
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "plugin_csv",
+                    vec!["csv_row".to_string()],
+                ),
+            ])) as Arc<FileStateView<TestRead>>,
+            &FileQueryPlan {
+                filter: FileQueryFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
@@ -10378,20 +12383,18 @@ mod tests {
         )
         .expect("blobless file should prepare");
         let context = super::plugin_render_context_for_lix_file_scan(
-            Arc::new(RowsHotStateReader {
-                rows: vec![live_plugin_registry_row(
-                    "01920000-0000-7000-8000-0000000000b1",
-                    vec![test_plugin_registry_entry_with_content(
-                        "plugin_text",
-                        "*.active",
-                        Some(PluginContentMatcher::Text),
-                        "plugin_text_state",
-                        wasm,
-                    )],
+            Arc::new(FileStateView::test_rows(vec![live_plugin_registry_row(
+                "01920000-0000-7000-8000-0000000000b1",
+                vec![test_plugin_registry_entry_with_content(
+                    "plugin_text",
+                    "*.active",
+                    Some(PluginContentMatcher::Text),
+                    "plugin_text_state",
+                    wasm,
                 )],
-            }) as Arc<dyn HotStateReader>,
-            &HotStateScanRequest {
-                filter: HotStateFilter {
+            )])) as Arc<FileStateView<TestRead>>,
+            &FileQueryPlan {
+                filter: FileQueryFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
@@ -10438,7 +12441,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].row_pk.as_ref(),
+            rows[0].entity_pk.as_ref(),
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(rows[0].schema_key, "lix_file_descriptor");
@@ -10636,6 +12639,77 @@ mod tests {
     }
 
     #[test]
+    fn file_delete_routes_only_exact_scope_plugin_owned_rows_to_reconciliation() {
+        let branch_id = "01920000-0000-7000-8000-0000000000b1";
+        let file_id = "01920000-0000-7000-8000-000000000472";
+        let owner =
+            PluginFileOwner::new(file_id, "plugin_sentinel", vec!["plugin_note".to_string()])
+                .expect("plugin owner fixture should be valid");
+        let file_key = FilesystemDescriptorKey::from_context(
+            &FilesystemRowContext {
+                branch_id: branch_id.to_string(),
+                global: false,
+                untracked: false,
+                file_id: None,
+                metadata: None,
+            },
+            file_id,
+        );
+        let render = super::PluginRenderContext {
+            host: PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            branches: BTreeMap::new(),
+            owners_by_file: BTreeMap::from([(file_key, owner)]),
+            owner_change_ids_by_file: BTreeMap::new(),
+            session_file_views: None,
+        };
+        let plugin_row = FilesystemStateRow {
+            schema_key: "plugin_note".to_string(),
+            file_id: Some(file_id.to_string()),
+            branch_id: branch_id.to_string(),
+            ..live_file_row(
+                "01920000-0000-7000-8000-000000000099",
+                branch_id,
+                r#"{"id":"01920000-0000-7000-8000-000000000099","value":"note"}"#,
+            )
+        };
+
+        assert!(super::is_plugin_owned_delete_row(
+            Some(&render),
+            &plugin_row
+        ));
+
+        for row in [
+            FilesystemStateRow {
+                branch_id: "01920000-0000-7000-8000-0000000000b2".to_string(),
+                ..plugin_row.clone()
+            },
+            FilesystemStateRow {
+                global: true,
+                ..plugin_row.clone()
+            },
+            FilesystemStateRow {
+                schema_key: "ordinary_file_entity".to_string(),
+                ..plugin_row.clone()
+            },
+        ] {
+            assert!(!super::is_plugin_owned_delete_row(Some(&render), &row));
+        }
+
+        let mut reservation = plugin_row.clone();
+        reservation.schema_key = "lix_key_value".to_string();
+        reservation.entity_pk =
+            crate::entity_pk::EntityPk::single("lix_plugin_create_v1:0123456789abcdef01234567");
+        assert!(super::is_plugin_owned_delete_row(
+            Some(&render),
+            &reservation
+        ));
+        assert!(!super::is_plugin_owned_delete_row(None, &reservation));
+
+        reservation.entity_pk = crate::entity_pk::EntityPk::single("ordinary-key");
+        assert!(!super::is_plugin_owned_delete_row(None, &reservation));
+    }
+
+    #[test]
     fn file_delete_rejects_noncanonical_plugin_archive_identity() {
         for (file_id, path) in [
             ("file-arbitrary", "/.lix/plugins/plugin_sentinel.lixplugin"),
@@ -10755,14 +12829,13 @@ mod tests {
 
     #[tokio::test]
     async fn file_path_update_seeds_resolver_from_visible_directory_state() {
-        let mut resolvers = super::directory_path_resolvers_from_hot_state(
-            Arc::new(RowsHotStateReader {
-                rows: vec![live_directory_row(
+        let mut resolvers = super::directory_path_resolvers_from_state_view(
+            Arc::new(FileStateView::test_rows(vec![live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
                     "01920000-0000-7000-8000-0000000000b1",
                     "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
                 )],
-            }) as Arc<dyn HotStateReader>,
+            )) as Arc<FileStateView<TestRead>>,
             Some("01920000-0000-7000-8000-0000000000b1"),
         )
         .await
@@ -10799,8 +12872,8 @@ mod tests {
 
     #[tokio::test]
     async fn file_path_update_stages_only_missing_parent_directories() {
-        let mut resolvers = super::directory_path_resolvers_from_hot_state(
-            Arc::new(RowsHotStateReader::default()) as Arc<dyn HotStateReader>,
+        let mut resolvers = super::directory_path_resolvers_from_state_view(
+            Arc::new(FileStateView::test_rows(Vec::new())) as Arc<FileStateView<TestRead>>,
             Some("01920000-0000-7000-8000-0000000000b1"),
         )
         .await
@@ -10835,7 +12908,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_directory_descriptor")
             .expect("missing /docs/ directory should be staged");
         assert_eq!(
-            directory.row_pk,
+            directory.entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-000000000353"))
         );
 
@@ -11098,7 +13171,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("data insert should stage blob ref row");
         assert_eq!(
-            blob_ref_row.row_pk,
+            blob_ref_row.entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -11154,7 +13227,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor tombstone should be staged");
         assert_eq!(
-            descriptor.row_pk,
+            descriptor.entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -11169,7 +13242,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref tombstone should be staged");
         assert_eq!(
-            blob_ref.row_pk,
+            blob_ref.entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
@@ -11190,7 +13263,7 @@ mod tests {
         let row = staged.state_rows.row(0);
         assert_eq!(row.schema_key, "lix_file_descriptor");
         assert_eq!(
-            row.row_pk,
+            row.entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(row.snapshot, None);
@@ -11331,7 +13404,7 @@ mod tests {
                 assert_eq!(*mode, TransactionWriteMode::Insert);
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
-                    rows.row(0).row_pk,
+                    rows.row(0).entity_pk,
                     Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
                 );
                 assert_eq!(rows.row(0).schema_key, "lix_file_descriptor");
@@ -11342,10 +13415,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_delete_reuses_single_candidate_scan() {
-        let mut write_context = CapturingWriteContext {
-            rows: file_dml_rows(),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(file_dml_rows());
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -11391,10 +13461,7 @@ mod tests {
                 7,
             ),
         ]);
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -11414,8 +13481,8 @@ mod tests {
         assert_eq!(write_context.exact_load_requests.len(), 1);
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(
-            write_context.exact_load_requests[0].rows[0].row_pk,
-            crate::row_pk::RowPk::uuid_from_canonical(
+            write_context.exact_load_requests[0].rows[0].entity_pk,
+            crate::entity_pk::EntityPk::uuid_from_canonical(
                 "01920000-0000-7000-8000-0000000000d2",
             )
             .expect("fixture file ID")
@@ -11430,10 +13497,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_update_reuses_source_rows_for_blob_and_path_state() {
-        let mut write_context = CapturingWriteContext {
-            rows: file_dml_rows(),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(file_dml_rows());
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -11471,10 +13535,7 @@ mod tests {
             "01920000-0000-7000-8000-0000000000b1",
             r#"{"id":"01920000-0000-7000-8000-000000000482","directory_id":null,"name":"other.md"}"#,
         ));
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -11507,10 +13568,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_content_update_reuses_source_blob_ref_keys() {
-        let mut write_context = CapturingWriteContext {
-            rows: file_dml_rows(),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(file_dml_rows());
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
@@ -11549,10 +13607,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_upsert_attribute_update_uses_exact_id_blob_lookup() {
-        let mut write_context = CapturingWriteContext {
-            rows: file_dml_rows(),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(file_dml_rows());
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let assignments = vec![
@@ -11581,7 +13636,7 @@ mod tests {
     #[tokio::test]
     async fn file_id_conflict_probe_uses_path_index_and_exact_blob_batch() {
         let data = b"hello".to_vec();
-        let blob_hash = BlobId::from_content(&data);
+        let blob_hash = BlobId::from_canonical_content(&data);
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -11596,11 +13651,8 @@ mod tests {
                 data.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            blob_bytes_by_hash: BTreeMap::from([(blob_hash, data)]),
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
+        write_context.blob_bytes_by_hash = BTreeMap::from([(blob_hash, data)]);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
 
@@ -11621,9 +13673,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_file_content_update_uses_path_index_and_target_blob_scan() {
+    async fn fast_file_content_update_uses_path_index_and_exact_blob_read() {
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let scan_requests = Arc::new(Mutex::new(Vec::new()));
+        let exact_load_requests = Arc::new(Mutex::new(Vec::new()));
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_directory_row(
@@ -11640,17 +13693,23 @@ mod tests {
             .expect("filesystem path index should build"),
         );
         let old_data = b"old";
+        let blob_rows = vec![live_blob_ref_row(
+            "01920000-0000-7000-8000-0000000000d2",
+            "01920000-0000-7000-8000-0000000000b1",
+            "01920000-0000-7000-8000-0000000000d2",
+            &BlobId::from_canonical_content(old_data).to_hex(),
+            old_data.len(),
+        )];
         let mut write_context = IndexedFileContentUpdateWriteContext {
-            index,
-            blob_rows: vec![live_blob_ref_row(
-                "01920000-0000-7000-8000-0000000000d2",
+            state_view: test_transaction_state_view_for_branch(
                 "01920000-0000-7000-8000-0000000000b1",
-                "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_data).to_hex(),
-                old_data.len(),
-            )],
+                &blob_rows,
+            ),
+            index,
+            blob_rows,
             writes: Vec::new(),
             scan_requests: Arc::clone(&scan_requests),
+            exact_load_requests: Arc::clone(&exact_load_requests),
             path_index_requests: Arc::clone(&path_index_requests),
         };
 
@@ -11668,14 +13727,21 @@ mod tests {
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         {
             let requests = scan_requests.lock().expect("scan request mutex");
+            assert!(requests.is_empty());
+        }
+        {
+            let requests = exact_load_requests.lock().expect("exact request mutex");
             assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].rows.len(), 1);
+            assert_eq!(requests[0].untracked, Some(false));
+            assert_eq!(requests[0].rows[0].schema_key, super::BLOB_REF_SCHEMA_KEY);
             assert_eq!(
-                requests[0].filter.schema_keys,
-                vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
+                requests[0].rows[0].entity_pk,
+                uuid_pk("01920000-0000-7000-8000-0000000000d2")
             );
             assert_eq!(
-                requests[0].filter.row_pks,
-                vec![uuid_pk("01920000-0000-7000-8000-0000000000d2")]
+                requests[0].rows[0].file_id.as_deref(),
+                Some("01920000-0000-7000-8000-0000000000d2")
             );
         }
 
@@ -11742,14 +13808,11 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_data).to_hex(),
+                &BlobId::from_canonical_content(old_data).to_hex(),
                 old_data.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
@@ -11784,7 +13847,7 @@ mod tests {
         assert!(file_content[0].had_blob_ref);
         assert_eq!(
             file_content[0].base_blob_hash(),
-            Some(BlobId::from_content(old_data)),
+            Some(BlobId::from_canonical_content(old_data)),
             "the exact indexed blob hash should be retained for optional CAS reuse",
         );
         let descriptor = rows
@@ -11812,26 +13875,21 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_payload).to_hex(),
+                &BlobId::from_canonical_content(old_payload).to_hex(),
                 old_payload.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
-        let chunk_hash = ChunkHash::from_content(b"durable media chunk");
+        let mut write_context = CapturingWriteContext::with_rows(rows);
         let chunk_count = 4_096;
         let chunk_size = 1024 * 1024;
         let size_bytes = u64::from(chunk_count) * chunk_size;
-        let blob_id = BlobId::from_chunks(
-            size_bytes,
-            (0..chunk_count).map(|_| (chunk_hash, chunk_size)),
-        );
+        let blob_id = BlobId::from_bytes([0x44; 32]);
         let receipt = BlobWriteReceipt {
             hash: blob_id,
             size_bytes,
             layout: BlobLayout::Chunked { chunk_count },
+            manifest_object_id: [0; 32],
+            manifest_was_existing: false,
         };
 
         let outcome = super::execute_fast_lix_file_prepared_path_write(
@@ -11897,14 +13955,11 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_data).to_hex(),
+                &BlobId::from_canonical_content(old_data).to_hex(),
                 old_data.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
@@ -12045,15 +14100,11 @@ mod tests {
 
     #[tokio::test]
     async fn fast_file_path_upsert_preserves_root_directory_namespace_collision() {
-        let mut write_context = CapturingWriteContext {
-            rows: vec![live_directory_row(
-                "01920000-0000-7000-8000-0000000000d3",
-                "01920000-0000-7000-8000-0000000000b1",
-                r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
-            )],
-            ..CapturingWriteContext::default()
-        };
-
+        let mut write_context = CapturingWriteContext::with_rows(vec![live_directory_row(
+            "01920000-0000-7000-8000-0000000000d3",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
+        )]);
         let error = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![("/docs".to_string(), b"file".to_vec().into(), None, None)],
@@ -12065,7 +14116,7 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert_eq!(write_context.path_index_count, 1);
-        assert_eq!(write_context.scan_count, 1);
+        assert_eq!(write_context.scan_count, 0);
         assert!(write_context.writes.is_empty());
     }
 
@@ -12078,9 +14129,9 @@ mod tests {
         );
         let mut global_fallback = live_blob_ref_row(
             "01920000-0000-7000-8000-000000000442",
-            crate::GLOBAL_BRANCH_ID,
+            GLOBAL_BRANCH_ID,
             "01920000-0000-7000-8000-000000000442",
-            &BlobId::from_content(b"global").to_hex(),
+            &BlobId::from_canonical_content(b"global").to_hex(),
             6,
         );
         global_fallback.global = true;
@@ -12095,18 +14146,15 @@ mod tests {
             "01920000-0000-7000-8000-000000000112",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000112",
-            &BlobId::from_content(b"branch").to_hex(),
+            &BlobId::from_canonical_content(b"branch").to_hex(),
             6,
         );
-        let mut write_context = CapturingWriteContext {
-            rows: vec![
-                local_descriptor,
-                global_fallback,
-                global_descriptor,
-                branch_override,
-            ],
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(vec![
+            local_descriptor,
+            global_fallback,
+            global_descriptor,
+            branch_override,
+        ]);
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
@@ -12163,14 +14211,11 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobId::from_content(old_data).to_hex(),
+                &BlobId::from_canonical_content(old_data).to_hex(),
                 old_data.len(),
             ),
         ];
-        let mut write_context = CapturingWriteContext {
-            rows,
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(rows);
 
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
@@ -12202,39 +14247,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_file_path_write_declines_ambiguous_cross_scope_paths() {
-        let tracked = live_file_row(
-            "01920000-0000-7000-8000-000000000122",
-            "01920000-0000-7000-8000-0000000000b1",
-            r#"{"id":"01920000-0000-7000-8000-000000000122","directory_id":null,"name":"shared.md"}"#,
-        );
-        let mut untracked = live_file_row(
-            "01920000-0000-7000-8000-000000000132",
-            "01920000-0000-7000-8000-0000000000b1",
-            r#"{"id":"01920000-0000-7000-8000-000000000132","directory_id":null,"name":"shared.md"}"#,
-        );
-        untracked.untracked = true;
-        let mut write_context = CapturingWriteContext {
-            rows: vec![tracked, untracked],
-            ..CapturingWriteContext::default()
-        };
-
-        let outcome = super::execute_fast_lix_file_path_writes(
-            &mut write_context,
-            vec![("/shared.md".to_string(), b"new".to_vec().into(), None, None)],
-            super::FastLixFilePathWriteConflict::UpdateContentAndMetadata,
-            None,
-        )
-        .await
-        .expect("ambiguous legacy topology should decline the fast path");
-
-        assert_eq!(outcome, None);
-        assert_eq!(write_context.path_index_count, 1);
-        assert_eq!(write_context.scan_count, 1);
-        assert!(write_context.writes.is_empty());
-    }
-
-    #[tokio::test]
     async fn file_dml_apply_without_source_state_errors() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
@@ -12260,14 +14272,11 @@ mod tests {
     #[tokio::test]
     async fn file_insert_sink_stages_file_content_writes() {
         let batch = data_insert_batch();
-        let mut write_context = CapturingWriteContext {
-            rows: vec![live_directory_row(
-                "01920000-0000-7000-8000-0000000000d3",
-                "01920000-0000-7000-8000-0000000000b1",
-                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
-            )],
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(vec![live_directory_row(
+            "01920000-0000-7000-8000-0000000000d3",
+            "01920000-0000-7000-8000-0000000000b1",
+            "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
+        )]);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink =
             LixFileInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit(), true);
@@ -12313,23 +14322,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_insert_sink_seeds_path_resolver_from_hot_state() {
+    async fn file_insert_sink_seeds_path_resolver_from_state_view() {
         let batch = path_data_insert_batch();
-        let mut write_context = CapturingWriteContext {
-            rows: vec![
-                live_directory_row(
-                    "01920000-0000-7000-8000-0000000000d3",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
-                ),
-                live_directory_row(
-                    "01920000-0000-7000-8000-000000000313",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
-                ),
-            ],
-            ..CapturingWriteContext::default()
-        };
+        let mut write_context = CapturingWriteContext::with_rows(vec![
+            live_directory_row(
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000b1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
+            ),
+            live_directory_row(
+                "01920000-0000-7000-8000-000000000313",
+                "01920000-0000-7000-8000-0000000000b1",
+                "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
+            ),
+        ]);
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink =
             LixFileInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit(), true);

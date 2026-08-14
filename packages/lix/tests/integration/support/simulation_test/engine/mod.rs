@@ -1,7 +1,5 @@
-mod expect_same;
 mod macro_runtime;
 mod mode;
-mod rebuild_tracked_state;
 mod simulation;
 
 #[allow(unused_imports)]

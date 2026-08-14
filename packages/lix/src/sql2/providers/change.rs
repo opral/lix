@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,9 +8,10 @@ use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
 use crate::LixError;
-use crate::changelog::{
-    ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogContext, ChangelogReader,
-};
+#[cfg(test)]
+use crate::changelog::CommitId;
+use crate::changelog::{ChangeId, ChangeRecord};
+use crate::forktree::ForkTreeReadFacade;
 use crate::serialize_row_metadata;
 
 use crate::sql2::SqlChangelogQuerySource;
@@ -52,7 +54,7 @@ struct ChangeSpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for ChangeSpec<S>
+impl<S> TableSpec<S> for ChangeSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -91,17 +93,26 @@ where
                 Arc::clone(&schema),
                 (self.query_source.clone(), schema),
                 move |(query_source, schema)| async move {
-                    let mut json_reader = query_source.json_reader;
-                    let canonical_changes =
-                        scan_changelog_changes(query_source.store, pushed_limit, route)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?;
+                    let mut forktree_reader = query_source.forktree_reader;
+                    let canonical_changes = match route {
+                        ChangeScanRoute::Exact(change_id) => {
+                            load_exact_change(&forktree_reader, change_id)
+                                .await
+                                .map(|change| change.into_iter().collect())
+                                .map_err(lix_error_to_datafusion_error)?
+                        }
+                        ChangeScanRoute::All | ChangeScanRoute::Empty => {
+                            scan_changelog_changes(&forktree_reader, pushed_limit, route)
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?
+                        }
+                    };
                     let mut changes = Vec::with_capacity(canonical_changes.len());
                     for change in canonical_changes {
                         match change {
                             LixChangeRow::Direct(change) => changes.push(
                                 materialize_changelog_change_record(
-                                    &mut json_reader,
+                                    &mut forktree_reader,
                                     change,
                                     payload_projection,
                                 )
@@ -110,7 +121,7 @@ where
                             ),
                             LixChangeRow::DerivedCommit(change) => changes.push(
                                 materialize_commit_graph_change(
-                                    &mut json_reader,
+                                    &mut forktree_reader,
                                     change,
                                     payload_projection,
                                 )
@@ -145,7 +156,7 @@ fn change_payload_projection(schema: &Schema, filters: &[Expr]) -> ChangePayload
 }
 
 async fn scan_changelog_changes<S>(
-    store: S,
+    reader: &ForkTreeReadFacade<S>,
     limit: Option<usize>,
     route: ChangeScanRoute,
 ) -> Result<Vec<LixChangeRow>, LixError>
@@ -154,45 +165,109 @@ where
 {
     match route {
         ChangeScanRoute::Empty => return Ok(Vec::new()),
-        ChangeScanRoute::Exact(change_id) => {
-            return load_exact_change(store, change_id)
-                .await
-                .map(|change| change.into_iter().collect());
+        ChangeScanRoute::Exact(_) => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "exact changelog routes must use the operation-owned reader at the SQL boundary",
+            ));
         }
         ChangeScanRoute::All => {}
     }
-    let packed_changes =
-        crate::tracked_state::scan_change_records_from_commit_deltas(&store).await?;
-    let mut reader = ChangelogContext::new().reader(store.clone());
-    let mut changes = packed_changes
-        .into_iter()
-        .map(LixChangeRow::Direct)
-        .collect::<Vec<_>>();
-    let mut start_after = None::<String>;
+    let mut seen = BTreeSet::new();
+    let mut changes = Vec::new();
+    let mut start_after = None;
     loop {
-        let scan = reader
-            .scan_changes(ChangeScanRequest {
-                start_after: start_after.as_deref(),
-                limit: Some(1024),
-            })
-            .await?;
-        changes.extend(scan.entries.into_iter().map(LixChangeRow::Direct));
-        let Some(next) = scan.next_start_after else {
+        let page = reader.scan_change_records(start_after, 1024).await?;
+        let next_start_after = page.last().map(|change| change.change_id);
+        let page_is_full = page.len() == 1024;
+        for change in page {
+            push_unique_change(&mut changes, &mut seen, LixChangeRow::Direct(change))?;
+        }
+        if !page_is_full {
             break;
-        };
-        start_after = Some(next.to_string());
+        }
+        start_after = next_start_after;
     }
-    let mut graph_reader = crate::commit_graph::CommitGraphContext::new().reader(store);
-    for commit in graph_reader.all_nodes().await? {
-        changes.push(LixChangeRow::DerivedCommit(
-            crate::commit_graph::canonical_commit_change(&commit),
-        ));
+    let mut start_after = None;
+    loop {
+        let page = reader.scan_commit_records(start_after, 1024).await?;
+        let next_start_after = page.last().map(|record| record.commit_id);
+        let page_is_full = page.len() == 1024;
+        for record in page {
+            push_unique_change(
+                &mut changes,
+                &mut seen,
+                LixChangeRow::DerivedCommit(crate::commit_graph::canonical_commit_change(&record)),
+            )?;
+        }
+        if !page_is_full {
+            break;
+        }
+        start_after = next_start_after;
     }
     changes.sort_by_key(LixChangeRow::change_id);
     if let Some(limit) = limit {
         changes.truncate(limit);
     }
     Ok(changes)
+}
+
+fn push_unique_change(
+    changes: &mut Vec<LixChangeRow>,
+    seen: &mut BTreeSet<ChangeId>,
+    change: LixChangeRow,
+) -> Result<(), LixError> {
+    let change_id = change.change_id();
+    if !seen.insert(change_id) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("ChangeCatalog enumeration returned duplicate change '{change_id}'"),
+        ));
+    }
+    changes.push(change);
+    Ok(())
+}
+
+#[cfg(test)]
+fn require_commit_records(
+    expected_commit_ids: &[CommitId],
+    records: Vec<Option<crate::changelog::CommitRecord>>,
+) -> Result<Vec<crate::changelog::CommitRecord>, LixError> {
+    if records.len() != expected_commit_ids.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "CommitCatalog enumeration returned {} records for {} requested commits",
+                records.len(),
+                expected_commit_ids.len()
+            ),
+        ));
+    }
+    expected_commit_ids
+        .iter()
+        .copied()
+        .zip(records)
+        .map(|(expected_commit_id, record)| {
+            let record = record.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "CommitCatalog enumeration omitted authenticated commit '{expected_commit_id}'"
+                    ),
+                )
+            })?;
+            if record.commit_id != expected_commit_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "CommitCatalog enumeration returned commit '{}' for requested '{}'",
+                        record.commit_id, expected_commit_id
+                    ),
+                ));
+            }
+            Ok(record)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -247,45 +322,41 @@ fn exact_change_id_filter(filter: &Expr) -> Option<Option<ChangeId>> {
 }
 
 async fn load_exact_change<S>(
-    store: S,
+    reader: &ForkTreeReadFacade<S>,
     change_id: ChangeId,
 ) -> Result<Option<LixChangeRow>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    if let Some(change) = crate::tracked_state::load_change_record_by_id(&store, change_id).await? {
-        return Ok(Some(LixChangeRow::Direct(change)));
-    }
-
-    let mut reader = ChangelogContext::new().reader(store.clone());
     if let Some(change) = reader
-        .load_changes(ChangeLoadRequest {
-            change_ids: std::slice::from_ref(&change_id),
-        })
+        .load_change_records(std::slice::from_ref(&change_id))
         .await?
         .into_iter()
         .next()
-        .and_then(|(_, value)| value)
+        .flatten()
     {
         return Ok(Some(LixChangeRow::Direct(change)));
     }
 
-    // A commit's synthetic `lix_commit` change is its commit id at ordinal
-    // zero of the commit's own change address space, so the reverse lookup is
-    // arithmetic plus the commit read we would have done anyway.
-    let Some(commit_id) = change_id.as_commit_change() else {
-        return Ok(None);
-    };
-    let Some(commit) = crate::commit_graph::CommitGraphContext::new()
-        .reader(store)
-        .load_node(&commit_id)
-        .await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(LixChangeRow::DerivedCommit(
-        crate::commit_graph::canonical_commit_change(&commit),
-    )))
+    let mut start_after = None;
+    loop {
+        let page = reader.scan_commit_records(start_after, 1024).await?;
+        let next_start_after = page.last().map(|record| record.commit_id);
+        let page_is_full = page.len() == 1024;
+        if let Some(record) = page
+            .into_iter()
+            .find(|record| crate::commit_graph::canonical_commit_change(record).id == change_id)
+        {
+            return Ok(Some(LixChangeRow::DerivedCommit(
+                crate::commit_graph::canonical_commit_change(&record),
+            )));
+        }
+        if !page_is_full {
+            break;
+        }
+        start_after = next_start_after;
+    }
+    Ok(None)
 }
 
 enum LixChangeRow {
@@ -362,7 +433,10 @@ mod tests {
     use datafusion::arrow::datatypes::Schema;
     use datafusion::logical_expr::{Expr, col, lit};
 
-    use super::{ChangeScanRoute, change_payload_projection, change_scan_route, lix_change_schema};
+    use super::{
+        ChangeScanRoute, change_payload_projection, change_scan_route, lix_change_schema,
+        require_commit_records,
+    };
 
     #[test]
     fn identity_projection_skips_json_payloads() {
@@ -406,5 +480,40 @@ mod tests {
             change_scan_route(&[col("schema_key").eq(lit("example"))]),
             ChangeScanRoute::All
         ));
+    }
+
+    #[test]
+    fn commit_catalog_missing_or_reordered_records_fail_closed() {
+        let first_id = crate::changelog::CommitId::for_test_label("catalog-first");
+        let second_id = crate::changelog::CommitId::for_test_label("catalog-second");
+        let record = |commit_id| crate::changelog::CommitRecord {
+            format_version: 2,
+            commit_id,
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            change_id: crate::changelog::ChangeId::for_test_label("catalog-change"),
+            account_id: "test".to_owned(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "catalog test timestamp",
+                "2026-05-12T00:00:00Z",
+            ),
+        };
+        let expected = [first_id, second_id];
+
+        assert!(require_commit_records(&expected, vec![Some(record(first_id)), None]).is_err());
+        assert!(
+            require_commit_records(
+                &expected,
+                vec![Some(record(first_id)), Some(record(first_id))],
+            )
+            .is_err()
+        );
+        assert!(
+            require_commit_records(
+                &expected,
+                vec![Some(record(second_id)), Some(record(first_id))],
+            )
+            .is_err()
+        );
     }
 }

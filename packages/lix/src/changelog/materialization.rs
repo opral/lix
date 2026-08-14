@@ -1,19 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
-use bytes::Bytes;
-
 use crate::LixError;
-use crate::common::{ExactBatch, SharedStr};
-use crate::json_store::{
-    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonStoreContext,
-};
-use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageProjectedValue,
-};
+use crate::common::SharedStr;
+use crate::forktree::ForkTreeReadFacade;
+use crate::storage_adapter::StorageAdapterRead;
 
-use super::{CHANGE_SPACE, ChangeId, ChangeRecord, decode_change_record};
-
-const CHANGE_STORAGE_KEY_BYTES: usize = 16;
+use super::{ChangeId, ChangeRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChangeRecordProjection {
@@ -26,24 +18,6 @@ impl ChangeRecordProjection {
         Self {
             snapshot_content: true,
             metadata: true,
-        }
-    }
-
-    /// Loads identity and revision columns without hydrating JSON payloads.
-    pub(crate) fn identity_only() -> Self {
-        Self {
-            snapshot_content: false,
-            metadata: false,
-        }
-    }
-
-    pub(crate) fn from_columns(columns: &[String]) -> Self {
-        if columns.is_empty() {
-            return Self::full();
-        }
-        Self {
-            snapshot_content: columns.iter().any(|column| column == "snapshot_content"),
-            metadata: columns.iter().any(|column| column == "metadata"),
         }
     }
 
@@ -62,7 +36,7 @@ pub(crate) struct MaterializedChangePayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedChangeIdentity {
     pub(crate) schema_key: String,
-    pub(crate) row_pk: crate::row_pk::RowPk,
+    pub(crate) entity_pk: crate::entity_pk::EntityPk,
     pub(crate) file_id: Option<String>,
 }
 
@@ -72,7 +46,7 @@ pub(crate) async fn load_change_records<S>(
     change_ids: impl Iterator<Item = ChangeId>,
 ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError>
 where
-    S: StorageAdapterRead + ?Sized,
+    S: StorageAdapterRead,
 {
     let mut unique = Vec::new();
     let mut seen = HashSet::new();
@@ -84,88 +58,14 @@ where
     if unique.is_empty() {
         return Ok(HashMap::new());
     }
-    let records = load_unique_change_records_in_order(store, &unique).await?;
+    let records = crate::forktree::load_change_records(store, &unique).await?;
     let mut by_id = HashMap::with_capacity(unique.len());
-    for (change_id, record) in records {
+    for (change_id, record) in unique.into_iter().zip(records) {
         if let Some(record) = record {
-            by_id.insert(*change_id, record);
+            by_id.insert(change_id, record);
         }
     }
     Ok(by_id)
-}
-
-/// Loads a caller-deduplicated change-id batch.
-///
-/// All changelog keys are fixed-width UUID bytes, so one immutable arena can
-/// back every point-read key. The plan also receives the keys as already
-/// unique, avoiding a second hash table, key vector, caller-order remap, and
-/// materialized value vector for the common identity mapping. Decoded records
-/// retain that same order so batch materialization does not need an
-/// intermediate `HashMap`.
-async fn load_unique_change_records_in_order<'a, S>(
-    store: &S,
-    unique: &'a [ChangeId],
-) -> Result<ExactBatch<'a, ChangeId, ChangeRecord>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if unique.is_empty() {
-        return ExactBatch::try_new("change materialization", unique, Vec::new());
-    }
-    let keys = change_storage_keys(unique)?;
-    let plan = PointReadPlan::from_unique_keys(CHANGE_SPACE, keys);
-    let result = plan.collect(store, StorageGetOptions::default()).await?;
-    decode_change_records_in_order(unique, result.value.unique_values)
-}
-
-fn decode_change_records_in_order(
-    unique: &[ChangeId],
-    values: Vec<Option<StorageProjectedValue>>,
-) -> Result<ExactBatch<'_, ChangeId, ChangeRecord>, LixError> {
-    let records = unique
-        .iter()
-        .copied()
-        .zip(values)
-        .map(|(change_id, value)| match value {
-            None => Ok(None),
-            Some(StorageProjectedValue::FullValue(bytes)) => {
-                decode_change_record(&bytes, change_id).map(Some)
-            }
-            Some(StorageProjectedValue::KeyOnly) => Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "change point read returned a key-only projection for ChangeRecord '{change_id}'"
-                ),
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    ExactBatch::try_new("change materialization", unique, records)
-}
-
-fn change_storage_keys(
-    unique: &[ChangeId],
-) -> Result<Vec<crate::storage_adapter::StorageKey>, LixError> {
-    let arena_len = unique
-        .len()
-        .checked_mul(CHANGE_STORAGE_KEY_BYTES)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "change point-read key arena size overflowed",
-            )
-        })?;
-    let mut arena = Vec::with_capacity(arena_len);
-    for change_id in unique {
-        arena.extend_from_slice(change_id.as_uuid().as_bytes());
-    }
-    debug_assert_eq!(arena.len(), arena_len);
-    let arena = Bytes::from(arena);
-    Ok((0..unique.len())
-        .map(|index| {
-            let start = index * CHANGE_STORAGE_KEY_BYTES;
-            crate::storage_adapter::StorageKey(arena.slice(start..start + CHANGE_STORAGE_KEY_BYTES))
-        })
-        .collect())
 }
 
 /// Hydrates records that a caller already retained from their authoritative
@@ -173,15 +73,15 @@ fn change_storage_keys(
 /// publication never discard commit-local payloads and fall back to the
 /// standalone changelog namespace.
 pub(crate) async fn materialize_known_change_payloads<S>(
-    store: &S,
+    reader: &mut ForkTreeReadFacade<S>,
     changes: impl Iterator<Item = ChangeRecord>,
     projection: ChangeRecordProjection,
 ) -> Result<HashMap<ChangeId, MaterializedChangePayload>, LixError>
 where
-    S: StorageAdapterRead + ?Sized,
+    S: StorageAdapterRead,
 {
     Ok(
-        materialize_known_change_payloads_in_order(store, changes, projection)
+        materialize_known_change_payloads_in_order(reader, changes, projection)
             .await?
             .into_iter()
             .collect(),
@@ -194,12 +94,12 @@ where
 /// one source change. Lifecycle operations such as checkpoints must preserve
 /// each identity-specific payload even though those rows share a change id.
 pub(crate) async fn materialize_known_change_payloads_in_order<S>(
-    store: &S,
+    reader: &mut ForkTreeReadFacade<S>,
     changes: impl Iterator<Item = ChangeRecord>,
     projection: ChangeRecordProjection,
 ) -> Result<Vec<(ChangeId, MaterializedChangePayload)>, LixError>
 where
-    S: StorageAdapterRead + ?Sized,
+    S: StorageAdapterRead,
 {
     let changes = changes.collect::<Vec<_>>();
     if !projection.requires_payload() {
@@ -218,177 +118,47 @@ where
             .collect());
     }
 
-    let mut json_refs = Vec::new();
-    let mut plans = Vec::with_capacity(changes.len());
+    let mut payloads = Vec::with_capacity(changes.len());
     for change in changes {
         let change_id = change.change_id;
-        plans.push((
+        let snapshot_content = if projection.snapshot_content {
+            reader
+                .load_json_slot(&change.snapshot)
+                .await?
+                .map(SharedStr::from)
+        } else {
+            None
+        };
+        let metadata = if projection.metadata {
+            reader
+                .load_json_slot(&change.metadata)
+                .await?
+                .map(SharedStr::from)
+        } else {
+            None
+        };
+        payloads.push((
             change_id,
-            MaterializedChangeIdentity {
-                schema_key: change.schema_key,
-                row_pk: change.row_pk,
-                file_id: change.file_id,
+            MaterializedChangePayload {
+                identity: Some(MaterializedChangeIdentity {
+                    schema_key: change.schema_key,
+                    entity_pk: change.entity_pk,
+                    file_id: change.file_id,
+                }),
+                snapshot_content,
+                metadata,
             },
-            materialized_json_slot(projection.snapshot_content, change.snapshot, &mut json_refs),
-            materialized_json_slot(projection.metadata, change.metadata, &mut json_refs),
         ));
     }
-
-    let mut json_values = load_json_values(store, &json_refs).await?;
-    plans
-        .into_iter()
-        .map(|(change_id, identity, snapshot, metadata)| {
-            Ok((
-                change_id,
-                MaterializedChangePayload {
-                    identity: Some(identity),
-                    snapshot_content: materialized_json_string(
-                        snapshot,
-                        &json_refs,
-                        &mut json_values,
-                    )?,
-                    metadata: materialized_json_string(metadata, &json_refs, &mut json_values)?,
-                },
-            ))
-        })
-        .collect()
-}
-
-enum MaterializedJsonSlot {
-    None,
-    Inline(Box<str>),
-    Loaded(usize),
-}
-
-fn materialized_json_slot(
-    include: bool,
-    slot: JsonSlot,
-    json_refs: &mut Vec<JsonRef>,
-) -> MaterializedJsonSlot {
-    if !include {
-        return MaterializedJsonSlot::None;
-    }
-    match slot {
-        JsonSlot::None => MaterializedJsonSlot::None,
-        JsonSlot::Inline(json) => MaterializedJsonSlot::Inline(json),
-        JsonSlot::Ref(json_ref) => {
-            let index = json_refs.len();
-            json_refs.push(json_ref);
-            MaterializedJsonSlot::Loaded(index)
-        }
-    }
-}
-
-async fn load_json_values<S>(
-    store: &S,
-    json_refs: &[JsonRef],
-) -> Result<Vec<Option<Bytes>>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if json_refs.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(JsonStoreContext::new()
-        .load_bytes_many(
-            store,
-            JsonLoadRequestRef {
-                refs: json_refs,
-                scope: JsonReadScopeRef::OutOfBand,
-            },
-        )
-        .await?
-        .into_values())
-}
-
-fn materialized_json_string(
-    slot: MaterializedJsonSlot,
-    json_refs: &[JsonRef],
-    json_values: &mut [Option<Bytes>],
-) -> Result<Option<SharedStr>, LixError> {
-    let index = match slot {
-        MaterializedJsonSlot::None => return Ok(None),
-        MaterializedJsonSlot::Inline(json) => {
-            return Ok(Some(SharedStr::from(json.into_string())));
-        }
-        MaterializedJsonSlot::Loaded(index) => index,
-    };
-    let json_ref = json_refs.get(index).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "change materialization lost JSON ref index",
-        )
-    })?;
-    let bytes = json_values
-        .get_mut(index)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "change materialization lost JSON value index",
-            )
-        })?
-        .take()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "change materialization is missing JSON payload '{}'",
-                    json_ref.to_hex()
-                ),
-            )
-        })?;
-    SharedStr::from_utf8(bytes).map(Some).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("materialized ChangeRecord JSON payload is not UTF-8: {error}"),
-        )
-    })
+    Ok(payloads)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::ChangeLoadBatch;
     use crate::changelog::test_support::test_change_record;
-    use crate::storage_adapter::{
-        Memory, RequestedToUniqueRef, StorageAdapter, StorageReadOptions,
-    };
-
-    fn encoded_change(schema_key: &str) -> Bytes {
-        let mut record = test_change_record();
-        record.schema_key = schema_key.to_owned();
-        Bytes::from(
-            crate::changelog::codec::encode_change_record(&record)
-                .expect("change record should encode"),
-        )
-    }
-
-    #[test]
-    fn change_storage_keys_share_one_contiguous_arena() {
-        let change_ids = [
-            ChangeId::new(uuid::Uuid::from_bytes([1; CHANGE_STORAGE_KEY_BYTES])),
-            ChangeId::new(uuid::Uuid::from_bytes([2; CHANGE_STORAGE_KEY_BYTES])),
-            ChangeId::new(uuid::Uuid::from_bytes([3; CHANGE_STORAGE_KEY_BYTES])),
-        ];
-
-        let keys = change_storage_keys(&change_ids).expect("change keys");
-        let arena_start = keys[0].0.as_ptr() as usize;
-        for (index, (change_id, key)) in change_ids.iter().zip(&keys).enumerate() {
-            assert_eq!(key.0.as_ref(), change_id.as_uuid().as_bytes());
-            assert_eq!(
-                key.0.as_ptr() as usize,
-                arena_start + index * CHANGE_STORAGE_KEY_BYTES,
-                "key {index} must be a contiguous slice of the batch arena"
-            );
-        }
-
-        let plan = PointReadPlan::from_unique_keys(CHANGE_SPACE, keys);
-        assert_eq!(
-            plan.requested_to_unique(),
-            RequestedToUniqueRef::Identity {
-                len: change_ids.len()
-            }
-        );
-    }
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
 
     #[test]
     fn decoded_change_records_preserve_unique_id_order_and_missing_slots() {
@@ -397,19 +167,21 @@ mod tests {
             ChangeId::for_test_label("ordered-missing"),
             ChangeId::for_test_label("ordered-c"),
         ];
-        let records = decode_change_records_in_order(
+        let mut alpha = test_change_record();
+        alpha.change_id = change_ids[0];
+        alpha.schema_key = "alpha".to_owned();
+        let mut charlie = test_change_record();
+        charlie.change_id = change_ids[2];
+        charlie.schema_key = "charlie".to_owned();
+        let records = ChangeLoadBatch::try_new(
+            "ForkTree ChangeCatalog",
             &change_ids,
-            vec![
-                Some(StorageProjectedValue::FullValue(encoded_change("alpha"))),
-                None,
-                Some(StorageProjectedValue::FullValue(encoded_change("charlie"))),
-            ],
+            vec![Some(alpha), None, Some(charlie)],
         )
-        .expect("ordered change records should decode");
-        let records = records
-            .into_iter()
-            .map(|(_, record)| record)
-            .collect::<Vec<_>>();
+        .expect("ordered change records should decode")
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect::<Vec<_>>();
 
         assert_eq!(records.len(), change_ids.len());
         let first = records[0].as_ref().expect("first record");
@@ -427,7 +199,7 @@ mod tests {
             ChangeId::for_test_label("cardinality-a"),
             ChangeId::for_test_label("cardinality-b"),
         ];
-        let error = decode_change_records_in_order(&change_ids, vec![None])
+        let error = ChangeLoadBatch::try_new("ForkTree ChangeCatalog", &change_ids, vec![None])
             .expect_err("short storage response must fail");
 
         assert!(
@@ -444,13 +216,14 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
+        let mut reader = ForkTreeReadFacade::new(&read);
         let first = test_change_record();
         let mut second = first.clone();
         second.schema_key = "derived-row".to_owned();
-        second.row_pk = crate::row_pk::RowPk::single("row-2");
+        second.entity_pk = crate::entity_pk::EntityPk::single("entity-2");
 
         let payloads = materialize_known_change_payloads_in_order(
-            &read,
+            &mut reader,
             [first.clone(), second.clone()].into_iter(),
             ChangeRecordProjection::full(),
         )
@@ -478,29 +251,5 @@ mod tests {
                 .schema_key,
             second.schema_key
         );
-    }
-
-    #[test]
-    fn materialized_json_string_consumes_owned_payload_bytes() {
-        let json = Bytes::from_static(br#"{"value":1}"#);
-        let json_ref = JsonRef::for_content(&json);
-        let source_ptr = json.as_ptr();
-        let mut json_values = vec![Some(json)];
-
-        let materialized = materialized_json_string(
-            MaterializedJsonSlot::Loaded(0),
-            &[json_ref],
-            &mut json_values,
-        )
-        .expect("json should materialize");
-
-        let materialized = materialized.expect("materialized JSON");
-        assert_eq!(materialized, r#"{"value":1}"#);
-        assert_eq!(
-            materialized.as_bytes().as_ptr(),
-            source_ptr,
-            "materialization must retain the JSON-store buffer"
-        );
-        assert!(json_values[0].is_none());
     }
 }

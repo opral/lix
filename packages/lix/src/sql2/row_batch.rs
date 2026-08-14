@@ -1,498 +1,681 @@
-//! Direct current-state snapshot serving for current SQL row scans.
+//! Native entity request decoding and terminal projections.
 //!
-//! The generic live-state reader intentionally exposes fully materialized
-//! engine rows. The committed current-state index has a narrower, private capability:
-//! it can serve durable snapshot bytes directly. Arrow providers and native
-//! public-result reads consume those same bytes, keeping visibility proof in
-//! one place and leaving every unsupported shape on the established row path.
+//! Entity providers consume concrete authenticated ForkTree state views.  The
+//! module keeps `StateRow` as the only row shape before Arrow/DataFusion takes
+//! ownership.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
-
-use async_trait::async_trait;
-use bytes::Bytes;
-use datafusion::arrow::array::{Array, BooleanArray, StringArray};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::physical_plan::Statistics;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
+use std::future::Future;
 
 use crate::LixError;
-use crate::row_pk::RowPk;
-use crate::hot_state::{
-    RowColumnarShadowMaskCache, RowColumnarShadowMaskKey, HotStateContext, HotStateRowFilter,
-    HotStateScanRequest,
-};
+use crate::entity_pk::{EntityPk, EntityPkComponents};
+use crate::forktree::{StateCell, StateKeyRef, decode_state_key, encode_state_key};
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
 use crate::storage_adapter::StorageAdapterRead;
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // Consumed by the source-wide statistics cache in the provider layer.
-pub(crate) struct RowColumnarScanLayout {
-    pub(crate) id: crate::columnar_row_group::RowGroupSetId,
-    pub(crate) manifest: Arc<crate::columnar_row_group::RowGroupManifest>,
-    pub(crate) manifest_digest: [u8; 32],
-    pub(crate) overlay: Arc<Vec<crate::hot_state::RowColumnarOverlayRow>>,
-    pub(crate) branch_id: Arc<str>,
-    pub(crate) head_commit_id: crate::changelog::CommitId,
-    pub(crate) current_state_revision: u64,
-    pub(crate) live_count: u64,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EntityScanRequest {
+    pub(crate) filter: EntityScanFilter,
+    pub(crate) projection: EntityProjection,
+    pub(crate) limit: Option<usize>,
 }
 
-/// Optional private capability supplied only by committed read sessions.
-///
-/// Returning `None` is the normal conservative answer: generic contexts,
-/// transaction-local staged state, retention-scoped reads, and unsupported
-/// SQL shapes all retain the existing materialized-row implementation. A
-/// successful result has one entry per live current-state member, ordered by
-/// logical row primary key ascending. File-backed members sharing a
-/// primary key remain separate adjacent entries; a caller that relies on a
-/// stronger tie order must retain the general SQL path.
-#[async_trait]
-pub(crate) trait RowSnapshotReader: Send + Sync {
-    async fn scan_row_snapshots(
-        &self,
-        request: HotStateScanRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError>;
-
-    /// Returns primary keys from the same committed direct-scan proof as raw
-    /// snapshots. Providers use this only when every projected SQL field is
-    /// an exact primary-key component, avoiding a redundant JSON decode while
-    /// leaving all relational operators to DataFusion.
-    async fn scan_row_primary_keys(
-        &self,
-        _request: HotStateScanRequest,
-    ) -> Result<Option<Vec<RowPk>>, LixError> {
-        Ok(None)
-    }
-
-    async fn plan_row_columnar_scan(
-        &self,
-        _request: HotStateScanRequest,
-    ) -> Result<Option<Arc<RowColumnarScanLayout>>, LixError> {
-        Ok(None)
-    }
-
-    async fn load_row_columnar_group(
-        &self,
-        _layout: Arc<RowColumnarScanLayout>,
-        _group_index: usize,
-        _projection: Vec<usize>,
-    ) -> Result<RecordBatch, LixError> {
-        Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "row snapshot reader does not support columnar groups".to_string(),
-        ))
-    }
-
-    /// Returns an exact keep mask for one immutable base group. Implementors
-    /// may cache it because both the row-group set and the sorted shadow
-    /// identity digest are content-addressed inputs.
-    async fn row_columnar_shadow_mask(
-        &self,
-        layout: Arc<RowColumnarScanLayout>,
-        group_index: usize,
-        identity_column: usize,
-        shadow_identities: Arc<HashSet<String, ahash::RandomState>>,
-        _shadow_identity_digest: [u8; 32],
-    ) -> Result<Arc<BooleanArray>, LixError> {
-        Ok(Arc::new(
-            load_row_columnar_shadow_mask(
-                self,
-                layout,
-                group_index,
-                identity_column,
-                shadow_identities.as_ref(),
-            )
-            .await?,
-        ))
-    }
-
-    #[allow(dead_code)]
-    async fn cached_row_columnar_statistics(
-        &self,
-        _layout: &RowColumnarScanLayout,
-        _group_index: usize,
-        _shadow_identity_digest: [u8; 32],
-        _projection: &[usize],
-    ) -> Result<Option<Statistics>, LixError> {
-        Ok(None)
-    }
-
-    #[allow(dead_code)]
-    async fn cache_row_columnar_statistics(
-        &self,
-        _layout: &RowColumnarScanLayout,
-        _group_index: usize,
-        _shadow_identity_digest: [u8; 32],
-        _projection: Vec<usize>,
-        _statistics: Statistics,
-    ) -> Result<(), LixError> {
-        Ok(())
-    }
-
-    async fn cached_row_columnar_batch(
-        &self,
-        _layout: &RowColumnarScanLayout,
-        _group_index: usize,
-        _shadow_identity_digest: [u8; 32],
-        _projection: &[usize],
-    ) -> Result<Option<Arc<RecordBatch>>, LixError> {
-        Ok(None)
-    }
-
-    async fn cache_row_columnar_batch(
-        &self,
-        _layout: &RowColumnarScanLayout,
-        _group_index: usize,
-        _shadow_identity_digest: [u8; 32],
-        _projection: Vec<usize>,
-        batch: Arc<RecordBatch>,
-    ) -> Result<Arc<RecordBatch>, LixError> {
-        Ok(batch)
-    }
-}
-
-pub(crate) struct CurrentRowSnapshotReader<S> {
-    hot_state: Arc<HotStateContext>,
-    store: S,
-    row_columnar_shadow_masks: Arc<Mutex<RowColumnarShadowMaskCache>>,
-    row_decoded_columns: crate::hot_state::RowDecodedColumnCache,
-}
-
-impl<S> CurrentRowSnapshotReader<S> {
-    pub(crate) fn new(hot_state: Arc<HotStateContext>, store: S) -> Self {
-        let row_columnar_shadow_masks = hot_state.row_columnar_scan_cache();
-        let row_decoded_columns = hot_state.row_decoded_column_cache();
+impl Default for EntityScanRequest {
+    fn default() -> Self {
         Self {
-            hot_state,
-            store,
-            row_columnar_shadow_masks,
-            row_decoded_columns,
+            filter: EntityScanFilter::default(),
+            projection: EntityProjection::default(),
+            limit: None,
         }
     }
 }
 
-#[async_trait]
-impl<S> RowSnapshotReader for CurrentRowSnapshotReader<S>
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EntityScanFilter {
+    pub(crate) schema_keys: Vec<String>,
+    pub(crate) branch_ids: Vec<String>,
+    pub(crate) file_ids: Vec<crate::NullableKeyFilter<String>>,
+    pub(crate) entity_pks: Vec<EntityPk>,
+    pub(crate) untracked: Option<bool>,
+    pub(crate) include_tombstones: bool,
+    pub(crate) constraints: Vec<()>,
+    pub(crate) rows: EntityRowSelection,
+}
+
+impl Default for EntityScanFilter {
+    fn default() -> Self {
+        Self {
+            schema_keys: Vec::new(),
+            branch_ids: Vec::new(),
+            file_ids: Vec::new(),
+            entity_pks: Vec::new(),
+            untracked: None,
+            include_tombstones: false,
+            constraints: Vec::new(),
+            rows: EntityRowSelection::All,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EntityRowSelection {
+    All,
+    None,
+}
+
+impl Default for EntityRowSelection {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EntityProjection {
+    pub(crate) columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EntityExactBatchRequest {
+    pub(crate) rows: Vec<EntityExactRowRequest>,
+    pub(crate) projection: EntityProjection,
+    pub(crate) untracked: Option<bool>,
+    pub(crate) include_tombstones: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EntityExactRowRequest {
+    pub(crate) schema_key: String,
+    pub(crate) branch_id: String,
+    pub(crate) entity_pk: EntityPk,
+    pub(crate) file_id: Option<String>,
+}
+
+/// A slot preserves exact request order and duplicates.  Missing slots stay
+/// `None`; present slots retain whether they came from tracked or untracked
+/// authenticated state so projection cannot silently change ownership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EntityStateSlot {
+    Tracked(StateRow),
+    /// A tracked row loaded from an explicit branch selector. The branch
+    /// identity is retained for by-branch projection when one operation
+    /// groups multiple branch ranges.
+    TrackedAt {
+        row: StateRow,
+        branch_id: String,
+    },
+}
+
+/// Native range scan with branch routing, tracked/untracked overlay, and
+/// final visibility/limit ordering. Every branch is borrowed from the same
+/// operation-owned ForkTree view; global rows are emitted once when several
+/// branch selectors share them.
+pub(crate) async fn scan_slots_forktree<S>(
+    view: &ForkTreeStateView<S>,
+    request: &EntityScanRequest,
+) -> Result<Vec<EntityStateSlot>, LixError>
 where
-    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+    S: StorageAdapterRead,
 {
-    async fn scan_row_snapshots(
-        &self,
-        request: HotStateScanRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        if !direct_row_snapshot_request(&request) {
-            return Ok(None);
-        }
-        self.hot_state
-            .reader(self.store.clone())
-            .scan_direct_row_snapshots(&request)
-            .await
-    }
-
-    async fn scan_row_primary_keys(
-        &self,
-        request: HotStateScanRequest,
-    ) -> Result<Option<Vec<RowPk>>, LixError> {
-        if !direct_row_snapshot_request(&request) {
-            return Ok(None);
-        }
-        self.hot_state
-            .reader(self.store.clone())
-            .scan_direct_row_primary_keys(&request)
-            .await
-    }
-
-    async fn plan_row_columnar_scan(
-        &self,
-        request: HotStateScanRequest,
-    ) -> Result<Option<Arc<RowColumnarScanLayout>>, LixError> {
-        if !direct_row_columnar_request(&request) {
-            return Ok(None);
-        }
-        Ok(self
-            .hot_state
-            .reader(self.store.clone())
-            .plan_direct_row_columnar_scan(&request)
-            .await?
-            .map(
-                |(
-                    id,
-                    manifest,
-                    manifest_digest,
-                    overlay,
-                    branch_id,
-                    head_commit_id,
-                    current_state_revision,
-                    live_count,
-                )| {
-                    Arc::new(RowColumnarScanLayout {
-                        id,
-                        manifest,
-                        manifest_digest,
-                        overlay,
-                        branch_id: Arc::from(branch_id),
-                        head_commit_id,
-                        current_state_revision,
-                        live_count,
-                    })
-                },
-            ))
-    }
-
-    async fn load_row_columnar_group(
-        &self,
-        layout: Arc<RowColumnarScanLayout>,
-        group_index: usize,
-        projection: Vec<usize>,
-    ) -> Result<RecordBatch, LixError> {
-        let schema =
-            crate::columnar_row_group::row_group_projected_schema(&layout.manifest, &projection)?;
-        let row_count = layout
-            .manifest
-            .groups
-            .get(group_index)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("row-group index {group_index} is outside the manifest"),
+    scan_slots_by_branches(
+        request,
+        view.branch_id(),
+        |branch_id, lower, upper| async move {
+            let (source_limit, source_include_tombstones) = range_source_options(request);
+            if request.filter.untracked == Some(true) {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "untracked state is no longer supported",
+                ));
+            }
+            let slots = view
+                .branch_range(
+                    &branch_id,
+                    lower.as_deref(),
+                    upper.as_deref(),
+                    source_limit,
+                    source_include_tombstones,
                 )
-            })?
-            .row_count as usize;
-        let arrays = self
-            .row_decoded_columns
-            .load_projection(
-                &self.store,
-                layout.id,
-                layout.manifest_digest,
-                &layout.manifest,
-                group_index,
-                &projection,
-            )
-            .await?;
-        if projection.is_empty() {
-            return RecordBatch::try_new_with_options(
-                schema,
-                arrays,
-                &datafusion::arrow::record_batch::RecordBatchOptions::new()
-                    .with_row_count(Some(row_count)),
-            )
-            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()));
-        }
-        RecordBatch::try_new(schema, arrays)
-            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))
-    }
-
-    async fn row_columnar_shadow_mask(
-        &self,
-        layout: Arc<RowColumnarScanLayout>,
-        group_index: usize,
-        identity_column: usize,
-        shadow_identities: Arc<HashSet<String, ahash::RandomState>>,
-        shadow_identity_digest: [u8; 32],
-    ) -> Result<Arc<BooleanArray>, LixError> {
-        let key = row_columnar_cache_key(&layout, group_index, shadow_identity_digest);
-        if let Some(mask) = self
-            .row_columnar_shadow_masks
-            .lock()
-            .map_err(|_| row_columnar_mask_error("row columnar shadow-mask cache poisoned"))?
-            .get(&key)
-        {
-            return Ok(mask);
-        }
-
-        let mask = Arc::new(
-            load_row_columnar_shadow_mask(
-                self,
-                layout,
-                group_index,
-                identity_column,
-                shadow_identities.as_ref(),
-            )
-            .await?,
-        );
-        Ok(self
-            .row_columnar_shadow_masks
-            .lock()
-            .map_err(|_| row_columnar_mask_error("row columnar shadow-mask cache poisoned"))?
-            .insert(key, mask))
-    }
-
-    async fn cached_row_columnar_statistics(
-        &self,
-        layout: &RowColumnarScanLayout,
-        group_index: usize,
-        shadow_identity_digest: [u8; 32],
-        projection: &[usize],
-    ) -> Result<Option<Statistics>, LixError> {
-        let key = row_columnar_cache_key(layout, group_index, shadow_identity_digest);
-        Ok(self
-            .row_columnar_shadow_masks
-            .lock()
-            .map_err(|_| row_columnar_mask_error("row columnar shadow-mask cache poisoned"))?
-            .statistics(&key, projection))
-    }
-
-    async fn cache_row_columnar_statistics(
-        &self,
-        layout: &RowColumnarScanLayout,
-        group_index: usize,
-        shadow_identity_digest: [u8; 32],
-        projection: Vec<usize>,
-        statistics: Statistics,
-    ) -> Result<(), LixError> {
-        let key = row_columnar_cache_key(layout, group_index, shadow_identity_digest);
-        self.row_columnar_shadow_masks
-            .lock()
-            .map_err(|_| row_columnar_mask_error("row columnar shadow-mask cache poisoned"))?
-            .insert_statistics(&key, projection, statistics);
-        Ok(())
-    }
-
-    async fn cached_row_columnar_batch(
-        &self,
-        layout: &RowColumnarScanLayout,
-        group_index: usize,
-        shadow_identity_digest: [u8; 32],
-        projection: &[usize],
-    ) -> Result<Option<Arc<RecordBatch>>, LixError> {
-        let key = row_columnar_cache_key(layout, group_index, shadow_identity_digest);
-        Ok(self
-            .row_columnar_shadow_masks
-            .lock()
-            .map_err(|_| row_columnar_mask_error("row columnar scan cache poisoned"))?
-            .batch(&key, projection))
-    }
-
-    async fn cache_row_columnar_batch(
-        &self,
-        layout: &RowColumnarScanLayout,
-        group_index: usize,
-        shadow_identity_digest: [u8; 32],
-        projection: Vec<usize>,
-        batch: Arc<RecordBatch>,
-    ) -> Result<Arc<RecordBatch>, LixError> {
-        let key = row_columnar_cache_key(layout, group_index, shadow_identity_digest);
-        Ok(self
-            .row_columnar_shadow_masks
-            .lock()
-            .map_err(|_| row_columnar_mask_error("row columnar scan cache poisoned"))?
-            .insert_batch(key, projection, batch))
-    }
+                .await?
+                .into_iter()
+                .map(|row| EntityStateSlot::TrackedAt {
+                    row,
+                    branch_id: branch_id.to_string(),
+                })
+                .filter(|slot| request.filter.include_tombstones || !slot_is_deleted(slot))
+                .collect();
+            Ok(filter_slots_by_file_id(slots, &request.filter.file_ids)?
+                .into_iter()
+                .take(request.limit.unwrap_or(usize::MAX))
+                .collect())
+        },
+    )
+    .await
 }
 
-fn row_columnar_cache_key(
-    layout: &RowColumnarScanLayout,
-    group_index: usize,
-    shadow_identity_digest: [u8; 32],
-) -> RowColumnarShadowMaskKey {
-    RowColumnarShadowMaskKey {
-        row_groups: layout.id,
-        branch_id: Arc::clone(&layout.branch_id),
-        head_commit_id: layout.head_commit_id,
-        current_state_revision: layout.current_state_revision,
-        shadow_identity_digest,
-        group_index,
-    }
+pub(crate) async fn scan_slots_transaction<S>(
+    view: &TransactionStateView<S>,
+    request: &EntityScanRequest,
+) -> Result<Vec<EntityStateSlot>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    scan_slots_by_branches(
+        request,
+        view.branch_id(),
+        |branch_id, lower, upper| async move {
+            let (source_limit, source_include_tombstones) = range_source_options(request);
+            if request.filter.untracked == Some(true) {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "untracked state is no longer supported",
+                ));
+            }
+            let slots = view
+                .branch_range(
+                    &branch_id,
+                    lower.as_deref(),
+                    upper.as_deref(),
+                    source_limit,
+                    source_include_tombstones,
+                )
+                .await?
+                .into_iter()
+                .map(|row| EntityStateSlot::TrackedAt {
+                    row,
+                    branch_id: branch_id.to_string(),
+                })
+                .filter(|slot| request.filter.include_tombstones || !slot_is_deleted(slot))
+                .collect();
+            Ok(filter_slots_by_file_id(slots, &request.filter.file_ids)?
+                .into_iter()
+                .take(request.limit.unwrap_or(usize::MAX))
+                .collect())
+        },
+    )
+    .await
 }
 
-async fn load_row_columnar_shadow_mask<R: RowSnapshotReader + ?Sized>(
-    reader: &R,
-    layout: Arc<RowColumnarScanLayout>,
-    group_index: usize,
-    identity_column: usize,
-    shadow_identities: &HashSet<String, ahash::RandomState>,
-) -> Result<BooleanArray, LixError> {
-    let batch = reader
-        .load_row_columnar_group(layout, group_index, vec![identity_column])
-        .await?;
-    let identities = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| row_columnar_mask_error("row columnar identity column is not Utf8"))?;
-    if identities.null_count() != 0 {
-        return Err(row_columnar_mask_error(
-            "row columnar identity column contains NULL",
+fn range_source_options(request: &EntityScanRequest) -> (Option<usize>, bool) {
+    (
+        request
+            .filter
+            .file_ids
+            .is_empty()
+            .then_some(request.limit)
+            .flatten(),
+        request.filter.include_tombstones,
+    )
+}
+
+fn filter_slots_by_file_id(
+    slots: Vec<EntityStateSlot>,
+    file_ids: &[crate::NullableKeyFilter<String>],
+) -> Result<Vec<EntityStateSlot>, LixError> {
+    if file_ids.is_empty()
+        || file_ids
+            .iter()
+            .any(|filter| matches!(filter, crate::NullableKeyFilter::Any))
+    {
+        return Ok(slots);
+    }
+    slots
+        .into_iter()
+        .filter_map(|slot| {
+            let key = match &slot {
+                EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                    decode_state_key(&row.key)
+                }
+            };
+            match key {
+                Ok(key) => file_ids
+                    .iter()
+                    .any(|filter| match filter {
+                        crate::NullableKeyFilter::Null => key.file_id.is_none(),
+                        crate::NullableKeyFilter::Value(file_id) => {
+                            key.file_id.as_deref() == Some(file_id.as_str())
+                        }
+                        crate::NullableKeyFilter::Any => true,
+                    })
+                    .then_some(Ok(slot)),
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
+async fn scan_slots_by_branches<F, Fut>(
+    request: &EntityScanRequest,
+    active_branch_id: String,
+    mut scan_branch: F,
+) -> Result<Vec<EntityStateSlot>, LixError>
+where
+    F: FnMut(String, Option<Vec<u8>>, Option<Vec<u8>>) -> Fut,
+    Fut: Future<Output = Result<Vec<EntityStateSlot>, LixError>>,
+{
+    if request.limit == Some(0) || matches!(request.filter.rows, EntityRowSelection::None) {
+        return Ok(Vec::new());
+    }
+    let mut bounds_request = request.clone();
+    bounds_request.filter.entity_pks.clear();
+    let schema_bounds = schema_bounds(&bounds_request)?;
+    let mut bounds = if request.filter.entity_pks.is_empty() {
+        vec![schema_bounds]
+    } else {
+        let schema = bounds_request
+            .filter
+            .schema_keys
+            .first()
+            .expect("schema bounds validated");
+        request
+            .filter
+            .entity_pks
+            .iter()
+            .map(|entity_pk| {
+                let bounds = crate::forktree::encode_state_entity_prefix_bounds(schema, entity_pk);
+                (Some(bounds.lower), bounds.upper)
+            })
+            .collect()
+    };
+    bounds.sort_by(|left, right| left.0.cmp(&right.0));
+    let branch_ids = if request.filter.branch_ids.is_empty() {
+        vec![active_branch_id]
+    } else {
+        request.filter.branch_ids.clone()
+    };
+    let mut branch_rows = Vec::new();
+    for branch_id in &branch_ids {
+        let mut rows = Vec::new();
+        for (lower, upper) in &bounds {
+            rows.extend(scan_branch(branch_id.clone(), lower.clone(), upper.clone()).await?);
+        }
+        branch_rows.push(merge_range_slots(
+            rows,
+            Vec::new(),
+            request.filter.include_tombstones,
+            request.limit,
         ));
     }
-    Ok(BooleanArray::from(
-        (0..identities.len())
-            .map(|index| !shadow_identities.contains(identities.value(index)))
-            .collect::<Vec<_>>(),
-    ))
+    // One branch is already emitted in canonical key order by the retained
+    // ForkTree range and its global/local overlay. Avoid rebuilding that same
+    // order through the multi-branch heap/dedup machinery.
+    if branch_rows.len() == 1 {
+        return Ok(branch_rows.pop().expect("one branch result"));
+    }
+    let mut global_keys = std::collections::BTreeSet::new();
+    let mut branch_rows = branch_rows
+        .into_iter()
+        .map(|rows| rows.into_iter().map(Some).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let mut cursors = BinaryHeap::new();
+    for (branch_index, rows) in branch_rows.iter().enumerate() {
+        if let Some(Some(slot)) = rows.first() {
+            cursors.push(Reverse((
+                slot_sort_key(slot),
+                slot_branch_sort_key(slot),
+                branch_index,
+                0_usize,
+            )));
+        }
+    }
+    let mut visible = Vec::new();
+    while let Some(Reverse((_key, _branch_sort, branch_index, row_index))) = cursors.pop() {
+        let slot = branch_rows[branch_index][row_index]
+            .take()
+            .expect("k-way branch cursor row");
+        if let Some(Some(next)) = branch_rows[branch_index].get(row_index + 1) {
+            cursors.push(Reverse((
+                slot_sort_key(next),
+                slot_branch_sort_key(next),
+                branch_index,
+                row_index + 1,
+            )));
+        }
+        let key = slot_sort_key(&slot);
+        let is_global = matches!(&slot, EntityStateSlot::Tracked(row) if row.source == crate::state::StateRowSource::Global)
+            || matches!(&slot, EntityStateSlot::TrackedAt { row, .. } if row.source == crate::state::StateRowSource::Global);
+        if is_global && !global_keys.insert((slot_branch_sort_key(&slot), key)) {
+            continue;
+        }
+        if request.filter.include_tombstones || !slot_is_deleted(&slot) {
+            visible.push(slot);
+            if request.limit.is_some_and(|limit| visible.len() >= limit) {
+                break;
+            }
+        }
+    }
+    Ok(visible)
 }
 
-fn row_columnar_mask_error(message: &str) -> LixError {
-    LixError::new(LixError::CODE_INTERNAL_ERROR, message.to_owned())
+fn slot_sort_key(slot: &EntityStateSlot) -> Vec<u8> {
+    match slot {
+        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => row.key.clone(),
+    }
 }
 
-/// The raw snapshot plane is deliberately narrower than the general
-/// live-state reader. It has no identity/filter evaluator beyond exact row
-/// PKs, so only a no-tombstone request without file or residual constraints
-/// can use it. Both Arrow and public-result consumers add their own
-/// output-shape checks above this shared serving boundary.
-fn direct_row_snapshot_request(request: &HotStateScanRequest) -> bool {
-    matches!(request.filter.rows, HotStateRowFilter::All)
-        && !request.filter.include_tombstones
-        && request.filter.untracked.is_none()
-        && request.filter.file_ids.is_empty()
-        && request.filter.constraints.is_empty()
+fn slot_branch_sort_key(slot: &EntityStateSlot) -> String {
+    match slot {
+        EntityStateSlot::Tracked(row) => match row.source {
+            crate::state::StateRowSource::Global => crate::GLOBAL_BRANCH_ID.to_string(),
+            crate::state::StateRowSource::Branch | crate::state::StateRowSource::Staged => {
+                String::new()
+            }
+        },
+        EntityStateSlot::TrackedAt { branch_id, .. } => branch_id.clone(),
+    }
 }
 
-fn direct_row_columnar_request(request: &HotStateScanRequest) -> bool {
-    direct_row_snapshot_request(request)
-        && request.filter.row_pks.is_empty()
-        && request.limit.is_none()
+fn merge_range_slots(
+    tracked: Vec<EntityStateSlot>,
+    untracked: Vec<EntityStateSlot>,
+    include_tombstones: bool,
+    limit: Option<usize>,
+) -> Vec<EntityStateSlot> {
+    if limit == Some(0) {
+        return Vec::new();
+    }
+    let mut tracked = tracked
+        .into_iter()
+        .map(|slot| (slot_sort_key(&slot), slot))
+        .peekable();
+    let mut untracked = untracked
+        .into_iter()
+        .map(|slot| (slot_sort_key(&slot), slot))
+        .peekable();
+    let mut output = Vec::new();
+    while tracked.peek().is_some() || untracked.peek().is_some() {
+        let slot = match (tracked.peek(), untracked.peek()) {
+            (Some((tracked_key, _)), Some((untracked_key, _))) if tracked_key == untracked_key => {
+                tracked.next().expect("peeked tracked slot");
+                untracked.next().expect("peeked untracked slot").1
+            }
+            (Some((tracked_key, _)), Some((untracked_key, _))) if tracked_key < untracked_key => {
+                tracked.next().expect("peeked tracked slot").1
+            }
+            (Some(_), Some(_)) => untracked.next().expect("peeked untracked slot").1,
+            (Some(_), None) => tracked.next().expect("peeked tracked slot").1,
+            (None, Some(_)) => untracked.next().expect("peeked untracked slot").1,
+            (None, None) => break,
+        };
+        if include_tombstones || !slot_is_deleted(&slot) {
+            output.push(slot);
+            if limit.is_some_and(|limit| output.len() >= limit) {
+                break;
+            }
+        }
+    }
+    output
+}
+
+fn slot_is_deleted(slot: &EntityStateSlot) -> bool {
+    match slot {
+        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+            row.value.cell.deleted()
+        }
+    }
+}
+
+pub(crate) async fn exact_forktree<S>(
+    view: &ForkTreeStateView<S>,
+    request: &EntityExactBatchRequest,
+) -> Result<Vec<Option<EntityStateSlot>>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    exact_forktree_inner(view, request).await
+}
+
+async fn exact_forktree_inner<S>(
+    view: &ForkTreeStateView<S>,
+    request: &EntityExactBatchRequest,
+) -> Result<Vec<Option<EntityStateSlot>>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let keys = request
+        .rows
+        .iter()
+        .map(|row| {
+            encode_state_key(StateKeyRef {
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                entity_pk: &row.entity_pk,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut tracked = vec![None; keys.len()];
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, row) in request.rows.iter().enumerate() {
+        groups.entry(row.branch_id.clone()).or_default().push(index);
+    }
+    for (branch_id, indices) in groups {
+        let branch_keys = indices
+            .iter()
+            .map(|index| keys[*index].clone())
+            .collect::<Vec<_>>();
+        if request.untracked == Some(true) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "untracked state is no longer supported",
+            ));
+        }
+        let branch_rows = view.branch_points(&branch_id, &branch_keys, true).await?;
+        for (index, row) in indices.iter().copied().zip(branch_rows) {
+            tracked[index] = row;
+        }
+    }
+    merge_exact_slots(request, keys, tracked)
+}
+
+pub(crate) async fn exact_transaction<S>(
+    view: &TransactionStateView<S>,
+    request: &EntityExactBatchRequest,
+) -> Result<Vec<Option<EntityStateSlot>>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let keys = request
+        .rows
+        .iter()
+        .map(|row| {
+            encode_state_key(StateKeyRef {
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                entity_pk: &row.entity_pk,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut tracked = vec![None; keys.len()];
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, row) in request.rows.iter().enumerate() {
+        groups.entry(row.branch_id.clone()).or_default().push(index);
+    }
+    for (branch_id, indices) in groups {
+        let branch_keys = indices
+            .iter()
+            .map(|index| keys[*index].clone())
+            .collect::<Vec<_>>();
+        if request.untracked == Some(true) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "untracked state is no longer supported",
+            ));
+        }
+        let branch_rows = view.branch_points(&branch_id, &branch_keys, true).await?;
+        for (index, row) in indices.iter().copied().zip(branch_rows) {
+            tracked[index] = row;
+        }
+    }
+    merge_exact_slots(request, keys, tracked)
+}
+
+fn merge_exact_slots(
+    request: &EntityExactBatchRequest,
+    keys: Vec<Vec<u8>>,
+    tracked: Vec<Option<StateRow>>,
+) -> Result<Vec<Option<EntityStateSlot>>, LixError> {
+    if tracked.len() != keys.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "native entity exact lookup returned the wrong slot count",
+        ));
+    }
+    let mut output = Vec::with_capacity(keys.len());
+    for ((requested, _key), tracked) in request.rows.iter().zip(keys).zip(tracked) {
+        let slot = if let Some(row) = tracked {
+            let decoded = decode_state_key(&row.key)?;
+            if decoded.schema_key != requested.schema_key
+                || decoded.entity_pk != requested.entity_pk
+                || decoded.file_id != requested.file_id
+            {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "native tracked entity row identity mismatch",
+                ));
+            }
+            if !request.include_tombstones && row.value.cell.deleted() {
+                None
+            } else {
+                Some(EntityStateSlot::TrackedAt {
+                    row,
+                    branch_id: requested.branch_id.clone(),
+                })
+            }
+        } else {
+            None
+        };
+        output.push(slot);
+    }
+    Ok(output)
+}
+
+pub(crate) fn schema_bounds(
+    request: &EntityScanRequest,
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), LixError> {
+    let schema = request.filter.schema_keys.first().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            "entity scan has no schema key",
+        )
+    })?;
+    if request.filter.schema_keys.iter().any(|key| key != schema) {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "one native entity scan cannot mix schema keys",
+        ));
+    }
+    // The native key codec exposes the schema prefix by encoding the empty
+    // PK without the trailing file-id component.  This remains a bounded
+    // ordered-tree range; it is never replaced by a full scan.
+    if !request.filter.entity_pks.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "entity-PK scans use exact native points",
+        ));
+    }
+    let empty_pk = EntityPk {
+        components: EntityPkComponents::Empty,
+    };
+    let lower = crate::forktree::encode_state_entity_prefix(schema, &empty_pk);
+    let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
+    Ok((Some(lower), upper))
+}
+
+#[cfg(test)]
+pub(crate) fn tracked_slot(row: &EntityStateSlot) -> Option<&StateRow> {
+    match row {
+        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => Some(row),
+    }
+}
+
+pub(crate) fn slot_snapshot(row: &EntityStateSlot) -> Option<&str> {
+    match row {
+        EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+            match &row.value.cell {
+                StateCell::Value(value) => Some(value.as_ref()),
+                StateCell::Null | StateCell::Tombstone => None,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn row_snapshot(row: &StateRow) -> Option<&str> {
+    match &row.value.cell {
+        StateCell::Value(value) => Some(value.as_ref()),
+        StateCell::Null | StateCell::Tombstone => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::{LixTimestamp, SharedStr};
+    use crate::forktree::{StateValue, encode_state_key};
+    use crate::state::StateRowSource;
 
-    fn cache_key_test_layout() -> RowColumnarScanLayout {
-        RowColumnarScanLayout {
-            id: crate::columnar_row_group::RowGroupSetId::new([41; 16]),
-            manifest: Arc::new(crate::columnar_row_group::RowGroupManifest {
-                namespace: "cache-key-test".to_owned(),
-                metadata: std::collections::HashMap::new(),
-                fields: Vec::new(),
-                groups: Vec::new(),
-                encoded_digest: [0; 32],
+    fn row(file_id: Option<&str>) -> EntityStateSlot {
+        let entity_pk = EntityPk::single("shared-plugin-row");
+        EntityStateSlot::Tracked(StateRow {
+            key: encode_state_key(StateKeyRef {
+                schema_key: "plugin_row",
+                file_id,
+                entity_pk: &entity_pk,
             }),
-            manifest_digest: [42; 32],
-            overlay: Arc::new(Vec::new()),
-            branch_id: Arc::from("branch-a"),
-            head_commit_id: crate::changelog::CommitId::for_test_label("cache-key-head"),
-            current_state_revision: 17,
-            live_count: 0,
+            value: StateValue {
+                change_id: ChangeId::for_test_label("entity-file-filter-change"),
+                commit_id: CommitId::for_test_label("entity-file-filter-commit"),
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                cell: StateCell::Value(SharedStr::from("{}")),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source: StateRowSource::Branch,
+        })
+    }
+
+    #[test]
+    fn file_filter_selects_one_owner_before_limit_for_shared_plugin_identity() {
+        let request = EntityScanRequest {
+            filter: EntityScanFilter {
+                file_ids: vec![crate::NullableKeyFilter::Value("file-b".to_string())],
+                ..EntityScanFilter::default()
+            },
+            limit: Some(1),
+            ..EntityScanRequest::default()
+        };
+        assert_eq!(range_source_options(&request).0, None);
+        let selected = filter_slots_by_file_id(
+            vec![row(Some("file-a")), row(Some("file-b"))],
+            &request.filter.file_ids,
+        )
+        .expect("authenticated file-owner filter");
+        assert_eq!(selected.len(), 1);
+        let key = match &selected[0] {
+            EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                decode_state_key(&row.key).expect("typed state key")
+            }
+        };
+        assert_eq!(key.file_id.as_deref(), Some("file-b"));
+    }
+
+    #[test]
+    fn file_filter_rejects_malformed_authenticated_key() {
+        let mut malformed = row(Some("file-a"));
+        match &mut malformed {
+            EntityStateSlot::Tracked(row) | EntityStateSlot::TrackedAt { row, .. } => {
+                row.key = vec![0xff];
+            }
         }
-    }
-
-    #[test]
-    fn columnar_cache_key_preserves_every_layout_dimension() {
-        let layout = cache_key_test_layout();
-        let key = row_columnar_cache_key(&layout, 3, [43; 32]);
-
-        assert_eq!(key.row_groups, layout.id);
-        assert_eq!(key.branch_id, layout.branch_id);
-        assert_eq!(key.head_commit_id, layout.head_commit_id);
-        assert_eq!(key.current_state_revision, layout.current_state_revision);
-        assert_eq!(key.shadow_identity_digest, [43; 32]);
-        assert_eq!(key.group_index, 3);
-    }
-
-    #[test]
-    fn exact_primary_key_and_limit_bypass_columnar_scan() {
-        let mut request = HotStateScanRequest::default();
-        assert!(direct_row_columnar_request(&request));
-
-        request
-            .filter
-            .row_pks
-            .push(RowPk::single("point-read"));
-        assert!(!direct_row_columnar_request(&request));
-
-        request.filter.row_pks.clear();
-        request.limit = Some(1);
-        assert!(!direct_row_columnar_request(&request));
+        assert!(
+            filter_slots_by_file_id(
+                vec![malformed],
+                &[crate::NullableKeyFilter::Value("file-a".to_string())],
+            )
+            .is_err()
+        );
     }
 }

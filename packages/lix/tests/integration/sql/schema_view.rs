@@ -501,16 +501,17 @@ simulation_test!(
 
         // Refusing to push it must not change the answer.
         let result = session
-            .execute("SELECT id FROM range_note WHERE weight > 0.5 ORDER BY id", &[])
+            .execute(
+                "SELECT id FROM range_note WHERE weight > 0.5 ORDER BY id",
+                &[],
+            )
             .await
             .expect("float range query should still answer");
         assert_eq!(range_note_ids(&result), vec!["n0".to_string()]);
     }
 );
 
-async fn register_range_note_schema(
-    session: &crate::support::simulation_test::engine::SimSession,
-) {
+async fn register_range_note_schema(session: &crate::support::simulation_test::engine::SimSession) {
     // `ordinal` is declared unique so this one fixture also carries hot-index
     // entries, letting the same differential cover the index range seek when
     // that path lands. `weight` is the deliberate negative control: a float

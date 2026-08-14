@@ -26,12 +26,13 @@ use crate::filesystem::{
     FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
     FilesystemPathSelection,
 };
-use crate::functions::FunctionProviderHandle;
-use crate::hot_state::{HotStateFilter, HotStateProjection, HotStateReader, HotStateScanRequest};
-use crate::hot_state::{
-    MaterializedHotStateBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
+#[cfg(test)]
+use crate::forktree::StateCell;
+use crate::forktree::{
+    encode_state_entity_prefix, encode_state_entity_prefix_bounds, exclusive_prefix_upper_bound,
 };
-use crate::plugin::runtime::{is_plugin_storage_path, reject_normal_plugin_storage_mutation};
+use crate::functions::FunctionProviderHandle;
+use crate::plugin::{is_plugin_storage_path, reject_normal_plugin_storage_mutation};
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
     resolve_write_branch_scope,
@@ -43,9 +44,11 @@ use crate::sql2::write_normalization::{
     InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
     defaultable_text_insert_value, insert_column_is_omitted,
 };
+use crate::state::{ForkTreeStateView, StateRow, TransactionStateView};
+use crate::storage_adapter::{StorageAdapterRead, StorageError};
 #[cfg(test)]
-use crate::transaction_types::TransactionWriteRow;
-use crate::transaction_types::{
+use crate::transaction::types::TransactionWriteRow;
+use crate::transaction::types::{
     LogicalPrimaryKey, RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWriteOperation,
     TransactionWriteOrigin,
 };
@@ -56,15 +59,14 @@ use crate::{
 
 use crate::filesystem::{
     DirectoryDescriptorWriteIntent, DirectoryPathRecord, DirectoryPathResolver,
-    FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext, VisibleFilesystem,
-    create_directory_path_with_leaf_id_with_resolvers, derive_directory_paths,
-    directory_path_resolvers_from_hot_state, directory_path_resolvers_from_path_index,
-    filesystem_storage_scope_key, plan_parsed_directory_path_update_with_resolvers,
-    plan_recursive_directory_delete,
+    FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext, FilesystemStateRow,
+    FilesystemStateRows, VisibleFilesystem, create_directory_path_with_leaf_id_with_resolvers,
+    derive_directory_paths, directory_path_resolvers_from_path_index, filesystem_storage_scope_key,
+    plan_parsed_directory_path_update_with_resolvers, plan_recursive_directory_delete,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextHotStateReader};
-use crate::transaction_types::{TransactionWrite, TransactionWriteMode};
+use crate::sql2::{SqlWriteContext, WriteAccess};
+use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
 use super::file::{
     FileIdConstraint, FilePathPredicate, exact_string_column_constraint_from_filters,
@@ -78,13 +80,13 @@ use super::upsert::{
     StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertReturningRow, UpsertSupport,
     materialize_omitted_column, materialize_omitted_insert_default, validate_target_columns,
 };
-use crate::row_pk::RowPk;
+use crate::entity_pk::EntityPk;
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 /// Physical-identity column the upsert driver matches conflicting rows on.
 /// A directory's identity is its `id`; the underlying live state keys on the
-/// directory id as a single-element row primary key.
+/// directory id as a single-element entity primary key.
 const LIX_DIRECTORY_IDENTITY: &[&str] = &["id"];
 const LIX_DIRECTORY_PATH_IDENTITY: &[&str] = &["path"];
 const LIX_DIRECTORY_BY_BRANCH_PATH_IDENTITY: &[&str] = &["path", "lixcol_branch_id"];
@@ -144,21 +146,24 @@ pub(crate) async fn execute_exact_lix_directory_root_listing(
     })
 }
 
-pub(super) async fn register_lix_directory_active_provider(
+pub(super) async fn register_lix_directory_active_provider<R>(
     session: &SessionContext,
     surface_name: &str,
     active_branch_id: &str,
-    hot_state: Arc<dyn HotStateReader>,
+    state: &ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     register_spec_table(
         session,
         surface_name,
         Arc::new(LixDirectorySpec::active_branch(
             active_branch_id,
-            hot_state,
+            DirectoryState::Committed(state.clone()),
             filesystem_path_index,
             branch_ref,
             functions,
@@ -167,19 +172,22 @@ pub(super) async fn register_lix_directory_active_provider(
     )
 }
 
-pub(super) async fn register_lix_directory_by_branch_provider(
+pub(super) async fn register_lix_directory_by_branch_provider<R>(
     session: &SessionContext,
     surface_name: &str,
-    hot_state: Arc<dyn HotStateReader>,
+    state: &ForkTreeStateView<R>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     register_spec_table(
         session,
         surface_name,
-        Arc::new(LixDirectorySpec::by_branch(
-            hot_state,
+        Arc::new(LixDirectorySpec::by_branch_read(
+            DirectoryState::Committed(state.clone()),
             filesystem_path_index,
             branch_ref,
             functions,
@@ -188,20 +196,25 @@ pub(super) async fn register_lix_directory_by_branch_provider(
     )
 }
 
-pub(super) async fn register_by_branch_write_provider(
+pub(super) async fn register_by_branch_write_provider<R>(
     session: &SessionContext,
     surface_name: &str,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
     branch_ref: Arc<dyn BranchRefReader>,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let functions = write_ctx.functions();
-    let hot_state = Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
-    let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = hot_state.clone();
+    let active_branch_id = write_ctx.active_branch_id();
+    let state = write_ctx.state_view().clone();
+    let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = Arc::new(write_ctx.clone());
     register_spec_table(
         session,
         surface_name,
         Arc::new(LixDirectorySpec::by_branch(
-            hot_state,
+            active_branch_id,
+            DirectoryState::Transaction(state),
             filesystem_path_index,
             branch_ref,
             functions,
@@ -210,22 +223,25 @@ pub(super) async fn register_by_branch_write_provider(
     )
 }
 
-pub(super) async fn register_active_write_provider(
+pub(super) async fn register_active_write_provider<R>(
     session: &SessionContext,
     surface_name: &str,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
     branch_ref: Arc<dyn BranchRefReader>,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let active_branch_id = write_ctx.active_branch_id();
     let functions = write_ctx.functions();
-    let hot_state = Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
-    let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = hot_state.clone();
+    let state = write_ctx.state_view().clone();
+    let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = Arc::new(write_ctx.clone());
     register_spec_table(
         session,
         surface_name,
         Arc::new(LixDirectorySpec::active_branch(
             active_branch_id,
-            hot_state,
+            DirectoryState::Transaction(state),
             filesystem_path_index,
             branch_ref,
             functions,
@@ -235,13 +251,103 @@ pub(super) async fn register_active_write_provider(
 }
 
 #[derive(Clone)]
-struct LixDirectorySpec {
+struct LixDirectorySpec<R> {
     schema: SchemaRef,
-    hot_state: Arc<dyn HotStateReader>,
+    state: DirectoryState<R>,
+    state_branch_id: String,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
+}
+
+#[derive(Clone)]
+enum DirectoryState<R> {
+    Committed(ForkTreeStateView<R>),
+    Transaction(TransactionStateView<R>),
+    #[cfg(test)]
+    Fixture(Vec<StateRow>),
+}
+
+impl<R> DirectoryState<R>
+where
+    R: StorageAdapterRead,
+{
+    async fn points(
+        &self,
+        keys: &[Vec<u8>],
+        include_tombstones: bool,
+    ) -> Result<Vec<Option<StateRow>>, StorageError> {
+        match self {
+            Self::Committed(state) => state.points(keys, include_tombstones).await,
+            Self::Transaction(state) => state.points(keys, include_tombstones).await,
+            #[cfg(test)]
+            Self::Fixture(rows) => Ok(keys
+                .iter()
+                .map(|key| {
+                    rows.iter()
+                        .find(|row| &row.key == key)
+                        .filter(|row| {
+                            include_tombstones || !matches!(row.value.cell, StateCell::Tombstone)
+                        })
+                        .cloned()
+                })
+                .collect()),
+        }
+    }
+
+    async fn range(
+        &self,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<Vec<StateRow>, StorageError> {
+        match self {
+            Self::Committed(state) => state.range(lower, upper, limit, include_tombstones).await,
+            Self::Transaction(state) => state.range(lower, upper, limit, include_tombstones).await,
+            #[cfg(test)]
+            Self::Fixture(rows) => Ok(rows
+                .iter()
+                .filter(|row| lower.is_none_or(|bound| row.key.as_slice() >= bound))
+                .filter(|row| upper.is_none_or(|bound| row.key.as_slice() < bound))
+                .filter(|row| include_tombstones || !matches!(row.value.cell, StateCell::Tombstone))
+                .take(limit.unwrap_or(usize::MAX))
+                .cloned()
+                .collect()),
+        }
+    }
+
+    async fn branch_range(
+        &self,
+        branch_id: &str,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: Option<usize>,
+        include_tombstones: bool,
+    ) -> Result<Vec<StateRow>, LixError> {
+        match self {
+            Self::Committed(state) => {
+                state
+                    .branch_range(branch_id, lower, upper, limit, include_tombstones)
+                    .await
+            }
+            Self::Transaction(state) => {
+                state
+                    .branch_range(branch_id, lower, upper, limit, include_tombstones)
+                    .await
+            }
+            #[cfg(test)]
+            Self::Fixture(rows) => Ok(rows
+                .iter()
+                .filter(|row| lower.is_none_or(|bound| row.key.as_slice() >= bound))
+                .filter(|row| upper.is_none_or(|bound| row.key.as_slice() < bound))
+                .filter(|row| include_tombstones || !matches!(row.value.cell, StateCell::Tombstone))
+                .take(limit.unwrap_or(usize::MAX))
+                .cloned()
+                .collect()),
+        }
+    }
 }
 
 /// Stable public identity for a directory post-image. By-branch surfaces need
@@ -253,10 +359,124 @@ struct DirectoryReturningKey {
     branch_id: String,
 }
 
-impl LixDirectorySpec {
+#[derive(Clone, Debug, Default)]
+struct DirectoryScanFilter {
+    branch_ids: Vec<String>,
+    entity_pks: Vec<EntityPk>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DirectoryScanRequest {
+    filter: DirectoryScanFilter,
+    limit: Option<usize>,
+}
+
+fn resolve_directory_branch_rows(
+    rows: Vec<(String, StateRow)>,
+    limit: Option<usize>,
+) -> Vec<(String, StateRow)> {
+    // A branch view includes the authenticated global overlay. Deduplicate
+    // only duplicate acquisition of the same public (requested branch,
+    // identity) row: public by-branch semantics intentionally expand global
+    // rows into every selected branch, including the raw global branch row
+    // when it is selected.
+    let mut deduplicated = BTreeMap::new();
+    for (requested_branch_id, row) in rows {
+        deduplicated.insert(
+            (row.key.clone(), requested_branch_id.clone()),
+            (requested_branch_id, row),
+        );
+    }
+    let mut rows = deduplicated.into_values().collect::<Vec<_>>();
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    rows
+}
+
+fn resolve_directory_filesystem_rows(
+    rows: Vec<FilesystemStateRow>,
+    limit: Option<usize>,
+) -> FilesystemStateRows {
+    // The tracked lane is inserted first and the untracked lane second, so an
+    // untracked value or tombstone owns the visible key. The shared merge
+    // keeps that tombstone until after shadowing, then removes it from the
+    // public directory projection.
+    if let Some(limit) = limit {
+        let mut rows = crate::filesystem::merge_filesystem_state_rows(rows, false)
+            .into_iter()
+            .collect::<Vec<_>>();
+        rows.truncate(limit);
+        return FilesystemStateRows::from_rows(rows);
+    }
+    crate::filesystem::merge_filesystem_state_rows(rows, false)
+}
+
+impl<R> LixDirectorySpec<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    async fn load_rows(&self, request: &DirectoryScanRequest) -> Result<FilesystemStateRows> {
+        let branch_ids = if request.filter.branch_ids.is_empty() {
+            vec![self.state_branch_id.clone()]
+        } else {
+            request.filter.branch_ids.clone()
+        };
+        let mut rows = Vec::new();
+        for branch_id in branch_ids {
+            if request.filter.entity_pks.is_empty() {
+                let first = EntityPk::uuid_from_canonical("00000000-0000-0000-0000-000000000000")
+                    .expect("minimum UUID is canonical");
+                let last = EntityPk::uuid_from_canonical("ffffffff-ffff-ffff-ffff-ffffffffffff")
+                    .expect("maximum UUID is canonical");
+                let lower = encode_state_entity_prefix(DIRECTORY_SCHEMA_KEY, &first);
+                let upper = exclusive_prefix_upper_bound(&encode_state_entity_prefix(
+                    DIRECTORY_SCHEMA_KEY,
+                    &last,
+                ));
+                rows.extend(
+                    FilesystemStateRows::from_view_rows(
+                        self.state
+                            .branch_range(&branch_id, Some(&lower), upper.as_deref(), None, false)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?,
+                        &branch_id,
+                        false,
+                    )
+                    .map_err(lix_error_to_datafusion_error)?,
+                );
+            } else {
+                for entity_pk in &request.filter.entity_pks {
+                    let bounds = encode_state_entity_prefix_bounds(DIRECTORY_SCHEMA_KEY, entity_pk);
+                    rows.extend(
+                        FilesystemStateRows::from_view_rows(
+                            self.state
+                                .branch_range(
+                                    &branch_id,
+                                    Some(&bounds.lower),
+                                    bounds.upper.as_deref(),
+                                    None,
+                                    false,
+                                )
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?,
+                            &branch_id,
+                            false,
+                        )
+                        .map_err(lix_error_to_datafusion_error)?,
+                    );
+                }
+            }
+        }
+
+        Ok(resolve_directory_filesystem_rows(
+            rows.into_iter().collect(),
+            request.limit,
+        ))
+    }
     async fn indexed_path_matches(
         &self,
-        request: &HotStateScanRequest,
+        request: &DirectoryScanRequest,
         filters: &[Expr],
     ) -> Result<Option<(FilesystemPathSelection, FilesystemPathSelection)>> {
         let predicate = file_path_predicate_from_filters(filters);
@@ -285,14 +505,16 @@ impl LixDirectorySpec {
 
     fn active_branch(
         active_branch_id: impl Into<String>,
-        hot_state: Arc<dyn HotStateReader>,
+        state: DirectoryState<R>,
         filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         functions: FunctionProviderHandle,
     ) -> Self {
+        let active_branch_id = active_branch_id.into();
         Self {
             schema: lix_directory_schema(),
-            hot_state,
+            state,
+            state_branch_id: active_branch_id.clone(),
             filesystem_path_index,
             branch_ref,
             functions,
@@ -301,14 +523,37 @@ impl LixDirectorySpec {
     }
 
     fn by_branch(
-        hot_state: Arc<dyn HotStateReader>,
+        active_branch_id: impl Into<String>,
+        state: DirectoryState<R>,
+        filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
+        functions: FunctionProviderHandle,
+    ) -> Self {
+        let active_branch_id = active_branch_id.into();
+        Self {
+            schema: lix_directory_by_branch_schema(),
+            state,
+            state_branch_id: active_branch_id,
+            filesystem_path_index,
+            branch_ref,
+            functions,
+            branch_binding: BranchBinding::explicit(),
+        }
+    }
+
+    fn by_branch_read(
+        state: DirectoryState<R>,
         filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_directory_by_branch_schema(),
-            hot_state,
+            state,
+            // Read planning resolves an unqualified by-branch request to all
+            // visible branches. This fallback is used only by helpers that
+            // bypass that planning step; global is the neutral owner there.
+            state_branch_id: GLOBAL_BRANCH_ID.to_string(),
             filesystem_path_index,
             branch_ref,
             functions,
@@ -323,39 +568,34 @@ impl LixDirectorySpec {
     /// previous live-state scan.
     async fn path_resolvers_for_write(
         &self,
-        write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
+        batch: Option<&RecordBatch>,
     ) -> Result<BTreeMap<String, DirectoryPathResolver>> {
-        let branch_ids = self
-            .branch_binding
-            .active_branch_id()
-            .map(|branch_id| vec![branch_id.to_string()])
-            .unwrap_or_default();
+        let branch_ids = if let Some(batch) = batch {
+            directory_branch_ids_from_batch(batch, self.branch_binding.active_branch_id())?
+                .into_iter()
+                .collect()
+        } else {
+            self.branch_binding
+                .active_branch_id()
+                .map(|branch_id| vec![branch_id.to_string()])
+                .unwrap_or_default()
+        };
         let index = self
             .filesystem_path_index
             .path_index(&FilesystemPathIndexRequest::new(branch_ids))
-            .await;
-        match index {
-            Ok(index) => directory_path_resolvers_from_path_index(
-                index.as_ref(),
-                self.branch_binding.active_branch_id(),
-            )
-            .map_err(lix_error_to_datafusion_error),
-            // The index includes files as well as directories. If building it
-            // fails for an unrelated malformed file descriptor, retain the
-            // previous directory-write behavior rather than failing a write
-            // that the directory-only live-state resolver can still plan.
-            Err(_) => directory_path_resolvers_from_hot_state(
-                Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
-                self.branch_binding.active_branch_id(),
-            )
             .await
-            .map_err(lix_error_to_datafusion_error),
-        }
+            .map_err(lix_error_to_datafusion_error)?;
+        directory_path_resolvers_from_path_index(
+            index.as_ref(),
+            self.branch_binding.active_branch_id(),
+        )
+        .map_err(lix_error_to_datafusion_error)
     }
 
     /// Resolve the candidate-row scan request for an UPDATE/DELETE, scoped by
     /// the explicit branch ids from the statement filters.
-    async fn dml_scan_request(&self, filters: &[Expr]) -> Result<HotStateScanRequest> {
+    async fn dml_scan_request(&self, filters: &[Expr]) -> Result<DirectoryScanRequest> {
         let mut request =
             lix_directory_scan_request(self.branch_binding.active_branch_id(), None, None);
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
@@ -374,20 +614,20 @@ impl LixDirectorySpec {
     /// can inspect every directory path, not just the filter-matched rows.
     fn dml_source(
         &self,
-        write_ctx: &SqlWriteContext,
-        request: HotStateScanRequest,
+        _write_ctx: &SqlWriteContext<R>,
+        request: DirectoryScanRequest,
         indexed_matches: Option<(FilesystemPathSelection, FilesystemPathSelection)>,
         captured: Arc<Mutex<Option<RecordBatch>>>,
     ) -> RowSource {
         row_source(
             (
-                write_ctx.clone(),
+                self.clone(),
                 request,
                 indexed_matches,
                 Arc::clone(&self.schema),
                 captured,
             ),
-            |(write_ctx, request, indexed_matches, table_schema, captured)| async move {
+            |(spec, request, indexed_matches, table_schema, captured)| async move {
                 let (source_batch, all_directories_batch) =
                     if let Some((selected, all)) = indexed_matches.as_ref() {
                         (
@@ -397,11 +637,8 @@ impl LixDirectorySpec {
                                 .map_err(lix_error_to_datafusion_error)?,
                         )
                     } else {
-                        let rows = write_ctx
-                            .scan_hot_state_batch(&request)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?;
-                        let batch = lix_directory_record_batch(&table_schema, &rows)
+                        let rows = spec.load_rows(&request).await?;
+                        let batch = lix_directory_record_batch_with_branch_ids(&table_schema, rows)
                             .map_err(lix_error_to_datafusion_error)?;
                         (batch.clone(), batch)
                     };
@@ -444,7 +681,7 @@ impl LixDirectorySpec {
     /// select the requested identities in write-row order.
     async fn returning_post_image(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         keys: &[DirectoryReturningKey],
     ) -> Result<RecordBatch> {
         if keys.is_empty() {
@@ -463,11 +700,12 @@ impl LixDirectorySpec {
                 .into_iter()
                 .collect();
         }
-        let rows = write_ctx
-            .scan_hot_state_batch(&request)
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-        let batch = lix_directory_record_batch(&self.schema, &rows)
+        let transaction_spec = Self {
+            state: DirectoryState::Transaction(write_ctx.state_view().clone()),
+            ..self.clone()
+        };
+        let rows = transaction_spec.load_rows(&request).await?;
+        let batch = lix_directory_record_batch_with_branch_ids(&self.schema, rows)
             .map_err(lix_error_to_datafusion_error)?;
         let mut post_rows = BTreeMap::new();
         for row_index in 0..batch.num_rows() {
@@ -498,12 +736,15 @@ impl LixDirectorySpec {
 }
 
 #[async_trait]
-impl TableSpec for LixDirectorySpec {
+impl<R> TableSpec<R> for LixDirectorySpec<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn table_name(&self) -> &str {
         "lix_directory"
     }
 
-    fn upsert_support(&self) -> Option<&dyn UpsertSupport> {
+    fn upsert_support(&self) -> Option<&dyn UpsertSupport<R>> {
         Some(self)
     }
 
@@ -595,7 +836,7 @@ impl TableSpec for LixDirectorySpec {
             source: scan_row_source(
                 Arc::clone(&output_schema),
                 (
-                    Arc::clone(&self.hot_state),
+                    self.clone(),
                     Arc::clone(&self.schema),
                     output_schema,
                     projection.cloned(),
@@ -605,7 +846,7 @@ impl TableSpec for LixDirectorySpec {
                     limit,
                 ),
                 |(
-                    hot_state,
+                    spec,
                     batch_schema,
                     _output_schema,
                     projection,
@@ -617,12 +858,8 @@ impl TableSpec for LixDirectorySpec {
                     let batch = if let Some(indexed_matches) = indexed_matches.as_ref() {
                         indexed_lix_directory_record_batch(&batch_schema, indexed_matches)
                     } else {
-                        let rows = hot_state.scan_batch(&request).await.map_err(|error| {
-                            DataFusionError::Execution(format!(
-                                "sql2 lix_directory scan failed: {error}"
-                            ))
-                        })?;
-                        lix_directory_record_batch(&batch_schema, &rows)
+                        let rows = spec.load_rows(&request).await?;
+                        lix_directory_record_batch_with_branch_ids(&batch_schema, rows)
                     }
                     .map_err(|error| {
                         DataFusionError::Execution(format!(
@@ -643,7 +880,7 @@ impl TableSpec for LixDirectorySpec {
 
     async fn stage_insert(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         batches: Vec<RecordBatch>,
     ) -> Result<u64> {
         let surface_name = lix_directory_surface_name(&self.branch_binding);
@@ -656,8 +893,12 @@ impl TableSpec for LixDirectorySpec {
         let mut rows = RawWriteBatch::with_capacity(row_capacity);
         let mut count = 0_u64;
         for batch in batches {
+            validate_lix_directory_schema_boundary_batch(&batch)?;
             if path_resolvers.is_none() {
-                path_resolvers = Some(self.path_resolvers_for_write(write_ctx).await?);
+                path_resolvers = Some(
+                    self.path_resolvers_for_write(write_ctx, Some(&batch))
+                        .await?,
+                );
             }
             count = count
                 .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
@@ -703,7 +944,7 @@ impl TableSpec for LixDirectorySpec {
 
     async fn plan_insert_with_returning(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         _input: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
         returning: DmlReturning,
     ) -> Result<InsertApply> {
@@ -725,11 +966,15 @@ impl TableSpec for LixDirectorySpec {
                 let mut count = 0_u64;
                 for batch in batches {
                     let batch = spec.materialize_returning_insert_defaults(&batch)?;
+                    validate_lix_directory_schema_boundary_batch(&batch)?;
                     for row_index in 0..batch.num_rows() {
                         keys.push(spec.returning_key_from_batch(&batch, row_index)?);
                     }
                     if path_resolvers.is_none() {
-                        path_resolvers = Some(spec.path_resolvers_for_write(&write_ctx).await?);
+                        path_resolvers = Some(
+                            spec.path_resolvers_for_write(&write_ctx, Some(&batch))
+                                .await?,
+                        );
                     }
                     count = count
                         .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
@@ -796,18 +1041,20 @@ impl TableSpec for LixDirectorySpec {
 
     async fn plan_delete(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
         let request = self.dml_scan_request(filters).await?;
         let indexed_matches = self.indexed_path_matches(&request, filters).await?;
         let captured: Arc<Mutex<Option<RecordBatch>>> = Arc::new(Mutex::new(None));
         let branch_binding = self.branch_binding.clone();
+        let filesystem_path_index = Arc::clone(&self.filesystem_path_index);
         Ok(PlannedDml {
             source: self.dml_source(&write_ctx, request, indexed_matches, Arc::clone(&captured)),
             apply: Arc::new(move |matched_batch| {
                 let write_ctx = write_ctx.clone();
                 let branch_binding = branch_binding.clone();
+                let filesystem_path_index = Arc::clone(&filesystem_path_index);
                 let captured = Arc::clone(&captured);
                 async move {
                     let source_batch = captured
@@ -827,14 +1074,14 @@ impl TableSpec for LixDirectorySpec {
                     )?;
                     let mut visible_filesystems = BTreeMap::new();
                     for branch_id in branch_ids {
+                        let index = filesystem_path_index
+                            .path_index(&FilesystemPathIndexRequest::new(vec![branch_id.clone()]))
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
                         visible_filesystems.insert(
                             branch_id.clone(),
-                            VisibleFilesystem::load(
-                                Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
-                                &branch_id,
-                            )
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?,
+                            visible_filesystem_from_path_index(index.as_ref())
+                                .map_err(lix_error_to_datafusion_error)?,
                         );
                     }
                     let (write_rows, count) = lix_directory_recursive_delete_rows_from_batch(
@@ -862,7 +1109,7 @@ impl TableSpec for LixDirectorySpec {
 
     async fn plan_update(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
@@ -871,20 +1118,19 @@ impl TableSpec for LixDirectorySpec {
         let captured: Arc<Mutex<Option<RecordBatch>>> = Arc::new(Mutex::new(None));
         let branch_binding = self.branch_binding.clone();
         let functions = self.functions.clone();
+        let resolver_spec = self.clone();
         Ok(PlannedDml {
             source: self.dml_source(&write_ctx, request, indexed_matches, captured),
             apply: Arc::new(move |matched_batch| {
                 let write_ctx = write_ctx.clone();
                 let branch_binding = branch_binding.clone();
                 let functions = functions.clone();
+                let resolver_spec = resolver_spec.clone();
                 let assignments = assignments.clone();
                 async move {
-                    let mut path_resolvers = directory_path_resolvers_from_hot_state(
-                        Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
-                        branch_binding.active_branch_id(),
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
+                    let mut path_resolvers = resolver_spec
+                        .path_resolvers_for_write(&write_ctx, Some(&matched_batch))
+                        .await?;
                     let write_rows = lix_directory_update_write_rows_from_batch(
                         &matched_batch,
                         &assignments,
@@ -915,7 +1161,7 @@ impl TableSpec for LixDirectorySpec {
 
     async fn plan_update_with_returning(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
         returning: DmlReturning,
@@ -941,12 +1187,9 @@ impl TableSpec for LixDirectorySpec {
                             returning_spec.returning_key_from_batch(&matched_batch, row_index)
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let mut path_resolvers = directory_path_resolvers_from_hot_state(
-                        Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
-                        branch_binding.active_branch_id(),
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
+                    let mut path_resolvers = returning_spec
+                        .path_resolvers_for_write(&write_ctx, Some(&matched_batch))
+                        .await?;
                     let write_rows = lix_directory_update_write_rows_from_batch(
                         &matched_batch,
                         &assignments,
@@ -981,7 +1224,10 @@ impl TableSpec for LixDirectorySpec {
 }
 
 #[async_trait]
-impl UpsertSupport for LixDirectorySpec {
+impl<R> UpsertSupport<R> for LixDirectorySpec<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn conflict_identity_columns(&self) -> &[&'static str] {
         LIX_DIRECTORY_IDENTITY
     }
@@ -1022,11 +1268,14 @@ impl UpsertSupport for LixDirectorySpec {
     /// Directories have no file data, so the result is plain state rows.
     async fn insert_staged_rows(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         batch: &RecordBatch,
     ) -> Result<StagedUpsert> {
         let surface_name = lix_directory_surface_name(&self.branch_binding);
-        let mut path_resolvers = self.path_resolvers_for_write(write_ctx).await?;
+        validate_lix_directory_schema_boundary_batch(batch)?;
+        let mut path_resolvers = self
+            .path_resolvers_for_write(write_ctx, Some(batch))
+            .await?;
 
         let rows = if record_batch_has_non_null_column(batch, "path")? {
             lix_directory_write_rows_from_batch_with_path_resolvers(
@@ -1059,19 +1308,13 @@ impl UpsertSupport for LixDirectorySpec {
                 "lixcol_global",
                 "INSERT into lix_directory",
             )?;
-            defaultable_bool_insert_value(
-                batch,
-                row_index,
-                "lixcol_untracked",
-                "INSERT into lix_directory",
-            )?;
         }
         Ok(())
     }
 
     async fn materialize_excluded_defaults(
         &self,
-        _write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
         proposed: &RecordBatch,
     ) -> Result<RecordBatch> {
         let materialized = if insert_column_is_omitted(proposed, "id") {
@@ -1087,16 +1330,12 @@ impl UpsertSupport for LixDirectorySpec {
             "lixcol_global",
             Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
         )?;
-        materialize_omitted_column(
-            &materialized,
-            "lixcol_untracked",
-            Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
-        )
+        Ok(materialized)
     }
 
     async fn materialize_returning_insert_defaults(
         &self,
-        _write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
         proposed: &RecordBatch,
     ) -> Result<RecordBatch> {
         LixDirectorySpec::materialize_returning_insert_defaults(self, proposed)
@@ -1104,7 +1343,7 @@ impl UpsertSupport for LixDirectorySpec {
 
     async fn capture_upsert_returning(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         affected_rows: Vec<UpsertReturningRow>,
         returning: DmlReturning,
     ) -> Result<()> {
@@ -1123,7 +1362,7 @@ impl UpsertSupport for LixDirectorySpec {
     /// column schema (the same builder the scan path uses).
     async fn scan_conflict_candidates(
         &self,
-        write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
         proposed: &RecordBatch,
         target: &UpsertConflictTarget,
     ) -> Result<RecordBatch> {
@@ -1144,8 +1383,8 @@ impl UpsertSupport for LixDirectorySpec {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        request.filter.row_pks = match target.kind() {
-            UpsertConflictKind::Id => proposed_directory_row_pks(proposed)?,
+        request.filter.entity_pks = match target.kind() {
+            UpsertConflictKind::Id => proposed_directory_entity_pks(proposed)?,
             UpsertConflictKind::Path => {
                 validate_required_paths(proposed, "lix_directory")?;
                 Vec::new()
@@ -1158,30 +1397,27 @@ impl UpsertSupport for LixDirectorySpec {
             // lane for each path (tracked, untracked, and global), so retain
             // those rows for the generic matcher and its lane validation.
             // Primary-key conflict targets intentionally retain the generic
-            // row-PK scan below. An index-build failure also falls through
+            // entity-PK scan below. An index-build failure also falls through
             // to that generic directory-only scan.
             let index = self
                 .filesystem_path_index
                 .path_index(&FilesystemPathIndexRequest::new(
                     request.filter.branch_ids.clone(),
                 ))
-                .await;
-            if let Ok(index) = index {
-                let matches = indexed_path_matches(
-                    index,
-                    &proposed_directory_path_predicate(proposed)?,
-                    FilesystemPathKind::Directory,
-                );
-                return indexed_lix_directory_record_batch(&self.schema, &matches)
-                    .map_err(lix_error_to_datafusion_error);
-            }
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            let matches = indexed_path_matches(
+                index,
+                &proposed_directory_path_predicate(proposed)?,
+                FilesystemPathKind::Directory,
+            );
+            return indexed_lix_directory_record_batch(&self.schema, &matches)
+                .map_err(lix_error_to_datafusion_error);
         }
 
-        let rows = write_ctx
-            .scan_hot_state_batch(&request)
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-        lix_directory_record_batch(&self.schema, &rows).map_err(lix_error_to_datafusion_error)
+        let rows = self.load_rows(&request).await?;
+        lix_directory_record_batch_with_branch_ids(&self.schema, rows)
+            .map_err(lix_error_to_datafusion_error)
     }
 
     fn validate_conflict_pair(
@@ -1195,22 +1431,7 @@ impl UpsertSupport for LixDirectorySpec {
         if target.kind() != UpsertConflictKind::Path {
             return Ok(());
         }
-        let existing_untracked =
-            optional_bool_value(existing, existing_row, "lixcol_untracked")?.unwrap_or(false);
-        let proposed_untracked =
-            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
-        if existing_untracked == proposed_untracked {
-            return Ok(());
-        }
-        let path = required_string_value(proposed, proposed_row, "path")?;
-        Err(lix_error_to_datafusion_error(LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!(
-                "INSERT ON CONFLICT (path) on lix_directory cannot write {} path {path:?} over existing {} directory",
-                lane_name(proposed_untracked),
-                lane_name(existing_untracked)
-            ),
-        )))
+        Ok(())
     }
 
     /// Apply the `DO UPDATE` assignments to the augmented batch (existing
@@ -1222,16 +1443,13 @@ impl UpsertSupport for LixDirectorySpec {
     /// directory's `id`, `path`, and context columns.
     async fn apply_conflict_update(
         &self,
-        write_ctx: &SqlWriteContext,
+        write_ctx: &SqlWriteContext<R>,
         augmented: &RecordBatch,
         assignments: &[(String, Arc<dyn PhysicalExpr>)],
     ) -> Result<StagedUpsert> {
-        let mut path_resolvers = directory_path_resolvers_from_hot_state(
-            Arc::new(WriteContextHotStateReader::new(write_ctx.clone())),
-            self.branch_binding.active_branch_id(),
-        )
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
+        let mut path_resolvers = self
+            .path_resolvers_for_write(write_ctx, Some(augmented))
+            .await?;
         let rows = lix_directory_update_write_rows_from_batch(
             augmented,
             assignments,
@@ -1243,22 +1461,22 @@ impl UpsertSupport for LixDirectorySpec {
     }
 }
 
-/// The proposed directory ids as single-element row primary keys, used to
+/// The proposed directory ids as single-element entity primary keys, used to
 /// narrow the conflict-candidate live-state scan. Rows without an explicit
 /// `id` (defaulted ids) contribute nothing — a generated id cannot collide
 /// with an existing row.
-fn proposed_directory_row_pks(proposed: &RecordBatch) -> Result<Vec<RowPk>> {
-    let mut row_pks = Vec::new();
+fn proposed_directory_entity_pks(proposed: &RecordBatch) -> Result<Vec<EntityPk>> {
+    let mut entity_pks = Vec::new();
     for row_index in 0..proposed.num_rows() {
         if let Some(id) = optional_string_value(proposed, row_index, "id")? {
-            row_pks.push(RowPk::uuid_from_canonical(&id).map_err(|error| {
+            entity_pks.push(EntityPk::uuid_from_canonical(&id).map_err(|error| {
                 DataFusionError::Execution(format!(
                     "lix_directory id must be a canonical UUID: {error}"
                 ))
             })?);
         }
     }
-    Ok(row_pks)
+    Ok(entity_pks)
 }
 
 /// The finite, exact directory paths whose existing rows can conflict with a
@@ -1319,7 +1537,7 @@ fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {
 }
 
 trait DirectoryLiveRow {
-    fn row_pk_json(&self) -> Result<String, LixError>;
+    fn entity_pk_json(&self) -> Result<String, LixError>;
     fn schema_key(&self) -> &str;
     fn file_id(&self) -> Option<&str>;
     fn global(&self) -> bool;
@@ -1332,102 +1550,59 @@ trait DirectoryLiveRow {
     fn branch_id(&self) -> &str;
 }
 
-impl DirectoryLiveRow for MaterializedHotStateRow {
-    fn row_pk_json(&self) -> Result<String, LixError> {
-        self.row_pk.as_json_array_text()
+impl DirectoryLiveRow for FilesystemStateRow {
+    fn entity_pk_json(&self) -> Result<String, LixError> {
+        self.entity_pk().as_json_array_text()
     }
 
     fn schema_key(&self) -> &str {
-        &self.schema_key
+        self.schema_key()
     }
 
     fn file_id(&self) -> Option<&str> {
-        self.file_id.as_deref()
+        self.file_id()
     }
 
     fn global(&self) -> bool {
-        self.global
+        self.global()
     }
 
     fn change_id(&self) -> Option<String> {
-        self.change_id.map(|id| id.to_string())
+        self.change_id().map(|id| id.to_string())
     }
 
     fn created_at(&self) -> String {
-        self.created_at.to_string()
+        self.created_at().to_string()
     }
 
     fn updated_at(&self) -> String {
-        self.updated_at.to_string()
+        self.updated_at().to_string()
     }
 
     fn commit_id(&self) -> Option<String> {
-        self.commit_id.map(|id| id.to_string())
+        self.commit_id().map(|id| id.to_string())
     }
 
     fn untracked(&self) -> bool {
-        self.untracked
+        self.untracked()
     }
 
     fn metadata(&self) -> Option<String> {
-        self.metadata.as_deref().map(serialize_row_metadata)
+        self.metadata()
+            .map(|value| serialize_row_metadata(value.as_str()))
     }
 
     fn branch_id(&self) -> &str {
-        &self.branch_id
-    }
-}
-
-impl DirectoryLiveRow for MaterializedHotStateRowRef<'_> {
-    fn row_pk_json(&self) -> Result<String, LixError> {
-        (*self).row_pk().as_json_array_text()
-    }
-
-    fn schema_key(&self) -> &str {
-        (*self).schema_key()
-    }
-
-    fn file_id(&self) -> Option<&str> {
-        (*self).file_id()
-    }
-
-    fn global(&self) -> bool {
-        (*self).global()
-    }
-
-    fn change_id(&self) -> Option<String> {
-        (*self).change_id().map(|id| id.to_string())
-    }
-
-    fn created_at(&self) -> String {
-        (*self).created_at().to_string()
-    }
-
-    fn updated_at(&self) -> String {
-        (*self).updated_at().to_string()
-    }
-
-    fn commit_id(&self) -> Option<String> {
-        (*self).commit_id().map(|id| id.to_string())
-    }
-
-    fn untracked(&self) -> bool {
-        (*self).untracked()
-    }
-
-    fn metadata(&self) -> Option<String> {
-        (*self)
-            .metadata()
-            .map(|value| serialize_row_metadata(value))
-    }
-
-    fn branch_id(&self) -> &str {
-        (*self).branch_id()
+        if self.global() {
+            GLOBAL_BRANCH_ID
+        } else {
+            self.branch_id()
+        }
     }
 }
 
 #[derive(Debug, Clone)]
-struct DirectoryDescriptorRecord<L = MaterializedHotStateRow> {
+struct DirectoryDescriptorRecord<L = FilesystemStateRow> {
     id: String,
     parent_id: Option<String>,
     name: String,
@@ -1536,8 +1711,6 @@ fn lix_directory_update_write_rows_from_batch(
         let parent_id =
             update_optional_string_value(batch, &assignment_values, row_index, "parent_id")?;
         let name = update_required_string_value(batch, &assignment_values, row_index, "name")?;
-        crate::common::validate_lix_path_segment(&name)
-            .map_err(lix_error_to_datafusion_error)?;
         if let Some(directory_id) = id.as_ref() {
             let resolver = path_resolvers
                 .entry(directory_path_resolver_key(&context))
@@ -1665,7 +1838,7 @@ fn is_user_visible_filesystem_delete_row(row: RawWriteRowRef<'_>) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct StateRowDedupeKey {
-    row_pk: String,
+    entity_pk: String,
     schema_key: String,
     file_id: Option<String>,
     branch_id: String,
@@ -1676,11 +1849,11 @@ struct StateRowDedupeKey {
 impl From<RawWriteRowRef<'_>> for StateRowDedupeKey {
     fn from(row: RawWriteRowRef<'_>) -> Self {
         Self {
-            row_pk: row
-                .row_pk
-                .expect("directory provider staged row should carry row_pk")
+            entity_pk: row
+                .entity_pk
+                .expect("directory provider staged row should carry entity_pk")
                 .as_single_string_owned()
-                .expect("directory provider staged row primary key should project"),
+                .expect("directory provider staged row entity primary key should project"),
             schema_key: row.schema_key.to_string(),
             file_id: row.file_id.map(ToString::to_string),
             branch_id: row.branch_id.to_string(),
@@ -1721,7 +1894,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     let mut rows = RawWriteBatch::with_capacity(batch.num_rows().saturating_mul(3));
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_row_pk")?;
+            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_entity_pk")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_change_id")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_created_at")?;
@@ -1771,8 +1944,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
 
         let parent_id = optional_string_value(batch, row_index, "parent_id")?;
         let name = required_string_value(batch, row_index, "name")?;
-        crate::common::validate_lix_path_segment(&name)
-            .map_err(lix_error_to_datafusion_error)?;
+        validate_lix_directory_name_at_schema_boundary(&name)?;
         if let Some(path_resolvers) = path_resolvers.as_deref_mut() {
             if let Some(directory_id) = id.as_ref() {
                 let resolver = path_resolvers
@@ -1802,6 +1974,32 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         }
     }
     Ok(rows)
+}
+
+/// Validate descriptor names before acquiring any path/index state. A direct
+/// descriptor write must report the schema-boundary error even when preparing
+/// the transaction-visible resolver would fail for an unrelated reason.
+fn validate_lix_directory_schema_boundary_batch(batch: &RecordBatch) -> Result<()> {
+    for row_index in 0..batch.num_rows() {
+        if optional_string_value(batch, row_index, "path")?.is_some() {
+            continue;
+        }
+        let name = required_string_value(batch, row_index, "name")?;
+        validate_lix_directory_name_at_schema_boundary(&name)?;
+    }
+    Ok(())
+}
+
+fn validate_lix_directory_name_at_schema_boundary(name: &str) -> Result<()> {
+    crate::common::validate_lix_path_segment(name).map_err(|error| {
+        lix_error_to_datafusion_error(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "schema '{DIRECTORY_SCHEMA_KEY}' property '/name' validation failed: {}",
+                error.message
+            ),
+        ))
+    })
 }
 
 fn map_lix_directory_insert_error(
@@ -1836,8 +2034,8 @@ fn attach_lix_directory_insert_origin(
             let row = rows.row(index);
             row.schema_key == DIRECTORY_SCHEMA_KEY
                 && row
-                    .row_pk
-                    .and_then(|row_pk| row_pk.as_single_string().ok())
+                    .entity_pk
+                    .and_then(|entity_pk| entity_pk.as_single_string().ok())
                     == Some(directory_id)
         };
         if matches {
@@ -1848,7 +2046,7 @@ fn attach_lix_directory_insert_origin(
 
 fn lix_directory_insert_origin(surface_name: &str, directory_id: &str) -> TransactionWriteOrigin {
     TransactionWriteOrigin {
-        surface: crate::transaction_types::shared_origin_surface(surface_name),
+        surface: crate::transaction::types::shared_origin_surface(surface_name),
         operation: TransactionWriteOperation::Insert,
         primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(directory_id))),
     }
@@ -1875,13 +2073,7 @@ fn directory_row_context_from_batch(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: defaultable_bool_insert_value(
-            batch,
-            row_index,
-            "lixcol_untracked",
-            "INSERT into lix_directory",
-        )?
-        .unwrap_or(false),
+        untracked: false,
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_directory")?,
     })
@@ -1910,7 +2102,7 @@ fn directory_row_context_from_update(
     Ok(FilesystemRowContext {
         branch_id: scope.branch_id,
         global: scope.global,
-        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        untracked: false,
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: update_optional_metadata_value(
             batch,
@@ -1931,14 +2123,21 @@ fn directory_path_resolver_key(context: &FilesystemRowContext) -> String {
     )
 }
 
-fn lix_directory_record_batch(
+fn lix_directory_record_batch_with_branch_ids(
     schema: &SchemaRef,
-    rows: &MaterializedHotStateBatch,
+    rows: FilesystemStateRows,
+) -> Result<RecordBatch, LixError> {
+    lix_directory_record_batch_from_filesystem_rows(schema, rows)
+}
+
+fn lix_directory_record_batch_from_filesystem_rows(
+    schema: &SchemaRef,
+    filesystem_rows: FilesystemStateRows,
 ) -> Result<RecordBatch, LixError> {
     let mut directory_rows = Vec::new();
 
-    for row in rows.iter() {
-        if row.schema_key() != DIRECTORY_SCHEMA_KEY {
+    for row in filesystem_rows.iter() {
+        if row.schema_key() != DIRECTORY_SCHEMA_KEY || row.deleted() {
             continue;
         }
         let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
@@ -1951,13 +2150,13 @@ fn lix_directory_record_batch(
                     format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
                 )
             })?;
-        let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
+        let key = FilesystemDescriptorKey::from_state_row(row, snapshot.id.clone());
         directory_rows.push(DirectoryDescriptorRecord {
             id: snapshot.id,
             parent_id: snapshot.parent_id,
             name: snapshot.name,
             key,
-            live: row,
+            live: row.clone(),
         });
     }
 
@@ -1987,13 +2186,29 @@ fn indexed_lix_directory_record_batch(
                     parent_id: entry.parent_id.clone(),
                     name: entry.name.clone(),
                     key: entry.key.clone(),
-                    live: entry.live_row(),
+                    live: entry.state_row(),
                 },
                 Some(entry.path.clone()),
             )
         })
         .collect();
     lix_directory_record_batch_from_rendered(schema, rows)
+}
+
+/// Reuses the authenticated path-index projection already owned by this
+/// transaction read. The reconstructed descriptor rows are consumed only by
+/// recursive-delete planning and never become another storage authority.
+fn visible_filesystem_from_path_index(
+    index: &crate::filesystem::FilesystemPathIndex,
+) -> Result<VisibleFilesystem, LixError> {
+    let mut rows = Vec::new();
+    for entry in index.entries() {
+        rows.push(entry.state_row());
+        if let Some(blob_ref) = entry.blob_ref_state_row() {
+            rows.push(blob_ref.clone());
+        }
+    }
+    VisibleFilesystem::from_state_rows(&FilesystemStateRows::from_rows(rows))
 }
 
 fn indexed_directory_parent_matches(
@@ -2044,7 +2259,7 @@ where
     let mut paths = Vec::new();
     let mut parent_ids = Vec::new();
     let mut names = Vec::new();
-    let mut row_pks = Vec::new();
+    let mut entity_pks = Vec::new();
     let mut schema_keys = Vec::new();
     let mut file_ids = Vec::new();
     let mut globals = Vec::new();
@@ -2052,7 +2267,6 @@ where
     let mut created_ats = Vec::new();
     let mut updated_ats = Vec::new();
     let mut commit_ids = Vec::new();
-    let mut untracked_values = Vec::new();
     let mut metadata_values = Vec::new();
     let mut branch_ids = Vec::new();
 
@@ -2061,7 +2275,7 @@ where
         paths.push(path);
         parent_ids.push(directory.parent_id);
         names.push(Some(directory.name));
-        row_pks.push(Some(directory.live.row_pk_json()?));
+        entity_pks.push(Some(directory.live.entity_pk_json()?));
         schema_keys.push(Some(directory.live.schema_key().to_owned()));
         file_ids.push(directory.live.file_id().map(str::to_owned));
         globals.push(Some(directory.live.global()));
@@ -2069,9 +2283,13 @@ where
         created_ats.push(directory.live.created_at());
         updated_ats.push(directory.live.updated_at());
         commit_ids.push(directory.live.commit_id());
-        untracked_values.push(Some(directory.live.untracked()));
         metadata_values.push(directory.live.metadata());
-        branch_ids.push(Some(directory.live.branch_id().to_owned()));
+        let branch_id = if schema.column_with_name("lixcol_branch_id").is_some() {
+            directory.key.branch_id().to_owned()
+        } else {
+            directory.live.branch_id().to_owned()
+        };
+        branch_ids.push(Some(branch_id));
     }
 
     let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
@@ -2081,7 +2299,7 @@ where
             "path" => Arc::new(StringArray::from(paths.clone())),
             "parent_id" => Arc::new(StringArray::from(parent_ids.clone())),
             "name" => Arc::new(StringArray::from(names.clone())),
-            "lixcol_row_pk" => Arc::new(StringArray::from(row_pks.clone())),
+            "lixcol_entity_pk" => Arc::new(StringArray::from(entity_pks.clone())),
             "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
             "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
@@ -2089,7 +2307,6 @@ where
             "lixcol_created_at" => Arc::new(StringArray::from(created_ats.clone())),
             "lixcol_updated_at" => Arc::new(StringArray::from(updated_ats.clone())),
             "lixcol_commit_id" => Arc::new(StringArray::from(commit_ids.clone())),
-            "lixcol_untracked" => Arc::new(BooleanArray::from(untracked_values.clone())),
             "lixcol_metadata" => Arc::new(StringArray::from(metadata_values.clone())),
             "lixcol_branch_id" => Arc::new(StringArray::from(branch_ids.clone())),
             other => {
@@ -2115,35 +2332,18 @@ where
 
 fn lix_directory_scan_request(
     branch_binding: Option<&str>,
-    projected_schema: Option<&Schema>,
+    _projected_schema: Option<&Schema>,
     limit: Option<usize>,
-) -> HotStateScanRequest {
-    HotStateScanRequest {
-        filter: HotStateFilter {
-            schema_keys: vec![DIRECTORY_SCHEMA_KEY.to_string()],
+) -> DirectoryScanRequest {
+    DirectoryScanRequest {
+        filter: DirectoryScanFilter {
             branch_ids: branch_binding
                 .map(|branch_id| vec![branch_id.to_string()])
                 .unwrap_or_default(),
-            ..HotStateFilter::default()
+            entity_pks: Vec::new(),
         },
-        projection: lix_directory_hot_state_projection(projected_schema),
         limit,
     }
-}
-
-fn lix_directory_hot_state_projection(projected_schema: Option<&Schema>) -> HotStateProjection {
-    let Some(schema) = projected_schema else {
-        return HotStateProjection::default();
-    };
-    let mut columns = vec!["snapshot_content".to_string()];
-    if schema
-        .fields()
-        .iter()
-        .any(|field| field.name() == "lixcol_metadata")
-    {
-        columns.push("metadata".to_string());
-    }
-    HotStateProjection { columns }
 }
 
 fn validate_lix_directory_update_assignments(
@@ -2349,7 +2549,7 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        json_field("lixcol_row_pk", false),
+        json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -2357,7 +2557,6 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]))
 }
@@ -2402,21 +2601,24 @@ mod tests {
     use crate::filesystem::{
         FilesystemPathIndex, FilesystemPathIndexReader, FilesystemPathIndexRequest,
     };
+    use crate::filesystem::{FilesystemStateRow, FilesystemStateRows};
+    use crate::forktree::{StateCell, StateValue};
     use crate::functions::FunctionProviderHandle;
-    use crate::hot_state::{
-        HotStateReader, HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateRow,
-    };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction_types::{
+    use crate::state::{StateRow, StateRowSource};
+    use crate::storage::MemoryRead;
+    use crate::storage_adapter::SharedStorageAdapterRead;
+    use crate::transaction::types::{
         RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
         TransactionWriteOutcome, TransactionWriteRow,
     };
 
     use super::super::spec::{SpecTableProvider, TableSpec};
     use super::{
-        BranchBinding, DirectoryDescriptorRecord, LixDirectorySpec, UpsertConflictTarget,
-        UpsertSupport, derive_directory_paths, lix_directory_by_branch_schema,
-        lix_directory_insert_origin, lix_directory_record_batch,
+        BranchBinding, DirectoryDescriptorRecord, DirectoryState, LixDirectorySpec,
+        UpsertConflictTarget, UpsertSupport, derive_directory_paths,
+        lix_directory_by_branch_schema, lix_directory_insert_origin,
+        lix_directory_record_batch_from_filesystem_rows,
         lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
         lix_directory_write_rows_from_batch_with_path_resolvers,
     };
@@ -2424,16 +2626,18 @@ mod tests {
         FilesystemDescriptorKey, VisibleFilesystem, directory_path_resolvers_from_state_batch,
     };
 
+    type FixtureRead = SharedStorageAdapterRead<MemoryRead>;
+
     fn path_index_from_rows(
-        rows: Vec<MaterializedHotStateRow>,
+        rows: Vec<FilesystemStateRow>,
     ) -> Result<FilesystemPathIndex, LixError> {
-        FilesystemPathIndex::from_live_batch(&MaterializedHotStateBatch::from_rows(rows))
+        FilesystemPathIndex::from_state_rows(&FilesystemStateRows::from_rows(rows))
     }
 
     fn visible_filesystem_from_rows(
-        rows: Vec<MaterializedHotStateRow>,
+        rows: Vec<FilesystemStateRow>,
     ) -> Result<VisibleFilesystem, LixError> {
-        VisibleFilesystem::from_live_batch(&MaterializedHotStateBatch::from_rows(rows))
+        VisibleFilesystem::from_state_rows(&FilesystemStateRows::from_rows(rows))
     }
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
@@ -2445,6 +2649,96 @@ mod tests {
         FunctionProviderHandle::system()
     }
 
+    fn branch_state_row(key: u8, source: StateRowSource) -> StateRow {
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(i64::from(key));
+        StateRow {
+            key: vec![key],
+            value: StateValue {
+                change_id: ChangeId::for_test_label(&format!("change-{key}")),
+                commit_id: CommitId::for_test_label(&format!("commit-{key}")),
+                created_at: timestamp,
+                updated_at: timestamp,
+                cell: StateCell::Value(format!("value-{key}").into()),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source,
+        }
+    }
+
+    #[test]
+    fn directory_by_branch_expands_global_overlay_before_limit() {
+        let branch_one = "01920000-0000-7000-8000-0000000000a1";
+        let branch_two = "01920000-0000-7000-8000-0000000000a2";
+        let rows = super::resolve_directory_branch_rows(
+            vec![
+                (
+                    branch_one.to_owned(),
+                    branch_state_row(1, StateRowSource::Global),
+                ),
+                (
+                    branch_two.to_owned(),
+                    branch_state_row(1, StateRowSource::Global),
+                ),
+                (
+                    branch_two.to_owned(),
+                    branch_state_row(2, StateRowSource::Branch),
+                ),
+                (
+                    branch_one.to_owned(),
+                    branch_state_row(2, StateRowSource::Branch),
+                ),
+            ],
+            Some(2),
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, branch_one);
+        assert_eq!(rows[0].1.key, vec![1]);
+        assert_eq!(rows[1].0, branch_two);
+        assert_eq!(rows[1].1.key, vec![1]);
+    }
+
+    #[test]
+    fn directory_visible_rows_untracked_value_and_tombstone_shadow_tracked() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let entity_id = "01920000-0000-7000-8000-0000000000d3";
+        let tracked = live_filesystem_row(
+            entity_id,
+            super::DIRECTORY_SCHEMA_KEY,
+            None,
+            branch_id,
+            r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"tracked"}"#,
+        );
+        let mut untracked = live_filesystem_row(
+            entity_id,
+            super::DIRECTORY_SCHEMA_KEY,
+            None,
+            branch_id,
+            r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"untracked"}"#,
+        );
+        untracked.untracked = true;
+
+        let visible = super::resolve_directory_filesystem_rows(
+            vec![tracked.clone(), untracked.clone()],
+            None,
+        );
+        assert_eq!(visible.len(), 1);
+        assert!(visible.row(0).untracked());
+        assert!(
+            visible
+                .row(0)
+                .snapshot_content()
+                .is_some_and(|content| content.contains("untracked"))
+        );
+
+        untracked.deleted = true;
+        untracked.snapshot_content = None;
+        let masked = super::resolve_directory_filesystem_rows(vec![tracked, untracked], None);
+        assert!(masked.is_empty());
+    }
+
     fn eq_filter(column_name: &str, value: &str) -> Expr {
         Expr::BinaryExpr(BinaryExpr::new(
             Box::new(Expr::Column(Column::from_name(column_name))),
@@ -2454,30 +2748,6 @@ mod tests {
                 None,
             )),
         ))
-    }
-
-    struct RejectingHotStateReader {
-        scan_count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl HotStateReader for RejectingHotStateReader {
-        async fn load_exact_batch(
-            &self,
-            request: &crate::hot_state::HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
-        }
-
-        async fn scan_batch(
-            &self,
-            _request: &HotStateScanRequest,
-        ) -> Result<MaterializedHotStateBatch, LixError> {
-            self.scan_count.fetch_add(1, Ordering::SeqCst);
-            Err(LixError::unknown(
-                "directory parent-id scan should not read live state",
-            ))
-        }
     }
 
     struct StaticFilesystemPathIndexReader {
@@ -2529,27 +2799,25 @@ mod tests {
     /// Stage a single INSERT batch through the directory spec, exercising the
     /// same `stage_insert` path the writable provider uses.
     async fn stage_directory_insert(
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<FixtureRead>,
         branch_binding: BranchBinding,
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
-        let hot_state = Arc::new(crate::sql2::WriteContextHotStateReader::new(
-            write_ctx.clone(),
-        ));
-        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
-            write_ctx.clone(),
-        ));
-        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = hot_state.clone();
+        let write_state = Arc::new(write_ctx.clone());
+        let branch_ref = Arc::new(write_ctx.clone());
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = write_state;
+        let state = DirectoryState::Fixture(Vec::new());
         let spec = match branch_binding {
             BranchBinding::Active { .. } => LixDirectorySpec::active_branch(
                 write_ctx.active_branch_id(),
-                hot_state,
+                state,
                 filesystem_path_index,
                 branch_ref,
                 test_functions(),
             ),
             BranchBinding::Explicit => LixDirectorySpec::by_branch(
-                hot_state,
+                write_ctx.active_branch_id(),
+                state,
                 filesystem_path_index,
                 branch_ref,
                 test_functions(),
@@ -2559,22 +2827,17 @@ mod tests {
     }
 
     /// Stage one active-branch INSERT with an injected path-index reader so a
-    /// routing test can prove resolver seeding does not fall back to a
-    /// live-state scan.
+    /// routing test can prove resolver seeding stays on the injected index.
     async fn stage_active_directory_insert_with_path_index(
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<FixtureRead>,
         filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
         batch: RecordBatch,
     ) -> Result<u64, datafusion::common::DataFusionError> {
-        let hot_state = Arc::new(crate::sql2::WriteContextHotStateReader::new(
-            write_ctx.clone(),
-        ));
-        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
-            write_ctx.clone(),
-        ));
+        let branch_ref = Arc::new(write_ctx.clone());
+        let state = DirectoryState::Fixture(Vec::new());
         let spec = LixDirectorySpec::active_branch(
             write_ctx.active_branch_id(),
-            hot_state,
+            state,
             filesystem_path_index,
             branch_ref,
             test_functions(),
@@ -2584,7 +2847,7 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingWriteContext {
-        rows: Vec<MaterializedHotStateRow>,
+        rows: Vec<FilesystemStateRow>,
         writes: Vec<TransactionWrite>,
         reject_scans: bool,
     }
@@ -2604,6 +2867,12 @@ mod tests {
 
     #[async_trait]
     impl SqlWriteExecutionContext for CapturingWriteContext {
+        type ReadStore = FixtureRead;
+
+        fn state_view(&self) -> &crate::state::TransactionStateView<Self::ReadStore> {
+            panic!("directory fixture must use its native state/path-index owner")
+        }
+
         fn active_branch_id(&self) -> &str {
             "01920000-0000-7000-8000-0000000000a1"
         }
@@ -2616,46 +2885,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn load_bytes_many(
+        async fn filesystem_path_index(
             &mut self,
-            hashes: &[crate::binary_cas::BlobId],
-        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            BlobDataReader::load_bytes_many(self, hashes).await
-        }
-
-        async fn scan_hot_state_batch(
-            &mut self,
-            _request: &HotStateScanRequest,
-        ) -> Result<MaterializedHotStateBatch, LixError> {
-            if self.reject_scans {
-                return Err(LixError::unknown(
-                    "directory index routing should not scan live state",
-                ));
-            }
-            Ok(MaterializedHotStateBatch::from_rows(self.rows.clone()))
-        }
-
-        async fn load_exact_hot_state_batch(
-            &mut self,
-            request: &crate::hot_state::HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
-                request
-                    .rows
-                    .iter()
-                    .map(|requested| {
-                        self.rows
-                            .iter()
-                            .find(|row| {
-                                row.schema_key == requested.schema_key
-                                    && row.row_pk == requested.row_pk
-                                    && row.file_id == requested.file_id
-                                    && row.branch_id.as_ref() == requested.branch_id.as_str()
-                            })
-                            .cloned()
-                    })
-                    .collect(),
-            ))
+            _request: &FilesystemPathIndexRequest,
+        ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+            Ok(Arc::new(path_index_from_rows(self.rows.clone())?))
         }
 
         async fn load_branch_head(
@@ -2680,7 +2914,7 @@ mod tests {
 
         async fn stage_typed_mutation_journal_replace(
             &mut self,
-            _rows: crate::transaction_types::TypedMutationJournalBatch,
+            _rows: crate::transaction::types::TypedMutationJournalBatch,
         ) -> Result<TransactionWriteOutcome, LixError> {
             Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
@@ -2698,13 +2932,9 @@ mod tests {
         }
     }
 
-    fn live_row(
-        row_pk: &str,
-        branch_id: &str,
-        snapshot_content: &str,
-    ) -> MaterializedHotStateRow {
+    fn live_row(entity_pk: &str, branch_id: &str, snapshot_content: &str) -> FilesystemStateRow {
         live_filesystem_row(
-            row_pk,
+            entity_pk,
             super::DIRECTORY_SCHEMA_KEY,
             None,
             branch_id,
@@ -2713,14 +2943,14 @@ mod tests {
     }
 
     fn live_filesystem_row(
-        row_pk: &str,
+        entity_pk: &str,
         schema_key: &str,
         file_id: Option<&str>,
         branch_id: &str,
         snapshot_content: &str,
-    ) -> MaterializedHotStateRow {
-        MaterializedHotStateRow {
-            row_pk: crate::row_pk::RowPk::uuid_from_canonical(row_pk)
+    ) -> FilesystemStateRow {
+        FilesystemStateRow {
+            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
                 .expect("fixture filesystem ID should be a UUID"),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
@@ -2728,8 +2958,8 @@ mod tests {
             metadata: Some(json!({"source": "test"}).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
-            change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
-            commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -2737,7 +2967,44 @@ mod tests {
         }
     }
 
-    fn filesystem_rows() -> Vec<MaterializedHotStateRow> {
+    fn state_rows_from_filesystem_rows(rows: &[FilesystemStateRow]) -> Vec<StateRow> {
+        rows.iter()
+            .map(|row| {
+                let key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                });
+                let cell = if row.deleted {
+                    StateCell::Tombstone
+                } else if let Some(snapshot) = &row.snapshot_content {
+                    StateCell::Value(snapshot.clone())
+                } else {
+                    StateCell::Null
+                };
+                StateRow {
+                    key,
+                    value: StateValue {
+                        change_id: row.change_id.expect("fixture row change id"),
+                        commit_id: row.commit_id.expect("fixture row commit id"),
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        cell,
+                        metadata: row.metadata.clone(),
+                        origin_key: None,
+                        blob_manifest_object_ids: Vec::new(),
+                    },
+                    source: if row.global {
+                        StateRowSource::Global
+                    } else {
+                        StateRowSource::Branch
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn filesystem_rows() -> Vec<FilesystemStateRow> {
         vec![
             live_filesystem_row(
                 "01920000-0000-7000-8000-0000000000d3",
@@ -2869,7 +3136,7 @@ mod tests {
             id: "01920000-0000-7000-8000-0000000000d3".to_string(),
             parent_id: None,
             name: "docs".to_string(),
-            key: FilesystemDescriptorKey::from_live_row(
+            key: FilesystemDescriptorKey::from_state_row(
                 &root_live,
                 "01920000-0000-7000-8000-0000000000d3",
             ),
@@ -2879,7 +3146,7 @@ mod tests {
             id: "01920000-0000-7000-8000-000000000313".to_string(),
             parent_id: Some("01920000-0000-7000-8000-0000000000d3".to_string()),
             name: "guides".to_string(),
-            key: FilesystemDescriptorKey::from_live_row(
+            key: FilesystemDescriptorKey::from_state_row(
                 &child_live,
                 "01920000-0000-7000-8000-000000000313",
             ),
@@ -2908,9 +3175,12 @@ mod tests {
             ),
         ];
 
-        let rows = MaterializedHotStateBatch::from_rows(rows);
-        let batch = lix_directory_record_batch(&lix_directory_by_branch_schema(), &rows)
-            .expect("directory batch should build");
+        let rows = FilesystemStateRows::from_rows(rows);
+        let batch = lix_directory_record_batch_from_filesystem_rows(
+            &lix_directory_by_branch_schema(),
+            rows,
+        )
+        .expect("directory batch should build");
 
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(
@@ -2937,7 +3207,7 @@ mod tests {
 
     #[tokio::test]
     async fn directory_parent_id_scan_uses_indexed_descriptors() {
-        let hot_state_scans = Arc::new(AtomicUsize::new(0));
+        let state_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
             path_index_from_rows(vec![
@@ -2966,9 +3236,7 @@ mod tests {
         );
         let spec = LixDirectorySpec::active_branch(
             "01920000-0000-7000-8000-0000000000a1",
-            Arc::new(RejectingHotStateReader {
-                scan_count: Arc::clone(&hot_state_scans),
-            }),
+            DirectoryState::<FixtureRead>::Fixture(Vec::new()),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -3010,12 +3278,12 @@ mod tests {
         assert_eq!(paths.value(0), "/docs/guides");
         assert_eq!(paths.value(1), "/docs/reference");
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(hot_state_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(state_scans.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn directory_root_scan_uses_indexed_descriptors() {
-        let hot_state_scans = Arc::new(AtomicUsize::new(0));
+        let state_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
             path_index_from_rows(vec![
@@ -3039,9 +3307,7 @@ mod tests {
         );
         let spec = LixDirectorySpec::active_branch(
             "01920000-0000-7000-8000-0000000000a1",
-            Arc::new(RejectingHotStateReader {
-                scan_count: Arc::clone(&hot_state_scans),
-            }),
+            DirectoryState::<FixtureRead>::Fixture(Vec::new()),
             Arc::new(StaticFilesystemPathIndexReader {
                 index,
                 request_count: Arc::clone(&path_index_requests),
@@ -3082,7 +3348,7 @@ mod tests {
         assert_eq!(paths.value(0), "/docs");
         assert_eq!(paths.value(1), "/other");
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(hot_state_scans.load(Ordering::SeqCst), 0);
+        assert_eq!(state_scans.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3093,8 +3359,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![TransactionWriteRow {
-                row_pk: Some(
-                    crate::row_pk::RowPk::uuid_from_canonical(
+                entity_pk: Some(
+                    crate::entity_pk::EntityPk::uuid_from_canonical(
                         "01920000-0000-7000-8000-0000000000d3",
                     )
                     .expect("fixture directory ID"),
@@ -3165,7 +3431,7 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
             "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
         )];
-        let existing_rows = MaterializedHotStateBatch::from_rows(existing_rows);
+        let existing_rows = FilesystemStateRows::from_rows(existing_rows);
         let mut resolvers = directory_path_resolvers_from_state_batch(&existing_rows)
             .expect("existing directory rows should seed paths");
 
@@ -3211,11 +3477,11 @@ mod tests {
                 .map(|row| {
                     (
                         row.schema_key.as_str(),
-                        row.row_pk
+                        row.entity_pk
                             .as_ref()
-                            .expect("planned delete row should carry row_pk")
+                            .expect("planned delete row should carry entity_pk")
                             .as_single_string_owned()
-                            .expect("planned delete row should project row_pk"),
+                            .expect("planned delete row should project entity_pk"),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -3271,7 +3537,7 @@ mod tests {
             .map(|row| {
                 (
                     row.schema_key.clone(),
-                    row.row_pk.clone(),
+                    row.entity_pk.clone(),
                     row.file_id.clone(),
                     row.branch_id.clone(),
                 )
@@ -3296,8 +3562,8 @@ mod tests {
             &[TransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: RawWriteBatch::from_test_rows(vec![TransactionWriteRow {
-                    row_pk: Some(
-                        crate::row_pk::RowPk::uuid_from_canonical(
+                    entity_pk: Some(
+                        crate::entity_pk::EntityPk::uuid_from_canonical(
                             "01920000-0000-7000-8000-0000000000d3",
                         )
                         .expect("fixture directory ID"),
@@ -3358,7 +3624,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_path_insert_uses_indexed_resolver_without_hot_state_fallback() {
+    async fn directory_path_insert_uses_indexed_resolver_only() {
         let index = Arc::new(
             path_index_from_rows(vec![live_row(
                 "01920000-0000-7000-8000-0000000000d3",
@@ -3386,7 +3652,7 @@ mod tests {
                 active_directory_path_insert_batch("/docs/nested"),
             )
             .await
-            .expect("indexed directory path insert should stage without a live-state scan")
+            .expect("indexed directory path insert should stage through its sole index owner")
         };
 
         assert_eq!(count, 1);
@@ -3404,7 +3670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_path_insert_falls_back_when_path_index_build_fails() {
+    async fn directory_path_insert_fails_closed_when_path_index_build_fails() {
         let mut write_context = CapturingWriteContext {
             rows: vec![live_row(
                 "01920000-0000-7000-8000-0000000000d3",
@@ -3415,7 +3681,7 @@ mod tests {
             reject_scans: false,
         };
 
-        let count = {
+        let error = {
             let write_ctx = SqlWriteContext::new(&mut write_context);
             stage_active_directory_insert_with_path_index(
                 write_ctx,
@@ -3423,20 +3689,11 @@ mod tests {
                 active_directory_path_insert_batch("/docs/nested"),
             )
             .await
-            .expect("directory path insert should retain its live-state fallback")
+            .expect_err("directory path insert must fail when its sole index owner fails")
         };
 
-        assert_eq!(count, 1);
-        let [TransactionWrite::Rows { rows, .. }] = write_context.writes.as_slice() else {
-            panic!("expected one directory staged write");
-        };
-        assert_eq!(rows.len(), 1);
-        let snapshot = rows.row(0).snapshot.expect("staged descriptor snapshot");
-        assert_eq!(
-            snapshot["parent_id"],
-            "01920000-0000-7000-8000-0000000000d3"
-        );
-        assert_eq!(snapshot["name"], "nested");
+        assert!(error.to_string().contains("path-index construction"));
+        assert!(write_context.writes.is_empty());
     }
 
     #[tokio::test]
@@ -3446,12 +3703,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
             "{\"id\":\"01920000-0000-7000-8000-000000000403\",\"parent_id\":null,\"name\":\"docs\"}",
         );
-        let mut untracked = live_row(
-            "01920000-0000-7000-8000-000000000413",
-            "01920000-0000-7000-8000-0000000000a1",
-            "{\"id\":\"01920000-0000-7000-8000-000000000413\",\"parent_id\":null,\"name\":\"docs\"}",
-        );
-        untracked.untracked = true;
         let mut global = live_row(
             "01920000-0000-7000-8000-000000000363",
             "ffffffff-ffff-7fff-bfff-ffffffffffff",
@@ -3464,7 +3715,7 @@ mod tests {
             "{\"id\":\"01920000-0000-7000-8000-000000000383\",\"parent_id\":null,\"name\":\"other\"}",
         );
         let index = Arc::new(
-            path_index_from_rows(vec![tracked, untracked, global, other])
+            path_index_from_rows(vec![tracked, global, other])
                 .expect("filesystem path index should build"),
         );
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> =
@@ -3481,9 +3732,9 @@ mod tests {
             let write_ctx = SqlWriteContext::new(&mut write_context);
             let spec = LixDirectorySpec::active_branch(
                 "01920000-0000-7000-8000-0000000000a1",
-                Arc::new(RejectingHotStateReader {
-                    scan_count: Arc::new(AtomicUsize::new(0)),
-                }),
+                DirectoryState::<FixtureRead>::Fixture(state_rows_from_filesystem_rows(
+                    &write_context.rows,
+                )),
                 filesystem_path_index,
                 Arc::new(TestBranchRefReader),
                 test_functions(),
@@ -3509,40 +3760,15 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("candidate global column should be boolean");
-        let untracked = candidates
-            .column_by_name("lixcol_untracked")
-            .expect("candidate untracked column")
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .expect("candidate untracked column should be boolean");
         let lanes = (0..candidates.num_rows())
-            .map(|row| {
-                (
-                    ids.value(row).to_string(),
-                    globals.value(row),
-                    untracked.value(row),
-                )
-            })
+            .map(|row| (ids.value(row).to_string(), globals.value(row)))
             .collect::<BTreeSet<_>>();
 
         assert_eq!(
             lanes,
             [
-                (
-                    "01920000-0000-7000-8000-000000000363".to_string(),
-                    true,
-                    false
-                ),
-                (
-                    "01920000-0000-7000-8000-000000000403".to_string(),
-                    false,
-                    false
-                ),
-                (
-                    "01920000-0000-7000-8000-000000000413".to_string(),
-                    false,
-                    true
-                ),
+                ("01920000-0000-7000-8000-000000000363".to_string(), true,),
+                ("01920000-0000-7000-8000-000000000403".to_string(), false,),
             ]
             .into_iter()
             .collect(),
@@ -3550,7 +3776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_path_conflict_candidates_fall_back_when_index_build_fails() {
+    async fn directory_path_conflict_candidates_fail_closed_when_index_build_fails() {
         let mut write_context = CapturingWriteContext {
             rows: vec![live_row(
                 "01920000-0000-7000-8000-0000000000d3",
@@ -3560,13 +3786,11 @@ mod tests {
             writes: Vec::new(),
             reject_scans: false,
         };
-        let candidates = {
+        let error = {
             let write_ctx = SqlWriteContext::new(&mut write_context);
             let spec = LixDirectorySpec::active_branch(
                 "01920000-0000-7000-8000-0000000000a1",
-                Arc::new(RejectingHotStateReader {
-                    scan_count: Arc::new(AtomicUsize::new(0)),
-                }),
+                DirectoryState::<FixtureRead>::Fixture(Vec::new()),
                 Arc::new(FailingFilesystemPathIndexReader),
                 Arc::new(TestBranchRefReader),
                 test_functions(),
@@ -3577,21 +3801,14 @@ mod tests {
                 &UpsertConflictTarget::path(&["path"]),
             )
             .await
-            .expect("path conflicts should retain their generic directory scan fallback")
+            .expect_err("path conflicts must fail when their sole index owner fails")
         };
 
-        let ids = candidates
-            .column_by_name("id")
-            .expect("candidate id column")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("candidate id column should be string");
-        assert_eq!(candidates.num_rows(), 1);
-        assert_eq!(ids.value(0), "01920000-0000-7000-8000-0000000000d3");
+        assert!(error.to_string().contains("path-index construction"));
     }
 
     #[tokio::test]
-    async fn directory_id_conflict_candidates_keep_generic_row_pk_scan() {
+    async fn directory_id_conflict_candidates_keep_generic_entity_pk_scan() {
         let indexed = live_row(
             "01920000-0000-7000-8000-000000000373",
             "01920000-0000-7000-8000-0000000000a1",
@@ -3614,13 +3831,12 @@ mod tests {
             writes: Vec::new(),
             reject_scans: false,
         };
+        let state_rows = state_rows_from_filesystem_rows(&write_context.rows);
         let candidates = {
             let write_ctx = SqlWriteContext::new(&mut write_context);
             let spec = LixDirectorySpec::active_branch(
                 "01920000-0000-7000-8000-0000000000a1",
-                Arc::new(RejectingHotStateReader {
-                    scan_count: Arc::new(AtomicUsize::new(0)),
-                }),
+                DirectoryState::<FixtureRead>::Fixture(state_rows),
                 filesystem_path_index,
                 Arc::new(TestBranchRefReader),
                 test_functions(),
@@ -3631,7 +3847,7 @@ mod tests {
                 &UpsertConflictTarget::id(&["id"]),
             )
             .await
-            .expect("id conflicts should use the row-primary-key scan")
+            .expect("id conflicts should use the entity-primary-key scan")
         };
 
         let ids = candidates
@@ -3648,16 +3864,13 @@ mod tests {
     fn directory_provider_keeps_no_write_authority() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let hot_state = Arc::new(crate::sql2::WriteContextHotStateReader::new(
-            write_ctx.clone(),
-        ));
-        let branch_ref = Arc::new(crate::sql2::WriteContextBranchRefReader::new(
-            write_ctx.clone(),
-        ));
-        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = hot_state.clone();
+        let write_state = Arc::new(write_ctx.clone());
+        let branch_ref = Arc::new(write_ctx.clone());
+        let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> = write_state;
+        let state = DirectoryState::<FixtureRead>::Fixture(Vec::new());
         let provider = SpecTableProvider::new(Arc::new(LixDirectorySpec::active_branch(
             write_ctx.active_branch_id(),
-            hot_state,
+            state,
             filesystem_path_index,
             branch_ref,
             test_functions(),

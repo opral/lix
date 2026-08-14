@@ -254,7 +254,6 @@ simulation_test!(
             .expect("other active undo interval write should succeed");
         let other_active_history =
             branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
-
         assert_commits(
             &main,
             &[
@@ -267,11 +266,30 @@ simulation_test!(
             true,
         )
         .await;
+        other
+            .create_checkpoint()
+            .await
+            .expect("other active recovery rotation should succeed");
         for _ in 4..CHECKPOINT_GC_INTERVAL {
             main.create_checkpoint()
                 .await
                 .expect("global GC padding checkpoint should succeed");
         }
+        // Empty checkpoints deliberately retain the current recovery selector.
+        // Rotate that authenticated root with a no-net-state pair before
+        // asserting that the old interval becomes collectible.
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('gc-rotation', 'temporary')",
+            &[],
+        )
+        .await
+        .expect("GC rotation insert should succeed");
+        main.execute("DELETE FROM lix_key_value WHERE key = 'gc-rotation'", &[])
+            .await
+            .expect("GC rotation delete should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("GC rotation checkpoint should succeed");
         wait_for_commits(&main, &[&main_auto_commit, &other_auto_commit], false).await;
         // The other branch's current recovery alias, serving checkpoint
         // floor, and active undo/history interval remain distinct logical
@@ -396,6 +414,29 @@ simulation_test!(
                 .await
                 .expect("padding checkpoint should succeed");
         }
+        // Recovery is selector-owned: empty checkpoints retain the prior
+        // root. Use a no-net-state head advance to exercise explicit root
+        // retirement without reviving cadence/progress state.
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO {REPLAY_GC_SCHEMA_KEY} (id, indexed_value, note, generation) VALUES ('rotation-row', 'rotation', 'temporary', 3)"
+                ),
+                &[],
+            )
+            .await
+            .expect("recovery rotation insert should succeed");
+        session
+            .execute(
+                &format!("DELETE FROM {REPLAY_GC_SCHEMA_KEY} WHERE id = 'rotation-row'"),
+                &[],
+            )
+            .await
+            .expect("recovery rotation delete should succeed");
+        session
+            .create_checkpoint()
+            .await
+            .expect("recovery rotation checkpoint should succeed");
         wait_for_commits(&session, &[&retired_head], false).await;
 
         assert_replay_gc_state(&session).await;

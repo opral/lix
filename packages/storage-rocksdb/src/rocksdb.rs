@@ -13,29 +13,23 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[cfg(test)]
 use bytes::Buf as _;
 use bytes::Bytes;
-use bytes::BytesMut;
 use lix::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use lix::storage::immutable::validate_immutable_batch;
 use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
-    ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId, Storage, StorageError,
-    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueIntegrity,
-    ValueSemantics, WriteOptions, WriteStats,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, Storage, StorageError, StorageRead,
+    StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueSemantics, WriteOptions,
+    WriteStats,
 };
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
-    WriteBatch, WriteOptions as RocksDBWriteOptions,
+    WriteBatch,
 };
 use rocksdb::{DBRawIteratorWithThreadMode, Snapshot};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-const WRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
-/// Spare memtables per column family. Four buffers cap resident memtable memory
-/// at `WRITE_BUFFER_BYTES * WRITE_BUFFER_COUNT` per family (512 MiB across the
-/// two families) and are what keeps a flush off the next writer's latency.
-const WRITE_BUFFER_COUNT: i32 = 4;
 const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
 const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const BLOB_GC_FORCE_THRESHOLD: f64 = 0.5;
@@ -79,10 +73,6 @@ pub struct RocksDBWrite {
     batch: WriteBatch,
     immutable_values: HashMap<Vec<u8>, Bytes>,
     stats: WriteStats,
-    /// Mirrors [`WriteOptions::await_durable`]. `commit()` does not otherwise
-    /// see the options it was opened with, which is how this adapter came to
-    /// accept the flag and silently drop it.
-    await_durable: bool,
 }
 
 static OPEN_DATABASES: OnceLock<Mutex<HashMap<PathBuf, Weak<RocksDBInner>>>> = OnceLock::new();
@@ -209,7 +199,6 @@ impl Storage for RocksDB {
                 },
                 immutable_values: HashMap::new(),
                 stats: WriteStats::default(),
-                await_durable: opts.await_durable,
             })
         }
     }
@@ -222,15 +211,15 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
             Precondition::KeyAbsent { space, key } => !key_exists(
                 db,
                 column_family(db, *space),
-                &physical_key(space.id, key).0,
+                &physical_key(space.id(), key).0,
             )?,
             Precondition::KeyPresent { space, key } => key_exists(
                 db,
                 column_family(db, *space),
-                &physical_key(space.id, key).0,
+                &physical_key(space.id(), key).0,
             )?,
             Precondition::KeyValueHashEquals { space, key, hash } => db
-                .get_cf(column_family(db, *space), physical_key(space.id, key).0)
+                .get_cf(column_family(db, *space), physical_key(space.id(), key).0)
                 .map_err(rocksdb_error)?
                 .is_some_and(|value| blake3::hash(&value).as_bytes() == hash),
             Precondition::KeyValueEquals {
@@ -238,11 +227,11 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
                 key,
                 expected,
             } => db
-                .get_cf(column_family(db, *space), physical_key(space.id, key).0)
+                .get_cf(column_family(db, *space), physical_key(space.id(), key).0)
                 .map_err(rocksdb_error)?
                 .is_some_and(|value| value.as_slice() == expected.as_ref()),
             Precondition::RangeEmpty { space, range } => {
-                let bounds = EncodedBounds::new(physical_range(space.id, range.clone()));
+                let bounds = EncodedBounds::new(physical_range(space.id(), range.clone()));
                 range_is_empty(db, column_family(db, *space), &bounds)?
             }
             Precondition::BranchEquals { ref_key, expected } => db
@@ -261,36 +250,8 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
     }
 }
 
-/// Read options for a full-value read of `space`.
-///
-/// RocksDB verifies a CRC32C over every block and every blob-file record it
-/// reads. For a [`ValueIntegrity::ContentAddressed`] space that is a strictly
-/// weaker duplicate of a check the engine has already made unconditional: the
-/// key *is* the BLAKE3-256 digest of the value, and the engine recomputes and
-/// compares it before the bytes escape the read. Corruption that RocksDB's
-/// CRC32C would have caught is caught by the digest instead — including the
-/// cases CRC32C cannot distinguish — so the second pass buys nothing and costs
-/// a full sweep over every payload byte.
-///
-/// It is worth stating what is *not* claimed. Skipping verification means a
-/// corrupt block reaches the engine before it is rejected, so the failure mode
-/// moves from RocksDB's error to the engine's content-address error. The bytes
-/// never escape either way. `verify_checksums` also covers this column
-/// family's index and filter blocks; a corrupt index can only send the read to
-/// the wrong key, and the wrong payload fails the digest check for the key that
-/// was actually asked for.
-///
-/// Every other space gets RocksDB's default, which verifies.
-fn value_read_options(space: StorageSpace) -> rocksdb::ReadOptions {
-    let mut options = rocksdb::ReadOptions::default();
-    if space.value_integrity == ValueIntegrity::ContentAddressed {
-        options.set_verify_checksums(false);
-    }
-    options
-}
-
 fn column_family(db: &DB, space: StorageSpace) -> &ColumnFamily {
-    match space.value_semantics {
+    match space.value_semantics() {
         ValueSemantics::Mutable => mutable_column_family(db),
         ValueSemantics::Immutable => db
             .cf_handle(IMMUTABLE_COLUMN_FAMILY)
@@ -329,14 +290,14 @@ fn range_is_empty(
 
 /// Spaces share the column family for their value semantics and are scoped by
 /// a four-byte big-endian space id prefix within that physical domain.
-fn physical_key(space: SpaceId, key: &Key) -> Key {
+fn physical_key(space: u32, key: &Key) -> Key {
     let mut bytes = Vec::with_capacity(4 + key.0.len());
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Key(Bytes::from(bytes))
 }
 
-fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+fn physical_range(space: u32, range: KeyRange) -> KeyRange {
     let map = |bound: Bound<Key>, unbounded: Bound<Key>| match bound {
         Bound::Included(key) => Bound::Included(physical_key(space, &key)),
         Bound::Excluded(key) => Bound::Excluded(physical_key(space, &key)),
@@ -345,11 +306,11 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
     KeyRange {
         lower: map(
             range.lower,
-            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+            Bound::Included(Key(Bytes::copy_from_slice(&space.to_be_bytes()))),
         ),
         upper: map(
             range.upper,
-            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+            space.checked_add(1).map_or(Bound::Unbounded, |next| {
                 Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
             }),
         ),
@@ -369,7 +330,7 @@ impl StorageRead for RocksDBRead<'_> {
                 let physical_keys = request
                     .keys
                     .iter()
-                    .map(|key| physical_key(request.space.id, key))
+                    .map(|key| physical_key(request.space.id(), key))
                     .collect::<Vec<_>>();
                 match request.opts.projection {
                     CoreProjection::KeyOnly => {
@@ -386,10 +347,9 @@ impl StorageRead for RocksDBRead<'_> {
                         }
                     }
                     CoreProjection::FullValue => {
-                        let values = self.snapshot.multi_get_cf_opt(
-                            physical_keys.iter().map(|key| (cf, key.0.as_ref())),
-                            value_read_options(request.space),
-                        );
+                        let values = self
+                            .snapshot
+                            .multi_get_cf(physical_keys.iter().map(|key| (cf, key.0.as_ref())));
                         results.extend(
                             values
                                 .into_iter()
@@ -418,17 +378,8 @@ impl StorageRead for RocksDBRead<'_> {
             if opts.order == ScanOrder::Descending {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
-            let bounds = EncodedBounds::new(physical_range(space.id, range.clone()));
-            let mut iterator = match opts.projection {
-                // A key-only scan never materializes a value, so there is no
-                // value checksum to skip and the default options are right.
-                CoreProjection::KeyOnly => {
-                    self.snapshot.raw_iterator_cf(column_family(self.db, space))
-                }
-                CoreProjection::FullValue => self
-                    .snapshot
-                    .raw_iterator_cf_opt(column_family(self.db, space), value_read_options(space)),
-            };
+            let bounds = EncodedBounds::new(physical_range(space.id(), range.clone()));
+            let mut iterator = self.snapshot.raw_iterator_cf(column_family(self.db, space));
             iterator.seek(&bounds.lower_seek);
             iterator.status().map_err(rocksdb_error)?;
             ScanCursor::from_source(
@@ -439,7 +390,6 @@ impl StorageRead for RocksDBRead<'_> {
                     bounds,
                     projection: opts.projection,
                     space,
-                    keys: ScanKeyArena::new(),
                 },
             )
         }
@@ -451,80 +401,6 @@ struct RocksDBScanSource<'a> {
     bounds: EncodedBounds,
     projection: CoreProjection,
     space: StorageSpace,
-    keys: ScanKeyArena,
-}
-
-/// Chunk size for [`ScanKeyArena`].
-///
-/// This constant is the whole trade. Larger chunks mean fewer allocations per
-/// page; they also mean a single retained row pins a larger buffer, because a
-/// key handed out of a chunk keeps the entire chunk alive. At 16 KiB a chunk
-/// holds roughly 270 typical HOT keys, so a full page of 4 096 rows costs
-/// about 16 allocations instead of 4 096, while the worst case — one surviving
-/// row per chunk — pins 16 KiB rather than a whole page.
-const SCAN_KEY_ARENA_CHUNK_BYTES: usize = 16 * 1024;
-
-/// Hands out scanned keys as refcounted slices of a shared chunk instead of
-/// one heap allocation per row.
-///
-/// `Bytes::copy_from_slice` produces a `Vec`-backed buffer, and a `Vec`-backed
-/// `Bytes` cannot be cloned without first being **promoted**: the clone
-/// allocates a refcount control block and installs it with a compare-and-swap.
-/// The HOT key decoder clones every row's key onto its primary-key components,
-/// so the per-row cost was two allocations and a promotion to hand out bytes
-/// the page already had in memory.
-///
-/// Splitting one `BytesMut` gives every key in a chunk a handle on a single
-/// shared allocation, so cloning a key is a plain uncontended increment and
-/// nothing is promoted.
-///
-/// **Keys only, deliberately.** Values are unbounded — a value can be a blob —
-/// so pooling them would trade a bounded amount of time for an unbounded
-/// amount of retained memory, and would do it worst on exactly the selective
-/// scans that already materialize more than they return.
-struct ScanKeyArena {
-    chunk: BytesMut,
-}
-
-impl ScanKeyArena {
-    fn new() -> Self {
-        Self {
-            chunk: BytesMut::new(),
-        }
-    }
-
-    /// Copies `bytes` into the current chunk and returns a shared handle on it.
-    ///
-    /// Keys already frozen out of a full chunk keep that chunk alive on their
-    /// own, so starting a fresh one never invalidates them.
-    fn take(&mut self, bytes: &[u8]) -> Bytes {
-        if self.chunk.capacity() < bytes.len() {
-            let capacity = SCAN_KEY_ARENA_CHUNK_BYTES.max(bytes.len());
-            self.chunk = BytesMut::with_capacity(capacity);
-            #[cfg(feature = "storage-benches")]
-            {
-                lix::storage_bench::record_scan_key_buffer_allocation(capacity);
-            }
-        }
-        self.chunk.extend_from_slice(bytes);
-        let key = self.chunk.split_to(bytes.len()).freeze();
-        // Guards the one thing that can go wrong when keys are carved out of a
-        // shared buffer rather than copied into their own: handing back a
-        // window of the wrong width would silently mint a different logical
-        // key. Cheap — a compare against a length already in a register.
-        //
-        // The message doubles as this build's arm marker. `ScanKeyArena`
-        // inlines away in release and leaves no symbol, and a `#[used]` static
-        // is dropped by the linker, but a panic string cannot be collected, so
-        // `strings | grep lix.rocksdb.scan_key_arena.v1` answers "is the arena
-        // in this artifact?" without trusting which directory it came from.
-        assert_eq!(
-            key.len(),
-            bytes.len(),
-            "lix.rocksdb.scan_key_arena.v1 handed out a key of the wrong width"
-        );
-        key
-    }
 }
 
 impl StorageScanSource for RocksDBScanSource<'_> {
@@ -545,7 +421,7 @@ impl StorageScanSource for RocksDBScanSource<'_> {
                 if !self.bounds.before_upper(encoded_key) {
                     break;
                 }
-                let key = Key(self.keys.take(scan_key_payload(self.space, encoded_key)?));
+                let key = decode_rocksdb_scan_key(self.space, encoded_key)?;
                 let value = match self.projection {
                     CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
                     CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::copy_from_slice(
@@ -564,21 +440,18 @@ impl StorageScanSource for RocksDBScanSource<'_> {
                 .iterator
                 .key()
                 .is_some_and(|key| self.bounds.before_upper(key));
-            Ok(ScanChunk::new(entries, has_more))
+            Ok(ScanChunk { entries, has_more })
         })
     }
 }
 
-fn scan_key_payload<'a>(
-    space: StorageSpace,
-    encoded_key: &'a [u8],
-) -> Result<&'a [u8], StorageError> {
-    if encoded_key.len() < 4 || encoded_key[..4] != space.id.0.to_be_bytes() {
+fn decode_rocksdb_scan_key(space: StorageSpace, encoded_key: &[u8]) -> Result<Key, StorageError> {
+    if encoded_key.len() < 4 || encoded_key[..4] != space.id().to_be_bytes() {
         return Err(StorageError::Corruption(
             "RocksDB scan key escaped its storage space".to_string(),
         ));
     }
-    Ok(&encoded_key[4..])
+    Ok(Key(Bytes::copy_from_slice(&encoded_key[4..])))
 }
 
 impl StorageWrite for RocksDBWrite {
@@ -588,7 +461,7 @@ impl StorageWrite for RocksDBWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            if space.value_semantics == ValueSemantics::Immutable {
+            if space.value_semantics() == ValueSemantics::Immutable {
                 validate_immutable_batch(&entries)?;
             }
             let max_key_bytes = entries
@@ -599,13 +472,13 @@ impl StorageWrite for RocksDBWrite {
                 .unwrap_or(0);
             let mut physical_key = Vec::with_capacity(max_key_bytes);
             let cf = column_family(&self.inner.db, space);
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             for entry in entries.entries {
                 physical_key.clear();
                 physical_key.extend_from_slice(&space_prefix);
                 physical_key.extend_from_slice(&entry.key.0);
                 let value = stored_value_bytes(entry.value);
-                if space.value_semantics == ValueSemantics::Immutable {
+                if space.value_semantics() == ValueSemantics::Immutable {
                     if let Some(staged) = self.immutable_values.get(physical_key.as_slice()) {
                         if staged != &value {
                             return Err(StorageError::Corruption(
@@ -651,7 +524,7 @@ impl StorageWrite for RocksDBWrite {
             });
             let mut key_bytes = Vec::with_capacity(physical_key_bytes);
             let cf = column_family(&self.inner.db, space);
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             for key in keys {
                 let key_start = key_bytes.len();
                 key_bytes.extend_from_slice(&space_prefix);
@@ -672,7 +545,7 @@ impl StorageWrite for RocksDBWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             let cf = column_family(&self.inner.db, space);
-            let range = physical_range(space.id, range);
+            let range = physical_range(space.id(), range);
             if let Some((lower, upper)) = rocksdb_delete_range_bounds(&range) {
                 self.batch
                     .delete_range_cf(cf, lower.as_slice(), upper.as_slice());
@@ -701,23 +574,7 @@ impl StorageWrite for RocksDBWrite {
 
     fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         async move {
-            // `await_durable` means "do not acknowledge until the backend has
-            // crossed its durable persistence boundary". For RocksDB that is
-            // `sync = true`: the WAL append is fsynced before `write` returns,
-            // so an acknowledged publication survives power loss, not merely
-            // process death.
-            //
-            // Deliberately conditional. Ordinary row commits do not request
-            // durability and must not pay an fsync for it; the engine sets the
-            // flag only for atomic content-addressed publications and media
-            // uploads, which is precisely where losing an acknowledged write
-            // would be visible as a missing file.
-            let mut write_options = RocksDBWriteOptions::default();
-            write_options.set_sync(self.await_durable);
-            self.inner
-                .db
-                .write_opt(self.batch, &write_options)
-                .map_err(rocksdb_error)?;
+            self.inner.db.write(self.batch).map_err(rocksdb_error)?;
             Ok(CommitResult {
                 commit_id: None,
                 stats: self.stats,
@@ -897,17 +754,7 @@ fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
 
 fn column_family_options() -> Options {
     let mut options = Options::default();
-    options.set_write_buffer_size(WRITE_BUFFER_BYTES);
-    // RocksDB's default of two write buffers gives a writer exactly one spare
-    // memtable: the moment the active one fills, the next `db.write` blocks
-    // until the previous flush has finished. A media commit stages megabytes at
-    // a time, so a bulk import fills both buffers and the *next* ordinary agent
-    // commit pays the whole flush inside its own latency. Measured on a 64 file
-    // / 10 MiB corpus, that one commit cost 337-369 ms against a 21 ms median;
-    // with four buffers it costs 22 ms and the median does not move. Raising
-    // `max_background_jobs` instead changes nothing (measured 339/369 ms), so
-    // the spare-memtable count is the whole effect.
-    options.set_max_write_buffer_number(WRITE_BUFFER_COUNT);
+    options.set_write_buffer_size(64 * 1024 * 1024);
     let mut table_options = BlockBasedOptions::default();
     // Full whole-key filters let missing point reads skip unrelated SST data.
     table_options.set_bloom_filter(8.0, false);

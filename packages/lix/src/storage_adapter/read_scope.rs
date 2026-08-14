@@ -27,7 +27,7 @@ pub trait StorageAdapterRead: Send + Sync {
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send;
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StorageAdapterReadScope<R> {
     read: R,
 }
@@ -86,43 +86,6 @@ where
     }
 }
 
-/// Charges one adapter point-read batch to the active plan-load phase.
-///
-/// This is the single boundary every engine point read crosses, so counting
-/// here answers "how many physical reads does one plan load issue" without
-/// trusting a hand audit of the call tree.
-#[cfg(feature = "root-replay-trace")]
-async fn traced_get_many<F>(
-    requests: &[GetManyRequest<'_>],
-    future: F,
-) -> Result<GetManyResult, StorageError>
-where
-    F: Future<Output = Result<GetManyResult, StorageError>>,
-{
-    let keys = requests
-        .iter()
-        .map(|request| request.keys.len() as u64)
-        .sum::<u64>();
-    let start = std::time::Instant::now();
-    let result = future.await;
-    let nanos = start.elapsed().as_nanos() as u64;
-    let (hits, bytes) = match result.as_ref() {
-        Ok(result) => result
-            .values
-            .iter()
-            .flatten()
-            .fold((0u64, 0u64), |(hits, bytes), value| match value {
-                crate::storage::ProjectedValue::KeyOnly => (hits + 1, bytes),
-                crate::storage::ProjectedValue::FullValue(payload) => {
-                    (hits + 1, bytes + payload.len() as u64)
-                }
-            }),
-        Err(_) => (0, 0),
-    };
-    crate::storage_bench::record_plan_load_io(nanos, requests.len() as u64, keys, hits, bytes);
-    result
-}
-
 impl<R> StorageAdapterRead for StorageAdapterReadScope<R>
 where
     R: StorageRead,
@@ -135,14 +98,7 @@ where
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        #[cfg(feature = "root-replay-trace")]
-        {
-            traced_get_many(requests, self.read.get_many(requests))
-        }
-        #[cfg(not(feature = "root-replay-trace"))]
-        {
-            self.read.get_many(requests)
-        }
+        self.read.get_many(requests)
     }
 
     fn begin_scan(
@@ -167,14 +123,7 @@ where
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        #[cfg(feature = "root-replay-trace")]
-        {
-            traced_get_many(requests, self.read.get_many(requests))
-        }
-        #[cfg(not(feature = "root-replay-trace"))]
-        {
-            self.read.get_many(requests)
-        }
+        self.read.get_many(requests)
     }
 
     fn begin_scan(

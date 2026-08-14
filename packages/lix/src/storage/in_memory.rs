@@ -25,7 +25,7 @@ const SNAPSHOT_ENTRY_HEADER_BYTES: usize = size_of::<u32>() * 2;
 /// crosses the trait boundary: reads return logical keys.
 fn physical_key(space: SpaceId, key: &Key) -> Key {
     let mut bytes = bytes::BytesMut::with_capacity(4 + key.0.len());
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.value().to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Key(bytes.freeze())
 }
@@ -39,10 +39,14 @@ fn physical_bound(space: SpaceId, bound: Bound<Key>, unbounded: Bound<Key>) -> B
 }
 
 fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
-    let lower_unbounded = Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes())));
-    let upper_unbounded = space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
-        Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
-    });
+    let lower_unbounded =
+        Bound::Included(Key(Bytes::copy_from_slice(&space.value().to_be_bytes())));
+    let upper_unbounded = space
+        .value()
+        .checked_add(1)
+        .map_or(Bound::Unbounded, |next| {
+            Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
+        });
     KeyRange {
         lower: physical_bound(space, range.lower, lower_unbounded),
         upper: physical_bound(space, range.upper, upper_unbounded),
@@ -302,7 +306,7 @@ impl StorageRead for MemoryRead {
             .flat_map(|request| {
                 request.keys.iter().map(|key| {
                     self.entries
-                        .get(&physical_key(request.space.id, key))
+                        .get(&physical_key(request.space.declared_id(), key))
                         .map(|value| project_value(value, request.opts.projection))
                 })
             })
@@ -320,7 +324,7 @@ impl StorageRead for MemoryRead {
         if opts.order == ScanOrder::Descending {
             return Err(StorageError::Unsupported(Capability::ReverseScan));
         }
-        let physical = physical_range(space.id, range.clone());
+        let physical = physical_range(space.declared_id(), range.clone());
         ScanCursor::from_source(
             range,
             opts.order,
@@ -367,7 +371,7 @@ impl StorageScanSource for MemoryScanSource<'_> {
 
 fn decode_memory_scan_key(space: StorageSpace, key: Key) -> Result<Key, StorageError> {
     let bytes = key.0;
-    if bytes.len() < 4 || bytes[..4] != space.id.0.to_be_bytes() {
+    if bytes.len() < 4 || bytes[..4] != space.id().to_be_bytes() {
         return Err(StorageError::Corruption(
             "in-memory scan key escaped its storage space".to_string(),
         ));
@@ -382,9 +386,9 @@ impl StorageWrite for MemoryWrite {
         entries: PutBatch,
     ) -> Result<(), StorageError> {
         for entry in entries.entries {
-            let key = physical_key(space.id, &entry.key);
+            let key = physical_key(space.declared_id(), &entry.key);
             let value = stored_value_bytes(entry.value);
-            if space.value_semantics == ValueSemantics::Immutable {
+            if space.value_semantics() == ValueSemantics::Immutable {
                 if let Some(existing) = self.immutable_values.get(&key) {
                     if existing != &value {
                         return Err(StorageError::Corruption(
@@ -416,7 +420,7 @@ impl StorageWrite for MemoryWrite {
 
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         for key in keys {
-            let key = physical_key(space.id, key);
+            let key = physical_key(space.declared_id(), key);
             if !self.overlay.puts.is_empty() {
                 self.overlay.puts.remove(&key);
             }
@@ -432,7 +436,7 @@ impl StorageWrite for MemoryWrite {
         space: StorageSpace,
         range: KeyRange,
     ) -> Result<(), StorageError> {
-        let range = physical_range(space.id, range);
+        let range = physical_range(space.declared_id(), range);
         let base_keys = self
             .base
             .entries_range(lower_bound(&range), upper_bound(&range), usize::MAX)
@@ -499,24 +503,24 @@ fn check_preconditions(
         .enumerate()
         .filter_map(|(index, precondition)| {
             let matches = match precondition {
-                Precondition::KeyAbsent { space, key } => {
-                    entries.get(&physical_key(space.id, key)).is_none()
-                }
-                Precondition::KeyPresent { space, key } => {
-                    entries.get(&physical_key(space.id, key)).is_some()
-                }
+                Precondition::KeyAbsent { space, key } => entries
+                    .get(&physical_key(space.declared_id(), key))
+                    .is_none(),
+                Precondition::KeyPresent { space, key } => entries
+                    .get(&physical_key(space.declared_id(), key))
+                    .is_some(),
                 Precondition::KeyValueHashEquals { space, key, hash } => entries
-                    .get(&physical_key(space.id, key))
+                    .get(&physical_key(space.declared_id(), key))
                     .is_some_and(|value| blake3::hash(value).as_bytes() == hash),
                 Precondition::KeyValueEquals {
                     space,
                     key,
                     expected,
                 } => entries
-                    .get(&physical_key(space.id, key))
+                    .get(&physical_key(space.declared_id(), key))
                     .is_some_and(|value| value == expected),
                 Precondition::RangeEmpty { space, range } => {
-                    let range = physical_range(space.id, range.clone());
+                    let range = physical_range(space.declared_id(), range.clone());
                     entries
                         .entries_range(lower_bound(&range), upper_bound(&range), 1)
                         .is_empty()
@@ -589,8 +593,8 @@ mod tests {
     use crate::storage::conformance::{ConformanceStatus, run_storage_conformance};
     use crate::storage::{
         BeginScanOptions, GetManyRequest, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory,
-        ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId, Storage, StorageError,
-        StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
+        ProjectedValue, PutBatch, PutEntry, ReadOptions, Storage, StorageError, StorageRead,
+        StorageSpace, StorageWrite, StoredValue, ValueSemantics, WriteOptions,
     };
 
     #[tokio::test]
@@ -611,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn delete_range_covers_more_than_one_scan_page() {
         let storage = Memory::new();
-        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+        let space = StorageSpace::engine_declared(7, "test.mutable", ValueSemantics::Mutable);
         let mut write = storage
             .begin_write(WriteOptions::default())
             .await
@@ -680,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_roundtrip_is_deterministic_and_point_in_time() {
         let storage = Memory::new();
-        let space = StorageSpace::mutable(SpaceId(17), "test.mutable");
+        let space = StorageSpace::engine_declared(17, "test.mutable", ValueSemantics::Mutable);
         let key_a = Key(Bytes::from_static(b"a"));
         let key_b = Key(Bytes::from_static(b"b"));
         let mut write = storage

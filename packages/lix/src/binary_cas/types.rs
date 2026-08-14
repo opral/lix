@@ -1,9 +1,37 @@
 use crate::LixError;
-use crate::binary_cas::chunking::chunk_ranges;
-use crate::binary_cas::codec::BinaryChunkCodec;
-use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
 use std::ops::Range;
-use std::sync::Arc;
+
+fn hash_bytes_to_hex(bytes: &[u8; 32]) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String is infallible");
+    }
+    encoded
+}
+
+fn hash_hex_to_bytes(value: &str, context: &str) -> Result<[u8; 32], LixError> {
+    if value.len() != 64 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("{context} hash must contain 64 hexadecimal characters"),
+        ));
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("{context} hash contains non-hexadecimal characters"),
+            )
+        })?;
+    }
+    Ok(bytes)
+}
+
+fn binary_blob_hash_bytes(content: &[u8]) -> [u8; 32] {
+    *blake3::hash(content).as_bytes()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlobId([u8; 32]);
@@ -13,39 +41,12 @@ impl BlobId {
         Self(bytes)
     }
 
-    pub(crate) fn from_content(content: &[u8]) -> Self {
-        let ranges = chunk_ranges(content);
-        match ranges.as_slice() {
-            [] | [_] => Self::from_single_chunk(ChunkHash::from_content(content)),
-            ranges => Self::from_chunks(
-                content.len() as u64,
-                ranges.iter().map(|&(start, end)| {
-                    (
-                        ChunkHash::from_content(&content[start..end]),
-                        (end - start) as u64,
-                    )
-                }),
-            ),
-        }
-    }
-
-    pub(crate) fn from_single_chunk(chunk_hash: ChunkHash) -> Self {
-        Self(chunk_hash.into_bytes())
-    }
-
-    /// Computes the canonical identity of a fixed-chunk blob without opening
-    /// its payload. Upload recovery persists precisely these bounded receipts.
-    pub(crate) fn from_chunks(
-        size_bytes: u64,
-        chunks: impl IntoIterator<Item = (ChunkHash, u64)>,
-    ) -> Self {
-        let mut hasher = blake3::Hasher::new_derive_key("lix binary cas fixed manifest v3");
-        hasher.update(&size_bytes.to_le_bytes());
-        for (hash, size) in chunks {
-            hasher.update(&size.to_le_bytes());
-            hasher.update(hash.as_bytes());
-        }
-        Self(*hasher.finalize().as_bytes())
+    /// Derives the sole semantic identity from the canonical authenticated
+    /// Merkle layout. This name deliberately excludes the retired flat/fixed
+    /// manifest constructor contract.
+    pub(crate) fn from_canonical_content(content: &[u8]) -> Self {
+        crate::forktree::canonical_blob_id_for_content(content)
+            .expect("in-memory content has canonical Merkle geometry")
     }
 
     pub(crate) fn from_hex(hash_hex: &str) -> Result<Self, LixError> {
@@ -74,24 +75,8 @@ impl BlobId {
 pub(crate) struct ChunkHash([u8; 32]);
 
 impl ChunkHash {
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
     pub(crate) fn from_content(content: &[u8]) -> Self {
         Self(binary_blob_hash_bytes(content))
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    pub(crate) fn into_bytes(self) -> [u8; 32] {
-        self.0
-    }
-
-    pub(crate) fn to_hex(self) -> String {
-        hash_bytes_to_hex(&self.0)
     }
 }
 
@@ -135,34 +120,19 @@ impl BlobSameLengthSplice {
 pub(crate) struct BlobPayload {
     bytes: crate::Blob,
     hash: Option<BlobId>,
-    chunks: Arc<[BlobChunkReceipt]>,
 }
 
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
         let bytes = bytes.into();
-        // The one and only boundary search for these bytes. Staging rebuilds
-        // the ranges from the receipt sizes below.
-        let chunks = chunk_ranges(&bytes)
-            .into_iter()
-            .map(|(start, end)| BlobChunkReceipt {
-                hash: ChunkHash::from_content(&bytes[start..end]),
-                size_bytes: (end - start) as u64,
-            })
-            .collect::<Arc<[_]>>();
-        let hash = match chunks.as_ref() {
-            [] => None,
-            [chunk] => Some(BlobId::from_single_chunk(chunk.hash)),
-            chunks => Some(BlobId::from_chunks(
-                bytes.len() as u64,
-                chunks.iter().map(|chunk| (chunk.hash, chunk.size_bytes)),
-            )),
-        };
-        Self {
-            bytes,
-            hash,
-            chunks,
-        }
+        let hash = (!bytes.is_empty()).then(|| BlobId::from_canonical_content(&bytes));
+        Self { bytes, hash }
+    }
+
+    pub(crate) fn from_bytes_with_hash(bytes: impl Into<crate::Blob>, hash: BlobId) -> Self {
+        let bytes = bytes.into();
+        let hash = (!bytes.is_empty()).then_some(hash);
+        Self { bytes, hash }
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -177,13 +147,6 @@ impl BlobPayload {
         self.hash
     }
 
-    /// Canonical chunk identities derived from these exact immutable bytes,
-    /// in order. Their sizes are also the payload's chunk layout, so staging
-    /// neither hashes nor re-searches for boundaries a second time.
-    pub(crate) fn chunks(&self) -> &[BlobChunkReceipt] {
-        &self.chunks
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -194,66 +157,26 @@ impl BlobPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlobDeltaSegment {
-    Copy { offset: u64, length: u64 },
-    Insert { bytes: Vec<u8> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlobDeltaBaseLayout {
+pub(crate) enum BlobLayout {
+    Empty,
     SingleChunk { chunk_hash: ChunkHash },
     Chunked { chunk_count: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlobLayout {
-    Empty,
-    SingleChunk {
-        chunk_hash: ChunkHash,
-    },
-    Chunked {
-        chunk_count: u32,
-    },
-    /// One-level, flattened copy/insert program against a canonical full blob,
-    /// so reads never walk a history chain.
-    Delta {
-        base_blob_hash: BlobId,
-        base_size_bytes: u64,
-        base_layout: BlobDeltaBaseLayout,
-        segments: Vec<BlobDeltaSegment>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BlobMetadata {
-    pub(crate) hash: BlobId,
-    pub(crate) size_bytes: u64,
-    pub(crate) layout: BlobLayout,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BlobMetadataBatch {
-    entries: Vec<Option<BlobMetadata>>,
-}
-
-impl BlobMetadataBatch {
-    pub(crate) fn new(entries: Vec<Option<BlobMetadata>>) -> Self {
-        Self { entries }
-    }
-
-    pub(crate) fn into_vec(self) -> Vec<Option<BlobMetadata>> {
-        self.entries
-    }
+enum BlobBytesEntry {
+    Owned(Vec<u8>),
+    Shared(bytes::Bytes),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobBytesBatch {
-    entries: Vec<Option<Vec<u8>>>,
+    entries: Vec<Option<BlobBytesEntry>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobRangeBytes {
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) bytes: bytes::Bytes,
     pub(crate) total_size: u64,
     pub(crate) range: Range<u64>,
 }
@@ -275,11 +198,126 @@ impl BlobRangeBytesBatch {
 
 impl BlobBytesBatch {
     pub(crate) fn new(entries: Vec<Option<Vec<u8>>>) -> Self {
-        Self { entries }
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|entry| entry.map(BlobBytesEntry::Owned))
+                .collect(),
+        }
+    }
+
+    /// Retains already shared payload buffers without copying. The caller is
+    /// responsible for having authenticated every buffer before construction.
+    pub(crate) fn from_shared(entries: Vec<Option<bytes::Bytes>>) -> Self {
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|entry| entry.map(BlobBytesEntry::Shared))
+                .collect(),
+        }
+    }
+
+    /// Retains shared `Blob` payloads without copying. The caller is
+    /// responsible for having authenticated every buffer before construction.
+    pub(crate) fn from_blobs(entries: Vec<Option<crate::Blob>>) -> Self {
+        Self::from_shared(
+            entries
+                .into_iter()
+                .map(|entry| entry.map(crate::Blob::into_bytes))
+                .collect(),
+        )
     }
 
     pub(crate) fn into_vec(self) -> Vec<Option<Vec<u8>>> {
         self.entries
+            .into_iter()
+            .map(|entry| {
+                entry.map(|entry| match entry {
+                    BlobBytesEntry::Owned(bytes) => bytes,
+                    BlobBytesEntry::Shared(bytes) => match bytes.try_into_mut() {
+                        Ok(bytes) => bytes.into(),
+                        Err(bytes) => bytes.to_vec(),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn into_shared_vec(self) -> Vec<Option<bytes::Bytes>> {
+        self.entries
+            .into_iter()
+            .map(|entry| {
+                entry.map(|entry| match entry {
+                    BlobBytesEntry::Owned(bytes) => bytes.into(),
+                    BlobBytesEntry::Shared(bytes) => bytes,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn into_blob_vec(self) -> Vec<Option<crate::Blob>> {
+        self.entries
+            .into_iter()
+            .map(|entry| {
+                entry.map(|entry| match entry {
+                    BlobBytesEntry::Owned(bytes) => bytes.into(),
+                    BlobBytesEntry::Shared(bytes) => bytes.into(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlobBytesBatch;
+    use bytes::Bytes;
+
+    #[test]
+    fn owned_batches_transfer_vec_storage_without_copying() {
+        let source = vec![0x5a; 32];
+        let source_ptr = source.as_ptr();
+        let returned = BlobBytesBatch::new(vec![Some(source)])
+            .into_vec()
+            .pop()
+            .flatten()
+            .expect("owned entry");
+        assert_eq!(returned.as_ptr(), source_ptr);
+    }
+
+    #[test]
+    fn shared_batches_transfer_bytes_storage_into_blob_without_copying() {
+        let source = Bytes::from_static(b"shared authenticated payload");
+        let source_ptr = source.as_ptr();
+        let blob = BlobBytesBatch::from_shared(vec![Some(source)])
+            .into_blob_vec()
+            .pop()
+            .flatten()
+            .expect("shared entry");
+        assert_eq!(blob.as_ref().as_ptr(), source_ptr);
+    }
+
+    #[test]
+    fn unique_shared_batches_transfer_vec_storage_without_copying() {
+        let source = vec![0xa5; 32];
+        let source_ptr = source.as_ptr();
+        let returned = BlobBytesBatch::from_shared(vec![Some(Bytes::from(source))])
+            .into_vec()
+            .pop()
+            .flatten()
+            .expect("unique shared entry");
+        assert_eq!(returned.as_ptr(), source_ptr);
+    }
+
+    #[test]
+    fn shared_slice_and_static_batches_keep_copy_fallback_correct() {
+        let backing = Bytes::from_static(b"0123456789");
+        let sliced = backing.slice(2..7);
+        let values =
+            BlobBytesBatch::from_shared(vec![Some(sliced), Some(Bytes::from_static(b"static"))])
+                .into_vec();
+        assert_eq!(values[0].as_deref(), Some(b"23456".as_slice()));
+        assert_eq!(values[1].as_deref(), Some(b"static".as_slice()));
     }
 }
 
@@ -288,61 +326,11 @@ pub(crate) struct BlobWriteReceipt {
     pub(crate) hash: BlobId,
     pub(crate) size_bytes: u64,
     pub(crate) layout: BlobLayout,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BlobChunkReceipt {
-    pub(crate) hash: ChunkHash,
-    pub(crate) size_bytes: u64,
-}
-
-#[derive(musli::Decode)]
-#[musli(packed)]
-pub(crate) struct BinaryCasChunkView<'a> {
-    pub(crate) codec: BinaryChunkCodec,
-    pub(crate) uncompressed_len: u64,
-    #[musli(bytes)]
-    pub(crate) payload: &'a [u8],
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
-
-    #[test]
-    fn payload_carries_exact_canonical_chunk_receipts() {
-        // A byte pattern with real variety: the gear hash finds no cut point in
-        // a short repeating sequence, so a periodic fixture would collapse to
-        // one max-sized chunk and prove nothing about receipt ordering.
-        let mut bytes = vec![0u8; MEDIA_CHUNK_BYTES * 5 + 17];
-        let mut state = 0x2545_f491_4f6c_dd1d_u64;
-        for chunk in bytes.chunks_mut(8) {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
-        }
-        let payload = BlobPayload::from_bytes(bytes.clone());
-
-        // Boundaries are content-defined, so the receipts are asserted by the
-        // properties staging relies on rather than by fixed sizes: they tile
-        // the payload in order and each names its own slice.
-        assert!(payload.chunks().len() > 1);
-        assert_eq!(payload.hash(), Some(BlobId::from_content(&bytes)));
-        let mut cursor = 0usize;
-        for receipt in payload.chunks() {
-            let end = cursor + receipt.size_bytes as usize;
-            assert_eq!(receipt.hash, ChunkHash::from_content(&bytes[cursor..end]));
-            cursor = end;
-        }
-        assert_eq!(cursor, bytes.len());
-
-        let clone = payload.clone();
-        assert!(std::ptr::eq(
-            payload.chunks().as_ptr(),
-            clone.chunks().as_ptr()
-        ));
-        assert_eq!(payload.bytes(), clone.bytes());
-    }
+    /// The authenticated ForkTree manifest object staged for this receipt.
+    /// A semantic BlobId alone cannot authorize a physical object edge.
+    pub(crate) manifest_object_id: [u8; 32],
+    /// True only when the writer authenticated the exact immutable manifest
+    /// already present in the retained read; this is an in-memory proof bit,
+    /// not a second persisted authority.
+    pub(crate) manifest_was_existing: bool,
 }

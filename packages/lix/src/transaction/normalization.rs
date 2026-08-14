@@ -13,8 +13,8 @@ use crate::schema::{
 };
 use crate::sql2::PublicCatalog;
 #[cfg(test)]
-use crate::transaction_types::TransactionWriteRow;
-use crate::transaction_types::{PreparedRowFacts, RawWriteBatch, RawWriteRowRef, TransactionJson};
+use crate::transaction::types::TransactionWriteRow;
+use crate::transaction::types::{PreparedRowFacts, RawWriteBatch, RawWriteRowRef, TransactionJson};
 
 pub(crate) const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";

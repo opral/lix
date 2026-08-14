@@ -13,18 +13,19 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::LixError;
+use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::SharedStr;
-use crate::tracked_state::{TrackedStateContext, TrackedStateFilter, TrackedStateScanRequest};
+use crate::forktree::ForkTreeReadFacade;
 
-use crate::sql2::SqlHistoryQuerySource;
+use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-    HISTORY_COL_ROW_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_ENTITY_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
     serialize_history_source_changes, validate_history_anchor_filter,
@@ -37,9 +38,7 @@ use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::history_util::{
-    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, row_pk_json_array,
-};
+use super::history_util::{ObservedStateOrdinal, ObservedStateRows, entity_pk_json_array};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -47,8 +46,9 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 pub(super) async fn register_lix_directory_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlHistoryQuerySource<S>,
+    commit_graph: super::SharedCommitGraph,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -58,8 +58,9 @@ where
         surface_name,
         Arc::new(LixDirectoryHistorySpec {
             schema: lix_directory_history_schema(),
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
+            commit_graph,
             query_source,
+            default_as_of_commit_id,
         }),
         WriteAccess::read_only(),
     )
@@ -68,11 +69,12 @@ where
 struct LixDirectoryHistorySpec<S> {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
 }
 
 #[async_trait]
-impl<S> TableSpec for LixDirectoryHistorySpec<S>
+impl<S> TableSpec<S> for LixDirectoryHistorySpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -114,7 +116,7 @@ where
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema, projection);
         let mut route = HistoryRoute::from_filters(filters);
-        route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
+        route.default_to_as_of_commit_id(&self.default_as_of_commit_id);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
@@ -175,7 +177,7 @@ impl DirectoryPathRecord for DirectoryHistoryRecord {
 
 #[derive(Debug)]
 struct DirectoryHistoryObservedState {
-    rows: ObservedTrackedStateRows,
+    rows: ObservedStateRows,
     descriptors: Vec<DirectoryHistoryObservedRecord>,
 }
 
@@ -184,7 +186,7 @@ struct DirectoryHistoryObservedRecord {
     id: String,
     parent_id: Option<String>,
     name: Option<String>,
-    row: ObservedTrackedStateOrdinal,
+    row: ObservedStateOrdinal,
 }
 
 impl DirectoryPathRecord for DirectoryHistoryObservedRecord {
@@ -237,7 +239,7 @@ struct DirectoryDescriptorSnapshot {
 
 async fn load_directory_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     route: &HistoryRoute,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<Vec<DirectoryHistoryOutputRow>, LixError>
@@ -255,7 +257,6 @@ where
         &event_route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
         metadata_projection,
-        None,
     )
     .await?;
     let event_descriptors = parse_directory_history_records(&event_entries)?;
@@ -276,13 +277,14 @@ where
         })
         .collect::<Vec<_>>();
     observed_commit_ids.extend(direct_parent_commit_ids);
+    let historical = query_source.forktree_reader.clone();
     let observed_states =
-        load_directory_history_observed_states(query_source, observed_commit_ids).await?;
+        load_directory_history_observed_states(&historical, observed_commit_ids).await?;
     let events = grouped_directory_history_events(
         &event_descriptors,
         &observed_states,
         &parent_commit_ids_by_commit,
-    );
+    )?;
     let mut output = Vec::new();
 
     for event in events {
@@ -301,7 +303,13 @@ where
             .enumerate()
             .find(|(_, descriptor)| descriptor.id == event.directory_id)
         else {
-            continue;
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "lix_directory_history event for '{}' at commit '{}' has no authenticated descriptor",
+                    event.directory_id, event.observed_commit_id
+                ),
+            ));
         };
         let path = if visible_descriptor.name.is_some() {
             resolve_observed_directory_path(
@@ -309,7 +317,7 @@ where
                 &observed_state.descriptors,
                 &mut BTreeMap::new(),
                 &mut BTreeSet::new(),
-            )
+            )?
         } else {
             None
         };
@@ -334,10 +342,10 @@ where
         });
     }
     output.retain(|row| {
-        let row_pk = row_pk_json_array(&row.descriptor().id).ok();
+        let entity_pk = entity_pk_json_array(&row.descriptor().id).ok();
         route.matches_surface_row(
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            row_pk.as_deref().unwrap_or(&row.descriptor().id),
+            entity_pk.as_deref().unwrap_or(&row.descriptor().id),
             None,
             row.event.depth,
         )
@@ -385,35 +393,23 @@ where
 }
 
 async fn load_directory_history_observed_states<S>(
-    query_source: SqlHistoryQuerySource<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_ids: BTreeSet<String>,
 ) -> Result<BTreeMap<String, Arc<DirectoryHistoryObservedState>>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    // Equal-depth commits can be siblings. Resolve the directory projection
-    // from the observed commit's root so no sibling descriptor can leak into
-    // the row merely because it has the same traversal depth.
-    let mut reader = TrackedStateContext::new().reader(query_source.store);
     let mut states = BTreeMap::new();
     for observed_commit_id in observed_commit_ids {
-        let batch = reader
-            .scan_batch_at_commit(
-                &observed_commit_id,
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-                        include_tombstones: true,
-                        ..TrackedStateFilter::default()
-                    },
-                    ..TrackedStateScanRequest::default()
-                },
-            )
-            .await?;
-        let rows = ObservedTrackedStateRows::from_batch(
-            SharedStr::from(observed_commit_id.as_str()),
-            batch,
-        )?;
+        let commit_id =
+            CommitId::parse_lix(&observed_commit_id, "directory history observed commit")?;
+        let batch = historical.scan_state_rows_at_commit(commit_id).await?;
+        let batch = batch
+            .into_iter()
+            .filter(|row| row.key.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+            .collect();
+        let rows =
+            ObservedStateRows::from_rows(SharedStr::from(observed_commit_id.as_str()), batch)?;
         let descriptors = parse_directory_history_observed_records(&rows)?;
         states.insert(
             observed_commit_id,
@@ -424,21 +420,34 @@ where
 }
 
 fn parse_directory_history_observed_records(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<DirectoryHistoryObservedRecord>, LixError> {
     rows.iter()
         .filter(|observed| observed.row().schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|observed| {
             let _ = observed.observed_commit_id();
             let row = observed.row();
+            let row_id = row.entity_pk().as_single_string_owned()?;
             let Some(snapshot_content) = row.snapshot_content() else {
-                return Ok(DirectoryHistoryObservedRecord {
-                    id: row.row_pk().as_single_string_owned()?,
-                    parent_id: None,
-                    name: None,
-                    row: observed.ordinal(),
-                });
+                if row.deleted() {
+                    return Ok(DirectoryHistoryObservedRecord {
+                        id: row_id,
+                        parent_id: None,
+                        name: None,
+                        row: observed.ordinal(),
+                    });
+                }
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("directory descriptor row '{row_id}' has no authenticated payload"),
+                ));
             };
+            let snapshot_content = Some(snapshot_content).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("directory descriptor row '{row_id}' has no authenticated payload"),
+                )
+            })?;
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -446,8 +455,17 @@ fn parse_directory_history_observed_records(
                         format!("invalid lix_directory_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "observed directory descriptor payload identity '{}' does not match authenticated row key '{}'",
+                        snapshot.id, row_id
+                    ),
+                ));
+            }
             Ok(DirectoryHistoryObservedRecord {
-                id: snapshot.id,
+                id: row_id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
                 row: observed.ordinal(),
@@ -463,14 +481,21 @@ fn parse_directory_history_records(
         .iter()
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
-            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
+            let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            if entry.change.snapshot_content.is_none() {
                 return Ok(DirectoryHistoryRecord {
-                    id: entry.change.row_pk.as_single_string_owned()?,
+                    id: row_id,
                     parent_id: None,
                     name: None,
                     entry: entry.clone(),
                 });
-            };
+            }
+            let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("directory descriptor history row '{row_id}' has no authenticated payload"),
+                )
+            })?;
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -478,8 +503,17 @@ fn parse_directory_history_records(
                         format!("invalid lix_directory_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "directory descriptor payload identity '{}' does not match authenticated row key '{}'",
+                        snapshot.id, row_id
+                    ),
+                ));
+            }
             Ok(DirectoryHistoryRecord {
-                id: snapshot.id,
+                id: row_id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
                 entry: entry.clone(),
@@ -492,7 +526,7 @@ fn grouped_directory_history_events(
     descriptors: &[DirectoryHistoryRecord],
     observed_states: &BTreeMap<String, Arc<DirectoryHistoryObservedState>>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
-) -> Vec<DirectoryHistoryEvent> {
+) -> Result<Vec<DirectoryHistoryEvent>, LixError> {
     let mut grouped = BTreeMap::<(String, String, String), DirectoryHistoryEvent>::new();
     let directory_trees = observed_states
         .iter()
@@ -518,7 +552,7 @@ fn grouped_directory_history_events(
                     directory_trees
                         .get(state_commit_id)
                         .expect("every observed directory state should have a directory tree")
-                        .descendants_including(&descriptor.id),
+                        .descendants_including(&descriptor.id)?,
                 );
             }
         }
@@ -560,7 +594,7 @@ fn grouped_directory_history_events(
             .then(left.depth.cmp(&right.depth))
             .then(left.observed_commit_id.cmp(&right.observed_commit_id))
     });
-    events
+    Ok(events)
 }
 
 fn directory_history_event_from_entry(
@@ -587,8 +621,8 @@ static LIX_DIRECTORY_HISTORY_COLS: ColumnTable<DirectoryHistoryOutputRow> = Colu
         ),
         ("name", Col::Utf8(|row| row.descriptor().name.as_deref())),
         (
-            HISTORY_COL_ROW_PK,
-            Col::Utf8Fallible(|row| row_pk_json_array(&row.descriptor().id).map(Some)),
+            HISTORY_COL_ENTITY_PK,
+            Col::Utf8Fallible(|row| entity_pk_json_array(&row.descriptor().id).map(Some)),
         ),
         (
             HISTORY_COL_SOURCE_CHANGES,
@@ -642,7 +676,7 @@ pub(super) fn lix_directory_history_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
-        json_field(HISTORY_COL_ROW_PK, false),
+        json_field(HISTORY_COL_ENTITY_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),

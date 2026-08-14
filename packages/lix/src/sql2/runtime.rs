@@ -1,30 +1,26 @@
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::Arc;
 #[cfg(feature = "storage-benches")]
 use std::time::Instant;
 
-use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::ScanArgs;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{DataFusionError, NullEquality, ScalarValue, internal_err};
-use datafusion::datasource::provider_as_source;
+use datafusion::common::{DataFusionError, internal_err};
+use datafusion::dataframe::DataFrame;
+use datafusion::datasource::source_as_provider;
 use datafusion::error::Result;
 use datafusion::execution::SessionState;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
-use datafusion::logical_expr::{JoinType, LogicalPlan};
-use datafusion::physical_expr::expressions::Column as PhysicalColumn;
-use datafusion::physical_expr::{LexOrdering, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::execution_plan::{Boundedness, CardinalityEffect, EmissionType};
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::execution_plan::{CardinalityEffect, EmissionType};
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -34,9 +30,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use tokio::sync::OnceCell;
 
 use crate::catalog::CatalogFingerprint;
-use crate::sql2::{
-    CachedPhysicalRead, CachedScanRequest, PhysicalReadPlanCacheKey, SqlPlanningCache,
-};
+use crate::sql2::{PhysicalReadPlanCacheKey, SqlPlanningCache};
 
 use super::providers::{PhysicalScanKey, SpecScanExec, StatementScanKey};
 
@@ -45,84 +39,14 @@ type PhysicalPlanningCache = (
     PhysicalReadPlanCacheKey<CatalogFingerprint>,
 );
 
-/// One read statement's logical plan as handed to the execution runtime.
-///
-/// A warm physical-template execution never reads the logical plan at all —
-/// the cached leaf-scan requests replan directly against the current session —
-/// so a statement that owns a physical-cache key hands over the planning
-/// cache's *detached* template (table scans holding `EmptyTable` placeholders)
-/// instead of eagerly rebinding every scan to live providers first. The
-/// rebinding then happens here, and only on the paths that actually plan the
-/// logical tree.
-pub(crate) enum RuntimeReadPlan {
-    /// Table scans carry live snapshot-bound providers; plannable as-is.
-    Bound(LogicalPlan),
-    /// Table scans carry detached `EmptyTable` placeholders and must be
-    /// rebound against the session state before DataFusion may plan them.
-    Detached(LogicalPlan),
-}
-
-impl RuntimeReadPlan {
-    pub(crate) fn inner(&self) -> &LogicalPlan {
-        match self {
-            Self::Bound(plan) | Self::Detached(plan) => plan,
-        }
-    }
-
-    async fn into_bound(self, state: &SessionState) -> Result<LogicalPlan> {
-        match self {
-            Self::Bound(plan) => Ok(plan),
-            Self::Detached(plan) => rebind_detached_read_plan(state, plan).await,
-        }
-    }
-}
-
-/// Replaces detached `EmptyTable` scan sources with the current session's
-/// providers. Mirrors the eager rebinding previously done during logical
-/// planning; provider resolution goes through the same shared catalog list.
-async fn rebind_detached_read_plan(state: &SessionState, plan: LogicalPlan) -> Result<LogicalPlan> {
-    let mut tables = BTreeSet::new();
-    plan.apply(|node| {
-        if let LogicalPlan::TableScan(scan) = node {
-            tables.insert(scan.table_name.clone());
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    let mut providers = BTreeMap::new();
-    for table in tables {
-        let provider = state
-            .schema_for_ref(table.clone())?
-            .table(table.table())
-            .await?
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!("cached SQL plan provider '{table}' is unavailable"))
-            })?;
-        providers.insert(table, provider_as_source(provider));
-    }
-    plan.transform_up(|node| {
-        let LogicalPlan::TableScan(mut scan) = node else {
-            return Ok(Transformed::no(node));
-        };
-        scan.source = providers.get(&scan.table_name).cloned().ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "cached SQL plan provider '{}' is unavailable",
-                scan.table_name
-            ))
-        })?;
-        Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
-    })
-    .map(|transformed| transformed.data)
-}
-
-pub(crate) async fn collect_plan(
-    state: &SessionState,
-    logical_plan: RuntimeReadPlan,
+pub(crate) async fn collect_dataframe(
+    dataframe: DataFrame,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Vec<RecordBatch>> {
-    let task_ctx = execution_task_context(state);
+    let task_ctx = Arc::new(dataframe.task_ctx());
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan = create_or_rebind_physical_plan(state, logical_plan, physical_planning_cache).await?;
+    let plan = create_or_rebind_physical_plan(dataframe, physical_planning_cache).await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -149,15 +73,14 @@ pub(crate) async fn collect_plan(
 /// stop polling it early; dropping the stream then drops the underlying scan
 /// futures as well.
 #[cfg(feature = "storage-benches")]
-pub(crate) async fn stream_plan(
-    state: &SessionState,
-    logical_plan: RuntimeReadPlan,
+pub(crate) async fn stream_dataframe(
+    dataframe: DataFrame,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<SendableRecordBatchStream> {
-    let task_ctx = execution_task_context(state);
+    let task_ctx = Arc::new(dataframe.task_ctx());
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let plan = create_or_rebind_physical_plan(state, logical_plan, physical_planning_cache).await?;
+    let plan = create_or_rebind_physical_plan(dataframe, physical_planning_cache).await?;
     let plan = adapt_runtime_plan(plan)?;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -169,62 +92,25 @@ pub(crate) async fn stream_plan(
     stream_adapted_input_plan(plan, task_ctx)
 }
 
-/// Builds the execution context for one statement without copying the session
-/// function registries.
-///
-/// `TaskContext`'s registries exist for plan deserialization. Physical
-/// expressions already own an `Arc` to every function they call, and Lix never
-/// resolves a function by name during execution, so cloning several hundred
-/// `String` keys per query would be pure overhead.
-fn execution_task_context(state: &SessionState) -> Arc<TaskContext> {
-    Arc::new(TaskContext::new(
-        None,
-        state.session_id().to_string(),
-        state.config().clone(),
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        Arc::clone(state.runtime_env()),
-    ))
-}
-
 async fn create_or_rebind_physical_plan(
-    state: &SessionState,
-    logical_plan: RuntimeReadPlan,
+    dataframe: DataFrame,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let Some((cache, key)) = physical_planning_cache else {
-        return state
-            .create_physical_plan(&logical_plan.into_bound(state).await?)
-            .await;
+        return dataframe.create_physical_plan().await;
     };
-    let Some(cached) = cache.physical_read_plan(&key) else {
-        let logical_plan = logical_plan.into_bound(state).await?;
-        let optimized = state.optimize(&logical_plan)?;
-        let plan = state
-            .query_planner()
-            .create_physical_plan(&optimized, state)
-            .await?;
+    let Some(template) = cache.physical_read_plan(&key) else {
+        let plan = dataframe.create_physical_plan().await?;
         if let Some(template) = detach_physical_plan_template(Arc::clone(&plan)) {
-            cache.remember_physical_read_plan(
-                key,
-                CachedPhysicalRead {
-                    scans: cached_scan_requests(&optimized),
-                    template,
-                },
-            );
+            cache.remember_physical_read_plan(key, template);
         }
         return Ok(plan);
     };
 
-    // Warm path. Neither DataFusion's analyzer, logical optimizer nor physical
-    // planner runs again for this statement shape: each cached leaf scan is
-    // replanned against the current snapshot's provider and grafted into the
-    // template. The logical plan is never consulted, which is why a detached
-    // one may arrive here without ever being rebound.
-    if let Some(replacements) = plan_cached_spec_scans(&cached.scans, state).await?
-        && let Some(plan) =
-            rebind_physical_plan_template(Arc::clone(&cached.template), replacements)
+    let (state, logical_plan) = dataframe.into_parts();
+    let optimized = state.optimize(&logical_plan)?;
+    if let Some(replacements) = plan_current_spec_scans(&optimized, &state).await?
+        && let Some(plan) = rebind_physical_plan_template(template, replacements)
     {
         return Ok(plan);
     }
@@ -233,61 +119,40 @@ async fn create_or_rebind_physical_plan(
     // invalidates the detached template before execution. Fall back to the
     // ordinary DataFusion planner for this statement and evict the stale entry.
     cache.forget_physical_read_plan(&key);
-    let logical_plan = logical_plan.into_bound(state).await?;
-    let optimized = state.optimize(&logical_plan)?;
     state
         .query_planner()
-        .create_physical_plan(&optimized, state)
+        .create_physical_plan(&optimized, &state)
         .await
 }
 
-/// Reduces an optimized plan's leaf scans to provider-free scan requests.
-///
-/// A cache entry must never retain a table provider bound to the storage
-/// snapshot that planned it. Keeping only the resolved table name, projection,
-/// filters and fetch makes that structural rather than a discipline: there is
-/// no provider in the entry to go stale, and no logical plan to clone on the
-/// warm path.
-fn cached_scan_requests(plan: &LogicalPlan) -> Vec<CachedScanRequest> {
-    fn collect(plan: &LogicalPlan, scans: &mut Vec<CachedScanRequest>) {
-        if let LogicalPlan::TableScan(scan) = plan {
-            scans.push(CachedScanRequest {
-                table: scan.table_name.clone(),
-                projection: scan.projection.clone(),
-                filters: unnormalize_cols(scan.filters.clone()),
-                fetch: scan.fetch,
-            });
-        }
-        for input in plan.inputs() {
-            collect(input, scans);
-        }
+fn collect_logical_table_scans(
+    plan: &LogicalPlan,
+    scans: &mut Vec<datafusion::logical_expr::TableScan>,
+) {
+    if let LogicalPlan::TableScan(scan) = plan {
+        scans.push(scan.clone());
     }
-
-    let mut scans = Vec::new();
-    collect(plan, &mut scans);
-    scans
+    for input in plan.inputs() {
+        collect_logical_table_scans(input, scans);
+    }
 }
 
-/// Replans each cached leaf scan against the current snapshot's provider.
-///
-/// Declining (returning `None`) is always safe: the caller evicts the entry and
-/// falls back to the ordinary DataFusion planner.
-async fn plan_cached_spec_scans(
-    scans: &[CachedScanRequest],
+async fn plan_current_spec_scans(
+    logical_plan: &LogicalPlan,
     state: &SessionState,
 ) -> Result<Option<HashMap<PhysicalScanKey, VecDeque<Arc<dyn ExecutionPlan>>>>> {
+    let mut logical_scans = Vec::new();
+    collect_logical_table_scans(logical_plan, &mut logical_scans);
     let mut replacements: HashMap<PhysicalScanKey, VecDeque<Arc<dyn ExecutionPlan>>> =
         HashMap::new();
-    for scan in scans {
-        let Ok(schema) = state.schema_for_ref(scan.table.clone()) else {
+    for scan in logical_scans {
+        let Ok(provider) = source_as_provider(&scan.source) else {
             return Ok(None);
         };
-        let Some(provider) = schema.table(scan.table.table()).await? else {
-            return Ok(None);
-        };
+        let filters = unnormalize_cols(scan.filters);
         let args = ScanArgs::default()
             .with_projection(scan.projection.as_deref())
-            .with_filters(Some(&scan.filters))
+            .with_filters(Some(&filters))
             .with_limit(scan.fetch);
         let result = provider.scan_with_args(state, args).await?;
         let plan = Arc::clone(result.plan());
@@ -302,34 +167,14 @@ async fn plan_cached_spec_scans(
     Ok(Some(replacements))
 }
 
-/// Operators a reusable template may contain.
-///
-/// Every entry must rebuild into a fresh operator that carries no state from a
-/// prior execution. `SortExec` qualifies only without a fetch: a top-k sort
-/// owns a shared dynamic filter that its ordinary clone deliberately keeps
-/// alive, so it is rejected rather than rebuilt.
-fn template_operator_is_reusable(plan: &dyn ExecutionPlan) -> bool {
-    match plan.name() {
-        "ProjectionExec"
-        | "HashJoinExec"
-        | "FilterExec"
-        | "CooperativeExec"
-        | "CoalesceBatchesExec"
-        | "CoalescePartitionsExec"
-        | "SortPreservingMergeExec" => true,
-        "SortExec" => plan
-            .as_any()
-            .downcast_ref::<SortExec>()
-            .is_some_and(|sort| sort.fetch().is_none()),
-        _ => false,
-    }
-}
-
 fn detach_physical_plan_template(plan: Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     if let Some(scan) = plan.as_any().downcast_ref::<SpecScanExec>() {
         return Some(Arc::new(DetachedSpecScanExec::new(scan)));
     }
-    if !template_operator_is_reusable(plan.as_ref()) {
+    if !matches!(
+        plan.name(),
+        "ProjectionExec" | "HashJoinExec" | "FilterExec" | "CooperativeExec"
+    ) {
         return None;
     }
     let children = plan
@@ -357,9 +202,7 @@ fn rebind_physical_plan_template_inner(
 ) -> Option<Arc<dyn ExecutionPlan>> {
     if let Some(detached) = plan.as_any().downcast_ref::<DetachedSpecScanExec>() {
         let replacement = replacements.get_mut(&detached.key)?.pop_front()?;
-        return detached
-            .fingerprint
-            .matches(replacement.as_ref())
+        return (physical_plan_fingerprint(replacement.as_ref()) == detached.fingerprint)
             .then_some(replacement);
     }
     let children = plan
@@ -387,70 +230,20 @@ fn rebuild_template_node(
             .build_exec()
             .ok();
     }
-    if let Some(sort) = plan.as_any().downcast_ref::<SortExec>() {
-        // `SortExec::with_new_children` clones the operator, which shares its
-        // metrics set and top-k dynamic filter with the template. Build a fresh
-        // sort instead; `template_operator_is_reusable` already excluded the
-        // fetch variants that own a dynamic filter.
-        if sort.fetch().is_some() {
-            return None;
-        }
-        let [child] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).ok()?;
-        return Some(Arc::new(
-            SortExec::new(sort.expr().clone(), child)
-                .with_preserve_partitioning(sort.preserve_partitioning()),
-        ));
-    }
     plan.with_new_children(children).ok()
 }
 
-/// The structural identity a replacement scan must reproduce before a detached
-/// template leaf accepts it.
-///
-/// This is compared once per leaf on every warm execution, so it is kept as
-/// direct field equality. Formatting `Debug` for the schema and the full
-/// `PlanProperties` — including `EquivalenceProperties` — allocated several
-/// kilobytes of string per scan per query for the same decision.
-///
-/// `Partitioning` deliberately compares by discriminant and partition count:
-/// its `PartialEq` returns `false` for two identical `UnknownPartitioning`
-/// values, which is the variant every `SpecScanExec` reports.
-struct ScanFingerprint {
-    schema: SchemaRef,
-    partitioning: std::mem::Discriminant<Partitioning>,
-    partition_count: usize,
-    output_ordering: Option<LexOrdering>,
-    emission_type: EmissionType,
-    boundedness: Boundedness,
-}
-
-impl ScanFingerprint {
-    fn new(plan: &dyn ExecutionPlan) -> Self {
-        let properties = plan.properties();
-        Self {
-            schema: plan.schema(),
-            partitioning: std::mem::discriminant(&properties.partitioning),
-            partition_count: properties.partitioning.partition_count(),
-            output_ordering: properties.output_ordering().cloned(),
-            emission_type: properties.emission_type,
-            boundedness: properties.boundedness,
-        }
-    }
-
-    fn matches(&self, plan: &dyn ExecutionPlan) -> bool {
-        let properties = plan.properties();
-        self.partition_count == properties.partitioning.partition_count()
-            && self.partitioning == std::mem::discriminant(&properties.partitioning)
-            && self.emission_type == properties.emission_type
-            && self.boundedness == properties.boundedness
-            && self.output_ordering.as_ref() == properties.output_ordering()
-            && self.schema == plan.schema()
-    }
+fn physical_plan_fingerprint(plan: &dyn ExecutionPlan) -> Arc<str> {
+    Arc::from(format!(
+        "schema={:?};properties={:?}",
+        plan.schema(),
+        plan.properties()
+    ))
 }
 
 struct DetachedSpecScanExec {
     key: PhysicalScanKey,
-    fingerprint: ScanFingerprint,
+    fingerprint: Arc<str>,
     properties: Arc<PlanProperties>,
 }
 
@@ -458,7 +251,7 @@ impl DetachedSpecScanExec {
     fn new(scan: &SpecScanExec) -> Self {
         Self {
             key: scan.physical_cache_key().clone(),
-            fingerprint: ScanFingerprint::new(scan),
+            fingerprint: physical_plan_fingerprint(scan),
             properties: Arc::clone(scan.properties()),
         }
     }
@@ -632,10 +425,6 @@ fn adapt_runtime_plan_inner(
         return Ok(Arc::new(StatementScanCacheExec::new(state)));
     }
 
-    if let Some(probe_join) = probe_key_join(&plan)? {
-        return Ok(probe_join);
-    }
-
     let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() else {
         return Ok(plan);
     };
@@ -643,279 +432,6 @@ fn adapt_runtime_plan_inner(
         Arc::clone(coalesce.input()),
         coalesce.fetch(),
     )))
-}
-
-/// Distinct probe keys one join may carry into its scan.
-///
-/// Each key becomes its own index bucket lookup, so a wide build side is
-/// cheaper to answer with the collection scan the join already had. The
-/// storage plane applies the same cap independently and declines above it, so
-/// exceeding this number costs a scan, never a wrong answer.
-const MAX_PROBE_KEYS: usize = 64;
-
-/// Wraps a hash join whose probe side is a scan that can seek on the join key.
-///
-/// Only the shapes where discarding a non-matching probe row is already the
-/// join's own behaviour qualify:
-///
-/// - `CollectLeft`, so the build side is the left input and is fully consumed
-///   before the probe side is read;
-/// - `Inner` or `Left`, whose output contains a right row only when it matched
-///   a left row — `Right` and `Full` null-extend unmatched probe rows and are
-///   therefore excluded;
-/// - `NullEqualsNothing`, so a null probe key cannot match and dropping null
-///   rows is not observable;
-/// - a single output partition, so the build side is consumed once.
-///
-/// With more than one equijoin key, restricting on any one of them is still
-/// conservative: a row that matches must match on every key, so it survives the
-/// restriction on each of them individually.
-fn probe_key_join(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() else {
-        return Ok(None);
-    };
-    if join.mode != PartitionMode::CollectLeft
-        || !matches!(join.join_type(), JoinType::Inner | JoinType::Left)
-        || join.null_equality() != NullEquality::NullEqualsNothing
-        || plan.output_partitioning().partition_count() != 1
-        || join.left().output_partitioning().partition_count() != 1
-    {
-        return Ok(None);
-    }
-    let Some(scan) = probe_scan(join.right()) else {
-        return Ok(None);
-    };
-    let left_schema = join.left().schema();
-    let right_schema = join.right().schema();
-    for (left_key, right_key) in join.on() {
-        let Some(column) = right_key.as_any().downcast_ref::<PhysicalColumn>() else {
-            continue;
-        };
-        if !scan.serves_probe_column(column.name()) {
-            continue;
-        }
-        // The restriction is handed to the provider as literals of the probe
-        // column's own type. A join key that had to be widened or cast is not
-        // that type, so leave those to the scan.
-        if left_key.data_type(&left_schema)? != right_key.data_type(&right_schema)? {
-            continue;
-        }
-        return Ok(Some(Arc::new(ProbeKeyJoinExec::new(
-            Arc::clone(plan),
-            Arc::clone(left_key),
-            column.name().to_string(),
-        ))));
-    }
-    Ok(None)
-}
-
-/// The scan a probe side reads its rows from, if the operators above it in
-/// that side neither rename its columns nor add rows to it.
-///
-/// DataFusion puts a cooperative-yielding wrapper over every leaf and may put
-/// batch coalescing or a residual filter between the join and the scan. All
-/// three pass their input's schema through unchanged, so a join key names the
-/// same scan column through any chain of them, and all three only ever emit a
-/// subset of what the scan produced — which is what makes restricting the scan
-/// beneath them observationally identical to restricting the probe side.
-fn probe_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&SpecScanExec> {
-    if let Some(scan) = plan.as_any().downcast_ref::<SpecScanExec>() {
-        return Some(scan);
-    }
-    if !probe_passthrough(plan.as_ref()) {
-        return None;
-    }
-    let children = plan.children();
-    let [child] = children.as_slice() else {
-        return None;
-    };
-    probe_scan(child)
-}
-
-fn probe_passthrough(plan: &dyn ExecutionPlan) -> bool {
-    matches!(
-        plan.name(),
-        "CooperativeExec" | "CoalesceBatchesExec" | "FilterExec"
-    )
-}
-
-/// Rebuilds a probe side around a replacement for the scan `probe_scan` found.
-fn replace_probe_scan(
-    plan: &Arc<dyn ExecutionPlan>,
-    replacement: Arc<dyn ExecutionPlan>,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    if plan.as_any().downcast_ref::<SpecScanExec>().is_some() {
-        return Ok(replacement);
-    }
-    let children = plan.children();
-    let [child] = children.as_slice() else {
-        return internal_err!("probe side lost its scan");
-    };
-    let child = replace_probe_scan(child, replacement)?;
-    Arc::clone(plan).with_new_children(vec![child])
-}
-
-/// A hash join that reads its build side first and replans its probe scan
-/// restricted to the build side's key values.
-///
-/// The rewrite is an access-path choice, never a semantic one. The restricted
-/// scan is the same provider scan with one extra `IN` predicate on a key
-/// column, and the join that runs over it is the original join with its
-/// children swapped for a replay of the build side and that restricted scan.
-/// Every reason to decline — too many distinct keys, a provider that cannot
-/// seek the column, a build side whose keys are all null — falls back to the
-/// unrestricted scan and produces the same rows more slowly.
-#[derive(Debug)]
-struct ProbeKeyJoinExec {
-    join: Arc<dyn ExecutionPlan>,
-    left_key: Arc<dyn PhysicalExpr>,
-    probe_column: String,
-    properties: Arc<PlanProperties>,
-}
-
-impl ProbeKeyJoinExec {
-    fn new(
-        join: Arc<dyn ExecutionPlan>,
-        left_key: Arc<dyn PhysicalExpr>,
-        probe_column: String,
-    ) -> Self {
-        Self {
-            properties: Arc::clone(join.properties()),
-            join,
-            left_key,
-            probe_column,
-        }
-    }
-}
-
-impl DisplayAs for ProbeKeyJoinExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ProbeKeyJoinExec: probe_key={}", self.probe_column)
-    }
-}
-
-impl ExecutionPlan for ProbeKeyJoinExec {
-    fn name(&self) -> &'static str {
-        "ProbeKeyJoinExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        self.join.children()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let join = rebuild_hash_join(&self.join, children)?;
-        // Re-derive rather than reattach: a replacement probe child that can no
-        // longer seek this key must go back to the plain join.
-        Ok(probe_key_join(&join)?.unwrap_or(join))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        let join = Arc::clone(&self.join);
-        let left_key = Arc::clone(&self.left_key);
-        let probe_column = self.probe_column.clone();
-        let schema = self.schema();
-        let restricted = stream::once(async move {
-            let children = join.children();
-            let (Some(build), Some(probe)) = (children.first(), children.get(1)) else {
-                return internal_err!("probe-key join lost a child");
-            };
-            // The build side is consumed once here to read the keys and replayed
-            // from memory by the join. `CollectLeft` already materializes it, so
-            // this is the same collection moved one operator earlier.
-            let build: Arc<dyn ExecutionPlan> = Arc::new(StatementScanCacheExec::new(Arc::new(
-                StatementScanCacheState::new(Arc::clone(build)),
-            )));
-            let batches =
-                collect_adapted_input_plan(Arc::clone(&build), Arc::clone(&context)).await?;
-            let restricted_scan = match probe_keys(&batches, &left_key)? {
-                Some(values) => match probe_scan(probe) {
-                    Some(scan) if scan.serves_probe_column(&probe_column) => {
-                        scan.rebind_probe(&probe_column, values).await?
-                    }
-                    _ => None,
-                },
-                None => None,
-            };
-            let probe = match restricted_scan {
-                Some(restricted_scan) => replace_probe_scan(probe, restricted_scan)?,
-                None => Arc::clone(probe),
-            };
-            rebuild_hash_join(&join, vec![build, probe])?.execute(partition, context)
-        })
-        .try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, restricted)))
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        self.join.partition_statistics(partition)
-    }
-}
-
-/// Rebuilds a hash join over new children with no state carried over.
-///
-/// `HashJoinExec::with_new_children` deliberately preserves the build table and
-/// dynamic-filter state of the operator it clones, which a rebuilt join must
-/// not inherit.
-fn rebuild_hash_join(
-    join: &Arc<dyn ExecutionPlan>,
-    children: Vec<Arc<dyn ExecutionPlan>>,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let Some(hash_join) = join.as_any().downcast_ref::<HashJoinExec>() else {
-        return internal_err!("probe-key join wraps a non-hash join");
-    };
-    hash_join
-        .builder()
-        .with_new_children(children)?
-        .reset_state()
-        .build_exec()
-}
-
-/// The distinct non-null build-side key values, or `None` when the join must
-/// keep its unrestricted probe scan.
-///
-/// Null keys are dropped because the caller already established
-/// `NullEqualsNothing`, under which a null key matches nothing.
-fn probe_keys(
-    batches: &[RecordBatch],
-    key: &Arc<dyn PhysicalExpr>,
-) -> Result<Option<Vec<ScalarValue>>> {
-    let mut seen = HashSet::new();
-    let mut values = Vec::new();
-    for batch in batches {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let array = key.evaluate(batch)?.into_array(batch.num_rows())?;
-        for index in 0..array.len() {
-            if array.is_null(index) {
-                continue;
-            }
-            let value = ScalarValue::try_from_array(&array, index)?;
-            if seen.insert(value.clone()) {
-                if values.len() == MAX_PROBE_KEYS {
-                    return Ok(None);
-                }
-                values.push(value);
-            }
-        }
-    }
-    Ok((!values.is_empty()).then_some(values))
 }
 
 #[derive(Debug)]

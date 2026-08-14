@@ -1,6 +1,7 @@
 mod analysis;
 mod branch;
 mod conflicts;
+mod native;
 mod stats;
 
 #[cfg(feature = "storage-benches")]

@@ -3,6 +3,7 @@ pub(crate) mod datafusion;
 pub(crate) mod write;
 
 use crate::SqlQueryResult;
+use crate::storage_adapter::StorageAdapterRead;
 
 /// Internal write outcome.  DML normally only reports its affected-row count,
 /// while `DELETE … RETURNING` additionally carries the pre-delete result set.
@@ -99,21 +100,29 @@ pub(crate) enum SqlLogicalPlan {
     Write(SqlWriteLogicalPlan),
 }
 
-pub(crate) fn prepare_path_value_replacement_program(
-    ctx: &dyn crate::sql2::SqlWriteExecutionContext,
+pub(crate) fn prepare_path_value_replacement_program<C, R>(
+    ctx: &C,
     plan: &SqlLogicalPlan,
-) -> Option<bound_public_write::PreparedPathValueReplacementProgram> {
+) -> Option<bound_public_write::PreparedPathValueReplacementProgram>
+where
+    C: crate::sql2::SqlWriteExecutionContext<ReadStore = R>,
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let SqlLogicalPlan::Write(write) = plan else {
         return None;
     };
     bound_public_write::prepare_path_value_replacement_program_from_logical(ctx, &write.plan)
 }
 
-pub(crate) async fn prepare_path_value_replacement_row(
-    ctx: &mut dyn crate::sql2::SqlWriteExecutionContext,
+pub(crate) async fn prepare_path_value_replacement_row<C, R>(
+    ctx: &mut C,
     program: &bound_public_write::PreparedPathValueReplacementProgram,
     params: &[crate::Value],
-) -> Result<Option<bound_public_write::PreparedPathValueReplacementRow>, crate::LixError> {
+) -> Result<Option<bound_public_write::PreparedPathValueReplacementRow>, crate::LixError>
+where
+    C: crate::sql2::SqlWriteExecutionContext<ReadStore = R>,
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     bound_public_write::prepare_path_value_replacement_row(ctx, program, params).await
 }
 
@@ -130,24 +139,3 @@ pub(crate) fn append_path_value_replacement_snapshot(
         normalized,
     )
 }
-
-pub(crate) fn append_path_value_replacement_snapshot_text(
-    primary_key: &str,
-    replacement_value: Option<&str>,
-    normalized: &mut Vec<u8>,
-) -> Result<(usize, usize), crate::LixError> {
-    bound_public_write::append_path_value_replacement_snapshot_text(
-        primary_key,
-        replacement_value,
-        normalized,
-    )
-}
-
-#[cfg(test)]
-pub(crate) use bound_public_write::{
-    take_certified_row_insert_batch_executions,
-    take_certified_row_insert_parameter_batch_executions,
-    take_certified_generation_identity_replacements,
-    take_certified_replacement_parameter_batch_executions,
-    take_certified_single_path_value_replacements, take_row_update_parameter_batch_executions,
-};

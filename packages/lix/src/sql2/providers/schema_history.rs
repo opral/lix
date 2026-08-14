@@ -19,10 +19,10 @@ use crate::commit_graph::CommitGraphReader;
 use crate::serialize_row_metadata;
 use crate::sql2::change_materialization::MaterializedChange;
 
-use crate::sql2::SqlHistoryQuerySource;
+use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::catalog::{
-    SchemaColumnType, SchemaSurfaceShape, SchemaSurfaceSpec, schema_surface_schema,
+    EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, entity_surface_schema,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
@@ -31,21 +31,22 @@ use crate::sql2::history_route::{
     HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
     parse_history_filter, validate_history_anchor_filter,
 };
-use crate::sql2::providers::schema::{
-    row_f64_value, row_i64_value, row_json_text_value, parse_snapshot,
+use crate::sql2::providers::entity::{
+    entity_f64_value, entity_i64_value, entity_json_text_value, parse_snapshot,
 };
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::schema::{RowPrimaryKeyFilterAnalyzer, row_pks_from_primary_key_filters};
+use super::entity::{EntityPrimaryKeyFilterAnalyzer, entity_pks_from_primary_key_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
-pub(super) fn register_row_history_surface<S>(
+pub(super) fn register_entity_history_surface<S>(
     session: &SessionContext,
     surface_name: &str,
-    spec: Arc<SchemaSurfaceSpec>,
+    spec: Arc<EntitySurfaceSpec>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -53,12 +54,13 @@ where
     register_spec_table(
         session,
         surface_name,
-        Arc::new(SchemaHistorySpec {
+        Arc::new(EntityHistorySpec {
             surface_name: surface_name.to_string(),
-            schema: schema_surface_schema(&spec, SchemaSurfaceShape::History),
+            schema: entity_surface_schema(&spec, EntitySurfaceShape::History),
             spec,
             commit_graph,
             query_source,
+            default_as_of_commit_id,
         }),
         WriteAccess::read_only(),
     )
@@ -67,17 +69,18 @@ where
 /// Schema-specific history surface backed directly by the commit graph.
 ///
 /// The spec uses the commit graph primitive directly, then shapes canonical
-/// changes into the typed row columns for one registered schema.
-struct SchemaHistorySpec<S> {
+/// changes into the typed entity columns for one registered schema.
+struct EntityHistorySpec<S> {
     surface_name: String,
-    spec: Arc<SchemaSurfaceSpec>,
+    spec: Arc<EntitySurfaceSpec>,
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
 }
 
 #[async_trait]
-impl<S> TableSpec for SchemaHistorySpec<S>
+impl<S> TableSpec<S> for EntityHistorySpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -98,7 +101,7 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        let identity_analyzer = RowPrimaryKeyFilterAnalyzer::new(&self.spec);
+        let identity_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
         if parse_history_filter(filter).is_some() || identity_analyzer.supports(filter) {
             TableProviderFilterPushDown::Exact
         } else if identity_analyzer.contains_routable_conjunct(filter) {
@@ -121,8 +124,8 @@ where
         limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
-        let mut route = row_history_route_from_filters(&self.spec, filters)?;
-        route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
+        let mut route = entity_history_route_from_filters(&self.spec, filters)?;
+        route.default_to_as_of_commit_id(&self.default_as_of_commit_id);
         let schema = projected_schema(&self.schema, projection);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         Ok(PlannedScan {
@@ -139,7 +142,7 @@ where
                     metadata_projection,
                 ),
                 move |(spec, commit_graph, query_source, route, schema, metadata_projection)| async move {
-                    let rows = load_row_history_rows(
+                    let rows = load_entity_history_rows(
                         &spec,
                         commit_graph,
                         query_source,
@@ -149,34 +152,34 @@ where
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                    row_history_record_batch(&schema, &spec, &rows)
+                    entity_history_record_batch(&schema, &spec, &rows)
                 },
             ),
         })
     }
 }
 
-fn row_history_route_from_filters(
-    spec: &SchemaSurfaceSpec,
+fn entity_history_route_from_filters(
+    spec: &EntitySurfaceSpec,
     filters: &[Expr],
 ) -> Result<HistoryRoute> {
     let mut route = HistoryRoute::from_filters(filters);
-    if let Some(row_pks) = row_pks_from_primary_key_filters(spec, filters)? {
-        let surface_row_pks = row_pks
+    if let Some(entity_pks) = entity_pks_from_primary_key_filters(spec, filters)? {
+        let surface_entity_pks = entity_pks
             .iter()
-            .map(crate::row_pk::RowPk::as_json_array_text)
+            .map(crate::entity_pk::EntityPk::as_json_array_text)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(lix_error_to_datafusion_error)?;
-        route.constrain_row_pks(surface_row_pks);
+        route.constrain_entity_pks(surface_entity_pks);
         if !route.is_contradictory() {
-            route.set_resolved_row_pks(row_pks);
+            route.set_resolved_entity_pks(entity_pks);
         }
     }
     Ok(route)
 }
 
 #[derive(Debug, Clone)]
-struct SchemaHistoryRow {
+struct EntityHistoryRow {
     change: MaterializedChange,
     observed_commit_id: String,
     commit_created_at: Option<String>,
@@ -184,14 +187,14 @@ struct SchemaHistoryRow {
     depth: u32,
 }
 
-async fn load_row_history_rows<S>(
-    spec: &SchemaSurfaceSpec,
+async fn load_entity_history_rows<S>(
+    spec: &EntitySurfaceSpec,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     route: &HistoryRoute,
     limit: Option<usize>,
     metadata_projection: HistoryMetadataProjection,
-) -> Result<Vec<SchemaHistoryRow>, LixError>
+) -> Result<Vec<EntityHistoryRow>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -206,12 +209,11 @@ where
         route,
         vec![spec.schema_key.clone()],
         metadata_projection,
-        limit,
     )
     .await?;
     let mut rows = entries
         .into_iter()
-        .map(|entry| SchemaHistoryRow {
+        .map(|entry| EntityHistoryRow {
             change: entry.change,
             observed_commit_id: entry.observed_commit_id,
             commit_created_at: entry.commit_created_at,
@@ -225,20 +227,20 @@ where
     Ok(rows)
 }
 
-/// The `lixcol_*` system-column tail every schema history surface shares.
-/// The row-payload columns are spec-dependent (typed per registered
-/// schema), so they stay in [`row_history_column_array`]; only the fixed
+/// The `lixcol_*` system-column tail every entity history surface shares.
+/// The entity-payload columns are spec-dependent (typed per registered
+/// schema), so they stay in [`entity_history_column_array`]; only the fixed
 /// system columns live in the static table.
-static ROW_HISTORY_SYSTEM_COLS: ColumnTable<SchemaHistoryRow> = ColumnTable {
+static ENTITY_HISTORY_SYSTEM_COLS: ColumnTable<EntityHistoryRow> = ColumnTable {
     columns: &[
         (
-            "lixcol_row_pk",
+            "lixcol_entity_pk",
             Col::Utf8Owned(|row| {
                 Some(
                     row.change
-                        .row_pk
+                        .entity_pk
                         .as_json_array_text()
-                        .expect("canonical change row primary key should project"),
+                        .expect("canonical change entity primary key should project"),
                 )
             }),
         ),
@@ -286,10 +288,10 @@ static ROW_HISTORY_SYSTEM_COLS: ColumnTable<SchemaHistoryRow> = ColumnTable {
     ],
 };
 
-fn row_history_batch_error(error: ColumnTableError) -> DataFusionError {
+fn entity_history_batch_error(error: ColumnTableError) -> DataFusionError {
     match error {
         ColumnTableError::UnsupportedColumn(column) => DataFusionError::Execution(format!(
-            "sql2 row history provider does not support system column '{column}'"
+            "sql2 entity history provider does not support system column '{column}'"
         )),
         ColumnTableError::Arrow(error) | ColumnTableError::ArrowZeroColumn(error) => {
             DataFusionError::from(error)
@@ -298,10 +300,10 @@ fn row_history_batch_error(error: ColumnTableError) -> DataFusionError {
     }
 }
 
-fn row_history_record_batch(
+fn entity_history_record_batch(
     schema: &SchemaRef,
-    spec: &SchemaSurfaceSpec,
-    rows: &[SchemaHistoryRow],
+    spec: &EntitySurfaceSpec,
+    rows: &[EntityHistoryRow],
 ) -> Result<RecordBatch> {
     let system_fields = schema
         .fields()
@@ -309,15 +311,15 @@ fn row_history_record_batch(
         .filter(|field| field.name().starts_with("lixcol_"))
         .cloned()
         .collect::<Vec<_>>();
-    let system_batch = ROW_HISTORY_SYSTEM_COLS
+    let system_batch = ENTITY_HISTORY_SYSTEM_COLS
         .build(Arc::new(Schema::new(system_fields)), rows)
-        .map_err(row_history_batch_error)?;
+        .map_err(entity_history_batch_error)?;
     let columns = schema
         .fields()
         .iter()
         .map(|field| {
             system_batch.column_by_name(field.name()).map_or_else(
-                || row_history_column_array(field.name(), spec, rows),
+                || entity_history_column_array(field.name(), spec, rows),
                 |array| Ok(Arc::clone(array)),
             )
         })
@@ -330,51 +332,51 @@ fn row_history_record_batch(
 }
 
 #[expect(trivial_casts)]
-fn row_history_column_array(
+fn entity_history_column_array(
     column_name: &str,
-    spec: &SchemaSurfaceSpec,
-    rows: &[SchemaHistoryRow],
+    spec: &EntitySurfaceSpec,
+    rows: &[EntityHistoryRow],
 ) -> Result<ArrayRef> {
     let column_type = spec
         .visible_column(column_name)
         .ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "sql2 row history provider '{}' does not expose column '{}'",
+                "sql2 entity history provider '{}' does not expose column '{}'",
                 spec.schema_key, column_name
             ))
         })?
         .column_type;
     let projected_values = rows
         .iter()
-        .map(|row| row_history_column_value(row, spec, column_name))
+        .map(|row| entity_history_column_value(row, spec, column_name))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(match column_type {
-        SchemaColumnType::String | SchemaColumnType::Json => Arc::new(StringArray::from(
+        EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
             projected_values
                 .iter()
-                .map(|snapshot| row_json_text_value(snapshot.as_ref(), column_type))
+                .map(|snapshot| entity_json_text_value(snapshot.as_ref(), column_type))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
-        SchemaColumnType::Integer => Arc::new(Int64Array::from(
+        EntityColumnType::Integer => Arc::new(Int64Array::from(
             projected_values
                 .iter()
-                .map(|snapshot| row_i64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .map(|snapshot| entity_i64_value(snapshot.as_ref(), &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
-        SchemaColumnType::Number => Arc::new(Float64Array::from(
+        EntityColumnType::Number => Arc::new(Float64Array::from(
             projected_values
                 .iter()
-                .map(|snapshot| row_f64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .map(|snapshot| entity_f64_value(snapshot.as_ref(), &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
-        SchemaColumnType::Boolean => Arc::new(BooleanArray::from(
+        EntityColumnType::Boolean => Arc::new(BooleanArray::from(
             projected_values
                 .iter()
                 .map(|snapshot| snapshot.as_ref().and_then(JsonValue::as_bool))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
-        SchemaColumnType::Timestamptz => Arc::new(
+        EntityColumnType::Timestamptz => Arc::new(
             TimestampMicrosecondArray::from(
                 projected_values
                     .iter()
@@ -407,9 +409,9 @@ fn row_history_column_array(
     })
 }
 
-fn row_history_column_value(
-    row: &SchemaHistoryRow,
-    spec: &SchemaSurfaceSpec,
+fn entity_history_column_value(
+    row: &EntityHistoryRow,
+    spec: &EntitySurfaceSpec,
     column_name: &str,
 ) -> Result<Option<JsonValue>> {
     let snapshot = parse_snapshot(row.change.snapshot_content.as_deref())?;
@@ -417,14 +419,14 @@ fn row_history_column_value(
         return Ok(snapshot.get(column_name).cloned());
     }
 
-    let row_pk = row.change.row_pk.as_json_array_text().map_err(|error| {
+    let entity_pk = row.change.entity_pk.as_json_array_text().map_err(|error| {
         DataFusionError::Execution(format!(
-            "sql2 row history provider failed to project row pk: {error}"
+            "sql2 entity history provider failed to project entity pk: {error}"
         ))
     })?;
     tombstone_identity_column_value(
         column_name,
-        &row_pk,
+        &entity_pk,
         HistoryIdentityProjection::PrimaryKeyPaths(&spec.primary_key_paths),
     )
     .map_err(|error| DataFusionError::Execution(error.to_string()))
@@ -436,13 +438,13 @@ mod tests {
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
     use serde_json::json;
 
-    use crate::sql2::catalog::derive_schema_surface_spec_from_schema;
+    use crate::sql2::catalog::derive_entity_surface_spec_from_schema;
 
-    use super::row_history_route_from_filters;
+    use super::entity_history_route_from_filters;
 
     #[test]
     fn public_composite_key_filters_route_in_schema_order() {
-        let spec = derive_schema_surface_spec_from_schema(&json!({
+        let spec = derive_entity_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "localized_message",
             "columns": [
@@ -460,17 +462,17 @@ mod tests {
             eq("locale", "en"),
         ];
 
-        let route = row_history_route_from_filters(&spec, &filters)
+        let route = entity_history_route_from_filters(&spec, &filters)
             .expect("history route should derive");
 
         assert_eq!(route.as_of_commit_ids, vec!["commit-head"]);
-        assert_eq!(route.row_pks, vec![r#"["en","welcome"]"#]);
+        assert_eq!(route.entity_pks, vec![r#"["en","welcome"]"#]);
         assert!(!route.is_contradictory());
     }
 
     #[test]
     fn public_and_opaque_identity_filters_intersect() {
-        let spec = derive_schema_surface_spec_from_schema(&json!({
+        let spec = derive_entity_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "localized_message",
             "columns": [
@@ -483,20 +485,20 @@ mod tests {
         let filters = vec![
             eq("key", "welcome"),
             eq("locale", "en"),
-            eq("lixcol_row_pk", r#"["fr","welcome"]"#),
+            eq("lixcol_entity_pk", r#"["fr","welcome"]"#),
         ];
 
-        let route = row_history_route_from_filters(&spec, &filters)
+        let route = entity_history_route_from_filters(&spec, &filters)
             .expect("history route should derive");
 
         assert!(route.is_contradictory());
 
-        let wrong_arity_route = row_history_route_from_filters(
+        let wrong_arity_route = entity_history_route_from_filters(
             &spec,
             &[
                 eq("key", "welcome"),
                 eq("locale", "en"),
-                eq("lixcol_row_pk", r#"["en"]"#),
+                eq("lixcol_entity_pk", r#"["en"]"#),
             ],
         )
         .expect("wrong-arity identity should produce a route");

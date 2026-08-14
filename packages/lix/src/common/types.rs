@@ -184,12 +184,13 @@ impl SharedStr {
         self.bytes.as_ptr() == other.bytes.as_ptr() && self.bytes.len() == other.bytes.len()
     }
 
-    pub(crate) fn retained_buffer_len(&self) -> usize {
-        self.bytes.len()
-    }
-
+    #[cfg(test)]
     pub(crate) fn retained_buffer_identity(&self) -> (*const u8, usize) {
         (self.bytes.as_ptr(), self.bytes.len())
+    }
+
+    pub(crate) fn retained_buffer_len(&self) -> usize {
+        self.bytes.len()
     }
 }
 

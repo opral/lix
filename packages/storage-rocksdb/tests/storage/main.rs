@@ -1,5 +1,3 @@
-#[path = "../../../lix/tests/adapter_deterministic_sequence_corruption.rs"]
-mod deterministic_sequence_corruption;
 mod file_sql;
 mod native_file_read;
 mod native_file_upsert;
@@ -59,35 +57,4 @@ async fn checkpointed_state_survives_undo_redo_and_cold_reopen_on_rocksdb() {
         .await
         .expect("reopen repository after redo");
     undo_redo_checkpoint::assert_cold_redo(&lix, branch_id).await;
-}
-
-#[tokio::test]
-async fn deterministic_sequence_member_corruption_fails_closed_on_rocksdb() {
-    let temp_dir = tempfile::tempdir().expect("create RocksDB temp directory");
-
-    let initial_path = temp_dir.path().join("sequence-initial.rocksdb");
-    let storage = RocksDB::open(&initial_path).expect("open initial RocksDB storage");
-    deterministic_sequence_corruption::initialize_with_deterministic_mode(storage.clone()).await;
-    storage.flush().expect("flush initial deterministic mode");
-    drop(storage);
-    let storage = RocksDB::open(&initial_path).expect("reopen initial RocksDB storage");
-    deterministic_sequence_corruption::assert_next_uuid(storage, "000000000000").await;
-
-    let corrupt_path = temp_dir.path().join("sequence-corrupt.rocksdb");
-    let storage = RocksDB::open(&corrupt_path).expect("open corruption RocksDB storage");
-    deterministic_sequence_corruption::initialize_with_deterministic_mode(storage.clone()).await;
-    deterministic_sequence_corruption::assert_next_uuid(storage.clone(), "000000000000").await;
-    storage.flush().expect("flush published sequence member");
-    drop(storage);
-
-    let storage = RocksDB::open(&corrupt_path).expect("reopen published sequence storage");
-    deterministic_sequence_corruption::replace_selected_sequence_member_with_unrelated(&storage)
-        .await;
-    storage
-        .flush()
-        .expect("flush same-count sequence member substitution");
-    drop(storage);
-
-    let storage = RocksDB::open(&corrupt_path).expect("reopen corrupt sequence storage");
-    deterministic_sequence_corruption::assert_missing_sequence_member_fails_closed(storage).await;
 }

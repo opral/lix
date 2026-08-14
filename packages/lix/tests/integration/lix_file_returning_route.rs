@@ -5,10 +5,10 @@
 //! with `FileIdConstraint::Ids` and no path index, so it is the only caller
 //! whose readback can degrade to a full branch walk.
 
+use lix::Value;
 use lix::engine::Engine;
 use lix::storage::Memory;
 use lix::storage_bench::take_file_live_scan_accounting;
-use lix::Value;
 
 async fn seed(files: usize) -> lix::session::SessionContext<Memory> {
     let storage = Memory::new();
@@ -57,7 +57,10 @@ async fn returning_readback_decodes_a_bounded_number_of_entries() {
         let session = seed(files).await;
         let id = text(
             &session
-                .execute("SELECT id FROM lix_file WHERE path = '/seed-00000007.bin'", &[])
+                .execute(
+                    "SELECT id FROM lix_file WHERE path = '/seed-00000007.bin'",
+                    &[],
+                )
                 .await
                 .expect("target file should resolve")
                 .rows()[0]
@@ -145,11 +148,7 @@ async fn returning_readback_decodes_a_bounded_number_of_entries() {
 async fn pinned_returning_readback_agrees_with_the_unfiltered_read() {
     let session = seed(8).await;
 
-    async fn check(
-        session: &lix::session::SessionContext<Memory>,
-        id: &str,
-        path: &str,
-    ) {
+    async fn check(session: &lix::session::SessionContext<Memory>, id: &str, path: &str) {
         let oracle = session
             .execute("SELECT id, path FROM lix_file", &[])
             .await
@@ -204,7 +203,11 @@ async fn pinned_returning_readback_agrees_with_the_unfiltered_read() {
         )
         .await
         .expect("content clear should return its post-image");
-    assert_eq!(cleared.rows().len(), 1, "content clear should return one row");
+    assert_eq!(
+        cleared.rows().len(),
+        1,
+        "content clear should return one row"
+    );
     check(&session, &minted, "/oracle/renamed.md").await;
 
     // 4. Delete: tombstones both rows.
@@ -221,7 +224,10 @@ async fn pinned_returning_readback_agrees_with_the_unfiltered_read() {
         .await
         .expect("unfiltered read should succeed");
     assert!(
-        !after.rows().iter().any(|row| text(&row.values()[0]) == minted),
+        !after
+            .rows()
+            .iter()
+            .any(|row| text(&row.values()[0]) == minted),
         "deleted file should be absent from the unfiltered read"
     );
 

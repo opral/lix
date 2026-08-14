@@ -1,14 +1,14 @@
+use std::collections::BTreeSet;
+
 use crate::LixError;
-use crate::changelog::{ChangeRecordProjection, CommitId};
-use crate::checkpoint::CHECKPOINT_SCHEMA_KEY;
-use crate::row_pk::RowPk;
+use crate::changelog::CommitId;
+use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
+use crate::entity_pk::EntityPk;
+use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow, StateKey};
 use crate::sql2::SqlWriteExecutionContext;
-use crate::storage_adapter::Storage;
-use crate::tracked_state::{
-    TrackedStateIndexValue, TrackedStateKey, descriptor_dependency_cascade_file_ids,
-};
+use crate::storage_adapter::{Storage, StorageAdapterRead};
 use crate::transaction::Transaction;
-use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
+use crate::transaction::types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 use crate::undo_redo::{
     UNDO_REDO_MARKER_SCHEMA_KEY, UndoRedoKind, UndoRedoMarker, marker_stage_row,
 };
@@ -67,9 +67,10 @@ where
         .load_branch_head(&branch_id)
         .await?
         .ok_or_else(|| LixError::branch_not_found(&branch_id, "undo", "target"))?;
+    let facade = transaction.forktree_read_facade();
     let head_record = load_node(transaction, head).await?;
     let (state, head_delta) =
-        semantic_state_for_record(transaction, &branch_id, head, &head_record).await?;
+        semantic_state_for_record(&facade, &branch_id, head, &head_record).await?;
     let target = state.undo_top.ok_or_else(|| {
         LixError::new(
             LixError::CODE_NOTHING_TO_UNDO,
@@ -82,14 +83,23 @@ where
         load_node(transaction, target).await?
     };
     let parent = only_parent(&target_record.parent_commit_ids, target, "undo")?;
-    let state_before_target = semantic_state_at(transaction, &branch_id, parent).await?;
+    let state_before_target = semantic_state_at(transaction, &facade, &branch_id, parent).await?;
 
     let target_delta = if target == head {
         head_delta
     } else {
-        load_commit_delta(transaction, target).await?
+        load_commit_delta(&facade, target).await?
     };
-    let outcome = apply_state_diff(transaction, head, parent, false, &target_delta).await?;
+    let outcome = apply_state_diff(
+        transaction,
+        &facade,
+        head,
+        parent,
+        target,
+        false,
+        &target_delta,
+    )
+    .await?;
     let inverse_commit_id = outcome.commit_id.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -125,8 +135,9 @@ where
         .load_branch_head(&branch_id)
         .await?
         .ok_or_else(|| LixError::branch_not_found(&branch_id, "redo", "target"))?;
+    let facade = transaction.forktree_read_facade();
     let head_record = load_node(transaction, head).await?;
-    let (state, _) = semantic_state_for_record(transaction, &branch_id, head, &head_record).await?;
+    let (state, _) = semantic_state_for_record(&facade, &branch_id, head, &head_record).await?;
     let redo_node = state.redo_top.ok_or_else(|| {
         LixError::new(
             LixError::CODE_NOTHING_TO_REDO,
@@ -139,7 +150,7 @@ where
             None => return Err(missing_redo_node(redo_node)),
         }
     } else {
-        let node = operation_marker_at(transaction, &branch_id, redo_node)
+        let node = operation_marker_at(&facade, &branch_id, redo_node)
             .await?
             .filter(|marker| marker.kind == UndoRedoKind::Undo)
             .ok_or_else(|| missing_redo_node(redo_node))?;
@@ -148,8 +159,17 @@ where
     let target_record = load_node(transaction, target).await?;
     only_parent(&target_record.parent_commit_ids, target, "redo")?;
 
-    let target_delta = load_commit_delta(transaction, target).await?;
-    let outcome = apply_state_diff(transaction, head, target, true, &target_delta).await?;
+    let target_delta = load_commit_delta(&facade, target).await?;
+    let outcome = apply_state_diff(
+        transaction,
+        &facade,
+        head,
+        target,
+        target,
+        true,
+        &target_delta,
+    )
+    .await?;
     let replay_commit_id = outcome.commit_id.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -178,6 +198,7 @@ where
 
 async fn semantic_state_at<S>(
     transaction: &mut Transaction<S>,
+    facade: &ForkTreeReadFacade<impl StorageAdapterRead>,
     branch_id: &str,
     commit_id: CommitId,
 ) -> Result<SemanticState, LixError>
@@ -188,33 +209,22 @@ where
     if record.parent_commit_ids.len() != 1 {
         return Ok(SemanticState::default());
     }
-    if transaction
-        .is_current_checkpoint_commit(branch_id, commit_id)
-        .await?
-    {
-        return Ok(SemanticState::default());
-    }
-    let local_operation_key = semantic_key(branch_id)?;
-    let marker_schemas = [UNDO_REDO_MARKER_SCHEMA_KEY.to_string()];
-    let marker_delta = {
-        let mut tracked = transaction.tracked_state_reader().await;
-        tracked
-            .commit_delta_values_for_schemas(commit_id, &marker_schemas)
-            .await?
-    };
+    let keys = semantic_keys(branch_id)?;
+    let marker_delta = facade.load_commit_delta_rows(commit_id, None).await?;
+    let mut has_checkpoint = false;
     let mut has_foreign_operation = false;
     let mut has_local_operation = false;
-    for row in marker_delta.iter().filter(|row| !row.value().deleted) {
-        let key = row.key_ref();
-        match key.schema_key {
-            UNDO_REDO_MARKER_SCHEMA_KEY if key.row_pk == &local_operation_key.row_pk => {
+    for row in marker_delta.iter().filter(|row| !row.deleted) {
+        match row.key.schema_key.as_str() {
+            CHECKPOINT_MARKER_SCHEMA_KEY => has_checkpoint = true,
+            UNDO_REDO_MARKER_SCHEMA_KEY if row.key.entity_pk == keys[1].entity_pk => {
                 has_local_operation = true;
             }
             UNDO_REDO_MARKER_SCHEMA_KEY => has_foreign_operation = true,
             _ => {}
         }
     }
-    if has_foreign_operation {
+    if has_checkpoint || has_foreign_operation {
         return Ok(SemanticState::default());
     }
     if !has_local_operation {
@@ -225,57 +235,55 @@ where
             redo_next: None,
         });
     }
-    let marker = operation_marker_at(transaction, branch_id, commit_id)
+    let marker = operation_marker_at(facade, branch_id, commit_id)
         .await?
         .ok_or_else(|| missing_operation_marker(commit_id))?;
     Ok(semantic_state_from_marker(marker, commit_id))
 }
 
-fn semantic_key(branch_id: &str) -> Result<TrackedStateKey, LixError> {
-    let branch_pk = RowPk::uuid_from_canonical(branch_id).map_err(|error| {
+fn semantic_keys(branch_id: &str) -> Result<[StateKey; 2], LixError> {
+    let branch_pk = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PARAM,
             format!("undo branch id must be a canonical UUID: {error}"),
         )
     })?;
-    Ok(TrackedStateKey {
-        schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
-        file_id: None,
-        row_pk: branch_pk,
-    })
+    Ok([
+        StateKey {
+            schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
+            file_id: None,
+            entity_pk: branch_pk.clone(),
+        },
+        StateKey {
+            schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
+            file_id: None,
+            entity_pk: branch_pk,
+        },
+    ])
 }
 
-async fn semantic_state_for_record<S>(
-    transaction: &mut Transaction<S>,
+async fn semantic_state_for_record(
+    facade: &ForkTreeReadFacade<impl StorageAdapterRead>,
     branch_id: &str,
     commit_id: CommitId,
     record: &crate::commit_graph::CommitGraphNode,
-) -> Result<
-    (
-        SemanticState,
-        Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-    ),
-    LixError,
->
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
+) -> Result<(SemanticState, Vec<HistoricalStateRow>), LixError> {
     if record.parent_commit_ids.len() != 1 {
         return Ok((SemanticState::default(), Vec::new()));
     }
 
-    if transaction
-        .is_current_checkpoint_commit(branch_id, commit_id)
-        .await?
-    {
-        return Ok((SemanticState::default(), Vec::new()));
-    }
-    let local_operation_key = semantic_key(branch_id)?;
-    let delta = load_commit_delta(transaction, commit_id).await?;
-    let operation_marker = delta
+    let keys = semantic_keys(branch_id)?;
+    let delta_rows = facade.load_commit_delta_rows(commit_id, None).await?;
+    if delta_rows
         .iter()
-        .find(|(key, value)| key.schema_key == UNDO_REDO_MARKER_SCHEMA_KEY && !value.deleted);
-    let Some((operation_marker_key, _)) = operation_marker else {
+        .any(|row| row.key.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY && !row.deleted)
+    {
+        return Ok((SemanticState::default(), delta_rows));
+    }
+    let operation_marker = delta_rows
+        .iter()
+        .find(|row| row.key.schema_key == UNDO_REDO_MARKER_SCHEMA_KEY && !row.deleted);
+    let Some(operation_row) = operation_marker else {
         return Ok((
             SemanticState {
                 undo_top: Some(commit_id),
@@ -283,34 +291,20 @@ where
                 redo_target: None,
                 redo_next: None,
             },
-            delta,
+            delta_rows,
         ));
     };
-    if operation_marker_key != &local_operation_key {
-        return Ok((SemanticState::default(), delta));
-    }
-    let rows = {
-        let mut tracked = transaction.tracked_state_reader().await;
-        tracked
-            .load_projected_batch_at_commit(
-                &commit_id.to_string(),
-                std::slice::from_ref(&local_operation_key),
-                &ChangeRecordProjection::from_columns(&[
-                    "commit_id".to_string(),
-                    "snapshot_content".to_string(),
-                ]),
-            )
-            .await?
+    let operation_key = StateKey {
+        schema_key: keys[1].schema_key.clone(),
+        file_id: keys[1].file_id.clone(),
+        entity_pk: keys[1].entity_pk.clone(),
     };
-    let Some(row) = rows.row(0).filter(|row| !row.deleted()) else {
-        return Err(missing_operation_marker(commit_id));
-    };
-    if row.commit_id() != commit_id {
-        return Err(missing_operation_marker(commit_id));
+    if operation_row.key != operation_key {
+        return Ok((SemanticState::default(), delta_rows));
     }
-    let marker = parse_marker(row.snapshot_content(), commit_id)?;
+    let marker = parse_marker(operation_row.snapshot_content.as_ref(), commit_id)?;
     let state = semantic_state_from_marker(marker, commit_id);
-    Ok((state, delta))
+    Ok((state, delta_rows))
 }
 
 fn semantic_state_from_marker(marker: UndoRedoMarker, commit_id: CommitId) -> SemanticState {
@@ -330,40 +324,30 @@ fn semantic_state_from_marker(marker: UndoRedoMarker, commit_id: CommitId) -> Se
     }
 }
 
-async fn operation_marker_at<S>(
-    transaction: &mut Transaction<S>,
+async fn operation_marker_at(
+    facade: &ForkTreeReadFacade<impl StorageAdapterRead>,
     branch_id: &str,
     commit_id: CommitId,
-) -> Result<Option<UndoRedoMarker>, LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    let branch_pk = RowPk::uuid_from_canonical(branch_id)
+) -> Result<Option<UndoRedoMarker>, LixError> {
+    let branch_pk = EntityPk::uuid_from_canonical(branch_id)
         .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, error.to_string()))?;
-    let rows = {
-        let mut tracked = transaction.tracked_state_reader().await;
-        tracked
-            .load_projected_batch_at_commit(
-                &commit_id.to_string(),
-                &[TrackedStateKey {
-                    schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
-                    file_id: None,
-                    row_pk: branch_pk,
-                }],
-                &ChangeRecordProjection::from_columns(&[
-                    "commit_id".to_string(),
-                    "snapshot_content".to_string(),
-                ]),
-            )
-            .await?
+    let key = StateKey {
+        schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
+        file_id: None,
+        entity_pk: branch_pk,
     };
+    let rows = facade
+        .load_state_rows_at_commit(&commit_id.to_string(), std::slice::from_ref(&key))
+        .await?;
     let Some(row) = rows
-        .row(0)
-        .filter(|row| !row.deleted() && row.commit_id() == commit_id)
+        .into_iter()
+        .next()
+        .flatten()
+        .filter(|row| !row.deleted && row.commit_id == commit_id)
     else {
         return Ok(None);
     };
-    parse_marker(row.snapshot_content(), commit_id).map(Some)
+    parse_marker(row.snapshot_content.as_ref(), commit_id).map(Some)
 }
 
 fn parse_marker(
@@ -400,15 +384,11 @@ fn missing_operation_marker(commit_id: CommitId) -> LixError {
     )
 }
 
-async fn load_commit_delta<S>(
-    transaction: &mut Transaction<S>,
+async fn load_commit_delta(
+    facade: &ForkTreeReadFacade<impl StorageAdapterRead>,
     commit_id: CommitId,
-) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    let mut tracked = transaction.tracked_state_reader().await;
-    tracked.commit_delta_members(commit_id).await
+) -> Result<Vec<HistoricalStateRow>, LixError> {
+    facade.load_commit_delta_rows(commit_id, None).await
 }
 
 async fn load_node<S>(
@@ -419,8 +399,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     transaction
-        .commit_graph_reader()
-        .await
+        .commit_graph_reader_on_opening_read()
         .load_node(&commit_id)
         .await?
         .ok_or_else(|| {
@@ -451,10 +430,12 @@ fn only_parent(
 
 async fn apply_state_diff<S>(
     transaction: &mut Transaction<S>,
+    facade: &ForkTreeReadFacade<impl StorageAdapterRead>,
     current: CommitId,
     desired: CommitId,
+    target: CommitId,
     desired_is_target: bool,
-    target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
+    target_delta: &[HistoricalStateRow],
 ) -> Result<crate::sql2::DiffCommandOutcome, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -463,32 +444,106 @@ where
     let keys = if cascade_file_ids.is_empty() {
         target_delta
             .iter()
-            .map(|(key, _)| key.clone())
+            .map(|row| row.key.clone())
             .collect::<Vec<_>>()
     } else {
         let visible_schema_keys = transaction.visible_schema_keys()?;
         let dependency_commit = if desired_is_target { current } else { desired };
-        let mut tracked = transaction.tracked_state_reader().await;
-        tracked
-            .descriptor_dependency_closure(
-                &current.to_string(),
-                &desired.to_string(),
-                &dependency_commit.to_string(),
-                target_delta,
-                &cascade_file_ids,
-                &visible_schema_keys,
-            )
-            .await?
+        descriptor_dependency_closure(
+            facade,
+            current,
+            desired,
+            dependency_commit,
+            target_delta,
+            &cascade_file_ids,
+            &visible_schema_keys,
+        )
+        .await?
     };
     let keys = keys
         .into_iter()
         .filter(|key| {
-            key.schema_key != CHECKPOINT_SCHEMA_KEY && key.schema_key != UNDO_REDO_MARKER_SCHEMA_KEY
+            key.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
+                && key.schema_key != UNDO_REDO_MARKER_SCHEMA_KEY
         })
         .collect::<Vec<_>>();
     transaction
-        .execute_tracked_state_transition(current, desired, keys)
+        .execute_state_transition_with_facade(facade, current, desired, keys)
         .await
+}
+
+async fn descriptor_dependency_closure(
+    facade: &ForkTreeReadFacade<impl StorageAdapterRead>,
+    current: CommitId,
+    desired: CommitId,
+    dependency_commit: CommitId,
+    target_delta: &[HistoricalStateRow],
+    file_ids: &[String],
+    visible_schema_keys: &[String],
+) -> Result<Vec<StateKey>, LixError> {
+    let mut keys = target_delta
+        .iter()
+        .map(|row| row.key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut schema_keys = visible_schema_keys.iter().cloned().collect::<BTreeSet<_>>();
+    if target_delta
+        .iter()
+        .any(|row| row.key.schema_key == "lix_registered_schema")
+    {
+        for endpoint in [current, desired] {
+            for row in facade.scan_state_rows_at_commit(endpoint).await? {
+                if row.key.schema_key == "lix_registered_schema" && !row.deleted {
+                    schema_keys.insert(row.key.entity_pk.as_single_string_owned().map_err(
+                        |error| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "registered schema dependency identity is invalid: {error}"
+                                ),
+                            )
+                        },
+                    )?);
+                }
+            }
+        }
+    }
+    for row in facade.scan_state_rows_at_commit(dependency_commit).await? {
+        if row.deleted
+            || !row
+                .key
+                .file_id
+                .as_ref()
+                .is_some_and(|file_id| file_ids.contains(file_id))
+            || !schema_keys.contains(&row.key.schema_key)
+        {
+            continue;
+        }
+        keys.insert(row.key);
+    }
+    Ok(keys.into_iter().collect())
+}
+
+fn descriptor_dependency_cascade_file_ids(
+    target_delta: &[HistoricalStateRow],
+) -> Result<Vec<String>, LixError> {
+    let mut file_ids = BTreeSet::new();
+    for row in target_delta {
+        if row.key.schema_key != "lix_file_descriptor" || !row.deleted {
+            continue;
+        }
+        let file_id = row
+            .key
+            .entity_pk
+            .as_single_string_owned()
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("file descriptor tombstone has invalid identity: {error}"),
+                )
+            })?;
+        file_ids.insert(file_id);
+    }
+    Ok(file_ids.into_iter().collect())
 }
 
 async fn stage_marker<S>(
@@ -511,6 +566,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value as JsonValue;
+
     use super::{load_commit_delta, load_node, only_parent};
     use crate::engine::Engine;
     use crate::sql2::SqlWriteExecutionContext;
@@ -531,7 +588,7 @@ mod tests {
     async fn setup() -> crate::session::SessionContext<Memory> {
         setup_engine()
             .await
-            .open_session()
+            .open_workspace_session()
             .await
             .expect("session opens")
     }
@@ -550,7 +607,7 @@ mod tests {
             .and_then(|row| row.get::<Value>("value").ok())
             .and_then(|value| match value {
                 Value::Text(value) => Some(value),
-                Value::Json(value) => value.as_json_string(),
+                Value::Json(JsonValue::String(value)) => Some(value),
                 _ => None,
             })
     }
@@ -606,20 +663,22 @@ mod tests {
         let duplicate = session
             .with_write_transaction_lending(async move |transaction| {
                 let branch_id = transaction.active_branch_id().to_string();
+                let facade = transaction.forktree_read_facade();
                 let head = transaction
                     .load_branch_head(&branch_id)
                     .await?
                     .expect("branch has a head");
                 let record = load_node(transaction, head).await?;
                 let parent = only_parent(&record.parent_commit_ids, head, "test")?;
-                let key = load_commit_delta(transaction, head)
+                let key = load_commit_delta(&facade, head)
                     .await?
                     .into_iter()
-                    .find(|(key, _)| key.schema_key == "lix_key_value")
+                    .find(|row| row.key.schema_key == "lix_key_value")
                     .expect("update delta contains the key-value row")
-                    .0;
+                    .key
+                    .clone();
                 transaction
-                    .execute_tracked_state_transition(head, parent, vec![key.clone(), key])
+                    .execute_state_transition(head, parent, vec![key.clone(), key])
                     .await
             })
             .await
@@ -630,20 +689,22 @@ mod tests {
         let stale = session
             .with_write_transaction_lending(async move |transaction| {
                 let branch_id = transaction.active_branch_id().to_string();
+                let facade = transaction.forktree_read_facade();
                 let head = transaction
                     .load_branch_head(&branch_id)
                     .await?
                     .expect("branch has a head");
                 let record = load_node(transaction, head).await?;
                 let parent = only_parent(&record.parent_commit_ids, head, "test")?;
-                let key = load_commit_delta(transaction, head)
+                let key = load_commit_delta(&facade, head)
                     .await?
                     .into_iter()
-                    .find(|(key, _)| key.schema_key == "lix_key_value")
+                    .find(|row| row.key.schema_key == "lix_key_value")
                     .expect("update delta contains the key-value row")
-                    .0;
+                    .key
+                    .clone();
                 transaction
-                    .execute_tracked_state_transition(parent, head, vec![key])
+                    .execute_state_transition(parent, head, vec![key])
                     .await
             })
             .await
@@ -722,7 +783,10 @@ mod tests {
     #[tokio::test]
     async fn branch_forked_at_checkpoint_starts_at_an_undo_floor() {
         let engine = setup_engine().await;
-        let session = engine.open_session().await.expect("session opens");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("session opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('before-fork', 'kept')",
@@ -742,7 +806,7 @@ mod tests {
             })
             .await
             .expect("branch creates");
-        let fork = engine.open_session_at(branch.id).await.expect("fork opens");
+        let fork = engine.open_session(branch.id).await.expect("fork opens");
 
         let error = fork
             .undo()
@@ -755,7 +819,10 @@ mod tests {
     #[tokio::test]
     async fn branch_forked_at_undo_commit_resets_undo_history() {
         let engine = setup_engine().await;
-        let session = engine.open_session().await.expect("session opens");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("session opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('abandoned', 'change')",
@@ -772,7 +839,7 @@ mod tests {
             })
             .await
             .expect("branch creates");
-        let fork = engine.open_session_at(branch.id).await.expect("fork opens");
+        let fork = engine.open_session(branch.id).await.expect("fork opens");
 
         let error = fork
             .undo()
@@ -805,37 +872,6 @@ mod tests {
         assert_eq!(value(&session, "right").await, None);
         let error = session.undo().await.expect_err("batch was one unit");
         assert_eq!(error.code, LixError::CODE_NOTHING_TO_UNDO);
-    }
-
-    #[tokio::test]
-    async fn mixed_transaction_leaves_untracked_state_untouched() {
-        let session = setup().await;
-        let mut transaction = session
-            .begin_transaction()
-            .await
-            .expect("transaction opens");
-        transaction
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('tracked', 'yes')",
-                &[],
-            )
-            .await
-            .expect("tracked row stages");
-        transaction
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('ui', 'open', true)",
-                &[],
-            )
-            .await
-            .expect("untracked row stages");
-        transaction
-            .commit()
-            .await
-            .expect("mixed transaction commits");
-
-        session.undo().await.expect("tracked portion undoes");
-        assert_eq!(value(&session, "tracked").await, None);
-        assert_eq!(value(&session, "ui").await.as_deref(), Some("open"));
     }
 
     #[tokio::test]
@@ -995,57 +1031,6 @@ mod tests {
         );
     }
 
-    /// The mixed state that made undo lossy can no longer be created.
-    ///
-    /// This test used to write an untracked row into a *tracked* file and then
-    /// assert that `undo` refused to proceed — a guard
-    /// (`reject_untracked_descriptor_cascade`) standing in for an invariant the
-    /// engine did not enforce. PR D enforces the invariant at the write, so the
-    /// INSERT is now rejected and the guard has nothing left to catch.
-    #[tokio::test]
-    async fn untracked_row_cannot_be_owned_by_a_tracked_file() {
-        let session = setup().await;
-        session
-            .upsert_file_content("/owned.txt".into(), Blob::from("tracked".as_bytes()))
-            .await
-            .expect("file creates");
-        let file = session
-            .execute("SELECT id FROM lix_file WHERE path = '/owned.txt'", &[])
-            .await
-            .expect("file id reads");
-        let file_id = match file.rows()[0].get::<Value>("id").expect("id projects") {
-            Value::Text(value) => value,
-            value => panic!("expected text file id, got {value:?}"),
-        };
-        let error = session
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_file_id, lixcol_untracked) \
-                 VALUES ('file-ui', 'open', $1, true)",
-                &[Value::Text(file_id)],
-            )
-            .await
-            .expect_err("an untracked row must not be owned by a tracked file");
-        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert!(
-            error.message.contains("which exists but is tracked"),
-            "the rejection must name the file's lane, got: {}",
-            error.message
-        );
-
-        // With the mixed state unreachable, undo is ordinary again: it removes
-        // the file it created, and there is no untracked state to strand.
-        session.undo().await.expect("undo removes the tracked file");
-        assert!(
-            session
-                .read_file_content("/owned.txt".into(), None)
-                .await
-                .expect("file reads")
-                .is_none(),
-            "undo must remove the file its target commit created"
-        );
-        assert_eq!(value(&session, "file-ui").await, None);
-    }
-
     #[tokio::test]
     async fn redo_cursor_is_durable_across_fresh_sessions() {
         let storage = Memory::new();
@@ -1053,7 +1038,10 @@ mod tests {
             .await
             .expect("storage initializes");
         let engine = Engine::new(storage).await.expect("engine opens");
-        let first = engine.open_session().await.expect("first session opens");
+        let first = engine
+            .open_workspace_session()
+            .await
+            .expect("first session opens");
         first
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('durable', 'yes')",
@@ -1066,7 +1054,7 @@ mod tests {
         drop(first);
 
         let reopened = engine
-            .open_session_at(branch_id)
+            .open_session(branch_id)
             .await
             .expect("fresh pinned session opens");
         reopened.redo().await.expect("redo survives session loss");
@@ -1080,7 +1068,10 @@ mod tests {
             .await
             .expect("storage initializes");
         let engine = Engine::new(storage).await.expect("engine opens");
-        let main = engine.open_session().await.expect("main session opens");
+        let main = engine
+            .open_workspace_session()
+            .await
+            .expect("main session opens");
         let draft = main
             .create_branch(CreateBranchOptions {
                 id: Some("01930000-0000-7000-8000-000000000099".to_string()),
@@ -1090,7 +1081,7 @@ mod tests {
             .await
             .expect("draft creates");
         let draft_session = engine
-            .open_session_at(draft.id.clone())
+            .open_session(draft.id.clone())
             .await
             .expect("draft session opens");
         draft_session

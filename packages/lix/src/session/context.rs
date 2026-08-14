@@ -1,6 +1,5 @@
 #![allow(clippy::match_wild_err_arm, clippy::option_if_let_else)]
 
-use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -9,82 +8,76 @@ use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
-    BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
+    BranchLifecycle, BranchOperation, BranchRefReader, BranchRefStoreReader, BranchReferenceRole,
 };
-use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
-use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
+use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot};
+use crate::commit_graph::{CommitGraphReader, CommitGraphStoreReader};
 use crate::domain::Domain;
-use crate::row_pk::RowPk;
+use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
+use crate::forktree::{StateCell, StateKeyRef, encode_state_key};
 use crate::functions::FunctionProviderHandle;
-use crate::hot_state::{
-    HotStateContext, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateProjection,
-    HotStateReader,
-};
-use crate::json_store::JsonStoreContext;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
-use crate::plugin::runtime::PluginRuntimeHost;
+use crate::plugin::PluginRuntimeHost;
 use crate::sql2::{
-    ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
+    ChangelogQuerySource, SessionFileViews, SqlChangelogQuerySource, SqlExecutionContext,
+    SqlPlanningCache,
 };
+use crate::state::{ForkTreeStateView, TransactionStateView};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::telemetry::TelemetrySink;
-use crate::tracked_state::TrackedStateContext;
-use crate::transaction::{CertifiedHistoryStoreReader, Transaction, open_transaction};
+use crate::transaction::{Transaction, open_transaction};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
 use crate::transaction::CommitCoordinator;
 
-/// Loads the repository default branch from its canonical tracked key/value
-/// member when opening a primary session.
-pub(crate) async fn load_default_branch_id_from_index(
-    hot_state: &HotStateContext,
-    branch_ctx: &BranchContext,
+pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
+
+/// Loads the workspace selector from its canonical authenticated state member
+/// when opening a workspace session.
+pub(crate) async fn load_workspace_branch_id_from_index(
     reader: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
-    let rows = hot_state
-        .reader(reader)
-        .load_exact_batch(&HotStateExactBatchRequest {
-            rows: vec![HotStateExactRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                row_pk: RowPk::single(crate::init::DEFAULT_BRANCH_KEY),
-                file_id: None,
-            }],
-            projection: HotStateProjection {
-                columns: vec!["snapshot_content".to_string()],
-            },
-            untracked: Some(false),
-            include_tombstones: false,
-        })
-        .await?;
-    let row = rows.row(0).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "repository default branch is missing lix_key_value:lix_default_branch_id",
-        )
-    })?;
-    let snapshot_content = row
-        .snapshot_content()
-        .map(|value| value.as_ref())
+    let forktree = crate::forktree::ForkTreeReadFacade::new(reader);
+    let entity_pk = EntityPk::single(WORKSPACE_BRANCH_KEY);
+    let key = encode_state_key(StateKeyRef {
+        schema_key: "lix_key_value",
+        file_id: None,
+        entity_pk: &entity_pk,
+    });
+    let view = ForkTreeStateView::from_facade(forktree, GLOBAL_BRANCH_ID).await?;
+    let row = view
+        .points(&[key], true)
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "repository default branch is missing snapshot_content",
+                "workspace branch selector is missing lix_key_value:lix_workspace_branch_id",
             )
         })?;
-    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("repository default branch snapshot is invalid JSON: {error}"),
-        )
-    })?;
+    let snapshot_content = match row.value.cell {
+        StateCell::Value(value) => value,
+        StateCell::Null | StateCell::Tombstone => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "workspace branch selector is missing snapshot_content",
+            ));
+        }
+    };
+    let snapshot =
+        serde_json::from_str::<JsonValue>(snapshot_content.as_ref()).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("workspace branch selector snapshot is invalid JSON: {error}"),
+            )
+        })?;
     let branch_id = snapshot
         .get("value")
         .and_then(JsonValue::as_str)
@@ -92,12 +85,12 @@ pub(crate) async fn load_default_branch_id_from_index(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "repository default branch value must be a non-empty string",
+                "workspace branch selector value must be a non-empty string",
             )
         })?
         .to_string();
 
-    let branch_ref = branch_ctx.ref_reader(reader);
+    let branch_ref = BranchRefStoreReader::new(reader);
     BranchLifecycle::new(&branch_ref)
         .require_existing_ref(
             &branch_id,
@@ -106,42 +99,18 @@ pub(crate) async fn load_default_branch_id_from_index(
         )
         .await?;
 
+    // The selector is a constrained engine-owned reference: initialization,
+    // branch switching, and branch deletion enforce its target lifecycle at
+    // mutation time. Revalidating the same branch ref on every statement made
+    // workspace sessions pay a second point read for an invariant that no
+    // successful commit can violate.
     Ok(branch_id)
 }
 
 #[derive(Clone)]
-pub(crate) struct SessionBranch {
-    branch_id: Arc<RwLock<String>>,
-}
-
-impl SessionBranch {
-    pub(crate) fn new(branch_id: String) -> Self {
-        Self {
-            branch_id: Arc::new(RwLock::new(branch_id)),
-        }
-    }
-
-    pub(crate) fn get(&self) -> Result<String, LixError> {
-        self.branch_id
-            .read()
-            .map(|branch_id| branch_id.clone())
-            .map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "session branch selector is poisoned",
-                )
-            })
-    }
-
-    pub(crate) fn set(&self, branch_id: String) -> Result<(), LixError> {
-        *self.branch_id.write().map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "session branch selector is poisoned",
-            )
-        })? = branch_id;
-        Ok(())
-    }
+pub(crate) enum SessionMode {
+    Pinned { branch_id: Arc<RwLock<String>> },
+    Workspace { branch_id: Arc<RwLock<String>> },
 }
 
 /// Session-context state for engine execution.
@@ -152,14 +121,11 @@ impl SessionBranch {
 /// commit or rollback, so all SQL during that window must run through the
 /// transaction handle.
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
-    pub(super) branch: SessionBranch,
+    pub(super) mode: SessionMode,
     pub(super) active_account_id: Arc<str>,
     pub(super) storage: StorageAdapter<StorageImpl>,
-    pub(super) hot_state: Arc<HotStateContext>,
-    pub(super) tracked_state: Arc<TrackedStateContext>,
-    pub(super) binary_cas: Arc<BinaryCasContext>,
-    pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -177,13 +143,9 @@ impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub(crate) async fn open_default(
+    pub(crate) async fn open_workspace(
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        hot_state: Arc<HotStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
-        binary_cas: Arc<BinaryCasContext>,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -196,18 +158,14 @@ where
     ) -> Result<Self, LixError> {
         let read =
             SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-        let branch_id =
-            load_default_branch_id_from_index(hot_state.as_ref(), branch_ctx.as_ref(), &read)
-                .await?;
+        let branch_id = load_workspace_branch_id_from_index(&read).await?;
         drop(read);
         Ok(Self::new(
-            SessionBranch::new(branch_id),
+            SessionMode::Workspace {
+                branch_id: Arc::new(RwLock::new(branch_id)),
+            },
             active_account_id,
             storage,
-            hot_state,
-            tracked_state,
-            binary_cas,
-            branch_ctx,
             catalog_context,
             sql_planning_cache,
             deterministic_runtime_gate,
@@ -220,14 +178,10 @@ where
         ))
     }
 
-    pub(crate) async fn open_at(
+    pub(crate) async fn open(
         active_branch_id: String,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        hot_state: Arc<HotStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
-        binary_cas: Arc<BinaryCasContext>,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -239,13 +193,11 @@ where
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
-            SessionBranch::new(active_branch_id),
+            SessionMode::Pinned {
+                branch_id: Arc::new(RwLock::new(active_branch_id)),
+            },
             active_account_id,
             storage,
-            hot_state,
-            tracked_state,
-            binary_cas,
-            branch_ctx,
             catalog_context,
             sql_planning_cache,
             deterministic_runtime_gate,
@@ -259,13 +211,9 @@ where
     }
 
     pub(super) fn new(
-        branch: SessionBranch,
+        mode: SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        hot_state: Arc<HotStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
-        binary_cas: Arc<BinaryCasContext>,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -277,13 +225,9 @@ where
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Self {
         Self::new_with_transaction_manager(
-            branch,
+            mode,
             active_account_id,
             storage,
-            hot_state,
-            tracked_state,
-            binary_cas,
-            branch_ctx,
             catalog_context,
             sql_planning_cache,
             deterministic_runtime_gate,
@@ -299,13 +243,9 @@ where
     }
 
     pub(super) fn new_with_transaction_manager(
-        branch: SessionBranch,
+        mode: SessionMode,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
-        hot_state: Arc<HotStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
-        binary_cas: Arc<BinaryCasContext>,
-        branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
@@ -319,13 +259,9 @@ where
         file_views: SessionFileViews,
     ) -> Self {
         Self {
-            branch,
+            mode,
             active_account_id: Arc::from(active_account_id),
             storage,
-            hot_state,
-            tracked_state,
-            binary_cas,
-            branch_ctx,
             catalog_context,
             sql_planning_cache,
             deterministic_runtime_gate,
@@ -355,6 +291,11 @@ where
     /// Returns the immutable account that authors every change from this session.
     pub fn active_account_id(&self) -> &str {
         &self.active_account_id
+    }
+
+    #[doc(hidden)]
+    pub fn is_pinned(&self) -> bool {
+        matches!(self.mode, SessionMode::Pinned { .. })
     }
 
     #[cfg(test)]
@@ -459,8 +400,10 @@ where
     /// through the transaction capability so the read is scoped to the
     /// same storage transaction as the writes it influences.
     ///
-    /// Every session owns an in-memory branch selector. Cloned handles share
-    /// it; independently opened sessions do not.
+    /// Pinned sessions are pure in-memory views over one branch. Workspace
+    /// sessions read the shared workspace selector from untracked global
+    /// `lix_key_value` state so multiple open app sessions can observe the same
+    /// active workspace branch.
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let read = SharedStorageAdapterRead::new(
@@ -473,15 +416,6 @@ where
             Ok(branch_id) => Ok(branch_id),
             Err(error) => Err(error),
         }
-    }
-
-    pub(crate) fn active_branch_id_owned(
-        self: Arc<Self>,
-    ) -> impl Future<Output = Result<String, LixError>> + Send + 'static {
-        // SAFETY: the future owns its Arc session. Storage read handles are
-        // Send by the Storage contract; the compiler obstruction is the
-        // higher-ranked shared reference carried by a borrowing adapter.
-        unsafe { super::AssumeSendFuture::new(async move { self.active_branch_id().await }) }
     }
 
     #[doc(hidden)]
@@ -502,7 +436,17 @@ where
         S: StorageAdapterRead + ?Sized,
     {
         self.ensure_open()?;
-        self.branch.get()
+        match &self.mode {
+            SessionMode::Pinned { branch_id } | SessionMode::Workspace { branch_id } => branch_id
+                .read()
+                .map(|branch_id| branch_id.clone())
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "session branch selector is poisoned",
+                    )
+                }),
+        }
     }
 
     /// Runs a transaction with a lending async closure.
@@ -540,14 +484,10 @@ where
         // truth for the mode.
         let _deterministic_runtime_guard = self.lock_deterministic_runtime().await;
         let opened = Box::pin(open_transaction(
-            &self.branch,
+            &self.mode,
             self.active_account_id.to_string(),
             self.storage.clone(),
-            Arc::clone(&self.hot_state),
-            Arc::clone(&self.tracked_state),
-            Arc::clone(&self.binary_cas),
             self.plugin_host.clone(),
-            Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),
             self.file_views.clone(),
@@ -645,9 +585,8 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) active_branch_id: &'a str,
     pub(super) active_account_id: &'a str,
     pub(super) read_store: SharedStorageAdapterRead<R>,
-    pub(super) hot_state: Arc<HotStateContext>,
-    pub(super) binary_cas: Arc<BinaryCasContext>,
-    pub(super) branch_ctx: Arc<BranchContext>,
+    pub(super) forktree: crate::forktree::ForkTreeReadFacade<SharedStorageAdapterRead<R>>,
+    pub(crate) state_view: crate::state::ForkTreeStateView<SharedStorageAdapterRead<R>>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) functions: FunctionProviderHandle,
@@ -659,19 +598,18 @@ impl<R> SessionSqlExecutionContext<'_, R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
 {
+    pub(crate) fn state_view(
+        &self,
+    ) -> &crate::state::ForkTreeStateView<SharedStorageAdapterRead<R>> {
+        &self.state_view
+    }
+
     async fn compiled_sql_catalog(&self) -> Result<Arc<CatalogSnapshot>, LixError> {
-        let revision = load_catalog_revision(&self.read_store)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.public_read.catalog_revision"
-            ))
-            .await?;
-        let hot_state = self.hot_state();
+        let transaction_state = TransactionStateView::new(self.state_view.clone(), Vec::new())?;
         self.catalog_context
-            .compiled_catalog_for_transaction_open(
-                hot_state.as_ref(),
+            .compiled_catalog_for_transaction_state(
+                &transaction_state,
                 &Domain::schema_catalog(self.active_branch_id.to_string(), true),
-                revision.as_ref(),
             )
             .await
     }
@@ -684,6 +622,10 @@ where
 {
     type ReadStore = SharedStorageAdapterRead<R>;
 
+    fn state_view(&self) -> &crate::state::ForkTreeStateView<Self::ReadStore> {
+        &self.state_view
+    }
+
     fn active_branch_id(&self) -> &str {
         self.active_branch_id
     }
@@ -692,7 +634,7 @@ where
         self.sql_planning_cache.datafusion_session()
     }
 
-    fn datafusion_read_session(&self) -> crate::sql2::PooledReadSession {
+    fn datafusion_read_session(&self) -> datafusion::prelude::SessionContext {
         self.sql_planning_cache.datafusion_read_session()
     }
 
@@ -716,60 +658,37 @@ where
         self.active_account_id
     }
 
-    #[expect(trivial_casts)]
-    fn hot_state(&self) -> Arc<dyn HotStateReader> {
-        Arc::new(self.hot_state.reader(self.read_store.clone())) as Arc<dyn HotStateReader>
-    }
-
-    fn row_snapshot_reader(&self) -> Option<Arc<dyn crate::sql2::RowSnapshotReader>> {
-        Some(Arc::new(crate::sql2::CurrentRowSnapshotReader::new(
-            Arc::clone(&self.hot_state),
-            self.read_store.clone(),
-        )))
-    }
-
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
-        let reader: Arc<dyn FilesystemPathIndexReader> =
-            Arc::new(self.hot_state.reader(self.read_store.clone()));
-        reader
-    }
-
-    fn history_query_source(
-        &self,
-        default_as_of_commit_id: String,
-    ) -> SqlHistoryQuerySource<Self::ReadStore> {
-        HistoryQuerySource {
-            store: self.read_store.clone(),
-            json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
-            certified_history_reader: Some(Arc::new(CertifiedHistoryStoreReader::new(
-                self.read_store.clone(),
-            ))),
-            default_as_of_commit_id,
-        }
+        Arc::new(crate::filesystem::ForkTreeFilesystemPathIndexReader::new(
+            self.forktree.clone(),
+        ))
     }
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
-            store: self.read_store.clone(),
-            json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
+            forktree_reader: self.forktree.clone(),
         }
     }
 
     fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
-        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
+        Box::new(CommitGraphStoreReader::new(self.read_store.clone()))
     }
 
     fn branch_ref(&self) -> Arc<dyn BranchRefReader> {
-        Arc::new(self.branch_ctx.ref_reader(self.read_store.clone()))
+        Arc::new(BranchRefStoreReader::new(self.read_store.clone()))
     }
 
     fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
     }
 
-    #[expect(trivial_casts)]
-    fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::new(self.binary_cas.reader(self.read_store.clone())) as Arc<dyn BlobDataReader>
+    fn authenticated_blob_reader(
+        &self,
+    ) -> Result<Arc<dyn crate::forktree::AuthenticatedBlobReader>, LixError> {
+        Ok(Arc::new(crate::forktree::blob_reader_on_read(
+            self.read_store.clone(),
+            self.active_branch_id,
+        )?))
     }
 
     async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
@@ -864,7 +783,12 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized storage should create engine");
-        std::sync::Arc::new(engine.open_session().await.expect("session should open"))
+        std::sync::Arc::new(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+        )
     }
 
     async fn open_blocking_read_session() -> (
@@ -880,7 +804,12 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         (
-            std::sync::Arc::new(engine.open_session().await.expect("session should open")),
+            std::sync::Arc::new(
+                engine
+                    .open_workspace_session()
+                    .await
+                    .expect("workspace session should open"),
+            ),
             gate,
         )
     }
@@ -898,7 +827,12 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         (
-            std::sync::Arc::new(engine.open_session().await.expect("session should open")),
+            std::sync::Arc::new(
+                engine
+                    .open_workspace_session()
+                    .await
+                    .expect("workspace session should open"),
+            ),
             gate,
         )
     }
@@ -1081,7 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_waits_for_session_read_blocked_in_storage_read() {
+    async fn close_waits_for_session_read_blocked_in_storage_snapshot() {
         let (session, gate) = open_blocking_read_session().await;
 
         gate.block_next();

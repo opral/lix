@@ -13,7 +13,8 @@ use crate::branch::BranchRefReader;
 ///
 /// Active surfaces read through one session branch. By-branch surfaces either
 /// read explicitly filtered branches or, without a branch predicate, enumerate
-/// every visible branch scope before handing the request to hot_state.
+/// every visible branch scope before handing the request to the projection
+/// layer.
 pub(crate) enum SqlBranchScope {
     Active(String),
     Explicit(Vec<String>),
@@ -106,12 +107,23 @@ pub(crate) async fn resolve_sql_branch_scope(
 ) -> Result<Vec<String>, LixError> {
     match scope {
         SqlBranchScope::Active(branch_id) => {
-            if branch_ref.load_head(&branch_id).await?.is_none() {
-                return Err(LixError::branch_not_found(
-                    branch_id,
-                    "resolve SQL active branch scope",
-                    "active branch",
-                ));
+            match branch_ref.load_head(&branch_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(LixError::branch_not_found(
+                        branch_id,
+                        "resolve SQL active branch scope",
+                        "active branch",
+                    ));
+                }
+                Err(error) if error.code == LixError::CODE_INVALID_PARAM => {
+                    return Err(LixError::branch_not_found(
+                        branch_id,
+                        "resolve SQL active branch scope",
+                        "active branch",
+                    ));
+                }
+                Err(error) => return Err(error),
             }
             Ok(vec![branch_id])
         }

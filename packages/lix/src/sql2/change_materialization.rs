@@ -1,11 +1,37 @@
 use crate::changelog::ChangeRecord;
 use crate::common::SharedStr;
-use crate::row_pk::RowPk;
-use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreReader};
+use crate::entity_pk::EntityPk;
+use crate::forktree::ForkTreeReadFacade;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{LixError, parse_row_metadata};
 
-/// Read-boundary view of a changelog change with JSON refs resolved.
+#[async_trait::async_trait]
+pub(crate) trait JsonPayloadReader {
+    async fn load_slot(
+        &mut self,
+        slot: &crate::json_store::JsonSlot,
+        field: &str,
+    ) -> Result<Option<SharedStr>, LixError>;
+}
+
+#[async_trait::async_trait]
+impl<S> JsonPayloadReader for ForkTreeReadFacade<S>
+where
+    S: StorageAdapterRead,
+{
+    async fn load_slot(
+        &mut self,
+        slot: &crate::json_store::JsonSlot,
+        _field: &str,
+    ) -> Result<Option<SharedStr>, LixError> {
+        self.load_json_slot(slot)
+            .await
+            .map(|value| value.map(Into::into))
+    }
+}
+
+/// Read-boundary view of a changelog change with authenticated JSON payloads
+/// resolved.
 ///
 /// `lix_change` materializes direct durable `changelog.change` facts and
 /// derived `lix_commit` changes from `changelog.commit`. History surfaces
@@ -15,7 +41,7 @@ use crate::{LixError, parse_row_metadata};
 pub(crate) struct MaterializedChange {
     pub(crate) id: String,
     pub(crate) account_id: String,
-    pub(crate) row_pk: RowPk,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
@@ -42,30 +68,30 @@ impl ChangePayloadProjection {
     };
 }
 
-pub(crate) async fn materialize_located_history_change<S>(
-    json_reader: &mut JsonStoreReader<S>,
+pub(crate) async fn materialize_located_history_change<R>(
+    json_reader: &mut R,
     change: crate::commit_graph::CommitGraphChange,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageAdapterRead,
+    R: JsonPayloadReader + Sync,
 {
     materialize_commit_graph_change(json_reader, change, ChangePayloadProjection::ALL).await
 }
 
-pub(crate) async fn materialize_changelog_change_record<S>(
-    json_reader: &mut JsonStoreReader<S>,
+pub(crate) async fn materialize_changelog_change_record<R>(
+    json_reader: &mut R,
     change: ChangeRecord,
     payload_projection: ChangePayloadProjection,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageAdapterRead,
+    R: JsonPayloadReader + Sync,
 {
     materialize_commit_graph_change(
         json_reader,
         crate::commit_graph::CommitGraphChange {
             id: change.change_id,
             account_id: change.account_id,
-            row_pk: change.row_pk,
+            entity_pk: change.entity_pk,
             schema_key: change.schema_key,
             file_id: change.file_id,
             snapshot: change.snapshot,
@@ -78,21 +104,21 @@ where
     .await
 }
 
-pub(crate) async fn materialize_commit_graph_change<S>(
-    json_reader: &mut JsonStoreReader<S>,
+pub(crate) async fn materialize_commit_graph_change<R>(
+    json_reader: &mut R,
     change: crate::commit_graph::CommitGraphChange,
     payload_projection: ChangePayloadProjection,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageAdapterRead,
+    R: JsonPayloadReader + Sync,
 {
     let snapshot_content = if payload_projection.snapshot_content {
-        load_changelog_json_slot(json_reader, &change.snapshot, "snapshot").await?
+        json_reader.load_slot(&change.snapshot, "snapshot").await?
     } else {
         None
     };
     let metadata = if payload_projection.metadata {
-        match load_changelog_json_slot(json_reader, &change.metadata, "metadata").await? {
+        match json_reader.load_slot(&change.metadata, "metadata").await? {
             Some(value) => {
                 Some(parse_row_metadata(&value, "changelog change metadata_ref")?.into())
             }
@@ -104,7 +130,7 @@ where
     Ok(MaterializedChange {
         id: change.id.to_string(),
         account_id: change.account_id,
-        row_pk: change.row_pk,
+        entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot_content,
@@ -112,164 +138,4 @@ where
         created_at: change.created_at.to_string(),
         origin_key: change.origin_key,
     })
-}
-
-async fn load_changelog_json_slot<S>(
-    json_reader: &mut JsonStoreReader<S>,
-    slot: &crate::json_store::JsonSlot,
-    field: &str,
-) -> Result<Option<SharedStr>, LixError>
-where
-    S: StorageAdapterRead,
-{
-    let json_ref = match slot {
-        crate::json_store::JsonSlot::None => return Ok(None),
-        crate::json_store::JsonSlot::Inline(json) => {
-            return Ok(Some(json.to_string().into()));
-        }
-        crate::json_store::JsonSlot::Ref(json_ref) => json_ref,
-    };
-    let batch = json_reader
-        .load_bytes_many(JsonLoadRequestRef {
-            refs: std::slice::from_ref(json_ref),
-            scope: JsonReadScopeRef::OutOfBand,
-        })
-        .await?;
-    let Some(bytes) = batch.into_values().into_iter().next().flatten() else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "changelog change {field} '{}' is missing",
-                json_ref.to_hex()
-            ),
-        ));
-    };
-    SharedStr::from_utf8(bytes).map(Some).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("changelog change {field} is not UTF-8 JSON: {error}"),
-        )
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::changelog::ChangeId;
-    use crate::commit_graph::CommitGraphChange;
-    use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk;
-    use crate::json_store::{
-        JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
-    };
-    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
-
-    use super::{ChangePayloadProjection, materialize_commit_graph_change};
-
-    fn change(snapshot: JsonSlot, metadata: JsonSlot) -> CommitGraphChange {
-        CommitGraphChange {
-            id: ChangeId::for_test_label("change-projection"),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            row_pk: RowPk::single("row-1"),
-            schema_key: "example".to_string(),
-            file_id: Some("file-1".to_string()),
-            snapshot,
-            metadata,
-            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
-            origin_key: Some("origin-1".to_string()),
-        }
-    }
-
-    #[tokio::test]
-    async fn unprojected_json_refs_are_not_loaded() {
-        let storage = StorageAdapter::new(Memory::new());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("begin read");
-        let mut json_reader = JsonStoreContext::new().reader(read);
-        let row = materialize_commit_graph_change(
-            &mut json_reader,
-            change(
-                JsonSlot::Ref(JsonRef::for_content(b"missing snapshot")),
-                JsonSlot::Ref(JsonRef::for_content(b"missing metadata")),
-            ),
-            ChangePayloadProjection {
-                snapshot_content: false,
-                metadata: false,
-            },
-        )
-        .await
-        .expect("unprojected missing refs should not be read");
-
-        assert_eq!(
-            row.id,
-            ChangeId::for_test_label("change-projection").to_string()
-        );
-        assert_eq!(row.origin_key.as_deref(), Some("origin-1"));
-        assert_eq!(row.snapshot_content, None);
-        assert_eq!(row.metadata, None);
-    }
-
-    #[tokio::test]
-    async fn projected_json_ref_still_reports_missing_payload() {
-        let storage = StorageAdapter::new(Memory::new());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("begin read");
-        let mut json_reader = JsonStoreContext::new().reader(read);
-        let missing_ref = JsonRef::for_content(b"missing snapshot");
-        let error = materialize_commit_graph_change(
-            &mut json_reader,
-            change(JsonSlot::Ref(missing_ref), JsonSlot::None),
-            ChangePayloadProjection {
-                snapshot_content: true,
-                metadata: false,
-            },
-        )
-        .await
-        .expect_err("projected missing ref should fail");
-
-        assert!(error.message.contains(&missing_ref.to_hex()));
-        assert!(error.message.contains("snapshot"));
-    }
-
-    #[tokio::test]
-    async fn projected_json_refs_are_materialized() {
-        let storage = StorageAdapter::new(Memory::new());
-        let snapshot = "{\"value\":1}";
-        let metadata = "{\"source\":\"test\"}";
-        let mut writes = storage.new_write_set();
-        let refs = JsonStoreContext::new()
-            .writer()
-            .stage_batch(
-                &mut writes,
-                JsonWritePlacementRef::OutOfBand,
-                [
-                    NormalizedJsonRef::new(snapshot),
-                    NormalizedJsonRef::new(metadata),
-                ],
-            )
-            .expect("stage json payloads");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit json payloads");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("begin read");
-        let mut json_reader = JsonStoreContext::new().reader(read);
-        let row = materialize_commit_graph_change(
-            &mut json_reader,
-            change(JsonSlot::Ref(refs[0]), JsonSlot::Ref(refs[1])),
-            ChangePayloadProjection::ALL,
-        )
-        .await
-        .expect("projected refs should materialize");
-
-        assert_eq!(row.snapshot_content.as_deref(), Some(snapshot));
-        assert_eq!(row.metadata.as_deref(), Some(metadata));
-    }
 }

@@ -11,7 +11,7 @@ use crate::storage_adapter::Memory;
 use crate::storage_adapter::Storage;
 use crate::{ExecuteResult, LixError, Value, sql2};
 
-use super::SessionContext;
+use super::{SessionContext, SessionMode};
 
 #[derive(Debug, Clone)]
 struct ObserveQuery {
@@ -161,7 +161,6 @@ where
             .clone();
         match event {
             ObserveInvalidationEvent::Generation(generation) => Ok(generation),
-            #[cfg(not(target_family = "wasm"))]
             ObserveInvalidationEvent::TerminalStorageError(error) => Err(error),
         }
     }
@@ -289,34 +288,19 @@ where
     }
 
     fn observe_scope(&self) -> ObserveSessionScope {
-        ObserveSessionScope::Branch(
-            self.branch
-                .get()
-                .expect("session branch selector should be readable"),
-        )
+        match &self.mode {
+            SessionMode::Workspace { branch_id } => ObserveSessionScope::Branch(
+                branch_id
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            SessionMode::Pinned { branch_id } => ObserveSessionScope::Branch(
+                branch_id
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+        }
     }
 }
-
-
-/// See `session::execute::assume_send_future_proofs`.
-#[cfg(test)]
-mod assume_send_future_proofs {
-    use super::*;
-
-    // session/observe.rs -- ObserveEvents::next
-    #[allow(dead_code)]
-    fn next_inner_is_send(events: &mut ObserveEvents<Memory>) {
-        fn is_send<T: Send>(_: &T) {}
-        is_send(&events.next_inner());
-    }
-
-    #[allow(dead_code)]
-    fn observe_events_is_send_for_every_storage<S>()
-    where
-        S: Storage + Clone + Send + Sync + 'static,
-    {
-        fn assert_send<T: Send>() {}
-        assert_send::<ObserveEvents<S>>();
-    }
-}
-

@@ -1,24 +1,15 @@
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::{
-    BufferRange, CommitResult, EncodedMutationBatch, Key, KeyRange, PutBatch, PutEntry, SpaceId,
-    Storage, StorageError, StorageWrite, StoredValue, WriteOptions,
+    BufferRange, CommitResult, EncodedMutationBatch, Key, KeyRange, PutBatch, PutEntry, Storage,
+    StorageError, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
 use bytes::Bytes;
-use tracing::Instrument as _;
 
 type FastHashBuilder = RandomState;
-static NEXT_STORAGE_WRITE_SET_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_storage_write_set_id() -> u64 {
-    NEXT_STORAGE_WRITE_SET_ID.fetch_add(1, Ordering::Relaxed)
-}
-
 pub trait IntoStorageSpace {
     fn into_storage_space(self) -> StorageSpace;
 }
@@ -78,11 +69,9 @@ impl IntoStorageValue for &[u8] {
 }
 
 pub struct StorageWriteSet {
-    identity: u64,
     groups: Vec<StorageWriteGroup>,
-    group_index: HashMap<SpaceId, usize, FastHashBuilder>,
+    group_index: HashMap<u32, usize, FastHashBuilder>,
     exclusive_range_deletes: Vec<(StorageSpace, KeyRange)>,
-    deferred_final_puts: Vec<Box<dyn DeferredFinalPutSource>>,
     stats: StorageWriteSetStats,
     // Domain stores can seal a write lane after planning a destructive sweep.
     // The flag carries no storage representation; it only prevents a later
@@ -97,10 +86,6 @@ impl fmt::Debug for StorageWriteSet {
             .debug_struct("StorageWriteSet")
             .field("groups", &self.groups)
             .field("exclusive_range_deletes", &self.exclusive_range_deletes)
-            .field(
-                "deferred_final_put_sources",
-                &self.deferred_final_puts.len(),
-            )
             .field("stats", &self.stats)
             .field("changelog_gc_sealed", &self.changelog_gc_sealed)
             .finish_non_exhaustive()
@@ -112,24 +97,6 @@ impl fmt::Debug for StorageWriteSet {
 /// The source has already validated logical uniqueness and ownership. Pages
 /// are deliberately restricted to final point puts so they cannot interact
 /// with a later range deletion in the same backend transaction.
-pub(crate) struct DeferredFinalPutPage {
-    pub(crate) space: StorageSpace,
-    pub(crate) entries: PutBatch,
-}
-
-/// Compact transaction-owned data that expands only at the backend boundary.
-///
-/// This is the storage-native escape hatch for large certified batches. The
-/// ordinary write set remains the general representation; a deferred source
-/// is accepted only when its target spaces have no ordinary mutations.
-pub(crate) trait DeferredFinalPutSource: Send + Sync {
-    fn target_spaces(&self) -> &[StorageSpace];
-    fn put_count(&self) -> u64;
-    fn written_bytes(&self) -> u64;
-    fn backend_capacity_hint_bytes(&self) -> usize;
-    fn next_page(&mut self) -> Option<DeferredFinalPutPage>;
-}
-
 #[derive(Clone, Debug)]
 struct StorageWriteGroup {
     space: StorageSpace,
@@ -187,33 +154,13 @@ enum MutationIndex {
     Delete(usize),
 }
 
-/// Staged content-addressed puts indexed by key.
-///
-/// A content-addressed space derives its key from the value, so the key alone
-/// identifies the content. Hashing only the key keeps coalescing proportional
-/// to the key bytes instead of the whole staged payload; the retained value is
-/// compared directly when a key repeats, which is the only case where the
-/// distinction between "identical entry" and "conflicting mutation" matters.
-type ContentAddressedIndex<'a> = HashMap<&'a [u8], &'a [u8], FastHashBuilder>;
-
-/// Returns whether the put must stay staged.
-///
-/// An identical entry is coalesced. A same-key/different-value entry is kept
-/// so the canonical validator still rejects it as a duplicate mutation.
-fn retain_content_addressed_put<'a>(
-    index: &mut ContentAddressedIndex<'a>,
+#[derive(Hash, PartialEq, Eq)]
+struct ContentAddressedRef<'a> {
     key: &'a [u8],
     value: &'a [u8],
-) -> bool {
-    match index.entry(key) {
-        Entry::Occupied(entry) => *entry.get() != value,
-        Entry::Vacant(entry) => {
-            entry.insert(value);
-            true
-        }
-    }
 }
 
+#[derive(Hash, PartialEq, Eq)]
 struct ArenaRemap {
     shared_buffer_base: usize,
 }
@@ -269,30 +216,23 @@ impl StorageWriteSet {
     /// Creates a canonical write set with capacity hints.
     pub fn with_capacity(_expected_mutations: usize, expected_spaces: usize) -> Self {
         Self {
-            identity: next_storage_write_set_id(),
             groups: Vec::with_capacity(expected_spaces),
             group_index: HashMap::with_capacity_and_hasher(
                 expected_spaces,
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             ),
             exclusive_range_deletes: Vec::new(),
-            deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.deferred_final_puts.is_empty()
-            && self.exclusive_range_deletes.is_empty()
+        self.exclusive_range_deletes.is_empty()
             && self
                 .groups
                 .iter()
                 .all(|group| group.puts.is_empty() && group.deletes.is_empty())
-    }
-
-    pub(crate) fn identity(&self) -> u64 {
-        self.identity
     }
 
     /// Conservative encoded-size hint for contiguous backend write batches.
@@ -315,25 +255,7 @@ impl StorageWriteSet {
             });
             total.saturating_add(puts).saturating_add(deletes)
         });
-        self.deferred_final_puts
-            .iter()
-            .fold(ordinary, |total, source| {
-                total.saturating_add(source.backend_capacity_hint_bytes())
-            })
-    }
-
-    #[cfg(feature = "storage-benches")]
-    pub(crate) async fn apply<StorageImpl>(
-        self,
-        writer: &mut crate::storage_adapter::context::StorageAdapterWriteTransaction<
-            '_,
-            StorageImpl,
-        >,
-    ) -> Result<StorageWriteSetStats, crate::LixError>
-    where
-        StorageImpl: Storage,
-    {
-        writer.write_set(self).await
+        ordinary
     }
 
     pub fn put<S, K, V>(&mut self, space: S, key: K, value: V)
@@ -358,52 +280,6 @@ impl StorageWriteSet {
     /// Identical entries already staged by an earlier batch are coalesced;
     /// same-key, different-value entries remain duplicate mutations and are
     /// deliberately left for the canonical validator to reject.
-    pub(crate) fn put_content_addressed_batch<I>(&mut self, space: StorageSpace, entries: I)
-    where
-        I: IntoIterator<Item = (Key, StoredValue)>,
-    {
-        let entries = entries.into_iter().collect::<Vec<_>>();
-        if entries.is_empty() {
-            return;
-        }
-
-        let keep = {
-            let group = self.group_mut(space);
-            let mut existing = ContentAddressedIndex::with_capacity_and_hasher(
-                group.puts.len().saturating_add(entries.len()),
-                FastHashBuilder::with_seeds(0, 0, 0, 0),
-            );
-            for put in &group.puts {
-                existing.insert(group.key_bytes(put.key), group.value_bytes(put.value));
-            }
-
-            entries
-                .iter()
-                .map(|(key, value)| {
-                    retain_content_addressed_put(
-                        &mut existing,
-                        key.0.as_ref(),
-                        value.bytes.as_ref(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let mut staged_puts = 0;
-        let mut written_bytes = 0;
-        let group = self.group_mut(space);
-        for ((key, value), keep) in entries.into_iter().zip(keep) {
-            if !keep {
-                continue;
-            }
-            written_bytes += value.bytes.len() as u64;
-            staged_puts += 1;
-            group.stage_put(key.0, value.bytes);
-        }
-        self.stats.staged_puts += staged_puts;
-        self.stats.written_bytes += written_bytes;
-    }
-
     /// Retains one already-encoded contiguous mutation batch without copying
     /// its key or value buffers.
     ///
@@ -428,44 +304,6 @@ impl StorageWriteSet {
         self.stats.written_bytes += written_bytes;
     }
 
-    /// Retains a compact, already-validated owner until backend lowering.
-    ///
-    /// Deferred sources are intentionally exclusive per target space. This
-    /// makes their no-duplicate certificate compositional with the ordinary
-    /// write-set validator instead of silently bypassing mutations staged by
-    /// another domain writer.
-    pub(crate) fn stage_deferred_final_put_source(
-        &mut self,
-        source: Box<dyn DeferredFinalPutSource>,
-    ) -> Result<(), StorageWriteSetError> {
-        for &space in source.target_spaces() {
-            if self
-                .group_index
-                .get(&space.id)
-                .and_then(|index| self.groups.get(*index))
-                .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
-                || self.deferred_final_puts.iter().any(|existing| {
-                    existing
-                        .target_spaces()
-                        .iter()
-                        .any(|target| target.id == space.id)
-                })
-            {
-                return Err(StorageWriteSetError::DuplicateMutation {
-                    space,
-                    key: Key(Bytes::new()),
-                });
-            }
-        }
-        self.stats.staged_puts = self.stats.staged_puts.saturating_add(source.put_count());
-        self.stats.written_bytes = self
-            .stats
-            .written_bytes
-            .saturating_add(source.written_bytes());
-        self.deferred_final_puts.push(source);
-        Ok(())
-    }
-
     /// Retains one contiguous content-addressed batch while coalescing puts
     /// already present in the same storage-space lane.
     ///
@@ -488,22 +326,24 @@ impl StorageWriteSet {
         );
         let puts = {
             let group = self.group_mut(space);
-            let mut existing = ContentAddressedIndex::with_capacity_and_hasher(
+            let mut existing = HashSet::with_capacity_and_hasher(
                 group.puts.len().saturating_add(puts.len()),
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             );
             for put in &group.puts {
-                existing.insert(group.key_bytes(put.key), group.value_bytes(put.value));
+                existing.insert(ContentAddressedRef {
+                    key: group.key_bytes(put.key),
+                    value: group.value_bytes(put.value),
+                });
             }
             puts.into_iter()
                 .filter(|put| {
-                    retain_content_addressed_put(
-                        &mut existing,
-                        &key_bytes
+                    existing.insert(ContentAddressedRef {
+                        key: &key_bytes
                             [put.key.offset()..put.key.offset().saturating_add(put.key.len())],
-                        &value_bytes[put.value.offset()
+                        value: &value_bytes[put.value.offset()
                             ..put.value.offset().saturating_add(put.value.len())],
-                    )
+                    })
                 })
                 .collect::<Vec<_>>()
         };
@@ -565,20 +405,14 @@ impl StorageWriteSet {
     ) -> Result<(), StorageWriteSetError> {
         let has_points = self
             .group_index
-            .get(&space.id)
+            .get(&space.id())
             .and_then(|index| self.groups.get(*index))
             .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty());
         let has_range = self
             .exclusive_range_deletes
             .iter()
-            .any(|(existing, _)| existing.id == space.id);
-        let has_deferred = self.deferred_final_puts.iter().any(|source| {
-            source
-                .target_spaces()
-                .iter()
-                .any(|target| target.id == space.id)
-        });
-        if has_points || has_range || has_deferred {
+            .any(|(existing, _)| existing.id() == space.id());
+        if has_points || has_range {
             return Err(StorageWriteSetError::DuplicateMutation {
                 space,
                 key: Key(Bytes::new()),
@@ -608,60 +442,10 @@ impl StorageWriteSet {
         group.value_arena.reserve_shared(expected_puts);
     }
 
-    /// Returns whether this write set already stages a put for an exact
-    /// `(space, key)` pair.
-    ///
-    /// Domain writers use this only for transaction-scoped format markers;
-    /// normal data rows must remain unique and are validated by [`Self::validate`].
-    pub(crate) fn contains_put(&self, space: StorageSpace, key: &[u8]) -> bool {
-        self.group_index
-            .get(&space.id)
-            .and_then(|index| self.groups.get(*index))
-            .is_some_and(|group| group.puts.iter().any(|put| group.key_bytes(put.key) == key))
-    }
-
-    /// Returns an exact ordinary staged put value for transaction-local
-    /// immutable read-your-writes. Deferred sources remain final-only.
-    pub(crate) fn staged_value(&self, space: StorageSpace, key: &[u8]) -> Option<Bytes> {
-        let group = self
-            .group_index
-            .get(&space.id)
-            .and_then(|index| self.groups.get(*index))?;
-        let put = group
-            .puts
-            .iter()
-            .find(|put| group.key_bytes(put.key) == key)?;
-        Some(Bytes::copy_from_slice(group.value_bytes(put.value)))
-    }
-
-    /// Takes an owned snapshot of ordinary puts in one storage lane for an
-    /// async read-your-writes planner. The owned bytes keep the planner's
-    /// future `Send` without requiring `StorageWriteSet` to be `Sync`.
-    pub(crate) fn staged_values_in_space(&self, space: StorageSpace) -> Vec<(Bytes, Bytes)> {
-        let Some(group) = self
-            .group_index
-            .get(&space.id)
-            .and_then(|index| self.groups.get(*index))
-        else {
-            return Vec::new();
-        };
-        group
-            .puts
-            .iter()
-            .map(|put| {
-                (
-                    Bytes::copy_from_slice(group.key_bytes(put.key)),
-                    Bytes::copy_from_slice(group.value_bytes(put.value)),
-                )
-            })
-            .collect()
-    }
-
     pub fn extend(&mut self, other: Self) {
         let Self {
             groups,
             exclusive_range_deletes,
-            deferred_final_puts,
             stats,
             changelog_gc_sealed,
             ..
@@ -675,27 +459,6 @@ impl StorageWriteSet {
         for (space, range) in exclusive_range_deletes {
             self.delete_range_exclusive(space, range)
                 .expect("extended exclusive range-delete spaces remain exclusive");
-        }
-        for source in deferred_final_puts {
-            for &space in source.target_spaces() {
-                assert!(
-                    self.group_index
-                        .get(&space.id)
-                        .and_then(|index| self.groups.get(*index))
-                        .is_none_or(|group| group.puts.is_empty() && group.deletes.is_empty()),
-                    "extended deferred spaces remain exclusive"
-                );
-                assert!(
-                    self.deferred_final_puts.iter().all(|existing| {
-                        existing
-                            .target_spaces()
-                            .iter()
-                            .all(|target| target.id != space.id)
-                    }),
-                    "extended deferred sources remain exclusive"
-                );
-            }
-            self.deferred_final_puts.push(source);
         }
         self.stats.staged_puts += stats.staged_puts;
         self.stats.staged_deletes += stats.staged_deletes;
@@ -736,7 +499,7 @@ impl StorageWriteSet {
     /// storage space.  This is benchmark/test observability only: production
     /// planning continues to use the aggregate write-set counters and never
     /// depends on this classification.
-    #[cfg(feature = "storage-benches")]
+    #[cfg(any(test, feature = "storage-benches"))]
     pub fn delete_counts_by_space(&self) -> Vec<(StorageSpace, usize)> {
         self.groups
             .iter()
@@ -746,37 +509,7 @@ impl StorageWriteSet {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_mutations_in_space(&self, space: StorageSpace) -> bool {
-        self.group_index
-            .get(&space.id)
-            .and_then(|index| self.groups.get(*index))
-            .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
-    }
-
-    /// Keys this write set already declares in `space`.
-    ///
-    /// A caller that reclaims a whole key range needs this when another writer
-    /// in the same transaction may already have declared some of those keys:
-    /// restating one is a duplicate mutation, not an idempotent delete.
-    pub(crate) fn declared_keys(&self, space: StorageSpace) -> std::collections::BTreeSet<Vec<u8>> {
-        self.group_index
-            .get(&space.id)
-            .and_then(|index| self.groups.get(*index))
-            .map(|group| {
-                (0..group.puts.len())
-                    .map(MutationIndex::Put)
-                    .chain((0..group.deletes.len()).map(MutationIndex::Delete))
-                    .map(|mutation| group.mutation_key(mutation).to_vec())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn changelog_gc_is_sealed(&self) -> bool {
-        self.changelog_gc_sealed
-    }
-
+    #[allow(dead_code)] // Activated by the checkpoint GC integration.
     pub(crate) fn seal_changelog_gc(&mut self) {
         self.changelog_gc_sealed = true;
     }
@@ -856,7 +589,7 @@ impl StorageWriteSet {
             if order_stats_enabled() && !group.puts.is_empty() {
                 eprintln!(
                     "write-set-order space={} puts={} puts_sorted={puts_sorted} deletes={} deletes_sorted={deletes_sorted}",
-                    group.space.name,
+                    group.space.name(),
                     group.puts.len(),
                     group.deletes.len(),
                 );
@@ -882,7 +615,6 @@ impl StorageWriteSet {
         let Self {
             groups,
             exclusive_range_deletes,
-            mut deferred_final_puts,
             mut stats,
             ..
         } = self;
@@ -912,7 +644,7 @@ impl StorageWriteSet {
                     .sum::<usize>();
                 eprintln!(
                     "write-set-space space={} puts={} deletes={} key_bytes={} value_bytes={}",
-                    group.space.name,
+                    group.space.name(),
                     group.puts.len(),
                     group.deletes.len(),
                     key_bytes,
@@ -933,29 +665,6 @@ impl StorageWriteSet {
                 stats.storage_calls += 1;
                 write
                     .delete_many(space, &deletes)
-                    .await
-                    .map_err(StorageWriteSetError::Storage)?;
-            }
-        }
-
-        for source in &mut deferred_final_puts {
-            while let Some(page) = tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.storage_lowering.deferred_next_page"
-            )
-            .in_scope(|| source.next_page())
-            {
-                if page.entries.entries.is_empty() {
-                    continue;
-                }
-                stats.put_batches += 1;
-                stats.storage_calls += 1;
-                write
-                    .put_many(page.space, page.entries)
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.storage_lowering.deferred_put_page"
-                    ))
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
@@ -991,7 +700,7 @@ impl StorageWriteSet {
     }
 
     fn group_mut(&mut self, space: StorageSpace) -> &mut StorageWriteGroup {
-        if let Some(index) = self.group_index.get(&space.id).copied() {
+        if let Some(index) = self.group_index.get(&space.id()).copied() {
             let group = &mut self.groups[index];
             if group.space != space {
                 group.conflicting_declarations.push(space);
@@ -1000,7 +709,7 @@ impl StorageWriteSet {
         }
 
         let index = self.groups.len();
-        self.group_index.insert(space.id, index);
+        self.group_index.insert(space.id(), index);
         self.stats.touched_spaces += 1;
         self.groups.push(StorageWriteGroup::new(space));
         let group = &mut self.groups[index];
@@ -1014,19 +723,13 @@ impl StorageWriteSet {
         for (index, (space, _)) in self.exclusive_range_deletes.iter().enumerate() {
             let conflicts_with_points = self
                 .group_index
-                .get(&space.id)
+                .get(&space.id())
                 .and_then(|group_index| self.groups.get(*group_index))
                 .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty());
             let conflicts_with_range = self.exclusive_range_deletes[index + 1..]
                 .iter()
-                .any(|(other, _)| other.id == space.id);
-            let conflicts_with_deferred = self.deferred_final_puts.iter().any(|source| {
-                source
-                    .target_spaces()
-                    .iter()
-                    .any(|target| target.id == space.id)
-            });
-            if conflicts_with_points || conflicts_with_range || conflicts_with_deferred {
+                .any(|(other, _)| other.id() == space.id());
+            if conflicts_with_points || conflicts_with_range {
                 return Err(StorageWriteSetError::DuplicateMutation {
                     space: *space,
                     key: Key(Bytes::new()),
@@ -1081,11 +784,9 @@ fn validate_sorted_group(group: &StorageWriteGroup) -> Result<(), StorageWriteSe
 impl Default for StorageWriteSet {
     fn default() -> Self {
         Self {
-            identity: next_storage_write_set_id(),
             groups: Vec::new(),
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
             exclusive_range_deletes: Vec::new(),
-            deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }
@@ -1184,7 +885,7 @@ impl StorageWriteGroup {
             deletes,
             conflicting_declarations,
         } = other;
-        debug_assert_eq!(self.space.id, space.id);
+        debug_assert_eq!(self.space.id(), space.id());
         self.puts.reserve(puts.len());
         self.deletes.reserve(deletes.len());
         let key_remap = self.key_arena.append(key_arena);
@@ -1298,7 +999,7 @@ impl fmt::Display for StorageWriteSetError {
             Self::ConflictingSpaceDeclaration { existing, incoming } => write!(
                 f,
                 "conflicting storage space declarations for {:?}: {existing} vs {incoming}",
-                existing.id
+                existing.id()
             ),
             Self::DuplicateMutation { space, key } => {
                 write!(f, "duplicate storage mutation for {space}/{key:?}")
@@ -1330,8 +1031,7 @@ mod tests {
 
     use crate::storage::{
         BufferRange, CommitResult, EncodedMutationBatch, EncodedMutationBatchError, EncodedPut,
-        Key, KeyRange, Memory, PutBatch, SpaceId, StorageError, StorageWrite, StoredValue,
-        WriteOptions,
+        Key, KeyRange, Memory, PutBatch, StorageError, StorageWrite, StoredValue, WriteOptions,
     };
     use crate::storage_adapter::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
@@ -1346,7 +1046,7 @@ mod tests {
     }
 
     fn space() -> StorageSpace {
-        StorageSpace::mutable(SpaceId(1), "test.space")
+        StorageSpace::engine_declared(1, "test.space", crate::storage::ValueSemantics::Mutable)
     }
 
     #[derive(Default)]
@@ -1641,6 +1341,34 @@ mod tests {
         writes
             .validate()
             .expect("identical content-addressed descriptors should coalesce");
+
+        let mut conflicting = StorageWriteSet::new();
+        let first = EncodedMutationBatch::try_new(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"first"),
+            vec![EncodedPut {
+                key: BufferRange::new(0, 3),
+                value: BufferRange::new(0, 5),
+            }],
+            Vec::new(),
+        )
+        .expect("valid first batch");
+        let second = EncodedMutationBatch::try_new(
+            Bytes::from_static(b"key"),
+            Bytes::from_static(b"other"),
+            vec![EncodedPut {
+                key: BufferRange::new(0, 3),
+                value: BufferRange::new(0, 5),
+            }],
+            Vec::new(),
+        )
+        .expect("valid conflicting batch");
+        conflicting.stage_content_addressed_encoded_batch(space(), first);
+        conflicting.stage_content_addressed_encoded_batch(space(), second);
+        assert!(matches!(
+            conflicting.validate(),
+            Err(StorageWriteSetError::DuplicateMutation { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1739,43 +1467,15 @@ mod tests {
     }
 
     #[test]
-    fn content_addressed_batch_coalesces_duplicates_across_staging_calls() {
-        let mut writes = StorageWriteSet::new();
-        writes.put_content_addressed_batch(
-            space(),
-            [
-                (key("a"), value("A")),
-                (key("b"), value("B")),
-                (key("a"), value("A")),
-            ],
-        );
-        writes
-            .put_content_addressed_batch(space(), [(key("b"), value("B")), (key("c"), value("C"))]);
-
-        assert_eq!(writes.stats().staged_puts, 3);
-        writes
-            .validate()
-            .expect("identical content-addressed candidates should coalesce");
-    }
-
-    #[test]
-    fn content_addressed_batch_preserves_conflicting_hash_validation() {
-        let mut writes = StorageWriteSet::new();
-        writes.put_content_addressed_batch(space(), [(key("a"), value("A"))]);
-        writes.put_content_addressed_batch(space(), [(key("a"), value("different"))]);
-
-        assert!(matches!(
-            writes.validate(),
-            Err(StorageWriteSetError::DuplicateMutation { .. })
-        ));
-    }
-
-    #[test]
     fn one_space_id_cannot_change_value_semantics() {
         let mut writes = StorageWriteSet::new();
         writes.put(space(), key("mutable"), value("A"));
         writes.put(
-            StorageSpace::immutable(SpaceId(1), "test.space"),
+            StorageSpace::engine_declared(
+                1,
+                "test.space",
+                crate::storage::ValueSemantics::Immutable,
+            ),
             key("immutable"),
             value("B"),
         );

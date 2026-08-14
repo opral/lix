@@ -1,11 +1,14 @@
 use lix::{LixError, Value};
 
 simulation_test!(
-    read_only_branch_components_reject_direct_row_writes,
+    read_only_branch_components_reject_direct_entity_writes,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine.open_session().await.expect("session should open"),
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
             &engine,
         );
 
@@ -51,20 +54,15 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine.open_session().await.expect("session should open"),
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
             &engine,
         );
 
         for surface_name in [
-            "lix_state",
-            "lix_state_by_branch",
-            "lix_state_history",
-            "lix_label",
-            "lix_label_by_branch",
-            "lix_label_history",
-            "lix_label_assignment",
-            "lix_label_assignment_by_branch",
-            "lix_label_assignment_history",
+            "lix_checkpoint_marker",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",
@@ -91,7 +89,10 @@ simulation_test!(
 simulation_test!(read_only_history_views_reject_dml, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-        engine.open_session().await.expect("session should open"),
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
         &engine,
     );
 
@@ -120,7 +121,10 @@ simulation_test!(read_only_history_views_reject_dml, |sim| async move {
 simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-        engine.open_session().await.expect("session should open"),
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
         &engine,
     );
 
@@ -128,7 +132,7 @@ simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"read_only_history_row\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+             lix_json('{\"x-lix-key\":\"read_only_history_entity\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
              false,\
              true\
              )",
@@ -140,12 +144,12 @@ simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
     assert_read_only_error(
         session
             .execute(
-                "INSERT INTO read_only_history_row_history (id) VALUES ('row-a')",
+                "INSERT INTO read_only_history_entity_history (id) VALUES ('entity-a')",
                 &[],
             )
             .await
             .expect_err("typed history insert should be read-only"),
-        "read_only_history_row_history",
+        "read_only_history_entity_history",
         "History views are query-only",
     );
 });
@@ -156,14 +160,14 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let reader = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("reader session should open"),
             &engine,
         );
         let writer = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("writer session should open"),
             &engine,

@@ -1,4 +1,4 @@
-use lix::{LixError, Value};
+use lix::{CreateBranchOptions, LixError, Value};
 use serde_json::json;
 
 use super::select_rows;
@@ -209,21 +209,6 @@ simulation_test!(
             Value::Text(receipt.commit_id.clone()),
             "retained HOT rows must project the checkpoint as their live commit owner"
         );
-
-        engine
-            .rebuild_tracked_state_for_branch(sim.main_branch_id())
-            .await
-            .expect("checkpoint tracked state should rebuild");
-        assert_eq!(
-            select_rows(
-                &session,
-                "SELECT lixcol_created_at, lixcol_updated_at, lixcol_commit_id \
-                 FROM lix_key_value WHERE key = 'checkpoint-key'",
-            )
-            .await,
-            timestamps_before_rebuild,
-            "checkpoint timestamps must remain stable after tracked-state rebuild"
-        );
     }
 );
 
@@ -336,6 +321,116 @@ simulation_test!(
             .await,
             vec![vec![Value::Text("removed".to_string())]],
             "an exact PK filter must preserve the same net diff",
+        );
+    }
+);
+
+simulation_test!(
+    working_diff_by_branch_is_isolated_and_survives_cold_reopen,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('working-alternate-branch', 'base')",
+            &[],
+        )
+        .await
+        .expect("branch baseline should succeed");
+        main.create_checkpoint()
+            .await
+            .expect("branch baseline checkpoint should succeed");
+        let baseline = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-000000000298".to_string()),
+                name: "Working diff alternate branch".to_string(),
+                from_commit_id: Some(baseline),
+            })
+            .await
+            .expect("alternate branch should be created");
+        let alternate = sim.wrap_session(
+            engine
+                .open_session(branch.id.clone())
+                .await
+                .expect("alternate branch session should open"),
+            &engine,
+        );
+        alternate
+            .create_checkpoint()
+            .await
+            .expect("alternate branch checkpoint should succeed");
+        alternate
+            .execute(
+                "UPDATE lix_key_value SET value = 'alternate' \
+                 WHERE key = 'working-alternate-branch'",
+                &[],
+            )
+            .await
+            .expect("alternate branch update should succeed");
+
+        assert_eq!(
+            select_rows(
+                &main,
+                "SELECT COUNT(*) FROM lix_working_diff \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"working-alternate-branch\"]')",
+            )
+            .await,
+            vec![vec![Value::Integer(0)]],
+            "main must not see another branch's working diff"
+        );
+        assert_eq!(
+            select_rows(
+                &main,
+                &format!(
+                    "SELECT diff_type FROM lix_working_diff_by_branch \
+                     WHERE lixcol_branch_id = '{}' \
+                       AND schema_key = 'lix_key_value' \
+                       AND entity_pk = lix_json('[\"working-alternate-branch\"]')",
+                    branch.id
+                ),
+            )
+            .await,
+            vec![vec![Value::Text("modified".to_string())]],
+            "the branch-bounded working diff must expose its local change"
+        );
+
+        let reopened_engine = sim
+            .reboot_engine_from_current_snapshot()
+            .await
+            .expect("engine should cold reopen");
+        let reopened = sim.wrap_session(
+            reopened_engine
+                .open_workspace_session()
+                .await
+                .expect("reopened workspace session should open"),
+            &reopened_engine,
+        );
+        assert_eq!(
+            select_rows(
+                &reopened,
+                &format!(
+                    "SELECT diff_type FROM lix_working_diff_by_branch \
+                     WHERE lixcol_branch_id = '{}' \
+                       AND schema_key = 'lix_key_value' \
+                       AND entity_pk = lix_json('[\"working-alternate-branch\"]')",
+                    branch.id
+                ),
+            )
+            .await,
+            vec![vec![Value::Text("modified".to_string())]],
+            "the alternate branch diff must survive a cold reopen"
         );
     }
 );

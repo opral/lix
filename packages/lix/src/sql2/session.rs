@@ -8,10 +8,9 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
+use crate::storage_adapter::StorageAdapterRead;
 
-use super::branch_ref::CachingBranchRefReader;
-use super::exec::statement_has_table_function;
-use super::planning_cache::PooledReadSession;
+use super::branch_ref::PreparedBranchRefReader;
 use super::providers;
 use super::udfs::{
     ExecutionSlots, bind_execution_sql2_functions, register_execution_sql2_functions,
@@ -22,7 +21,7 @@ use super::{SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext};
 pub(crate) async fn build_read_session<C>(
     ctx: &C,
     statements: &[DataFusionStatement],
-) -> Result<PooledReadSession, LixError>
+) -> Result<SessionContext, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
@@ -33,7 +32,7 @@ pub(crate) async fn build_read_session_at_head<C>(
     ctx: &C,
     active_head: BranchHead,
     statements: &[DataFusionStatement],
-) -> Result<PooledReadSession, LixError>
+) -> Result<SessionContext, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
@@ -44,12 +43,11 @@ async fn build_read_session_with_active_head<C>(
     ctx: &C,
     active_head: Option<BranchHead>,
     statements: &[DataFusionStatement],
-) -> Result<PooledReadSession, LixError>
+) -> Result<SessionContext, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let pooled = ctx.datafusion_read_session();
-    let session = pooled.context();
+    let session = ctx.datafusion_read_session();
     let branch_ref: Arc<dyn BranchRefReader> = match active_head.as_ref() {
         Some(head) => {
             if head.branch_id != ctx.active_branch_id() {
@@ -58,12 +56,19 @@ where
                     "prepared SQL read head does not match the active branch",
                 ));
             }
-            Arc::new(CachingBranchRefReader::with_head(
-                ctx.branch_ref(),
-                head.clone(),
-            ))
+            let branch_ref = Arc::new(PreparedBranchRefReader::new(ctx.branch_ref(), head.clone()));
+            match branch_ref.load_head(&head.branch_id).await? {
+                Some(_) => branch_ref,
+                None => {
+                    return Err(LixError::branch_not_found(
+                        head.branch_id.clone(),
+                        "build SQL read session at head",
+                        "prepared branch selector",
+                    ));
+                }
+            }
         }
-        None => Arc::new(CachingBranchRefReader::new(ctx.branch_ref())),
+        None => ctx.branch_ref(),
     };
     let active_branch_commit_id = match active_head {
         Some(head) => Some(head.commit_id.to_string()),
@@ -73,75 +78,75 @@ where
             .map(|head| head.commit_id.to_string()),
     };
     bind_execution_sql2_functions(
-        session,
+        &session,
         ctx.functions(),
         ctx.active_account_id(),
         Some(ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
     );
-    // `lix_diff` is a table-valued function, so only a statement that actually
-    // calls one can reach it. Registering it unconditionally took the session
-    // write lock on every read.
-    if statements.iter().any(statement_has_table_function) {
-        providers::register_diff_function(session, ctx.changelog_query_source());
-    }
-    let provider_selection = providers::read_provider_selection(pooled.state(), statements);
+    let commit_graph = ctx.commit_graph();
+    let commit_graph = Arc::new(tokio::sync::Mutex::new(commit_graph));
+    let changelog_query_source = ctx.changelog_query_source();
+    providers::register_diff_function(&session, changelog_query_source.clone());
+    let provider_selection = providers::read_provider_selection(&session, statements);
     providers::register_read(
-        session,
+        &session,
         ctx,
         branch_ref,
         active_branch_commit_id,
+        commit_graph,
+        changelog_query_source,
         &provider_selection,
     )
     .await?;
 
-    Ok(pooled)
+    Ok(session)
 }
 
-pub(crate) async fn build_transaction_read_session<C>(
+pub(crate) async fn build_transaction_read_session<C, R>(
     read_ctx: &C,
-    write_ctx: &mut dyn SqlWriteExecutionContext,
+    write_ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     statement: &DataFusionStatement,
-) -> Result<PooledReadSession, LixError>
+) -> Result<SessionContext, LixError>
 where
     C: SqlExecutionContext + ?Sized,
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let pooled = read_ctx.datafusion_read_session();
-    let session = pooled.context();
-    let read_branch_ref: Arc<dyn BranchRefReader> =
-        Arc::new(CachingBranchRefReader::new(read_ctx.branch_ref()));
+    let session = read_ctx.datafusion_read_session();
+    let read_branch_ref: Arc<dyn BranchRefReader> = read_ctx.branch_ref();
     let active_branch_commit_id = read_branch_ref
         .load_head(read_ctx.active_branch_id())
         .await?
         .map(|head| head.commit_id.to_string());
     bind_execution_sql2_functions(
-        session,
+        &session,
         read_ctx.functions(),
         read_ctx.active_account_id(),
         Some(read_ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
     );
-    if statement_has_table_function(statement) {
-        providers::register_diff_function(session, read_ctx.changelog_query_source());
-    }
-    let write_ctx = SqlWriteContext::new(write_ctx);
-    let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
-        Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone())),
-    ));
+    let commit_graph = read_ctx.commit_graph();
+    let commit_graph = Arc::new(tokio::sync::Mutex::new(commit_graph));
+    let changelog_query_source = read_ctx.changelog_query_source();
+    providers::register_diff_function(&session, changelog_query_source.clone());
+    let write_ctx = SqlWriteContext::<R>::new(write_ctx);
+    let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(write_ctx.clone());
     let provider_selection =
-        providers::read_provider_selection(pooled.state(), std::slice::from_ref(statement));
+        providers::read_provider_selection(&session, std::slice::from_ref(statement));
     providers::register_transaction(
-        session,
+        &session,
         read_ctx,
         read_branch_ref,
         active_branch_commit_id,
+        commit_graph,
+        changelog_query_source,
         write_ctx,
         write_branch_ref,
         SqlWriteSessionOptions::default(),
         &provider_selection,
     )
     .await?;
-    Ok(pooled)
+    Ok(session)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -150,21 +155,30 @@ pub(crate) struct SqlWriteSessionOptions {
     pub(crate) explicit_insert_columns: Option<BTreeSet<String>>,
 }
 
-pub(crate) struct SqlWriteSession {
+pub(crate) struct SqlWriteSession<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     datafusion: SessionContext,
-    write_targets: Arc<providers::WriteTargetRegistry>,
+    write_targets: Arc<providers::WriteTargetRegistry<R>>,
 }
 
-impl SqlWriteSession {
+impl<R> SqlWriteSession<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     pub(crate) fn write_target(
         &self,
         table_name: &str,
-    ) -> Result<Arc<providers::SpecWriteTarget>, LixError> {
+    ) -> Result<Arc<providers::SpecWriteTarget<R>>, LixError> {
         self.write_targets.target(table_name)
     }
 }
 
-impl Deref for SqlWriteSession {
+impl<R> Deref for SqlWriteSession<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     type Target = SessionContext;
 
     fn deref(&self) -> &Self::Target {
@@ -172,19 +186,20 @@ impl Deref for SqlWriteSession {
     }
 }
 
-pub(crate) async fn build_write_session_with_options(
-    ctx: &mut dyn SqlWriteExecutionContext,
+pub(crate) async fn build_write_session_with_options<R>(
+    ctx: &mut dyn SqlWriteExecutionContext<ReadStore = R>,
     options: SqlWriteSessionOptions,
     provider_selection: &providers::ProviderSelection,
-) -> Result<SqlWriteSession, LixError> {
+) -> Result<SqlWriteSession<R>, LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let session = ctx.datafusion_session();
-    let write_ctx = SqlWriteContext::new(ctx)
+    let write_ctx = SqlWriteContext::<R>::new(ctx)
         .with_explicit_insert_columns(options.explicit_insert_columns.clone());
     let write_targets = write_ctx.write_targets()?;
     let active_branch_id = write_ctx.active_branch_id();
-    let branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(Arc::new(
-        super::WriteContextBranchRefReader::new(write_ctx.clone()),
-    )));
+    let branch_ref: Arc<dyn BranchRefReader> = Arc::new(write_ctx.clone());
     let active_branch_commit_id =
         branch_ref
             .load_head(&active_branch_id)
@@ -200,8 +215,8 @@ pub(crate) async fn build_write_session_with_options(
         &session,
         write_ctx.functions(),
         &write_ctx.active_account_id(),
-        Some(&active_branch_id),
-        Some(&active_branch_commit_id.commit_id.to_string()),
+        Some(active_branch_id.as_str()),
+        Some(active_branch_commit_id.commit_id.to_string().as_str()),
     );
     providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
 
@@ -245,34 +260,6 @@ pub(crate) fn new_sql_session_context() -> SessionContext {
     sql_session_from_template(session.state(), None)
 }
 
-#[cfg(test)]
-mod tests {
-    use datafusion::common::config::Dialect;
-
-    use super::new_sql_session_context;
-
-    #[test]
-    fn datafusion_session_uses_postgresql_dialect() {
-        let session = new_sql_session_context();
-        assert_eq!(
-            session.copied_config().options().sql_parser.dialect,
-            Dialect::PostgreSQL
-        );
-    }
-}
-
-/// Builds a Lix SQL session from a template state, gives it its own
-/// execution-function slots, and registers the five execution UDFs against them.
-///
-/// Every Lix SQL session goes through here exactly once. Doing it at session
-/// construction rather than per statement is what lets a pooled session keep a
-/// stable function registry: nothing mutates `SessionState`'s scalar-function
-/// map after this point.
-///
-/// The slots are installed into the config *before* the state is built, so this
-/// costs one `SessionState` construction rather than one per configuration step.
-/// Write sessions are not pooled — they are built per statement — so an extra
-/// registry deep copy here would land on every write.
 pub(crate) fn sql_session_from_template(
     template: SessionState,
     catalog_list: Option<Arc<dyn CatalogProviderList>>,

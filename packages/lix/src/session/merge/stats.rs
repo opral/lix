@@ -1,10 +1,8 @@
 use std::cmp::Ordering;
 
 use crate::LixError;
-use crate::tracked_state::{
-    TrackedStateDiff, TrackedStateDiffIdentity, TrackedStateDiffKind, TrackedStateMergePick,
-    TrackedStateMergePlan,
-};
+
+use super::native::{MergeDiff, MergeDiffKind, MergePlan};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct MergeStats {
@@ -14,7 +12,7 @@ pub(crate) struct MergeStats {
     pub(crate) removed: usize,
 }
 
-pub(crate) fn stats_from_diff(diff: &TrackedStateDiff) -> MergeStats {
+pub(crate) fn stats_from_diff(diff: &MergeDiff) -> MergeStats {
     let mut stats = MergeStats::default();
     for entry in &diff.entries {
         stats.add(entry.kind);
@@ -23,32 +21,32 @@ pub(crate) fn stats_from_diff(diff: &TrackedStateDiff) -> MergeStats {
 }
 
 pub(crate) fn stats_from_plan(
-    plan: &TrackedStateMergePlan,
-    source_diff: &TrackedStateDiff,
+    plan: &MergePlan,
+    source_diff: &MergeDiff,
 ) -> Result<MergeStats, LixError> {
-    if identities_are_strictly_sorted(plan.picks.iter().map(pick_identity), plan.picks.len())
-        && identities_are_strictly_sorted(
-            source_diff.entries.iter().map(|entry| &entry.identity),
-            source_diff.entries.len(),
-        )
-    {
-        return stats_from_sorted_plan(plan, source_diff);
+    if !identities_are_strictly_sorted(
+        plan.picks.iter().map(|pick| pick.identity(source_diff)),
+        plan.picks.len(),
+    ) || !identities_are_strictly_sorted(
+        source_diff.entries.iter().map(|entry| &entry.identity),
+        source_diff.entries.len(),
+    ) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native merge stats received non-canonical StateKey order",
+        ));
     }
-
-    // Defensive hand-built callers can supply unsorted inputs. Keep their
-    // behavior correct without imposing an index allocation on the normal
-    // tree-diff path, whose entries and merge picks are already key ordered.
-    stats_from_unsorted_plan(plan, source_diff)
+    stats_from_sorted_plan(plan, source_diff)
 }
 
 fn stats_from_sorted_plan(
-    plan: &TrackedStateMergePlan,
-    source_diff: &TrackedStateDiff,
+    plan: &MergePlan,
+    source_diff: &MergeDiff,
 ) -> Result<MergeStats, LixError> {
     let mut stats = MergeStats::default();
     let mut source_index = 0;
     for pick in &plan.picks {
-        let identity = pick_identity(pick);
+        let identity = pick.identity(source_diff);
         let mut found = false;
         while let Some(entry) = source_diff.entries.get(source_index) {
             match identity_cmp(&entry.identity, identity) {
@@ -69,27 +67,8 @@ fn stats_from_sorted_plan(
     Ok(stats)
 }
 
-fn stats_from_unsorted_plan(
-    plan: &TrackedStateMergePlan,
-    source_diff: &TrackedStateDiff,
-) -> Result<MergeStats, LixError> {
-    let mut stats = MergeStats::default();
-    for pick in &plan.picks {
-        let identity = pick_identity(pick);
-        let Some(entry) = source_diff
-            .entries
-            .iter()
-            .find(|entry| &entry.identity == identity)
-        else {
-            return Err(missing_source_entry(identity));
-        };
-        stats.add(entry.kind);
-    }
-    Ok(stats)
-}
-
 fn identities_are_strictly_sorted<'a>(
-    mut identities: impl Iterator<Item = &'a TrackedStateDiffIdentity>,
+    mut identities: impl Iterator<Item = &'a crate::forktree::StateKey>,
     len: usize,
 ) -> bool {
     if len < 2 {
@@ -107,22 +86,21 @@ fn identities_are_strictly_sorted<'a>(
     true
 }
 
-fn missing_source_entry(identity: &TrackedStateDiffIdentity) -> LixError {
-    let row_pk = identity
-        .row_pk()
+fn missing_source_entry(identity: &crate::forktree::StateKey) -> LixError {
+    let entity_pk = identity
+        .entity_pk
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid row pk>".to_string());
+        .unwrap_or_else(|_| "<invalid entity pk>".to_string());
     LixError::new(
         "LIX_ERROR_UNKNOWN",
         format!(
-            "merge analysis could not find source diff entry for source schema '{}' row '{}'",
-            identity.schema_key(),
-            row_pk
+            "merge analysis could not find source diff entry for source schema '{}' entity '{}'",
+            identity.schema_key, entity_pk
         ),
     )
 }
 
-fn identity_cmp(left: &TrackedStateDiffIdentity, right: &TrackedStateDiffIdentity) -> Ordering {
+fn identity_cmp(left: &crate::forktree::StateKey, right: &crate::forktree::StateKey) -> Ordering {
     #[cfg(test)]
     STATS_IDENTITY_COMPARISONS.with(|comparisons| comparisons.set(comparisons.get() + 1));
     left.cmp(right)
@@ -144,83 +122,74 @@ fn identity_comparison_count() -> usize {
 }
 
 impl MergeStats {
-    fn add(&mut self, kind: TrackedStateDiffKind) {
+    fn add(&mut self, kind: MergeDiffKind) {
         self.total += 1;
         match kind {
-            TrackedStateDiffKind::Added => self.added += 1,
-            TrackedStateDiffKind::Modified => self.modified += 1,
-            TrackedStateDiffKind::Removed => self.removed += 1,
+            MergeDiffKind::Added => self.added += 1,
+            MergeDiffKind::Modified => self.modified += 1,
+            MergeDiffKind::Removed => self.removed += 1,
         }
     }
 }
 
-fn pick_identity(pick: &TrackedStateMergePick) -> &TrackedStateDiffIdentity {
-    &pick.identity
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::native::{MergeDiffEntry, MergeDiffKind, MergePick, MergePlan, MergeRow};
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk;
-    use crate::tracked_state::{
-        TrackedStateDiffEntry, TrackedStateDiffRow, TrackedStateKey, TrackedStateMergePick,
-    };
+    use crate::entity_pk::EntityPk;
 
     #[test]
     fn ten_thousand_sorted_merge_picks_have_linear_stats_scan() {
         const ROW_COUNT: usize = 10_000;
-        let identities = TrackedStateDiffIdentity::from_key_batch(
-            (0..ROW_COUNT)
-                .map(|index| TrackedStateKey {
-                    schema_key: "shared_schema".to_string(),
-                    file_id: Some("shared_file".to_string()),
-                    row_pk: RowPk::single(format!("row-{index:05}")),
-                })
-                .collect(),
-        )
-        .expect("identity batch should fit");
+        let identities = (0..ROW_COUNT)
+            .map(|index| crate::forktree::StateKey {
+                schema_key: "shared_schema".to_string(),
+                file_id: Some("shared_file".to_string()),
+                entity_pk: EntityPk::single(format!("entity-{index:05}")),
+            })
+            .collect::<Vec<_>>();
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
         let change_id = ChangeId::for_test_label("stats-change");
         let commit_id = CommitId::for_test_label("stats-commit");
-        let source_diff = TrackedStateDiff::from_entries(
+        let source_diff = MergeDiff::from_entries_with_payloads(
             identities
                 .iter()
                 .enumerate()
                 .map(|(index, identity)| {
-                    let row = TrackedStateDiffRow {
-                        identity: identity.clone(),
+                    let row = MergeRow {
                         deleted: false,
                         created_at: timestamp,
                         updated_at: timestamp,
                         change_id,
                         commit_id,
                     };
-                    TrackedStateDiffEntry {
+                    MergeDiffEntry {
                         identity: identity.clone(),
                         kind: match index % 3 {
-                            0 => TrackedStateDiffKind::Added,
-                            1 => TrackedStateDiffKind::Modified,
-                            _ => TrackedStateDiffKind::Removed,
+                            0 => MergeDiffKind::Added,
+                            1 => MergeDiffKind::Modified,
+                            _ => MergeDiffKind::Removed,
                         },
                         before: None,
                         after: Some(row),
                     }
                 })
                 .collect(),
+            super::super::native::MergePayloadBatch::default(),
         );
-        let plan = TrackedStateMergePlan {
+        let plan = MergePlan {
             picks: source_diff
                 .entries
                 .iter()
-                .map(|entry| TrackedStateMergePick {
-                    identity: entry.identity.clone(),
+                .enumerate()
+                .map(|(index, _entry)| MergePick {
                     change_id,
-                    selected_row: entry.after.clone().expect("source row"),
+                    source_index: index,
                 })
                 .collect(),
-            conflicts: Vec::new().into(),
+            conflicts: Vec::new(),
         };
 
         reset_identity_comparison_count();

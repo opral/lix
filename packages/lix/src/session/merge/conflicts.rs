@@ -1,9 +1,8 @@
 use crate::changelog::ChangeId;
-use crate::row_pk::RowPk;
-#[cfg(test)]
-use crate::tracked_state::TrackedStateDiffIdentity;
-use crate::tracked_state::{
-    TrackedStateDiffEntry, TrackedStateDiffKind, TrackedStateMergeConflict, TrackedStateMergePlan,
+use crate::entity_pk::EntityPk;
+
+use super::native::{
+    MergeConflict as NativeMergeConflict, MergeDiffEntry, MergeDiffKind, MergeKeyExt, MergePlan,
 };
 
 /// Borrowed, typed view over a merge plan's conflict column.
@@ -13,11 +12,11 @@ use crate::tracked_state::{
 /// and public preview all inspect the same identity and side records.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MergeConflictBatch<'a> {
-    rows: &'a [TrackedStateMergeConflict],
+    rows: &'a [NativeMergeConflict],
 }
 
 impl<'a> MergeConflictBatch<'a> {
-    pub(crate) fn from_plan(plan: &'a TrackedStateMergePlan) -> Self {
+    pub(crate) fn from_plan(plan: &'a MergePlan) -> Self {
         Self {
             rows: &plan.conflicts,
         }
@@ -33,24 +32,24 @@ impl<'a> MergeConflictBatch<'a> {
 /// One allocation-free row view in [`MergeConflictBatch`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MergeConflictRow<'a> {
-    tracked: &'a TrackedStateMergeConflict,
+    tracked: &'a NativeMergeConflict,
 }
 
 impl<'a> MergeConflictRow<'a> {
-    fn new(tracked: &'a TrackedStateMergeConflict) -> Self {
+    fn new(tracked: &'a NativeMergeConflict) -> Self {
         Self { tracked }
     }
 
-    pub(crate) fn tracked(self) -> &'a TrackedStateMergeConflict {
+    pub(crate) fn tracked(self) -> &'a NativeMergeConflict {
         self.tracked
     }
 
     pub(crate) fn kind(self) -> MergeConflictKind {
-        MergeConflictKind::SameRowChanged
+        MergeConflictKind::SameEntityChanged
     }
 
     #[cfg(test)]
-    pub(crate) fn identity(self) -> &'a TrackedStateDiffIdentity {
+    pub(crate) fn identity(self) -> &'a crate::forktree::StateKey {
         &self.tracked.identity
     }
 
@@ -58,8 +57,8 @@ impl<'a> MergeConflictRow<'a> {
         self.tracked.identity.schema_key()
     }
 
-    pub(crate) fn row_pk(self) -> &'a RowPk {
-        self.tracked.identity.row_pk()
+    pub(crate) fn entity_pk(self) -> &'a EntityPk {
+        self.tracked.identity.entity_pk()
     }
 
     pub(crate) fn file_id(self) -> Option<&'a str> {
@@ -81,21 +80,21 @@ impl<'a> MergeConflictRow<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeConflictKind {
-    SameRowChanged,
+    SameEntityChanged,
 }
 
 /// One side-column view in a conflict batch row.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MergeConflictSideRow<'a> {
-    entry: &'a TrackedStateDiffEntry,
+    entry: &'a MergeDiffEntry,
 }
 
 impl<'a> MergeConflictSideRow<'a> {
     pub(crate) fn kind(self) -> MergeConflictChangeKind {
         match self.entry.kind {
-            TrackedStateDiffKind::Added => MergeConflictChangeKind::Added,
-            TrackedStateDiffKind::Modified => MergeConflictChangeKind::Modified,
-            TrackedStateDiffKind::Removed => MergeConflictChangeKind::Removed,
+            MergeDiffKind::Added => MergeConflictChangeKind::Added,
+            MergeDiffKind::Modified => MergeConflictChangeKind::Modified,
+            MergeDiffKind::Removed => MergeConflictChangeKind::Removed,
         }
     }
 
@@ -117,14 +116,14 @@ pub(crate) enum MergeConflictChangeKind {
 
 #[cfg(test)]
 mod tests {
+    use super::super::native::{MergeDiffEntry, MergeDiffKind, MergeKeyExt, MergePlan, MergeRow};
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::tracked_state::{TrackedStateDiffRow, TrackedStateKey};
 
-    fn row(identity: TrackedStateDiffIdentity, label: &str) -> TrackedStateDiffRow {
-        TrackedStateDiffRow {
-            identity,
+    fn row(identity: crate::forktree::StateKey, label: &str) -> MergeRow {
+        let _ = identity;
+        MergeRow {
             deleted: false,
             created_at: LixTimestamp::expect_parse("created", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("updated", "2026-01-01T00:00:00Z"),
@@ -135,31 +134,31 @@ mod tests {
 
     #[test]
     fn conflict_batch_rows_borrow_the_plan_and_share_one_identity_owner() {
-        let identity = TrackedStateDiffIdentity::from_key(TrackedStateKey {
+        let identity = crate::forktree::StateKey {
             schema_key: "schema".to_owned(),
             file_id: Some("file".to_owned()),
-            row_pk: RowPk::single("row"),
-        });
+            entity_pk: EntityPk::single("entity"),
+        };
         let target_row = row(identity.clone(), "target");
         let source_row = row(identity.clone(), "source");
-        let conflict = TrackedStateMergeConflict {
+        let conflict = NativeMergeConflict {
             identity: identity.clone(),
-            target: TrackedStateDiffEntry {
+            target: MergeDiffEntry {
                 identity: identity.clone(),
-                kind: TrackedStateDiffKind::Modified,
+                kind: MergeDiffKind::Modified,
                 before: None,
                 after: Some(target_row),
             },
-            source: TrackedStateDiffEntry {
+            source: MergeDiffEntry {
                 identity: identity.clone(),
-                kind: TrackedStateDiffKind::Modified,
+                kind: MergeDiffKind::Modified,
                 before: None,
                 after: Some(source_row),
             },
         };
-        let plan = TrackedStateMergePlan {
-            picks: Vec::new().into(),
-            conflicts: vec![conflict].into(),
+        let plan = MergePlan {
+            picks: Vec::new(),
+            conflicts: vec![conflict],
         };
 
         let batch = MergeConflictBatch::from_plan(&plan);
@@ -168,16 +167,6 @@ mod tests {
         assert!(std::ptr::eq(view.tracked(), &plan.conflicts[0]));
         assert!(identity.shares_key_with(view.identity()));
         assert!(identity.shares_key_with(&view.tracked().target.identity));
-        assert!(
-            identity.shares_key_with(
-                &view
-                    .tracked()
-                    .source
-                    .after
-                    .as_ref()
-                    .expect("source row")
-                    .identity
-            )
-        );
+        assert!(identity.shares_key_with(&view.tracked().source.identity));
     }
 }

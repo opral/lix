@@ -1,4 +1,4 @@
-use lix::{LixError, Value};
+use lix::{CreateBranchOptions, LixError, MergeBranchOptions, MergeBranchPreviewOptions, Value};
 use serde_json::json;
 
 use super::select_rows;
@@ -8,7 +8,10 @@ simulation_test!(
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine.open_session().await.expect("session should open"),
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
             &engine,
         );
         let baseline = sim.initial_commit_id().to_string();
@@ -35,8 +38,8 @@ simulation_test!(
 
         let working = select_rows(
             &session,
-            "SELECT diff_id, row_pk, diff_type FROM lix_working_diff \
-         WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
+            "SELECT diff_id, entity_pk, diff_type FROM lix_working_diff \
+         WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
         )
         .await;
         assert_eq!(working.len(), 2);
@@ -57,7 +60,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_revert (diff_id) \
                  SELECT diff_id \
-                 FROM (VALUES ($1)) AS selected(diff_id) \
+                 FROM VALUES ($1) AS selected(diff_id) \
                  RETURNING commit_id",
                 &[selected_diff_id],
             )
@@ -78,7 +81,7 @@ simulation_test!(
             .await,
             vec![vec![
                 Value::Text("b".to_string()),
-                Value::Json(json!("two").into()),
+                Value::Json(json!("two")),
             ]]
         );
 
@@ -86,7 +89,7 @@ simulation_test!(
             "SELECT diff_id, before_change_id, after_change_id \
          FROM lix_diff('{baseline}', '{original_head}') \
          WHERE schema_key = 'lix_key_value' \
-           AND row_pk = CAST('[\"a\"]' AS JSONB)"
+           AND entity_pk = lix_json('[\"a\"]')"
         );
         let historical_rows = select_rows(&session, &historical_diff).await;
         assert_eq!(historical_rows.len(), 1);
@@ -98,7 +101,7 @@ simulation_test!(
                 "INSERT INTO lix_apply (diff_id) \
                  SELECT diff_id FROM lix_diff($1, $2) \
                  WHERE schema_key = 'lix_key_value' \
-                   AND row_pk = CAST('[\"a\"]' AS JSONB) \
+                   AND entity_pk = lix_json('[\"a\"]') \
                  RETURNING commit_id",
                 &[
                     Value::Text(baseline.clone()),
@@ -116,7 +119,7 @@ simulation_test!(
                 "INSERT INTO lix_apply (diff_id) \
                  SELECT diff_id FROM lix_diff($1, $2) \
                  WHERE schema_key = 'lix_key_value' \
-                   AND row_pk = CAST('[\"a\"]' AS JSONB)",
+                   AND entity_pk = lix_json('[\"a\"]')",
                 &[
                     Value::Text(baseline),
                     Value::Text(original_head.to_string()),
@@ -135,7 +138,7 @@ simulation_test!(
                 "INSERT INTO lix_create_checkpoint (diff_id) \
              SELECT diff_id FROM lix_working_diff \
              WHERE schema_key = $1 \
-               AND row_pk = CAST($2 AS JSONB) \
+               AND entity_pk = lix_json($2) \
              RETURNING commit_id",
                 &[
                     Value::Text("lix_key_value".to_string()),
@@ -151,21 +154,14 @@ simulation_test!(
             Some(Value::Text(commit_id)) => commit_id.clone(),
             value => panic!("checkpoint RETURNING should contain a commit ID, got {value:?}"),
         };
-        assert_eq!(
-            select_rows(
-                &session,
-                &format!(
-                    "SELECT commit_id, lixcol_global FROM lix_checkpoint \
-                     WHERE commit_id = '{checkpoint_commit_id}'"
-                ),
+        let checkpoint_row = session
+            .execute(
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1",
+                &[Value::Text(checkpoint_commit_id.clone())],
             )
-            .await,
-            vec![vec![
-                Value::Text(checkpoint_commit_id.clone()),
-                Value::Boolean(true),
-            ]],
-            "partial checkpoint publication must remain globally owned",
-        );
+            .await
+            .expect("returned checkpoint commit should be queryable");
+        assert_eq!(checkpoint_row.len(), 1);
         let child_head = engine
             .load_branch_head_commit_id(sim.main_branch_id())
             .await
@@ -176,11 +172,11 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT row_pk FROM lix_working_diff \
-             WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
+                "SELECT entity_pk FROM lix_working_diff \
+             WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
             )
             .await,
-            vec![vec![Value::Json(json!(["b"]).into())]]
+            vec![vec![Value::Json(json!(["b"]))]]
         );
         assert_eq!(
             select_rows(
@@ -189,15 +185,57 @@ simulation_test!(
             )
             .await,
             vec![
-                vec![
-                    Value::Text("a".to_string()),
-                    Value::Json(json!("one").into())
-                ],
-                vec![
-                    Value::Text("b".to_string()),
-                    Value::Json(json!("two").into())
-                ],
+                vec![Value::Text("a".to_string()), Value::Json(json!("one"))],
+                vec![Value::Text("b".to_string()), Value::Json(json!("two"))],
             ]
+        );
+
+        let second_checkpoint = session
+            .execute(
+                "INSERT INTO lix_create_checkpoint (diff_id) \
+                 SELECT diff_id FROM lix_working_diff \
+                 WHERE schema_key = $1 \
+                   AND entity_pk = lix_json($2) \
+                 RETURNING commit_id",
+                &[
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("[\"b\"]".to_string()),
+                ],
+            )
+            .await
+            .expect("second partial checkpoint should succeed");
+        assert_eq!(second_checkpoint.rows_affected(), 1);
+        let second_checkpoint_commit_id =
+            match second_checkpoint.get(&second_checkpoint.rows()[0], "commit_id") {
+                Some(Value::Text(commit_id)) => commit_id.clone(),
+                value => {
+                    panic!("second checkpoint RETURNING should contain a commit ID, got {value:?}")
+                }
+            };
+        assert_ne!(second_checkpoint_commit_id, checkpoint_commit_id);
+        assert!(
+            select_rows(
+                &session,
+                "SELECT diff_id FROM lix_working_diff WHERE schema_key = 'lix_key_value'",
+            )
+            .await
+            .is_empty(),
+            "two consecutive partial checkpoints must advance the working-diff baseline"
+        );
+        let checkpoint_history = select_rows(
+            &session,
+            "SELECT commit_id, lixcol_depth FROM lix_checkpoint ORDER BY lixcol_depth",
+        )
+        .await;
+        assert_eq!(
+            checkpoint_history.first().map(|row| &row[0]),
+            Some(&Value::Text(second_checkpoint_commit_id.clone())),
+            "the second partial checkpoint must be the branch-bound latest checkpoint"
+        );
+        assert!(
+            checkpoint_history
+                .iter()
+                .any(|row| { row.first() == Some(&Value::Text(checkpoint_commit_id.clone())) })
         );
 
         let head_before_empty = engine
@@ -226,136 +264,355 @@ simulation_test!(
     }
 );
 
-// A checkpointed delete is a *soft* delete: the checkpoint root keeps a
-// tombstone for the identity. Re-inserting that identity therefore produces an
-// `added` working-diff row whose before-image is `BeforePresent { deleted:
-// true }` rather than absent. `diff_id` must encode only the after side in that
-// case, exactly as it does for an identity that was never present — otherwise
-// physically compacting tombstones away would renumber the id.
 simulation_test!(
-    diff_id_ignores_a_checkpointed_delete_tombstone,
+    historical_diff_exposes_distinct_change_ids_for_modified_row,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine.open_session().await.expect("session should open"),
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
             &engine,
         );
 
-        // A `d1.` id carries a one-byte side mask plus one 16-byte UUID per
-        // present side, base64url-unpadded: 3 + 23 = 26 chars for one side,
-        // 3 + 44 = 47 for two. Length is the only way to observe the encoded
-        // side count from SQL, since clients must not decode a diff_id.
-        const AFTER_ONLY_LEN: usize = 26;
-
-        // Control: an identity that was never present before the checkpoint.
         session
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('fresh', 'one')",
+                r#"INSERT INTO lix_registered_schema (value, lixcol_global)
+                   VALUES (
+                     lix_json('{"x-lix-key":"change_id_regression","x-lix-primary-key":["/id"],"type":"object","required":["id","value"],"properties":{"id":{"type":"string"},"value":{"type":"string"}},"additionalProperties":false}'),
+                     false
+                   )"#,
                 &[],
             )
             .await
-            .expect("fresh insert should succeed");
-        let fresh = select_rows(
+            .expect("regression schema should register");
+
+        session
+            .execute(
+                "INSERT INTO change_id_regression (id, value) VALUES \
+                 ('change-id-regression', 'before'), \
+                 ('second-row', 'before'), \
+                 ('stable-row', 'stable')",
+                &[],
+            )
+            .await
+            .expect("initial row should commit");
+        let before = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("pre-update head should load")
+            .expect("pre-update head should exist");
+        session
+            .create_branch(CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-000000000099".to_string()),
+                name: "ChangeId regression branch".to_string(),
+                from_commit_id: Some(before.to_string()),
+            })
+            .await
+            .expect("branch snapshot should succeed");
+
+        let mut update_transaction = session
+            .begin_transaction()
+            .await
+            .expect("update transaction should begin");
+        update_transaction
+            .execute(
+                "INSERT INTO change_id_regression (id, value) VALUES \
+                 ('change-id-regression', 'after'), \
+                 ('second-row', 'after') \
+                 ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("updated rows should stage");
+        update_transaction
+            .commit()
+            .await
+            .expect("updated rows should commit");
+        let after = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("post-update head should load")
+            .expect("post-update head should exist");
+
+        let rows = select_rows(
             &session,
-            "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff \
-             WHERE schema_key = 'lix_key_value' AND row_pk = CAST('[\"fresh\"]' AS JSONB)",
+            &format!(
+                "SELECT diff_type, before_change_id, after_change_id \
+                 FROM lix_diff('{before}', '{after}') \
+                 WHERE schema_key = 'change_id_regression' \
+                   AND entity_pk = lix_json('[\"change-id-regression\"]')"
+            ),
         )
         .await;
-        assert_eq!(fresh.len(), 1);
-        assert_eq!(fresh[0][1], Value::Text("added".to_string()));
-        assert_eq!(
-            fresh[0][2],
-            Value::Null,
-            "an identity that never existed has no before row"
-        );
-        let Value::Text(fresh_diff_id) = &fresh[0][0] else {
-            panic!("diff_id should be text, got {:?}", fresh[0][0]);
+        assert_eq!(rows.len(), 1, "one modified row should be visible");
+        assert_eq!(rows[0][0], Value::Text("modified".to_string()));
+        let (before_change_id, after_change_id) = match (&rows[0][1], &rows[0][2]) {
+            (Value::Text(before), Value::Text(after)) => (before, after),
+            values => panic!("modified diff must expose two change IDs, got {values:?}"),
         };
-        assert_eq!(fresh_diff_id.len(), AFTER_ONLY_LEN);
+        assert!(!before_change_id.is_empty());
+        assert!(!after_change_id.is_empty());
+        assert_ne!(
+            before_change_id, after_change_id,
+            "an update must publish a new authenticated ChangeId"
+        );
+    }
+);
 
-        // Now build the tombstone history: insert, checkpoint, delete,
-        // checkpoint (which retains the tombstone), then re-insert.
-        session
+simulation_test!(
+    historical_diff_ignores_page_provenance_when_change_identity_is_unchanged,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), false)",
+            &[Value::Text(
+                json!({
+                    "x-lix-key": "change_id_branch_regression",
+                    "x-lix-primary-key": ["/id"],
+                    "type": "object",
+                    "required": ["id", "value"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "value": {"type": "string"}
+                    },
+                    "additionalProperties": false
+                })
+                .to_string(),
+            )],
+        )
+        .await
+        .expect("register regression schema");
+        main.execute(
+            "INSERT INTO change_id_branch_regression (id, value) VALUES \
+             ('row-0', 'base-0'), ('row-1', 'base-1'), ('row-2', 'base-2')",
+            &[],
+        )
+        .await
+        .expect("seed branch regression rows");
+        let base = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("base head should load")
+            .expect("base head should exist")
+            .to_string();
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-000000000199".to_owned()),
+                name: "ChangeId branch regression".to_owned(),
+                from_commit_id: Some(base.clone()),
+            })
+            .await
+            .expect("create source branch");
+        let source = sim.wrap_session(
+            engine
+                .open_session(branch.id.clone())
+                .await
+                .expect("source session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO change_id_branch_regression (id, value) VALUES \
+             ('row-0', 'target-0'), ('row-1', 'target-1') \
+             ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+            &[],
+        )
+        .await
+        .expect("target update should commit");
+        source
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('recycled', 'one')",
+                "INSERT INTO change_id_branch_regression (id, value) VALUES ('row-2', 'source-2') \
+                 ON CONFLICT (id) DO UPDATE SET value = excluded.value",
                 &[],
             )
             .await
-            .expect("first insert should succeed");
-        session
-            .execute(
-                "INSERT INTO lix_create_checkpoint (diff_id) \
-                 SELECT diff_id FROM lix_working_diff",
-                &[],
-            )
-            .await
-            .expect("checkpoint of the insert should succeed");
-        session
-            .execute("DELETE FROM lix_key_value WHERE key = 'recycled'", &[])
-            .await
-            .expect("delete should succeed");
-        session
-            .execute(
-                "INSERT INTO lix_create_checkpoint (diff_id) \
-                 SELECT diff_id FROM lix_working_diff",
-                &[],
-            )
-            .await
-            .expect("checkpoint of the delete should succeed");
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('recycled', 'two')",
-                &[],
-            )
-            .await
-            .expect("re-insert should succeed");
+            .expect("source update should commit");
 
-        let recycled = select_rows(
-            &session,
-            "SELECT diff_id, diff_type, before_change_id FROM lix_working_diff \
-             WHERE schema_key = 'lix_key_value' AND row_pk = CAST('[\"recycled\"]' AS JSONB)",
+        let preview = main
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: branch.id.clone(),
+            })
+            .await
+            .expect("merge preview should succeed");
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: branch.id,
+        })
+        .await
+        .expect("merge should succeed");
+        let merged_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("post-merge head should load")
+            .expect("post-merge head should exist")
+            .to_string();
+
+        let rows = select_rows(
+            &main,
+            &format!(
+                "SELECT entity_pk, diff_type, before_change_id, after_change_id \
+                 FROM lix_diff('{}', '{merged_head}') \
+                 WHERE schema_key = 'change_id_branch_regression' ORDER BY entity_pk",
+                preview.target_head_commit_id
+            ),
         )
         .await;
-        assert_eq!(recycled.len(), 1);
-        assert_eq!(recycled[0][1], Value::Text("added".to_string()));
-
-        // Non-vacuity: this scenario only tests anything if the checkpointed
-        // delete really did leave a tombstone that reaches the diff surface.
-        // `before_change_id` reports the raw before row, so it stays populated.
-        assert!(
-            matches!(&recycled[0][2], Value::Text(id) if !id.is_empty()),
-            "fixture must retain a tombstoned before row, got {:?}",
-            recycled[0][2]
-        );
-
-        let Value::Text(recycled_diff_id) = &recycled[0][0] else {
-            panic!("diff_id should be text, got {:?}", recycled[0][0]);
-        };
         assert_eq!(
-            recycled_diff_id.len(),
-            AFTER_ONLY_LEN,
-            "a tombstoned before row must not add a side to the diff_id"
+            rows.len(),
+            1,
+            "only the source-edited row belongs to the post-merge target diff"
         );
+        assert_eq!(rows[0][0], Value::Json(json!(["row-2"])));
+        assert_eq!(rows[0][1], Value::Text("modified".to_owned()));
+        let (Value::Text(before), Value::Text(after)) = (&rows[0][2], &rows[0][3]) else {
+            panic!("modified rows must expose two ChangeIds: {:?}", rows[0]);
+        };
+        assert_ne!(before, after, "modified rows must have distinct ChangeIds");
+    }
+);
 
-        // The normalized id must still drive a command end to end.
-        let reverted = session
+simulation_test!(
+    diff_commands_reject_staged_state_that_moved_the_selected_identity,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        let initial_head = sim.initial_commit_id().to_string();
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('apply-guard', 'published')",
+                &[],
+            )
+            .await
+            .expect("apply source should publish");
+        let apply_source_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("apply source head should load")
+            .expect("apply source head should exist")
+            .to_string();
+        session
+            .execute("DELETE FROM lix_key_value WHERE key = 'apply-guard'", &[])
+            .await
+            .expect("apply target should return to absence");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('revert-guard', 'before')",
+                &[],
+            )
+            .await
+            .expect("revert predecessor should publish");
+        let revert_before_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("revert predecessor head should load")
+            .expect("revert predecessor head should exist")
+            .to_string();
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'revert-guard'",
+                &[],
+            )
+            .await
+            .expect("revert endpoint should publish");
+        let revert_after_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("revert endpoint head should load")
+            .expect("revert endpoint head should exist")
+            .to_string();
+
+        let mut apply_transaction = session
+            .begin_transaction()
+            .await
+            .expect("apply transaction should begin");
+        apply_transaction
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('apply-guard', 'staged')",
+                &[],
+            )
+            .await
+            .expect("apply transaction should stage its current value");
+        let apply_error = apply_transaction
+            .execute(
+                "INSERT INTO lix_apply (diff_id) \
+                 SELECT diff_id FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"apply-guard\"]')",
+                &[Value::Text(initial_head), Value::Text(apply_source_head)],
+            )
+            .await
+            .expect_err("apply must validate against the staged current value");
+        assert_eq!(apply_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        let apply_visible = apply_transaction
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'apply-guard'",
+                &[],
+            )
+            .await
+            .expect("failed apply must retain the staged value");
+        assert_eq!(
+            apply_visible.rows()[0].get::<Value>("value").unwrap(),
+            Value::Json(json!("staged"))
+        );
+        apply_transaction
+            .rollback()
+            .await
+            .expect("apply transaction should roll back");
+
+        let mut revert_transaction = session
+            .begin_transaction()
+            .await
+            .expect("revert transaction should begin");
+        revert_transaction
+            .execute(
+                "UPDATE lix_key_value SET value = 'staged' WHERE key = 'revert-guard'",
+                &[],
+            )
+            .await
+            .expect("revert transaction should stage its current value");
+        let revert_error = revert_transaction
             .execute(
                 "INSERT INTO lix_revert (diff_id) \
-                 SELECT diff_id FROM (VALUES ($1)) AS selected(diff_id) \
-                 RETURNING commit_id",
-                &[recycled[0][0].clone()],
+                 SELECT diff_id FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"revert-guard\"]')",
+                &[
+                    Value::Text(revert_before_head),
+                    Value::Text(revert_after_head),
+                ],
             )
             .await
-            .expect("revert of a tombstone-backed add should succeed");
-        assert_eq!(reverted.rows_affected(), 1);
-        assert_eq!(
-            select_rows(
-                &session,
-                "SELECT key FROM lix_key_value WHERE key = 'recycled'",
+            .expect_err("revert must validate against the staged current value");
+        assert_eq!(revert_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        let revert_visible = revert_transaction
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'revert-guard'",
+                &[],
             )
-            .await,
-            Vec::<Vec<Value>>::new(),
-            "reverting the re-insert must return the identity to absent"
+            .await
+            .expect("failed revert must retain the staged value");
+        assert_eq!(
+            revert_visible.rows()[0].get::<Value>("value").unwrap(),
+            Value::Json(json!("staged"))
         );
+        revert_transaction
+            .rollback()
+            .await
+            .expect("revert transaction should roll back");
     }
 );

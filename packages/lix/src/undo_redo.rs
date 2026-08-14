@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::changelog::CommitId;
-use crate::transaction_types::{TransactionJson, TransactionWriteRow};
+use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 
 pub(crate) const UNDO_REDO_MARKER_SCHEMA_KEY: &str = "lix_undo_redo_marker";
 

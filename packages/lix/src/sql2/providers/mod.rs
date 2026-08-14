@@ -7,20 +7,26 @@ use datafusion::prelude::SessionContext;
 
 use crate::LixError;
 use crate::branch::BranchRefReader;
+use crate::commit_graph::CommitGraphReader;
+use crate::storage_adapter::StorageAdapterRead;
 
 mod branch;
-mod branch_selection;
 mod change;
+mod checkpoint;
 mod columns;
 mod diff;
 mod directory;
 mod directory_history;
 pub(crate) use diff::register_diff_function;
 mod diff_command;
-mod schema;
-mod schema_history;
+mod entity;
+mod entity_history;
 mod file;
 mod file_history;
+
+#[cfg(test)]
+pub(crate) use file::FileExactBatchPlan;
+
 mod filesystem_history_path;
 mod filesystem_working_diff;
 mod history_table_function;
@@ -33,11 +39,13 @@ mod working_diff;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
-use crate::sql2::{SqlExecutionContext, SqlWriteContext};
+use crate::sql2::{SqlChangelogQuerySource, SqlExecutionContext, SqlWriteContext};
 
-use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::TableSource;
 
+pub(crate) type SharedCommitGraph = Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>;
+
+pub(crate) use branch::execute_exact_branch_delete;
 pub(crate) use directory::execute_exact_lix_directory_root_listing;
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
@@ -53,12 +61,15 @@ pub(crate) use spec::{DmlReturning, SpecWriteTarget, WriteTargetRegistry};
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
 
 pub(crate) fn history_anchor_column(source: &dyn TableSource) -> Option<&'static str> {
-    let source = source.as_any().downcast_ref::<DefaultTableSource>()?;
-    let provider = source
-        .table_provider
-        .as_any()
-        .downcast_ref::<spec::SpecTableProvider>()?;
-    provider.history_anchor_column()
+    match source
+        .schema()
+        .metadata()
+        .get("lix.history_anchor_column")
+        .map(String::as_str)
+    {
+        Some("lixcol_as_of_commit_id") => Some("lixcol_as_of_commit_id"),
+        _ => None,
+    }
 }
 
 pub(crate) async fn register_read<C>(
@@ -66,6 +77,8 @@ pub(crate) async fn register_read<C>(
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
     active_branch_commit_id: Option<String>,
+    commit_graph: SharedCommitGraph,
+    changelog_query_source: SqlChangelogQuerySource<C::ReadStore>,
     selection: &ProviderSelection,
 ) -> Result<(), LixError>
 where
@@ -84,30 +97,13 @@ where
         ctx,
         branch_ref,
         active_branch_commit_id,
+        commit_graph,
+        changelog_query_source,
         catalog.as_ref(),
         ReadProviderScope::All,
         selection,
     )
     .await?;
-    register_information_schema(session, selection, catalog)
-}
-
-/// Installs the `information_schema` views only for statements that can reach
-/// them.
-///
-/// `read_provider_selection` widens to [`ProviderSelection::All`] for every
-/// `information_schema`-qualified reference and every `SHOW` form, so a narrowed
-/// selection provably never resolves an information-schema table. Registering
-/// the schema anyway cost one catalog write lock and one `SchemaProvider`
-/// allocation on every ordinary statement.
-fn register_information_schema(
-    session: &SessionContext,
-    selection: &ProviderSelection,
-    catalog: Arc<PublicCatalog>,
-) -> Result<(), LixError> {
-    if !matches!(selection, ProviderSelection::All) {
-        return Ok(());
-    }
     crate::sql2::information_schema::register(session, catalog)
 }
 
@@ -148,7 +144,7 @@ impl ProviderSelection {
     /// Runtime registration rejects schema keys whose generated table names
     /// would shadow these fixed providers.
     /// `All` and every unknown name remain conservative: they load the full
-    /// visible catalog so information-schema, custom rows, and normal
+    /// visible catalog so information-schema, custom entities, and normal
     /// unknown-table errors keep their current semantics.
     fn requires_visible_schemas(&self) -> bool {
         match self {
@@ -161,13 +157,11 @@ impl ProviderSelection {
 }
 
 pub(crate) fn read_provider_selection(
-    state: &datafusion::execution::session_state::SessionState,
+    session: &SessionContext,
     statements: &[datafusion::sql::parser::Statement],
 ) -> ProviderSelection {
     let mut names = BTreeSet::new();
-    // Resolving references only reads the SQL parser configuration, so the
-    // statement's pooled session state is used directly instead of cloning the
-    // live one.
+    let state = session.state();
     for statement in statements {
         if statement_requires_all_providers(statement) {
             return ProviderSelection::All;
@@ -238,6 +232,8 @@ async fn register_read_from_catalog<C>(
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
     active_branch_commit_id: Option<String>,
+    commit_graph: SharedCommitGraph,
+    query_source: SqlChangelogQuerySource<C::ReadStore>,
     catalog: &PublicCatalog,
     scope: ReadProviderScope,
     selection: &ProviderSelection,
@@ -248,15 +244,21 @@ where
     let needs_history_query_source = catalog.surfaces().any(|surface| {
         scope.includes(surface)
             && selection.includes(surface)
-            && match &surface.kind {
-                PublicSurfaceKind::FileHistory | PublicSurfaceKind::DirectoryHistory => true,
-                PublicSurfaceKind::SchemaHistory { schema_key } => {
-                    schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
-                }
-                _ => false,
-            }
+            && matches!(
+                &surface.kind,
+                PublicSurfaceKind::FileHistory
+                    | PublicSurfaceKind::DirectoryHistory
+                    | PublicSurfaceKind::EntityHistory { .. }
+                    | PublicSurfaceKind::WorkingDiff
+                    | PublicSurfaceKind::WorkingDiffByBranch
+                    | PublicSurfaceKind::FileWorkingDiff
+                    | PublicSurfaceKind::FileWorkingDiffByBranch
+                    | PublicSurfaceKind::DirectoryWorkingDiff
+                    | PublicSurfaceKind::DirectoryWorkingDiffByBranch
+            )
     });
-    let history_query_source = if needs_history_query_source {
+    let changelog_query_source = query_source;
+    let history_default_as_of_commit_id = if needs_history_query_source {
         let active_branch_commit_id = active_branch_commit_id.ok_or_else(|| {
             LixError::branch_not_found(
                 ctx.active_branch_id(),
@@ -264,41 +266,26 @@ where
                 "active branch",
             )
         })?;
-        Some(ctx.history_query_source(active_branch_commit_id))
+        Some(active_branch_commit_id)
     } else {
         None
     };
-    let history_query_source_for_provider = || {
-        history_query_source.clone().ok_or_else(|| {
-            LixError::new(
+    let query_source_for_provider = || {
+        if history_default_as_of_commit_id.is_none() {
+            return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "selected history provider is missing its query source",
+            ));
+        }
+        Ok(changelog_query_source.clone())
+    };
+    let history_anchor_for_provider = || {
+        history_default_as_of_commit_id.clone().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "selected history provider is missing its pinned commit anchor",
             )
         })
-    };
-    let needs_checkpoint_history = catalog.surfaces().any(|surface| {
-        scope.includes(surface)
-            && selection.includes(surface)
-            && matches!(
-                &surface.kind,
-                PublicSurfaceKind::SchemaHistory { schema_key }
-                    if schema_key == crate::checkpoint::CHECKPOINT_SCHEMA_KEY
-            )
-    });
-    let checkpoint_history_query_source = if needs_checkpoint_history {
-        let global_head = branch_ref
-            .load_head_commit_id(crate::GLOBAL_BRANCH_ID)
-            .await?
-            .ok_or_else(|| {
-                LixError::branch_not_found(
-                    crate::GLOBAL_BRANCH_ID,
-                    "register checkpoint history provider",
-                    "global branch",
-                )
-            })?;
-        Some(ctx.history_query_source(global_head.to_string()))
-    } else {
-        None
     };
     for surface in catalog.surfaces() {
         if !scope.includes(surface) || !selection.includes(surface) {
@@ -309,7 +296,7 @@ where
                 branch::register_lix_branch_read_provider(
                     session,
                     &surface.name,
-                    ctx.hot_state(),
+                    ctx.state_view(),
                     Arc::clone(&branch_ref),
                 )
                 .await?;
@@ -320,8 +307,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
+                    query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -331,8 +317,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
+                    query_source_for_provider()?,
                 )
                 .await?;
             }
@@ -342,8 +327,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
+                    query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
                 .await?;
@@ -354,8 +338,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
+                    query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::File,
                 )
                 .await?;
@@ -366,8 +349,7 @@ where
                     &surface.name,
                     Some(ctx.active_branch_id().to_string()),
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
+                    query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
                 .await?;
@@ -378,8 +360,7 @@ where
                     &surface.name,
                     None,
                     Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
+                    query_source_for_provider()?,
                     filesystem_working_diff::FilesystemWorkingDiffKind::Directory,
                 )
                 .await?;
@@ -388,7 +369,7 @@ where
                 change::register_lix_change_read_provider(
                     session,
                     &surface.name,
-                    ctx.changelog_query_source(),
+                    changelog_query_source.clone(),
                 )
                 .await?;
             }
@@ -397,10 +378,10 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.hot_state(),
+                    ctx.state_view(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
-                    ctx.blob_reader(),
+                    ctx.authenticated_blob_reader()?,
                     ctx.plugin_host(),
                     ctx.functions(),
                     ctx.session_file_views(),
@@ -411,10 +392,10 @@ where
                 file::register_lix_file_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.hot_state(),
+                    ctx.state_view(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
-                    ctx.blob_reader(),
+                    ctx.authenticated_blob_reader()?,
                     ctx.plugin_host(),
                     ctx.functions(),
                     ctx.session_file_views(),
@@ -425,9 +406,9 @@ where
                 file_history::register_lix_file_history_surface(
                     session,
                     &surface.name,
-                    ctx.commit_graph(),
-                    history_query_source_for_provider()?,
-                    ctx.blob_reader(),
+                    Arc::clone(&commit_graph),
+                    query_source_for_provider()?,
+                    history_anchor_for_provider()?,
                     ctx.plugin_host(),
                 )
                 .await?;
@@ -437,7 +418,7 @@ where
                     session,
                     &surface.name,
                     ctx.active_branch_id(),
-                    ctx.hot_state(),
+                    ctx.state_view(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -448,7 +429,7 @@ where
                 directory::register_lix_directory_by_branch_provider(
                     session,
                     &surface.name,
-                    ctx.hot_state(),
+                    ctx.state_view(),
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
@@ -459,33 +440,57 @@ where
                 directory_history::register_lix_directory_history_surface(
                     session,
                     &surface.name,
-                    ctx.commit_graph(),
-                    history_query_source_for_provider()?,
+                    Arc::clone(&commit_graph),
+                    query_source_for_provider()?,
+                    history_anchor_for_provider()?,
                 )
                 .await?;
             }
-            PublicSurfaceKind::SchemaBase { .. }
-            | PublicSurfaceKind::SchemaByBranch { .. }
-            | PublicSurfaceKind::SchemaHistory { .. }
+            PublicSurfaceKind::EntityBase { .. }
+            | PublicSurfaceKind::EntityByBranch { .. }
+            | PublicSurfaceKind::EntityHistory { .. }
             | PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => {}
         }
     }
-    let needs_row_history = catalog.surfaces().any(|surface| {
+    let needs_entity_history = catalog.surfaces().any(|surface| {
         scope.includes(surface)
             && selection.includes(surface)
-            && matches!(&surface.kind, PublicSurfaceKind::SchemaHistory { .. })
+            && matches!(&surface.kind, PublicSurfaceKind::EntityHistory { .. })
     });
-    schema::register_row_providers(
+    entity::register_entity_providers(
         session,
         ctx.active_branch_id(),
-        ctx.hot_state(),
-        ctx.row_snapshot_reader(),
+        ctx.state_view().clone(),
         Arc::clone(&branch_ref),
-        needs_row_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
-        history_query_source,
-        checkpoint_history_query_source,
+        (needs_entity_history
+            || catalog.surfaces().any(|surface| {
+                scope.includes(surface)
+                    && selection.includes(surface)
+                    && matches!(
+                        &surface.kind,
+                        PublicSurfaceKind::EntityBase { schema_key }
+                            | PublicSurfaceKind::EntityByBranch { schema_key }
+                                if matches!(
+                                    schema_key.as_str(),
+                                    "lix_commit"
+                                        | "lix_commit_edge"
+                                        | crate::branch::BRANCH_REF_SCHEMA_KEY
+                                )
+                    )
+            }))
+        .then(|| Arc::clone(&commit_graph)),
+        if needs_entity_history {
+            Some(query_source_for_provider()?)
+        } else {
+            None
+        },
+        if needs_entity_history {
+            Some(history_anchor_for_provider()?)
+        } else {
+            None
+        },
         catalog,
         scope == ReadProviderScope::All,
         selection,
@@ -495,31 +500,37 @@ where
     Ok(())
 }
 
-pub(crate) async fn register_write(
+pub(crate) async fn register_write<R>(
     session: &SessionContext,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
     selection: &ProviderSelection,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     let catalog = write_ctx.public_catalog()?;
     register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection)
         .await?;
-    register_information_schema(session, selection, catalog)
+    crate::sql2::information_schema::register(session, Arc::clone(&catalog))
 }
 
-pub(crate) async fn register_transaction<C>(
+pub(crate) async fn register_transaction<C, R>(
     session: &SessionContext,
     read_ctx: &C,
     read_branch_ref: Arc<dyn BranchRefReader>,
     active_branch_commit_id: Option<String>,
-    write_ctx: SqlWriteContext,
+    commit_graph: SharedCommitGraph,
+    query_source: SqlChangelogQuerySource<C::ReadStore>,
+    write_ctx: SqlWriteContext<R>,
     write_branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
     selection: &ProviderSelection,
 ) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     // Both capabilities project the same transaction-scoped schema snapshot.
     // Reuse that immutable metadata, then install read-only providers from the
@@ -530,6 +541,8 @@ where
         read_ctx,
         read_branch_ref,
         active_branch_commit_id,
+        commit_graph,
+        query_source,
         &catalog,
         ReadProviderScope::ReadOnly,
         selection,
@@ -544,17 +557,20 @@ where
         selection,
     )
     .await?;
-    register_information_schema(session, selection, catalog)
+    crate::sql2::information_schema::register(session, Arc::clone(&catalog))
 }
 
-async fn register_write_from_catalog(
+async fn register_write_from_catalog<R>(
     session: &SessionContext,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
     catalog: &PublicCatalog,
     selection: &ProviderSelection,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     for surface in catalog.surfaces() {
         if !selection.includes(surface) {
             continue;
@@ -643,12 +659,12 @@ async fn register_write_from_catalog(
             | PublicSurfaceKind::DirectoryWorkingDiffByBranch
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
-            PublicSurfaceKind::SchemaBase { .. }
-            | PublicSurfaceKind::SchemaByBranch { .. }
-            | PublicSurfaceKind::SchemaHistory { .. } => {}
+            PublicSurfaceKind::EntityBase { .. }
+            | PublicSurfaceKind::EntityByBranch { .. }
+            | PublicSurfaceKind::EntityHistory { .. } => {}
         }
     }
-    schema::register_row_write_providers(session, write_ctx, branch_ref, catalog, selection)
+    entity::register_entity_write_providers(session, write_ctx, branch_ref, catalog, selection)
         .await?;
     Ok(())
 }
@@ -656,35 +672,18 @@ async fn register_write_from_catalog(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::Arc;
 
-    use async_trait::async_trait;
     use serde_json::json;
 
     use datafusion::arrow::datatypes::{DataType, SchemaRef};
     use datafusion::prelude::SessionContext;
 
-    use crate::LixError;
-    use crate::branch::{BranchHead, BranchRefReader};
-    use crate::changelog::CommitId;
-    use crate::commit_graph::{
-        CommitGraphChangeHistoryRequest, CommitGraphNode, CommitGraphReader,
-        ReachableCommitGraphNode,
-    };
-    use crate::hot_state::{HotStateReader, HotStateScanRequest};
-    use crate::json_store::JsonStoreContext;
-    use crate::sql2::HistoryQuerySource;
-    use crate::sql2::catalog::{
-        PublicCatalog, PublicSurfaceKind, derive_schema_surface_spec_from_schema,
-    };
-    use crate::storage_adapter::{
-        Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
-    };
+    use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 
     use super::{
-        ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, file,
-        file_history, filesystem_working_diff, is_write_surface, read_provider_selection, schema,
-        working_diff,
+        ProviderSelection, ReadProviderScope, branch, change, checkpoint, directory,
+        directory_history, file, file_history, filesystem_working_diff, is_write_surface,
+        read_provider_selection, working_diff,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -692,7 +691,7 @@ mod tests {
             .iter()
             .map(|sql| crate::sql2::parse_statement(sql).expect("SQL should parse"))
             .collect::<Vec<_>>();
-        read_provider_selection(&SessionContext::new().state(), &statements)
+        read_provider_selection(&SessionContext::new(), &statements)
     }
 
     fn selected_names(names: &[&str]) -> ProviderSelection {
@@ -708,11 +707,11 @@ mod tests {
              SELECT left_side.id \
              FROM shadowed AS left_side \
              JOIN (\
-                 SELECT row_pk FROM lix_change \
+                 SELECT entity_pk FROM lix_change \
                  UNION ALL \
-                 SELECT row_pk FROM lix_change\
+                 SELECT entity_pk FROM lix_change\
              ) AS right_side \
-               ON left_side.id = right_side.row_pk \
+               ON left_side.id = right_side.entity_pk \
              JOIN public.\"lix_directory\" AS directory_a ON true \
              JOIN public.\"lix_directory\" AS directory_b ON true"]);
 
@@ -755,7 +754,7 @@ mod tests {
     #[test]
     fn referenced_provider_selection_registers_none_for_table_free_queries() {
         assert_eq!(
-            selection_for_sql(&["SELECT 1, uuidv7()"]),
+            selection_for_sql(&["SELECT 1, lix_uuid_v7()"]),
             ProviderSelection::Only(BTreeSet::new())
         );
     }
@@ -780,9 +779,9 @@ mod tests {
             !selection_for_sql(&["SELECT * FROM lix_key_value JOIN lix_file ON false"])
                 .requires_visible_schemas()
         );
-        assert!(selection_for_sql(&["SELECT * FROM custom_row"]).requires_visible_schemas());
+        assert!(selection_for_sql(&["SELECT * FROM custom_entity"]).requires_visible_schemas());
         assert!(
-            selection_for_sql(&["SELECT * FROM lix_key_value JOIN custom_row ON false",])
+            selection_for_sql(&["SELECT * FROM lix_key_value JOIN custom_entity ON false",])
                 .requires_visible_schemas()
         );
         assert!(
@@ -816,12 +815,10 @@ mod tests {
     #[test]
     fn transaction_registration_partitions_provider_construction_once() {
         let schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "phase8_row",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "phase8_entity",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } }
         });
         let catalog = PublicCatalog::from_visible_schemas(&[schema]).expect("catalog should build");
 
@@ -844,6 +841,8 @@ mod tests {
             read_only,
             vec![
                 "lix_change",
+                "lix_checkpoint",
+                "lix_checkpoint_by_branch",
                 "lix_directory_history",
                 "lix_directory_working_diff",
                 "lix_directory_working_diff_by_branch",
@@ -852,7 +851,7 @@ mod tests {
                 "lix_file_working_diff_by_branch",
                 "lix_working_diff",
                 "lix_working_diff_by_branch",
-                "phase8_row_history",
+                "phase8_entity_history",
             ]
         );
         assert_eq!(
@@ -866,15 +865,15 @@ mod tests {
                 "lix_file",
                 "lix_file_by_branch",
                 "lix_revert",
-                "phase8_row",
-                "phase8_row_by_branch",
+                "phase8_entity",
+                "phase8_entity_by_branch",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 30, "previous construction count");
+        assert_eq!(all_read + writable.len(), 32, "previous construction count");
         assert_eq!(
             read_only.len() + writable.len(),
-            20,
+            22,
             "new construction count"
         );
     }
@@ -953,6 +952,16 @@ mod tests {
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
+            "lix_checkpoint",
+            checkpoint::checkpoint_schema(false),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
+            "lix_checkpoint_by_branch",
+            checkpoint::checkpoint_schema(true),
+        );
+        assert_surface_schema_matches_provider_schema(
+            &catalog,
             "lix_working_diff",
             working_diff::working_diff_schema(false),
         );
@@ -993,79 +1002,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn provider_row_schemas_match_catalog_contract_order() {
-        let schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "phase8_row",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "count", "type": "int8", "nullable": true },
-                { "name": "body", "type": "jsonb", "nullable": true },
-            ],
-            "primary_key": ["id"],
-        });
-        let catalog =
-            PublicCatalog::from_visible_schemas(&[schema.clone()]).expect("catalog should build");
-        let _spec = derive_schema_surface_spec_from_schema(&schema).expect("schema should derive");
-        let session = SessionContext::new();
-        schema::register_row_providers(
-            &session,
-            "01920000-0000-7000-8000-0000000000a1",
-            Arc::new(EmptyHotStateReader),
-            None,
-            Arc::new(EmptyBranchRefReader),
-            Some(Arc::new(tokio::sync::Mutex::new(Box::new(
-                EmptyCommitGraphReader,
-            )))),
-            Some(empty_history_query_source().await),
-            None,
-            &catalog,
-            true,
-            &ProviderSelection::All,
-        )
-        .await
-        .expect("row providers should register");
-
-        assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_row").await;
-        assert_registered_table_schema_matches_catalog(
-            &session,
-            &catalog,
-            "phase8_row_by_branch",
-        )
-        .await;
-        assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_row_history")
-            .await;
-    }
-
-    async fn assert_registered_table_schema_matches_catalog(
-        session: &SessionContext,
-        catalog: &PublicCatalog,
-        surface_name: &str,
-    ) {
-        let surface = catalog
-            .surface(surface_name)
-            .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
-        let provider = if matches!(
-            surface.kind,
-            PublicSurfaceKind::SchemaHistory { .. }
-                | PublicSurfaceKind::FileHistory
-                | PublicSurfaceKind::DirectoryHistory
-        ) {
-            session
-                .table_function(surface_name)
-                .unwrap_or_else(|error| panic!("{surface_name} function should load: {error}"))
-                .create_table_provider(&[])
-                .unwrap_or_else(|error| panic!("{surface_name} function should bind: {error}"))
-        } else {
-            session
-                .table_provider(surface_name)
-                .await
-                .unwrap_or_else(|error| panic!("{surface_name} provider should load: {error}"))
-        };
-        assert_surface_schema_matches_provider_schema(catalog, surface_name, provider.schema());
-    }
-
     fn assert_surface_schema_matches_provider_schema(
         catalog: &PublicCatalog,
         surface_name: &str,
@@ -1076,7 +1012,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
         let history_surface = matches!(
             surface.kind,
-            PublicSurfaceKind::SchemaHistory { .. }
+            PublicSurfaceKind::EntityHistory { .. }
                 | PublicSurfaceKind::FileHistory
                 | PublicSurfaceKind::DirectoryHistory
         );
@@ -1111,88 +1047,4 @@ mod tests {
             );
         }
     }
-
-    async fn empty_history_query_source()
-    -> crate::sql2::SqlHistoryQuerySource<SharedStorageAdapterRead<MemoryRead>> {
-        let storage = StorageAdapter::new(Memory::new());
-        let read_scope = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let read_scope = SharedStorageAdapterRead::new(read_scope);
-        HistoryQuerySource {
-            store: read_scope.clone(),
-            json_reader: JsonStoreContext::new().reader(read_scope),
-            certified_history_reader: None,
-            default_as_of_commit_id: CommitId::for_test_label("history-default").to_string(),
-        }
-    }
-
-    struct EmptyHotStateReader;
-
-    #[async_trait]
-    impl HotStateReader for EmptyHotStateReader {
-        async fn load_exact_batch(
-            &self,
-            request: &crate::hot_state::HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
-        }
-
-        async fn scan_batch(
-            &self,
-            _request: &HotStateScanRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateBatch, LixError> {
-            Ok(Vec::new().into())
-        }
-    }
-
-    struct EmptyBranchRefReader;
-
-    #[async_trait]
-    impl BranchRefReader for EmptyBranchRefReader {
-        async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-            Ok(Some(BranchHead {
-                branch_id: branch_id.to_string(),
-                commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
-            }))
-        }
-
-        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-            Ok(Vec::new().into())
-        }
-    }
-
-    struct EmptyCommitGraphReader;
-
-    #[async_trait]
-    impl CommitGraphReader for EmptyCommitGraphReader {
-        async fn load_node(
-            &mut self,
-            _commit_id: &CommitId,
-        ) -> Result<Option<CommitGraphNode>, LixError> {
-            Ok(None)
-        }
-
-        async fn reachable_nodes(
-            &mut self,
-            _head_commit_id: &CommitId,
-        ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
-            Ok(Vec::new().into())
-        }
-
-        async fn change_history_from_commit(
-            &mut self,
-            _start_commit_id: &CommitId,
-            _request: &CommitGraphChangeHistoryRequest,
-        ) -> Result<crate::commit_graph::CommitGraphHistory, LixError> {
-            Ok(crate::commit_graph::CommitGraphHistory {
-                entries: Vec::new(),
-                reachable_nodes: Arc::from([]),
-            })
-        }
-    }
 }
-
-#[cfg(test)]
-pub(crate) use file_history::{file_history_context_census, reset_file_history_context_census};

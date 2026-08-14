@@ -11,8 +11,8 @@ use crate::plugin::runtime::{
     ParsedPluginArchive, parse_plugin_archive_for_install, plugin_key_from_archive_path,
     plugin_storage_archive_file_id,
 };
-use crate::schema::registered_schema_row_pk;
-use crate::transaction_types::{RawWriteBatch, TransactionJson};
+use crate::schema::registered_schema_entity_pk;
+use crate::transaction::types::{RawWriteBatch, TransactionJson};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
@@ -83,7 +83,7 @@ fn plugin_schema_rows(
     let mut rows = RawWriteBatch::with_capacity(parsed.schemas.len());
     for (schema, schema_key) in parsed.schemas.iter().zip(&parsed.schema_keys) {
         rows.push_parts(
-            Some(registered_schema_row_pk(schema_key)?),
+            Some(registered_schema_entity_pk(schema_key)?),
             REGISTERED_SCHEMA_KEY.into(),
             None,
             Some(TransactionJson::from_value(
@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(plan.parsed.manifest.key, "plugin_test");
         assert_eq!(plan.parsed.schema_keys, ["plugin_test_note"]);
         assert_eq!(plan.parsed.wasm_bytes, WASM);
-        assert_eq!(plan.parsed.wasm_hash, BlobId::from_content(WASM));
+        assert_eq!(plan.parsed.wasm_hash, BlobId::from_canonical_content(WASM));
         assert_eq!(plan.schema_rows.len(), 1);
         let schema_row = plan.schema_rows.row(0);
         assert_eq!(schema_row.schema_key, "lix_registered_schema");

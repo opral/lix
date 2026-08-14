@@ -118,10 +118,7 @@ simulation_test!(
         let Value::Text(uuid) = &uuid_rows.rows()[0].values()[0] else {
             panic!("uuidv7 should return text");
         };
-        assert!(
-            !uuid.is_empty(),
-            "uuidv7 should return a non-empty UUID"
-        );
+        assert!(!uuid.is_empty(), "uuidv7 should return a non-empty UUID");
 
         let insert_result = session
             .execute(
@@ -414,10 +411,7 @@ simulation_test!(
         );
 
         let failed_write = session
-            .execute(
-                "INSERT INTO missing_engine_table VALUES (uuidv7())",
-                &[],
-            )
+            .execute("INSERT INTO missing_engine_table VALUES (uuidv7())", &[])
             .await;
         assert!(
             failed_write.is_err(),

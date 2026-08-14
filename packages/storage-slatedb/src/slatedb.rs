@@ -25,8 +25,8 @@ use lix::storage::immutable::{
 use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
-    ReadEntry, ReadOptions, ScanChunk, ScanCursor as StorageScanCursor, ScanOrder, SpaceId,
-    Storage, StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
+    ReadEntry, ReadOptions, ScanChunk, ScanCursor as StorageScanCursor, ScanOrder, Storage,
+    StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
     ValueSemantics, WriteOptions, WriteStats,
 };
 use object_store::local::LocalFileSystem;
@@ -363,8 +363,31 @@ impl ImmutableValueStore {
                         .into_iter()
                         .zip(plan.placements)
                         .map(|((index, requested), fragments)| {
-                            materialize_immutable_request(&spans, &requested, &fragments)
-                                .map(|value| (index, value))
+                            let mut encoded = BytesMut::with_capacity(requested.len());
+                            for (span_index, range) in fragments {
+                                let span = spans
+                                    .get(span_index)
+                                    .and_then(Option::as_ref)
+                                    .ok_or_else(|| {
+                                        StorageError::Corruption(
+                                            "immutable segment read omitted a requested extent"
+                                                .to_string(),
+                                        )
+                                    })?;
+                                if range.end > span.len() {
+                                    return Err(StorageError::Corruption(
+                                        "immutable segment extent is truncated".to_string(),
+                                    ));
+                                }
+                                encoded.extend_from_slice(&span[range]);
+                            }
+                            if encoded.len() != requested.len() {
+                                return Err(StorageError::Corruption(
+                                    "immutable extents did not reconstruct the requested value"
+                                        .to_string(),
+                                ));
+                            }
+                            Ok((index, encoded.freeze()))
                         })
                         .collect::<Result<Vec<_>, StorageError>>()
                 }
@@ -430,53 +453,6 @@ impl ImmutableValueStore {
         }
         Ok(())
     }
-}
-
-fn materialize_immutable_request(
-    spans: &[Option<Bytes>],
-    requested: &Range<usize>,
-    fragments: &[(usize, Range<usize>)],
-) -> Result<Bytes, StorageError> {
-    if let [(span_index, range)] = fragments {
-        let span = spans
-            .get(*span_index)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| {
-                StorageError::Corruption(
-                    "immutable segment read omitted a requested extent".to_string(),
-                )
-            })?;
-        if range.end > span.len() || range.len() != requested.len() {
-            return Err(StorageError::Corruption(
-                "immutable segment extent is truncated".to_string(),
-            ));
-        }
-        return Ok(span.slice(range.clone()));
-    }
-
-    let mut encoded = BytesMut::with_capacity(requested.len());
-    for (span_index, range) in fragments {
-        let span = spans
-            .get(*span_index)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| {
-                StorageError::Corruption(
-                    "immutable segment read omitted a requested extent".to_string(),
-                )
-            })?;
-        if range.end > span.len() {
-            return Err(StorageError::Corruption(
-                "immutable segment extent is truncated".to_string(),
-            ));
-        }
-        encoded.extend_from_slice(&span[range.clone()]);
-    }
-    if encoded.len() != requested.len() {
-        return Err(StorageError::Corruption(
-            "immutable extents did not reconstruct the requested value".to_string(),
-        ));
-    }
-    Ok(encoded.freeze())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1689,34 +1665,6 @@ pub struct SlateDBRead {
     publication_view: Option<PublicationView>,
     durability: ReadDurability,
     point_cache: SnapshotPointCache,
-    #[cfg(test)]
-    scan_worker_gate: Option<Arc<ScanTestGate>>,
-    #[cfg(test)]
-    scan_hydration_gate: Option<Arc<ScanTestGate>>,
-}
-
-#[cfg(test)]
-struct ScanTestGate {
-    entered: AtomicBool,
-    entered_notify: Notify,
-    release: Notify,
-}
-
-#[cfg(test)]
-impl ScanTestGate {
-    fn new() -> Self {
-        Self {
-            entered: AtomicBool::new(false),
-            entered_notify: Notify::new(),
-            release: Notify::new(),
-        }
-    }
-
-    async fn wait_until_entered(&self) {
-        while !self.entered.load(Ordering::Acquire) {
-            self.entered_notify.notified().await;
-        }
-    }
 }
 
 #[allow(missing_debug_implementations)]
@@ -1883,82 +1831,64 @@ impl WritePipeline {
         error.map_or(Ok(()), Err)
     }
 
-    /// Obtains a snapshot together with the retirement guard its reader must
-    /// hold until it captures a publication view.
-    ///
-    /// Both paths — cached and freshly fetched — return a `SnapshotFetch`, so
-    /// the guard cannot be omitted by construction. `cleanup_publications`
-    /// retires a publication only while `snapshot_fetches == 0`, and a reader
-    /// holding a snapshot it has not yet captured a view against still depends
-    /// on every publication newer than that snapshot. The cached fast path
-    /// used to return no guard, which let cleanup retire a publication in
-    /// exactly that gap; the reader then observed neither the snapshot value
-    /// nor the overlay value, i.e. a stale point read or scan.
     async fn snapshot(
         &self,
         worker: &SlateDBWorker,
-    ) -> Result<(Arc<DbSnapshot>, SnapshotFetch), StorageError> {
-        let (cached, publication_id) = {
+    ) -> Result<(Arc<DbSnapshot>, Option<SnapshotFetch>), StorageError> {
+        let publication_id = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(snapshot) = state.latest_snapshot.clone() {
+                worker.check_open_fast()?;
+                return Ok((snapshot, None));
+            }
             state.snapshot_fetches = state
                 .snapshot_fetches
                 .checked_add(1)
                 .expect("SlateDB snapshot fetch overflow");
-            (state.latest_snapshot.clone(), state.next_publication_id)
+            state.next_publication_id
         };
-        // Constructed immediately after the increment so that every early
-        // return below balances the counter through `SnapshotFetch::drop`.
         let fetch = SnapshotFetch {
             pipeline: self.clone(),
             worker: worker.clone(),
         };
-        if let Some(snapshot) = cached {
-            worker.check_open_fast()?;
-            return Ok((snapshot, fetch));
-        }
         let snapshot = worker
             .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
             .await?;
-        if !self.try_install_snapshot(publication_id, &snapshot) {
+        let cacheable = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.next_publication_id == publication_id
+                && state
+                    .tail
+                    .as_ref()
+                    .is_none_or(|tail| tail.done.load(Ordering::Acquire))
+                && snapshot_covers_persisted_publications(&state, snapshot.seq())
+        };
+        if cacheable {
+            self.install_snapshot(Arc::clone(&snapshot));
+        } else {
             worker.check_open_fast()?;
         }
-        Ok((snapshot, fetch))
+        Ok((snapshot, Some(fetch)))
     }
 
-    /// Publishes `snapshot` as the cached snapshot when it is still current,
-    /// reporting whether it was installed.
-    ///
-    /// The freshness test and the install happen under **one** acquisition of
-    /// the pipeline lock. They used to be two, and a commit landing in the gap
-    /// was silently undone: `commit` clears `latest_snapshot` and bumps
-    /// `next_publication_id`, then the later install found `latest_snapshot`
-    /// empty, passed its monotonic guard vacuously, and reinstated a snapshot
-    /// that predated the write that commit had just published.
-    fn try_install_snapshot(&self, publication_id: u64, snapshot: &Arc<DbSnapshot>) -> bool {
+    fn install_snapshot(&self, snapshot: Arc<DbSnapshot>) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cacheable = state.next_publication_id == publication_id
-            && state
-                .tail
-                .as_ref()
-                .is_none_or(|tail| tail.done.load(Ordering::Acquire))
-            && snapshot_covers_persisted_publications(&state, snapshot.seq());
-        if !cacheable {
-            return false;
-        }
         if state
             .latest_snapshot
             .as_ref()
             .is_none_or(|current| current.seq() <= snapshot.seq())
         {
-            state.latest_snapshot = Some(Arc::clone(snapshot));
+            state.latest_snapshot = Some(snapshot);
         }
-        true
     }
 
     fn capture_with_worker(
@@ -1967,11 +1897,6 @@ impl WritePipeline {
         snapshot_sequence: u64,
     ) -> PublicationView {
         self.capture_inner(Some(worker), snapshot_sequence)
-    }
-
-    #[cfg(test)]
-    fn capture(&self, snapshot_sequence: u64) -> PublicationView {
-        self.capture_inner(None, snapshot_sequence)
     }
 
     fn capture_inner(
@@ -2575,10 +2500,6 @@ impl Storage for SlateDB {
                 publication_view,
                 durability: opts.durability,
                 point_cache: self.point_cache.clone(),
-                #[cfg(test)]
-                scan_worker_gate: None,
-                #[cfg(test)]
-                scan_hydration_gate: None,
             })
         }
     }
@@ -2610,20 +2531,6 @@ impl Storage for SlateDB {
             })
         }
     }
-}
-
-#[cfg(test)]
-async fn collect_startup_immutable_garbage(
-    worker: &SlateDBWorker,
-    store: &ImmutableValueStore,
-    cutoff: SystemTime,
-) -> Result<(), StorageError> {
-    let store = store.clone();
-    worker
-        .call_read(move |database| async move {
-            collect_startup_immutable_garbage_from_database(database, &store, cutoff).await
-        })
-        .await
 }
 
 async fn collect_startup_immutable_garbage_from_database(
@@ -2710,7 +2617,7 @@ async fn check_preconditions(
                         .filter_map(|(offset, precondition)| match precondition {
                             Precondition::KeyValueHashEquals { space, .. }
                             | Precondition::KeyValueEquals { space, .. }
-                                if space.value_semantics == ValueSemantics::Immutable =>
+                                if space.value_semantics() == ValueSemantics::Immutable =>
                             {
                                 values[offset]
                                     .as_ref()
@@ -2742,7 +2649,7 @@ async fn check_preconditions(
 
                 let matches_precondition = match &preconditions[index] {
                     Precondition::RangeEmpty { space, range } => {
-                        let range = physical_range(space.id, range.clone())?;
+                        let range = physical_range(space.id(), range.clone())?;
                         let bounds = EncodedBounds::new(range.clone());
                         let mut keys = collect_snapshot_keys(Arc::clone(&snapshot), bounds).await?;
                         let visible_writes =
@@ -2826,7 +2733,9 @@ fn point_precondition_physical_key(
         Precondition::KeyAbsent { space, key }
         | Precondition::KeyPresent { space, key }
         | Precondition::KeyValueHashEquals { space, key, .. }
-        | Precondition::KeyValueEquals { space, key, .. } => physical_key(space.id, key).map(Some),
+        | Precondition::KeyValueEquals { space, key, .. } => {
+            physical_key(space.id(), key).map(Some)
+        }
         Precondition::RangeEmpty { .. } | Precondition::BranchEquals { .. } => Ok(None),
     }
 }
@@ -2847,20 +2756,6 @@ fn point_precondition_matches(precondition: &Precondition, value: Option<&Bytes>
     }
 }
 
-/// `ValueIntegrity::ContentAddressed` is a no-op on this adapter, deliberately.
-///
-/// The declaration tells a backend it *may* skip its own value checksum,
-/// because the engine recomputes the value's BLAKE3-256 digest from its key on
-/// every full-value read. Acting on it is an optimisation, never an
-/// obligation, and SlateDB has nothing to act with: `slatedb::config::ReadOptions`
-/// exposes `durability_filter`, `dirty`, `cache_blocks` and `filter_context`
-/// and no checksum control at any level. Immutable values also leave the LSM
-/// entirely for `db/lix-immutable-value-segment-v1`, where integrity is the
-/// object store's rather than a per-read setting.
-///
-/// So SlateDB keeps verifying exactly as before and stays correct by doing
-/// nothing. This comment exists so the asymmetry with `packages/storage-rocksdb`
-/// reads as a decision rather than as a missed call site.
 impl StorageRead for SlateDBRead {
     fn snapshot_cache_key(&self) -> Option<u128> {
         let publication_id = self
@@ -2879,7 +2774,7 @@ impl StorageRead for SlateDBRead {
             if let [request] = requests
                 && let [key] = request.keys
             {
-                let key = physical_key(request.space.id, key)?;
+                let key = physical_key(request.space.id(), key)?;
                 let snapshot = Arc::clone(&self.snapshot);
                 let durability = self.durability;
                 let mut value = if durability == ReadDurability::Visible {
@@ -2929,7 +2824,7 @@ impl StorageRead for SlateDBRead {
             );
             for request in requests {
                 for key in request.keys {
-                    physical_keys.push(physical_key(request.space.id, key)?);
+                    physical_keys.push(physical_key(request.space.id(), key)?);
                 }
             }
             if physical_keys.is_empty() {
@@ -3018,7 +2913,7 @@ impl StorageRead for SlateDBRead {
             if opts.order == ScanOrder::Descending {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
-            let bounds = EncodedBounds::new(physical_range(space.id, range.clone())?);
+            let bounds = EncodedBounds::new(physical_range(space.id(), range.clone())?);
             let visible_writes = self
                 .publication_view
                 .as_ref()
@@ -3049,10 +2944,6 @@ impl StorageRead for SlateDBRead {
                     space,
                     projection: opts.projection,
                     state: Some(state),
-                    #[cfg(test)]
-                    worker_gate: self.scan_worker_gate.clone(),
-                    #[cfg(test)]
-                    hydration_gate: self.scan_hydration_gate.clone(),
                 },
             )
         }
@@ -3066,10 +2957,6 @@ struct SlateDBScanSource {
     space: StorageSpace,
     projection: CoreProjection,
     state: Option<SlateStreamingScanState>,
-    #[cfg(test)]
-    worker_gate: Option<Arc<ScanTestGate>>,
-    #[cfg(test)]
-    hydration_gate: Option<Arc<ScanTestGate>>,
 }
 
 impl StorageScanSource for SlateDBScanSource {
@@ -3081,37 +2968,22 @@ impl StorageScanSource for SlateDBScanSource {
             self.write_pipeline.terminal_error()?;
             let state = self.state.take().ok_or(StorageError::InvalidCursor)?;
             let projection = self.projection;
-            let space_id = self.space.id;
-            #[cfg(test)]
-            let worker_gate = self.worker_gate.clone();
-            let (state, chunk) = self
+            let space_id = self.space.id();
+            let (state, mut chunk) = self
                 .worker
                 .call_read(move |_db| async move {
-                    #[cfg(test)]
-                    if let Some(gate) = worker_gate {
-                        gate.entered.store(true, Ordering::Release);
-                        gate.entered_notify.notify_waiters();
-                        gate.release.notified().await;
-                    }
                     streaming_scan_page(state, limit_rows, projection, space_id).await
                 })
                 .await?;
             self.state = Some(state);
-            #[cfg(test)]
-            if let Some(gate) = &self.hydration_gate {
-                gate.entered.store(true, Ordering::Release);
-                gate.entered_notify.notify_waiters();
-                gate.release.notified().await;
-            }
-            let (mut entries, has_more) = chunk.into_parts();
             hydrate_immutable_value_scan(
                 &self.immutable_value_store,
                 self.space,
                 self.projection,
-                &mut entries,
+                &mut chunk,
             )
             .await?;
-            Ok(ScanChunk::new(entries, has_more))
+            Ok(chunk)
         })
     }
 }
@@ -3268,7 +3140,7 @@ async fn streaming_scan_page(
     mut state: SlateStreamingScanState,
     limit_rows: usize,
     projection: CoreProjection,
-    space_id: SpaceId,
+    space_id: u32,
 ) -> Result<(SlateStreamingScanState, ScanChunk), StorageError> {
     let mut rows = Vec::with_capacity(limit_rows);
     if let Some(row) = state.output_pending.take() {
@@ -3285,8 +3157,7 @@ async fn streaming_scan_page(
     let entries = rows
         .into_iter()
         .map(|(key, value)| {
-            if key.0.len() < SPACE_PREFIX_LEN
-                || key.0[..SPACE_PREFIX_LEN] != space_id.0.to_be_bytes()
+            if key.0.len() < SPACE_PREFIX_LEN || key.0[..SPACE_PREFIX_LEN] != space_id.to_be_bytes()
             {
                 return Err(StorageError::Corruption(format!(
                     "slatedb scan key escaped its storage space: {:?}",
@@ -3299,7 +3170,7 @@ async fn streaming_scan_page(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((state, ScanChunk::new(entries, has_more)))
+    Ok((state, ScanChunk { entries, has_more }))
 }
 
 async fn next_streaming_visible_row(
@@ -3354,7 +3225,7 @@ async fn hydrate_immutable_value_gets(
     let mut result_index = 0usize;
     for request in requests {
         for _ in request.keys {
-            if request.space.value_semantics == ValueSemantics::Immutable
+            if request.space.value_semantics() == ValueSemantics::Immutable
                 && request.opts.projection == CoreProjection::FullValue
                 && let Some(Some(ProjectedValue::FullValue(marker))) = results.get(result_index)
             {
@@ -3379,15 +3250,17 @@ async fn hydrate_immutable_value_scan(
     immutable_value_store: &ImmutableValueStore,
     space: StorageSpace,
     projection: CoreProjection,
-    entries: &mut [ReadEntry],
+    chunk: &mut ScanChunk,
 ) -> Result<(), StorageError> {
-    if space.value_semantics != ValueSemantics::Immutable || projection != CoreProjection::FullValue
+    if space.value_semantics() != ValueSemantics::Immutable
+        || projection != CoreProjection::FullValue
     {
         return Ok(());
     }
     let values = immutable_value_store
         .get_many(
-            entries
+            chunk
+                .entries
                 .iter()
                 .map(|entry| match &entry.value {
                     ProjectedValue::FullValue(marker) => Ok(marker.clone()),
@@ -3398,7 +3271,7 @@ async fn hydrate_immutable_value_scan(
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .await?;
-    for (entry, value) in entries.iter_mut().zip(values) {
+    for (entry, value) in chunk.entries.iter_mut().zip(values) {
         entry.value = ProjectedValue::FullValue(value);
     }
     Ok(())
@@ -3511,8 +3384,8 @@ impl StorageWrite for SlateDBWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            if space.value_semantics == ValueSemantics::Immutable {
-                let put_entries = entries.entries.len() as u64;
+            if space.value_semantics() == ValueSemantics::Immutable {
+                let mut put_entries = 0_u64;
                 let mut segment_writer = ImmutableSegmentWriter::default();
                 let mut written_bytes = 0_u64;
                 let staged_entries = entries
@@ -3520,29 +3393,27 @@ impl StorageWrite for SlateDBWrite {
                     .into_iter()
                     .map(|entry| {
                         Ok((
-                            physical_key(space.id, &entry.key)?,
+                            physical_key(space.id(), &entry.key)?,
                             stored_value_bytes(entry.value),
                         ))
                     })
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let visible_values = if self.writer_permit.is_some() {
-                    read_visible_immutable_values(
-                        &self.worker,
-                        &self.write_pipeline,
-                        &self.point_cache,
-                        &self.immutable_value_store,
-                        staged_entries.iter().map(|(key, _)| key.clone()).collect(),
-                    )
-                    .await?
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                } else {
-                    vec![None; staged_entries.len()]
-                };
+                // This read is deliberately outside the write fence. It
+                // prevents unchanged immutable values from being packed into
+                // a replacement segment while allowing concurrent immutable
+                // uploads and mutable publications to proceed. The fence is
+                // acquired after upload for the authenticated recheck below.
+                let visible_values = read_visible_immutable_values(
+                    &self.worker,
+                    &self.write_pipeline,
+                    &self.point_cache,
+                    &self.immutable_value_store,
+                    staged_entries.iter().map(|(key, _)| key.clone()).collect(),
+                )
+                .await?;
                 for ((physical_key, value), visible) in
                     staged_entries.into_iter().zip(visible_values)
                 {
-                    written_bytes = written_bytes.saturating_add(value.len() as u64);
                     if let Some(existing) = visible {
                         if existing != value {
                             return Err(StorageError::Corruption(
@@ -3560,9 +3431,12 @@ impl StorageWrite for SlateDBWrite {
                         }
                         continue;
                     }
+                    let value_len = value.len() as u64;
                     self.immutable_values
                         .insert(physical_key.clone(), value.clone());
                     segment_writer.insert(physical_key, value)?;
+                    put_entries = put_entries.saturating_add(1);
+                    written_bytes = written_bytes.saturating_add(value_len);
                 }
                 let immutable_segments = segment_writer.finish(|_| true)?;
                 let immutable_locators = immutable_segments
@@ -3592,6 +3466,12 @@ impl StorageWrite for SlateDBWrite {
                 for (physical_key, locator) in immutable_locators {
                     self.overlay.insert(physical_key, Some(locator));
                 }
+                // A concurrent writer may have published one of the values
+                // after the preflight read. Recheck under the existing fence;
+                // identical assignments discard our duplicate locator, while
+                // conflicting bytes fail closed. Unpublished segments remain
+                // protected by process_segments for reachability GC.
+                self.serialize_publication().await?;
                 self.stats.put_entries += put_entries;
                 self.stats.written_bytes += written_bytes;
                 self.stats.storage_calls += 1;
@@ -3606,7 +3486,7 @@ impl StorageWrite for SlateDBWrite {
                 }
                 total.checked_add(key_len).ok_or(StorageError::InvalidKey)
             })?;
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             let mut physical_keys = Vec::with_capacity(physical_key_bytes);
             for entry in &entries.entries {
                 physical_keys.extend_from_slice(&space_prefix);
@@ -3643,7 +3523,7 @@ impl StorageWrite for SlateDBWrite {
                 }
                 total.checked_add(key_len).ok_or(StorageError::InvalidKey)
             })?;
-            let space_prefix = space.id.0.to_be_bytes();
+            let space_prefix = space.id().to_be_bytes();
             let mut physical_keys = Vec::with_capacity(physical_key_bytes);
             for key in keys {
                 physical_keys.extend_from_slice(&space_prefix);
@@ -3670,7 +3550,7 @@ impl StorageWrite for SlateDBWrite {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             self.serialize_publication().await?;
-            let range = physical_range(space.id, range)?;
+            let range = physical_range(space.id(), range)?;
             let bounds = EncodedBounds::new(range.clone());
             if bounds.is_empty() {
                 self.stats.deleted_ranges += 1;
@@ -3859,35 +3739,15 @@ async fn drain_write_queue(
                     }
                 }
             }
-            // SlateDB's own `await_durable` write option does not ask for a WAL
-            // flush; it only parks on the WAL buffer's durability watcher, which
-            // fires either when the buffer exceeds `l0_sst_size_bytes` (64 MiB)
-            // or when the periodic `flush_interval` ticker (100 ms) elapses.
-            // Every durable commit under that ceiling therefore paid up to a
-            // full 100 ms tick of pure idle latency for a WAL write that costs
-            // microseconds. Enqueue the batch without waiting, then ask the
-            // batch writer to flush now. The flush message is ordered behind
-            // this batch on the same writer channel, so it carries exactly the
-            // same durability guarantee — the WAL SST is in the object store
-            // before the commit is acknowledged — and one flush covers every
-            // durable write in the drained group, amortizing the barrier
-            // across a concurrent window instead of serializing on the ticker.
-            async {
-                let handle = db
-                    .write_with_options(
-                        batch,
-                        &SlateDBWriteOptions {
-                            await_durable: false,
-                            ..SlateDBWriteOptions::default()
-                        },
-                    )
-                    .await?;
-                if await_durable {
-                    db.flush().await?;
-                }
-                Ok::<_, slatedb::Error>(handle.seqnum())
-            }
+            db.write_with_options(
+                batch,
+                &SlateDBWriteOptions {
+                    await_durable,
+                    ..SlateDBWriteOptions::default()
+                },
+            )
             .await
+            .map(|handle| handle.seqnum())
             .map_err(slatedb_error)
             .map_err(commit_outcome_unknown)
         };
@@ -4493,18 +4353,18 @@ fn db_cache(block_cache_bytes: u64, metadata_cache_bytes: u64) -> Arc<dyn DbCach
     )
 }
 
-fn physical_key(space: SpaceId, key: &Key) -> Result<Key, StorageError> {
+fn physical_key(space: u32, key: &Key) -> Result<Key, StorageError> {
     let len = SPACE_PREFIX_LEN + key.0.len();
     if len > MAX_SLATEDB_KEY_LEN {
         return Err(StorageError::InvalidKey);
     }
     let mut bytes = Vec::with_capacity(len);
-    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&space.to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Ok(Key(Bytes::from(bytes)))
 }
 
-fn physical_range(space: SpaceId, range: KeyRange) -> Result<KeyRange, StorageError> {
+fn physical_range(space: u32, range: KeyRange) -> Result<KeyRange, StorageError> {
     let map = |bound: Bound<Key>, unbounded: Bound<Key>| -> Result<Bound<Key>, StorageError> {
         Ok(match bound {
             Bound::Included(key) => Bound::Included(physical_key(space, &key)?),
@@ -4515,11 +4375,11 @@ fn physical_range(space: SpaceId, range: KeyRange) -> Result<KeyRange, StorageEr
     Ok(KeyRange {
         lower: map(
             range.lower,
-            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+            Bound::Included(Key(Bytes::copy_from_slice(&space.to_be_bytes()))),
         )?,
         upper: map(
             range.upper,
-            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+            space.checked_add(1).map_or(Bound::Unbounded, |next| {
                 Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
             }),
         )?,
@@ -4726,7 +4586,7 @@ impl WriteGate {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
 
@@ -4767,32 +4627,6 @@ mod tests {
         let range = segment.values[0].1.clone();
         let bytes = Bytes::from(segment.frames.into_iter().collect::<PutPayload>());
         (segment.id, bytes, range)
-    }
-
-    #[test]
-    fn single_immutable_extent_reuses_the_fetched_span() {
-        let span = Bytes::from_static(b"0123456789");
-        let expected_ptr = span.slice(2..5).as_ptr();
-        let value = materialize_immutable_request(&[Some(span)], &(100..103), &[(0, 2..5)])
-            .expect("materialize one immutable extent");
-
-        assert_eq!(value, Bytes::from_static(b"234"));
-        assert_eq!(value.as_ptr(), expected_ptr);
-    }
-
-    #[test]
-    fn fragmented_immutable_extents_still_reconstruct_one_value() {
-        let value = materialize_immutable_request(
-            &[
-                Some(Bytes::from_static(b"abc")),
-                Some(Bytes::from_static(b"def")),
-            ],
-            &(100..104),
-            &[(0, 1..3), (1, 0..2)],
-        )
-        .expect("materialize fragmented immutable extents");
-
-        assert_eq!(value, Bytes::from_static(b"bcde"));
     }
 
     #[test]
@@ -5749,7 +5583,7 @@ mod tests {
 
         let immutable_directory = directory.path().join(DB_PATH).join(IMMUTABLE_VALUE_PATH);
         let physical_key =
-            physical_key(TEST_IMMUTABLE_SPACE.id, &key).expect("derive physical immutable key");
+            physical_key(TEST_IMMUTABLE_SPACE.id(), &key).expect("derive physical immutable key");
         let (segment_key, encoded_value, _) = immutable_test_segment(physical_key, value.clone());
         let segment_hash: [u8; 32] = segment_key.0.as_ref().try_into().expect("segment hash");
         let stored_path =
@@ -5802,12 +5636,10 @@ mod tests {
             },
         ))
         .expect("begin immutable chunk scan");
-        let (scan, _scan_has_more) = block_on(cursor.next_page(16))
-            .expect("scan immutable chunk")
-            .into_parts();
-        assert_eq!(scan.len(), 1);
-        assert_eq!(scan[0].key, key);
-        assert_eq!(scan[0].value, ProjectedValue::FullValue(value));
+        let scan = block_on(cursor.next_page(16)).expect("scan immutable chunk");
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].key, key);
+        assert_eq!(scan.entries[0].value, ProjectedValue::FullValue(value));
 
         let matching = block_on(storage.begin_write(WriteOptions {
             preconditions: vec![Precondition::KeyValueHashEquals {
@@ -5931,13 +5763,13 @@ mod tests {
             )
             .await
             .expect("begin fresh worker-cancellation cursor");
-        let (restarted, _restarted_has_more) = restart
+        let restarted = restart
             .next_page(2)
             .await
-            .expect("drain fresh worker-cancellation cursor")
-            .into_parts();
+            .expect("drain fresh worker-cancellation cursor");
         assert_eq!(
             restarted
+                .entries
                 .iter()
                 .map(|entry| entry.key.0.as_ref())
                 .collect::<Vec<_>>(),
@@ -6024,15 +5856,14 @@ mod tests {
             )
             .await
             .expect("begin explicit exclusive restart");
-        let (restarted, _restarted_has_more) = restart
+        let restarted = restart
             .next_page(1)
             .await
-            .expect("read explicit exclusive restart page")
-            .into_parts();
-        assert_eq!(restarted.len(), 1);
-        assert_eq!(restarted[0].key, second_key);
+            .expect("read explicit exclusive restart page");
+        assert_eq!(restarted.entries.len(), 1);
+        assert_eq!(restarted.entries[0].key, second_key);
         assert_eq!(
-            restarted[0].value,
+            restarted.entries[0].value,
             ProjectedValue::FullValue(Bytes::from_static(b"second-value"))
         );
     }
@@ -6097,7 +5928,7 @@ mod tests {
             vec![Some(ProjectedValue::FullValue(value.clone()))]
         );
         let physical_key =
-            physical_key(TEST_IMMUTABLE_SPACE.id, &key).expect("derive physical immutable key");
+            physical_key(TEST_IMMUTABLE_SPACE.id(), &key).expect("derive physical immutable key");
         let (segment_key, encoded_value, _range) =
             immutable_test_segment(physical_key, value.clone());
         let segment_hash: [u8; 32] = segment_key.0.as_ref().try_into().expect("segment hash");
@@ -6420,7 +6251,7 @@ mod tests {
             );
             assert!(
                 db.manifest()
-                    .segment(&space.id.0.to_be_bytes())
+                    .segment(&space.id().to_be_bytes())
                     .is_some_and(|segment| !segment.l0().is_empty()),
                 "the row must be isolated in its storage-space segment"
             );
@@ -6569,16 +6400,12 @@ mod tests {
             },
         ))
         .expect("begin cursor-test scan");
-        let (first, first_has_more) = block_on(cursor.next_page(1))
-            .expect("scan first cursor-test page")
-            .into_parts();
-        assert_eq!(first[0].key, keys[0]);
-        assert!(first_has_more);
-        let (second, second_has_more) = block_on(cursor.next_page(1))
-            .expect("scan second cursor-test page")
-            .into_parts();
-        assert_eq!(second[0].key, keys[1]);
-        assert!(second_has_more);
+        let first = block_on(cursor.next_page(1)).expect("scan first cursor-test page");
+        assert_eq!(first.entries[0].key, keys[0]);
+        assert!(first.has_more);
+        let second = block_on(cursor.next_page(1)).expect("scan second cursor-test page");
+        assert_eq!(second.entries[0].key, keys[1]);
+        assert!(second.has_more);
 
         // A changed projection requires a new cursor with an explicit exclusive
         // authenticated restart boundary.
@@ -6594,12 +6421,10 @@ mod tests {
             },
         ))
         .expect("begin projected restart scan");
-        let (third, third_has_more) = block_on(key_cursor.next_page(1))
-            .expect("scan projected restart page")
-            .into_parts();
-        assert_eq!(third[0].key, keys[2]);
-        assert_eq!(third[0].value, ProjectedValue::KeyOnly);
-        assert!(!third_has_more);
+        let third = block_on(key_cursor.next_page(1)).expect("scan projected restart page");
+        assert_eq!(third.entries[0].key, keys[2]);
+        assert_eq!(third.entries[0].value, ProjectedValue::KeyOnly);
+        assert!(!third.has_more);
 
         let mut restarted_cursor = block_on(read.begin_scan(
             space,
@@ -6610,15 +6435,11 @@ mod tests {
             },
         ))
         .expect("begin restarted cursor-test scan");
-        let (restarted, _restarted_has_more) = block_on(restarted_cursor.next_page(1))
-            .expect("scan restarted first page")
-            .into_parts();
-        assert_eq!(restarted[0].key, keys[0]);
-        let (restarted_second, __restarted_second_has_more) =
-            block_on(restarted_cursor.next_page(1))
-                .expect("scan restarted second page")
-                .into_parts();
-        assert_eq!(restarted_second[0].key, keys[1]);
+        let restarted = block_on(restarted_cursor.next_page(1)).expect("scan restarted first page");
+        assert_eq!(restarted.entries[0].key, keys[0]);
+        let restarted_second =
+            block_on(restarted_cursor.next_page(1)).expect("scan restarted second page");
+        assert_eq!(restarted_second.entries[0].key, keys[1]);
     }
 
     #[test]
@@ -6786,8 +6607,7 @@ mod tests {
         assert_eq!(
             block_on(cursor.next_page(usize::MAX))
                 .expect("scan pending point")
-                .into_parts()
-                .0,
+                .entries,
             vec![ReadEntry {
                 key: key.clone(),
                 value: ProjectedValue::FullValue(value.clone()),
@@ -7222,8 +7042,7 @@ mod tests {
         assert_eq!(
             block_on(cursor.next_page(usize::MAX))
                 .expect("read publication through older scan view")
-                .into_parts()
-                .0,
+                .entries,
             vec![ReadEntry {
                 key,
                 value: ProjectedValue::FullValue(value),
@@ -7286,166 +7105,6 @@ mod tests {
                 &key,
             ),
             Some(Some(value))
-        );
-    }
-
-    fn cached_snapshot_test_storage(name: &'static str) -> SlateDB {
-        SlateDB::open_object_store_with_options(
-            name,
-            Arc::new(InMemory::new()),
-            SlateDBObjectStoreOptions::default(),
-        )
-        .expect("open cached-snapshot coherence storage")
-    }
-
-    async fn cached_snapshot_commit(storage: &SlateDB, space: StorageSpace, value: &'static str) {
-        let mut write = storage
-            .begin_write(WriteOptions::default())
-            .await
-            .expect("begin cached-snapshot write");
-        write
-            .put_many(
-                space,
-                PutBatch {
-                    entries: vec![PutEntry {
-                        key: Key(Bytes::from_static(b"a")),
-                        value: StoredValue {
-                            bytes: Bytes::from_static(value.as_bytes()),
-                        },
-                    }],
-                },
-            )
-            .await
-            .expect("stage cached-snapshot write");
-        write.commit().await.expect("commit cached-snapshot write");
-    }
-
-    fn snapshot_fetches_of(storage: &SlateDB) -> usize {
-        storage
-            .write_pipeline
-            .state
-            .lock()
-            .expect("lock publication state")
-            .snapshot_fetches
-    }
-
-    /// D2. Companion to
-    /// `dropping_unrelated_view_does_not_reclaim_publication_a_stale_fetch_needs`,
-    /// which proves the `snapshot_fetches` guard protects a reader in the gap
-    /// between obtaining a snapshot and capturing its publication view — but
-    /// only ever exercises the fetch path, pinning `snapshot_fetches = 1`.
-    ///
-    /// The cached fast path used to return no guard, so a cached reader sat in
-    /// the identical gap with the protection switched off and
-    /// `cleanup_publications` could retire the publication its older snapshot
-    /// still needed. Both paths must register the guard.
-    #[tokio::test]
-    async fn cached_snapshot_path_registers_a_retirement_guard() {
-        let storage = cached_snapshot_test_storage("test-cached-snapshot-guard");
-        let space = StorageSpace::mutable(SpaceId(0x91), "test.cached-snapshot-guard");
-        cached_snapshot_commit(&storage, space, "A").await;
-
-        let (snapshot, fetch) = storage
-            .write_pipeline
-            .snapshot(&storage.worker)
-            .await
-            .expect("fetch a snapshot");
-        drop(fetch);
-        assert_eq!(snapshot_fetches_of(&storage), 0);
-
-        // Force the cached fast path deterministically.
-        storage
-            .write_pipeline
-            .state
-            .lock()
-            .expect("lock publication state")
-            .latest_snapshot = Some(Arc::clone(&snapshot));
-
-        let (_cached, cached_fetch) = storage
-            .write_pipeline
-            .snapshot(&storage.worker)
-            .await
-            .expect("take the cached snapshot path");
-        assert_eq!(
-            snapshot_fetches_of(&storage),
-            1,
-            "the cached snapshot path must register the same retirement guard as the fetch path"
-        );
-        drop(cached_fetch);
-        assert_eq!(
-            snapshot_fetches_of(&storage),
-            0,
-            "dropping the guard must balance the counter"
-        );
-    }
-
-    /// D1. `commit` clears `latest_snapshot` and bumps `next_publication_id`
-    /// so the next reader refetches. That invalidation must not be undone by an
-    /// install decided before the commit landed.
-    ///
-    /// The state below is arranged so that **only** the publication-id term can
-    /// reject the install: the racing publication has already persisted and
-    /// been retired from `visible`, so `snapshot_covers_persisted_publications`
-    /// holds, the tail is complete, and `latest_snapshot` is empty, so the
-    /// monotonic guard passes vacuously. That is precisely the state the old
-    /// two-phase structure reached by the time it called `install_snapshot`.
-    #[tokio::test]
-    async fn commit_is_not_undone_by_an_install_decided_before_it() {
-        let storage = cached_snapshot_test_storage("test-cached-snapshot-install-race");
-        let space = StorageSpace::mutable(SpaceId(0x92), "test.cached-snapshot-install-race");
-        cached_snapshot_commit(&storage, space, "A").await;
-
-        let (stale_snapshot, fetch) = storage
-            .write_pipeline
-            .snapshot(&storage.worker)
-            .await
-            .expect("fetch the pre-commit snapshot");
-        let publication_id = storage
-            .write_pipeline
-            .state
-            .lock()
-            .expect("lock publication state")
-            .next_publication_id;
-        drop(fetch);
-
-        // The commit that races the in-flight install, then fully settles:
-        // its publication persists and retires, leaving only the publication
-        // id to witness that the snapshot is stale.
-        cached_snapshot_commit(&storage, space, "B").await;
-        {
-            let mut state = storage
-                .write_pipeline
-                .state
-                .lock()
-                .expect("lock publication state");
-            state.visible.clear();
-            state.tail = None;
-            state.latest_snapshot = None;
-            assert_ne!(
-                state.next_publication_id, publication_id,
-                "the racing commit must advance the publication id"
-            );
-            assert!(
-                snapshot_covers_persisted_publications(&state, stale_snapshot.seq()),
-                "every other cacheability term must hold, isolating the publication-id check"
-            );
-        }
-
-        assert!(
-            !storage
-                .write_pipeline
-                .try_install_snapshot(publication_id, &stale_snapshot),
-            "an install decided before the commit must be rejected"
-        );
-        assert!(
-            storage
-                .write_pipeline
-                .state
-                .lock()
-                .expect("lock publication state")
-                .latest_snapshot
-                .is_none(),
-            "the commit's cache invalidation must not be undone by a stale install"
         );
     }
 

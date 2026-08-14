@@ -1,12 +1,12 @@
 //! Durable, branch-local plugin registry state.
 //!
-//! The registry is one tracked `lix_key_value` row per branch. File
-//! ownership uses the same reserved row key for every file and relies on
+//! The registry is one tracked `lix_key_value` entity per branch. File
+//! ownership uses the same reserved entity key for every file and relies on
 //! `file_id` for identity. That layout gives the transaction hot paths one
 //! exact registry read and one batched owner read instead of a filesystem
 //! scan.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -16,16 +16,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BlobId;
-use crate::branch::BranchHeadControl;
-use crate::changelog::{ChangeRecordProjection, CommitId};
-use crate::hot_state::MaterializedHotStateRow;
-use crate::row_pk::RowPk;
-use crate::tracked_state::{
-    MaterializedTrackedStateRowRef, TrackedStateFilter, TrackedStateReadColumns,
-    TrackedStateScanRequest, TrackedStateStoreReader,
-};
-use crate::transaction_types::{TransactionJson, TransactionWriteRow};
-use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
+use crate::entity_pk::EntityPk;
+use crate::state::StateRow;
+use crate::storage_adapter::StorageAdapterRead;
+use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::{GLOBAL_BRANCH_ID, LixError};
 
 use super::InstalledPlugin;
 use super::manifest::{
@@ -185,7 +180,7 @@ impl PluginRegistryEntry {
     }
 
     pub(crate) fn to_installed_plugin(&self, wasm: Vec<u8>) -> Result<InstalledPlugin, LixError> {
-        let wasm_hash = BlobId::from_content(&wasm);
+        let wasm_hash = BlobId::from_canonical_content(&wasm);
         let actual_hash = wasm_hash.to_hex();
         if actual_hash != self.wasm_blob_hash {
             return Err(invalid_registry(format!(
@@ -336,7 +331,7 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// Decode the JSON held in the `value` field. A missing row is the
+    /// Decode the JSON held in the `value` field. A missing entity is the
     /// canonical empty registry and requires no filesystem discovery.
     pub(crate) fn from_optional_value(value: Option<&JsonValue>) -> Result<Self, LixError> {
         let Some(value) = value else {
@@ -357,18 +352,20 @@ impl PluginRegistry {
         Self::from_optional_value(Some(value))
     }
 
-    pub(crate) fn from_optional_hot_state_row(
-        row: Option<&MaterializedHotStateRow>,
+    pub(crate) fn from_required_state_row(
+        row: Option<&StateRow>,
         branch_id: &str,
     ) -> Result<Self, LixError> {
         let Some(row) = row else {
-            return Ok(Self::empty());
+            return Err(invalid_registry(format!(
+                "authenticated plugin registry is missing for branch '{branch_id}'"
+            )));
         };
-        // The branch registry is branch-global with no file, so it is always
-        // tracked regardless of any file's lane.
-        validate_hot_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id, false)?;
-        if row.deleted || row.snapshot_content.is_none() {
-            return Ok(Self::empty());
+        validate_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id)?;
+        if !matches!(row.value.cell, crate::forktree::StateCell::Value(_)) {
+            return Err(invalid_registry(format!(
+                "authenticated plugin registry is not a value for branch '{branch_id}'"
+            )));
         }
         let snapshot = parse_snapshot_content(row, "plugin registry")?;
         Self::from_optional_snapshot(Some(&snapshot))
@@ -398,12 +395,11 @@ impl PluginRegistry {
     }
 
     pub(crate) fn write_row(&self, branch_id: &str) -> Result<TransactionWriteRow, LixError> {
-        plugin_key_value_write_row(
+        tracked_key_value_write_row(
             PLUGIN_REGISTRY_KEY,
             None,
             Some(self.to_snapshot()?),
             branch_id,
-            false,
         )
     }
 
@@ -458,122 +454,44 @@ impl PluginRegistry {
     }
 }
 
-/// Loads one retained registry through the plugin-owned durable decoder.
-pub(crate) async fn load_plugin_registry_at_commit<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+pub(crate) async fn load_plugin_registry_on_historical_view<R>(
+    view: &crate::forktree::AuthenticatedHistoricalStateView<'_, R>,
     commit_id: &str,
 ) -> Result<PluginRegistry, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    R: StorageAdapterRead + ?Sized,
 {
-    let registry_key = crate::tracked_state::TrackedStateKey {
-        schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
-        row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
+    let registry_key = crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+        schema_key: KEY_VALUE_SCHEMA_KEY,
+        entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
         file_id: None,
-    };
-    let rows = reader
-        .load_projected_batch_at_commit(
-            commit_id,
-            std::slice::from_ref(&registry_key),
-            &ChangeRecordProjection::full(),
-        )
+    });
+    let value = view
+        .load_state_value(&registry_key, true)
         .await?
-        .into_rows();
-    let row = rows.into_iter().next().flatten();
-    let snapshot = match row {
-        None => None,
-        Some(row) if row.deleted || row.snapshot_content.is_none() => None,
-        Some(row) => Some(
-            serde_json::from_str(row.snapshot_content.as_deref().expect("checked")).map_err(
-                |error| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!("historical plugin registry snapshot is invalid JSON: {error}"),
-                    )
-                },
-            )?,
-        ),
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("historical plugin registry is missing at commit '{commit_id}'"),
+            )
+        })?;
+    let snapshot = match value.0.cell {
+        crate::forktree::StateCell::Value(value) => {
+            Some(serde_json::from_str(value.as_str()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!("historical plugin registry snapshot is invalid JSON: {error}"),
+                )
+            })?)
+        }
+        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                format!("historical plugin registry is deleted at commit '{commit_id}'"),
+            ));
+        }
     };
     PluginRegistry::from_optional_snapshot(snapshot.as_ref())
-}
-
-/// Re-derives every WASM payload root owned by current and retained plugin
-/// registry generations. Registry snapshots remain the sole serving authority;
-/// this returns only their authenticated content hashes for binary-CAS marking.
-pub(crate) async fn collect_gc_wasm_blob_roots<S>(
-    store: &S,
-    controls: &[(String, BranchHeadControl)],
-    retained_commits: &BTreeSet<CommitId>,
-) -> Result<BTreeSet<BlobId>, LixError>
-where
-    S: crate::storage_adapter::StorageAdapterRead,
-{
-    let request = TrackedStateScanRequest {
-        filter: TrackedStateFilter {
-            schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_owned()],
-            row_pks: vec![RowPk::single(PLUGIN_REGISTRY_KEY)],
-            file_ids: vec![NullableKeyFilter::Null],
-            ..TrackedStateFilter::default()
-        },
-        read_columns: TrackedStateReadColumns {
-            columns: vec!["snapshot_content".to_owned()],
-        },
-        limit: None,
-    };
-    let current = crate::hot_state::TrackedHeadContext::new()
-        .reader(store)
-        .scan_live_batches_for_controls(controls, &request, None)
-        .await?;
-    let mut roots = BTreeSet::new();
-    for (branch_id, rows) in current {
-        for row in rows.into_rows() {
-            let registry = PluginRegistry::from_optional_hot_state_row(Some(&row), &branch_id)?;
-            extend_registry_wasm_roots(&registry, &mut roots)?;
-        }
-    }
-
-    let retained_schema_keys = [KEY_VALUE_SCHEMA_KEY.to_owned()];
-    for commit_id in retained_commits {
-        for row in crate::tracked_state::load_retained_commit_snapshots_for_schemas(
-            store,
-            *commit_id,
-            &retained_schema_keys,
-        )
-        .await?
-        {
-            if row.deleted
-                || row.key.file_id.is_some()
-                || row.key.row_pk != RowPk::single(PLUGIN_REGISTRY_KEY)
-            {
-                continue;
-            }
-            let snapshot: JsonValue = serde_json::from_str(
-                row.snapshot.as_deref().ok_or_else(|| {
-                    invalid_registry(format!(
-                        "historical plugin registry mutation in commit '{commit_id}' has no snapshot"
-                    ))
-                })?,
-            )
-            .map_err(|error| {
-                invalid_registry(format!(
-                    "historical plugin registry mutation in commit '{commit_id}' is invalid JSON: {error}"
-                ))
-            })?;
-            let registry = PluginRegistry::from_optional_snapshot(Some(&snapshot))?;
-            extend_registry_wasm_roots(&registry, &mut roots)?;
-        }
-    }
-    Ok(roots)
-}
-
-fn extend_registry_wasm_roots(
-    registry: &PluginRegistry,
-    roots: &mut BTreeSet<BlobId>,
-) -> Result<(), LixError> {
-    for plugin in registry.plugins() {
-        roots.insert(BlobId::from_hex(plugin.wasm_blob_hash())?);
-    }
-    Ok(())
 }
 
 /// Durable per-file ownership. `file_id` is storage identity, not duplicated
@@ -640,70 +558,47 @@ impl PluginFileOwner {
         }))
     }
 
-    pub(crate) fn from_hot_state_row(
-        row: &MaterializedHotStateRow,
+    pub(crate) fn from_state_row(
+        row: &StateRow,
         branch_id: &str,
-        untracked: bool,
     ) -> Result<Option<Self>, LixError> {
-        let file_id = row.file_id.as_deref().ok_or_else(|| {
+        let key = crate::forktree::decode_state_key(&row.key)?;
+        let file_id = key.file_id.as_deref().ok_or_else(|| {
             invalid_registry("plugin owner row is missing its file_id storage identity")
         })?;
-        validate_hot_state_identity(row, PLUGIN_OWNER_KEY, Some(file_id), branch_id, untracked)?;
-        if row.deleted || row.snapshot_content.is_none() {
+        validate_state_identity(row, PLUGIN_OWNER_KEY, Some(file_id), branch_id)?;
+        if row.value.cell.deleted() || state_snapshot_content(row).is_none() {
             return Ok(None);
         }
         let snapshot = parse_snapshot_content(row, "plugin owner")?;
         Self::from_snapshot(file_id, &snapshot).map(Some)
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_tracked_state_row(
-        row: &crate::tracked_state::MaterializedTrackedStateRow,
+    pub(crate) fn from_historical_state_row(
+        row: &crate::forktree::HistoricalStateRow,
     ) -> Result<Option<Self>, LixError> {
-        let file_id = row.file_id.as_deref().ok_or_else(|| {
+        let file_id = row.key.file_id.as_deref().ok_or_else(|| {
             invalid_registry("plugin owner row is missing its file_id storage identity")
         })?;
-        if row.schema_key != KEY_VALUE_SCHEMA_KEY || row.row_pk != RowPk::single(PLUGIN_OWNER_KEY) {
+        if row.key.schema_key != KEY_VALUE_SCHEMA_KEY
+            || row.key.entity_pk.as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
+        {
             return Err(invalid_registry(
-                "tracked plugin owner row has an invalid storage identity",
+                "historical plugin owner row has an invalid storage identity",
             ));
         }
         if row.deleted || row.snapshot_content.is_none() {
             return Ok(None);
         }
         let snapshot = serde_json::from_str(
-            row.snapshot_content.as_deref().expect("checked above"),
+            row.snapshot_content
+                .as_ref()
+                .expect("checked above")
+                .as_str(),
         )
         .map_err(|error| {
             invalid_registry(format!(
-                "tracked plugin owner snapshot is invalid JSON: {error}"
-            ))
-        })?;
-        Self::from_snapshot(file_id, &snapshot).map(Some)
-    }
-
-    pub(crate) fn from_tracked_state_row_ref(
-        row: MaterializedTrackedStateRowRef<'_>,
-    ) -> Result<Option<Self>, LixError> {
-        let file_id = row.file_id().ok_or_else(|| {
-            invalid_registry("plugin owner row is missing its file_id storage identity")
-        })?;
-        if row.schema_key() != KEY_VALUE_SCHEMA_KEY
-            || row.row_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
-        {
-            return Err(invalid_registry(
-                "tracked plugin owner row has an invalid storage identity",
-            ));
-        }
-        if row.deleted() || row.snapshot_content().is_none() {
-            return Ok(None);
-        }
-        let snapshot = serde_json::from_str(
-            row.snapshot_content().expect("checked above").as_str(),
-        )
-        .map_err(|error| {
-            invalid_registry(format!(
-                "tracked plugin owner snapshot is invalid JSON: {error}"
+                "historical plugin owner snapshot is invalid JSON: {error}"
             ))
         })?;
         Self::from_snapshot(file_id, &snapshot).map(Some)
@@ -730,30 +625,24 @@ impl PluginFileOwner {
         Self::new(file_id, owner_value.plugin_key, owner_value.schema_keys)
     }
 
-    pub(crate) fn write_row(
-        &self,
-        branch_id: &str,
-        untracked: bool,
-    ) -> Result<TransactionWriteRow, LixError> {
-        plugin_key_value_write_row(
+    pub(crate) fn write_row(&self, branch_id: &str) -> Result<TransactionWriteRow, LixError> {
+        tracked_key_value_write_row(
             PLUGIN_OWNER_KEY,
             Some(self.file_id.clone()),
             Some(self.to_snapshot()?),
             branch_id,
-            untracked,
         )
     }
 
     pub(crate) fn delete_row(
         file_id: impl Into<String>,
         branch_id: &str,
-        untracked: bool,
     ) -> Result<TransactionWriteRow, LixError> {
         let file_id = file_id.into();
         if file_id.is_empty() {
             return Err(invalid_registry("plugin owner file_id must not be empty"));
         }
-        plugin_key_value_write_row(PLUGIN_OWNER_KEY, Some(file_id), None, branch_id, untracked)
+        tracked_key_value_write_row(PLUGIN_OWNER_KEY, Some(file_id), None, branch_id)
     }
 
     fn validate(&self) -> Result<(), LixError> {
@@ -1172,24 +1061,18 @@ fn decode_key_value_snapshot<'a>(
     })
 }
 
-/// Builds a reserved `lix_key_value` row for plugin bookkeeping.
-///
-/// File-scoped plugin rows must be written in the same durability lane as the
-/// file they describe, so the lane is a parameter rather than a constant. Rows
-/// that are not file-scoped (the branch's plugin registry) are always tracked.
-fn plugin_key_value_write_row(
+fn tracked_key_value_write_row(
     key: &str,
     file_id: Option<String>,
     snapshot: Option<JsonValue>,
     branch_id: &str,
-    untracked: bool,
 ) -> Result<TransactionWriteRow, LixError> {
     validate_branch_local_scope(branch_id)?;
     let snapshot = snapshot
         .map(|snapshot| TransactionJson::from_value(snapshot, "plugin registry key-value row"))
         .transpose()?;
     Ok(TransactionWriteRow {
-        row_pk: Some(RowPk::single(key)),
+        entity_pk: Some(EntityPk::single(key)),
         schema_key: KEY_VALUE_SCHEMA_KEY.into(),
         file_id: file_id.map(Into::into),
         snapshot,
@@ -1200,32 +1083,27 @@ fn plugin_key_value_write_row(
         global: false,
         change_id: None,
         commit_id: None,
-        untracked,
+        untracked: false,
         branch_id: branch_id.into(),
     })
 }
 
-fn validate_hot_state_identity(
-    row: &MaterializedHotStateRow,
+fn validate_state_identity(
+    row: &StateRow,
     key: &str,
     expected_file_id: Option<&str>,
     branch_id: &str,
-    expected_untracked: bool,
 ) -> Result<(), LixError> {
     validate_branch_local_scope(branch_id)?;
-    if row.schema_key != KEY_VALUE_SCHEMA_KEY
-        || row.row_pk.as_single_string().ok() != Some(key)
-        || row.file_id.as_deref() != expected_file_id
-        || row.global
-        // A file-scoped reserved row lives in its own file's lane. The branch
-        // registry stays tracked (it is branch-global with no file), but an
-        // owner row for an untracked file is untracked, and reading it back
-        // must accept exactly the lane it was written in.
-        || row.untracked != expected_untracked
-        || row.branch_id.as_ref() != branch_id
+    let state_key = crate::forktree::decode_state_key(&row.key)?;
+    if state_key.schema_key != KEY_VALUE_SCHEMA_KEY
+        || state_key.entity_pk.as_single_string().ok() != Some(key)
+        || state_key.file_id.as_deref() != expected_file_id
+        || branch_id.is_empty()
+        || row.source != crate::state::StateRowSource::Branch
     {
         return Err(invalid_registry(format!(
-            "reserved plugin row '{key}' has invalid branch-local storage identity"
+            "reserved plugin row '{key}' has invalid tracked branch-local storage identity"
         )));
     }
     Ok(())
@@ -1240,15 +1118,18 @@ fn validate_branch_local_scope(branch_id: &str) -> Result<(), LixError> {
     Ok(())
 }
 
-fn parse_snapshot_content(
-    row: &MaterializedHotStateRow,
-    kind: &str,
-) -> Result<JsonValue, LixError> {
-    let raw = row.snapshot_content.as_deref().ok_or_else(|| {
-        invalid_registry(format!("{kind} live-state row is missing snapshot_content"))
-    })?;
+fn parse_snapshot_content(row: &StateRow, kind: &str) -> Result<JsonValue, LixError> {
+    let raw = state_snapshot_content(row)
+        .ok_or_else(|| invalid_registry(format!("{kind} state row is missing snapshot content")))?;
     serde_json::from_str(raw)
         .map_err(|error| invalid_registry(format!("{kind} snapshot is invalid JSON: {error}")))
+}
+
+fn state_snapshot_content(row: &StateRow) -> Option<&str> {
+    match &row.value.cell {
+        crate::forktree::StateCell::Value(value) => Some(value.as_str()),
+        crate::forktree::StateCell::Null | crate::forktree::StateCell::Tombstone => None,
+    }
 }
 
 fn glob_specificity_rank(glob: &str) -> (u8, i32) {
@@ -1278,6 +1159,7 @@ mod tests {
     use std::cell::Cell;
     use std::sync::Arc;
 
+    use crate::changelog::ChangeId;
     use serde_json::{Value as JsonValue, json};
 
     use super::*;
@@ -1297,7 +1179,7 @@ mod tests {
                     serde_json::to_string(&content).expect("plugin content type should serialize");
                 format!(r#","content":{value}"#)
             })
-            .unwrap_or_default();
+            .unwrap_or_else(String::new);
         format!(
             r#"{{
                 "schemas":["schema/default.json"],
@@ -1523,16 +1405,16 @@ mod tests {
     }
 
     #[test]
-    fn owner_rows_share_one_row_key_and_use_file_id_identity() {
+    fn owner_rows_share_one_entity_key_and_use_file_id_identity() {
         let owner = PluginFileOwner::new(
             "01920000-0000-7000-8000-0000000000a2",
             "plugin_a",
             vec!["plugin_a_note".to_string(), "plugin_a_meta".to_string()],
         )
         .unwrap();
-        let row = owner.write_row("main", false).unwrap();
+        let row = owner.write_row("main").unwrap();
         assert_eq!(
-            row.row_pk.unwrap().as_single_string().unwrap(),
+            row.entity_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_OWNER_KEY
         );
         assert_eq!(
@@ -1548,9 +1430,59 @@ mod tests {
         let registry_row = PluginRegistry::empty().write_row("main").unwrap();
         assert_eq!(registry_row.file_id, None);
         assert_eq!(
-            registry_row.row_pk.unwrap().as_single_string().unwrap(),
+            registry_row.entity_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_REGISTRY_KEY
         );
+    }
+
+    #[test]
+    fn registry_state_identity_is_branch_local_and_never_global() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let snapshot = PluginRegistry::empty().to_snapshot().unwrap().to_string();
+        let timestamp = crate::common::LixTimestamp::expect_parse(
+            "plugin registry test timestamp",
+            "2026-08-10T00:00:00Z",
+        );
+        let row = StateRow {
+            key: crate::forktree::encode_state_key(crate::forktree::StateKeyRef {
+                schema_key: KEY_VALUE_SCHEMA_KEY,
+                file_id: None,
+                entity_pk: &EntityPk::single(PLUGIN_REGISTRY_KEY),
+            }),
+            value: crate::forktree::StateValue {
+                change_id: ChangeId::new(uuid::Uuid::from_u128(1)),
+                commit_id: crate::changelog::CommitId::new(uuid::Uuid::from_u128(2)),
+                created_at: timestamp,
+                updated_at: timestamp,
+                cell: crate::forktree::StateCell::Value(snapshot.into()),
+                metadata: None,
+                origin_key: None,
+                blob_manifest_object_ids: Vec::new(),
+            },
+            source: crate::state::StateRowSource::Branch,
+        };
+        assert_eq!(
+            PluginRegistry::from_required_state_row(Some(&row), branch_id).unwrap(),
+            PluginRegistry::empty()
+        );
+
+        let error = PluginRegistry::from_required_state_row(
+            Some(&StateRow {
+                source: crate::state::StateRowSource::Global,
+                ..row
+            }),
+            branch_id,
+        )
+        .expect_err("global state must not impersonate a branch plugin registry");
+        assert!(
+            error
+                .message
+                .contains("tracked branch-local storage identity")
+        );
+
+        let error = PluginRegistry::from_required_state_row(None, branch_id)
+            .expect_err("missing registry must not become implicit empty authority");
+        assert!(error.message.contains("registry is missing"));
     }
 
     #[test]
@@ -1573,7 +1505,7 @@ mod tests {
             archive_file_id: plugin_storage_archive_file_id("plugin_a"),
             archive_path: plugin_storage_archive_path("plugin_a"),
             archive_blob_hash: hash('a'),
-            wasm_blob_hash: BlobId::from_content(&wasm).to_hex(),
+            wasm_blob_hash: BlobId::from_canonical_content(&wasm).to_hex(),
         };
         let registry_entry = PluginRegistryEntry::new(input.clone()).unwrap();
         let installed = registry_entry
@@ -1581,7 +1513,7 @@ mod tests {
             .expect("matching extracted WASM should materialize");
         assert_eq!(installed.key, "plugin_a");
         assert_eq!(installed.content, Some(PluginContentMatcher::Text));
-        assert_eq!(installed.wasm_hash, BlobId::from_content(&wasm));
+        assert_eq!(installed.wasm_hash, BlobId::from_canonical_content(&wasm));
         assert_eq!(installed.wasm, wasm);
 
         input.wasm_blob_hash = hash('b');

@@ -17,6 +17,12 @@ pub mod wire;
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 pub mod runtime;
 
+// Engine internals consume the single component-runtime contract through the
+// plugin owner. Keep these crate-private so the public plugin authoring API is
+// still the target-neutral `api`/`wire` surface above.
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+pub(crate) use runtime::*;
+
 #[cfg(any(
     not(target_arch = "wasm32"),
     all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")

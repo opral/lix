@@ -253,7 +253,6 @@ impl SegmentBuilder {
         crate::storage_bench::record_immutable_segment_identity_hash_bytes(
             size_of::<u64>() + key.0.len() + size_of::<u64>(),
         );
-
         let mut header = BytesMut::with_capacity(IMMUTABLE_VALUE_MAGIC.len() + size_of::<u64>());
         header.extend_from_slice(IMMUTABLE_VALUE_MAGIC);
         header.extend_from_slice(&value_len.to_le_bytes());

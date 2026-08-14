@@ -41,16 +41,11 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "diagnostics",
             "execution",
             "init",
-            "hot_state",
+            "live_state",
             "schema",
             "session",
             "sql",
         ],
-    },
-    ForbiddenDependencyRule {
-        from_scope: "hot_state",
-        reason: "hot_state is the generic projection engine and must not reacquire services sidecars or write orchestration owners",
-        forbidden_scopes: &["execution", "services"],
     },
     ForbiddenDependencyRule {
         from_scope: "sql2",
@@ -76,7 +71,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
 ];
 
-const TARGET_CORE_MODULES: &[&str] = &["storage", "hot_state", "session", "sql2", "transaction"];
+const TARGET_CORE_MODULES: &[&str] = &["storage", "session", "sql2", "transaction"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineDependencyGraph {
@@ -1259,6 +1254,32 @@ fn production_source_files() -> Vec<(String, String)> {
     files
 }
 
+fn current_retired_authority_residue() -> Vec<(String, String)> {
+    const RETIRED_TOKENS: &[&str] = &[
+        "live_state",
+        "tracked_state",
+        "TrackedState",
+        "TrackedHead",
+        "BranchHeadControl",
+        "StateForeignKeyPlan",
+        "StateDeleteReferencePlan",
+        "lix_state_by_branch",
+        "lix_state_history",
+        "lix_label_assignment",
+    ];
+
+    production_source_files()
+        .into_iter()
+        .flat_map(|(relative_path, source)| {
+            let masked_source = mask_rust_source(&source);
+            RETIRED_TOKENS.iter().filter_map(move |token| {
+                contains_identifier(&masked_source, token)
+                    .then(|| (relative_path.clone(), (*token).to_owned()))
+            })
+        })
+        .collect()
+}
+
 fn source_test_and_bench_rust_files() -> Vec<(String, String)> {
     let mut files = production_source_files();
 
@@ -1624,6 +1645,9 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
             if sealed_owner_allows_importer(owner_root, &relative_path) {
                 continue;
             }
+            if sealed_owner_allows_import_path(owner_root, &imported_path) {
+                continue;
+            }
 
             if !violates_sealed_owner_boundary(owner_root, &imported_path, &child_modules) {
                 continue;
@@ -1644,12 +1668,6 @@ fn violates_sealed_owner_boundary(
     imported_path: &[String],
     child_modules: &BTreeMap<String, BTreeSet<String>>,
 ) -> bool {
-    if owner_root == "plugin" {
-        return !matches!(
-            imported_path.get(1).map(String::as_str),
-            Some("runtime" | "wire")
-        );
-    }
     if sealed_owner_root_facade_owners().contains(owner_root) {
         return true;
     }
@@ -1666,6 +1684,13 @@ fn sealed_owner_root_facade_owners() -> BTreeSet<&'static str> {
 fn sealed_owner_allows_importer(owner_root: &str, importer_file: &str) -> bool {
     (matches!(owner_root, "api") && importer_file == "lib.rs")
         || importer_file == "storage_bench.rs"
+}
+
+fn sealed_owner_allows_import_path(owner_root: &str, imported_path: &[String]) -> bool {
+    owner_root == "transaction"
+        && imported_path
+            .get(1)
+            .is_some_and(|segment| segment == "types")
 }
 
 fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -> String {
@@ -1942,7 +1967,7 @@ fn current_services_sibling_dependency_violations() -> Vec<ImportPathViolation> 
 }
 
 fn is_engine_owned_persistence_path(relative_path: &str) -> bool {
-    let in_scope_owner_root = relative_path.starts_with("hot_state")
+    let in_scope_owner_root = relative_path.starts_with("live_state")
         || relative_path.starts_with("canonical")
         || relative_path.starts_with("binary_cas")
         || relative_path.starts_with("session/branch_ops");
@@ -2027,7 +2052,7 @@ fn current_engine_owned_persistence_raw_storage_type_violations() -> Vec<RawStor
 }
 
 fn is_owner_persistence_root_path(relative_path: &str) -> bool {
-    relative_path.starts_with("hot_state")
+    relative_path.starts_with("live_state")
         || relative_path.starts_with("canonical")
         || relative_path.starts_with("binary_cas")
 }
@@ -2078,7 +2103,14 @@ fn current_storage_import_outside_storage_adapter_violations() -> Vec<ImportPath
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
-        if relative_path.starts_with("storage") || relative_path.starts_with("storage_adapter") {
+        // ForkTree is the sealed persistence owner. Its codec/tree/view code
+        // must use the substrate directly to authenticate and publish the
+        // owner-owned OBJECT_SPACE/SELECTOR_SPACE planes. Every other engine
+        // root is required to consume adapter-facing aliases instead.
+        if relative_path.starts_with("storage")
+            || relative_path.starts_with("storage_adapter")
+            || relative_path.starts_with("forktree/")
+        {
             continue;
         }
 
@@ -2171,8 +2203,8 @@ fn is_allowed_raw_execute_boundary_path(relative_path: &str) -> bool {
     is_owner_local_storage_path(relative_path)
         || relative_path.starts_with("sql")
         || relative_path.starts_with("execution")
-        || relative_path == "server_protocol/mod.rs"
         || relative_path == "transaction/buffered_write_transaction.rs"
+        || relative_path == "transaction/live_state_write_transaction.rs"
 }
 
 fn current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations()
@@ -2441,6 +2473,21 @@ fn rust_modules_do_not_use_path_attributes() {
 }
 
 #[test]
+fn retired_state_authorities_have_no_production_residue() {
+    let residues = current_retired_authority_residue();
+
+    assert!(
+        residues.is_empty(),
+        "retired live/tracked-state authority names must not re-enter production source;\n\nResidues:\n{}",
+        residues
+            .iter()
+            .map(|(path, token)| format!("{path}: {token}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
+#[test]
 fn sealed_owner_violations_are_empty() {
     let violations = current_sealed_owner_violations();
 
@@ -2654,7 +2701,7 @@ fn internal_metadata_crud_is_centralized_in_owner_storage() {
 
     assert!(
         violations.is_empty(),
-        "internal metadata CRUD for primary-session state, commit idempotency, and undo/redo log should live in owner-local `storage.rs` seams, not scattered through `api/*`, `init/*`, `session/*`, or `transaction/*`.\n\nCurrent violations:\n{}",
+        "internal metadata CRUD for workspace selectors, commit idempotency, and undo/redo log should live in owner-local `storage.rs` seams, not scattered through `api/*`, `init/*`, `session/*`, or `transaction/*`.\n\nCurrent violations:\n{}",
         render_grouped_raw_sql_execution_violations(&violations),
     );
 }
@@ -2746,7 +2793,11 @@ fn sql2_read_session_does_not_register_write_surfaces() {
     assert_source_contains_none(
         relative,
         read_session,
-        &["SqlWriteContext::new", "providers::register_write"],
+        &[
+            "SqlWriteContext::new",
+            "SqlWriteContext::<R>::new",
+            "providers::register_write",
+        ],
     );
 
     let relative = "sql2/providers/mod.rs";
@@ -2835,7 +2886,7 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
     assert_source_contains_all(
         relative,
         write_session,
-        &["SqlWriteContext::new", "providers::register_write"],
+        &["SqlWriteContext::<R>::new", "providers::register_write"],
     );
     assert_source_contains_none(relative, write_session, &["providers::register_read"]);
 
@@ -2875,7 +2926,7 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
         relative,
         write_registration,
         &[
-            "ctx.hot_state()",
+            "ctx.live_state()",
             "ctx.branch_ref()",
             "PublicCatalog::from_visible_schemas",
             "register_lix_branch_provider",

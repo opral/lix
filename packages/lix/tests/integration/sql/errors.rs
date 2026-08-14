@@ -225,29 +225,32 @@ simulation_test!(sql_explain_is_read_shaped, |sim| async move {
     assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
 });
 
-simulation_test!(sql_json_function_miss_has_postgres_jsonb_hint, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_session()
+simulation_test!(
+    sql_json_function_miss_has_postgres_jsonb_hint,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute("SELECT json_extract('{\"a\":1}', '$.a')", &[])
             .await
-            .expect("main session should open"),
-        &engine,
-    );
+            .expect_err("non-Lix JSON UDF should fail with a targeted hint");
 
-    let error = session
-        .execute("SELECT json_extract('{\"a\":1}', '$.a')", &[])
-        .await
-        .expect_err("non-Lix JSON UDF should fail with a targeted hint");
-
-    assert_eq!(error.code, LixError::CODE_UDF_NOT_FOUND);
-    assert!(
-        error
-            .hint()
-            .is_some_and(|hint| hint.contains("PostgreSQL JSONB operators")),
-        "expected PostgreSQL JSONB hint: {error}"
-    );
-});
+        assert_eq!(error.code, LixError::CODE_UDF_NOT_FOUND);
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("PostgreSQL JSONB operators")),
+            "expected PostgreSQL JSONB hint: {error}"
+        );
+    }
+);
 
 simulation_test!(
     sql_json_arrow_operator_uses_postgres_semantics,

@@ -7,9 +7,7 @@ use lix::{
 use lix::{LixError, Value};
 use lix::{engine::Engine, init::InitReceipt, session::SessionContext};
 
-use super::expect_same::SimulationAssertions;
 use super::mode::{SimulationMode, SimulationOptions};
-use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
 
 /// Per-mode handle exposed to tests using `simulation_test!`.
 #[derive(Clone)]
@@ -18,12 +16,9 @@ use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
     reason = "shared integration-test harness is compiled once per test target"
 )]
 pub struct Simulation {
-    mode: SimulationMode,
     storage: Memory,
     engine: Engine,
     receipt: InitReceipt,
-    rebuild_tracked_state: RebuildTrackedStateSimulation,
-    assertions: SimulationAssertions,
 }
 
 #[allow(
@@ -32,24 +27,19 @@ pub struct Simulation {
 )]
 impl Simulation {
     pub(super) async fn from_bootstrap(
-        mode: SimulationMode,
+        _mode: SimulationMode,
         options: SimulationOptions,
         storage: Memory,
         receipt: InitReceipt,
-        assertions: SimulationAssertions,
     ) -> Result<Self, LixError> {
         let engine = Engine::new(storage.clone()).await?;
         if options.deterministic {
-            super::macro_runtime::enable_deterministic_mode(&engine, &receipt, mode).await?;
+            super::macro_runtime::enable_deterministic_mode(&engine, &receipt).await?;
         }
-        assertions.start_mode(mode);
         Ok(Self {
-            mode,
             storage,
             engine,
             receipt,
-            rebuild_tracked_state: RebuildTrackedStateSimulation::new(mode),
-            assertions,
         })
     }
 
@@ -68,11 +58,10 @@ impl Simulation {
     }
 
     /// Wraps a normal engine session with simulation hooks.
-    pub fn wrap_session(&self, session: SessionContext, engine: &Engine) -> SimSession {
+    pub fn wrap_session(&self, session: SessionContext, _engine: &Engine) -> SimSession {
         SimSession {
             sim: self.clone(),
-            engine: engine.clone(),
-            fs: SimFs::new(self.clone(), engine.clone(), session.clone()),
+            fs: SimFs::new(self.clone(), session.clone()),
             session,
         }
     }
@@ -97,10 +86,6 @@ impl Simulation {
     pub fn main_branch_id(&self) -> &str {
         &self.receipt.main_branch_id
     }
-
-    pub(crate) fn finish(&self) {
-        self.assertions.finish_mode(self.mode);
-    }
 }
 
 /// Session wrapper that injects simulation behavior around normal execution.
@@ -111,7 +96,6 @@ impl Simulation {
 )]
 pub struct SimSession {
     sim: Simulation,
-    engine: Engine,
     session: SessionContext,
     pub fs: SimFs,
 }
@@ -121,11 +105,10 @@ pub struct SimSession {
     reason = "shared integration-test harness is compiled once per test target"
 )]
 impl SimSession {
-    pub fn wrap_session(&self, session: SessionContext, engine: &Engine) -> Self {
+    pub fn wrap_session(&self, session: SessionContext, _engine: &Engine) -> Self {
         Self {
             sim: self.sim.clone(),
-            engine: engine.clone(),
-            fs: SimFs::new(self.sim.clone(), engine.clone(), session.clone()),
+            fs: SimFs::new(self.sim.clone(), session.clone()),
             session,
         }
     }
@@ -135,68 +118,31 @@ impl SimSession {
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        let statement_kind = classify_statement(sql);
-        if statement_kind == StatementKind::Read {
-            let active_branch_id = self.session.active_branch_id().await?;
-            self.sim
-                .rebuild_tracked_state
-                .before_read(&self.engine, &active_branch_id)
-                .await?;
-        }
-
         let result = self.session.execute(sql, params).await;
-        if let Ok(result) = &result {
-            if statement_kind == StatementKind::Write || execute_result_looks_like_write(result) {
-                self.sim.rebuild_tracked_state.after_successful_write();
-            }
-        }
         result
     }
 
     pub async fn begin_transaction(&self) -> Result<SimTransaction, LixError> {
-        let active_branch_id = self.session.active_branch_id().await?;
-        self.sim
-            .rebuild_tracked_state
-            .before_read(&self.engine, &active_branch_id)
-            .await?;
         let transaction = self.session.begin_transaction().await?;
-        Ok(SimTransaction {
-            sim: self.sim.clone(),
-            engine: self.engine.clone(),
-            session: self.session.clone(),
-            transaction,
-            saw_write: false,
-        })
+        Ok(SimTransaction { transaction })
     }
 
     pub async fn create_branch(
         &self,
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
-        let result = self.session.create_branch(options).await;
-        if result.is_ok() {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
-        result
+        self.session.create_branch(options).await
     }
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
-        let result = self.session.create_checkpoint().await;
-        if result.is_ok() {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
-        result
+        self.session.create_checkpoint().await
     }
 
     pub async fn merge_branch(
         &self,
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
-        let result = self.session.merge_branch(options).await;
-        if result.is_ok() {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
-        result
+        self.session.merge_branch(options).await
     }
 
     pub async fn merge_branch_preview(
@@ -221,7 +167,6 @@ impl SimSession {
 )]
 pub struct SimFs {
     sim: Simulation,
-    engine: Engine,
     session: SessionContext,
 }
 
@@ -230,12 +175,8 @@ pub struct SimFs {
     reason = "shared integration-test harness is compiled once per test target"
 )]
 impl SimFs {
-    fn new(sim: Simulation, engine: Engine, session: SessionContext) -> Self {
-        Self {
-            sim,
-            engine,
-            session,
-        }
+    fn new(sim: Simulation, session: SessionContext) -> Self {
+        Self { sim, session }
     }
 
     pub async fn write_file(&self, path: &str, data: Vec<u8>) -> Result<(), LixError> {
@@ -248,18 +189,10 @@ impl SimFs {
             )
             .await
             .map(|_| ());
-        if result.is_ok() {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
         result
     }
 
     pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
-        let active_branch_id = self.session.active_branch_id().await?;
-        self.sim
-            .rebuild_tracked_state
-            .before_read(&self.engine, &active_branch_id)
-            .await?;
         let result = self
             .session
             .execute(
@@ -283,18 +216,10 @@ impl SimFs {
             )
             .await
             .map(|_| ());
-        if result.is_ok() {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
         result
     }
 
     pub async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>, LixError> {
-        let active_branch_id = self.session.active_branch_id().await?;
-        self.sim
-            .rebuild_tracked_state
-            .before_read(&self.engine, &active_branch_id)
-            .await?;
         let result = self
             .session
             .execute(
@@ -342,9 +267,6 @@ impl SimFs {
             Ok(())
         }
         .await;
-        if result.is_ok() {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
         result
     }
 }
@@ -371,11 +293,7 @@ fn direct_child_name(parent: &str, child: &str) -> Option<String> {
     reason = "shared integration-test harness is compiled once per test target"
 )]
 pub struct SimTransaction {
-    sim: Simulation,
-    engine: Engine,
-    session: SessionContext,
     transaction: SessionTransaction,
-    saw_write: bool,
 }
 
 #[allow(
@@ -388,197 +306,14 @@ impl SimTransaction {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        let statement_kind = classify_statement(sql);
-        match statement_kind {
-            StatementKind::Read => {
-                let active_branch_id = self.transaction.active_branch_id()?.to_string();
-                self.sim
-                    .rebuild_tracked_state
-                    .before_read(&self.engine, &active_branch_id)
-                    .await?;
-            }
-            StatementKind::Write | StatementKind::Utility => {}
-        }
-        let result = self.transaction.execute(sql, params).await;
-        if let Ok(result) = &result {
-            if statement_kind == StatementKind::Write || execute_result_looks_like_write(result) {
-                self.saw_write = true;
-            }
-        }
-        result
+        self.transaction.execute(sql, params).await
     }
 
     pub async fn commit(self) -> Result<(), LixError> {
-        let result = self.transaction.commit().await;
-        if result.is_ok() && self.saw_write {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
-        result
+        self.transaction.commit().await
     }
 
     pub async fn rollback(self) -> Result<(), LixError> {
         self.transaction.rollback().await
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatementKind {
-    Read,
-    Write,
-    Utility,
-}
-
-fn classify_statement(sql: &str) -> StatementKind {
-    let sql = skip_leading_sql_trivia(sql);
-    if let Some(inner) = sql.strip_prefix('(') {
-        return classify_statement(inner);
-    }
-
-    let (keyword, _rest) = first_keyword_and_rest(sql);
-    match keyword.as_str() {
-        "SELECT" | "WITH" | "VALUES" | "FROM" | "TABLE" | "EXPLAIN" => StatementKind::Read,
-        "INSERT" | "UPDATE" | "DELETE" => StatementKind::Write,
-        _ => StatementKind::Utility,
-    }
-}
-
-fn first_keyword_and_rest(sql: &str) -> (String, &str) {
-    let sql = skip_leading_sql_trivia(sql);
-    let end_index = sql
-        .char_indices()
-        .find_map(|(index, ch)| {
-            if !(ch.is_ascii_alphanumeric() || ch == '_') {
-                Some(index)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(sql.len());
-    (sql[..end_index].to_ascii_uppercase(), &sql[end_index..])
-}
-
-fn skip_leading_sql_trivia(mut sql: &str) -> &str {
-    loop {
-        let trimmed = sql.trim_start();
-        if trimmed.len() != sql.len() {
-            sql = trimmed;
-            continue;
-        }
-
-        if let Some(comment_body) = sql.strip_prefix("--") {
-            let Some(newline_index) = comment_body.find('\n') else {
-                return "";
-            };
-            sql = &comment_body[newline_index + 1..];
-            continue;
-        }
-
-        if let Some(comment_body) = sql.strip_prefix("/*") {
-            let Some(end_index) = end_of_nested_block_comment(comment_body) else {
-                return "";
-            };
-            sql = &comment_body[end_index..];
-            continue;
-        }
-
-        return sql;
-    }
-}
-
-fn end_of_nested_block_comment(comment_body: &str) -> Option<usize> {
-    let mut depth = 1usize;
-    let mut index = 0usize;
-    while index < comment_body.len() {
-        let rest = &comment_body[index..];
-        if rest.starts_with("/*") {
-            depth += 1;
-            index += 2;
-            continue;
-        }
-        if rest.starts_with("*") {
-            depth -= 1;
-            index += 2;
-            if depth == 0 {
-                return Some(index);
-            }
-            continue;
-        }
-        index += rest.chars().next().map(char::len_utf8).unwrap_or_default();
-    }
-    None
-}
-
-fn execute_result_looks_like_write(result: &ExecuteResult) -> bool {
-    result.columns().is_empty() && result.rows().is_empty()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classify_statement_splits_reads_writes_and_utility() {
-        assert_eq!(classify_statement("SELECT 1"), StatementKind::Read);
-        assert_eq!(
-            classify_statement("  WITH x AS (...) SELECT 1"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            classify_statement("-- leading comment\nSELECT 1"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            classify_statement("/* leading block */ INSERT INTO t VALUES (1)"),
-            StatementKind::Write
-        );
-        assert_eq!(
-            classify_statement("/* outer /* inner */ outer */ SELECT 1"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            classify_statement("INSERT INTO t VALUES (1)"),
-            StatementKind::Write
-        );
-        assert_eq!(
-            classify_statement("UPDATE t SET a = 1"),
-            StatementKind::Write
-        );
-        assert_eq!(classify_statement("DELETE FROM t"), StatementKind::Write);
-        assert_eq!(classify_statement("EXPLAIN SELECT 1"), StatementKind::Read);
-        assert_eq!(
-            classify_statement("EXPLAIN ANALYZE INSERT INTO t VALUES (1)"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            classify_statement("EXPLAIN FORMAT INDENT SELECT 1"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            classify_statement("EXPLAIN FORMAT 'INDENT' SELECT 1"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            classify_statement("EXPLAIN FORMAT \"INDENT\" SELECT 1"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            classify_statement("SELECT/* comment */ 1"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            classify_statement("EXPLAIN/* comment */ SELECT 1"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            classify_statement("EXPLAIN (SELECT 1)"),
-            StatementKind::Read
-        );
-        assert_eq!(classify_statement("VALUES (1), (2)"), StatementKind::Read);
-        assert_eq!(
-            classify_statement("FROM lix_file SELECT id"),
-            StatementKind::Read
-        );
-        assert_eq!(classify_statement("(SELECT 1)"), StatementKind::Read);
-        assert_eq!(classify_statement("((SELECT 1))"), StatementKind::Read);
     }
 }

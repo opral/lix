@@ -12,7 +12,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -20,10 +20,9 @@ simulation_test!(
 
         let register_schema_result = session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_dummy_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_dummy_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -34,41 +33,38 @@ simulation_test!(
 
         let registered_schema_row = session
             .execute(
-                "SELECT lixcol_row_pk, value \
+                "SELECT lixcol_entity_pk, value \
                  FROM lix_registered_schema",
                 &[],
             )
             .await
             .expect("registered schema read should succeed");
         let registered_schema_rows = registered_schema_row;
-        let registered_schema_row_pk = registered_schema_rows
+        let registered_schema_entity_pk = registered_schema_rows
             .rows()
             .iter()
             .find_map(|row| match row.values() {
-                [Value::Json(row_pk), Value::Json(value)]
-                    if value
-                        .to_value()
-                        .get("key")
-                        .and_then(serde_json::Value::as_str)
+                [Value::Json(entity_pk), Value::Json(value)]
+                    if value.get("x-lix-key").and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema") =>
                 {
-                    Some(row_pk)
+                    Some(entity_pk)
                 }
-                [Value::Json(row_pk), Value::Text(value)] => {
+                [Value::Json(entity_pk), Value::Text(value)] => {
                     let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
-                    (value.get("key").and_then(serde_json::Value::as_str)
+                    (value.get("x-lix-key").and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema"))
-                    .then_some(row_pk)
+                    .then_some(entity_pk)
                 }
                 _ => None,
             })
             .expect("registered schema row should be visible");
-        assert_eq!(registered_schema_row_pk, &json!(["engine_dummy_schema"]));
+        assert_eq!(registered_schema_entity_pk, &json!(["engine_dummy_schema"]));
 
         let insert_state_result = session
             .execute(
-                "INSERT INTO engine_dummy_schema (id, name, lixcol_untracked) \
-             VALUES ('dummy-1', 'Dummy', true)",
+                "INSERT INTO engine_dummy_schema (id, name) \
+             VALUES ('dummy-1', 'Dummy')",
                 &[],
             )
             .await
@@ -102,25 +98,33 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         let schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "default_values_probe",
-            "columns": [
-                { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
-                { "name": "label", "type": "text", "nullable": false, "default_value": "untitled" },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "default_values_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "x-lix-default": "lix_uuid_v7()",
+                },
+                "label": {
+                    "type": "string",
+                    "default": "untitled",
+                },
+            },
+            "required": ["id", "label"],
+            "additionalProperties": false,
         });
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES ($1)",
-                &[Value::Json(schema.into())],
+                &[Value::Json(schema)],
             )
             .await
             .expect("schema registration should succeed");
@@ -134,7 +138,7 @@ simulation_test!(
         let selected = session
             .execute("SELECT id, label FROM default_values_probe", &[])
             .await
-            .expect("defaulted row should be readable");
+            .expect("defaulted entity should be readable");
         assert_eq!(selected.len(), 1);
         let [Value::Text(id), Value::Text(label)] = selected.rows()[0].values() else {
             panic!("generated and literal defaults should produce text columns");
@@ -151,25 +155,30 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         let schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "default_values_missing_required",
-            "columns": [
-                { "name": "id", "type": "uuid", "nullable": false, "default_expression": "uuidv7()" },
-                { "name": "label", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "default_values_missing_required",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "x-lix-default": "lix_uuid_v7()",
+                },
+                "label": { "type": "string" },
+            },
+            "required": ["id", "label"],
+            "additionalProperties": false,
         });
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) VALUES ($1)",
-                &[Value::Json(schema.into())],
+                &[Value::Json(schema)],
             )
             .await
             .expect("schema registration should succeed");
@@ -191,7 +200,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -203,10 +212,9 @@ simulation_test!(
 
         transaction
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"sql_template_snapshot_note\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"text\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"sql_template_snapshot_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -249,50 +257,11 @@ simulation_test!(
                 &[Value::Text("note-1".to_string())],
             )
             .await
-            .expect("new schema surface should be readable after commit");
+            .expect("new entity surface should be readable after commit");
         assert_rows_eq(
             selected,
             vec![vec![Value::Text("after commit".to_string())]],
         );
-    }
-);
-
-simulation_test!(
-    untracked_registered_schema_does_not_authorize_tracked_typed_write,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_untracked_only_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
-                 true\
-                 )",
-                &[],
-            )
-            .await
-            .expect("untracked schema registration should succeed");
-
-        let error = session
-            .execute(
-                "INSERT INTO engine_untracked_only_schema \
-                 (id, name, lixcol_untracked) \
-                 VALUES ('tracked-1', 'Tracked', false)",
-                &[],
-            )
-            .await
-            .expect_err("tracked rows must not validate against committed untracked schemas");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
     }
 );
 
@@ -302,7 +271,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -317,19 +286,19 @@ simulation_test!(
             "lix_plugin_note",
         ] {
             let schema = json!({
-                "$schema": "https://lix.dev/schema-v1.json",
-                "key": schema_key,
-                "columns": [
-                    { "name": "id", "type": "text", "nullable": false },
-                ],
-                "primary_key": ["id"],
+                "x-lix-key": schema_key,
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false,
             });
             let error = session
                 .execute(
                     "INSERT INTO lix_registered_schema \
-                     (value, lixcol_global, lixcol_untracked) \
-                     VALUES ($1, false, false)",
-                    &[Value::Json(schema.into())],
+                     (value, lixcol_global) \
+                     VALUES ($1, false)",
+                    &[Value::Json(schema)],
                 )
                 .await
                 .expect_err("every lix_* runtime schema key should be reserved");
@@ -350,19 +319,19 @@ simulation_test!(
         }
 
         let noncolliding_schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "acme_plugin_note",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "acme_plugin_note",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false,
         });
         session
             .execute(
                 "INSERT INTO lix_registered_schema \
-                 (value, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, false, false)",
-                &[Value::Json(noncolliding_schema.into())],
+                 (value, lixcol_global) \
+                 VALUES ($1, false)",
+                &[Value::Json(noncolliding_schema)],
             )
             .await
             .expect("an application-owned schema namespace should remain registerable");
@@ -375,7 +344,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -383,7 +352,7 @@ simulation_test!(
 
         let registered = session
             .execute(
-                "SELECT value ->> 'key' \
+                "SELECT lix_json_get_text(value, 'x-lix-key') \
                  FROM lix_registered_schema",
                 &[],
             )
@@ -404,7 +373,7 @@ simulation_test!(
             "lix_branch_descriptor",
             "lix_branch_ref",
             "lix_change",
-            "lix_checkpoint",
+            "lix_checkpoint_marker",
             "lix_commit",
             "lix_commit_edge",
             "lix_directory_descriptor",
@@ -437,6 +406,7 @@ simulation_test!(
             "lix_registered_schema",
             "lix_registered_schema_by_branch",
             "lix_checkpoint",
+            "lix_checkpoint_by_branch",
             "lix_working_diff",
             "lix_working_diff_by_branch",
             "lix_file_working_diff",
@@ -453,7 +423,7 @@ simulation_test!(
             .execute(
                 "SELECT function_name \
                  FROM information_schema.table_functions \
-                 WHERE function_name IN ('lix_checkpoint_history', 'lix_key_value_history', 'lix_registered_schema_history') \
+                 WHERE function_name IN ('lix_key_value_history', 'lix_registered_schema_history') \
                  GROUP BY function_name \
                  ORDER BY function_name",
                 &[],
@@ -463,12 +433,12 @@ simulation_test!(
         assert_rows_eq(
             history_functions,
             vec![
-                vec![Value::Text("lix_checkpoint_history".to_string())],
                 vec![Value::Text("lix_key_value_history".to_string())],
                 vec![Value::Text("lix_registered_schema_history".to_string())],
             ],
         );
         for surface_name in [
+            "lix_checkpoint_marker",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",
@@ -491,7 +461,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_session()
+            .open_workspace_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -499,10 +469,9 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
 
     session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_delete_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_delete_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -512,40 +481,37 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
 
     let registered_schema_rows = session
         .execute(
-            "SELECT lixcol_row_pk, value \
+            "SELECT lixcol_entity_pk, value \
                  FROM lix_registered_schema",
             &[],
         )
         .await
         .expect("registered schema read should succeed");
-    let delete_schema_row_pk = registered_schema_rows
+    let delete_schema_entity_pk = registered_schema_rows
         .rows()
         .iter()
         .find_map(|row| match row.values() {
-            [Value::Json(row_pk), Value::Json(value)]
-                if value
-                    .to_value()
-                    .get("key")
-                    .and_then(serde_json::Value::as_str)
+            [Value::Json(entity_pk), Value::Json(value)]
+                if value.get("x-lix-key").and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema") =>
             {
-                Some(row_pk.clone())
+                Some(entity_pk.clone())
             }
-            [Value::Json(row_pk), Value::Text(value)] => {
+            [Value::Json(entity_pk), Value::Text(value)] => {
                 let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
-                (value.get("key").and_then(serde_json::Value::as_str)
+                (value.get("x-lix-key").and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema"))
-                .then_some(row_pk.clone())
+                .then_some(entity_pk.clone())
             }
             _ => None,
         })
-        .expect("registered schema row pk should be discoverable");
+        .expect("registered schema entity pk should be discoverable");
 
     let error = session
         .execute(
             "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = $1",
-            &[Value::Json(delete_schema_row_pk)],
+                 WHERE lixcol_entity_pk = $1",
+            &[Value::Json(delete_schema_entity_pk)],
         )
         .await
         .expect_err("schema deletion is not supported yet");
@@ -561,7 +527,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
     let like_error = session
         .execute(
             "DELETE FROM lix_registered_schema \
-             WHERE value ->> 'key' LIKE 'engine_delete%'",
+             WHERE lix_json_get_text(value, 'x-lix-key') LIKE 'engine_delete%'",
             &[],
         )
         .await
@@ -581,38 +547,42 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         let initial_schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "engine_schema_update_history",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "title", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "engine_schema_update_history",
+                        "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
         });
         let amended_schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "engine_schema_update_history",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "title", "type": "text", "nullable": false },
-                { "name": "subtitle", "type": "text", "nullable": true },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "engine_schema_update_history",
+                        "x-lix-primary-key": ["/id"],
+            "type": "object",
             "description": "Compatible tracked schema amendment",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" },
+                "subtitle": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
         });
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, false, false)",
-                &[Value::Json(initial_schema.clone().into())],
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
+                 VALUES ($1, false)",
+                &[Value::Json(initial_schema.clone())],
             )
             .await
             .expect("tracked schema insert should succeed");
@@ -626,8 +596,8 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_row_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB)",
-                &[Value::Json(amended_schema.clone().into())],
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]')",
+                &[Value::Json(amended_schema.clone())],
             )
             .await
             .expect("compatible tracked schema amendment should succeed");
@@ -641,9 +611,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, lixcol_row_pk, lixcol_observed_commit_id, lixcol_depth \
+                    "SELECT value, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_depth \
                      FROM lix_registered_schema_history('{second_commit_id}') \
-                       WHERE lixcol_row_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB) \
+                       WHERE lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]') \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -655,14 +625,14 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Json(amended_schema.into()),
-                    Value::Json(json!(["engine_schema_update_history"]).into()),
+                    Value::Json(amended_schema),
+                    Value::Json(json!(["engine_schema_update_history"])),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
                 ],
                 vec![
-                    Value::Json(initial_schema.into()),
-                    Value::Json(json!(["engine_schema_update_history"]).into()),
+                    Value::Json(initial_schema),
+                    Value::Json(json!(["engine_schema_update_history"])),
                     Value::Text(first_commit_id),
                     Value::Integer(1),
                 ],
@@ -672,12 +642,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_registered_schema_insert_rejects_unknown_primary_key_column,
+    lix_registered_schema_insert_rejects_primary_key_without_json_pointer_slash,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -685,33 +655,44 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_bad_pointer_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"missing\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_bad_pointer_schema\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
             )
             .await
-            .expect_err("registered schema insert should reject unknown primary-key columns");
+            .expect_err("registered schema insert should reject JSON Pointers without leading slash");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error.message.contains("unknown column 'missing'"),
+            error.message.contains("must begin with '/'"),
             "unexpected message: {}",
             error.message
         );
+        assert!(
+            error
+                .message
+                .contains("x-lix-primary-key: \"id\" → \"/id\""),
+            "message should show the offending primary key pointer: {}",
+            error.message
+        );
+        let hint = error.hint.as_deref().expect("error should include a hint");
+        assert!(
+            hint.contains("Did you mean [\"/id\"]?"),
+            "hint should suggest the JSON Pointer form: {hint}"
+        );
     }
 );
 
 simulation_test!(
-    lix_registered_schema_insert_rejects_unknown_column_type,
+    lix_registered_schema_insert_rejects_unprojectable_entity_property,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -719,33 +700,37 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_empty_property_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"kind\",\"type\":\"object\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 true,\
-                 false\
+                 lix_json('{\"x-lix-key\":\"engine_empty_property_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{}},\"required\":[\"id\",\"kind\"],\"additionalProperties\":false}'),\
+                 true\
                  )",
                 &[],
             )
             .await
-            .expect_err("registered schema insert should reject unknown column types");
+            .expect_err("registered schema insert should reject properties without a SQL projection type");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error.message.contains("unknown variant `object`"),
-            "message should identify the unknown type: {}",
+            error.message.contains("property '/kind'"),
+            "message should identify the unprojectable property: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("SQL-projectable JSON Schema type"),
+            "message should explain the projection requirement: {}",
             error.message
         );
     }
 );
 
 simulation_test!(
-    row_by_branch_insert_rejects_target_branch_without_schema,
+    entity_by_branch_insert_rejects_target_branch_without_schema,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -760,10 +745,9 @@ simulation_test!(
         .expect("target branch should be created before schema registration");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_poison_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -774,8 +758,8 @@ simulation_test!(
         let error = main
             .execute(
                 "INSERT INTO engine_poison_schema_by_branch \
-                 (id, name, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('poison-1', 'Poisoned', '01930000-0000-7000-8000-000000000015', true)",
+                 (id, name, lixcol_branch_id) \
+                 VALUES ('poison-1', 'Poisoned', '01930000-0000-7000-8000-000000000015')",
                 &[],
             )
             .await
@@ -795,7 +779,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -810,10 +794,9 @@ simulation_test!(
         .expect("target branch should be created before schema divergence");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_divergent_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
                 &[],
@@ -822,27 +805,31 @@ simulation_test!(
             .expect("main schema should be registered");
 
         let main_schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "engine_divergent_schema",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "name", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "engine_divergent_schema",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "name": { "type": "string" }
+            },
+            "required": ["id", "name"],
+            "additionalProperties": false
         });
         let target_schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "engine_divergent_schema",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "title", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "engine_divergent_schema",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
         });
 
         let target = sim.wrap_session(
             engine
-                .open_session_at("01930000-0000-7000-8000-000000000012")
+                .open_session("01930000-0000-7000-8000-000000000012")
                 .await
                 .expect("target session should open"),
             &engine,
@@ -850,10 +837,9 @@ simulation_test!(
 
         target
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_divergent_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -865,23 +851,23 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_divergent_schema\"]')",
                 &[],
             )
             .await
             .expect("main schema read should succeed");
-        assert_rows_eq(main_result, vec![vec![Value::Json(main_schema.into())]]);
+        assert_rows_eq(main_result, vec![vec![Value::Json(main_schema)]]);
 
         let target_result = target
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_divergent_schema\"]')",
                 &[],
             )
             .await
             .expect("target schema read should succeed");
-        assert_rows_eq(target_result, vec![vec![Value::Json(target_schema.into())]]);
+        assert_rows_eq(target_result, vec![vec![Value::Json(target_schema)]]);
     }
 );
 
@@ -891,46 +877,52 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         let base_schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "engine_branch_schema_amendment",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "title", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "engine_branch_schema_amendment",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
         });
         let main_schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "engine_branch_schema_amendment",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "title", "type": "text", "nullable": false },
-                { "name": "main_note", "type": "text", "nullable": true },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "engine_branch_schema_amendment",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" },
+                "main_note": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
         });
         let draft_schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "engine_branch_schema_amendment",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "title", "type": "text", "nullable": false },
-                { "name": "draft_note", "type": "text", "nullable": true },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "engine_branch_schema_amendment",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" },
+                "draft_note": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
         });
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-             VALUES ($1, false, false)",
-            &[Value::Json(base_schema.into())],
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
+             VALUES ($1, false)",
+            &[Value::Json(base_schema)],
         )
         .await
         .expect("base schema should be registered");
@@ -945,7 +937,7 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session_at("01930000-0000-7000-8000-000000000014")
+                .open_session("01930000-0000-7000-8000-000000000014")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -955,8 +947,8 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
-                &[Value::Json(main_schema.clone().into())],
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                &[Value::Json(main_schema.clone())],
             )
             .await
             .expect("main additive schema amendment should succeed");
@@ -966,8 +958,8 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
-                &[Value::Json(draft_schema.clone().into())],
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
+                &[Value::Json(draft_schema.clone())],
             )
             .await
             .expect("draft additive schema amendment should succeed");
@@ -977,33 +969,33 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
                 &[],
             )
             .await
             .expect("main amended schema read should succeed");
-        assert_rows_eq(main_result, vec![vec![Value::Json(main_schema.into())]]);
+        assert_rows_eq(main_result, vec![vec![Value::Json(main_schema)]]);
 
         let draft_result = draft
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
                 &[],
             )
             .await
             .expect("draft amended schema read should succeed");
-        assert_rows_eq(draft_result, vec![vec![Value::Json(draft_schema.into())]]);
+        assert_rows_eq(draft_result, vec![vec![Value::Json(draft_schema)]]);
     }
 );
 
 simulation_test!(
-    row_by_branch_insert_rejects_fk_graph_when_target_branch_lacks_schemas,
+    entity_by_branch_insert_rejects_fk_graph_when_target_branch_lacks_schemas,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1018,10 +1010,9 @@ simulation_test!(
         .expect("target branch should be created before FK schemas");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_fk_parent_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_fk_parent_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -1030,10 +1021,9 @@ simulation_test!(
         .expect("parent schema should register on active main");
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_fk_child_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"parent_id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"],\"foreign_keys\":[{\"columns\":[\"parent_id\"],\"references\":{\"schema_key\":\"engine_fk_parent_schema\",\"columns\":[\"id\"]}}]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -1044,8 +1034,8 @@ simulation_test!(
         let parent_result = main
             .execute(
                 "INSERT INTO engine_fk_parent_schema_by_branch \
-                 (id, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('parent-1', '01930000-0000-7000-8000-000000000013', true)",
+                 (id, lixcol_branch_id) \
+                 VALUES ('parent-1', '01930000-0000-7000-8000-000000000013')",
                 &[],
             )
             .await;
@@ -1062,8 +1052,8 @@ simulation_test!(
         let error = main
             .execute(
                 "INSERT INTO engine_fk_child_schema_by_branch \
-                 (id, parent_id, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('child-1', 'parent-1', '01930000-0000-7000-8000-000000000013', true)",
+                 (id, parent_id, lixcol_branch_id) \
+                 VALUES ('child-1', 'parent-1', '01930000-0000-7000-8000-000000000013')",
                 &[],
             )
             .await
@@ -1079,12 +1069,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    registered_row_insert_applies_defaulted_primary_key,
+    registered_entity_insert_applies_defaulted_primary_key,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1092,10 +1082,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_default_id_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_default_id_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1109,37 +1098,37 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("row insert should apply defaulted primary key");
+            .expect("entity insert should apply defaulted primary key");
         assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
-                "SELECT lixcol_row_pk, id, name \
+                "SELECT lixcol_entity_pk, id, name \
                  FROM engine_default_id_schema \
                  WHERE name = 'Generated'",
                 &[],
             )
             .await
-            .expect("row read should succeed");
+            .expect("entity read should succeed");
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Json(row_pk), Value::Text(id), Value::Text(name)] = values else {
+        let [Value::Json(entity_pk), Value::Text(id), Value::Text(name)] = values else {
             panic!("expected generated id row, got {values:?}");
         };
-        assert_eq!(row_pk, &json!([id]));
+        assert_eq!(entity_pk, &json!([id]));
         assert!(!id.is_empty(), "defaulted id should be non-empty");
         assert_eq!(name, "Generated");
     }
 );
 
 simulation_test!(
-    registered_row_insert_preserves_explicit_null_for_defaulted_column,
+    registered_entity_insert_preserves_explicit_null_for_defaulted_column,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1147,10 +1136,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_nullable_default_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"status\",\"type\":\"text\",\"nullable\":true,\"default_value\":\"computed\"}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_nullable_default_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1165,7 +1153,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("row insert should preserve explicit null");
+            .expect("entity insert should preserve explicit null");
 
         session
             .execute(
@@ -1174,7 +1162,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("row insert should apply default for omitted column");
+            .expect("entity insert should apply default for omitted column");
 
         let result = session
             .execute(
@@ -1184,7 +1172,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("row read should succeed");
+            .expect("entity read should succeed");
 
         assert_rows_eq(
             result,
@@ -1199,18 +1187,18 @@ simulation_test!(
     }
 );
 
-simulation_test!(row_by_branch_expands_global_rows, |sim| async move {
+simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
     let global_session = sim.wrap_session(
         engine
-            .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+            .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .await
             .expect("global session should open"),
         &engine,
     );
     let session = sim.wrap_session(
         engine
-            .open_session()
+            .open_workspace_session()
             .await
             .expect("main session should open"),
         &engine,
@@ -1218,11 +1206,10 @@ simulation_test!(row_by_branch_expands_global_rows, |sim| async move {
 
     global_session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_overlay_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             true,\
-             false\
+             lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             true\
              )",
             &[],
         )
@@ -1231,10 +1218,9 @@ simulation_test!(row_by_branch_expands_global_rows, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_overlay_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -1245,51 +1231,49 @@ simulation_test!(row_by_branch_expands_global_rows, |sim| async move {
     session
         .execute(
             "INSERT INTO engine_overlay_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-global-overlay', 'Global Row', true, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('entity-global-overlay', 'Global Entity', true)",
             &[],
         )
         .await
-        .expect("global row insert should succeed");
+        .expect("global entity insert should succeed");
 
     let result = session
         .execute(
-            "SELECT id, name, lixcol_branch_id, lixcol_global, lixcol_untracked \
+            "SELECT id, name, lixcol_branch_id, lixcol_global \
                  FROM engine_overlay_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-global-overlay\"]' AS JSONB) \
+                 WHERE lixcol_entity_pk = lix_json('[\"entity-global-overlay\"]') \
                  ORDER BY lixcol_branch_id",
             &[],
         )
         .await
-        .expect("row by-branch read should succeed");
+        .expect("entity by-branch read should succeed");
     assert_rows_eq(
         result,
         vec![
             vec![
-                Value::Text("row-global-overlay".to_string()),
-                Value::Text("Global Row".to_string()),
+                Value::Text("entity-global-overlay".to_string()),
+                Value::Text("Global Entity".to_string()),
                 Value::Text(sim.main_branch_id().to_string()),
                 Value::Boolean(true),
-                Value::Boolean(false),
             ],
             vec![
-                Value::Text("row-global-overlay".to_string()),
-                Value::Text("Global Row".to_string()),
+                Value::Text("entity-global-overlay".to_string()),
+                Value::Text("Global Entity".to_string()),
                 Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
                 Value::Boolean(true),
-                Value::Boolean(false),
             ],
         ],
     );
 });
 
 simulation_test!(
-    global_row_insert_rejects_active_only_schema,
+    global_entity_insert_rejects_active_only_schema,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1297,10 +1281,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_global_poison_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_global_poison_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1311,8 +1294,8 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO engine_global_poison_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('global-poison-1', 'Wrong Scope', true, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('global-poison-1', 'Wrong Scope', true)",
                 &[],
             )
             .await
@@ -1327,12 +1310,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    registered_typed_schema_surface_uses_primary_key_columns,
+    registered_typed_entity_surface_uses_primary_key_columns,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1340,10 +1323,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_typed_row_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false},{\"name\":\"count\",\"type\":\"float8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_typed_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1353,43 +1335,43 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO engine_typed_row_schema \
-                 (id, name, count, lixcol_global, lixcol_untracked) \
-                 VALUES ('typed-row-1', 'Typed Row', 7, false, false)",
+                "INSERT INTO engine_typed_entity_schema \
+                 (id, name, count, lixcol_global) \
+                 VALUES ('typed-entity-1', 'Typed Entity', 7, false)",
                 &[],
             )
             .await
-            .expect("typed row insert should succeed");
+            .expect("typed entity insert should succeed");
         assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
-                "SELECT id, name, count, lixcol_row_pk \
-                 FROM engine_typed_row_schema \
-                 WHERE id = 'typed-row-1'",
+                "SELECT id, name, count, lixcol_entity_pk \
+                 FROM engine_typed_entity_schema \
+                 WHERE id = 'typed-entity-1'",
                 &[],
             )
             .await
-            .expect("typed row query by primary-key column should succeed");
+            .expect("typed entity query by primary-key column should succeed");
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Text("typed-row-1".to_string()),
-                Value::Text("Typed Row".to_string()),
+                Value::Text("typed-entity-1".to_string()),
+                Value::Text("Typed Entity".to_string()),
                 Value::Real(7.0),
-                Value::Json(json!(["typed-row-1"]).into()),
+                Value::Json(json!(["typed-entity-1"])),
             ]],
         );
     }
 );
 
 simulation_test!(
-    typed_row_number_update_accepts_integer_param_like_insert,
+    typed_entity_number_update_accepts_integer_param_like_insert,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1397,10 +1379,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_number_update_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"score\",\"type\":\"float8\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_number_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1411,12 +1392,12 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_number_update_schema \
-                 (id, score, lixcol_global, lixcol_untracked) \
-                 VALUES ('score-1', 1, false, false)",
+                 (id, score, lixcol_global) \
+                 VALUES ('score-1', 1, false)",
                 &[],
             )
             .await
-            .expect("typed row insert should accept integer literal for number column");
+            .expect("typed entity insert should accept integer literal for number column");
 
         session
             .execute(
@@ -1426,7 +1407,7 @@ simulation_test!(
                 &[Value::Integer(52000)],
             )
             .await
-            .expect("typed row update should accept integer param for number column");
+            .expect("typed entity update should accept integer param for number column");
 
         let result = session
             .execute(
@@ -1436,18 +1417,18 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("typed row query should succeed");
+            .expect("typed entity query should succeed");
         assert_rows_eq(result, vec![vec![Value::Real(52000.0)]]);
     }
 );
 
 simulation_test!(
-    typed_row_update_accepts_file_id_predicate,
+    typed_entity_update_accepts_file_id_predicate,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1455,10 +1436,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_file_scoped_row_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_file_scoped_entity_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1479,36 +1459,36 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO engine_file_scoped_row_schema \
-                 (id, name, lixcol_file_id, lixcol_global, lixcol_untracked) \
+                "INSERT INTO engine_file_scoped_entity_schema \
+                 (id, name, lixcol_file_id, lixcol_global) \
                  VALUES \
-                 ('row-1', 'before-1', '66696c65-2d31-8000-8000-000000000000', false, false), \
-                 ('row-2', 'before-2', '66696c65-2d32-8000-8000-000000000000', false, false)",
+                 ('row-1', 'before-1', '66696c65-2d31-8000-8000-000000000000', false), \
+                 ('row-2', 'before-2', '66696c65-2d32-8000-8000-000000000000', false)",
                 &[],
             )
             .await
-            .expect("typed row inserts with file ids should succeed");
+            .expect("typed entity inserts with file ids should succeed");
 
         let update = session
             .execute(
-                "UPDATE engine_file_scoped_row_schema \
+                "UPDATE engine_file_scoped_entity_schema \
                  SET name = 'after' \
                  WHERE lixcol_file_id = '66696c65-2d31-8000-8000-000000000000'",
                 &[],
             )
             .await
-            .expect("file id should be accepted in a row write predicate");
+            .expect("file id should be accepted in an entity write predicate");
         assert_eq!(update, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
                 "SELECT id, name, lixcol_file_id \
-                 FROM engine_file_scoped_row_schema \
+                 FROM engine_file_scoped_entity_schema \
                  ORDER BY id",
                 &[],
             )
             .await
-            .expect("row file id should be readable");
+            .expect("entity file id should be readable");
         assert_rows_eq(
             result,
             vec![
@@ -1528,12 +1508,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_update_accepts_parseable_json_text_identity_predicate,
+    typed_entity_update_accepts_parseable_json_text_identity_predicate,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1541,10 +1521,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_identity_literal_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_identity_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1555,18 +1534,18 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_identity_literal_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'before', false)",
                 &[],
             )
             .await
-            .expect("typed row insert should succeed");
+            .expect("typed entity insert should succeed");
 
         let update = session
             .execute(
                 "UPDATE engine_identity_literal_schema \
                  SET name = 'after' \
-                 WHERE lixcol_row_pk = '[\"row-1\"]'",
+                 WHERE lixcol_entity_pk = '[\"row-1\"]'",
                 &[],
             )
             .await
@@ -1579,18 +1558,18 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("updated typed row should read");
+            .expect("updated typed entity should read");
         assert_rows_eq(result, vec![vec![Value::Text("after".to_string())]]);
     }
 );
 
 simulation_test!(
-    typed_row_update_accepts_parseable_json_text_identity_in_predicate,
+    typed_entity_update_accepts_parseable_json_text_identity_in_predicate,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1598,10 +1577,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_identity_in_literal_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_identity_in_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1612,18 +1590,18 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_identity_in_literal_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'before', false)",
                 &[],
             )
             .await
-            .expect("typed row insert should succeed");
+            .expect("typed entity insert should succeed");
 
         let update = session
             .execute(
                 "UPDATE engine_identity_in_literal_schema \
                  SET name = 'after' \
-                 WHERE lixcol_row_pk IN ('[\"row-1\"]')",
+                 WHERE lixcol_entity_pk IN ('[\"row-1\"]')",
                 &[],
             )
             .await
@@ -1636,28 +1614,27 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("updated typed row should read");
+            .expect("updated typed entity should read");
         assert_rows_eq(result, vec![vec![Value::Text("after".to_string())]]);
     }
 );
 
 simulation_test!(
-    typed_row_base_update_cannot_override_active_branch_filter,
+    typed_entity_base_update_cannot_override_active_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_base_branch_filter_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_base_branch_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -1675,7 +1652,7 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session_at("01930000-0000-7000-8000-00000000000d")
+                .open_session("01930000-0000-7000-8000-00000000000d")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -1684,30 +1661,30 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO engine_base_branch_filter_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'draft', false)",
                 &[],
             )
             .await
-            .expect("draft row insert should succeed");
+            .expect("draft entity insert should succeed");
 
         let error = main
             .execute(
                 "UPDATE engine_base_branch_filter_schema \
                  SET name = 'main-updated-draft' \
-                 WHERE lixcol_row_pk = '[\"row-1\"]' \
+                 WHERE lixcol_entity_pk = '[\"row-1\"]' \
                    AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000d'",
                 &[],
             )
             .await
-            .expect_err("base row table should not expose lixcol_branch_id");
+            .expect_err("base entity table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
             .execute(
                 "SELECT name \
                  FROM engine_base_branch_filter_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000d'",
                 &[],
             )
@@ -1718,22 +1695,21 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_base_insert_cannot_override_active_branch_scope,
+    typed_entity_base_insert_cannot_override_active_branch_scope,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_base_insert_branch_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_base_insert_branch_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -1752,19 +1728,19 @@ simulation_test!(
         let error = main
             .execute(
                 "INSERT INTO engine_base_insert_branch_schema \
-                 (id, name, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', '01930000-0000-7000-8000-00000000000e', false)",
+                 (id, name, lixcol_branch_id) \
+                 VALUES ('row-1', 'draft', '01930000-0000-7000-8000-00000000000e')",
                 &[],
             )
             .await
-            .expect_err("base row table should not expose lixcol_branch_id");
+            .expect_err("base entity table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
             .execute(
                 "SELECT name \
                  FROM engine_base_insert_branch_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000e'",
                 &[],
             )
@@ -1775,12 +1751,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_insert_rejects_unknown_column,
+    typed_entity_insert_rejects_unknown_column,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1788,10 +1764,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_unknown_insert_column_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_unknown_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1802,12 +1777,12 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO engine_unknown_insert_column_schema \
-                 (id, name, missing_column, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', 'ignored-before-fix', false, false)",
+                 (id, name, missing_column, lixcol_global) \
+                 VALUES ('row-1', 'before', 'ignored-before-fix', false)",
                 &[],
             )
             .await
-            .expect_err("typed row insert should not ignore unknown columns");
+            .expect_err("typed entity insert should not ignore unknown columns");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = session
@@ -1819,12 +1794,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_insert_rejects_duplicate_columns,
+    typed_entity_insert_rejects_duplicate_columns,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1832,10 +1807,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_duplicate_insert_column_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_duplicate_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1846,12 +1820,12 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO engine_duplicate_insert_column_schema \
-                 (id, name, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', 'after', false, false)",
+                 (id, name, name, lixcol_global) \
+                 VALUES ('row-1', 'before', 'after', false)",
                 &[],
             )
             .await
-            .expect_err("typed row insert should not accept duplicate columns");
+            .expect_err("typed entity insert should not accept duplicate columns");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = session
@@ -1863,12 +1837,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_insert_rejects_unresolved_qualified_table,
+    typed_entity_insert_rejects_unresolved_qualified_table,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1876,10 +1850,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_qualified_insert_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_qualified_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -1890,8 +1863,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO bogus.engine_qualified_insert_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'wrong', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'wrong', false)",
                 &[],
             )
             .await
@@ -1906,22 +1879,21 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_base_insert_cannot_override_active_branch_filter,
+    typed_entity_base_insert_cannot_override_active_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_base_branch_insert_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_base_branch_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -1940,12 +1912,12 @@ simulation_test!(
         let error = main
             .execute(
                 "INSERT INTO engine_base_branch_insert_schema \
-                 (id, name, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft-via-main', '01930000-0000-7000-8000-00000000000e', false, false)",
+                 (id, name, lixcol_branch_id, lixcol_global) \
+                 VALUES ('row-1', 'draft-via-main', '01930000-0000-7000-8000-00000000000e', false)",
                 &[],
             )
             .await
-            .expect_err("base row table should not expose lixcol_branch_id");
+            .expect_err("base entity table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
@@ -1962,22 +1934,21 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_by_branch_delete_requires_explicit_branch_filter,
+    typed_entity_by_branch_delete_requires_explicit_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_by_branch_delete_scope_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_by_branch_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -1995,16 +1966,16 @@ simulation_test!(
 
         main.execute(
             "INSERT INTO engine_by_branch_delete_scope_schema \
-             (id, name, lixcol_global, lixcol_untracked) \
-             VALUES ('row-1', 'main', false, false)",
+             (id, name, lixcol_global) \
+             VALUES ('row-1', 'main', false)",
             &[],
         )
         .await
-        .expect("main row insert should succeed");
+        .expect("main entity insert should succeed");
 
         let draft = sim.wrap_session(
             engine
-                .open_session_at("01930000-0000-7000-8000-000000000010")
+                .open_session("01930000-0000-7000-8000-000000000010")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -2012,16 +1983,16 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO engine_by_branch_delete_scope_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'draft', false)",
                 &[],
             )
             .await
-            .expect("draft row insert should succeed");
+            .expect("draft entity insert should succeed");
 
         main.execute(
             "DELETE FROM engine_by_branch_delete_scope_schema_by_branch \
-             WHERE lixcol_row_pk = '[\"row-1\"]'",
+             WHERE lixcol_entity_pk = '[\"row-1\"]'",
             &[],
         )
         .await
@@ -2032,7 +2003,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_delete_scope_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000010') \
                  ORDER BY name",
                     sim.main_branch_id()
@@ -2058,22 +2029,21 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_by_branch_update_requires_explicit_branch_filter,
+    typed_entity_by_branch_update_requires_explicit_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_by_branch_update_scope_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_by_branch_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -2091,16 +2061,16 @@ simulation_test!(
 
         main.execute(
             "INSERT INTO engine_by_branch_update_scope_schema \
-             (id, name, lixcol_global, lixcol_untracked) \
-             VALUES ('row-1', 'main', false, false)",
+             (id, name, lixcol_global) \
+             VALUES ('row-1', 'main', false)",
             &[],
         )
         .await
-        .expect("main row insert should succeed");
+        .expect("main entity insert should succeed");
 
         let draft = sim.wrap_session(
             engine
-                .open_session_at("01930000-0000-7000-8000-000000000011")
+                .open_session("01930000-0000-7000-8000-000000000011")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -2108,17 +2078,17 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO engine_by_branch_update_scope_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'draft', false)",
                 &[],
             )
             .await
-            .expect("draft row insert should succeed");
+            .expect("draft entity insert should succeed");
 
         main.execute(
             "UPDATE engine_by_branch_update_scope_schema_by_branch \
              SET name = 'updated-all' \
-             WHERE lixcol_row_pk = '[\"row-1\"]'",
+             WHERE lixcol_entity_pk = '[\"row-1\"]'",
             &[],
         )
         .await
@@ -2129,7 +2099,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_update_scope_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000011') \
                  ORDER BY name",
                     sim.main_branch_id()
@@ -2155,22 +2125,21 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_by_branch_dml_rejects_branch_id_alias,
+    typed_entity_by_branch_dml_rejects_branch_id_alias,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session_at(sim.main_branch_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
         main.execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_registered_schema (value, lixcol_global) \
              VALUES (\
-             CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_by_branch_alias_scope_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-             false,\
+             lix_json('{\"x-lix-key\":\"engine_by_branch_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false\
              )",
             &[],
@@ -2188,16 +2157,16 @@ simulation_test!(
 
         main.execute(
             "INSERT INTO engine_by_branch_alias_scope_schema \
-             (id, name, lixcol_global, lixcol_untracked) \
-             VALUES ('row-1', 'main', false, false)",
+             (id, name, lixcol_global) \
+             VALUES ('row-1', 'main', false)",
             &[],
         )
         .await
-        .expect("main row insert should succeed");
+        .expect("main entity insert should succeed");
 
         let draft = sim.wrap_session(
             engine
-                .open_session_at("01930000-0000-7000-8000-00000000000f")
+                .open_session("01930000-0000-7000-8000-00000000000f")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -2205,18 +2174,18 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO engine_by_branch_alias_scope_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'draft', false)",
                 &[],
             )
             .await
-            .expect("draft row insert should succeed");
+            .expect("draft entity insert should succeed");
 
         let update_error = main
             .execute(
                 "UPDATE engine_by_branch_alias_scope_schema_by_branch \
                  SET name = 'updated-via-alias' \
-                 WHERE lixcol_row_pk = '[\"row-1\"]' \
+                 WHERE lixcol_entity_pk = '[\"row-1\"]' \
                    AND branch_id = '01930000-0000-7000-8000-00000000000f'",
                 &[],
             )
@@ -2227,7 +2196,7 @@ simulation_test!(
         let delete_error = main
             .execute(
                 "DELETE FROM engine_by_branch_alias_scope_schema_by_branch \
-                 WHERE lixcol_row_pk = '[\"row-1\"]' \
+                 WHERE lixcol_entity_pk = '[\"row-1\"]' \
                    AND branch_id = '01930000-0000-7000-8000-00000000000f'",
                 &[],
             )
@@ -2240,7 +2209,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_alias_scope_schema_by_branch \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB) \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-00000000000f') \
                  ORDER BY name",
                     sim.main_branch_id()
@@ -2266,12 +2235,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_update_rejects_duplicate_assignments,
+    typed_entity_update_rejects_duplicate_assignments,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2279,10 +2248,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_duplicate_update_assignment_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_duplicate_update_assignment_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -2293,12 +2261,12 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_duplicate_update_assignment_schema \
-                 (id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', false, false)",
+                 (id, name, lixcol_global) \
+                 VALUES ('row-1', 'before', false)",
                 &[],
             )
             .await
-            .expect("row insert should succeed");
+            .expect("entity insert should succeed");
 
         let error = session
             .execute(
@@ -2308,7 +2276,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("typed row update should not accept duplicate assignments");
+            .expect_err("typed entity update should not accept duplicate assignments");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = session
@@ -2323,12 +2291,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    primary_key_only_row_metadata_update_keeps_internal_snapshot_projection,
+    typed_entity_update_preserves_absent_optional_non_nullable_fields,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -2336,76 +2304,9 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                "INSERT INTO lix_registered_schema (value, lixcol_global) \
                  VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_propertyless_update_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                   false,\
-                   false\
-                 )",
-                &[],
-            )
-            .await
-            .expect("primary-key-only schema should register");
-
-        session
-            .execute(
-                "INSERT INTO engine_propertyless_update_schema \
-                 (id, lixcol_row_pk, lixcol_metadata, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                   'propertyless-row',\
-                   CAST('[\"propertyless-row\"]' AS JSONB),\
-                   CAST('{\"phase\":\"before\"}' AS JSONB),\
-                   false,\
-                   false\
-                 )",
-                &[],
-            )
-            .await
-            .expect("propertyless row should insert");
-
-        session
-            .execute(
-                "UPDATE engine_propertyless_update_schema \
-                 SET lixcol_metadata = CAST('{\"phase\":\"after\"}' AS JSONB) \
-                 WHERE lixcol_row_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
-                &[],
-            )
-            .await
-            .expect("metadata-only update should retain its internal source snapshot");
-
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT lixcol_metadata \
-                     FROM engine_propertyless_update_schema \
-                     WHERE lixcol_row_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
-                    &[],
-                )
-                .await
-                .expect("updated propertyless row should remain readable"),
-            vec![vec![Value::Json(json!({"phase": "after"}).into())]],
-        );
-    }
-);
-
-simulation_test!(
-    typed_row_update_preserves_absent_optional_non_nullable_fields,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                 CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_optional_update_schema\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false},{\"name\":\"rank\",\"type\":\"int8\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                 false,\
+                 lix_json('{\"x-lix-key\":\"engine_optional_update_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
                  false\
                  )",
                 &[],
@@ -2416,8 +2317,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_optional_update_schema \
-                 (id, title, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'before', false, false)",
+                 (id, title, lixcol_global) \
+                 VALUES ('row-1', 'before', false)",
                 &[],
             )
             .await
@@ -2435,19 +2336,23 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT title, rank \
+                "SELECT title, rank, lixcol_snapshot_content \
                  FROM engine_optional_update_schema \
                  WHERE id = 'row-1'",
                 &[],
             )
             .await
-            .expect("typed row query should succeed");
+            .expect("typed entity query should succeed");
         assert_rows_eq(
             result,
-            vec![vec![Value::Text("after".to_string()), Value::Null]],
+            vec![vec![
+                Value::Text("after".to_string()),
+                Value::Null,
+                Value::Json(json!({"id": "row-1", "title": "after"})),
+            ]],
         );
 
-        session
+        let error = session
             .execute(
                 "UPDATE engine_optional_update_schema \
                  SET rank = NULL \
@@ -2455,6 +2360,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("explicit SQL NULL is valid for a nullable int8 column");
+            .expect_err("explicit NULL should still be validated as JSON null");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(
+            error
+                .message
+                .contains("/rank null is not of type \"integer\""),
+            "expected rank validation error, got {error:?}"
+        );
     }
 );

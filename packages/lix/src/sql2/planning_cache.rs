@@ -1,20 +1,18 @@
-use std::any::Any;
+#[cfg(test)]
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::sql2::catalog::PublicCatalog;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, Value};
-use async_trait::async_trait;
 use datafusion::catalog::{
     CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList,
-    SchemaProvider, TableProvider,
+    MemorySchemaProvider,
 };
-use datafusion::common::exec_err;
 use datafusion::execution::session_state::SessionState;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
@@ -34,29 +32,6 @@ pub(crate) struct CachedReadPlan {
     pub(crate) plan: LogicalPlan,
     pub(crate) json_predicate_params: std::collections::BTreeSet<usize>,
     pub(crate) expected_parameter_count: usize,
-}
-
-/// One reusable physical read template plus the leaf scan requests it was
-/// planned from.
-///
-/// The template is stripped of snapshot-bound table providers, and the scan
-/// requests carry no provider at all — only the table name, projection,
-/// unnormalized filters and fetch that the optimizer settled on for this exact
-/// cache key. A warm execution therefore skips DataFusion's analyzer, logical
-/// optimizer and physical planner entirely: it resolves each table against the
-/// current session, replans just that leaf, and grafts it into the template.
-pub(crate) struct CachedPhysicalRead {
-    pub(crate) scans: Vec<CachedScanRequest>,
-    pub(crate) template: Arc<dyn ExecutionPlan>,
-}
-
-/// One leaf `TableScan` of a cached optimized plan, reduced to the arguments
-/// `TableProvider::scan_with_args` needs.
-pub(crate) struct CachedScanRequest {
-    pub(crate) table: datafusion::common::TableReference,
-    pub(crate) projection: Option<Vec<usize>>,
-    pub(crate) filters: Vec<datafusion::logical_expr::Expr>,
-    pub(crate) fetch: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -99,148 +74,6 @@ pub(crate) struct AutoParameterizedUpdate {
     pub(crate) params: Vec<Value>,
 }
 
-#[derive(Default)]
-pub(crate) struct CachedUpdateLiteralShape {
-    shape_address: usize,
-    shape_len: usize,
-    prefix_end: usize,
-    middle_start: usize,
-    middle_end: usize,
-    suffix_start: usize,
-}
-
-/// Statement-scoped `public` schema for pooled read sessions.
-///
-/// Every snapshot-bound table provider a statement registers lands here and
-/// must be gone by the time the session returns to the pool. DataFusion's
-/// `MemorySchemaProvider` can only express that as `table_names()` — one owned
-/// `String` per table, per statement, walking every dashmap shard — followed by
-/// one `deregister_table` per name. This provider keeps the identical
-/// registration semantics (registering an existing name is an error, matching
-/// `MemorySchemaProvider`) while letting session recycling drop every provider
-/// in one map clear.
-#[derive(Debug, Default)]
-struct StatementSchemaProvider {
-    tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
-}
-
-impl StatementSchemaProvider {
-    fn tables(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<dyn TableProvider>>> {
-        self.tables
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn tables_mut(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Arc<dyn TableProvider>>> {
-        self.tables
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Drops every statement-registered provider at once.
-    fn clear(&self) {
-        self.tables_mut().clear();
-    }
-}
-
-#[async_trait]
-impl SchemaProvider for StatementSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn table_names(&self) -> Vec<String> {
-        self.tables().keys().cloned().collect()
-    }
-
-    async fn table(
-        &self,
-        name: &str,
-    ) -> Result<Option<Arc<dyn TableProvider>>, datafusion::error::DataFusionError> {
-        Ok(self.tables().get(name).cloned())
-    }
-
-    fn register_table(
-        &self,
-        name: String,
-        table: Arc<dyn TableProvider>,
-    ) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
-        let mut tables = self.tables_mut();
-        if tables.contains_key(name.as_str()) {
-            return exec_err!("The table {name} already exists");
-        }
-        Ok(tables.insert(name, table))
-    }
-
-    fn deregister_table(
-        &self,
-        name: &str,
-    ) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
-        Ok(self.tables_mut().remove(name))
-    }
-
-    fn table_exist(&self, name: &str) -> bool {
-        self.tables().contains_key(name)
-    }
-}
-
-/// One DataFusion session borrowed from the engine's pool for the duration of
-/// one statement.
-///
-/// The `SessionState` travels with the session instead of being cloned out of
-/// it per statement. `SessionState::clone` deep-copies the `String`-keyed
-/// registries for every built-in scalar, aggregate, window and table function;
-/// with the execution UDFs registered once at session construction those
-/// registries no longer change, so the pooled copy stays authoritative for the
-/// lifetime of the session.
-pub(crate) struct PooledReadSession {
-    context: SessionContext,
-    state: Arc<SessionState>,
-}
-
-impl PooledReadSession {
-    fn new(context: SessionContext) -> Self {
-        let state = Arc::new(context.state());
-        Self { context, state }
-    }
-
-    /// A session that is not owned by any pool, used by lightweight contexts
-    /// that build one DataFusion session per statement.
-    pub(crate) fn standalone(context: SessionContext) -> Self {
-        Self::new(context)
-    }
-
-    pub(crate) fn context(&self) -> &SessionContext {
-        &self.context
-    }
-
-    /// The session state for this statement.
-    ///
-    /// Table registration flows through the shared catalog list, so this stays
-    /// current for provider resolution. Per-statement table-valued functions
-    /// are registered on the live session and are resolved there during logical
-    /// planning; this copy is used for physical planning and execution, which
-    /// never resolves a function by name.
-    pub(crate) fn state(&self) -> &Arc<SessionState> {
-        &self.state
-    }
-
-    /// Restamps `query_execution_start_time` so `now()` and friends observe the
-    /// statement's own start rather than the session's construction time.
-    fn begin_statement(&mut self) {
-        match Arc::get_mut(&mut self.state) {
-            Some(state) => state.mark_start_execution(),
-            None => {
-                let mut state = self.state.as_ref().clone();
-                state.mark_start_execution();
-                self.state = Arc::new(state);
-            }
-        }
-    }
-}
-
 /// Bounded, engine-owned cache for snapshot-independent SQL planning templates.
 ///
 /// Parsed statements depend only on the exact SQL text. Bound write plans also
@@ -250,13 +83,13 @@ impl PooledReadSession {
 /// session before execution.
 pub(crate) struct SqlPlanningCache<CatalogKey> {
     datafusion_state: SessionState,
-    read_sessions: Mutex<Vec<PooledReadSession>>,
+    read_sessions: Mutex<Vec<SessionContext>>,
     parsed_statements: Mutex<LruCache<Arc<str>, Arc<DataFusionStatement>>>,
     public_catalogs: Mutex<LruCache<CatalogKey, Arc<PublicCatalog>>>,
     write_plans: Mutex<LruCache<WritePlanCacheKey<CatalogKey>, Arc<LogicalWritePlan>>>,
     read_plans: Mutex<LruCache<ReadPlanCacheKey<CatalogKey>, Arc<CachedReadPlan>>>,
     physical_read_plans:
-        Mutex<LruCache<PhysicalReadPlanCacheKey<CatalogKey>, Arc<CachedPhysicalRead>>>,
+        Mutex<LruCache<PhysicalReadPlanCacheKey<CatalogKey>, Arc<dyn ExecutionPlan>>>,
 }
 
 impl<CatalogKey> std::fmt::Debug for SqlPlanningCache<CatalogKey> {
@@ -298,45 +131,40 @@ where
         let catalogs = Arc::new(MemoryCatalogProviderList::new());
         let catalog = Arc::new(MemoryCatalogProvider::new());
         catalog
-            .register_schema("public", Arc::new(StatementSchemaProvider::default()))
+            .register_schema("public", Arc::new(MemorySchemaProvider::new()))
             .expect("fresh DataFusion catalog accepts the public schema");
         catalogs.register_catalog("datafusion".to_string(), catalog);
-        super::session::sql_session_from_template(self.datafusion_state.clone(), Some(catalogs))
+        let state = SessionStateBuilder::new_from_existing(self.datafusion_state.clone())
+            .with_catalog_list(catalogs)
+            .build();
+        SessionContext::new_with_state(state)
     }
 
-    pub(crate) fn datafusion_read_session(&self) -> PooledReadSession {
-        let mut session = lock_or_recover(&self.read_sessions)
+    pub(crate) fn datafusion_read_session(&self) -> SessionContext {
+        lock_or_recover(&self.read_sessions)
             .pop()
-            .unwrap_or_else(|| PooledReadSession::new(self.datafusion_session()));
-        session.begin_statement();
-        session
+            .unwrap_or_else(|| self.datafusion_session())
     }
 
-    pub(crate) fn recycle_datafusion_read_session(&self, session: PooledReadSession) {
-        if let Some(catalog) = session.context.catalog("datafusion")
+    pub(crate) fn recycle_datafusion_read_session(&self, session: SessionContext) {
+        if let Some(catalog) = session.catalog("datafusion")
             && let Some(public) = catalog.schema("public")
         {
-            match public.as_any().downcast_ref::<StatementSchemaProvider>() {
-                Some(statement_schema) => statement_schema.clear(),
-                None => {
-                    // Sessions built by `datafusion_session` always carry a
-                    // `StatementSchemaProvider`; this enumeration remains only
-                    // for a foreign schema provider reaching the pool.
-                    for table in public.table_names() {
-                        let _ = session.context.deregister_table(
-                            datafusion::common::TableReference::full("datafusion", "public", table),
-                        );
-                    }
-                }
+            for table in public.table_names() {
+                let _ = session.deregister_table(datafusion::common::TableReference::full(
+                    "datafusion",
+                    "public",
+                    table,
+                ));
             }
         }
-        // Only table-valued functions are registered per statement; the five
-        // execution scalar functions are installed once at session construction
-        // and read their per-statement values from the session's slots. Borrow
-        // the live state rather than cloning it — a clone would deep-copy the
-        // registries for every built-in function just to diff two name sets.
-        let state_ref = session.context.state_ref();
-        let state = state_ref.read();
+        let state = session.state();
+        let execution_scalar_functions = state
+            .scalar_functions()
+            .keys()
+            .filter(|name| !self.datafusion_state.scalar_functions().contains_key(*name))
+            .cloned()
+            .collect::<Vec<_>>();
         let execution_table_functions = state
             .table_functions()
             .keys()
@@ -344,9 +172,11 @@ where
             .cloned()
             .collect::<Vec<_>>();
         drop(state);
-        drop(state_ref);
+        for name in execution_scalar_functions {
+            session.deregister_udf(&name);
+        }
         for name in execution_table_functions {
-            session.context.deregister_udtf(&name);
+            session.deregister_udtf(&name);
         }
 
         let mut sessions = lock_or_recover(&self.read_sessions);
@@ -379,16 +209,16 @@ where
     pub(crate) fn physical_read_plan(
         &self,
         key: &PhysicalReadPlanCacheKey<CatalogKey>,
-    ) -> Option<Arc<CachedPhysicalRead>> {
+    ) -> Option<Arc<dyn ExecutionPlan>> {
         lock_or_recover(&self.physical_read_plans).get(key).cloned()
     }
 
     pub(crate) fn remember_physical_read_plan(
         &self,
         key: PhysicalReadPlanCacheKey<CatalogKey>,
-        plan: CachedPhysicalRead,
+        plan: Arc<dyn ExecutionPlan>,
     ) {
-        lock_or_recover(&self.physical_read_plans).put(key, Arc::new(plan));
+        lock_or_recover(&self.physical_read_plans).put(key, plan);
     }
 
     pub(crate) fn forget_physical_read_plan(&self, key: &PhysicalReadPlanCacheKey<CatalogKey>) {
@@ -398,11 +228,6 @@ where
     #[cfg(test)]
     pub(crate) fn read_plan_count(&self) -> usize {
         lock_or_recover(&self.read_plans).len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear_read_plans(&self) {
-        lock_or_recover(&self.read_plans).clear();
     }
 
     /// Parses exact SQL once and returns an owned clone of the cached AST.
@@ -470,6 +295,7 @@ where
     /// Returns borrowed decoded string literals when a warm UPDATE still
     /// matches its normalized shape. Ordinary literals borrow the caller's
     /// SQL directly; SQL quote escapes allocate only the affected slot.
+    #[cfg(test)]
     pub(crate) fn decode_update_literals_for_shape<'a>(
         &self,
         sql: &'a str,
@@ -484,53 +310,6 @@ where
             sql,
             normalized_shape,
             parameter_count,
-            escape_scratch,
-        )
-    }
-
-    pub(crate) fn decode_update_literals_for_cached_shape<'a>(
-        &self,
-        sql: &'a str,
-        normalized_shape: &str,
-        parameter_count: usize,
-        escape_scratch: &mut SmallVec<[String; 4]>,
-        cached_shape: &mut CachedUpdateLiteralShape,
-    ) -> Option<SmallVec<[Cow<'a, str>; 4]>> {
-        if parameter_count != 2 {
-            return self.decode_update_literals_for_shape(
-                sql,
-                normalized_shape,
-                parameter_count,
-                escape_scratch,
-            );
-        }
-        if cached_shape.shape_address != normalized_shape.as_ptr() as usize
-            || cached_shape.shape_len != normalized_shape.len()
-            || normalized_shape.get(cached_shape.prefix_end..cached_shape.middle_start)
-                != Some("$1")
-            || normalized_shape.get(cached_shape.middle_end..cached_shape.suffix_start)
-                != Some("$2")
-        {
-            let (prefix, remainder) = normalized_shape.split_once("$1")?;
-            let (middle, suffix) = remainder.split_once("$2")?;
-            if prefix.contains('$') || middle.contains('$') || suffix.contains('$') {
-                return None;
-            }
-            cached_shape.shape_address = normalized_shape.as_ptr() as usize;
-            cached_shape.shape_len = normalized_shape.len();
-            cached_shape.prefix_end = prefix.len();
-            cached_shape.middle_start = prefix.len() + 2;
-            cached_shape.middle_end = cached_shape.middle_start + middle.len();
-            cached_shape.suffix_start = cached_shape.middle_end + 2;
-        }
-        if escape_scratch.len() < 2 {
-            escape_scratch.resize_with(2, String::new);
-        }
-        decode_two_update_string_literals(
-            sql,
-            &normalized_shape[..cached_shape.prefix_end],
-            &normalized_shape[cached_shape.middle_start..cached_shape.middle_end],
-            &normalized_shape[cached_shape.suffix_start..],
             escape_scratch,
         )
     }
@@ -646,9 +425,9 @@ impl<CatalogKey> PhysicalReadPlanCacheKey<CatalogKey> {
                 Value::Text(value) => (5, value.as_bytes().to_vec()),
                 Value::Json(value) => {
                     parameters.push(6);
-                    let bytes = serde_json::to_vec(value).ok()?;
+                    let bytes = value.as_bytes();
                     parameters.extend_from_slice(&bytes.len().to_le_bytes());
-                    parameters.extend_from_slice(&bytes);
+                    parameters.extend_from_slice(bytes);
                     continue;
                 }
                 Value::Blob(value) => (7, value.to_vec()),
@@ -676,8 +455,8 @@ impl From<&Value> for ParameterType {
             Value::Real(_) => Self::Real,
             Value::Text(_) => Self::Text,
             Value::Json(_) => Self::Json,
-            Value::Blob(_) => Self::Blob,
             Value::Timestamp(_) => Self::Timestamp,
+            Value::Blob(_) => Self::Blob,
         }
     }
 }
@@ -875,11 +654,13 @@ fn update_string_literals_match_shape(sql: &str, normalized_shape: &str) -> bool
     !quoted_identifier && param_count > 0 && shape.get(shape_cursor..) == Some(&bytes[copied..])
 }
 
+#[cfg(test)]
 enum DecodedUpdateLiteral<'a> {
     Borrowed(&'a str),
     Escaped(usize),
 }
 
+#[cfg(test)]
 fn decode_update_string_literals_for_shape<'a>(
     sql: &'a str,
     normalized_shape: &str,
@@ -1026,6 +807,7 @@ fn decode_update_string_literals_for_shape<'a>(
     )
 }
 
+#[cfg(test)]
 fn decode_two_update_string_literals<'a>(
     sql: &'a str,
     prefix: &str,
@@ -1252,9 +1034,8 @@ mod tests {
     fn recycled_read_sessions_drop_snapshot_bound_tables() {
         let cache = test_cache(2);
         let session = cache.datafusion_read_session();
-        let session_id = session.context().session_id();
+        let session_id = session.session_id();
         session
-            .context()
             .register_table(
                 "snapshot_table",
                 Arc::new(EmptyTable::new(Arc::new(Schema::empty()))),
@@ -1263,8 +1044,8 @@ mod tests {
 
         cache.recycle_datafusion_read_session(session);
         let recycled = cache.datafusion_read_session();
-        assert_eq!(recycled.context().session_id(), session_id);
-        assert!(!recycled.context().table_exist("snapshot_table").unwrap());
+        assert_eq!(recycled.session_id(), session_id);
+        assert!(!recycled.table_exist("snapshot_table").unwrap());
     }
 
     #[test]
@@ -1280,18 +1061,18 @@ mod tests {
         let cache = test_cache(8);
         let first = cache
             .auto_parameterized_update(
-                "UPDATE notes SET value = CAST('{\"text\":\"first\"}' AS JSONB) WHERE id = 'a'",
+                "UPDATE notes SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
             )
             .expect("literal update auto-parameterizes");
         let second = cache
             .auto_parameterized_update(
-                "UPDATE notes SET value = CAST('{\"text\":\"second\"}' AS JSONB) WHERE id = 'b'",
+                "UPDATE notes SET value = lix_json('{\"text\":\"second\"}') WHERE id = 'b'",
             )
             .expect("case-equivalent literal update auto-parameterizes");
 
         assert_eq!(
             first.sql.as_ref(),
-            "UPDATE notes SET value = CAST($1 AS JSONB) WHERE id = $2"
+            "UPDATE notes SET value = lix_json($1) WHERE id = $2"
         );
         assert_eq!(
             first.params,
@@ -1315,19 +1096,19 @@ mod tests {
         let cache = test_cache(8);
         let template = cache
             .auto_parameterized_update(
-                "UPDATE \"notes\" SET value = CAST('{\"text\":\"first\"}' AS JSONB) WHERE id = 'a'",
+                "UPDATE \"notes\" SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
             )
             .unwrap();
 
         assert!(cache.update_literal_shape_matches(
-            "UPDATE \"notes\" SET value = CAST('{\"text\":\"it''''s fine\"}' AS JSONB) WHERE id = 'b'",
+            "UPDATE \"notes\" SET value = lix_json('{\"text\":\"it''''s fine\"}') WHERE id = 'b'",
             &template.sql,
         ));
         for different_shape in [
-            "UPDATE \"notes\" SET value = CAST('{}' AS JSONB) WHERE other_id = 'b'",
-            "UPDATE notes SET value = CAST('{}' AS JSONB) WHERE id = 'b'",
-            "UPDATE \"notes\" SET value = CAST('{}' AS JSONB) WHERE id = 'b' -- comment",
-            "UPDATE \"notes\" SET value = CAST('{}' AS JSONB) WHERE id = $1",
+            "UPDATE \"notes\" SET value = lix_json('{}') WHERE other_id = 'b'",
+            "UPDATE notes SET value = lix_json('{}') WHERE id = 'b'",
+            "UPDATE \"notes\" SET value = lix_json('{}') WHERE id = 'b' -- comment",
+            "UPDATE \"notes\" SET value = lix_json('{}') WHERE id = $1",
         ] {
             assert!(
                 !cache.update_literal_shape_matches(different_shape, &template.sql),
@@ -1344,7 +1125,7 @@ mod tests {
         params[1].push_str("stale-id");
 
         assert!(cache.decode_certified_update_literals_into(
-            "UPDATE notes SET value = CAST('{\"text\":\"it''s fine\"}' AS JSONB) WHERE id = 'b'",
+            "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'b'",
             &mut params,
         ));
         assert_eq!(params, ["{\"text\":\"it's fine\"}", "b"]);
@@ -1359,13 +1140,13 @@ mod tests {
         let cache = test_cache(8);
         let template = cache
             .auto_parameterized_update(
-                "UPDATE notes SET value = CAST('{\"text\":\"first\"}' AS JSONB) WHERE id = 'a'",
+                "UPDATE notes SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
             )
             .unwrap();
         let mut escape_scratch = SmallVec::new();
         let borrowed = cache
             .decode_update_literals_for_shape(
-                "UPDATE notes SET value = CAST('{\"text\":\"second\"}' AS JSONB) WHERE id = 'b'",
+                "UPDATE notes SET value = lix_json('{\"text\":\"second\"}') WHERE id = 'b'",
                 &template.sql,
                 2,
                 &mut escape_scratch,
@@ -1378,7 +1159,7 @@ mod tests {
 
         let escaped = cache
             .decode_update_literals_for_shape(
-                "UPDATE notes SET value = CAST('{\"text\":\"it''s fine\"}' AS JSONB) WHERE id = 'c'",
+                "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'c'",
                 &template.sql,
                 2,
                 &mut escape_scratch,
@@ -1396,7 +1177,7 @@ mod tests {
         let allocation = escape_scratch[0].as_ptr();
         let escaped_again = cache
             .decode_update_literals_for_shape(
-                "UPDATE notes SET value = CAST('{\"text\":\"it''s fine\"}' AS JSONB) WHERE id = 'd'",
+                "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'd'",
                 &template.sql,
                 2,
                 &mut escape_scratch,
@@ -1427,13 +1208,14 @@ mod tests {
         let catalog_a = "catalog-a".to_string();
         let catalog_b = "catalog-b".to_string();
         let schema = json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "app_note",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "text", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
+            "x-lix-key": "app_note",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "text": { "type": "string" }
+            },
+            "required": ["id", "text"]
         });
 
         let first = cache

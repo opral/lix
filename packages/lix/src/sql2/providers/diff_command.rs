@@ -15,12 +15,15 @@ use crate::sql2::{DiffCommand, SqlWriteContext, WriteAccess};
 
 use super::spec::{InsertApply, PlannedScan, TableSpec, register_spec_table, scan_row_source};
 
-pub(super) async fn register_diff_command_provider(
+pub(super) async fn register_diff_command_provider<R>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     command: DiffCommand,
-    write_ctx: SqlWriteContext,
-) -> Result<(), LixError> {
+    write_ctx: SqlWriteContext<R>,
+) -> Result<(), LixError>
+where
+    R: crate::storage_adapter::StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     register_spec_table(
         session,
         surface_name,
@@ -38,7 +41,10 @@ struct DiffCommandSpec {
 }
 
 #[async_trait]
-impl TableSpec for DiffCommandSpec {
+impl<R> TableSpec<R> for DiffCommandSpec
+where
+    R: crate::storage_adapter::StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn table_name(&self) -> &str {
         &self.table_name
     }
@@ -68,7 +74,7 @@ impl TableSpec for DiffCommandSpec {
 
     async fn plan_insert(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         _input: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<InsertApply>> {
         let command = self.command;

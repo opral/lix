@@ -48,35 +48,61 @@ impl HistoryDirectoryTree {
     /// Returns the changed directory and every directory below it.
     ///
     /// Including the root is useful for files directly owned by the changed
-    /// directory. A visited set makes corrupt cycles terminate deterministically
-    /// instead of multiplying history rows.
-    pub(super) fn descendants_including(&self, directory_id: &str) -> BTreeSet<String> {
+    /// directory. A depth-first active set makes corrupt cycles fail closed
+    /// instead of silently truncating the history fan-out.
+    pub(super) fn descendants_including(
+        &self,
+        directory_id: &str,
+    ) -> Result<BTreeSet<String>, LixError> {
         let mut descendants = BTreeSet::new();
-        let mut pending = vec![directory_id.to_string()];
-        while let Some(candidate) = pending.pop() {
-            if !descendants.insert(candidate.clone()) {
+        let mut completed = BTreeSet::new();
+        let mut active = BTreeSet::new();
+        let mut pending = vec![(directory_id.to_string(), true)];
+        while let Some((candidate, entering)) = pending.pop() {
+            if !entering {
+                active.remove(&candidate);
+                completed.insert(candidate);
                 continue;
             }
+            if active.contains(&candidate) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("directory descendant graph contains a cycle at '{candidate}'"),
+                ));
+            }
+            if completed.contains(&candidate) {
+                continue;
+            }
+            active.insert(candidate.clone());
+            descendants.insert(candidate.clone());
+            pending.push((candidate.clone(), false));
             if let Some(children) = self.children_by_parent.get(&candidate) {
-                pending.extend(children.iter().rev().cloned());
+                pending.extend(children.iter().rev().cloned().map(|child| (child, true)));
             }
         }
-        descendants
+        Ok(descendants)
     }
 
-    pub(super) fn has_ancestor_including(&self, directory_id: &str, ancestor_id: &str) -> bool {
+    pub(super) fn has_ancestor_including(
+        &self,
+        directory_id: &str,
+        ancestor_id: &str,
+    ) -> Result<bool, LixError> {
         let mut current = Some(directory_id);
         let mut visited = BTreeSet::new();
         while let Some(candidate) = current {
             if candidate == ancestor_id {
-                return true;
+                return Ok(true);
             }
             if !visited.insert(candidate) {
-                return false;
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("directory ancestry contains a cycle at '{candidate}'"),
+                ));
             }
             current = self.parent_by_directory.get(candidate).map(String::as_str);
         }
-        false
+        Ok(false)
     }
 }
 
@@ -90,30 +116,51 @@ pub(super) fn resolve_observed_directory_path<R: DirectoryPathRecord>(
     directories: &[R],
     cache: &mut BTreeMap<String, Option<String>>,
     visiting: &mut BTreeSet<String>,
-) -> Option<String> {
+) -> Result<Option<String>, LixError> {
     if let Some(path) = cache.get(directory_id) {
-        return path.clone();
+        return Ok(path.clone());
     }
     if !visiting.insert(directory_id.to_string()) {
-        cache.insert(directory_id.to_string(), None);
-        return None;
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("directory parent cycle while resolving '{directory_id}'"),
+        ));
     }
 
     let directory = directories
         .iter()
-        .find(|directory| directory.name().is_some() && directory.id() == directory_id)?;
-    let name = directory.name()?;
+        .find(|directory| directory.id() == directory_id)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "directory '{directory_id}' is missing from the authenticated history root"
+                ),
+            )
+        })?;
+    let name = directory.name().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("directory '{directory_id}' is missing its authenticated name"),
+        )
+    })?;
     let path = match directory.parent_id() {
         Some(parent_id) => {
             let parent_path =
-                resolve_observed_directory_path(parent_id, directories, cache, visiting)?;
-            compose_directory_path(Some(&parent_path), name).ok()?
+                resolve_observed_directory_path(parent_id, directories, cache, visiting)?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("directory '{directory_id}' has no authenticated parent path"),
+                        )
+                    })?;
+            compose_directory_path(Some(&parent_path), name)?
         }
-        None => compose_directory_path(None, name).ok()?,
+        None => compose_directory_path(None, name)?,
     };
     visiting.remove(directory_id);
     cache.insert(directory_id.to_string(), Some(path.clone()));
-    Some(path)
+    Ok(Some(path))
 }
 
 /// Loads direct-parent edges for every commit reachable from the requested
@@ -144,5 +191,94 @@ pub(super) async fn load_history_commit_parents(
             );
         }
     }
+    for (commit_id, parents) in &parents_by_commit {
+        for parent_id in parents {
+            if !parents_by_commit.contains_key(parent_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("history commit '{commit_id}' references missing parent '{parent_id}'"),
+                ));
+            }
+        }
+        let mut current = Some(commit_id.as_str());
+        let mut visiting = BTreeSet::new();
+        while let Some(current_id) = current {
+            if !visiting.insert(current_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("history commit ancestry contains a cycle at '{current_id}'"),
+                ));
+            }
+            let parent_list: Option<&Vec<String>> = parents_by_commit.get(current_id);
+            current = parent_list
+                .and_then(|parents| parents.first())
+                .map(String::as_str);
+        }
+    }
     Ok(parents_by_commit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DirectoryPathRecord, resolve_observed_directory_path};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    struct Directory {
+        id: &'static str,
+        parent_id: Option<&'static str>,
+        name: Option<&'static str>,
+    }
+
+    impl DirectoryPathRecord for Directory {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn parent_id(&self) -> Option<&str> {
+            self.parent_id
+        }
+
+        fn name(&self) -> Option<&str> {
+            self.name
+        }
+    }
+
+    #[test]
+    fn missing_parent_is_typed_failure() {
+        let directories = [Directory {
+            id: "child",
+            parent_id: Some("missing"),
+            name: Some("child"),
+        }];
+        let result = resolve_observed_directory_path(
+            "child",
+            &directories,
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parent_cycle_is_typed_failure() {
+        let directories = [
+            Directory {
+                id: "a",
+                parent_id: Some("b"),
+                name: Some("a"),
+            },
+            Directory {
+                id: "b",
+                parent_id: Some("a"),
+                name: Some("b"),
+            },
+        ];
+        let result = resolve_observed_directory_path(
+            "a",
+            &directories,
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        );
+        assert!(result.is_err());
+    }
 }

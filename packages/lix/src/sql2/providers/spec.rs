@@ -50,6 +50,7 @@ use crate::LixError;
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::write_normalization::{InsertColumnIntents, mark_omitted_insert_columns};
 use crate::sql2::{SqlWriteContext, WriteAccess};
+use crate::storage_adapter::StorageAdapterRead;
 
 use super::upsert;
 
@@ -377,7 +378,10 @@ pub(super) struct PlannedDml {
 /// `stage_insert` only when the spec must inspect or reject the physical
 /// INSERT input plan before execution (lix_file, row).
 #[async_trait]
-pub(super) trait TableSpec: Send + Sync + 'static {
+pub(super) trait TableSpec<R>: Send + Sync + 'static
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     /// Name used in error messages and plan display.
     fn table_name(&self) -> &str;
 
@@ -440,7 +444,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
     /// Convert INSERT input batches into staged writes; returns the row count.
     async fn stage_insert(
         &self,
-        _write_ctx: &SqlWriteContext,
+        _write_ctx: &SqlWriteContext<R>,
         _batches: Vec<RecordBatch>,
     ) -> Result<u64> {
         Err(DataFusionError::Execution(format!(
@@ -455,7 +459,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
     /// and routes the collected input batches to the returned handler.
     async fn plan_insert(
         &self,
-        _write_ctx: SqlWriteContext,
+        _write_ctx: SqlWriteContext<R>,
         _input: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<InsertApply>> {
         Ok(None)
@@ -467,7 +471,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
     /// turn `INSERT ... RETURNING` into a count-only mutation.
     async fn plan_insert_with_returning(
         &self,
-        _write_ctx: SqlWriteContext,
+        _write_ctx: SqlWriteContext<R>,
         _input: &Arc<dyn ExecutionPlan>,
         _returning: DmlReturning,
     ) -> Result<InsertApply> {
@@ -489,7 +493,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
 
     async fn plan_delete(
         &self,
-        _write_ctx: SqlWriteContext,
+        _write_ctx: SqlWriteContext<R>,
         _filters: &[Expr],
     ) -> Result<PlannedDml> {
         Err(DataFusionError::Execution(format!(
@@ -503,7 +507,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
     /// have lazily loaded columns retain their existing plan unchanged.
     async fn plan_delete_with_options(
         &self,
-        write_ctx: SqlWriteContext,
+        write_ctx: SqlWriteContext<R>,
         filters: &[Expr],
         _options: DmlPlanOptions,
     ) -> Result<PlannedDml> {
@@ -512,7 +516,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
 
     async fn plan_update(
         &self,
-        _write_ctx: SqlWriteContext,
+        _write_ctx: SqlWriteContext<R>,
         _assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         _filters: &[Expr],
     ) -> Result<PlannedDml> {
@@ -528,7 +532,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
     /// affected count for `UPDATE ... RETURNING`.
     async fn plan_update_with_returning(
         &self,
-        _write_ctx: SqlWriteContext,
+        _write_ctx: SqlWriteContext<R>,
         _assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         _filters: &[Expr],
         _returning: DmlReturning,
@@ -540,18 +544,21 @@ pub(super) trait TableSpec: Send + Sync + 'static {
     }
 
     /// The spec's `INSERT ... ON CONFLICT` capability, if it supports upsert.
-    fn upsert_support(&self) -> Option<&dyn upsert::UpsertSupport> {
+    fn upsert_support(&self) -> Option<&dyn upsert::UpsertSupport<R>> {
         None
     }
 }
 
 /// Register `spec` as a DataFusion table under its surface name.
-pub(super) fn register_spec_table(
+pub(super) fn register_spec_table<R>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    spec: Arc<dyn TableSpec>,
-    write_access: WriteAccess,
-) -> Result<(), LixError> {
+    spec: Arc<dyn TableSpec<R>>,
+    write_access: WriteAccess<R>,
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     if let Some(write_ctx) = write_access.into_write_context() {
         write_ctx.write_targets()?.register(
             surface_name,
@@ -576,18 +583,35 @@ pub(super) fn register_spec_table(
     Ok(())
 }
 
-pub(super) struct SpecTableProvider {
+pub(super) struct SpecTableProvider<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     provider_id: u64,
-    spec: Arc<dyn TableSpec>,
+    spec: Arc<dyn TableSpec<R>>,
     schema: SchemaRef,
 }
 
-impl SpecTableProvider {
-    pub(super) fn new(spec: Arc<dyn TableSpec>) -> Self {
+impl<R> SpecTableProvider<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    pub(super) fn new(spec: Arc<dyn TableSpec<R>>) -> Self {
         static NEXT_PROVIDER_ID: AtomicU64 = AtomicU64::new(0);
+        let schema = spec.schema();
+        let schema = if let Some(anchor_column) = spec.history_anchor_column() {
+            let mut metadata = schema.metadata().clone();
+            metadata.insert(
+                "lix.history_anchor_column".to_string(),
+                anchor_column.to_string(),
+            );
+            Arc::new(Schema::new_with_metadata(schema.fields().clone(), metadata))
+        } else {
+            schema
+        };
         Self {
             provider_id: NEXT_PROVIDER_ID.fetch_add(1, AtomicOrdering::Relaxed),
-            schema: spec.schema(),
+            schema,
             spec,
         }
     }
@@ -602,12 +626,24 @@ impl SpecTableProvider {
 /// DataFusion table providers never receive this registry and therefore cannot
 /// acquire mutation authority through the public `TableProvider` boundary.
 #[derive(Default)]
-pub(crate) struct WriteTargetRegistry {
-    targets: Mutex<BTreeMap<String, Arc<SpecWriteTarget>>>,
+pub(crate) struct WriteTargetRegistry<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    targets: Mutex<BTreeMap<String, Arc<SpecWriteTarget<R>>>>,
 }
 
-impl WriteTargetRegistry {
-    fn register(&self, name: &str, target: Arc<SpecWriteTarget>) -> Result<(), LixError> {
+impl<R> WriteTargetRegistry<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn new() -> Self {
+        Self {
+            targets: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn register(&self, name: &str, target: Arc<SpecWriteTarget<R>>) -> Result<(), LixError> {
         let mut targets = self.targets.lock().map_err(|_| {
             LixError::unknown("SQL physical write-target registry lock was poisoned")
         })?;
@@ -619,7 +655,7 @@ impl WriteTargetRegistry {
         Ok(())
     }
 
-    pub(crate) fn target(&self, name: &str) -> Result<Arc<SpecWriteTarget>, LixError> {
+    pub(crate) fn target(&self, name: &str) -> Result<Arc<SpecWriteTarget<R>>, LixError> {
         self.targets
             .lock()
             .map_err(|_| LixError::unknown("SQL physical write-target registry lock was poisoned"))?
@@ -638,14 +674,20 @@ impl WriteTargetRegistry {
 ///
 /// RETURNING and ON CONFLICT semantics remain in Lix's bound executor; this
 /// target only plans and stages the selected surface's physical operation.
-pub(crate) struct SpecWriteTarget {
-    spec: Arc<dyn TableSpec>,
+pub(crate) struct SpecWriteTarget<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    spec: Arc<dyn TableSpec<R>>,
     schema: SchemaRef,
-    write_ctx: SqlWriteContext,
+    write_ctx: SqlWriteContext<R>,
 }
 
-impl SpecWriteTarget {
-    fn new(spec: Arc<dyn TableSpec>, write_ctx: SqlWriteContext) -> Self {
+impl<R> SpecWriteTarget<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    fn new(spec: Arc<dyn TableSpec<R>>, write_ctx: SqlWriteContext<R>) -> Self {
         Self {
             schema: spec.schema(),
             spec,
@@ -775,7 +817,7 @@ impl SpecWriteTarget {
         &self,
         input: &Arc<dyn ExecutionPlan>,
         target_columns: &[String],
-    ) -> Result<(&dyn upsert::UpsertSupport, upsert::UpsertConflictTarget)> {
+    ) -> Result<(&dyn upsert::UpsertSupport<R>, upsert::UpsertConflictTarget)> {
         let table = self.spec.table_name();
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
@@ -912,7 +954,10 @@ impl SpecWriteTarget {
     }
 }
 
-impl std::fmt::Debug for SpecTableProvider {
+impl<R> std::fmt::Debug for SpecTableProvider<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpecTableProvider")
             .field("table", &self.spec.table_name())
@@ -921,7 +966,10 @@ impl std::fmt::Debug for SpecTableProvider {
 }
 
 #[async_trait]
-impl TableProvider for SpecTableProvider {
+impl<R> TableProvider for SpecTableProvider<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1004,7 +1052,10 @@ impl TableProvider for SpecTableProvider {
 /// multi-value `IN` pin nothing. Filters the spec reports as `Inexact` or
 /// `Unsupported` are skipped: their rows are only narrowed above the scan, so
 /// the scan itself proves nothing.
-fn exact_filter_constant_columns(spec: &dyn TableSpec, filters: &[Expr]) -> Vec<String> {
+fn exact_filter_constant_columns<R>(spec: &dyn TableSpec<R>, filters: &[Expr]) -> Vec<String>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn collect(filter: &Expr, columns: &mut Vec<String>) {
         match filter {
             Expr::BinaryExpr(binary) if binary.op == Operator::And => {
@@ -1041,7 +1092,10 @@ fn exact_filter_constant_columns(spec: &dyn TableSpec, filters: &[Expr]) -> Vec<
     columns
 }
 
-impl SpecTableProvider {
+impl<R> SpecTableProvider<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     /// Captures everything needed to replan this scan with one extra `IN`
     /// restriction, so a join can narrow it once its probe keys are known.
     fn probe_binding(
@@ -1100,13 +1154,19 @@ fn physical_filters(
         .collect()
 }
 
-struct SpecInsertSink {
-    spec: Arc<dyn TableSpec>,
-    write_ctx: SqlWriteContext,
+struct SpecInsertSink<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    spec: Arc<dyn TableSpec<R>>,
+    write_ctx: SqlWriteContext<R>,
     omitted_insert_columns: BTreeSet<String>,
 }
 
-impl std::fmt::Debug for SpecInsertSink {
+impl<R> std::fmt::Debug for SpecInsertSink<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpecInsertSink")
             .field("table", &self.spec.table_name())
@@ -1114,14 +1174,20 @@ impl std::fmt::Debug for SpecInsertSink {
     }
 }
 
-impl DisplayAs for SpecInsertSink {
+impl<R> DisplayAs for SpecInsertSink<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SpecInsertSink({})", self.spec.table_name())
     }
 }
 
 #[async_trait]
-impl InsertSink for SpecInsertSink {
+impl<R> InsertSink for SpecInsertSink<R>
+where
+    R: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
     async fn write_batches(
         &self,
         batches: Vec<RecordBatch>,
@@ -1808,7 +1874,9 @@ mod scan_source_tests {
     }
 
     #[async_trait]
-    impl TableSpec for CountingSpec {
+    impl TableSpec<crate::storage_adapter::StorageAdapterReadScope<crate::storage::MemoryRead>>
+        for CountingSpec
+    {
         fn table_name(&self) -> &str {
             "counted"
         }

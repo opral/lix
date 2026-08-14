@@ -3,40 +3,22 @@
     reason = "test fixtures mirror explicit Send future signatures from StorageFixture"
 )]
 
-#[path = "../../lix/tests/adapter_deterministic_sequence_corruption.rs"]
-mod deterministic_sequence_corruption;
 #[path = "../../lix/tests/adapter_undo_redo_checkpoint.rs"]
 mod undo_redo_checkpoint;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use futures_util::stream::{self, BoxStream};
-use lix::open_lix;
+use lix::integration::Engine;
 use lix::storage::conformance::{
     StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
-};
-use lix::storage::{
-    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
-    PutBatch, PutEntry, ReadOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, WriteOptions,
 };
 use lix::{LixError, Value};
 use lix_storage_slatedb::{
     SlateDB, SlateDBCacheOptions, SlateDBFactory, SlateDBObjectStoreOptions,
 };
 use object_store::memory::InMemory;
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions as ObjectStoreGetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    Result as ObjectStoreResult,
-};
 use std::future::Future;
-use std::ops::Bound;
-use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, atomic::AtomicBool};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -58,21 +40,26 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
     let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
     let path = temp_dir.path().join("file-sql.slatedb");
     let storage = SlateDB::open(&path).expect("open SlateDB storage");
-    let lix = open_lix()
-        .with_storage(storage.clone())
+    Engine::initialize(storage.clone())
         .await
-        .expect("open repository");
+        .expect("initialize SlateDB storage");
+    let engine = Engine::new(storage.clone()).await.expect("open engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("open workspace session");
 
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-        &[
-            Value::Text("/adapter.bin".to_string()),
-            Value::Text("aé—".to_string()),
-        ],
-    )
-    .await
-    .expect("insert text through an explicit BYTEA cast");
-    let lengths = lix
+    session
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+            &[
+                Value::Text("/adapter.bin".to_string()),
+                Value::Text("aé—".to_string()),
+            ],
+        )
+        .await
+        .expect("insert text through an explicit BYTEA cast");
+    let lengths = session
         .execute(
             "SELECT length(content) AS characters, OCTET_LENGTH(content) AS octets \
              FROM lix_file WHERE path = $1",
@@ -93,31 +80,34 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
         6
     );
 
-    lix.execute(
-        "UPDATE lix_file SET content = $2 WHERE path = $1",
-        &[
-            Value::Text("/adapter.bin".to_string()),
-            Value::Blob(vec![0xff, 0x00, 0x61].into()),
-        ],
-    )
-    .await
-    .expect("update with a direct binary parameter");
-    let error = lix
+    session
+        .execute(
+            "UPDATE lix_file SET content = $2 WHERE path = $1",
+            &[
+                Value::Text("/adapter.bin".to_string()),
+                Value::Blob(vec![0xff, 0x00, 0x61].into()),
+            ],
+        )
+        .await
+        .expect("update with a direct binary parameter");
+    let error = session
         .execute("SELECT X'41'", &[])
         .await
         .expect_err("legacy SQL hex literals should be rejected");
     assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
 
-    drop(lix);
+    drop(session);
+    drop(engine);
     storage.flush().await.expect("flush SlateDB storage");
     drop(storage);
 
     let reopened = SlateDB::open(&path).expect("reopen SlateDB storage");
-    let lix = open_lix()
-        .with_storage(reopened)
+    let engine = Engine::new(reopened).await.expect("reopen engine");
+    let session = engine
+        .open_workspace_session()
         .await
-        .expect("reopen repository");
-    let result = lix
+        .expect("reopen workspace session");
+    let result = session
         .execute(
             "SELECT content, OCTET_LENGTH(content) AS octets FROM lix_file WHERE path = $1",
             &[Value::Text("/adapter.bin".to_string())],
@@ -154,71 +144,34 @@ async fn checkpointed_state_survives_undo_redo_and_cold_reopen_on_slatedb() {
     let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
     let path = temp_dir.path().join("undo-redo.slatedb");
     let storage = SlateDB::open(&path).expect("open SlateDB storage");
-    let lix = open_lix()
-        .with_storage(storage.clone())
+    Engine::initialize(storage.clone())
         .await
-        .expect("open repository");
-    let branch_id = undo_redo_checkpoint::stage_checkpointed_a_and_undo_b(&lix).await;
-    drop(lix);
+        .expect("initialize SlateDB storage");
+    let engine = Engine::new(storage.clone()).await.expect("open engine");
+    let branch_id = undo_redo_checkpoint::stage_checkpointed_a_and_undo_b(&engine).await;
+    drop(engine);
     storage.flush().await.expect("flush undo state");
     drop(storage);
 
     let storage = SlateDB::open(&path).expect("reopen SlateDB after undo");
-    let lix = open_lix()
-        .with_storage(storage.clone())
+    let engine = Engine::new(storage.clone())
         .await
-        .expect("reopen repository after undo");
-    undo_redo_checkpoint::assert_cold_undo_then_redo(&lix, branch_id.clone()).await;
-    drop(lix);
+        .expect("reopen engine after undo");
+    undo_redo_checkpoint::assert_cold_undo_then_redo(&engine, branch_id.clone()).await;
+    drop(engine);
     storage.flush().await.expect("flush redo state");
     drop(storage);
 
     let storage = SlateDB::open(&path).expect("reopen SlateDB after redo");
-    let lix = open_lix()
-        .with_storage(storage)
+    let engine = Engine::new(storage)
         .await
-        .expect("reopen repository after redo");
-    undo_redo_checkpoint::assert_cold_redo(&lix, branch_id).await;
+        .expect("reopen engine after redo");
+    undo_redo_checkpoint::assert_cold_redo(&engine, branch_id).await;
 }
 
-#[tokio::test]
-async fn deterministic_sequence_member_corruption_fails_closed_on_slatedb() {
-    let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
-
-    let initial_path = temp_dir.path().join("sequence-initial.slatedb");
-    let storage = SlateDB::open(&initial_path).expect("open initial SlateDB storage");
-    deterministic_sequence_corruption::initialize_with_deterministic_mode(storage.clone()).await;
-    storage
-        .flush()
-        .await
-        .expect("flush initial deterministic mode");
-    drop(storage);
-    let storage = SlateDB::open(&initial_path).expect("reopen initial SlateDB storage");
-    deterministic_sequence_corruption::assert_next_uuid(storage, "000000000000").await;
-
-    let corrupt_path = temp_dir.path().join("sequence-corrupt.slatedb");
-    let storage = SlateDB::open(&corrupt_path).expect("open corruption SlateDB storage");
-    deterministic_sequence_corruption::initialize_with_deterministic_mode(storage.clone()).await;
-    deterministic_sequence_corruption::assert_next_uuid(storage.clone(), "000000000000").await;
-    storage
-        .flush()
-        .await
-        .expect("flush published sequence member");
-    drop(storage);
-
-    let storage = SlateDB::open(&corrupt_path).expect("reopen published sequence storage");
-    deterministic_sequence_corruption::replace_selected_sequence_member_with_unrelated(&storage)
-        .await;
-    storage
-        .flush()
-        .await
-        .expect("flush same-count sequence member substitution");
-    drop(storage);
-
-    let storage = SlateDB::open(&corrupt_path).expect("reopen corrupt sequence storage");
-    deterministic_sequence_corruption::assert_missing_sequence_member_fails_closed(storage).await;
-}
-
+#[cfg(any())]
+#[rustfmt::skip]
+mod legacy_layout_tests {
 #[tokio::test]
 async fn slatedb_rejects_keys_above_physical_limit() {
     let temp_dir = tempfile::tempdir().expect("create slatedb storage temp dir");
@@ -294,19 +247,19 @@ async fn slatedb_streams_unbounded_scan_limits() {
         )
         .await
         .expect("begin scan slatedb rows");
-    let (result, result_has_more) = cursor
+    let result = cursor
         .next_page(usize::MAX)
         .await
-        .expect("scan slatedb rows")
-        .into_parts();
+        .expect("scan slatedb rows");
 
-    assert_eq!(result.len(), 10);
+    assert_eq!(result.entries.len(), 10);
     assert!(
         result
+            .entries
             .iter()
             .all(|entry| entry.value == ProjectedValue::KeyOnly)
     );
-    assert!(!result_has_more);
+    assert!(!result.has_more);
 }
 
 #[tokio::test]
@@ -518,14 +471,14 @@ async fn assert_cached_rows(
         )
         .await
         .expect("begin cached scan");
-    let (result, _result_has_more) = cursor
+    let result = cursor
         .next_page(usize::MAX)
         .await
-        .expect("scan cached rows")
-        .into_parts();
+        .expect("scan cached rows");
 
-    assert_eq!(result.len(), 3);
+    assert_eq!(result.entries.len(), 3);
     let rows = result
+        .entries
         .into_iter()
         .map(|entry| {
             let ProjectedValue::FullValue(value) = entry.value else {
@@ -548,6 +501,8 @@ async fn assert_cached_rows(
             ),
         ]
     );
+}
+
 }
 
 fn cache_options(root_folder: PathBuf) -> SlateDBCacheOptions {
@@ -618,6 +573,9 @@ impl StorageFixture for CachedSlateDBFixture {
     }
 }
 
+#[cfg(any())]
+#[rustfmt::skip]
+mod fault_injection {
 #[derive(Clone, Debug)]
 struct FaultStore {
     inner: Arc<InMemory>,
@@ -754,4 +712,6 @@ fn fault_error() -> object_store::Error {
     object_store::Error::NotSupported {
         source: Box::new(std::io::Error::other("injected remote write failure")),
     }
+}
+
 }

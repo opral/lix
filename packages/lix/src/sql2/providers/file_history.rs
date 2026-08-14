@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableType;
@@ -14,30 +15,28 @@ use tokio::sync::Mutex;
 
 use crate::LixError;
 use crate::NullableKeyFilter;
-use crate::binary_cas::{BlobDataReader, BlobId};
+use crate::binary_cas::BlobId;
+use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
-use crate::row_pk::RowPk;
-use crate::plugin::runtime::{
+use crate::entity_pk::EntityPk;
+use crate::forktree::{ForkTreeReadFacade, StateKey, encode_state_entity_prefix_bounds};
+use crate::plugin::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRuntimeHost,
-};
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
-    TrackedStateStoreReader,
 };
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
-    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, row_pk_json_array,
+    ObservedStateOrdinal, ObservedStateRows, StateFilter, entity_pk_json_array,
 };
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
-use crate::sql2::SqlHistoryQuerySource;
+use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-    HISTORY_COL_ROW_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_ENTITY_PK, HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
     serialize_history_source_changes, validate_history_anchor_filter,
@@ -54,12 +53,30 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
+fn file_history_owner_schema_keys(
+    state: &FileHistoryObservedState,
+    owner: &PluginFileOwner,
+) -> Result<Vec<String>, LixError> {
+    state
+        .plugin_registry
+        .get(owner.plugin_key())
+        .map(crate::plugin::PluginRegistryEntry::schema_keys)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            invalid_file_history_state(format!(
+                "plugin owner '{}' references missing authenticated registry entry '{}'",
+                owner.file_id(),
+                owner.plugin_key(),
+            ))
+        })
+}
+
 pub(super) async fn register_lix_file_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlHistoryQuerySource<S>,
-    blob_reader: Arc<dyn BlobDataReader>,
+    commit_graph: super::SharedCommitGraph,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
     plugin_host: PluginRuntimeHost,
 ) -> Result<(), LixError>
 where
@@ -69,9 +86,9 @@ where
         session,
         surface_name,
         Arc::new(LixFileHistorySpec {
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
+            commit_graph,
             query_source,
-            blob_reader,
+            default_as_of_commit_id,
             plugin_host,
         }),
         WriteAccess::read_only(),
@@ -85,13 +102,13 @@ where
 /// nearest descriptor/blob/directory events per file.
 struct LixFileHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
-    blob_reader: Arc<dyn BlobDataReader>,
+    query_source: SqlChangelogQuerySource<S>,
+    default_as_of_commit_id: String,
     plugin_host: PluginRuntimeHost,
 }
 
 #[async_trait]
-impl<S> TableSpec for LixFileHistorySpec<S>
+impl<S> TableSpec<S> for LixFileHistorySpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -149,7 +166,7 @@ where
             })
         });
         let mut route = HistoryRoute::from_filters(filters);
-        route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
+        route.default_to_as_of_commit_id(&self.default_as_of_commit_id);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
         let public_predicate = FileHistoryPublicPredicate::from_filters(filters);
         let lookup_ids = FileHistoryLookupIds::from_public_predicate(&public_predicate);
@@ -161,7 +178,6 @@ where
                 (
                     Arc::clone(&self.commit_graph),
                     self.query_source.clone(),
-                    Arc::clone(&self.blob_reader),
                     self.plugin_host.clone(),
                     route,
                     public_predicate,
@@ -172,7 +188,6 @@ where
                 move |(
                     commit_graph,
                     query_source,
-                    blob_reader,
                     plugin_host,
                     route,
                     public_predicate,
@@ -183,7 +198,6 @@ where
                     let mut rows = load_file_history_rows(
                         commit_graph,
                         query_source,
-                        &blob_reader,
                         &plugin_host,
                         &route,
                         &public_predicate,
@@ -411,37 +425,23 @@ impl FileHistoryPublicPredicate {
         matches!(self, Self::All)
     }
 
-    fn exact_ids(&self) -> Option<&BTreeSet<String>> {
+    fn exact_ids_for_lookup(&self) -> Option<BTreeSet<String>> {
         match self {
-            Self::Ids(ids) => Some(ids),
-            _ => None,
-        }
-    }
-
-    /// The finite set of `path` literals every matching row must render, when
-    /// one exists.
-    ///
-    /// A conjunction narrows (either side alone is already a sound bound); a
-    /// disjunction only bounds the whole expression when both sides do.
-    fn exact_paths(&self) -> Option<BTreeSet<String>> {
-        match self {
-            Self::All | Self::Ids(_) => None,
-            Self::Paths(paths) => Some(paths.clone()),
-            Self::And(left, right) => match (left.exact_paths(), right.exact_paths()) {
-                (Some(left), Some(right)) => Some(left.intersection(&right).cloned().collect()),
-                (bound, None) | (None, bound) => bound,
-            },
-            Self::Or(left, right) => {
-                let mut left = left.exact_paths()?;
-                left.extend(right.exact_paths()?);
-                Some(left)
+            Self::Ids(ids) => Some(ids.clone()),
+            Self::And(left, right) => {
+                match (left.exact_ids_for_lookup(), right.exact_ids_for_lookup()) {
+                    (Some(left), Some(right)) => Some(left.intersection(&right).cloned().collect()),
+                    (Some(ids), None) | (None, Some(ids)) => Some(ids),
+                    (None, None) => None,
+                }
             }
+            Self::All | Self::Paths(_) | Self::Or(_, _) => None,
         }
     }
 }
 
 /// A conservative exact public `id` constraint that can be translated to the
-/// canonical descriptor/blob row primary key. Unlike
+/// canonical descriptor/blob entity primary key. Unlike
 /// [`FileHistoryPublicPredicate`], this deliberately declines disjunctions and
 /// non-literal `id` expressions: those retain the existing complete traversal
 /// and DataFusion residual evaluation.
@@ -450,11 +450,14 @@ struct FileHistoryLookupIds(BTreeSet<String>);
 
 impl FileHistoryLookupIds {
     fn from_public_predicate(predicate: &FileHistoryPublicPredicate) -> Option<Self> {
-        predicate.exact_ids().cloned().map(Self)
+        predicate
+            .exact_ids_for_lookup()
+            .filter(|ids| !ids.is_empty())
+            .map(Self)
     }
 
-    fn row_pks(&self) -> Result<Vec<String>, LixError> {
-        self.0.iter().map(|id| row_pk_json_array(id)).collect()
+    fn entity_pks(&self) -> Result<Vec<String>, LixError> {
+        self.0.iter().map(|id| entity_pk_json_array(id)).collect()
     }
 }
 
@@ -477,20 +480,6 @@ struct FileDescriptorSnapshot {
     name: String,
 }
 
-/// The two fields path resolution reads, borrowed from the snapshot text.
-///
-/// `Cow` rather than `&str` on purpose: a borrowed `&str` deserialize *fails*
-/// on any string containing a JSON escape, which would turn a legally named
-/// file into a query error. `Cow` borrows when it can and allocates when it
-/// must, so the fast path allocates nothing and the escaped path still decodes.
-#[derive(Debug, Deserialize)]
-struct FileDescriptorNameSnapshot<'a> {
-    #[serde(borrow)]
-    id: std::borrow::Cow<'a, str>,
-    #[serde(borrow)]
-    name: std::borrow::Cow<'a, str>,
-}
-
 #[derive(Debug, Deserialize)]
 struct DirectoryDescriptorSnapshot {
     id: String,
@@ -502,11 +491,7 @@ struct DirectoryDescriptorSnapshot {
 struct BlobRefSnapshot {
     id: String,
     blob_hash: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HistoryIdentitySnapshot {
-    id: String,
+    size_bytes: u64,
 }
 
 struct FileHistoryFilesystemContext {
@@ -521,7 +506,7 @@ struct FileHistoryObservedDescriptorRecord {
     id: String,
     directory_id: Option<String>,
     name: Option<String>,
-    row: ObservedTrackedStateOrdinal,
+    row: ObservedStateOrdinal,
 }
 
 #[derive(Debug, Clone)]
@@ -529,7 +514,7 @@ struct FileHistoryObservedDirectoryRecord {
     id: String,
     parent_id: Option<String>,
     name: Option<String>,
-    row: ObservedTrackedStateOrdinal,
+    row: ObservedStateOrdinal,
 }
 
 impl DirectoryPathRecord for FileHistoryObservedDirectoryRecord {
@@ -550,19 +535,21 @@ impl DirectoryPathRecord for FileHistoryObservedDirectoryRecord {
 struct FileHistoryObservedBlobRecord {
     file_id: String,
     blob_hash: Option<String>,
-    row: ObservedTrackedStateOrdinal,
+    size_bytes: Option<u64>,
+    deleted: bool,
+    row: ObservedStateOrdinal,
 }
 
 #[derive(Debug, Clone)]
 struct FileHistoryObservedPluginOwnerRecord {
     file_id: String,
     owner: Option<PluginFileOwner>,
-    row: ObservedTrackedStateOrdinal,
+    row: ObservedStateOrdinal,
 }
 
 #[derive(Debug)]
 struct FileHistoryObservedState {
-    rows: ObservedTrackedStateRows,
+    rows: ObservedStateRows,
     descriptors: Vec<FileHistoryObservedDescriptorRecord>,
     directories: Vec<FileHistoryObservedDirectoryRecord>,
     blobs: Vec<FileHistoryObservedBlobRecord>,
@@ -596,24 +583,25 @@ impl FileHistoryDirectoryIndex {
         }
     }
 
-    fn affected_file_ids(&self, changed_directory_id: &str) -> BTreeSet<String> {
+    fn affected_file_ids(&self, changed_directory_id: &str) -> Result<BTreeSet<String>, LixError> {
         let mut file_ids = BTreeSet::new();
         self.visit_affected_file_buckets(changed_directory_id, |bucket| {
             file_ids.extend(bucket.iter().cloned());
-        });
-        file_ids
+        })?;
+        Ok(file_ids)
     }
 
     fn visit_affected_file_buckets(
         &self,
         changed_directory_id: &str,
         mut visit: impl FnMut(&BTreeSet<String>),
-    ) {
-        for directory_id in self.tree.descendants_including(changed_directory_id) {
+    ) -> Result<(), LixError> {
+        for directory_id in self.tree.descendants_including(changed_directory_id)? {
             if let Some(bucket) = self.file_ids_by_directory.get(&directory_id) {
                 visit(bucket);
             }
         }
+        Ok(())
     }
 }
 
@@ -626,8 +614,7 @@ struct FileHistoryPluginDiscovery {
 
 async fn load_file_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
-    blob_reader: &Arc<dyn BlobDataReader>,
+    query_source: SqlChangelogQuerySource<S>,
     _plugin_host: &PluginRuntimeHost,
     route: &HistoryRoute,
     public_predicate: &FileHistoryPublicPredicate,
@@ -649,28 +636,6 @@ where
 
     let event_route = route.traversal_only();
     let context_route = route.anchors_only();
-    // A `path` predicate prunes exactly like an `id` predicate once it is
-    // resolved to the file IDs that could render that path.
-    let resolved_lookup_ids = match lookup_ids {
-        Some(lookup_ids) => Some(lookup_ids.clone()),
-        None => {
-            resolve_file_history_path_lookup_ids(
-                Arc::clone(&commit_graph),
-                query_source.clone(),
-                &context_route,
-                public_predicate,
-            )
-            .await?
-        }
-    };
-    if resolved_lookup_ids
-        .as_ref()
-        .is_some_and(|lookup_ids| lookup_ids.0.is_empty())
-    {
-        return Ok(Vec::new());
-    }
-    let lookup_ids = resolved_lookup_ids.as_ref();
-
     let filesystem_context = load_file_history_filesystem_context(
         Arc::clone(&commit_graph),
         query_source.clone(),
@@ -682,11 +647,12 @@ where
     .await?;
     let parent_commit_ids_by_commit =
         load_history_commit_parents(&commit_graph, &context_route.as_of_commit_ids).await?;
+    let historical = query_source.forktree_reader.clone();
     let plugin_discovery = discover_file_history_plugins(
         Arc::clone(&commit_graph),
         query_source.clone(),
+        &historical,
         &event_route,
-        &context_route,
         &parent_commit_ids_by_commit,
         metadata_projection,
     )
@@ -772,7 +738,7 @@ where
         .collect::<Vec<_>>();
     observed_commit_ids.extend(direct_parent_commit_ids);
     let observed_states =
-        load_file_history_observed_states(query_source, observed_commit_ids, lookup_ids).await?;
+        load_file_history_observed_states(&historical, observed_commit_ids, lookup_ids).await?;
     let filesystem_events = file_history_events(
         &filesystem_context.event_descriptors,
         &filesystem_context.event_directories,
@@ -780,13 +746,13 @@ where
         &filesystem_context.descriptors,
         &observed_states,
         &parent_commit_ids_by_commit,
-    );
+    )?;
     let plugin_state_events = file_history_plugin_events(
         &event_plugin_state,
         &event_plugin_owners,
         &observed_states,
         &plugin_discovery.parent_commit_ids_by_commit,
-    );
+    )?;
     let plugin_owner_events = event_plugin_owners
         .iter()
         .map(|record| file_history_event_from_entry(record.file_id.clone(), &record.entry));
@@ -802,22 +768,28 @@ where
             .chain(plugin_state_events)
             .chain(plugin_owner_events)
             .chain(plugin_registry_events),
-    );
+    )?;
     let prepared = prepare_file_history_rows(&observed_states, events, route, public_predicate)?;
-    let blob_bytes = if needs_data {
-        load_file_history_blob_bytes(blob_reader, &prepared).await?
-    } else {
-        BTreeMap::new()
-    };
+    let blob_bytes = load_file_history_blob_bytes(&historical, &prepared).await?;
 
     let mut output = Vec::with_capacity(prepared.len());
     for prepared_row in prepared {
-        let data = if needs_data && prepared_row.descriptor().name.is_some() {
-            validate_file_history_materialization(&prepared_row)?;
-            prepared_row.blob_hash.as_deref().map_or_else(
-                || Some(Vec::new()),
-                |blob_hash| blob_bytes.get(blob_hash).cloned().flatten(),
-            )
+        let data = if prepared_row.descriptor().name.is_some() {
+            let blob_hash = validate_exactly_one_blob_ref(
+                &prepared_row.observed_state,
+                &prepared_row.event,
+                true,
+            )?
+            .and_then(|reference| reference.blob_hash.as_deref());
+            let bytes = blob_hash
+                .and_then(|blob_hash| blob_bytes.get(blob_hash))
+                .and_then(Option::as_deref);
+            validate_file_history_materialization(&prepared_row, bytes)?;
+            if needs_data {
+                Some(bytes.unwrap_or_default().to_vec())
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -879,15 +851,18 @@ fn prepare_file_history_rows(
             .enumerate()
             .find(|(_, descriptor)| descriptor.id == event.file_id)
         else {
-            continue;
+            return Err(invalid_file_history_state(format!(
+                "file history event for '{}' at commit '{}' has no authenticated descriptor",
+                event.file_id, event.observed_commit_id
+            )));
         };
         let directory_index = directory_indexes
             .get(event.observed_commit_id.as_str())
             .expect("every observed file state should have a directory index");
-        if !file_history_event_affects_observed_file(&event, descriptor, &directory_index.tree) {
+        if !file_history_event_affects_observed_file(&event, descriptor, &directory_index.tree)? {
             continue;
         }
-        let path = resolve_observed_file_history_path(descriptor, &state.directories);
+        let path = resolve_observed_file_history_path(descriptor, &state.directories)?;
         let id = tombstone_identity_column_value(
             "id",
             &descriptor.id,
@@ -898,23 +873,17 @@ fn prepare_file_history_rows(
         if !public_predicate.matches(&id, path.as_deref()) {
             continue;
         }
-        let row_pk = row_pk_json_array(&descriptor.id).ok();
+        let entity_pk = entity_pk_json_array(&descriptor.id).ok();
         if !route.matches_surface_row(
             FILE_DESCRIPTOR_SCHEMA_KEY,
-            row_pk.as_deref().unwrap_or(&descriptor.id),
+            entity_pk.as_deref().unwrap_or(&descriptor.id),
             Some(&descriptor.id),
             event.depth,
         ) {
             continue;
         }
-        let blob_hash = state
-            .blobs
-            .iter()
-            .find(|blob| blob.file_id == event.file_id)
-            .and_then(|blob| {
-                let _ = state.rows.row(blob.row);
-                blob.blob_hash.clone()
-            });
+        let blob_hash = validate_exactly_one_blob_ref(state, &event, descriptor.name.is_some())?
+            .and_then(|blob| blob.blob_hash.clone());
         prepared.push(PreparedFileHistoryRow {
             id,
             path,
@@ -932,40 +901,58 @@ fn prepare_file_history_rows(
     Ok(prepared)
 }
 
-async fn load_file_history_blob_bytes(
-    blob_reader: &Arc<dyn BlobDataReader>,
+async fn load_file_history_blob_bytes<S>(
+    historical: &ForkTreeReadFacade<S>,
     rows: &[PreparedFileHistoryRow],
-) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError> {
-    let mut hashes = BTreeMap::<BlobId, BTreeSet<String>>::new();
-    for hash in rows
-        .iter()
-        .filter(|row| row.descriptor().name.is_some())
-        .filter_map(|row| row.blob_hash.as_deref())
-    {
-        hashes
-            .entry(BlobId::from_hex(hash)?)
-            .or_default()
-            .insert(hash.to_string());
+) -> Result<BTreeMap<String, Option<Bytes>>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut requests = Vec::new();
+    let mut hashes = Vec::new();
+    for row in rows.iter().filter(|row| row.descriptor().name.is_some()) {
+        let Some(reference) = validate_exactly_one_blob_ref(&row.observed_state, &row.event, true)?
+        else {
+            continue;
+        };
+        let observed = row.observed_state.rows.row(reference.row);
+        requests.push((
+            observed.observed_commit_id().to_owned(),
+            observed.row().key().clone(),
+        ));
+        hashes.push(row.blob_hash.clone().ok_or_else(|| {
+            invalid_file_history_state(format!(
+                "file '{}' at commit '{}' has no authenticated BlobId",
+                row.id, row.event.observed_commit_id
+            ))
+        })?);
     }
-    if hashes.is_empty() {
+    if requests.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let request = hashes.keys().copied().collect::<Vec<_>>();
-    let loaded = blob_reader.load_bytes_many(&request).await?.into_vec();
-    if loaded.len() != request.len() {
+    let loaded = historical
+        .load_historical_blob_bytes_for_rows(&requests)
+        .await?
+        .into_shared_vec();
+    if loaded.len() != hashes.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "file history blob batch returned {} values for {} requested hashes",
                 loaded.len(),
-                request.len()
+                hashes.len()
             ),
         ));
     }
     let mut by_encoded_hash = BTreeMap::new();
-    for ((_, encoded_hashes), bytes) in hashes.into_iter().zip(loaded) {
-        for encoded_hash in encoded_hashes {
-            by_encoded_hash.insert(encoded_hash, bytes.clone());
+    for (encoded_hash, bytes) in hashes.into_iter().zip(loaded) {
+        if let Some(previous) = by_encoded_hash.insert(encoded_hash.clone(), bytes.clone())
+            && previous != bytes
+        {
+            return Err(invalid_file_history_state(format!(
+                "file history BlobId '{}' resolves to conflicting authenticated payloads",
+                encoded_hash
+            )));
         }
     }
     Ok(by_encoded_hash)
@@ -975,210 +962,131 @@ fn invalid_file_history_state(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INVALID_PLUGIN, message)
 }
 
-/// A plugin owner commits a materialization contract alongside semantic
-/// state. Never silently serve an owned historical file from an absent or
-/// opposite representation: that would turn a damaged history root into empty
-/// bytes instead of surfacing the corruption to the caller.
+/// Validate a historical file materialization. A live descriptor without a
+/// BlobRef is the canonical descriptor-only representation of an empty file.
+/// Once a BlobRef exists, its identity, size, and payload remain strict.
 fn validate_file_history_materialization(
     prepared: &PreparedFileHistoryRow,
+    payload: Option<&[u8]>,
 ) -> Result<(), LixError> {
     let observed_commit_id = prepared.event.observed_commit_id.as_str();
     let state = prepared.observed_state.as_ref();
     let descriptor = prepared.descriptor();
-    let has_blob = prepared.blob_hash.is_some();
-    let Some(owner) = live_file_history_plugin_owner(state, &descriptor.id) else {
+    let plugin = live_file_history_plugin_owner(state, &descriptor.id)
+        .map(|owner| {
+            state
+                .plugin_registry
+                .get(owner.plugin_key())
+                .ok_or_else(|| {
+                    invalid_file_history_state(format!(
+                        "plugin-owned file '{}' at commit '{observed_commit_id}' names unavailable plugin '{}'",
+                        descriptor.id,
+                        owner.plugin_key(),
+                    ))
+                })
+        })
+        .transpose()?;
+    let Some(blob) = validate_exactly_one_blob_ref(state, &prepared.event, true)? else {
+        if payload.is_some_and(|payload| !payload.is_empty()) {
+            return Err(invalid_file_history_state(format!(
+                "descriptor-only file '{}' at commit '{observed_commit_id}' has an unexpected payload",
+                descriptor.id
+            )));
+        }
+        let _ = plugin;
         return Ok(());
     };
-    let plugin = state
-        .plugin_registry
-        .get(owner.plugin_key())
-        .ok_or_else(|| {
-            invalid_file_history_state(format!(
-                "plugin-owned file '{}' at commit '{observed_commit_id}' names unavailable plugin '{}'",
-                descriptor.id,
-                owner.plugin_key(),
-            ))
-        })?;
-    if has_blob {
-        Ok(())
-    } else {
-        Err(invalid_file_history_state(format!(
-            "plugin '{}' owns file '{}' at commit '{observed_commit_id}' without exactly one blob reference",
-            plugin.key(),
-            descriptor.id,
-        )))
+    let blob_hash = blob.blob_hash.as_deref().ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "file '{}' at commit '{observed_commit_id}' has no live blob identity",
+            descriptor.id
+        ))
+    })?;
+    let expected_blob_id = BlobId::from_hex(blob_hash).map_err(|error| {
+        invalid_file_history_state(format!(
+            "file '{}' at commit '{observed_commit_id}' has an invalid BlobId: {error}",
+            descriptor.id
+        ))
+    })?;
+    let payload = payload.ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "file '{}' blob payload '{}' is missing at observed commit '{observed_commit_id}'",
+            descriptor.id, blob_hash
+        ))
+    })?;
+    let declared_size = blob.size_bytes.ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "file '{}' blob reference '{}' has no declared size at observed commit '{observed_commit_id}'",
+            descriptor.id, blob_hash
+        ))
+    })?;
+    let payload_size = u64::try_from(payload.len()).map_err(|_| {
+        invalid_file_history_state(format!(
+            "file '{}' blob payload '{}' exceeds the supported size at observed commit '{observed_commit_id}'",
+            descriptor.id, blob_hash
+        ))
+    })?;
+    if declared_size != payload_size || BlobId::from_canonical_content(payload) != expected_blob_id
+    {
+        return Err(invalid_file_history_state(format!(
+            "file '{}' blob reference '{}' does not authenticate its payload at observed commit '{observed_commit_id}'",
+            descriptor.id, blob_hash
+        )));
     }
+    let _ = plugin;
+    Ok(())
 }
 
-/// Resolves an exact `path` predicate to the file IDs that can render it, so a
-/// path lookup prunes the traversal the same way an ID lookup already does.
-///
-/// A row's path is `<directory path>/<descriptor name>` and a path segment can
-/// never contain `/`, so a row renders `path` only when its descriptor name
-/// equals the final segment of `path` at that commit. Every name a file has
-/// ever carried was written by a descriptor change, and every commit a row can
-/// be observed at is reachable from the anchors — so descriptor changes read
-/// from the anchors are a superset of the matching file IDs. The residual
-/// [`FileHistoryPublicPredicate::matches`] still decides every row, so this
-/// only narrows the traversal; it never decides the answer.
-///
-/// Returns `None` when the predicate cannot be bounded to a finite set of
-/// paths, which keeps the complete traversal.
-async fn resolve_file_history_path_lookup_ids<S>(
-    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
-    anchor_route: &HistoryRoute,
-    public_predicate: &FileHistoryPublicPredicate,
-) -> Result<Option<FileHistoryLookupIds>, LixError>
-where
-    S: StorageAdapterRead + Clone + Send + Sync + 'static,
-{
-    let Some(paths) = public_predicate.exact_paths() else {
-        return Ok(None);
-    };
-    let mut names = BTreeSet::new();
-    for path in &paths {
-        match path.rsplit_once('/') {
-            Some((_, name)) if !name.is_empty() => {
-                names.insert(name.to_string());
+fn validate_exactly_one_blob_ref<'a>(
+    state: &'a FileHistoryObservedState,
+    event: &FileHistoryEvent,
+    require_live: bool,
+) -> Result<Option<&'a FileHistoryObservedBlobRecord>, LixError> {
+    let refs = state
+        .blobs
+        .iter()
+        .filter(|blob| blob.file_id == event.file_id)
+        .collect::<Vec<_>>();
+    if refs.len() > 1 {
+        return Err(invalid_file_history_state(format!(
+            "file '{}' at commit '{}' has duplicate or conflicting BlobRef rows",
+            event.file_id, event.observed_commit_id
+        )));
+    }
+    if refs.is_empty() {
+        return absent_blob_ref();
+    }
+    let blob = refs[0];
+    let _ = state.rows.row(blob.row);
+    match (blob.deleted, require_live) {
+        (true, true) => Err(invalid_file_history_state(format!(
+            "file '{}' at commit '{}' has a tombstoned BlobRef",
+            event.file_id, event.observed_commit_id
+        ))),
+        (true, false) => Ok(None),
+        (false, false) => Err(invalid_file_history_state(format!(
+            "file '{}' at commit '{}' has a live BlobRef for a deleted descriptor",
+            event.file_id, event.observed_commit_id
+        ))),
+        (false, true) => {
+            if blob.blob_hash.is_none() || blob.size_bytes.is_none() {
+                return Err(invalid_file_history_state(format!(
+                    "file '{}' at commit '{}' has an incomplete authenticated BlobRef",
+                    event.file_id, event.observed_commit_id
+                )));
             }
-            // Not a composable Lix path. Rather than reason about a literal no
-            // composed path can equal, leave the traversal unpruned.
-            _ => return Ok(None),
+            Ok(Some(blob))
         }
     }
-
-    let entries = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
-        },
-        commit_graph,
-        query_source,
-        anchor_route,
-        vec![FILE_DESCRIPTOR_SCHEMA_KEY.to_string()],
-        HistoryMetadataProjection::default(),
-        None,
-    )
-    .await?;
-
-    let needles = descriptor_name_needles(&names);
-    #[cfg(feature = "storage-benches")]
-    crate::storage_bench::record_path_resolver_prefilter(needles.is_some());
-
-    let mut file_ids = BTreeSet::new();
-    for entry in &entries {
-        // A tombstone carries no name, and the name it retired was written by
-        // the live descriptor change this scan already saw.
-        let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
-            continue;
-        };
-        // This is NOT a filter, and it is worth being precise about the
-        // difference: a filter decides the answer, and deciding this answer
-        // genuinely requires the parse -- that is why "filter earlier so fewer
-        // rows are parsed" does not work in `apply_row_batch_filters`. This
-        // is a *necessary condition* on the raw bytes, evaluated before the
-        // parse and never instead of it. A snapshot whose decoded `name` equals
-        // one of the queried names must contain that name's JSON string token
-        // verbatim, because `descriptor_name_needles` refuses any name whose
-        // encoding is not byte-identical to its source text. Failing the test
-        // therefore proves the parse could not have matched; passing it proves
-        // nothing and still parses.
-        if let Some(needles) = needles.as_deref()
-            && !needles
-                .iter()
-                .any(|needle| snapshot_content.contains(needle.as_str()))
-        {
-            #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_path_resolver_descriptor(
-                false,
-                !matches!(entry.change.metadata, None),
-            );
-            continue;
-        }
-        #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_path_resolver_descriptor(
-            true,
-            !matches!(entry.change.metadata, None),
-        );
-        let snapshot: FileDescriptorNameSnapshot<'_> = serde_json::from_str(snapshot_content)
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("invalid lix_file_descriptor history snapshot JSON: {error}"),
-                )
-            })?;
-        if !names.contains(snapshot.name.as_ref()) {
-            continue;
-        }
-        if RowPk::uuid_from_canonical(&snapshot.id).is_err() {
-            // The pruned readers key on a canonical UUID. A file ID that is not
-            // one cannot be routed, so keep the complete traversal.
-            return Ok(None);
-        }
-        file_ids.insert(snapshot.id.into_owned());
-    }
-    Ok(Some(FileHistoryLookupIds(file_ids)))
 }
 
-// Engagement counters for the descriptor-only context load.
-//
-// Thread-local, not process-global: `cargo test` runs many tests concurrently
-// in one binary and a global counter reports every other test's history reads
-// too, which makes an exact assertion pass in isolation and fail in a full run.
-// `#[tokio::test]` drives its future on the calling thread, so a test observes
-// exactly its own loads. The same reasoning is written out at
-// `filesystem::path_index`'s rebuild counters.
-#[cfg(test)]
-thread_local! {
-    static CONTEXT_DESCRIPTOR_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static CONTEXT_DESCRIPTOR_REUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_file_history_context_census() {
-    CONTEXT_DESCRIPTOR_LOADS.with(|loads| loads.set(0));
-    CONTEXT_DESCRIPTOR_REUSES.with(|reuses| reuses.set(0));
-}
-
-/// `(separate descriptor-only anchor loads, reuses of the event descriptors)`.
-#[cfg(test)]
-pub(crate) fn file_history_context_census() -> (usize, usize) {
-    (
-        CONTEXT_DESCRIPTOR_LOADS.with(std::cell::Cell::get),
-        CONTEXT_DESCRIPTOR_REUSES.with(std::cell::Cell::get),
-    )
-}
-
-/// The JSON string tokens a matching descriptor snapshot must contain verbatim.
-///
-/// Returns `None` when any queried name cannot be reduced to such a token, in
-/// which case the caller parses every snapshot exactly as it did before. The
-/// accepted set is deliberately narrow -- printable ASCII, no `"` and no `\` --
-/// because those are exactly the names `serde_json` writes back byte-identical
-/// to their source text. A name outside it may be written with an escape
-/// (`\u0041`, `\"`), and a byte test for the unescaped form would then miss a
-/// real match and silently drop history rows. Narrowing here is free: the test
-/// is an accelerator, and refusing it costs only the parse that already
-/// happened before.
-fn descriptor_name_needles(names: &BTreeSet<String>) -> Option<Vec<String>> {
-    let mut needles = Vec::with_capacity(names.len());
-    for name in names {
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| (byte.is_ascii_graphic() || byte == b' ') && byte != b'"' && byte != b'\\')
-        {
-            return None;
-        }
-        needles.push(format!("\"{name}\""));
-    }
-    Some(needles)
+fn absent_blob_ref<'a>() -> Result<Option<&'a FileHistoryObservedBlobRecord>, LixError> {
+    Ok(None)
 }
 
 async fn load_file_history_filesystem_context<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
     lookup_ids: Option<&FileHistoryLookupIds>,
@@ -1187,110 +1095,57 @@ async fn load_file_history_filesystem_context<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let event_entries = load_file_history_filesystem_entries(
+    let lookup_ids = lookup_ids.cloned();
+    let context_entries = load_file_history_filesystem_entries(
         Arc::clone(&commit_graph),
         query_source.clone(),
-        event_route,
-        lookup_ids,
-        metadata_projection,
-    )
-    .await?;
-    let event_descriptors = parse_file_history_descriptors(&event_entries)?;
-    // The context set contributes descriptors and nothing else (see
-    // `FileHistoryFilesystemContext::descriptors`, whose only consumer is
-    // `file_history_events`' `context_descriptors`). Loading the blob-ref and
-    // directory projections over the anchor route as well materialized one
-    // change per reachable content commit and then dropped every one of them,
-    // and it widened the touched-scope digest's schema-family test from
-    // `lix_file_descriptor` alone to a family every content commit touches --
-    // so the anchor walk could not prune the commits it was about to discard.
-    let descriptors = if event_route == context_route {
-        #[cfg(test)]
-        CONTEXT_DESCRIPTOR_REUSES.with(|reuses| reuses.set(reuses.get() + 1));
-        event_descriptors.clone()
-    } else {
-        #[cfg(test)]
-        CONTEXT_DESCRIPTOR_LOADS.with(|loads| loads.set(loads.get() + 1));
-        let context_entries = load_file_history_descriptor_entries(
-            commit_graph,
-            query_source,
-            context_route,
-            lookup_ids,
-            metadata_projection,
-        )
-        .await?;
-        parse_file_history_descriptors(&context_entries)?
-    };
-
-    Ok(FileHistoryFilesystemContext {
-        event_directories: parse_file_history_directories(&event_entries)?,
-        event_blobs: parse_file_history_blobs(&event_entries)?,
-        event_descriptors,
-        descriptors,
-    })
-}
-
-/// Loads the descriptor-only projection a shaped file-history row needs for
-/// path context.
-///
-/// This is deliberately narrower than
-/// [`load_file_history_filesystem_entries`]: restricting the traversal to
-/// `lix_file_descriptor` is what lets `scope_digest_outcome`'s schema-family
-/// test prove a content-only commit absent, which it cannot do once
-/// `lix_binary_blob_ref` is in the same request.
-async fn load_file_history_descriptor_entries<S>(
-    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
-    route: &HistoryRoute,
-    lookup_ids: Option<&FileHistoryLookupIds>,
-    metadata_projection: HistoryMetadataProjection,
-) -> Result<Vec<HistoryEntry>, LixError>
-where
-    S: StorageAdapterRead + Clone + Send + Sync + 'static,
-{
-    let route = match lookup_ids {
-        Some(lookup_ids) => file_history_descriptor_blob_route(route, lookup_ids)?,
-        None => route.clone(),
-    };
-    load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
-        },
-        commit_graph,
-        query_source,
-        &route,
-        vec![FILE_DESCRIPTOR_SCHEMA_KEY.to_string()],
+        context_route,
+        lookup_ids.as_ref(),
         metadata_projection,
         None,
     )
-    .await
+    .await?;
+    let directory_seed_ids = parse_file_history_directories(&context_entries)?
+        .into_iter()
+        .map(|directory| directory.id)
+        .collect::<BTreeSet<_>>();
+    let event_entries = load_file_history_filesystem_entries(
+        commit_graph,
+        query_source,
+        event_route,
+        lookup_ids.as_ref(),
+        metadata_projection,
+        Some(&directory_seed_ids),
+    )
+    .await?;
+
+    Ok(FileHistoryFilesystemContext {
+        event_descriptors: parse_file_history_descriptors(&event_entries)?,
+        event_directories: parse_file_history_directories(&event_entries)?,
+        event_blobs: parse_file_history_blobs(&event_entries)?,
+        descriptors: parse_file_history_descriptors(&context_entries)?,
+    })
 }
 
 async fn load_file_history_observed_states<S>(
-    query_source: SqlHistoryQuerySource<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_ids: BTreeSet<String>,
     lookup_ids: Option<&FileHistoryLookupIds>,
 ) -> Result<BTreeMap<String, Arc<FileHistoryObservedState>>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    // Traversal depth is only a distance from the requested start commit. In a
-    // DAG, an equal-depth row may belong to a sibling and must not shape this
-    // revision. Commit roots are the canonical state as of each observed
-    // commit, so use them directly instead of inferring ancestry from depth.
-    let mut reader = TrackedStateContext::new().reader(query_source.store);
     let mut states = BTreeMap::new();
     for observed_commit_id in observed_commit_ids {
         let state =
-            load_file_history_observed_state(&mut reader, &observed_commit_id, lookup_ids).await?;
+            load_file_history_observed_state(historical, &observed_commit_id, lookup_ids).await?;
         states.insert(observed_commit_id, Arc::new(state));
     }
     Ok(states)
 }
 
 async fn load_file_history_observed_state<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &str,
     lookup_ids: Option<&FileHistoryLookupIds>,
 ) -> Result<FileHistoryObservedState, LixError>
@@ -1298,23 +1153,24 @@ where
     S: StorageAdapterRead,
 {
     let observed_commit: SharedStr = observed_commit_id.into();
-    let plugin_registry = load_plugin_registry_at_observed_commit(reader, &observed_commit).await?;
+    let plugin_registry =
+        load_plugin_registry_at_observed_commit(historical, &observed_commit).await?;
     let plugin_owner_rows = load_file_history_plugin_owner_rows_at_observed_commit(
-        reader,
+        historical,
         &observed_commit,
         lookup_ids,
     )
     .await?;
     let mut rows = if let Some(lookup_ids) = lookup_ids {
-        load_selected_file_history_observed_rows(reader, &observed_commit, lookup_ids).await?
+        load_selected_file_history_observed_rows(historical, &observed_commit, lookup_ids).await?
     } else {
         scan_file_history_observed_rows(
-            reader,
+            historical,
             &observed_commit,
-            TrackedStateFilter {
+            StateFilter {
                 schema_keys: file_history_filesystem_schema_keys(),
                 include_tombstones: true,
-                ..TrackedStateFilter::default()
+                ..StateFilter::default()
             },
         )
         .await?
@@ -1335,19 +1191,19 @@ where
 }
 
 async fn load_file_history_plugin_owner_rows_at_observed_commit<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
     lookup_ids: Option<&FileHistoryLookupIds>,
-) -> Result<ObservedTrackedStateRows, LixError>
+) -> Result<ObservedStateRows, LixError>
 where
     S: StorageAdapterRead,
 {
     scan_file_history_observed_rows(
-        reader,
+        historical,
         observed_commit_id,
-        TrackedStateFilter {
+        StateFilter {
             schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-            row_pks: vec![RowPk::single(PLUGIN_OWNER_KEY)],
+            entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
             file_ids: lookup_ids
                 .map(|lookup_ids| {
                     lookup_ids
@@ -1365,18 +1221,18 @@ where
 }
 
 async fn load_selected_file_history_observed_rows<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
     lookup_ids: &FileHistoryLookupIds,
-) -> Result<ObservedTrackedStateRows, LixError>
+) -> Result<ObservedStateRows, LixError>
 where
     S: StorageAdapterRead,
 {
-    let row_pks = lookup_ids
+    let entity_pks = lookup_ids
         .0
         .iter()
         .map(|file_id| {
-            RowPk::uuid_from_canonical(file_id).map_err(|error| {
+            EntityPk::uuid_from_canonical(file_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!("file history id must be a canonical UUID: {error}"),
@@ -1386,14 +1242,14 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let file_ids = selected_file_id_filters(lookup_ids);
     let mut rows = scan_file_history_observed_rows(
-        reader,
+        historical,
         observed_commit_id,
-        TrackedStateFilter {
+        StateFilter {
             schema_keys: vec![
                 FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 BLOB_REF_SCHEMA_KEY.to_string(),
             ],
-            row_pks,
+            entity_pks,
             file_ids: file_ids.clone(),
             include_tombstones: true,
         },
@@ -1402,7 +1258,7 @@ where
     let descriptors = parse_file_history_observed_descriptors(&rows)?;
     rows.append(
         load_file_history_ancestor_directory_rows(
-            reader,
+            historical,
             observed_commit_id,
             &descriptors,
             file_ids.clone(),
@@ -1419,11 +1275,11 @@ fn selected_file_id_filters(lookup_ids: &FileHistoryLookupIds) -> Vec<NullableKe
 }
 
 async fn load_file_history_ancestor_directory_rows<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
     descriptors: &[FileHistoryObservedDescriptorRecord],
     file_ids: Vec<NullableKeyFilter<String>>,
-) -> Result<ObservedTrackedStateRows, LixError>
+) -> Result<ObservedStateRows, LixError>
 where
     S: StorageAdapterRead,
 {
@@ -1432,7 +1288,7 @@ where
         .filter_map(|descriptor| descriptor.directory_id.clone())
         .collect::<BTreeSet<_>>();
     let mut requested = BTreeSet::new();
-    let mut rows = ObservedTrackedStateRows::default();
+    let mut rows = ObservedStateRows::default();
     while !pending.is_empty() {
         let ids = std::mem::take(&mut pending)
             .into_iter()
@@ -1442,14 +1298,14 @@ where
             break;
         }
         let loaded = scan_file_history_observed_rows(
-            reader,
+            historical,
             observed_commit_id,
-            TrackedStateFilter {
+            StateFilter {
                 schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-                row_pks: ids
+                entity_pks: ids
                     .iter()
                     .map(|directory_id| {
-                        RowPk::uuid_from_canonical(directory_id).map_err(|error| {
+                        EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
                                 format!(
@@ -1477,90 +1333,148 @@ where
 }
 
 async fn scan_file_history_observed_rows<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
-    filter: TrackedStateFilter,
-) -> Result<ObservedTrackedStateRows, LixError>
+    filter: StateFilter,
+) -> Result<ObservedStateRows, LixError>
 where
     S: StorageAdapterRead,
 {
-    let rows = reader
-        .scan_batch_at_commit(
-            observed_commit_id.as_str(),
-            &TrackedStateScanRequest {
-                filter,
-                read_columns: TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_string(), "metadata".to_string()],
-                },
-                ..TrackedStateScanRequest::default()
-            },
-        )
-        .await?;
-    ObservedTrackedStateRows::from_batch(observed_commit_id.clone(), rows)
+    let commit_id = CommitId::parse_lix(observed_commit_id, "file history observed commit")?;
+    let rows = if !filter.schema_keys.is_empty()
+        && !filter.entity_pks.is_empty()
+        && let Some(file_ids) = exact_file_id_values(&filter.file_ids)
+    {
+        let keys = filter
+            .schema_keys
+            .iter()
+            .flat_map(|schema_key| {
+                filter.entity_pks.iter().flat_map(|entity_pk| {
+                    file_ids.iter().map(|file_id| StateKey {
+                        schema_key: schema_key.clone(),
+                        file_id: file_id.clone(),
+                        entity_pk: entity_pk.clone(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        historical
+            .load_state_rows_at_commit(observed_commit_id, &keys)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect()
+    } else if !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
+        let mut rows = Vec::new();
+        for schema_key in &filter.schema_keys {
+            for entity_pk in &filter.entity_pks {
+                let bounds = encode_state_entity_prefix_bounds(schema_key, entity_pk);
+                rows.extend(
+                    historical
+                        .scan_state_rows_at_commit_range(
+                            commit_id,
+                            &bounds.lower,
+                            bounds.upper.as_deref(),
+                        )
+                        .await?,
+                );
+            }
+        }
+        rows
+    } else {
+        historical.scan_state_rows_at_commit(commit_id).await?
+    };
+    let rows = rows
+        .into_iter()
+        .filter(|row| {
+            (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.key.schema_key))
+                && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.key.entity_pk))
+                && (filter.file_ids.is_empty()
+                    || filter.file_ids.iter().any(|file_id| match file_id {
+                        NullableKeyFilter::Any => true,
+                        NullableKeyFilter::Null => row.key.file_id.is_none(),
+                        NullableKeyFilter::Value(file_id) => {
+                            row.key.file_id.as_deref() == Some(file_id.as_str())
+                        }
+                    }))
+                && (filter.include_tombstones || !row.deleted)
+        })
+        .collect();
+    ObservedStateRows::from_rows(observed_commit_id.clone(), rows)
+}
+
+fn exact_file_id_values(file_ids: &[NullableKeyFilter<String>]) -> Option<Vec<Option<String>>> {
+    if file_ids.is_empty() {
+        return None;
+    }
+    let mut values = Vec::with_capacity(file_ids.len());
+    for file_id in file_ids {
+        match file_id {
+            NullableKeyFilter::Any => return None,
+            NullableKeyFilter::Null => values.push(None),
+            NullableKeyFilter::Value(file_id) => values.push(Some(file_id.clone())),
+        }
+    }
+    Some(values)
 }
 
 async fn load_plugin_registry_at_observed_commit<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     observed_commit_id: &SharedStr,
 ) -> Result<PluginRegistry, LixError>
 where
     S: StorageAdapterRead,
 {
-    let rows = reader
-        .scan_batch_at_commit(
-            observed_commit_id.as_str(),
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-                    row_pks: vec![RowPk::single(PLUGIN_REGISTRY_KEY)],
-                    file_ids: vec![NullableKeyFilter::Null],
-                    include_tombstones: true,
-                },
-                read_columns: TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_string()],
-                },
-                ..TrackedStateScanRequest::default()
-            },
-        )
-        .await?;
-    let snapshot = (rows.len() != 0)
-        .then(|| rows.row(rows.len() - 1))
-        .and_then(|row| (!row.deleted()).then_some(row.snapshot_content()))
-        .flatten();
-    parse_plugin_registry_snapshot(
-        snapshot.map(|snapshot| snapshot.as_str()),
-        observed_commit_id.as_str(),
+    let rows = scan_file_history_observed_rows(
+        historical,
+        observed_commit_id,
+        StateFilter {
+            schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+            entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+            file_ids: vec![NullableKeyFilter::Null],
+            include_tombstones: true,
+        },
     )
-}
-
-/// Builds the plugin registry a snapshot describes.
-///
-/// A `None` snapshot is an absent or tombstoned registry, i.e. no plugins.
-fn parse_plugin_registry_snapshot(
-    snapshot_content: Option<&str>,
-    observed_commit_id: &str,
-) -> Result<PluginRegistry, LixError> {
-    let snapshot = snapshot_content
-        .map(|snapshot| {
-            serde_json::from_str::<serde_json::Value>(snapshot).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "lix_file_history plugin registry snapshot is invalid JSON at observed commit '{observed_commit_id}': {error}"
-                    ),
-                )
-            })
-        })
-        .transpose()?;
-    PluginRegistry::from_optional_snapshot(snapshot.as_ref())
+    .await?;
+    let observed = rows.iter().next().ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "lix_file_history plugin registry row is missing at observed commit '{observed_commit_id}'"
+        ))
+    })?;
+    if rows.iter().nth(1).is_some() {
+        return Err(invalid_file_history_state(format!(
+            "lix_file_history plugin registry has duplicate authenticated rows at observed commit '{observed_commit_id}'"
+        )));
+    }
+    let row = observed.row();
+    if row.deleted() {
+        return Err(invalid_file_history_state(format!(
+            "lix_file_history plugin registry row is deleted at observed commit '{observed_commit_id}'"
+        )));
+    }
+    let snapshot = row.snapshot_content().ok_or_else(|| {
+        invalid_file_history_state(format!(
+            "lix_file_history plugin registry row is not an authenticated value at observed commit '{observed_commit_id}'"
+        ))
+    })?;
+    let snapshot = serde_json::from_str::<serde_json::Value>(snapshot).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "lix_file_history plugin registry snapshot is invalid JSON at observed commit '{observed_commit_id}': {error}"
+            ),
+        )
+    })?;
+    PluginRegistry::from_optional_snapshot(Some(&snapshot))
 }
 
 async fn load_file_history_filesystem_entries<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     route: &HistoryRoute,
     lookup_ids: Option<&FileHistoryLookupIds>,
     metadata_projection: HistoryMetadataProjection,
+    directory_seed_ids: Option<&BTreeSet<String>>,
 ) -> Result<Vec<HistoryEntry>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -1576,7 +1490,6 @@ where
             route,
             file_history_filesystem_schema_keys(),
             metadata_projection,
-            None,
         )
         .await;
     };
@@ -1595,82 +1508,114 @@ where
             BLOB_REF_SCHEMA_KEY.to_string(),
         ],
         metadata_projection,
-        None,
     )
     .await?;
-    // Directory changes can rename or move a selected file. Their row keys
-    // are unrelated to the public file ID, so retain the complete directory
-    // history and let `file_history_events` join only relevant directories.
-    let directories = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
-        },
-        commit_graph,
-        query_source,
-        route,
-        vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-        metadata_projection,
-        None,
-    )
-    .await?;
-    entries.extend(directories);
+    // Directory changes can rename or move a selected file, but only its
+    // authenticated descriptor ancestors can affect that file. Derive those
+    // directory IDs from the selected descriptor history and walk their
+    // authenticated parent chain. The old route scanned every directory in
+    // every reachable commit, which violated the point-history bound.
+    let mut pending_directory_ids = match directory_seed_ids {
+        Some(directory_seed_ids) => directory_seed_ids.clone(),
+        None => directory_ids_from_file_history_descriptors(&entries)?,
+    };
+    let mut requested_directory_ids = BTreeSet::new();
+    while !pending_directory_ids.is_empty() {
+        let directory_ids = std::mem::take(&mut pending_directory_ids)
+            .into_iter()
+            .filter(|directory_id| requested_directory_ids.insert(directory_id.clone()))
+            .collect::<Vec<_>>();
+        if directory_ids.is_empty() {
+            break;
+        }
+        let directory_route = file_history_directory_route(route, &directory_ids)?;
+        let directories = load_history_entries(
+            HistoryViewDescriptor {
+                view_name: "lix_file_history",
+                as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
+            },
+            Arc::clone(&commit_graph),
+            query_source.clone(),
+            &directory_route,
+            vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+            metadata_projection,
+        )
+        .await?;
+        pending_directory_ids.extend(
+            parse_file_history_directories(&directories)?
+                .into_iter()
+                .filter_map(|directory| directory.parent_id),
+        );
+        entries.extend(directories);
+    }
     Ok(entries)
 }
 
-/// Routes the descriptor + blob-ref traversal for a known set of file IDs.
-///
-/// # Why this pins `file_ids` as well as the row primary keys
-///
-/// `lix_binary_blob_ref` is touched by *every* content commit, so the
-/// touched-scope digest's schema-family test can never prove this projection
-/// absent: some commit in almost every workload has a blob-ref member. The
-/// digest also carries a `(schema_key, file_id)` **pair** token, which is
-/// exactly the discriminator this traversal needs — but `scope_digest_outcome`
-/// only reaches the pair probe when the request pins `file_ids`, and returns
-/// `LoadedPresent` otherwise. Leaving `file_ids` empty therefore loaded one
-/// commit delta per reachable commit to discover that its blob-ref member
-/// belongs to a different file.
-///
-/// # Why pinning cannot drop a history row
-///
-/// `change_matches_history_request` treats a non-empty `file_ids` as requiring
-/// a non-null `file_id` that is in the set, so pinning would be a correctness
-/// bug if any matching row could carry a null or different `file_id`. It
-/// cannot, for either of this route's two schema keys:
-///
-/// * `lix_file_descriptor` — `canonicalize_descriptor_file_id` rewrites
-///   `file_id` to the row's own `row_pk` on **every** normalized descriptor
-///   row, on all three exits of the row normalizer and for tombstones as well
-///   as live rows, and errors if that identity is not a single value. The
-///   planner really can hand it a descriptor row with `file_id: None` (an
-///   `INSERT` that leaves the file ID to the engine), and normalization is what
-///   closes that hole. `delete_restriction_source_domains` already depends on
-///   the same invariant.
-/// * `lix_binary_blob_ref` — every producer (`BlobRefRowInput::append_to` and
-///   `append_blob_ref_tombstone_row`) sets `row_pk` and `file_id` from the
-///   same file ID, and both schemas are read-only public surfaces, so no caller
-///   can supply a divergent pair.
-///
-/// Because `file_id == row_pk` holds for both, and this route already pins
-/// `resolved_row_pks` to the same IDs, the added predicate is implied by the
-/// one already applied: it cannot reject a change the existing row-PK test
-/// accepts. The identities compare byte-for-byte rather than merely
-/// semantically because `RowPk::uuid_from_canonical` accepts only the exact
-/// lowercase hyphenated form — a file ID that is not canonical already fails
-/// this function before any pinning happens.
+fn directory_ids_from_file_history_descriptors(
+    entries: &[HistoryEntry],
+) -> Result<BTreeSet<String>, LixError> {
+    let mut directory_ids = BTreeSet::new();
+    for descriptor in parse_file_history_descriptors(entries)? {
+        let Some(snapshot) = descriptor.entry.change.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot =
+            serde_json::from_str::<FileDescriptorSnapshot>(snapshot).map_err(|error| {
+                invalid_file_history_state(format!(
+                    "invalid selected file descriptor history snapshot JSON: {error}"
+                ))
+            })?;
+        if let Some(directory_id) = snapshot.directory_id {
+            directory_ids.insert(directory_id);
+        }
+    }
+    Ok(directory_ids)
+}
+
+fn file_history_directory_route(
+    route: &HistoryRoute,
+    directory_ids: &[String],
+) -> Result<HistoryRoute, LixError> {
+    let mut route = route.clone();
+    route.file_ids.clear();
+    route.entity_pks = directory_ids
+        .iter()
+        .map(|directory_id| {
+            let entity_pk = EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("file history directory ID must be a canonical UUID: {error}"),
+                )
+            })?;
+            entity_pk.as_json_array_text()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    route.resolved_entity_pks = directory_ids
+        .iter()
+        .map(|directory_id| {
+            EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("file history directory ID must be a canonical UUID: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(route)
+}
+
 fn file_history_descriptor_blob_route(
     route: &HistoryRoute,
     lookup_ids: &FileHistoryLookupIds,
 ) -> Result<HistoryRoute, LixError> {
     let mut route = route.clone();
-    route.row_pks = lookup_ids.row_pks()?;
     route.file_ids = lookup_ids.0.iter().cloned().collect();
-    route.resolved_row_pks = lookup_ids
+    route.entity_pks = lookup_ids.entity_pks()?;
+    route.resolved_entity_pks = lookup_ids
         .0
         .iter()
         .map(|file_id| {
-            RowPk::uuid_from_canonical(file_id).map_err(|error| {
+            EntityPk::uuid_from_canonical(file_id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!("file history id must be a canonical UUID: {error}"),
@@ -1683,7 +1628,7 @@ fn file_history_descriptor_blob_route(
 
 async fn load_file_history_plugin_state<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     event_route: &HistoryRoute,
     context_route: &HistoryRoute,
     plugin_schema_keys: Vec<String>,
@@ -1717,21 +1662,20 @@ where
                     &route,
                     schema_keys,
                     metadata_projection,
-                    None,
                 )
                 .await
             }
         })
         .await?;
     Ok((
-        parse_file_history_plugin_state(&event_entries),
-        parse_file_history_plugin_state(&context_entries),
+        parse_file_history_plugin_state(&event_entries)?,
+        parse_file_history_plugin_state(&context_entries)?,
     ))
 }
 
 async fn load_file_history_plugin_owner_events<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     event_route: &HistoryRoute,
     lookup_ids: Option<&FileHistoryLookupIds>,
     metadata_projection: HistoryMetadataProjection,
@@ -1740,9 +1684,9 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let mut owner_route = file_history_plugin_route(event_route, lookup_ids);
-    let owner_pk = RowPk::single(PLUGIN_OWNER_KEY);
-    owner_route.row_pks = vec![owner_pk.as_json_array_text()?];
-    owner_route.resolved_row_pks = vec![owner_pk];
+    let owner_pk = EntityPk::single(PLUGIN_OWNER_KEY);
+    owner_route.entity_pks = vec![owner_pk.as_json_array_text()?];
+    owner_route.resolved_entity_pks = vec![owner_pk];
     let entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
@@ -1753,7 +1697,6 @@ where
         &owner_route,
         vec![KEY_VALUE_SCHEMA_KEY.to_string()],
         metadata_projection,
-        None,
     )
     .await?;
     parse_file_history_plugin_owners(&entries)
@@ -1803,7 +1746,7 @@ fn file_history_events(
     context_descriptors: &[FileHistoryDescriptorRecord],
     observed_states: &BTreeMap<String, Arc<FileHistoryObservedState>>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
-) -> Vec<FileHistoryEvent> {
+) -> Result<Vec<FileHistoryEvent>, LixError> {
     let mut descriptor_ids_by_as_of = BTreeSet::<(String, String)>::new();
 
     for descriptor in context_descriptors {
@@ -1841,7 +1784,7 @@ fn file_history_events(
         let mut affected_file_ids = BTreeSet::new();
         for state_commit_id in state_commit_ids {
             if let Some(directory_index) = directory_indexes.get(state_commit_id) {
-                affected_file_ids.extend(directory_index.affected_file_ids(&directory.id));
+                affected_file_ids.extend(directory_index.affected_file_ids(&directory.id)?);
             }
         }
         for file_id in affected_file_ids {
@@ -1861,7 +1804,7 @@ fn file_history_events(
     sorted_grouped_file_history_events(candidates)
 }
 
-fn sorted_grouped_file_history_events<I>(events: I) -> Vec<FileHistoryEvent>
+fn sorted_grouped_file_history_events<I>(events: I) -> Result<Vec<FileHistoryEvent>, LixError>
 where
     I: IntoIterator<Item = FileHistoryEvent>,
 {
@@ -1887,6 +1830,23 @@ where
     }
     let mut events = grouped.into_values().collect::<Vec<_>>();
     for event in &mut events {
+        let validate_source_changes: Result<(), LixError> = (|| {
+            let mut source_changes_by_id = BTreeMap::<String, MaterializedChange>::new();
+            for change in &event.source_changes {
+                if let Some(previous) = source_changes_by_id.get(&change.id) {
+                    if previous != change {
+                        return Err(invalid_file_history_state(format!(
+                            "file '{}' at observed commit '{}' has conflicting source-change ID '{}'",
+                            event.file_id, event.observed_commit_id, change.id
+                        )));
+                    }
+                } else {
+                    source_changes_by_id.insert(change.id.clone(), change.clone());
+                }
+            }
+            Ok(())
+        })();
+        validate_source_changes?;
         event
             .source_changes
             .sort_by(|left, right| left.id.cmp(&right.id));
@@ -1901,106 +1861,59 @@ where
             .then(left.depth.cmp(&right.depth))
             .then(left.observed_commit_id.cmp(&right.observed_commit_id))
     });
-    events
+    Ok(events)
 }
 
 async fn discover_file_history_plugins<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
+    historical: &ForkTreeReadFacade<S>,
     event_route: &HistoryRoute,
-    context_route: &HistoryRoute,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
     metadata_projection: HistoryMetadataProjection,
 ) -> Result<FileHistoryPluginDiscovery, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let registry_pk = RowPk::single(PLUGIN_REGISTRY_KEY);
-    let registry_pk_text = registry_pk.as_json_array_text()?;
-
-    let mut registry_route = event_route.clone();
-    registry_route.row_pks = vec![registry_pk_text.clone()];
-    registry_route.resolved_row_pks = vec![registry_pk.clone()];
-    let registry_events = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_file_history",
-            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
-        },
-        Arc::clone(&commit_graph),
-        query_source.clone(),
-        &registry_route,
-        vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-        metadata_projection,
-        None,
-    )
-    .await?;
-
-    // Schema-key discovery reads the registry's change history once instead of
-    // reconstructing the registry at every reachable commit.
-    //
-    // The registry at a reachable commit is whatever the nearest reachable
-    // registry change wrote, so the reachable registry changes carry every
-    // registry value any reachable commit can observe. Taking the union over
-    // those changes is therefore the same schema-key set the per-commit
-    // reconstruction produced, for one traversal instead of one tracked-state
-    // scan per commit. The anchors-only route keeps this independent of a depth
-    // bound, which restricts the rows that are emitted, not which plugins
-    // existed.
-    let mut schema_key_route = context_route.clone();
-    schema_key_route.row_pks = vec![registry_pk_text];
-    schema_key_route.resolved_row_pks = vec![registry_pk];
-    let schema_key_entries = if schema_key_route == registry_route {
-        registry_events.clone()
-    } else {
-        load_history_entries(
-            HistoryViewDescriptor {
-                view_name: "lix_file_history",
-                as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
-            },
-            Arc::clone(&commit_graph),
-            query_source.clone(),
-            &schema_key_route,
-            vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-            HistoryMetadataProjection::default(),
-            None,
-        )
-        .await?
-    };
+    // The durable registry snapshot is already the complete plugin set at its
+    // observed commit. Read that exact root identity for every reachable commit
+    // instead of inventing a filesystem state from `(anchor, depth)`, which
+    // conflates equal-depth siblings in a DAG.
+    let observed_commit_ids = parent_commit_ids_by_commit
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut schema_keys = BTreeSet::new();
-    for entry in &schema_key_entries {
-        let registry = parse_plugin_registry_snapshot(
-            entry.change.snapshot_content.as_deref(),
-            &entry.observed_commit_id,
-        )?;
+    let mut registries_by_commit = BTreeMap::new();
+    for observed_commit_id in observed_commit_ids {
+        let shared_observed_commit: SharedStr = observed_commit_id.as_str().into();
+        let registry =
+            load_plugin_registry_at_observed_commit(historical, &shared_observed_commit).await?;
         schema_keys.extend(
             registry
                 .plugins()
                 .iter()
                 .flat_map(|plugin| plugin.schema_keys().iter().cloned()),
         );
-    }
-
-    // A registry is only ever compared at a commit whose registry changed and
-    // at that commit's direct parents, so reconstruct exactly those.
-    let mut registry_commit_ids = BTreeSet::new();
-    for entry in &registry_events {
-        registry_commit_ids.insert(entry.observed_commit_id.clone());
-        registry_commit_ids.extend(
-            parent_commit_ids_by_commit
-                .get(&entry.observed_commit_id)
-                .into_iter()
-                .flatten()
-                .cloned(),
-        );
-    }
-    let mut reader = TrackedStateContext::new().reader(query_source.store.clone());
-    let mut registries_by_commit = BTreeMap::new();
-    for observed_commit_id in registry_commit_ids {
-        let shared_observed_commit: SharedStr = observed_commit_id.as_str().into();
-        let registry =
-            load_plugin_registry_at_observed_commit(&mut reader, &shared_observed_commit).await?;
         registries_by_commit.insert(observed_commit_id, registry);
     }
+
+    let mut registry_route = event_route.clone();
+    let registry_pk = EntityPk::single(PLUGIN_REGISTRY_KEY);
+    registry_route.entity_pks = vec![registry_pk.as_json_array_text()?];
+    registry_route.resolved_entity_pks = vec![registry_pk];
+    let registry_events = load_history_entries(
+        HistoryViewDescriptor {
+            view_name: "lix_file_history",
+            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
+        },
+        commit_graph,
+        query_source,
+        &registry_route,
+        vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+        metadata_projection,
+    )
+    .await?;
 
     Ok(FileHistoryPluginDiscovery {
         schema_keys: schema_keys.into_iter().collect(),
@@ -2015,7 +1928,7 @@ fn file_history_plugin_events(
     event_plugin_owners: &[FileHistoryPluginOwnerRecord],
     observed_states: &BTreeMap<String, Arc<FileHistoryObservedState>>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
-) -> Vec<FileHistoryEvent> {
+) -> Result<Vec<FileHistoryEvent>, LixError> {
     let owner_changes = event_plugin_owners
         .iter()
         .map(|record| {
@@ -2026,59 +1939,70 @@ fn file_history_plugin_events(
         })
         .collect::<BTreeSet<_>>();
 
-    event_plugin_state
-        .iter()
-        .filter(|plugin_state| {
-            let observed_commit_id = plugin_state.entry.observed_commit_id.as_str();
-            let schema_key = plugin_state.entry.change.schema_key.as_str();
-            let live_owner_matches = observed_states
-                .get(observed_commit_id)
-                .and_then(|state| {
-                    live_file_history_plugin_owner(state, &plugin_state.file_id)
-                        .map(|owner| (state, owner))
-                })
-                .is_some_and(|(state, owner)| {
-                    file_history_owner_schema_keys(state, owner)
-                        .iter()
-                        .any(|owner_schema_key| owner_schema_key == schema_key)
-                });
-            if live_owner_matches {
-                return true;
-            }
+    let mut events = Vec::new();
+    for plugin_state in event_plugin_state {
+        let observed_commit_id = plugin_state.entry.observed_commit_id.as_str();
+        let schema_key = plugin_state.entry.change.schema_key.as_str();
+        let live_owner_matches = observed_states
+            .get(observed_commit_id)
+            .and_then(|state| {
+                live_file_history_plugin_owner(state, &plugin_state.file_id)
+                    .map(|owner| (state, owner))
+            })
+            .map_or(Ok::<bool, LixError>(false), |(state, owner)| {
+                Ok(file_history_owner_schema_keys(state, owner)?
+                    .iter()
+                    .any(|owner_schema_key| owner_schema_key == schema_key))
+            })?;
+        if live_owner_matches {
+            events.push(file_history_event_from_entry(
+                plugin_state.file_id.clone(),
+                &plugin_state.entry,
+            ));
+            continue;
+        }
 
-            // A non-owner live row cannot change the public file projection.
-            // A tombstone remains relevant only when this commit also changes
-            // the durable owner and a direct parent proves that the schema was
-            // part of the prior owner's rendering contract. This covers owner
-            // deletion, A -> B replacement, and same-key contract updates.
-            if plugin_state.entry.change.snapshot_content.is_some()
-                || !owner_changes.contains(&(observed_commit_id, plugin_state.file_id.as_str()))
-            {
-                return false;
-            }
-            parent_commit_ids_by_commit
-                .get(observed_commit_id)
-                .into_iter()
-                .flatten()
-                .any(|parent_commit_id| {
+        // A non-owner live row cannot change the public file projection.
+        // A tombstone remains relevant only when this commit also changes
+        // the durable owner and a direct parent proves that the schema was
+        // part of the prior owner's rendering contract. This covers owner
+        // deletion, A -> B replacement, and same-key contract updates.
+        if plugin_state.entry.change.snapshot_content.is_some()
+            || !owner_changes.contains(&(observed_commit_id, plugin_state.file_id.as_str()))
+        {
+            continue;
+        }
+        let prior_owner_matches = parent_commit_ids_by_commit
+            .get(observed_commit_id)
+            .into_iter()
+            .flatten()
+            .try_fold(
+                false,
+                |matched, parent_commit_id| -> Result<bool, LixError> {
+                    if matched {
+                        return Ok(true);
+                    }
                     observed_states
                         .get(parent_commit_id)
                         .and_then(|state| {
                             live_file_history_plugin_owner(state, &plugin_state.file_id)
                                 .map(|owner| (state, owner))
                         })
-                        .is_some_and(|(_state, owner)| {
-                            owner
-                                .schema_keys()
+                        .map_or(Ok(false), |(state, owner)| {
+                            Ok(file_history_owner_schema_keys(state, owner)?
                                 .iter()
-                                .any(|owner_schema_key| owner_schema_key == schema_key)
+                                .any(|owner_schema_key| owner_schema_key == schema_key))
                         })
-                })
-        })
-        .map(|plugin_state| {
-            file_history_event_from_entry(plugin_state.file_id.clone(), &plugin_state.entry)
-        })
-        .collect()
+                },
+            )?;
+        if prior_owner_matches {
+            events.push(file_history_event_from_entry(
+                plugin_state.file_id.clone(),
+                &plugin_state.entry,
+            ));
+        }
+    }
+    Ok(events)
 }
 
 fn live_file_history_plugin_owner<'a>(
@@ -2093,17 +2017,6 @@ fn live_file_history_plugin_owner<'a>(
             let _ = state.rows.row(record.row);
             record.owner.as_ref()
         })
-}
-
-fn file_history_owner_schema_keys<'a>(
-    state: &'a FileHistoryObservedState,
-    owner: &'a PluginFileOwner,
-) -> &'a [String] {
-    state
-        .plugin_registry
-        .get(owner.plugin_key())
-        .map(crate::plugin::runtime::PluginRegistryEntry::schema_keys)
-        .unwrap_or_else(|| owner.schema_keys())
 }
 
 fn file_history_plugin_registry_events(
@@ -2178,21 +2091,39 @@ fn parse_file_history_descriptors(
         .iter()
         .filter(|entry| entry.change.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
-            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
+            let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            if entry.change.file_id.as_deref() != Some(row_id.as_str()) {
+                return Err(invalid_file_history_state(format!(
+                    "file descriptor row file_id does not match authenticated entity key '{}'",
+                    row_id
+                )));
+            }
+            if entry.change.snapshot_content.is_none() {
                 return Ok(FileHistoryDescriptorRecord {
-                    id: entry.change.row_pk.as_single_string_owned()?,
+                    id: row_id,
                     entry: entry.clone(),
                 });
-            };
-            let snapshot: HistoryIdentitySnapshot = serde_json::from_str(snapshot_content)
+            }
+            let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "file descriptor history row '{row_id}' has no authenticated payload"
+                ))
+            })?;
+            let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!("invalid lix_file_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "file descriptor payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryDescriptorRecord {
-                id: snapshot.id,
+                id: row_id,
                 entry: entry.clone(),
             })
         })
@@ -2206,14 +2137,26 @@ fn parse_file_history_directories(
         .iter()
         .filter(|entry| entry.change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|entry| {
-            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
+            let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            if entry.change.file_id.is_some() {
+                return Err(invalid_file_history_state(format!(
+                    "directory descriptor row '{}' has a non-NULL file_id",
+                    row_id
+                )));
+            }
+            if entry.change.snapshot_content.is_none() {
                 return Ok(FileHistoryDirectoryRecord {
-                    id: entry.change.row_pk.as_single_string_owned()?,
+                    id: row_id,
                     parent_id: None,
                     name: None,
                     entry: entry.clone(),
                 });
-            };
+            }
+            let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "directory descriptor history row '{row_id}' has no authenticated payload"
+                ))
+            })?;
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
@@ -2221,8 +2164,14 @@ fn parse_file_history_directories(
                         format!("invalid lix_directory_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "directory descriptor payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryDirectoryRecord {
-                id: snapshot.id,
+                id: row_id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
                 entry: entry.clone(),
@@ -2238,34 +2187,60 @@ fn parse_file_history_blobs(
         .iter()
         .filter(|entry| entry.change.schema_key == BLOB_REF_SCHEMA_KEY)
         .map(|entry| {
-            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
+            let row_id = entry.change.entity_pk.as_single_string_owned()?;
+            let file_id = entry.change.file_id.clone().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "blob reference history row '{row_id}' is missing file_id"
+                ))
+            })?;
+            if entry.change.snapshot_content.is_none() {
+                if file_id != row_id {
+                    return Err(invalid_file_history_state(format!(
+                        "blob reference tombstone file identity '{}' does not match authenticated row key '{}'",
+                        file_id, row_id
+                    )));
+                }
                 return Ok(FileHistoryBlobRecord {
-                    file_id: entry.change.file_id.clone().unwrap_or_else(|| {
-                        entry
-                            .change
-                            .row_pk
-                            .as_single_string_owned()
-                            .expect("canonical change row primary key should project")
-                    }),
+                    file_id,
                     entry: entry.clone(),
                 });
-            };
-            let snapshot: HistoryIdentitySnapshot = serde_json::from_str(snapshot_content)
+            }
+            let snapshot_content = entry.change.snapshot_content.as_deref().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "blob reference history row '{row_id}' has no authenticated payload"
+                ))
+            })?;
+            let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!("invalid lix_binary_blob_ref history snapshot JSON: {error}"),
                     )
                 })?;
+            BlobId::from_hex(&snapshot.blob_hash).map_err(|error| {
+                invalid_file_history_state(format!(
+                    "blob reference history row '{row_id}' has an invalid BlobId: {error}"
+                ))
+            })?;
+            if snapshot.id != row_id
+                || file_id != snapshot.id
+            {
+                return Err(invalid_file_history_state(format!(
+                    "blob reference payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryBlobRecord {
-                file_id: entry.change.file_id.clone().unwrap_or(snapshot.id),
+                file_id,
                 entry: entry.clone(),
             })
         })
         .collect()
 }
 
-fn parse_file_history_plugin_state(entries: &[HistoryEntry]) -> Vec<FileHistoryPluginStateRecord> {
+fn parse_file_history_plugin_state(
+    entries: &[HistoryEntry],
+) -> Result<Vec<FileHistoryPluginStateRecord>, LixError> {
     entries
         .iter()
         .filter(|entry| {
@@ -2274,9 +2249,15 @@ fn parse_file_history_plugin_state(entries: &[HistoryEntry]) -> Vec<FileHistoryP
                 FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY
             )
         })
-        .filter_map(|entry| {
-            Some(FileHistoryPluginStateRecord {
-                file_id: entry.change.file_id.clone()?,
+        .map(|entry| {
+            let file_id = entry.change.file_id.clone().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "plugin history row at commit '{}' is missing file_id",
+                    entry.observed_commit_id
+                ))
+            })?;
+            Ok(FileHistoryPluginStateRecord {
+                file_id,
                 entry: entry.clone(),
             })
         })
@@ -2290,7 +2271,7 @@ fn parse_file_history_plugin_owners(
         .iter()
         .filter(|entry| {
             entry.change.schema_key == KEY_VALUE_SCHEMA_KEY
-                && entry.change.row_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                && entry.change.entity_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
         })
         .map(|entry| {
             let file_id = entry.change.file_id.clone().ok_or_else(|| {
@@ -2308,20 +2289,38 @@ fn parse_file_history_plugin_owners(
 }
 
 fn parse_file_history_observed_descriptors(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<FileHistoryObservedDescriptorRecord>, LixError> {
     rows.iter()
         .filter(|observed| observed.row().schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY)
         .map(|observed| {
             let _ = observed.observed_commit_id();
             let row = observed.row();
+            let row_id = row.entity_pk().as_single_string_owned()?;
+            if row.file_id().as_deref() != Some(row_id.as_str()) {
+                return Err(invalid_file_history_state(format!(
+                    "observed file descriptor row file_id does not match authenticated entity key '{}'",
+                    row_id
+                )));
+            }
+            if row.deleted() && row.snapshot_content().is_some() {
+                return Err(invalid_file_history_state(format!(
+                    "observed file descriptor row '{}' tombstone has a payload",
+                    row_id
+                )));
+            }
             let Some(snapshot_content) = row.snapshot_content() else {
-                return Ok(FileHistoryObservedDescriptorRecord {
-                    id: row.row_pk().as_single_string_owned()?,
-                    directory_id: None,
-                    name: None,
-                    row: observed.ordinal(),
-                });
+                if row.deleted() {
+                    return Ok(FileHistoryObservedDescriptorRecord {
+                        id: row_id,
+                        directory_id: None,
+                        name: None,
+                        row: observed.ordinal(),
+                    });
+                }
+                return Err(invalid_file_history_state(format!(
+                    "file descriptor row '{row_id}' has no authenticated payload"
+                )));
             };
             let snapshot: FileDescriptorSnapshot =
                 serde_json::from_str(snapshot_content).map_err(|error| {
@@ -2330,8 +2329,14 @@ fn parse_file_history_observed_descriptors(
                         format!("invalid lix_file_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "observed file descriptor payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryObservedDescriptorRecord {
-                id: snapshot.id,
+                id: row_id,
                 directory_id: snapshot.directory_id,
                 name: Some(snapshot.name),
                 row: observed.ordinal(),
@@ -2341,19 +2346,37 @@ fn parse_file_history_observed_descriptors(
 }
 
 fn parse_file_history_observed_directories(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<FileHistoryObservedDirectoryRecord>, LixError> {
     rows.iter()
         .filter(|observed| observed.row().schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|observed| {
             let row = observed.row();
+            let row_id = row.entity_pk().as_single_string_owned()?;
+            if row.file_id().is_some() {
+                return Err(invalid_file_history_state(format!(
+                    "observed directory descriptor row '{}' has a non-NULL file_id",
+                    row_id
+                )));
+            }
+            if row.deleted() && row.snapshot_content().is_some() {
+                return Err(invalid_file_history_state(format!(
+                    "observed directory descriptor row '{}' tombstone has a payload",
+                    row_id
+                )));
+            }
             let Some(snapshot_content) = row.snapshot_content() else {
-                return Ok(FileHistoryObservedDirectoryRecord {
-                    id: row.row_pk().as_single_string_owned()?,
-                    parent_id: None,
-                    name: None,
-                    row: observed.ordinal(),
-                });
+                if row.deleted() {
+                    return Ok(FileHistoryObservedDirectoryRecord {
+                        id: row_id,
+                        parent_id: None,
+                        name: None,
+                        row: observed.ordinal(),
+                    });
+                }
+                return Err(invalid_file_history_state(format!(
+                    "directory descriptor row '{row_id}' has no authenticated payload"
+                )));
             };
             let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                 .map_err(|error| {
@@ -2362,8 +2385,14 @@ fn parse_file_history_observed_directories(
                         format!("invalid lix_directory_descriptor history snapshot JSON: {error}"),
                     )
                 })?;
+            if snapshot.id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "observed directory descriptor payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryObservedDirectoryRecord {
-                id: snapshot.id,
+                id: row_id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
                 row: observed.ordinal(),
@@ -2373,25 +2402,37 @@ fn parse_file_history_observed_directories(
 }
 
 fn parse_file_history_observed_blobs(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<FileHistoryObservedBlobRecord>, LixError> {
     rows.iter()
         .filter(|observed| observed.row().schema_key() == BLOB_REF_SCHEMA_KEY)
         .map(|observed| {
             let row = observed.row();
-            let fallback_file_id = || {
-                row.file_id().map(str::to_owned).unwrap_or_else(|| {
-                    row.row_pk()
-                        .as_single_string_owned()
-                        .expect("canonical change row primary key should project")
-                })
-            };
+            let row_id = row.entity_pk().as_single_string_owned()?;
+            let file_id = row.file_id().map(str::to_owned).ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "observed blob reference row '{row_id}' is missing file_id"
+                ))
+            })?;
+            if file_id != row_id {
+                return Err(invalid_file_history_state(format!(
+                    "observed blob reference file identity '{}' does not match authenticated row key '{}'",
+                    file_id, row_id
+                )));
+            }
             let Some(snapshot_content) = row.snapshot_content() else {
-                return Ok(FileHistoryObservedBlobRecord {
-                    file_id: fallback_file_id(),
-                    blob_hash: None,
-                    row: observed.ordinal(),
-                });
+                if row.deleted() {
+                    return Ok(FileHistoryObservedBlobRecord {
+                        file_id,
+                        blob_hash: None,
+                        size_bytes: None,
+                        deleted: true,
+                        row: observed.ordinal(),
+                    });
+                }
+                return Err(invalid_file_history_state(format!(
+                    "blob reference row '{row_id}' has no authenticated payload"
+                )));
             };
             let snapshot: BlobRefSnapshot =
                 serde_json::from_str(snapshot_content).map_err(|error| {
@@ -2400,9 +2441,22 @@ fn parse_file_history_observed_blobs(
                         format!("invalid lix_binary_blob_ref history snapshot JSON: {error}"),
                     )
                 })?;
+            BlobId::from_hex(&snapshot.blob_hash).map_err(|error| {
+                invalid_file_history_state(format!(
+                    "observed blob reference row '{row_id}' has an invalid BlobId: {error}"
+                ))
+            })?;
+            if row.deleted() || snapshot.id != row_id || file_id != snapshot.id {
+                return Err(invalid_file_history_state(format!(
+                    "observed blob reference payload identity '{}' does not match authenticated row key '{}'",
+                    snapshot.id, row_id
+                )));
+            }
             Ok(FileHistoryObservedBlobRecord {
-                file_id: row.file_id().map(str::to_owned).unwrap_or(snapshot.id),
+                file_id,
                 blob_hash: Some(snapshot.blob_hash),
+                size_bytes: Some(snapshot.size_bytes),
+                deleted: false,
                 row: observed.ordinal(),
             })
         })
@@ -2410,13 +2464,13 @@ fn parse_file_history_observed_blobs(
 }
 
 fn parse_file_history_observed_plugin_owners(
-    rows: &ObservedTrackedStateRows,
+    rows: &ObservedStateRows,
 ) -> Result<Vec<FileHistoryObservedPluginOwnerRecord>, LixError> {
     rows.iter()
         .filter(|observed| {
             let row = observed.row();
             row.schema_key() == KEY_VALUE_SCHEMA_KEY
-                && row.row_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                && row.entity_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
         })
         .map(|observed| {
             let row = observed.row();
@@ -2426,24 +2480,37 @@ fn parse_file_history_observed_plugin_owners(
                     "lix_file_history plugin owner row is missing file_id",
                 )
             })?;
-            let owner = row
-                .snapshot_content()
-                .map(|snapshot| {
-                    serde_json::from_str::<serde_json::Value>(snapshot)
-                        .map_err(|error| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "lix_file_history plugin owner snapshot is invalid JSON for file '{file_id}': {error}"
-                                ),
-                            )
-                        })
-                        .and_then(|snapshot| PluginFileOwner::from_snapshot(&file_id, &snapshot))
+            if row.deleted() && row.snapshot_content().is_some() {
+                return Err(invalid_file_history_state(format!(
+                    "observed plugin owner row for file '{}' tombstone has a payload",
+                    file_id
+                )));
+            }
+            if row.deleted() {
+                return Ok(FileHistoryObservedPluginOwnerRecord {
+                    file_id,
+                    owner: None,
+                    row: observed.ordinal(),
+                });
+            }
+            let snapshot = row.snapshot_content().ok_or_else(|| {
+                invalid_file_history_state(format!(
+                    "plugin owner row for file '{file_id}' has no authenticated payload"
+                ))
+            })?;
+            let owner = serde_json::from_str::<serde_json::Value>(snapshot)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "lix_file_history plugin owner snapshot is invalid JSON for file '{file_id}': {error}"
+                        ),
+                    )
                 })
-                .transpose()?;
+                .and_then(|snapshot| PluginFileOwner::from_snapshot(&file_id, &snapshot))?;
             Ok(FileHistoryObservedPluginOwnerRecord {
                 file_id,
-                owner,
+                owner: Some(owner),
                 row: observed.ordinal(),
             })
         })
@@ -2454,57 +2521,71 @@ fn file_history_event_affects_observed_file(
     event: &FileHistoryEvent,
     descriptor: &FileHistoryObservedDescriptorRecord,
     directory_tree: &HistoryDirectoryTree,
-) -> bool {
+) -> Result<bool, LixError> {
     event
         .source_changes
         .iter()
-        .any(|change| match change.schema_key.as_str() {
-            FILE_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
-                change
+        .try_fold(false, |matched, change| {
+            if matched {
+                return Ok(true);
+            }
+            let matched = match change.schema_key.as_str() {
+                FILE_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
+                    change
+                        .file_id
+                        .as_deref()
+                        .is_some_and(|file_id| file_id == descriptor.id)
+                        || change
+                            .entity_pk
+                            .as_single_string_owned()
+                            .is_ok_and(|entity_id| entity_id == descriptor.id)
+                }
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                    let Ok(changed_directory_id) = change.entity_pk.as_single_string_owned() else {
+                        return Ok(false);
+                    };
+                    let Some(directory_id) = descriptor.directory_id.as_deref() else {
+                        return Ok(false);
+                    };
+                    directory_tree.has_ancestor_including(directory_id, &changed_directory_id)?
+                }
+                KEY_VALUE_SCHEMA_KEY
+                    if change.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
+                {
+                    event.file_id == descriptor.id
+                }
+                _ => change
                     .file_id
                     .as_deref()
-                    .is_some_and(|file_id| file_id == descriptor.id)
-                    || change
-                        .row_pk
-                        .as_single_string_owned()
-                        .is_ok_and(|row_id| row_id == descriptor.id)
-            }
-            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                let Ok(changed_directory_id) = change.row_pk.as_single_string_owned() else {
-                    return false;
-                };
-                let Some(directory_id) = descriptor.directory_id.as_deref() else {
-                    return false;
-                };
-                directory_tree.has_ancestor_including(directory_id, &changed_directory_id)
-            }
-            KEY_VALUE_SCHEMA_KEY
-                if change.row_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY) =>
-            {
-                event.file_id == descriptor.id
-            }
-            _ => change
-                .file_id
-                .as_deref()
-                .is_some_and(|file_id| file_id == descriptor.id),
+                    .is_some_and(|file_id| file_id == descriptor.id),
+            };
+            Ok(matched)
         })
 }
 
 fn resolve_observed_file_history_path(
     descriptor: &FileHistoryObservedDescriptorRecord,
     directories: &[FileHistoryObservedDirectoryRecord],
-) -> Option<String> {
-    let name = descriptor.name.as_ref()?;
+) -> Result<Option<String>, LixError> {
+    let Some(name) = descriptor.name.as_ref() else {
+        return Ok(None);
+    };
     let Some(directory_id) = descriptor.directory_id.as_deref() else {
-        return compose_file_path(None, name).ok();
+        return compose_file_path(None, name).map(Some);
     };
     let directory_path = resolve_observed_directory_path(
         directory_id,
         directories,
         &mut BTreeMap::new(),
         &mut BTreeSet::new(),
-    )?;
-    compose_file_path(Some(&directory_path), name).ok()
+    )?
+    .ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("directory '{directory_id}' has no authenticated path"),
+        )
+    })?;
+    compose_file_path(Some(&directory_path), name).map(Some)
 }
 
 static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
@@ -2518,8 +2599,8 @@ static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
         ("name", Col::Utf8(|row| row.descriptor().name.as_deref())),
         ("content", Col::Binary(|row| row.data.clone())),
         (
-            HISTORY_COL_ROW_PK,
-            Col::Utf8Fallible(|row| row_pk_json_array(&row.descriptor().id).map(Some)),
+            HISTORY_COL_ENTITY_PK,
+            Col::Utf8Fallible(|row| entity_pk_json_array(&row.descriptor().id).map(Some)),
         ),
         (
             HISTORY_COL_SOURCE_CHANGES,
@@ -2574,7 +2655,7 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
         Field::new("content", DataType::LargeBinary, true),
-        json_field(HISTORY_COL_ROW_PK, false),
+        json_field(HISTORY_COL_ENTITY_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
@@ -2592,35 +2673,32 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use async_trait::async_trait;
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 
-    use crate::LixError;
-    use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobId};
+    use crate::binary_cas::BlobId;
     use crate::changelog::{ChangeId, CommitId};
-    use crate::common::SharedStr;
-    use crate::row_pk::RowPk;
-    use crate::plugin::runtime::{
+    use crate::common::{LixTimestamp, SharedStr};
+    use crate::entity_pk::EntityPk;
+    use crate::forktree::{HistoricalStateRow, StateKey};
+    use crate::plugin::{
         PluginFileOwner, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
         plugin_storage_archive_file_id, plugin_storage_archive_path,
     };
     use crate::sql2::change_materialization::MaterializedChange;
     use crate::sql2::history_route::HistoryEntry;
-    use crate::tracked_state::{MaterializedTrackedStateBatch, MaterializedTrackedStateRow};
 
-    use super::ObservedTrackedStateRows;
+    use super::ObservedStateRows;
     use super::{
         FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryDirectoryIndex,
         FileHistoryDirectoryRecord, FileHistoryFilesystemContext, FileHistoryLookupIds,
         FileHistoryObservedState, FileHistoryPluginOwnerRecord, FileHistoryPluginStateRecord,
         FileHistoryPublicPredicate, HistoryRoute, PluginRegistry, PreparedFileHistoryRow,
         file_history_descriptor_blob_route, file_history_event_from_entry, file_history_events,
-        file_history_plugin_events, load_file_history_blob_bytes, load_file_history_entry_sets,
+        file_history_plugin_events, load_file_history_entry_sets,
         parse_file_history_observed_blobs, parse_file_history_observed_descriptors,
         parse_file_history_observed_directories, parse_file_history_observed_plugin_owners,
         prepare_file_history_rows, sorted_grouped_file_history_events,
@@ -2631,7 +2709,7 @@ mod tests {
             change: MaterializedChange {
                 id: format!("change-{file_id}-{depth}"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                row_pk: RowPk::single(file_id),
+                entity_pk: EntityPk::single(file_id),
                 schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 file_id: Some(file_id.to_string()),
                 snapshot_content: snapshot_content.map(Into::into),
@@ -2658,6 +2736,33 @@ mod tests {
         FileHistoryDescriptorRecord {
             id: file_id.to_string(),
             entry: history_entry(file_id, depth, snapshot),
+        }
+    }
+
+    fn observed_row(
+        schema_key: &str,
+        entity_pk: EntityPk,
+        file_id: Option<&str>,
+        deleted: bool,
+        ordinal: u128,
+    ) -> HistoricalStateRow {
+        let timestamp =
+            LixTimestamp::expect_parse("test historical row timestamp", "2026-01-01T00:00:00Z");
+        HistoricalStateRow {
+            key: StateKey {
+                entity_pk,
+                schema_key: schema_key.to_string(),
+                file_id: file_id.map(str::to_owned),
+            },
+            global: false,
+            snapshot_content: None,
+            metadata: None,
+            deleted,
+            blob_manifest_object_ids: Vec::new(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            change_id: ChangeId::new(uuid::Uuid::from_u128(ordinal)),
+            commit_id: CommitId::new(uuid::Uuid::from_u128(1)),
         }
     }
 
@@ -2705,6 +2810,7 @@ mod tests {
             serde_json::json!({
                 "id": file_id,
                 "blob_hash": hash.to_hex(),
+                "size_bytes": 0,
             })
             .to_string()
             .into(),
@@ -2731,29 +2837,35 @@ mod tests {
         entries: impl IntoIterator<Item = HistoryEntry>,
         plugin_registry: PluginRegistry,
     ) -> FileHistoryObservedState {
-        let materialized = entries
+        let rows = entries
             .into_iter()
             .enumerate()
             .map(|(index, entry)| {
                 let change = entry.change;
                 let deleted = change.snapshot_content.is_none();
-                MaterializedTrackedStateRow {
-                    row_pk: change.row_pk,
-                    schema_key: change.schema_key,
-                    file_id: change.file_id,
+                let created_at =
+                    LixTimestamp::expect_parse("test history created_at", &change.created_at);
+                let updated_at =
+                    LixTimestamp::expect_parse("test history updated_at", &change.created_at);
+                HistoricalStateRow {
+                    key: StateKey {
+                        entity_pk: change.entity_pk,
+                        schema_key: change.schema_key,
+                        file_id: change.file_id,
+                    },
+                    global: false,
                     snapshot_content: change.snapshot_content,
                     metadata: change.metadata,
                     deleted,
-                    created_at: change.created_at.clone(),
-                    updated_at: change.created_at,
+                    blob_manifest_object_ids: Vec::new(),
+                    created_at,
+                    updated_at,
                     change_id: ChangeId::new(uuid::Uuid::from_u128(index as u128 + 1)),
                     commit_id: CommitId::new(uuid::Uuid::from_u128(1)),
                 }
             })
             .collect::<Vec<_>>();
-        let batch =
-            MaterializedTrackedStateBatch::from_rows(materialized).expect("test history batch");
-        let rows = ObservedTrackedStateRows::from_batch(SharedStr::from_static("commit-0"), batch)
+        let rows = ObservedStateRows::from_rows(SharedStr::from_static("commit-0"), rows)
             .expect("test observed rows");
         FileHistoryObservedState {
             descriptors: parse_file_history_observed_descriptors(&rows).expect("test descriptors"),
@@ -2831,7 +2943,7 @@ mod tests {
         let mut entry = history_entry(file_id, 0, Some(snapshot_content));
         entry.observed_commit_id = observed_commit_id.to_string();
         entry.change.id = format!("owner-{file_id}-{observed_commit_id}");
-        entry.change.row_pk = RowPk::single(super::PLUGIN_OWNER_KEY);
+        entry.change.entity_pk = EntityPk::single(super::PLUGIN_OWNER_KEY);
         entry.change.schema_key = super::KEY_VALUE_SCHEMA_KEY.to_string();
         FileHistoryPluginOwnerRecord {
             file_id: file_id.to_string(),
@@ -2847,7 +2959,7 @@ mod tests {
         let mut entry = history_entry(file_id, 0, None);
         entry.observed_commit_id = observed_commit_id.to_string();
         entry.change.id = format!("plugin-state-{schema_key}-{observed_commit_id}");
-        entry.change.row_pk = RowPk::single("plugin-state");
+        entry.change.entity_pk = EntityPk::single("plugin-state");
         entry.change.schema_key = schema_key.to_string();
         FileHistoryPluginStateRecord {
             file_id: file_id.to_string(),
@@ -2885,9 +2997,11 @@ mod tests {
             manifest_json,
             archive_file_id: plugin_storage_archive_file_id(plugin_key),
             archive_path: plugin_storage_archive_path(plugin_key),
-            archive_blob_hash: BlobId::from_content(format!("archive-{plugin_key}").as_bytes())
-                .to_hex(),
-            wasm_blob_hash: BlobId::from_content(wasm).to_hex(),
+            archive_blob_hash: BlobId::from_canonical_content(
+                format!("archive-{plugin_key}").as_bytes(),
+            )
+            .to_hex(),
+            wasm_blob_hash: BlobId::from_canonical_content(wasm).to_hex(),
         })
         .expect("test plugin registry entry should be valid");
         PluginRegistry::new(vec![entry]).expect("test plugin registry should be valid")
@@ -2915,37 +3029,9 @@ mod tests {
         ))
     }
 
-    #[derive(Default)]
-    struct RecordingBlobReader {
-        calls: StdMutex<Vec<Vec<BlobId>>>,
-        values: BTreeMap<BlobId, Option<Vec<u8>>>,
-    }
-
-    #[async_trait]
-    impl BlobDataReader for RecordingBlobReader {
-        async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            self.calls.lock().unwrap().push(hashes.to_vec());
-            Ok(BlobBytesBatch::new(
-                hashes
-                    .iter()
-                    .map(|hash| self.values.get(hash).cloned().flatten())
-                    .collect(),
-            ))
-        }
-    }
-
-    struct FixedBatchBlobReader(Vec<Option<Vec<u8>>>);
-
-    #[async_trait]
-    impl BlobDataReader for FixedBatchBlobReader {
-        async fn load_bytes_many(&self, _hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
-            Ok(BlobBytesBatch::new(self.0.clone()))
-        }
-    }
-
     #[test]
     fn public_id_and_path_filters_prune_before_hydration() {
-        let hash = BlobId::from_content(b"content");
+        let hash = BlobId::from_canonical_content(b"content");
         let live_a = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
         let live_b = descriptor("01920000-0000-7000-8000-0000000000b2", Some("b.md"), 0);
         let tombstone = descriptor("file-deleted", None, 0);
@@ -3024,6 +3110,224 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_tombstones_remain_history_rows_but_nulls_fail_closed() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let descriptor_tombstone = ObservedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::FILE_DESCRIPTOR_SCHEMA_KEY,
+                EntityPk::single(file_id),
+                Some(file_id),
+                true,
+                1,
+            )],
+        )
+        .unwrap();
+        let descriptor = parse_file_history_observed_descriptors(&descriptor_tombstone).unwrap();
+        assert_eq!(descriptor.len(), 1);
+        assert_eq!(descriptor[0].name, None);
+
+        let directory_id = "01920000-0000-7000-8000-0000000000b2";
+        let directory_tombstone = ObservedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                EntityPk::single(directory_id),
+                None,
+                true,
+                2,
+            )],
+        )
+        .unwrap();
+        let directory = parse_file_history_observed_directories(&directory_tombstone).unwrap();
+        assert_eq!(directory.len(), 1);
+        assert_eq!(directory[0].name, None);
+
+        let blob_tombstone = ObservedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::BLOB_REF_SCHEMA_KEY,
+                EntityPk::single(file_id),
+                Some(file_id),
+                true,
+                3,
+            )],
+        )
+        .unwrap();
+        let blob = parse_file_history_observed_blobs(&blob_tombstone).unwrap();
+        assert_eq!(blob.len(), 1);
+        assert_eq!(blob[0].blob_hash, None);
+
+        let owner_tombstone = ObservedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::KEY_VALUE_SCHEMA_KEY,
+                EntityPk::single(super::PLUGIN_OWNER_KEY),
+                Some(file_id),
+                true,
+                4,
+            )],
+        )
+        .unwrap();
+        let owner = parse_file_history_observed_plugin_owners(&owner_tombstone).unwrap();
+        assert_eq!(owner.len(), 1);
+        assert_eq!(owner[0].owner, None);
+
+        let authenticated_null = ObservedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![observed_row(
+                super::FILE_DESCRIPTOR_SCHEMA_KEY,
+                EntityPk::single(file_id),
+                Some(file_id),
+                false,
+                5,
+            )],
+        )
+        .unwrap();
+        assert!(parse_file_history_observed_descriptors(&authenticated_null).is_err());
+    }
+
+    #[test]
+    fn observed_descriptor_tombstones_with_payload_fail_closed() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let mut file_tombstone = observed_row(
+            super::FILE_DESCRIPTOR_SCHEMA_KEY,
+            EntityPk::single(file_id),
+            Some(file_id),
+            true,
+            6,
+        );
+        file_tombstone.snapshot_content = Some(
+            serde_json::json!({
+                "id": file_id,
+                "directory_id": null,
+                "name": "file.txt",
+            })
+            .to_string()
+            .into(),
+        );
+        let mut directory_tombstone = observed_row(
+            super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+            EntityPk::single("01920000-0000-7000-8000-0000000000b2"),
+            None,
+            true,
+            7,
+        );
+        directory_tombstone.snapshot_content = Some(
+            serde_json::json!({
+                "id": "01920000-0000-7000-8000-0000000000b2",
+                "parent_id": null,
+                "name": "directory",
+            })
+            .to_string()
+            .into(),
+        );
+        let mut owner_tombstone = observed_row(
+            super::KEY_VALUE_SCHEMA_KEY,
+            EntityPk::single(super::PLUGIN_OWNER_KEY),
+            Some(file_id),
+            true,
+            8,
+        );
+        owner_tombstone.snapshot_content = Some("{}".into());
+
+        let rows = ObservedStateRows::from_rows(
+            SharedStr::from_static("commit-0"),
+            vec![file_tombstone, directory_tombstone, owner_tombstone],
+        )
+        .unwrap();
+
+        assert!(parse_file_history_observed_descriptors(&rows).is_err());
+        assert!(parse_file_history_observed_directories(&rows).is_err());
+        assert!(parse_file_history_observed_plugin_owners(&rows).is_err());
+    }
+
+    #[test]
+    fn live_descriptor_without_blob_ref_materializes_as_empty_file() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let descriptor = descriptor(file_id, Some("empty.txt"), 0);
+        let event = file_history_event_from_entry(file_id.to_string(), &descriptor.entry);
+        let missing = Arc::new(observed_state_from_entries(
+            [descriptor.entry.clone()],
+            PluginRegistry::empty(),
+        ));
+        assert!(
+            super::validate_exactly_one_blob_ref(missing.as_ref(), &event, true)
+                .unwrap()
+                .is_none(),
+            "a descriptor-only live file should not synthesize a BlobRef"
+        );
+        let missing_prepared = PreparedFileHistoryRow {
+            id: file_id.to_string(),
+            path: Some("/empty.txt".to_string()),
+            observed_state: Arc::clone(&missing),
+            descriptor_ordinal: 0,
+            blob_hash: None,
+            event: event.clone(),
+        };
+        super::validate_file_history_materialization(&missing_prepared, None)
+            .expect("descriptor-only live file should materialize as empty content");
+
+        let empty_hash = BlobId::from_canonical_content(b"");
+        let blob = blob_record(file_id, empty_hash, 0);
+        let state = Arc::new(observed_state_from_entries(
+            [descriptor.entry.clone(), blob.entry],
+            PluginRegistry::empty(),
+        ));
+        let reference = super::validate_exactly_one_blob_ref(state.as_ref(), &event, true)
+            .unwrap()
+            .expect("zero-length BlobRef should be live and authenticated");
+        assert_eq!(reference.size_bytes, Some(0));
+
+        let prepared = PreparedFileHistoryRow {
+            id: file_id.to_string(),
+            path: Some("/empty.txt".to_string()),
+            observed_state: state,
+            descriptor_ordinal: 0,
+            blob_hash: Some(empty_hash.to_hex()),
+            event,
+        };
+        super::validate_file_history_materialization(&prepared, Some(&[]))
+            .expect("authenticated zero-length payload should remain valid");
+    }
+
+    #[test]
+    fn historical_descriptor_and_directory_file_identity_bindings_fail_closed() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let mut file = history_entry(
+            file_id,
+            0,
+            Some(
+                serde_json::json!({
+                    "id": file_id,
+                    "directory_id": null,
+                    "name": "file.txt",
+                })
+                .to_string(),
+            ),
+        );
+        file.change.file_id = Some("01920000-0000-7000-8000-0000000000b2".to_string());
+        assert!(super::parse_file_history_descriptors(&[file]).is_err());
+
+        let directory_id = "01920000-0000-7000-8000-0000000000b2";
+        let mut directory = history_entry(
+            directory_id,
+            0,
+            Some(
+                serde_json::json!({
+                    "id": directory_id,
+                    "parent_id": null,
+                    "name": "directory",
+                })
+                .to_string(),
+            ),
+        );
+        directory.change.schema_key = super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string();
+        directory.change.file_id = Some(file_id.to_string());
+        assert!(super::parse_file_history_directories(&[directory]).is_err());
+    }
+
+    #[test]
     fn equal_depth_sibling_revisions_are_not_deduplicated() {
         let mut left = history_entry("01920000-0000-7000-8000-0000000000a2", 1, None);
         left.observed_commit_id = "commit-left".to_string();
@@ -3041,7 +3345,8 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000a2".to_string(),
                 &right,
             ),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(events.len(), 2);
         assert_eq!(
@@ -3069,7 +3374,8 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000a2".to_string(),
                 &blob,
             ),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_changes.len(), 2);
@@ -3084,6 +3390,62 @@ mod tests {
                 super::FILE_DESCRIPTOR_SCHEMA_KEY,
             ])
         );
+    }
+
+    #[test]
+    fn same_commit_sources_deduplicate_ids_after_grouping_and_sort() {
+        let mut first = history_entry("01920000-0000-7000-8000-0000000000a2", 0, None);
+        first.change.id = "source-b".to_string();
+        let mut second = first.clone();
+        second.change.id = "source-a".to_string();
+        let duplicate = second.clone();
+
+        let events = sorted_grouped_file_history_events([
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &first,
+            ),
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &second,
+            ),
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &duplicate,
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .source_changes
+                .iter()
+                .map(|change| change.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["source-a", "source-b"]
+        );
+    }
+
+    #[test]
+    fn conflicting_source_change_ids_fail_before_projection_limit() {
+        let mut first = history_entry("01920000-0000-7000-8000-0000000000a2", 0, None);
+        first.change.id = "source-conflict".to_string();
+        let mut conflicting = first.clone();
+        conflicting.change.schema_key = super::BLOB_REF_SCHEMA_KEY.to_string();
+
+        let result = sorted_grouped_file_history_events([
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &first,
+            ),
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &conflicting,
+            ),
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -3118,25 +3480,28 @@ mod tests {
             &descriptors,
             &observed_states,
             &BTreeMap::new(),
-        );
+        )
+        .expect("valid directory history should fan out");
 
         assert_eq!(events.len(), SIBLING_COUNT);
         for (index, event) in events.iter().enumerate() {
             assert_eq!(event.file_id, format!("file-{index:04}"));
             assert_eq!(event.source_changes.len(), 1);
             assert_eq!(
-                event.source_changes[0].row_pk,
-                RowPk::single(format!("directory-{index:04}"))
+                event.source_changes[0].entity_pk,
+                EntityPk::single(format!("directory-{index:04}"))
             );
         }
 
         let mut visited_buckets = 0;
         let mut visited_file_candidates = 0;
         for directory in &directories {
-            directory_index.visit_affected_file_buckets(&directory.id, |bucket| {
-                visited_buckets += 1;
-                visited_file_candidates += bucket.len();
-            });
+            directory_index
+                .visit_affected_file_buckets(&directory.id, |bucket| {
+                    visited_buckets += 1;
+                    visited_file_candidates += bucket.len();
+                })
+                .expect("valid directory tree should have no cycle");
         }
         assert_eq!(visited_buckets, SIBLING_COUNT);
         assert_eq!(visited_file_candidates, SIBLING_COUNT);
@@ -3159,14 +3524,15 @@ mod tests {
         );
         let old_state_tombstone =
             plugin_state_tombstone(file_id, "plugin_a_state", replacement_commit_id);
+        let mut parent_state = plugin_observed_state(parent_owner);
+        parent_state.plugin_registry = plugin_registry("plugin-a", &["plugin_a_state"]);
+        let mut replacement_state = plugin_observed_state(replacement_owner.clone());
+        replacement_state.plugin_registry = plugin_registry("plugin-b", &["plugin_b_state"]);
         let observed_states = BTreeMap::from([
-            (
-                parent_commit_id.to_string(),
-                Arc::new(plugin_observed_state(parent_owner)),
-            ),
+            (parent_commit_id.to_string(), Arc::new(parent_state)),
             (
                 replacement_commit_id.to_string(),
-                Arc::new(plugin_observed_state(replacement_owner.clone())),
+                Arc::new(replacement_state),
             ),
         ]);
         let parents = BTreeMap::from([(
@@ -3181,6 +3547,7 @@ mod tests {
                 &observed_states,
                 &parents,
             )
+            .unwrap()
             .is_empty(),
             "a prior-owner tombstone needs a durable owner change in the same commit"
         );
@@ -3189,7 +3556,8 @@ mod tests {
             &[replacement_owner],
             &observed_states,
             &parents,
-        );
+        )
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_changes[0].schema_key, "plugin_a_state");
     }
@@ -3221,7 +3589,8 @@ mod tests {
         let removed_schema_tombstone =
             plugin_state_tombstone(file_id, "plugin_a_removed", update_commit_id);
         let mut parent_state = plugin_observed_state(parent_owner);
-        parent_state.plugin_registry = plugin_registry("plugin-a", &["plugin_a_retained"]);
+        parent_state.plugin_registry =
+            plugin_registry("plugin-a", &["plugin_a_removed", "plugin_a_retained"]);
         let mut updated_state = plugin_observed_state(updated_owner.clone());
         updated_state.plugin_registry = plugin_registry("plugin-a", &["plugin_a_retained"]);
         let observed_states = BTreeMap::from([
@@ -3238,7 +3607,8 @@ mod tests {
             &[updated_owner],
             &observed_states,
             &parents,
-        );
+        )
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_changes[0].schema_key, "plugin_a_removed");
     }
@@ -3261,23 +3631,13 @@ mod tests {
             },
             &ids,
         )
-        .expect("file IDs should encode as canonical row keys");
+        .expect("file IDs should encode as canonical entity keys");
 
         assert_eq!(
-            route.row_pks,
+            route.entity_pks,
             vec![
                 r#"["01920000-0000-7000-8000-0000000000a2"]"#.to_string(),
                 r#"["01920000-0000-7000-8000-0000000000b2"]"#.to_string()
-            ]
-        );
-        // The digest's `(schema_key, file_id)` pair probe is only reached when
-        // the request pins `file_ids`; without this the blob-ref projection
-        // loads one commit delta per reachable content commit.
-        assert_eq!(
-            route.file_ids,
-            vec![
-                "01920000-0000-7000-8000-0000000000a2".to_string(),
-                "01920000-0000-7000-8000-0000000000b2".to_string()
             ]
         );
         assert_eq!(route.as_of_commit_ids, vec!["commit-start".to_string()]);
@@ -3316,196 +3676,14 @@ mod tests {
             Operator::And,
             Box::new(eq_filter("path", "/a.md")),
         ));
-        assert!(
-            FileHistoryLookupIds::from_public_predicate(&FileHistoryPublicPredicate::from_filters(
-                &[mixed_conjunction]
-            ))
-            .is_none(),
-            "mixed public predicates retain the existing complete traversal"
-        );
-    }
-
-    #[test]
-    fn exact_public_paths_bound_conjunctions_and_complete_disjunctions() {
-        let single = FileHistoryPublicPredicate::from_filters(&[eq_filter("path", "/docs/a.md")]);
-        assert_eq!(
-            single.exact_paths(),
-            Some(BTreeSet::from(["/docs/a.md".to_string()]))
-        );
-
-        // Either side of a conjunction is already a sound bound.
-        let mixed_conjunction = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a2")),
-            Operator::And,
-            Box::new(eq_filter("path", "/docs/a.md")),
-        ));
-        assert_eq!(
-            FileHistoryPublicPredicate::from_filters(&[mixed_conjunction]).exact_paths(),
-            Some(BTreeSet::from(["/docs/a.md".to_string()]))
-        );
-
-        let path_disjunction = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("path", "/docs/a.md")),
-            Operator::Or,
-            Box::new(eq_filter("path", "/docs/b.md")),
-        ));
-        assert_eq!(
-            FileHistoryPublicPredicate::from_filters(&[path_disjunction]).exact_paths(),
-            Some(BTreeSet::from([
-                "/docs/a.md".to_string(),
-                "/docs/b.md".to_string()
-            ]))
-        );
-
-        // One unbounded side leaves the whole disjunction unbounded.
-        let mixed_disjunction = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("path", "/docs/a.md")),
-            Operator::Or,
-            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a2")),
-        ));
-        assert!(
-            FileHistoryPublicPredicate::from_filters(&[mixed_disjunction])
-                .exact_paths()
-                .is_none(),
-            "an unbounded disjunct must retain the complete traversal"
-        );
-
-        assert!(FileHistoryPublicPredicate::All.exact_paths().is_none());
-    }
-
-    #[tokio::test]
-    async fn blob_hydration_batches_deduplicates_and_preserves_missing_values() {
-        let present_hash = BlobId::from_content(b"present");
-        let missing_hash = BlobId::from_content(b"missing");
-        let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
-        let event = file_history_event_from_entry(
-            "01920000-0000-7000-8000-0000000000a2".to_string(),
-            &descriptor.entry,
-        );
-        let observed_state = Arc::new(observed_state_from_entries(
-            [descriptor.entry.clone()],
-            PluginRegistry::empty(),
-        ));
-        let row = |id: &str, hash: BlobId| PreparedFileHistoryRow {
-            id: id.to_string(),
-            path: Some(format!("/{id}.md")),
-            observed_state: Arc::clone(&observed_state),
-            descriptor_ordinal: 0,
-            blob_hash: Some(hash.to_hex()),
-            event: event.clone(),
-        };
-        let rows = vec![
-            row("01920000-0000-7000-8000-0000000000a2", present_hash),
-            row("01920000-0000-7000-8000-0000000000b2", present_hash),
-            row("01920000-0000-7000-8000-0000000000c2", missing_hash),
-        ];
-        let reader = Arc::new(RecordingBlobReader {
-            calls: StdMutex::new(Vec::new()),
-            values: BTreeMap::from([(present_hash, Some(b"present".to_vec()))]),
-        });
-        let blob_reader: Arc<dyn BlobDataReader> = reader.clone();
-
-        let loaded = load_file_history_blob_bytes(&blob_reader, &rows)
-            .await
-            .unwrap();
-
-        let calls = reader.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].iter().copied().collect::<BTreeSet<_>>().len(), 2);
-        assert_eq!(
-            loaded.get(&present_hash.to_hex()),
-            Some(&Some(b"present".to_vec()))
-        );
-        assert_eq!(loaded.get(&missing_hash.to_hex()), Some(&None));
-    }
-
-    #[tokio::test]
-    async fn blob_hydration_rejects_malformed_batch_lengths() {
-        let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
-        let event = file_history_event_from_entry(
-            "01920000-0000-7000-8000-0000000000a2".to_string(),
-            &descriptor.entry,
-        );
-        let observed_state = Arc::new(observed_state_from_entries(
-            [descriptor.entry.clone()],
-            PluginRegistry::empty(),
-        ));
-        let row = |id: &str, hash: BlobId| PreparedFileHistoryRow {
-            id: id.to_string(),
-            path: Some(format!("/{id}.md")),
-            observed_state: Arc::clone(&observed_state),
-            descriptor_ordinal: 0,
-            blob_hash: Some(hash.to_hex()),
-            event: event.clone(),
-        };
-        let rows = vec![
-            row(
-                "01920000-0000-7000-8000-0000000000a2",
-                BlobId::from_content(b"first"),
-            ),
-            row(
-                "01920000-0000-7000-8000-0000000000b2",
-                BlobId::from_content(b"second"),
-            ),
-        ];
-
-        for malformed in [
-            vec![Some(b"only-one".to_vec())],
-            vec![None, None, Some(b"extra".to_vec())],
-        ] {
-            let reader: Arc<dyn BlobDataReader> = Arc::new(FixedBatchBlobReader(malformed));
-            let error = load_file_history_blob_bytes(&reader, &rows)
-                .await
-                .expect_err("mismatched positional batch must fail");
-            assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
-            assert!(error.message.contains("values for 2 requested hashes"));
-        }
-    }
-
-    #[tokio::test]
-    async fn unfiltered_bulk_history_keeps_all_rows_and_uses_one_blob_batch() {
-        let first_hash = BlobId::from_content(b"first");
-        let second_hash = BlobId::from_content(b"second");
-        let descriptors = vec![
-            descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0),
-            descriptor("01920000-0000-7000-8000-0000000000b2", Some("b.md"), 0),
-        ];
-        let events = descriptors
-            .iter()
-            .map(|descriptor| {
-                file_history_event_from_entry(descriptor.id.clone(), &descriptor.entry)
-            })
-            .collect::<Vec<_>>();
-        let context = filesystem_context(
-            descriptors,
-            vec![
-                blob_record("01920000-0000-7000-8000-0000000000a2", first_hash, 0),
-                blob_record("01920000-0000-7000-8000-0000000000b2", second_hash, 0),
-            ],
-        );
-        let rows = prepare_file_history_rows(
-            &observed_states(&context),
-            events,
-            &HistoryRoute::default(),
-            &FileHistoryPublicPredicate::All,
+        let mixed_ids = FileHistoryLookupIds::from_public_predicate(
+            &FileHistoryPublicPredicate::from_filters(&[mixed_conjunction]),
         )
-        .unwrap();
-        assert_eq!(rows.len(), 2);
-
-        let reader = Arc::new(RecordingBlobReader {
-            calls: StdMutex::new(Vec::new()),
-            values: BTreeMap::from([
-                (first_hash, Some(b"first".to_vec())),
-                (second_hash, Some(b"second".to_vec())),
-            ]),
-        });
-        let blob_reader: Arc<dyn BlobDataReader> = reader.clone();
-        let loaded = load_file_history_blob_bytes(&blob_reader, &rows)
-            .await
-            .unwrap();
-
-        assert_eq!(reader.calls.lock().unwrap().len(), 1);
-        assert_eq!(loaded.len(), 2);
+        .expect("an exact ID conjunct remains safe with a residual path predicate");
+        assert_eq!(
+            mixed_ids.0,
+            BTreeSet::from(["01920000-0000-7000-8000-0000000000a2".to_owned()])
+        );
     }
 
     #[tokio::test]

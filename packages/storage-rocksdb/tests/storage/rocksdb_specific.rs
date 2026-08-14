@@ -7,8 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, PutBatch, PutEntry,
-    ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
-    WriteOptions,
+    ReadOptions, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
 };
 use lix_storage_rocksdb::RocksDB;
 
@@ -16,7 +15,7 @@ use lix_storage_rocksdb::RocksDB;
 fn same_process_open_reuses_shared_database_handle() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
-    let space = StorageSpace::immutable(SpaceId(7), "test.immutable");
+    let space = lix::storage::conformance::IMMUTABLE_7;
     let storage_a = RocksDB::open(&path).expect("open first storage");
     let storage_b = RocksDB::open(&path).expect("open second storage");
 
@@ -48,7 +47,7 @@ fn single_key_get_many_preserves_snapshot_and_projection_semantics() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
     let storage = RocksDB::open(&path).expect("open storage");
-    let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+    let space = lix::storage::conformance::MUTABLE_7;
     let key = Key(Bytes::from_static(b"tracked-key"));
 
     put_one(
@@ -102,7 +101,7 @@ fn multi_key_delete_uses_exact_contiguous_key_ranges() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
     let storage = RocksDB::open(&path).expect("open storage");
-    let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
+    let space = lix::storage::conformance::MUTABLE_7;
     let keys = [
         Key(Bytes::from_static(b"delete-first")),
         Key(Bytes::from_static(b"delete-second")),
@@ -184,7 +183,7 @@ fn writes_large_values_to_blob_files() {
     let storage = RocksDB::open(&path).expect("open storage");
     put_one(
         &storage,
-        StorageSpace::immutable(SpaceId(7), "test.immutable"),
+        lix::storage::conformance::IMMUTABLE_7,
         Key(Bytes::from_static(b"large-value")),
         Bytes::from(vec![7; 128 * 1024]),
     );
@@ -204,7 +203,7 @@ fn compresses_metadata_but_not_immutable_payloads() {
     let storage = RocksDB::open(&path).expect("open storage");
     put_one(
         &storage,
-        StorageSpace::immutable(SpaceId(7), "test.immutable"),
+        lix::storage::conformance::IMMUTABLE_7,
         Key(Bytes::from_static(b"compressed-value")),
         Bytes::from(vec![b'a'; 64 * 1024]),
     );

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::common::SharedStr;
-use crate::tracked_state::TrackedStateKeyRef;
+use crate::forktree::StateKeyRef;
 
 use super::staging::PreparedWriteSet;
 
@@ -33,7 +33,7 @@ pub(super) struct StalePluginReconciliationPlan {
 
 pub(super) fn classify_stale_commit<'a>(
     prepared_writes: &'a PreparedWriteSet,
-    concurrent: impl Iterator<Item = TrackedStateKeyRef<'a>>,
+    concurrent: impl Iterator<Item = StateKeyRef<'a>>,
 ) -> StaleCommitPlan {
     let overlapping_indices = indexed_overlap_indices(
         prepared_writes
@@ -43,10 +43,10 @@ pub(super) fn classify_stale_commit<'a>(
             .map(|(index, row)| {
                 (
                     index,
-                    TrackedStateKeyRef {
+                    StateKeyRef {
                         schema_key: row.schema_key.as_str(),
                         file_id: row.file_id.map(SharedStr::as_str),
-                        row_pk: row.row_pk,
+                        entity_pk: row.entity_pk,
                     },
                 )
             }),
@@ -101,8 +101,8 @@ pub(super) fn classify_stale_commit<'a>(
 }
 
 fn indexed_overlap_indices<'a>(
-    prepared: impl Iterator<Item = (usize, TrackedStateKeyRef<'a>)>,
-    concurrent: impl Iterator<Item = TrackedStateKeyRef<'a>>,
+    prepared: impl Iterator<Item = (usize, StateKeyRef<'a>)>,
+    concurrent: impl Iterator<Item = StateKeyRef<'a>>,
 ) -> Vec<usize> {
     let concurrent_keys = concurrent.collect::<HashSet<_>>();
     prepared
@@ -115,30 +115,33 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::row_pk::RowPk;
-    use crate::tracked_state::TrackedStateKey;
+    use crate::catalog::SchemaPlanId;
+    use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
+    use crate::forktree::StateKey;
+    use crate::transaction::types::{PreparedRowFacts, PreparedStateBatch};
 
-    fn test_key_ref(key: &TrackedStateKey) -> TrackedStateKeyRef<'_> {
-        TrackedStateKeyRef {
+    fn test_key_ref(key: &StateKey) -> StateKeyRef<'_> {
+        StateKeyRef {
             schema_key: &key.schema_key,
             file_id: key.file_id.as_deref(),
-            row_pk: &key.row_pk,
+            entity_pk: &key.entity_pk,
         }
     }
 
-    fn overlap_fixture(rows: usize) -> (Vec<TrackedStateKey>, Vec<TrackedStateKey>) {
+    fn overlap_fixture(rows: usize) -> (Vec<StateKey>, Vec<StateKey>) {
         let prepared = (0..rows)
-            .map(|index| TrackedStateKey {
-                schema_key: "plugin_row".to_owned(),
+            .map(|index| StateKey {
+                schema_key: "plugin_entity".to_owned(),
                 file_id: Some("hot-file".to_owned()),
-                row_pk: RowPk::single(format!("row-{index}")),
+                entity_pk: EntityPk::single(format!("row-{index}")),
             })
             .collect::<Vec<_>>();
         let concurrent = (0..rows)
-            .map(|index| TrackedStateKey {
-                schema_key: "plugin_row".to_owned(),
+            .map(|index| StateKey {
+                schema_key: "plugin_entity".to_owned(),
                 file_id: Some("hot-file".to_owned()),
-                row_pk: RowPk::single(if index.is_multiple_of(2) {
+                entity_pk: EntityPk::single(if index.is_multiple_of(2) {
                     format!("row-{index}")
                 } else {
                     format!("other-{index}")
@@ -148,10 +151,7 @@ mod tests {
         (prepared, concurrent)
     }
 
-    fn legacy_nested_overlap_indices(
-        prepared: &[TrackedStateKey],
-        concurrent: &[TrackedStateKey],
-    ) -> Vec<usize> {
+    fn legacy_nested_overlap_indices(prepared: &[StateKey], concurrent: &[StateKey]) -> Vec<usize> {
         prepared
             .iter()
             .enumerate()
@@ -172,6 +172,52 @@ mod tests {
         assert_eq!(
             indexed,
             legacy_nested_overlap_indices(&prepared, &concurrent)
+        );
+    }
+
+    #[test]
+    fn unrelated_owner_does_not_enter_stale_plan() {
+        let mut state_rows = PreparedStateBatch::with_capacity(1);
+        state_rows.push_parts_with_change_addressability(
+            SchemaPlanId::for_test(0),
+            PreparedRowFacts::default(),
+            EntityPk::single("row-a"),
+            "plugin_entity".to_owned().into(),
+            Some("file-a".to_owned().into()),
+            None,
+            None,
+            None,
+            None,
+            LixTimestamp::from_unix_millis_utc_lossy(0),
+            LixTimestamp::from_unix_millis_utc_lossy(0),
+            false,
+            None,
+            false,
+            None,
+            false,
+            "main".to_owned().into(),
+        );
+        let prepared = PreparedWriteSet {
+            state_rows,
+            insert_selection: super::super::staging::PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: Default::default(),
+            first_commit_parent_override_by_branch: Default::default(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: Default::default(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+            branch_ref_intents: Vec::new(),
+            historical_blob_manifest_edges: Default::default(),
+        };
+        let unrelated = StateKey {
+            schema_key: "plugin_entity".to_owned(),
+            file_id: Some("file-b".to_owned()),
+            entity_pk: EntityPk::single("row-a"),
+        };
+
+        assert_eq!(
+            classify_stale_commit(&prepared, std::iter::once(test_key_ref(&unrelated))),
+            StaleCommitPlan::Direct
         );
     }
 

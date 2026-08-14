@@ -13,18 +13,18 @@ use crate::LixError;
 use crate::common::{SharedStr, json_pointer_get};
 use musli::{Allocator, Context, Decode, Decoder, Encode, Encoder};
 
-type RowPkComponentBuffer = SmallVec<[RowPkComponent; 2]>;
+type EntityPkComponentBuffer = SmallVec<[EntityPkComponent; 2]>;
 
-/// Logical row primary key derived from a schema primary key.
+/// Logical entity primary key derived from a schema primary key.
 ///
 /// Components stay typed inside the engine and are projected to standard JSON
 /// scalar representations only at API and SQL boundaries.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct RowPk {
-    pub(crate) components: RowPkComponents,
+pub(crate) struct EntityPk {
+    pub(crate) components: EntityPkComponents,
 }
 
-impl RowPk {
+impl EntityPk {
     /// How many refcounted buffer handles one `clone` of this key duplicates.
     ///
     /// A composite key shares one `Arc` over its component slice, so it costs
@@ -33,12 +33,12 @@ impl RowPk {
     #[cfg(feature = "storage-benches")]
     pub(crate) fn shared_handle_count(&self) -> usize {
         match &self.components {
-            RowPkComponents::Empty => 0,
-            RowPkComponents::Single(component) => match component {
-                RowPkComponent::String(_) | RowPkComponent::Bytes(_) => 1,
-                RowPkComponent::Uuid(_) | RowPkComponent::Integer(_) => 0,
+            EntityPkComponents::Empty => 0,
+            EntityPkComponents::Single(component) => match component {
+                EntityPkComponent::String(_) | EntityPkComponent::Bytes(_) => 1,
+                EntityPkComponent::Uuid(_) | EntityPkComponent::Integer(_) => 0,
             },
-            RowPkComponents::Shared(_) => 1,
+            EntityPkComponents::Shared(_) => 1,
         }
     }
 }
@@ -50,14 +50,14 @@ impl RowPk {
 /// composite clone allocate a fresh vector. Component payloads are themselves
 /// shared, so cloning either representation only increments existing owners.
 #[derive(Debug, Clone)]
-pub(crate) enum RowPkComponents {
+pub(crate) enum EntityPkComponents {
     Empty,
-    Single(RowPkComponent),
-    Shared(Arc<[RowPkComponent]>),
+    Single(EntityPkComponent),
+    Shared(Arc<[EntityPkComponent]>),
 }
 
-impl RowPkComponents {
-    fn from_smallvec(mut components: RowPkComponentBuffer) -> Self {
+impl EntityPkComponents {
+    fn from_smallvec(mut components: EntityPkComponentBuffer) -> Self {
         match components.len() {
             0 => Self::Empty,
             1 => Self::Single(
@@ -72,14 +72,14 @@ impl RowPkComponents {
                 let first = components
                     .pop()
                     .expect("two primary-key components were just counted");
-                let owner: Arc<[RowPkComponent; 2]> = Arc::new([first, second]);
+                let owner: Arc<[EntityPkComponent; 2]> = Arc::new([first, second]);
                 Self::Shared(owner)
             }
             _ => Self::Shared(Arc::from(components.into_vec())),
         }
     }
 
-    pub(crate) fn as_slice(&self) -> &[RowPkComponent] {
+    pub(crate) fn as_slice(&self) -> &[EntityPkComponent] {
         match self {
             Self::Empty => &[],
             Self::Single(component) => std::slice::from_ref(component),
@@ -88,44 +88,44 @@ impl RowPkComponents {
     }
 }
 
-impl Deref for RowPkComponents {
-    type Target = [RowPkComponent];
+impl Deref for EntityPkComponents {
+    type Target = [EntityPkComponent];
 
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
 
-impl<'a> IntoIterator for &'a RowPkComponents {
-    type Item = &'a RowPkComponent;
-    type IntoIter = std::slice::Iter<'a, RowPkComponent>;
+impl<'a> IntoIterator for &'a EntityPkComponents {
+    type Item = &'a EntityPkComponent;
+    type IntoIter = std::slice::Iter<'a, EntityPkComponent>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.as_slice().iter()
     }
 }
 
-impl PartialEq for RowPkComponents {
+impl PartialEq for EntityPkComponents {
     fn eq(&self, other: &Self) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl Eq for RowPkComponents {}
+impl Eq for EntityPkComponents {}
 
-impl PartialOrd for RowPkComponents {
+impl PartialOrd for EntityPkComponents {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for RowPkComponents {
+impl Ord for EntityPkComponents {
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_slice().cmp(other.as_slice())
     }
 }
 
-impl Hash for RowPkComponents {
+impl Hash for EntityPkComponents {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_slice().hash(state);
     }
@@ -133,7 +133,7 @@ impl Hash for RowPkComponents {
 
 /// Cross-type order is part of the physical key contract.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum RowPkComponent {
+pub(crate) enum EntityPkComponent {
     Uuid([u8; 16]),
     Integer(i64),
     String(SharedStr),
@@ -141,7 +141,7 @@ pub(crate) enum RowPkComponent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RowPkComponentType {
+pub(crate) enum EntityPkComponentType {
     Uuid,
     Integer,
     String,
@@ -150,15 +150,15 @@ pub(crate) enum RowPkComponentType {
     // `"contentEncoding": "base64"`. Schema v1 has no binary type and no
     // contentEncoding, so no schema can produce one. Kept rather than
     // deleted because five live match arms in the shipping library still
-    // handle it, one of them feeding the schema-surface fingerprint
-    // (sql2/catalog/schema_surface.rs), so removing the variant is a
+    // handle it, one of them feeding the entity-surface fingerprint
+    // (sql2/catalog/entity_surface.rs), so removing the variant is a
     // design decision about binary primary keys, not dead-code hygiene.
     #[allow(dead_code, reason = "unconstructible after the Schema v1 cut; see comment")]
     Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RowPkError {
+pub(crate) enum EntityPkError {
     EmptyPrimaryKey,
     EmptyPrimaryKeyPath {
         index: usize,
@@ -173,10 +173,10 @@ pub(crate) enum RowPkError {
         index: usize,
         expected: &'static str,
     },
-    InvalidEncodedRowPk,
+    InvalidEncodedEntityPk,
 }
 
-impl std::fmt::Display for RowPkError {
+impl std::fmt::Display for EntityPkError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyPrimaryKey => {
@@ -201,31 +201,37 @@ impl std::fmt::Display for RowPkError {
                 formatter,
                 "primary-key value at index {index} is not a valid {expected}"
             ),
-            Self::InvalidEncodedRowPk => {
+            Self::InvalidEncodedEntityPk => {
                 write!(
                     formatter,
-                    "encoded row primary key must be a non-empty JSON array of scalar values"
+                    "encoded entity primary key must be a non-empty JSON array of scalar values"
                 )
             }
         }
     }
 }
 
-impl RowPk {
+impl EntityPk {
+    pub(crate) fn empty() -> Self {
+        Self {
+            components: EntityPkComponents::Empty,
+        }
+    }
+
     pub(crate) fn single(value: impl Into<String>) -> Self {
         Self {
-            components: RowPkComponents::Single(RowPkComponent::String(value.into().into())),
+            components: EntityPkComponents::Single(EntityPkComponent::String(value.into().into())),
         }
     }
 
     pub(crate) fn from_shared_parts(
         parts: impl IntoIterator<Item = SharedStr>,
-    ) -> Result<Self, RowPkError> {
+    ) -> Result<Self, EntityPkError> {
         Self::from_components(
             parts
                 .into_iter()
-                .map(RowPkComponent::String)
-                .collect::<RowPkComponentBuffer>(),
+                .map(EntityPkComponent::String)
+                .collect::<EntityPkComponentBuffer>(),
         )
     }
 
@@ -236,11 +242,11 @@ impl RowPk {
     ) -> Self {
         let components = parts
             .into_iter()
-            .map(RowPkComponent::String)
-            .collect::<RowPkComponentBuffer>();
+            .map(EntityPkComponent::String)
+            .collect::<EntityPkComponentBuffer>();
         debug_assert!(!components.is_empty());
         Self {
-            components: RowPkComponents::from_smallvec(components),
+            components: EntityPkComponents::from_smallvec(components),
         }
     }
 
@@ -248,7 +254,7 @@ impl RowPk {
     /// intermediate component buffer after typed ingress validation.
     pub(crate) fn from_validated_shared_string(value: SharedStr) -> Self {
         Self {
-            components: RowPkComponents::Single(RowPkComponent::String(value)),
+            components: EntityPkComponents::Single(EntityPkComponent::String(value)),
         }
     }
 
@@ -261,76 +267,70 @@ impl RowPk {
 
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         let tuple_storage = match &self.components {
-            RowPkComponents::Shared(components) => {
-                components.len() * size_of::<RowPkComponent>()
+            EntityPkComponents::Shared(components) => {
+                components.len() * size_of::<EntityPkComponent>()
             }
-            RowPkComponents::Empty | RowPkComponents::Single(_) => 0,
+            EntityPkComponents::Empty | EntityPkComponents::Single(_) => 0,
         };
         tuple_storage
             + self
                 .components
                 .iter()
                 .map(|component| match component {
-                    RowPkComponent::Uuid(_) | RowPkComponent::Integer(_) => 0,
-                    RowPkComponent::String(value) => value.len(),
-                    RowPkComponent::Bytes(value) => value.len(),
+                    EntityPkComponent::Uuid(_) | EntityPkComponent::Integer(_) => 0,
+                    EntityPkComponent::String(value) => value.len(),
+                    EntityPkComponent::Bytes(value) => value.len(),
                 })
                 .sum::<usize>()
     }
 
     pub(crate) fn from_components(
-        components: RowPkComponentBuffer,
-    ) -> Result<Self, RowPkError> {
+        components: EntityPkComponentBuffer,
+    ) -> Result<Self, EntityPkError> {
         if components.is_empty() {
-            return Err(RowPkError::EmptyPrimaryKey);
+            return Err(EntityPkError::EmptyPrimaryKey);
         }
         for (index, component) in components.iter().enumerate() {
-            if matches!(component, RowPkComponent::String(value) if value.contains('\0')) {
-                return Err(RowPkError::InvalidPrimaryKeyValue {
+            if matches!(component, EntityPkComponent::String(value) if value.contains('\0')) {
+                return Err(EntityPkError::InvalidPrimaryKeyValue {
                     index,
                     expected: "text without Unicode NUL",
                 });
             }
         }
         Ok(Self {
-            components: RowPkComponents::from_smallvec(components),
+            components: EntityPkComponents::from_smallvec(components),
         })
     }
 
-    pub(crate) fn uuid_from_canonical(value: &str) -> Result<Self, RowPkError> {
+    pub(crate) fn uuid_from_canonical(value: &str) -> Result<Self, EntityPkError> {
         let bytes = crate::storage_codec::id_string::uuid_bytes_from_canonical(value).ok_or(
-            RowPkError::InvalidPrimaryKeyValue {
+            EntityPkError::InvalidPrimaryKeyValue {
                 index: 0,
                 expected: "canonical UUID string",
             },
         )?;
         Ok(Self {
-            components: RowPkComponents::Single(RowPkComponent::Uuid(bytes)),
+            components: EntityPkComponents::Single(EntityPkComponent::Uuid(bytes)),
         })
-    }
-
-    pub(crate) const fn uuid_from_bytes(bytes: [u8; 16]) -> Self {
-        Self {
-            components: RowPkComponents::Single(RowPkComponent::Uuid(bytes)),
-        }
     }
 
     pub(crate) fn from_external_parts(
         parts: Vec<String>,
-        component_types: &[RowPkComponentType],
-    ) -> Result<Self, RowPkError> {
+        component_types: &[EntityPkComponentType],
+    ) -> Result<Self, EntityPkError> {
         Self::from_shared_external_parts(parts.into_iter().map(SharedStr::from), component_types)
     }
 
     pub(crate) fn from_shared_external_parts(
         parts: impl IntoIterator<Item = SharedStr>,
-        component_types: &[RowPkComponentType],
-    ) -> Result<Self, RowPkError> {
+        component_types: &[EntityPkComponentType],
+    ) -> Result<Self, EntityPkError> {
         let mut parts = parts.into_iter().peekable();
         if parts.peek().is_none() {
-            return Err(RowPkError::EmptyPrimaryKey);
+            return Err(EntityPkError::EmptyPrimaryKey);
         }
-        let mut components = RowPkComponentBuffer::new();
+        let mut components = EntityPkComponentBuffer::new();
         let mut conversion_error = None;
         let mut missing_part = false;
         for (index, component_type) in component_types.iter().copied().enumerate() {
@@ -345,7 +345,7 @@ impl RowPk {
             }
         }
         if missing_part || parts.next().is_some() {
-            return Err(RowPkError::InvalidEncodedRowPk);
+            return Err(EntityPkError::InvalidEncodedEntityPk);
         }
         if let Some(error) = conversion_error {
             return Err(error);
@@ -355,43 +355,43 @@ impl RowPk {
 
     pub(crate) fn validate_external_parts(
         parts: &[&str],
-        component_types: &[RowPkComponentType],
-    ) -> Result<(), RowPkError> {
+        component_types: &[EntityPkComponentType],
+    ) -> Result<(), EntityPkError> {
         if parts.is_empty() {
-            return Err(RowPkError::EmptyPrimaryKey);
+            return Err(EntityPkError::EmptyPrimaryKey);
         }
         if parts.len() != component_types.len() {
-            return Err(RowPkError::InvalidEncodedRowPk);
+            return Err(EntityPkError::InvalidEncodedEntityPk);
         }
         for (index, (part, component_type)) in parts.iter().zip(component_types).enumerate() {
             match component_type {
-                RowPkComponentType::Uuid => {
+                EntityPkComponentType::Uuid => {
                     if crate::storage_codec::id_string::uuid_bytes_from_canonical(part).is_none() {
-                        return Err(RowPkError::InvalidPrimaryKeyValue {
+                        return Err(EntityPkError::InvalidPrimaryKeyValue {
                             index,
                             expected: "canonical UUID string",
                         });
                     }
                 }
-                RowPkComponentType::Integer => {
+                EntityPkComponentType::Integer => {
                     part.parse::<i64>()
-                        .map_err(|_| RowPkError::InvalidPrimaryKeyValue {
+                        .map_err(|_| EntityPkError::InvalidPrimaryKeyValue {
                             index,
                             expected: "integer",
                         })?;
                 }
-                RowPkComponentType::String => {
+                EntityPkComponentType::String => {
                     if part.contains('\0') {
-                        return Err(RowPkError::InvalidPrimaryKeyValue {
+                        return Err(EntityPkError::InvalidPrimaryKeyValue {
                             index,
                             expected: "text without Unicode NUL",
                         });
                     }
                 }
-                RowPkComponentType::Bytes => {
+                EntityPkComponentType::Bytes => {
                     base64::engine::general_purpose::STANDARD
                         .decode(part.as_bytes())
-                        .map_err(|_| RowPkError::InvalidPrimaryKeyValue {
+                        .map_err(|_| EntityPkError::InvalidPrimaryKeyValue {
                             index,
                             expected: "base64 string",
                         })?;
@@ -402,22 +402,22 @@ impl RowPk {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_parts(parts: Vec<String>) -> Result<Self, RowPkError> {
+    pub(crate) fn from_parts(parts: Vec<String>) -> Result<Self, EntityPkError> {
         Self::from_shared_parts(parts.into_iter().map(SharedStr::from))
     }
 
     #[cfg(test)]
-    pub(crate) fn tuple(parts: Vec<String>) -> Result<Self, RowPkError> {
+    pub(crate) fn tuple(parts: Vec<String>) -> Result<Self, EntityPkError> {
         Self::from_parts(parts)
     }
 
     #[cfg(test)]
     pub(crate) fn from_parts_unchecked(parts: Vec<String>) -> Self {
         Self {
-            components: RowPkComponents::from_smallvec(
+            components: EntityPkComponents::from_smallvec(
                 parts
                     .into_iter()
-                    .map(|part| RowPkComponent::String(part.into()))
+                    .map(|part| EntityPkComponent::String(part.into()))
                     .collect(),
             ),
         }
@@ -426,30 +426,30 @@ impl RowPk {
     pub(crate) fn from_primary_key_paths(
         snapshot: &JsonValue,
         primary_key_paths: &[Vec<String>],
-    ) -> Result<Self, RowPkError> {
+    ) -> Result<Self, EntityPkError> {
         if primary_key_paths.is_empty() {
-            return Err(RowPkError::EmptyPrimaryKey);
+            return Err(EntityPkError::EmptyPrimaryKey);
         }
 
-        let component_types = vec![RowPkComponentType::String; primary_key_paths.len()];
+        let component_types = vec![EntityPkComponentType::String; primary_key_paths.len()];
         Self::from_primary_key_plan(snapshot, primary_key_paths, &component_types)
     }
 
     pub(crate) fn from_primary_key_plan(
         snapshot: &JsonValue,
         primary_key_paths: &[Vec<String>],
-        component_types: &[RowPkComponentType],
-    ) -> Result<Self, RowPkError> {
+        component_types: &[EntityPkComponentType],
+    ) -> Result<Self, EntityPkError> {
         if primary_key_paths.len() != component_types.len() {
-            return Err(RowPkError::InvalidEncodedRowPk);
+            return Err(EntityPkError::InvalidEncodedEntityPk);
         }
         let mut components = SmallVec::with_capacity(primary_key_paths.len());
         for (index, path) in primary_key_paths.iter().enumerate() {
             if path.is_empty() {
-                return Err(RowPkError::EmptyPrimaryKeyPath { index });
+                return Err(EntityPkError::EmptyPrimaryKeyPath { index });
             }
             let Some(value) = json_pointer_get(snapshot, path) else {
-                return Err(RowPkError::MissingPrimaryKeyValue { index });
+                return Err(EntityPkError::MissingPrimaryKeyValue { index });
             };
             components.push(component_from_json_value(
                 value,
@@ -463,10 +463,10 @@ impl RowPk {
 
     pub(crate) fn from_json_values(
         values: &[JsonValue],
-        component_types: &[RowPkComponentType],
-    ) -> Result<Self, RowPkError> {
+        component_types: &[EntityPkComponentType],
+    ) -> Result<Self, EntityPkError> {
         if values.len() != component_types.len() {
-            return Err(RowPkError::InvalidEncodedRowPk);
+            return Err(EntityPkError::InvalidEncodedEntityPk);
         }
         let components = values
             .iter()
@@ -482,61 +482,61 @@ impl RowPk {
     pub(crate) fn as_json_array_value(&self) -> Result<JsonValue, LixError> {
         if self.components.is_empty() {
             return Err(LixError::unknown(
-                "row primary key must contain at least one primary-key part",
+                "entity primary key must contain at least one primary-key part",
             ));
         }
 
         Ok(JsonValue::Array(
             self.components
                 .iter()
-                .map(RowPkComponent::external_json)
+                .map(EntityPkComponent::external_json)
                 .collect(),
         ))
     }
 
     pub(crate) fn as_json_array_text(&self) -> Result<String, LixError> {
         serde_json::to_string(&self.as_json_array_value()?).map_err(|error| {
-            LixError::unknown(format!("failed to encode row pk as JSON: {error}"))
+            LixError::unknown(format!("failed to encode entity pk as JSON: {error}"))
         })
     }
 
     pub(crate) fn as_single_string(&self) -> Result<&str, LixError> {
         if self.components.is_empty() {
             return Err(LixError::unknown(
-                "row primary key must contain at least one primary-key part",
+                "entity primary key must contain at least one primary-key part",
             ));
         }
 
-        if let [RowPkComponent::String(value)] = self.components.as_slice() {
+        if let [EntityPkComponent::String(value)] = self.components.as_slice() {
             return Ok(value);
         }
 
         Err(LixError::unknown(
-            "row primary key is not a single string primary-key tuple",
+            "entity primary key is not a single string primary-key tuple",
         ))
     }
 
     pub(crate) fn as_single_string_owned(&self) -> Result<String, LixError> {
         let [component] = self.components.as_slice() else {
             return Err(LixError::unknown(
-                "row primary key is not a single-component tuple",
+                "entity primary key is not a single-component tuple",
             ));
         };
         Ok(component.external_string())
     }
 
-    pub(crate) fn from_json_array_text(row_pk: &str) -> Result<Self, RowPkError> {
-        let value = serde_json::from_str::<JsonValue>(row_pk)
-            .map_err(|_| RowPkError::InvalidEncodedRowPk)?;
+    pub(crate) fn from_json_array_text(entity_pk: &str) -> Result<Self, EntityPkError> {
+        let value = serde_json::from_str::<JsonValue>(entity_pk)
+            .map_err(|_| EntityPkError::InvalidEncodedEntityPk)?;
         Self::from_json_array_value(&value)
     }
 
-    pub(crate) fn from_json_array_value(row_pk: &JsonValue) -> Result<Self, RowPkError> {
-        let JsonValue::Array(values) = row_pk else {
-            return Err(RowPkError::InvalidEncodedRowPk);
+    pub(crate) fn from_json_array_value(entity_pk: &JsonValue) -> Result<Self, EntityPkError> {
+        let JsonValue::Array(values) = entity_pk else {
+            return Err(EntityPkError::InvalidEncodedEntityPk);
         };
         if values.is_empty() {
-            return Err(RowPkError::EmptyPrimaryKey);
+            return Err(EntityPkError::EmptyPrimaryKey);
         }
 
         let mut components = SmallVec::with_capacity(values.len());
@@ -547,7 +547,7 @@ impl RowPk {
     }
 }
 
-impl RowPkComponent {
+impl EntityPkComponent {
     pub(crate) fn external_string(&self) -> String {
         match self {
             Self::Uuid(bytes) => crate::storage_codec::id_string::uuid_string_from_bytes(*bytes),
@@ -565,7 +565,7 @@ impl RowPkComponent {
     }
 }
 
-impl Serialize for RowPk {
+impl Serialize for EntityPk {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -576,7 +576,7 @@ impl Serialize for RowPk {
     }
 }
 
-impl<'de> Deserialize<'de> for RowPk {
+impl<'de> Deserialize<'de> for EntityPk {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -586,18 +586,18 @@ impl<'de> Deserialize<'de> for RowPk {
     }
 }
 
-const ROW_PK_VALUE_CODEC_V1: u8 = 1;
+const ENTITY_PK_VALUE_CODEC_V1: u8 = 1;
 
 #[derive(musli::Encode, musli::Decode)]
 #[musli(packed)]
-struct RowPkWire {
+struct EntityPkWire {
     version: u8,
-    components: Vec<RowPkComponentWire>,
+    components: Vec<EntityPkComponentWire>,
 }
 
 #[derive(musli::Encode, musli::Decode)]
 #[musli(packed)]
-struct RowPkComponentWire {
+struct EntityPkComponentWire {
     tag: u8,
     #[musli(bytes)]
     value: Vec<u8>,
@@ -605,23 +605,23 @@ struct RowPkComponentWire {
 
 #[derive(musli::Encode)]
 #[musli(packed)]
-struct RowPkWireRef<'a> {
+struct EntityPkWireRef<'a> {
     version: u8,
-    components: &'a [RowPkComponentWireRef<'a>],
+    components: &'a [EntityPkComponentWireRef<'a>],
 }
 
 #[derive(musli::Encode)]
 #[musli(packed)]
-struct RowPkComponentWireRef<'a> {
+struct EntityPkComponentWireRef<'a> {
     tag: u8,
     #[musli(bytes)]
     value: &'a [u8],
 }
 
-impl<M> Encode<M> for RowPk
+impl<M> Encode<M> for EntityPk
 where
-    for<'a> RowPkWireRef<'a>: Encode<M>,
-    RowPkWire: Encode<M>,
+    for<'a> EntityPkWireRef<'a>: Encode<M>,
+    EntityPkWire: Encode<M>,
 {
     type Encode = Self;
 
@@ -632,17 +632,17 @@ where
         if let [component] = self.components.as_slice() {
             let integer;
             let (tag, value) = match component {
-                RowPkComponent::Uuid(bytes) => (0, bytes.as_slice()),
-                RowPkComponent::Integer(value) => {
+                EntityPkComponent::Uuid(bytes) => (0, bytes.as_slice()),
+                EntityPkComponent::Integer(value) => {
                     integer = value.to_be_bytes();
                     (1, integer.as_slice())
                 }
-                RowPkComponent::String(value) => (2, value.as_bytes()),
-                RowPkComponent::Bytes(value) => (3, value.as_ref()),
+                EntityPkComponent::String(value) => (2, value.as_bytes()),
+                EntityPkComponent::Bytes(value) => (3, value.as_ref()),
             };
-            let component = [RowPkComponentWireRef { tag, value }];
-            return encoder.encode(RowPkWireRef {
-                version: ROW_PK_VALUE_CODEC_V1,
+            let component = [EntityPkComponentWireRef { tag, value }];
+            return encoder.encode(EntityPkWireRef {
+                version: ENTITY_PK_VALUE_CODEC_V1,
                 components: &component,
             });
         }
@@ -651,26 +651,26 @@ where
             .components
             .iter()
             .map(|component| match component {
-                RowPkComponent::Uuid(bytes) => RowPkComponentWire {
+                EntityPkComponent::Uuid(bytes) => EntityPkComponentWire {
                     tag: 0,
                     value: bytes.to_vec(),
                 },
-                RowPkComponent::Integer(value) => RowPkComponentWire {
+                EntityPkComponent::Integer(value) => EntityPkComponentWire {
                     tag: 1,
                     value: value.to_be_bytes().to_vec(),
                 },
-                RowPkComponent::String(value) => RowPkComponentWire {
+                EntityPkComponent::String(value) => EntityPkComponentWire {
                     tag: 2,
                     value: value.as_bytes().to_vec(),
                 },
-                RowPkComponent::Bytes(value) => RowPkComponentWire {
+                EntityPkComponent::Bytes(value) => EntityPkComponentWire {
                     tag: 3,
                     value: value.to_vec(),
                 },
             })
             .collect::<Vec<_>>();
-        encoder.encode(RowPkWire {
-            version: ROW_PK_VALUE_CODEC_V1,
+        encoder.encode(EntityPkWire {
+            version: ENTITY_PK_VALUE_CODEC_V1,
             components,
         })
     }
@@ -682,10 +682,10 @@ where
                 .iter()
                 .map(|component| {
                     2 + match component {
-                        RowPkComponent::Uuid(_) => 16,
-                        RowPkComponent::Integer(_) => 8,
-                        RowPkComponent::String(value) => value.len(),
-                        RowPkComponent::Bytes(value) => value.len(),
+                        EntityPkComponent::Uuid(_) => 16,
+                        EntityPkComponent::Integer(_) => 8,
+                        EntityPkComponent::String(value) => value.len(),
+                        EntityPkComponent::Bytes(value) => value.len(),
                     }
                 })
                 .sum::<usize>(),
@@ -697,51 +697,51 @@ where
     }
 }
 
-impl<'de, M, A> Decode<'de, M, A> for RowPk
+impl<'de, M, A> Decode<'de, M, A> for EntityPk
 where
     A: Allocator,
-    RowPkWire: Decode<'de, M, A>,
+    EntityPkWire: Decode<'de, M, A>,
 {
     fn decode<D>(decoder: D) -> Result<Self, D::Error>
     where
         D: Decoder<'de, Mode = M, Allocator = A>,
     {
         let cx = decoder.cx();
-        let wire = RowPkWire::decode(decoder)?;
-        if wire.version != ROW_PK_VALUE_CODEC_V1 {
+        let wire = EntityPkWire::decode(decoder)?;
+        if wire.version != ENTITY_PK_VALUE_CODEC_V1 {
             return Err(cx.message(format_args!(
-                "unsupported row primary-key value codec version {}",
+                "unsupported entity primary-key value codec version {}",
                 wire.version
             )));
         }
         let mut components = SmallVec::with_capacity(wire.components.len());
         for (index, component) in wire.components.into_iter().enumerate() {
             let component = match component.tag {
-                0 => RowPkComponent::Uuid(component.value.try_into().map_err(|_| {
+                0 => EntityPkComponent::Uuid(component.value.try_into().map_err(|_| {
                     cx.message(format_args!(
-                        "UUID row primary-key component {index} must contain 16 bytes"
+                        "UUID entity primary-key component {index} must contain 16 bytes"
                     ))
                 })?),
-                1 => RowPkComponent::Integer(i64::from_be_bytes(
+                1 => EntityPkComponent::Integer(i64::from_be_bytes(
                     component.value.try_into().map_err(|_| {
                         cx.message(format_args!(
-                            "integer row primary-key component {index} must contain 8 bytes"
+                            "integer entity primary-key component {index} must contain 8 bytes"
                         ))
                     })?,
                 )),
-                2 => RowPkComponent::String(
+                2 => EntityPkComponent::String(
                     String::from_utf8(component.value)
                         .map_err(|error| {
                             cx.message(format_args!(
-                                "string row primary-key component {index} is not UTF-8: {error}"
+                                "string entity primary-key component {index} is not UTF-8: {error}"
                             ))
                         })?
                         .into(),
                 ),
-                3 => RowPkComponent::Bytes(component.value.into()),
+                3 => EntityPkComponent::Bytes(component.value.into()),
                 tag => {
                     return Err(cx.message(format_args!(
-                        "unknown row primary-key component tag {tag}"
+                        "unknown entity primary-key component tag {tag}"
                     )));
                 }
             };
@@ -749,7 +749,7 @@ where
         }
         Self::from_components(components).map_err(|error| {
             cx.message(format_args!(
-                "row primary key decoded from storage is invalid: {error}"
+                "entity primary key decoded from storage is invalid: {error}"
             ))
         })
     }
@@ -758,45 +758,45 @@ where
 fn untyped_component_from_json_value(
     value: &JsonValue,
     index: usize,
-) -> Result<RowPkComponent, RowPkError> {
+) -> Result<EntityPkComponent, EntityPkError> {
     match value {
-        JsonValue::String(value) => Ok(RowPkComponent::String(value.as_str().into())),
+        JsonValue::String(value) => Ok(EntityPkComponent::String(value.as_str().into())),
         JsonValue::Number(value) => value
             .as_i64()
-            .map(RowPkComponent::Integer)
-            .ok_or(RowPkError::UnsupportedPrimaryKeyValue { index }),
-        _ => Err(RowPkError::UnsupportedPrimaryKeyValue { index }),
+            .map(EntityPkComponent::Integer)
+            .ok_or(EntityPkError::UnsupportedPrimaryKeyValue { index }),
+        _ => Err(EntityPkError::UnsupportedPrimaryKeyValue { index }),
     }
 }
 
 fn component_from_external_shared_part(
     part: SharedStr,
-    component_type: RowPkComponentType,
+    component_type: EntityPkComponentType,
     index: usize,
-) -> Result<RowPkComponent, RowPkError> {
+) -> Result<EntityPkComponent, EntityPkError> {
     match component_type {
-        RowPkComponentType::Uuid => {
+        EntityPkComponentType::Uuid => {
             let bytes = crate::storage_codec::id_string::uuid_bytes_from_canonical(&part).ok_or(
-                RowPkError::InvalidPrimaryKeyValue {
+                EntityPkError::InvalidPrimaryKeyValue {
                     index,
                     expected: "canonical UUID string",
                 },
             )?;
-            Ok(RowPkComponent::Uuid(bytes))
+            Ok(EntityPkComponent::Uuid(bytes))
         }
-        RowPkComponentType::Integer => {
-            Ok(RowPkComponent::Integer(part.as_str().parse().map_err(
-                |_| RowPkError::InvalidPrimaryKeyValue {
+        EntityPkComponentType::Integer => {
+            Ok(EntityPkComponent::Integer(part.as_str().parse().map_err(
+                |_| EntityPkError::InvalidPrimaryKeyValue {
                     index,
                     expected: "integer",
                 },
             )?))
         }
-        RowPkComponentType::String => Ok(RowPkComponent::String(part)),
-        RowPkComponentType::Bytes => base64::engine::general_purpose::STANDARD
+        EntityPkComponentType::String => Ok(EntityPkComponent::String(part)),
+        EntityPkComponentType::Bytes => base64::engine::general_purpose::STANDARD
             .decode(part.as_bytes())
-            .map(|value| RowPkComponent::Bytes(value.into()))
-            .map_err(|_| RowPkError::InvalidPrimaryKeyValue {
+            .map(|value| EntityPkComponent::Bytes(value.into()))
+            .map_err(|_| EntityPkError::InvalidPrimaryKeyValue {
                 index,
                 expected: "base64 string",
             }),
@@ -805,49 +805,49 @@ fn component_from_external_shared_part(
 
 fn component_from_json_value(
     value: &JsonValue,
-    component_type: RowPkComponentType,
+    component_type: EntityPkComponentType,
     index: usize,
-) -> Result<RowPkComponent, RowPkError> {
+) -> Result<EntityPkComponent, EntityPkError> {
     match component_type {
-        RowPkComponentType::Uuid => {
+        EntityPkComponentType::Uuid => {
             let value = value
                 .as_str()
-                .ok_or(RowPkError::InvalidPrimaryKeyValue {
+                .ok_or(EntityPkError::InvalidPrimaryKeyValue {
                     index,
                     expected: "UUID string",
                 })?;
             let bytes = crate::storage_codec::id_string::uuid_bytes_from_canonical(value).ok_or(
-                RowPkError::InvalidPrimaryKeyValue {
+                EntityPkError::InvalidPrimaryKeyValue {
                     index,
                     expected: "canonical UUID string",
                 },
             )?;
-            Ok(RowPkComponent::Uuid(bytes))
+            Ok(EntityPkComponent::Uuid(bytes))
         }
-        RowPkComponentType::Integer => value.as_i64().map(RowPkComponent::Integer).ok_or(
-            RowPkError::InvalidPrimaryKeyValue {
+        EntityPkComponentType::Integer => value.as_i64().map(EntityPkComponent::Integer).ok_or(
+            EntityPkError::InvalidPrimaryKeyValue {
                 index,
                 expected: "signed 64-bit integer",
             },
         ),
-        RowPkComponentType::String => value
+        EntityPkComponentType::String => value
             .as_str()
-            .map(|value| RowPkComponent::String(value.into()))
-            .ok_or(RowPkError::InvalidPrimaryKeyValue {
+            .map(|value| EntityPkComponent::String(value.into()))
+            .ok_or(EntityPkError::InvalidPrimaryKeyValue {
                 index,
                 expected: "string",
             }),
-        RowPkComponentType::Bytes => {
+        EntityPkComponentType::Bytes => {
             let value = value
                 .as_str()
-                .ok_or(RowPkError::InvalidPrimaryKeyValue {
+                .ok_or(EntityPkError::InvalidPrimaryKeyValue {
                     index,
                     expected: "base64 string",
                 })?;
             base64::engine::general_purpose::STANDARD
                 .decode(value)
-                .map(|value| RowPkComponent::Bytes(value.into()))
-                .map_err(|_| RowPkError::InvalidPrimaryKeyValue {
+                .map(|value| EntityPkComponent::Bytes(value.into()))
+                .map_err(|_| EntityPkError::InvalidPrimaryKeyValue {
                     index,
                     expected: "base64 string",
                 })
@@ -886,7 +886,7 @@ mod tests {
 
     #[test]
     fn single_string_identity_projects_to_single_string() {
-        let identity = RowPk::single("plain-id");
+        let identity = EntityPk::single("plain-id");
 
         assert_eq!(
             identity.as_single_string().expect("projection should work"),
@@ -895,8 +895,8 @@ mod tests {
     }
 
     #[test]
-    fn single_identity_projects_to_json_array_row_pk() {
-        let identity = RowPk::single("plain-id");
+    fn single_identity_projects_to_json_array_entity_pk() {
+        let identity = EntityPk::single("plain-id");
 
         assert_eq!(
             identity
@@ -907,8 +907,8 @@ mod tests {
     }
 
     #[test]
-    fn composite_identity_projects_to_json_array_row_pk() {
-        let identity = RowPk::tuple(vec!["namespace".to_string(), "42".to_string()])
+    fn composite_identity_projects_to_json_array_entity_pk() {
+        let identity = EntityPk::tuple(vec!["namespace".to_string(), "42".to_string()])
             .expect("tuple identity");
 
         assert_eq!(
@@ -921,18 +921,18 @@ mod tests {
 
     #[test]
     fn ten_thousand_composite_clones_share_component_and_payload_owners() {
-        let identity = RowPk::tuple(vec![
+        let identity = EntityPk::tuple(vec![
             "namespace-with-a-non-inline-payload".to_string(),
-            "row-with-a-non-inline-payload".to_string(),
+            "entity-with-a-non-inline-payload".to_string(),
         ])
         .expect("composite identity");
-        let RowPkComponents::Shared(owner) = &identity.components else {
+        let EntityPkComponents::Shared(owner) = &identity.components else {
             panic!("a composite identity must use shared tuple storage")
         };
 
         let clones = std::iter::repeat_n(identity.clone(), 10_000).collect::<Vec<_>>();
         for cloned in &clones {
-            let RowPkComponents::Shared(cloned_owner) = &cloned.components else {
+            let EntityPkComponents::Shared(cloned_owner) = &cloned.components else {
                 panic!("a composite clone must retain shared tuple storage")
             };
             assert!(
@@ -940,7 +940,7 @@ mod tests {
                 "composite clones must retain the original component owner"
             );
             for (original, cloned) in owner.iter().zip(cloned_owner.iter()) {
-                let (RowPkComponent::String(original), RowPkComponent::String(cloned)) =
+                let (EntityPkComponent::String(original), EntityPkComponent::String(cloned)) =
                     (original, cloned)
                 else {
                     panic!("test identity contains only string components")
@@ -955,14 +955,14 @@ mod tests {
 
     #[test]
     fn ten_thousand_single_clones_share_the_inline_component_payload() {
-        let identity = RowPk::single("row-with-a-non-inline-payload");
-        let [RowPkComponent::String(owner)] = identity.components.as_slice() else {
+        let identity = EntityPk::single("entity-with-a-non-inline-payload");
+        let [EntityPkComponent::String(owner)] = identity.components.as_slice() else {
             panic!("single string identity must stay inline")
         };
 
         let clones = std::iter::repeat_n(identity.clone(), 10_000).collect::<Vec<_>>();
         for cloned in &clones {
-            let [RowPkComponent::String(cloned_owner)] = cloned.components.as_slice() else {
+            let [EntityPkComponent::String(cloned_owner)] = cloned.components.as_slice() else {
                 panic!("single string clone must stay inline")
             };
             assert!(
@@ -988,23 +988,23 @@ mod tests {
             }
         }
 
-        let scratch = RowPkComponentBuffer::new();
+        let scratch = EntityPkComponentBuffer::new();
         assert_eq!(scratch.capacity(), 2);
         assert!(!scratch.spilled());
 
         let namespace = SharedStr::from_static("namespace");
-        let row = SharedStr::from_static("row");
-        let identity = RowPk::from_shared_external_parts(
-            NoSizeHint([namespace.clone(), row.clone()].into_iter()),
-            &[RowPkComponentType::String, RowPkComponentType::String],
+        let entity = SharedStr::from_static("entity");
+        let identity = EntityPk::from_shared_external_parts(
+            NoSizeHint([namespace.clone(), entity.clone()].into_iter()),
+            &[EntityPkComponentType::String, EntityPkComponentType::String],
         )
         .expect("two-component external identity");
-        let RowPkComponents::Shared(owner) = &identity.components else {
+        let EntityPkComponents::Shared(owner) = &identity.components else {
             panic!("two components retain one final shared owner")
         };
         let [
-            RowPkComponent::String(actual_namespace),
-            RowPkComponent::String(actual_row),
+            EntityPkComponent::String(actual_namespace),
+            EntityPkComponent::String(actual_entity),
         ] = owner.as_ref()
         else {
             panic!("test identity contains two string components")
@@ -1012,104 +1012,104 @@ mod tests {
 
         assert_eq!(Arc::strong_count(owner), 1);
         assert!(actual_namespace.shares_buffer_with(&namespace));
-        assert!(actual_row.shares_buffer_with(&row));
+        assert!(actual_entity.shares_buffer_with(&entity));
 
         let identities = (0..10_000)
             .map(|_| {
-                RowPk::from_shared_external_parts(
-                    [namespace.clone(), row.clone()],
-                    &[RowPkComponentType::String, RowPkComponentType::String],
+                EntityPk::from_shared_external_parts(
+                    [namespace.clone(), entity.clone()],
+                    &[EntityPkComponentType::String, EntityPkComponentType::String],
                 )
                 .expect("two-component external identity")
             })
             .collect::<Vec<_>>();
         for identity in &identities {
-            let RowPkComponents::Shared(owner) = &identity.components else {
+            let EntityPkComponents::Shared(owner) = &identity.components else {
                 panic!("two components retain one final shared owner")
             };
             let [
-                RowPkComponent::String(actual_namespace),
-                RowPkComponent::String(actual_row),
+                EntityPkComponent::String(actual_namespace),
+                EntityPkComponent::String(actual_entity),
             ] = owner.as_ref()
             else {
                 panic!("test identity contains two string components")
             };
             assert_eq!(Arc::strong_count(owner), 1);
             assert!(actual_namespace.shares_buffer_with(&namespace));
-            assert!(actual_row.shares_buffer_with(&row));
+            assert!(actual_entity.shares_buffer_with(&entity));
         }
 
-        let single = RowPk::from_shared_external_parts(
-            NoSizeHint([row.clone()].into_iter()),
-            &[RowPkComponentType::String],
+        let single = EntityPk::from_shared_external_parts(
+            NoSizeHint([entity.clone()].into_iter()),
+            &[EntityPkComponentType::String],
         )
         .expect("single-component external identity");
-        let [RowPkComponent::String(actual)] = single.components.as_slice() else {
+        let [EntityPkComponent::String(actual)] = single.components.as_slice() else {
             panic!("one component must stay inline")
         };
-        assert!(actual.shares_buffer_with(&row));
+        assert!(actual.shares_buffer_with(&entity));
     }
 
     #[test]
     fn shared_external_cardinality_errors_precede_component_errors() {
         assert_eq!(
-            RowPk::from_shared_external_parts(
+            EntityPk::from_shared_external_parts(
                 [
                     SharedStr::from_static("not-an-integer"),
                     SharedStr::from_static("extra"),
                 ],
-                &[RowPkComponentType::Integer],
+                &[EntityPkComponentType::Integer],
             ),
-            Err(RowPkError::InvalidEncodedRowPk)
+            Err(EntityPkError::InvalidEncodedEntityPk)
         );
         assert_eq!(
-            RowPk::from_shared_external_parts(
+            EntityPk::from_shared_external_parts(
                 [SharedStr::from_static("not-an-integer")],
                 &[
-                    RowPkComponentType::Integer,
-                    RowPkComponentType::String,
+                    EntityPkComponentType::Integer,
+                    EntityPkComponentType::String,
                 ],
             ),
-            Err(RowPkError::InvalidEncodedRowPk)
+            Err(EntityPkError::InvalidEncodedEntityPk)
         );
     }
 
     #[test]
-    fn row_pk_json_array_roundtrips() {
-        let identity = RowPk::tuple(vec!["namespace".to_string(), "42".to_string()])
+    fn entity_pk_json_array_roundtrips() {
+        let identity = EntityPk::tuple(vec!["namespace".to_string(), "42".to_string()])
             .expect("tuple identity");
         let encoded = identity
             .as_json_array_text()
             .expect("projection should work");
 
         assert_eq!(
-            RowPk::from_json_array_text(&encoded).expect("decode should work"),
+            EntityPk::from_json_array_text(&encoded).expect("decode should work"),
             identity
         );
     }
 
     #[test]
-    fn row_pk_json_array_allows_empty_string_part() {
+    fn entity_pk_json_array_allows_empty_string_part() {
         assert_eq!(
-            RowPk::from_json_array_text("[\"\"]").expect("empty string is a valid part"),
-            RowPk::single("")
+            EntityPk::from_json_array_text("[\"\"]").expect("empty string is a valid part"),
+            EntityPk::single("")
         );
     }
 
     #[test]
     fn tuple_allows_empty_string_part() {
         assert_eq!(
-            RowPk::tuple(vec!["namespace".to_string(), "".to_string()])
+            EntityPk::tuple(vec!["namespace".to_string(), "".to_string()])
                 .expect("empty string is a valid part"),
-            RowPk::from_parts_unchecked(vec!["namespace".to_string(), "".to_string()])
+            EntityPk::from_parts_unchecked(vec!["namespace".to_string(), "".to_string()])
         );
     }
 
     #[test]
-    fn row_pk_json_array_does_not_collide_on_delimiter_like_values() {
+    fn entity_pk_json_array_does_not_collide_on_delimiter_like_values() {
         let left =
-            RowPk::tuple(vec!["a~b".to_string(), "c".to_string()]).expect("left tuple identity");
-        let right = RowPk::tuple(vec!["a".to_string(), "b~c".to_string()])
+            EntityPk::tuple(vec!["a~b".to_string(), "c".to_string()]).expect("left tuple identity");
+        let right = EntityPk::tuple(vec!["a".to_string(), "b~c".to_string()])
             .expect("right tuple identity");
 
         assert_ne!(
@@ -1120,7 +1120,7 @@ mod tests {
 
     #[test]
     fn composite_identity_rejects_single_string_projection() {
-        let identity = RowPk::tuple(vec!["namespace".to_string(), "42".to_string()])
+        let identity = EntityPk::tuple(vec!["namespace".to_string(), "42".to_string()])
             .expect("tuple identity");
 
         assert!(identity.as_single_string().is_err());
@@ -1129,8 +1129,8 @@ mod tests {
     #[test]
     fn composite_identity_does_not_collide_on_delimiter_like_values() {
         let left =
-            RowPk::tuple(vec!["a~b".to_string(), "1".to_string()]).expect("left tuple identity");
-        let right = RowPk::tuple(vec!["a".to_string(), "b~1".to_string()])
+            EntityPk::tuple(vec!["a~b".to_string(), "1".to_string()]).expect("left tuple identity");
+        let right = EntityPk::tuple(vec!["a".to_string(), "b~1".to_string()])
             .expect("right tuple identity");
 
         assert_ne!(
@@ -1146,7 +1146,7 @@ mod tests {
             "locale": "en"
         });
 
-        let identity = RowPk::from_primary_key_paths(
+        let identity = EntityPk::from_primary_key_paths(
             &snapshot,
             &[vec!["namespace".to_string()], vec!["locale".to_string()]],
         )
@@ -1154,29 +1154,29 @@ mod tests {
 
         assert_eq!(
             identity,
-            RowPk::from_parts_unchecked(vec!["messages".to_string(), "en".to_string()])
+            EntityPk::from_parts_unchecked(vec!["messages".to_string(), "en".to_string()])
         );
     }
 
     #[test]
-    fn row_pk_json_array_accepts_integer_and_rejects_non_scalar_parts() {
+    fn entity_pk_json_array_accepts_integer_and_rejects_non_scalar_parts() {
         assert_eq!(
-            RowPk::from_json_array_text("[\"namespace\",42]")
+            EntityPk::from_json_array_text("[\"namespace\",42]")
                 .expect("integer component should decode")
                 .components
                 .as_slice(),
             &[
-                RowPkComponent::String("namespace".into()),
-                RowPkComponent::Integer(42),
+                EntityPkComponent::String("namespace".into()),
+                EntityPkComponent::Integer(42),
             ]
         );
         assert_eq!(
-            RowPk::from_json_array_text("[\"namespace\",null]"),
-            Err(RowPkError::UnsupportedPrimaryKeyValue { index: 1 })
+            EntityPk::from_json_array_text("[\"namespace\",null]"),
+            Err(EntityPkError::UnsupportedPrimaryKeyValue { index: 1 })
         );
         assert_eq!(
-            RowPk::from_json_array_text("[[\"nested\"]]"),
-            Err(RowPkError::UnsupportedPrimaryKeyValue { index: 0 })
+            EntityPk::from_json_array_text("[[\"nested\"]]"),
+            Err(EntityPkError::UnsupportedPrimaryKeyValue { index: 0 })
         );
     }
 
@@ -1188,11 +1188,11 @@ mod tests {
         });
 
         assert_eq!(
-            RowPk::from_primary_key_paths(
+            EntityPk::from_primary_key_paths(
                 &snapshot,
                 &[vec!["namespace".to_string()], vec!["index".to_string()],],
             ),
-            Err(RowPkError::InvalidPrimaryKeyValue {
+            Err(EntityPkError::InvalidPrimaryKeyValue {
                 index: 1,
                 expected: "string",
             })
@@ -1207,31 +1207,31 @@ mod tests {
         });
 
         assert_eq!(
-            RowPk::from_primary_key_paths(
+            EntityPk::from_primary_key_paths(
                 &snapshot,
                 &[vec!["namespace".to_string()], vec!["id".to_string()],],
             )
             .expect("empty string is a valid primary-key value"),
-            RowPk::from_parts_unchecked(vec!["messages".to_string(), "".to_string()])
+            EntityPk::from_parts_unchecked(vec!["messages".to_string(), "".to_string()])
         );
     }
 
     #[test]
     fn from_primary_key_paths_rejects_nested_json_parts() {
         let snapshot = json!({
-            "row_pk": ["welcome.title", "en"],
+            "entity_pk": ["welcome.title", "en"],
             "schema_key": "message"
         });
 
         assert_eq!(
-            RowPk::from_primary_key_paths(
+            EntityPk::from_primary_key_paths(
                 &snapshot,
                 &[
-                    vec!["row_pk".to_string()],
+                    vec!["entity_pk".to_string()],
                     vec!["schema_key".to_string()],
                 ],
             ),
-            Err(RowPkError::InvalidPrimaryKeyValue {
+            Err(EntityPkError::InvalidPrimaryKeyValue {
                 index: 0,
                 expected: "string",
             })
@@ -1243,32 +1243,32 @@ mod tests {
         let snapshot = json!({ "id": "a" });
 
         assert_eq!(
-            RowPk::from_primary_key_paths(&snapshot, &[vec!["missing".to_string()]]),
-            Err(RowPkError::MissingPrimaryKeyValue { index: 0 })
+            EntityPk::from_primary_key_paths(&snapshot, &[vec!["missing".to_string()]]),
+            Err(EntityPkError::MissingPrimaryKeyValue { index: 0 })
         );
     }
 
     #[test]
-    fn storage_codec_roundtrips_row_pk() {
+    fn storage_codec_roundtrips_entity_pk() {
         let identity =
-            RowPk::tuple(vec!["namespace".to_string(), "id".to_string()]).expect("row pk");
-        let bytes = crate::storage_codec::encode("row primary key", &identity)
-            .expect("row pk should encode");
+            EntityPk::tuple(vec!["namespace".to_string(), "id".to_string()]).expect("entity pk");
+        let bytes = crate::storage_codec::encode("entity primary key", &identity)
+            .expect("entity pk should encode");
 
-        let decoded: RowPk = crate::storage_codec::decode("row primary key", &bytes)
-            .expect("row pk should decode");
+        let decoded: EntityPk = crate::storage_codec::decode("entity primary key", &bytes)
+            .expect("entity pk should decode");
 
         assert_eq!(decoded, identity);
     }
 
     #[test]
     fn storage_codec_preserves_typed_components_and_semantic_traits() {
-        let identity = RowPk::from_components(SmallVec::from_vec(vec![
-            RowPkComponent::Uuid([0x2a; 16]),
-            RowPkComponent::Integer(-42),
-            RowPkComponent::Bytes(Bytes::from_static(&[0, 1, 0xff])),
+        let identity = EntityPk::from_components(SmallVec::from_vec(vec![
+            EntityPkComponent::Uuid([0x2a; 16]),
+            EntityPkComponent::Integer(-42),
+            EntityPkComponent::Bytes(Bytes::from_static(&[0, 1, 0xff])),
         ]))
-        .expect("typed row pk");
+        .expect("typed entity pk");
         let cloned = identity.clone();
 
         assert_eq!(identity.cmp(&cloned), Ordering::Equal);
@@ -1282,31 +1282,31 @@ mod tests {
             json!(["2a2a2a2a-2a2a-2a2a-2a2a-2a2a2a2a2a2a", -42, "AAH/"])
         );
 
-        let encoded = crate::storage_codec::encode("typed row primary key", &identity)
-            .expect("typed row pk should encode");
-        let decoded: RowPk = crate::storage_codec::decode("typed row primary key", &encoded)
-            .expect("typed row pk should decode");
+        let encoded = crate::storage_codec::encode("typed entity primary key", &identity)
+            .expect("typed entity pk should encode");
+        let decoded: EntityPk = crate::storage_codec::decode("typed entity primary key", &encoded)
+            .expect("typed entity pk should decode");
         assert_eq!(decoded, identity);
     }
 
     #[test]
-    fn storage_codec_rejects_empty_row_pk() {
+    fn storage_codec_rejects_empty_entity_pk() {
         let bytes = crate::storage_codec::encode(
-            "row primary key parts",
-            &RowPkWire {
-                version: ROW_PK_VALUE_CODEC_V1,
+            "entity primary key parts",
+            &EntityPkWire {
+                version: ENTITY_PK_VALUE_CODEC_V1,
                 components: Vec::new(),
             },
         )
         .expect("empty parts should encode");
 
-        let error = crate::storage_codec::decode::<RowPk>("row primary key", &bytes)
-            .expect_err("empty row primary key should reject");
+        let error = crate::storage_codec::decode::<EntityPk>("entity primary key", &bytes)
+            .expect_err("empty entity primary key should reject");
 
         assert!(
             error
                 .message
-                .contains("row primary key decoded from storage is invalid")
+                .contains("entity primary key decoded from storage is invalid")
         );
     }
 }

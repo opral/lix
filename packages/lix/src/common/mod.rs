@@ -18,7 +18,6 @@ pub use execution_metadata::{
 pub use identity::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
 pub(crate) use identity::{json_pointer_get, validate_non_empty_identity_value};
 pub(crate) use json_pointer::format_json_pointer;
-#[cfg(test)]
 pub(crate) use json_pointer::parse_json_pointer;
 pub use lix_path::{LixPath, validate_lix_path_segment};
 pub(crate) use lix_path::{compose_directory_path, compose_file_path};

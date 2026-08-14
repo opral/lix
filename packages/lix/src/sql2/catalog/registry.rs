@@ -8,14 +8,14 @@ use serde_json::Value as JsonValue;
 use crate::LixError;
 
 use super::{PublicColumn, PublicSurfaceContract, PublicSurfaceKind, SurfaceCapabilities};
-use crate::sql2::catalog::schema_surface_schema;
+use crate::sql2::catalog::entity_surface_schema;
 use crate::sql2::catalog::{
-    SchemaSurfaceShape, SchemaSurfaceSpec, derive_schema_surface_spec_from_schema,
-    schema_exposed_as_history_surface, schema_exposed_as_schema_surface,
+    EntitySurfaceShape, EntitySurfaceSpec, derive_entity_surface_spec_from_schema,
+    schema_exposed_as_entity_history_surface, schema_exposed_as_entity_surface,
 };
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ROW_PK, HISTORY_COL_FILE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
     HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
 };
@@ -26,7 +26,7 @@ use crate::sql2::result_metadata::json_field;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PublicCatalog {
     surfaces: BTreeMap<String, PublicSurfaceContract>,
-    schema_specs: BTreeMap<String, SchemaSurfaceSpec>,
+    entity_specs: BTreeMap<String, EntitySurfaceSpec>,
 }
 
 impl PublicCatalog {
@@ -34,7 +34,7 @@ impl PublicCatalog {
         let mut catalog = Self::default();
         catalog.insert_system_surfaces()?;
         for schema in schema_definitions {
-            catalog.insert_schema_surfaces_from_schema(schema)?;
+            catalog.insert_entity_surfaces_from_schema(schema)?;
         }
         Ok(catalog)
     }
@@ -42,7 +42,7 @@ impl PublicCatalog {
     /// Compile-time SQL surfaces whose shape cannot be changed at runtime.
     ///
     /// Alongside the hand-written filesystem surfaces, Lix seeds a fixed set
-    /// of system row schemas. Public runtime registration reserves the
+    /// of system entity schemas. Public runtime registration reserves the
     /// complete `lix_*` namespace, so only trusted bootstrap schemas can add
     /// Lix-owned surfaces to this catalog.
     pub(crate) fn fixed_system() -> &'static Self {
@@ -92,8 +92,8 @@ impl PublicCatalog {
         self.surfaces.values()
     }
 
-    pub(crate) fn schema_spec(&self, schema_key: &str) -> Option<&SchemaSurfaceSpec> {
-        self.schema_specs.get(schema_key)
+    pub(crate) fn entity_spec(&self, schema_key: &str) -> Option<&EntitySurfaceSpec> {
+        self.entity_specs.get(schema_key)
     }
 
     #[cfg(test)]
@@ -129,7 +129,7 @@ impl PublicCatalog {
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("account_id", DataType::Utf8, false),
-                json_field("row_pk", false),
+                json_field("entity_pk", false),
                 Field::new("schema_key", DataType::Utf8, false),
                 Field::new("file_id", DataType::Utf8, true),
                 json_field("metadata", true),
@@ -139,14 +139,14 @@ impl PublicCatalog {
             ])),
             PublicSurfaceKind::FileHistory => history_filesystem_schema(true),
             PublicSurfaceKind::DirectoryHistory => history_filesystem_schema(false),
-            PublicSurfaceKind::SchemaBase { schema_key } => {
-                schema_surface_schema(self.schema_spec(schema_key)?, SchemaSurfaceShape::Active)
+            PublicSurfaceKind::EntityBase { schema_key } => {
+                entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::Active)
             }
-            PublicSurfaceKind::SchemaByBranch { schema_key } => {
-                schema_surface_schema(self.schema_spec(schema_key)?, SchemaSurfaceShape::ByBranch)
+            PublicSurfaceKind::EntityByBranch { schema_key } => {
+                entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::ByBranch)
             }
-            PublicSurfaceKind::SchemaHistory { schema_key } => {
-                schema_surface_schema(self.schema_spec(schema_key)?, SchemaSurfaceShape::History)
+            PublicSurfaceKind::EntityHistory { schema_key } => {
+                entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::History)
             }
         })
     }
@@ -156,9 +156,9 @@ impl PublicCatalog {
         match &surface.kind {
             PublicSurfaceKind::FileHistory => Some(history_filesystem_schema(true)),
             PublicSurfaceKind::DirectoryHistory => Some(history_filesystem_schema(false)),
-            PublicSurfaceKind::SchemaHistory { schema_key } => Some(schema_surface_schema(
-                self.schema_spec(schema_key)?,
-                SchemaSurfaceShape::History,
+            PublicSurfaceKind::EntityHistory { schema_key } => Some(entity_surface_schema(
+                self.entity_spec(schema_key)?,
+                EntitySurfaceShape::History,
             )),
             _ => None,
         }
@@ -219,7 +219,7 @@ impl PublicCatalog {
             public_columns([
                 ("id", false),
                 ("account_id", false),
-                ("row_pk", false),
+                ("entity_pk", false),
                 ("schema_key", false),
                 ("file_id", true),
                 ("metadata", true),
@@ -234,7 +234,7 @@ impl PublicCatalog {
             PublicSurfaceKind::WorkingDiff,
             public_columns([
                 ("diff_id", false),
-                ("row_pk", false),
+                ("entity_pk", false),
                 ("schema_key", false),
                 ("file_id", true),
                 ("diff_type", false),
@@ -248,7 +248,7 @@ impl PublicCatalog {
             PublicSurfaceKind::WorkingDiffByBranch,
             public_columns([
                 ("diff_id", false),
-                ("row_pk", false),
+                ("entity_pk", false),
                 ("schema_key", false),
                 ("file_id", true),
                 ("diff_type", false),
@@ -333,7 +333,7 @@ impl PublicCatalog {
         Ok(())
     }
 
-    fn insert_schema_surfaces_from_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
+    fn insert_entity_surfaces_from_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
         let parsed = crate::schema::parse_lix_schema(schema)?;
         if Self::runtime_schema_key_uses_reserved_namespace(&parsed.key)
             && !crate::schema::is_seed_schema_key(&parsed.key)
@@ -350,15 +350,15 @@ impl PublicCatalog {
             ));
         }
 
-        let spec = derive_schema_surface_spec_from_schema(schema)?;
+        let spec = derive_entity_surface_spec_from_schema(schema)?;
 
-        if !schema_exposed_as_schema_surface(&spec.schema_key) {
+        if !schema_exposed_as_entity_surface(&spec.schema_key) {
             return Ok(());
         }
 
-        let mut columns = row_columns(&spec);
-        columns.extend(row_hidden_columns(&spec, false));
-        let capabilities = if crate::sql2::read_only::is_read_only_schema_surface(&spec.schema_key)
+        let mut columns = entity_columns(&spec);
+        columns.extend(entity_hidden_columns(&spec, false));
+        let capabilities = if crate::sql2::read_only::is_read_only_entity_surface(&spec.schema_key)
         {
             SurfaceCapabilities::read_only()
         } else {
@@ -367,20 +367,20 @@ impl PublicCatalog {
 
         self.insert(surface(
             &spec.schema_key,
-            PublicSurfaceKind::SchemaBase {
+            PublicSurfaceKind::EntityBase {
                 schema_key: spec.schema_key.clone(),
             },
             columns,
             capabilities.clone(),
         ))?;
 
-        if spec.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY {
-            let mut by_branch_columns = row_columns(&spec);
-            by_branch_columns.extend(row_hidden_columns(&spec, true));
+        if spec.schema_key != crate::schema::LIX_CHECKPOINT_SCHEMA_KEY {
+            let mut by_branch_columns = entity_columns(&spec);
+            by_branch_columns.extend(entity_hidden_columns(&spec, true));
 
             self.insert(surface(
                 format!("{}_by_branch", spec.schema_key),
-                PublicSurfaceKind::SchemaByBranch {
+                PublicSurfaceKind::EntityByBranch {
                     schema_key: spec.schema_key.clone(),
                 },
                 by_branch_columns,
@@ -388,7 +388,7 @@ impl PublicCatalog {
             ))?;
         }
 
-        if schema_exposed_as_history_surface(&spec.schema_key) {
+        if schema_exposed_as_entity_history_surface(&spec.schema_key) {
             let history_identity_roots = primary_key_roots(&spec);
             let mut history_columns = spec
                 .columns
@@ -400,11 +400,11 @@ impl PublicCatalog {
                     )
                 })
                 .collect::<Vec<_>>();
-            history_columns.extend(row_history_system_columns());
+            history_columns.extend(entity_history_system_columns());
 
             self.insert(surface(
                 format!("{}_history", spec.schema_key),
-                PublicSurfaceKind::SchemaHistory {
+                PublicSurfaceKind::EntityHistory {
                     schema_key: spec.schema_key.clone(),
                 },
                 history_columns,
@@ -412,7 +412,7 @@ impl PublicCatalog {
             ))?;
         }
 
-        self.schema_specs.insert(spec.schema_key.clone(), spec);
+        self.entity_specs.insert(spec.schema_key.clone(), spec);
         Ok(())
     }
 }
@@ -421,7 +421,7 @@ impl PublicCatalog {
 fn working_diff_schema(by_branch: bool) -> SchemaRef {
     let mut fields = vec![
         Field::new("diff_id", DataType::Utf8, false),
-        json_field("row_pk", false),
+        json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         Field::new("diff_type", DataType::Utf8, false),
@@ -453,7 +453,7 @@ fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
         ]
     };
     fields.extend([
-        json_field("lixcol_row_pk", false),
+        json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -461,7 +461,6 @@ fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]);
     if by_branch {
@@ -488,7 +487,7 @@ fn history_filesystem_schema(include_data: bool) -> SchemaRef {
         ]
     };
     fields.extend([
-        json_field(HISTORY_COL_ROW_PK, false),
+        json_field(HISTORY_COL_ENTITY_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
@@ -525,14 +524,14 @@ fn public_columns<const N: usize>(columns: [(&str, bool); N]) -> Vec<PublicColum
         .collect()
 }
 
-fn primary_key_roots(spec: &SchemaSurfaceSpec) -> std::collections::BTreeSet<&String> {
+fn primary_key_roots(spec: &EntitySurfaceSpec) -> std::collections::BTreeSet<&String> {
     spec.primary_key_paths
         .iter()
         .filter_map(|path| path.first())
         .collect()
 }
 
-fn row_columns(spec: &SchemaSurfaceSpec) -> Vec<PublicColumn> {
+fn entity_columns(spec: &EntitySurfaceSpec) -> Vec<PublicColumn> {
     let primary_key_roots = primary_key_roots(spec);
     spec.columns
         .iter()
@@ -579,20 +578,20 @@ fn directory_columns(by_branch: bool) -> Vec<PublicColumn> {
     columns
 }
 
-fn row_hidden_columns(spec: &SchemaSurfaceSpec, by_branch: bool) -> Vec<PublicColumn> {
-    row_system_columns(
+fn entity_hidden_columns(spec: &EntitySurfaceSpec, by_branch: bool) -> Vec<PublicColumn> {
+    entity_system_columns(
         spec,
         if by_branch {
-            SchemaSurfaceShape::ByBranch
+            EntitySurfaceShape::ByBranch
         } else {
-            SchemaSurfaceShape::Active
+            EntitySurfaceShape::Active
         },
     )
 }
 
 fn filesystem_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
-        PublicColumn::hidden("lixcol_row_pk", false),
+        PublicColumn::hidden("lixcol_entity_pk", false),
         PublicColumn::hidden("lixcol_schema_key", false),
         PublicColumn::hidden("lixcol_file_id", true),
         PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
@@ -600,7 +599,6 @@ fn filesystem_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::hidden("lixcol_created_at", false),
         PublicColumn::hidden("lixcol_updated_at", false),
         PublicColumn::hidden("lixcol_commit_id", true),
-        PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
         PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
     ];
     if by_branch {
@@ -609,19 +607,19 @@ fn filesystem_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
     columns
 }
 
-fn row_system_columns(
-    spec: &SchemaSurfaceSpec,
-    variant: SchemaSurfaceShape,
+fn entity_system_columns(
+    spec: &EntitySurfaceSpec,
+    variant: EntitySurfaceShape,
 ) -> Vec<PublicColumn> {
-    debug_assert_ne!(variant, SchemaSurfaceShape::History);
-    let row_pk = PublicColumn::public_insert_only("lixcol_row_pk", false);
-    let row_pk = if spec.primary_key_paths.is_empty() {
-        row_pk
+    debug_assert_ne!(variant, EntitySurfaceShape::History);
+    let entity_pk = PublicColumn::public_insert_only("lixcol_entity_pk", false);
+    let entity_pk = if spec.primary_key_paths.is_empty() {
+        entity_pk
     } else {
-        row_pk.conditional_on_insert()
+        entity_pk.conditional_on_insert()
     };
     let mut columns = vec![
-        row_pk,
+        entity_pk,
         PublicColumn::public_read_only("lixcol_schema_key", false),
         PublicColumn::public_insert_only("lixcol_file_id", true).optional_on_insert(),
         PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
@@ -630,17 +628,16 @@ fn row_system_columns(
         PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
         PublicColumn::public_read_only("lixcol_change_id", true),
         PublicColumn::public_read_only("lixcol_commit_id", true),
-        PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
     ];
-    if variant == SchemaSurfaceShape::ByBranch {
+    if variant == EntitySurfaceShape::ByBranch {
         columns.push(PublicColumn::public_insert_only("lixcol_branch_id", false));
     }
     columns
 }
 
-fn row_history_system_columns() -> Vec<PublicColumn> {
+fn entity_history_system_columns() -> Vec<PublicColumn> {
     history_columns([
-        (HISTORY_COL_ROW_PK, false),
+        (HISTORY_COL_ENTITY_PK, false),
         (HISTORY_COL_SCHEMA_KEY, false),
         (HISTORY_COL_FILE_ID, true),
         (HISTORY_COL_METADATA, true),
@@ -662,7 +659,7 @@ fn file_history_columns() -> Vec<PublicColumn> {
         ("directory_id", true),
         ("name", true),
         ("content", true),
-        (HISTORY_COL_ROW_PK, false),
+        (HISTORY_COL_ENTITY_PK, false),
         (HISTORY_COL_SOURCE_CHANGES, false),
         (HISTORY_COL_OBSERVED_COMMIT_ID, false),
         (HISTORY_COL_COMMIT_CREATED_AT, false),
@@ -678,7 +675,7 @@ fn directory_history_columns() -> Vec<PublicColumn> {
         ("path", true),
         ("parent_id", true),
         ("name", true),
-        (HISTORY_COL_ROW_PK, false),
+        (HISTORY_COL_ENTITY_PK, false),
         (HISTORY_COL_SOURCE_CHANGES, false),
         (HISTORY_COL_OBSERVED_COMMIT_ID, false),
         (HISTORY_COL_COMMIT_CREATED_AT, false),

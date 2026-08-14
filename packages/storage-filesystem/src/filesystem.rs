@@ -402,9 +402,7 @@ impl FilesystemStorage {
         let primary = open_lix().with_storage(self.inner.clone()).await?;
         let active_branch_id = lix.active_branch_id().await?;
         let sync_lix = primary
-            .open_another_session()
-            .with_branch(active_branch_id)
-            .with_account(SYSTEM_ACCOUNT_ID)
+            .open_session_with_account(active_branch_id, SYSTEM_ACCOUNT_ID)
             .await?;
         primary.close().await?;
         FilesystemSupervisor::open(

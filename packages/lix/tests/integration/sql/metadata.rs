@@ -151,7 +151,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    metadata_rejects_invalid_json_on_typed_row_writes,
+    metadata_rejects_invalid_json_on_typed_entity_writes,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -166,28 +166,28 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
-                     VALUES ('metadata-row-insert', 'value', '{bad')",
+                     VALUES ('metadata-entity-insert', 'value', '{bad')",
                     &[],
                 )
                 .await
-                .expect_err("invalid typed row metadata should be rejected on INSERT"),
+                .expect_err("invalid typed entity metadata should be rejected on INSERT"),
         );
 
         assert_invalid_metadata_error(
             session
                 .execute(
                     "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
-                     VALUES ('metadata-row-json-null-insert', 'value', CAST('null' AS JSONB))",
+                     VALUES ('metadata-entity-json-null-insert', 'value', CAST('null' AS JSONB))",
                     &[],
                 )
                 .await
-                .expect_err("JSON null typed row metadata should be rejected on INSERT"),
+                .expect_err("JSON null typed entity metadata should be rejected on INSERT"),
         );
 
         session
             .execute(
                     "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
-                     VALUES ('metadata-row-lix-json-sql-null-insert', 'value', CAST(NULL AS JSONB))",
+                     VALUES ('metadata-entity-lix-json-sql-null-insert', 'value', CAST(NULL AS JSONB))",
                     &[],
                 )
                 .await
@@ -196,42 +196,42 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('metadata-row-json-null-value', CAST(NULL AS JSONB))",
+                 VALUES ('metadata-entity-json-null-value', CAST(NULL AS JSONB))",
                 &[],
             )
             .await
-            .expect("CAST(NULL AS JSONB) should be accepted for JSON row columns");
+            .expect("CAST(NULL AS JSONB) should be accepted for JSON entity columns");
         assert_metadata_null(
             session
                 .execute(
                     "SELECT value \
                      FROM lix_key_value \
-                     WHERE key = 'metadata-row-json-null-value'",
+                     WHERE key = 'metadata-entity-json-null-value'",
                     &[],
                 )
                 .await
-                .expect("JSON null row value should read"),
+                .expect("JSON null entity value should read"),
             "value",
         );
 
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('metadata-row-json-string-value', CAST('\"{\\\"source\\\":\\\"json-string\\\"}\"' AS JSONB))",
+                 VALUES ('metadata-entity-json-string-value', CAST('\"{\\\"source\\\":\\\"json-string\\\"}\"' AS JSONB))",
                 &[],
             )
             .await
-            .expect("JSON string row value should be accepted");
+            .expect("JSON string entity value should be accepted");
         assert_metadata_value(
             session
                 .execute(
                     "SELECT value \
                      FROM lix_key_value \
-                     WHERE key = 'metadata-row-json-string-value'",
+                     WHERE key = 'metadata-entity-json-string-value'",
                     &[],
                 )
                 .await
-                .expect("JSON string row value should read"),
+                .expect("JSON string entity value should read"),
             "value",
             &json!("{\"source\":\"json-string\"}"),
         );
@@ -239,17 +239,17 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
-                 VALUES ('metadata-row-sql-null-insert', 'value', NULL)",
+                 VALUES ('metadata-entity-sql-null-insert', 'value', NULL)",
                 &[],
             )
             .await
-            .expect("SQL NULL typed row metadata should be accepted on INSERT");
+            .expect("SQL NULL typed entity metadata should be accepted on INSERT");
         assert_metadata_null(
             session
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM lix_key_value \
-                     WHERE key = 'metadata-row-sql-null-insert'",
+                     WHERE key = 'metadata-entity-sql-null-insert'",
                     &[],
                 )
                 .await
@@ -261,7 +261,7 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
-                     VALUES ('metadata-row-json-null-param-insert', 'value', $1)",
+                     VALUES ('metadata-entity-json-null-param-insert', 'value', $1)",
                     &[Value::Json(json!(null).into())],
                 )
                 .await
@@ -271,17 +271,17 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('metadata-row-update', NULL)",
+                 VALUES ('metadata-entity-update', NULL)",
                 &[],
             )
             .await
-            .expect("typed row insert should succeed");
+            .expect("typed entity insert should succeed");
 
         session
             .execute(
                 "UPDATE lix_key_value \
                  SET lixcol_metadata = lixcol_metadata \
-                 WHERE key = 'metadata-row-update'",
+                 WHERE key = 'metadata-entity-update'",
                 &[],
             )
             .await
@@ -291,7 +291,7 @@ simulation_test!(
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM lix_key_value \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
@@ -303,7 +303,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_key_value \
                  SET lixcol_metadata = CAST('{}' AS JSONB) -> 'missing' \
-                 WHERE key = 'metadata-row-update'",
+                 WHERE key = 'metadata-entity-update'",
                 &[],
             )
             .await
@@ -313,7 +313,7 @@ simulation_test!(
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM lix_key_value \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
@@ -326,7 +326,7 @@ simulation_test!(
                 .execute(
                     "UPDATE lix_key_value \
                      SET lixcol_metadata = CAST('{\"m\":null}' AS JSONB) -> 'm' \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
@@ -337,7 +337,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_key_value \
                  SET lixcol_metadata = CAST('{\"m\":null}' AS JSONB) ->> 'm' \
-                 WHERE key = 'metadata-row-update'",
+                 WHERE key = 'metadata-entity-update'",
                 &[],
             )
             .await
@@ -347,7 +347,7 @@ simulation_test!(
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM lix_key_value \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
@@ -360,7 +360,7 @@ simulation_test!(
                 .execute(
                     "UPDATE lix_key_value \
                      SET lixcol_metadata = value \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
@@ -372,7 +372,7 @@ simulation_test!(
                 .execute(
                     "UPDATE lix_key_value \
                      SET lixcol_metadata = CAST('{\"m\":\"{\\\"source\\\":\\\"json-string\\\"}\"}' AS JSONB) -> 'm' \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
@@ -386,7 +386,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("typed row insert with JSON-shaped string key should succeed");
+            .expect("typed entity insert with JSON-shaped string key should succeed");
         session
             .execute(
                 "UPDATE lix_key_value \
@@ -414,7 +414,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_key_value \
                  SET lixcol_metadata = CAST('\"{\\\"m\\\":{\\\"source\\\":\\\"json-string-root\\\"}}\"' AS JSONB) -> 'm' \
-                 WHERE key = 'metadata-row-update'",
+                 WHERE key = 'metadata-entity-update'",
                 &[],
             )
             .await
@@ -424,7 +424,7 @@ simulation_test!(
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM lix_key_value \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
@@ -437,11 +437,11 @@ simulation_test!(
                 .execute(
                     "UPDATE lix_key_value \
                      SET lixcol_metadata = '{bad' \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
-                .expect_err("invalid typed row metadata should be rejected on UPDATE"),
+                .expect_err("invalid typed entity metadata should be rejected on UPDATE"),
         );
 
         assert_invalid_metadata_error(
@@ -449,28 +449,28 @@ simulation_test!(
                 .execute(
                     "UPDATE lix_key_value \
                      SET lixcol_metadata = CAST('null' AS JSONB) \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
-                .expect_err("JSON null typed row metadata should be rejected on UPDATE"),
+                .expect_err("JSON null typed entity metadata should be rejected on UPDATE"),
         );
 
         session
             .execute(
-                    "UPDATE lix_key_value \
+                "UPDATE lix_key_value \
                      SET lixcol_metadata = CAST(NULL AS JSONB) \
-                     WHERE key = 'metadata-row-update'",
-                    &[],
-                )
-                .await
-                .expect("CAST(NULL AS JSONB) is SQL NULL metadata on UPDATE");
+                     WHERE key = 'metadata-entity-update'",
+                &[],
+            )
+            .await
+            .expect("CAST(NULL AS JSONB) is SQL NULL metadata on UPDATE");
 
         session
             .execute(
                 "UPDATE lix_key_value \
                  SET lixcol_metadata = $1 \
-                 WHERE key = 'metadata-row-update'",
+                 WHERE key = 'metadata-entity-update'",
                 &[Value::Null],
             )
             .await
@@ -480,7 +480,7 @@ simulation_test!(
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM lix_key_value \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[],
                 )
                 .await
@@ -493,7 +493,7 @@ simulation_test!(
                 .execute(
                     "UPDATE lix_key_value \
                      SET lixcol_metadata = $1 \
-                     WHERE key = 'metadata-row-update'",
+                     WHERE key = 'metadata-entity-update'",
                     &[Value::Json(json!(null).into())],
                 )
                 .await
@@ -545,7 +545,7 @@ simulation_test!(
                     &[],
                 )
                 .await
-                .expect("typed row metadata should read"),
+                .expect("typed entity metadata should read"),
             "lixcol_metadata",
             &expected,
         );
@@ -555,7 +555,7 @@ simulation_test!(
                 .execute(
                     "SELECT metadata \
                      FROM lix_change \
-                     WHERE row_pk = CAST('[\"metadata-valid-object\"]' AS JSONB) \
+                     WHERE entity_pk = CAST('[\"metadata-valid-object\"]' AS JSONB) \
                        AND schema_key = 'lix_key_value'",
                     &[],
                 )

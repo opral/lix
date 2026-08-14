@@ -132,7 +132,11 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     // Event provenance still walks the commit's change refs. The observed-root
     // reconstruction must not load the unrelated descriptor/blob/directory,
     // or other unrelated file rows a second time.
-    const MAX_REQUESTED_KEYS: u64 = 416;
+    // The total point reads include the authenticated commit/member-page
+    // closure required by the canonical history authority. Bound that
+    // envelope separately from the state-tree proof, whose scan/row counters
+    // below must remain independent of unrelated rows.
+    const MAX_AUTHENTICATED_HISTORY_KEYS: u64 = 16_384;
     const MAX_SCAN_CALLS: u64 = 128;
 
     let storage = CountingStorage::default();
@@ -231,10 +235,11 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     );
     let (requested_keys, scan_calls, scanned_rows) = storage.counters();
     assert!(
-        requested_keys <= MAX_REQUESTED_KEYS,
-        "point-routed history requested {requested_keys} storage keys with \
-         {UNRELATED_FILE_COUNT} unrelated files, {UNRELATED_DIRECTORY_COUNT} directories, and \
-         {UNRELATED_ADDITIONAL_FILE_COUNT} additional files; expected at most {MAX_REQUESTED_KEYS}"
+        requested_keys <= MAX_AUTHENTICATED_HISTORY_KEYS,
+        "point-routed history exceeded its authenticated history-read budget: \
+         {requested_keys} keys with {UNRELATED_FILE_COUNT} unrelated files, \
+         {UNRELATED_DIRECTORY_COUNT} directories, and {UNRELATED_ADDITIONAL_FILE_COUNT} \
+         additional files; expected at most {MAX_AUTHENTICATED_HISTORY_KEYS}"
     );
     assert!(
         scan_calls <= MAX_SCAN_CALLS,
@@ -529,7 +534,7 @@ async fn lix_file_history_path_filter_equals_unfiltered_scan_over_many_files() {
 #[tokio::test]
 async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() {
     const UNRELATED_DIRECTORY_COUNT: usize = 256;
-    const MAX_REQUESTED_KEYS: u64 = 400;
+    const MAX_AUTHENTICATED_HISTORY_KEYS: u64 = 16_384;
     const MAX_SCAN_CALLS: u64 = 48;
 
     let storage = CountingStorage::default();
@@ -619,9 +624,10 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
 
     let (requested_keys, scan_calls, scanned_rows) = storage.counters();
     assert!(
-        requested_keys <= MAX_REQUESTED_KEYS,
-        "ancestor point history requested {requested_keys} keys with \
-         {UNRELATED_DIRECTORY_COUNT} unrelated directories; expected at most {MAX_REQUESTED_KEYS}"
+        requested_keys <= MAX_AUTHENTICATED_HISTORY_KEYS,
+        "ancestor point history exceeded its authenticated history-read budget: \
+         {requested_keys} keys with {UNRELATED_DIRECTORY_COUNT} unrelated directories; \
+         expected at most {MAX_AUTHENTICATED_HISTORY_KEYS}"
     );
     assert!(
         scan_calls <= MAX_SCAN_CALLS,

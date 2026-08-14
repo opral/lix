@@ -1,6 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::LixError;
+use crate::branch::BranchRefReader;
+use crate::common::{compose_directory_path, compose_file_path};
+use crate::entity_pk::EntityPk;
+use crate::forktree::{ForkTreeReadFacade, HistoricalStateRow};
+use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
+use crate::storage_adapter::StorageAdapterRead;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result;
@@ -8,22 +15,9 @@ use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use serde::de::DeserializeOwned;
 
-use crate::LixError;
-use crate::branch::BranchRefReader;
-use crate::checkpoint::checkpoint_commit_id_at_head;
-use crate::commit_graph::CommitGraphReader;
-use crate::common::{compose_directory_path, compose_file_path};
-use crate::row_pk::RowPk;
-use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
-use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateReadColumns,
-    TrackedStateScanRequest, TrackedStateStoreReader,
-};
-
-use super::branch_selection::{filter_conjuncts, selected_heads};
+use super::checkpoint::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
@@ -37,7 +31,6 @@ pub(super) async fn register_filesystem_working_diff_provider<S>(
     surface_name: &str,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlChangelogQuerySource<S>,
     kind: FilesystemWorkingDiffKind,
 ) -> Result<(), LixError>
@@ -51,8 +44,7 @@ where
             by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
-            commit_graph: Arc::new(Mutex::new(commit_graph)),
-            store: query_source.store,
+            forktree_reader: query_source.forktree_reader,
             kind,
         }),
         WriteAccess::read_only(),
@@ -69,13 +61,12 @@ struct FilesystemWorkingDiffSpec<S> {
     by_branch: bool,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
-    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    store: S,
+    forktree_reader: ForkTreeReadFacade<S>,
     kind: FilesystemWorkingDiffKind,
 }
 
 #[async_trait]
-impl<S> TableSpec for FilesystemWorkingDiffSpec<S>
+impl<S> TableSpec<S> for FilesystemWorkingDiffSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -112,7 +103,7 @@ where
         &self,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        limit: Option<usize>,
+        _limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema(), projection);
@@ -125,39 +116,34 @@ where
                 (
                     self.active_branch_id.clone(),
                     Arc::clone(&self.branch_ref),
-                    Arc::clone(&self.commit_graph),
-                    self.store.clone(),
+                    self.forktree_reader.clone(),
                     schema,
                     route,
                     self.kind,
                 ),
-                move |(active_branch_id, branch_ref, _commit_graph, store, schema, route, kind)| async move {
+                move |(_active_branch_id, _branch_ref, historical, schema, route, kind)| async move {
                     if route.contradictory {
                         return FILESYSTEM_WORKING_DIFF_COLS
                             .build(schema, &[])
                             .map_err(batch_error);
                     }
                     let heads = selected_heads(
-                        branch_ref.as_ref(),
-                        active_branch_id.as_deref(),
+                        _branch_ref.as_ref(),
+                        _active_branch_id.as_deref(),
                         &route.branch_ids,
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                    let mut tracked = TrackedStateContext::new().reader(store.clone());
                     let mut rows = Vec::new();
                     for head in heads {
-                        let checkpoint_id = checkpoint_commit_id_at_head(
-                            store.clone(),
-                            &head.branch_id,
-                            head.commit_id,
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
+                        let baseline = historical
+                            .checkpoint_baseline_for_branch(&head.branch_id)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
                         let mut branch_rows = load_rows(
-                            &mut tracked,
-                            &checkpoint_id.to_string(),
-                            &head.commit_id.to_string(),
+                            &historical,
+                            &baseline.checkpoint_commit_id.to_string(),
+                            &baseline.head_commit_id.to_string(),
                             &head.branch_id,
                             kind,
                         )
@@ -167,10 +153,6 @@ where
                             branch_rows.retain(|row| ids.contains(&row.id));
                         }
                         rows.extend(branch_rows);
-                        if limit.is_some_and(|limit| rows.len() >= limit) {
-                            rows.truncate(limit.unwrap_or(0));
-                            break;
-                        }
                     }
                     FILESYSTEM_WORKING_DIFF_COLS
                         .build(schema, &rows)
@@ -225,7 +207,7 @@ struct LogicalSnapshot {
 }
 
 async fn load_rows<S>(
-    tracked: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     checkpoint_id: &str,
     head_id: &str,
     branch_id: &str,
@@ -234,49 +216,64 @@ async fn load_rows<S>(
 where
     S: StorageAdapterRead,
 {
-    let diff = tracked
-        .diff_commits(
+    let before = historical
+        .scan_state_rows_at_commit(crate::changelog::CommitId::parse_lix(
             checkpoint_id,
-            head_id,
-            &TrackedStateDiffRequest {
-                filter: TrackedStateFilter {
-                    include_tombstones: true,
-                    ..TrackedStateFilter::default()
-                },
-                retain_payloads: false,
-            },
-        )
+            "working diff checkpoint",
+        )?)
         .await?;
+    let after = historical
+        .scan_state_rows_at_commit(crate::changelog::CommitId::parse_lix(
+            head_id,
+            "working diff head",
+        )?)
+        .await?;
+    let mut before_by_key = BTreeMap::new();
+    for row in before {
+        before_by_key.insert(row.key.clone(), row);
+    }
+    let mut after_by_key = BTreeMap::new();
+    for row in after {
+        after_by_key.insert(row.key.clone(), row);
+    }
+    let keys = before_by_key
+        .keys()
+        .chain(after_by_key.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut file_ids = BTreeSet::new();
     let mut directory_ids = BTreeSet::new();
-    for entry in &diff.entries {
-        if let Some(file_id) = entry.identity.file_id() {
+    for key in keys {
+        let before = before_by_key.get(&key);
+        let after = after_by_key.get(&key);
+        if !historical_rows_differ(before, after) {
+            continue;
+        }
+        if let Some(file_id) = key.file_id.as_deref() {
             file_ids.insert(file_id.to_owned());
         }
-        match entry.identity.schema_key() {
+        match key.schema_key.as_str() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_row_pk_value(entry.identity.row_pk()) {
+                if let Some(id) = single_entity_pk_value(&key.entity_pk) {
                     file_ids.insert(id);
                 }
             }
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_row_pk_value(entry.identity.row_pk()) {
+                if let Some(id) = single_entity_pk_value(&key.entity_pk) {
                     directory_ids.insert(id);
                 }
             }
             _ => {}
         }
     }
-    if diff.entries.is_empty() {
-        return Ok(Vec::new());
-    }
     if matches!(kind, FilesystemWorkingDiffKind::Directory) && directory_ids.is_empty() {
         return Ok(Vec::new());
     }
 
     let load_all_files = !directory_ids.is_empty();
-    let before = load_logical_snapshot(tracked, checkpoint_id, &file_ids, load_all_files).await?;
-    let after = load_logical_snapshot(tracked, head_id, &file_ids, load_all_files).await?;
+    let before =
+        load_logical_snapshot(historical, checkpoint_id, &file_ids, load_all_files).await?;
+    let after = load_logical_snapshot(historical, head_id, &file_ids, load_all_files).await?;
     let (before_entries, after_entries) = match kind {
         FilesystemWorkingDiffKind::File => (&before.files, &after.files),
         FilesystemWorkingDiffKind::Directory => (&before.directories, &after.directories),
@@ -316,15 +313,12 @@ where
     Ok(rows)
 }
 
-fn single_row_pk_value(row_pk: &RowPk) -> Option<String> {
-    serde_json::from_str::<Vec<String>>(&row_pk.as_json_array_text().ok()?)
-        .ok()?
-        .into_iter()
-        .next()
+fn single_entity_pk_value(entity_pk: &EntityPk) -> Option<String> {
+    entity_pk.as_single_string_owned().ok()
 }
 
 async fn load_logical_snapshot<S>(
-    tracked: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     commit_id: &str,
     selected_file_ids: &BTreeSet<String>,
     load_all_files: bool,
@@ -332,35 +326,35 @@ async fn load_logical_snapshot<S>(
 where
     S: StorageAdapterRead,
 {
-    let file_row_pks = if load_all_files {
+    let file_entity_pks = if load_all_files {
         Vec::new()
     } else {
         selected_file_ids
             .iter()
-            .map(|file_id| filesystem_descriptor_row_pk(file_id, "file"))
+            .map(|file_id| filesystem_descriptor_entity_pk(file_id, "file"))
             .collect::<Result<Vec<_>, _>>()?
     };
     let files = if !load_all_files && selected_file_ids.is_empty() {
         Vec::new()
     } else {
         scan_descriptors::<S, FileDescriptor>(
-            tracked,
+            historical,
             commit_id,
             FILE_DESCRIPTOR_SCHEMA_KEY,
-            file_row_pks,
+            file_entity_pks,
         )
         .await?
     };
     let directories = if load_all_files {
         scan_descriptors::<S, DirectoryDescriptor>(
-            tracked,
+            historical,
             commit_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             Vec::new(),
         )
         .await?
     } else {
-        load_ancestor_directories(tracked, commit_id, &files).await?
+        load_ancestor_directories(historical, commit_id, &files).await?
     };
 
     let directory_by_id = directories
@@ -374,18 +368,31 @@ where
             &directory_by_id,
             &mut directory_paths,
             &mut BTreeSet::new(),
-        )?;
+        )?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("missing authenticated directory path for '{id}'"),
+            )
+        })?;
     }
     let mut file_paths = BTreeMap::new();
     for file in files {
         let directory_path = file
             .directory_id
             .as_ref()
-            .and_then(|directory_id| directory_paths.get(directory_id))
-            .map(String::as_str);
-        if file.directory_id.is_some() && directory_path.is_none() {
-            continue;
-        }
+            .map(|directory_id| {
+                directory_paths
+                    .get(directory_id)
+                    .map(String::as_str)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("missing authenticated directory path for '{directory_id}'"),
+                        )
+                    })
+            })
+            .transpose()?;
         file_paths.insert(file.id, compose_file_path(directory_path, &file.name)?);
     }
     Ok(LogicalSnapshot {
@@ -395,7 +402,7 @@ where
 }
 
 async fn load_ancestor_directories<S>(
-    tracked: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     commit_id: &str,
     files: &[FileDescriptor],
 ) -> Result<Vec<DirectoryDescriptor>, LixError>
@@ -417,14 +424,24 @@ where
             break;
         }
         let loaded = scan_descriptors::<S, DirectoryDescriptor>(
-            tracked,
+            historical,
             commit_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             ids.iter()
-                .map(|directory_id| filesystem_descriptor_row_pk(directory_id, "directory"))
+                .map(|directory_id| filesystem_descriptor_entity_pk(directory_id, "directory"))
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .await?;
+        let loaded_ids = loaded
+            .iter()
+            .map(|directory| directory.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(missing) = ids.iter().find(|id| !loaded_ids.contains(id.as_str())) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("missing authenticated directory descriptor for '{missing}'"),
+            ));
+        }
         pending.extend(
             loaded
                 .iter()
@@ -436,8 +453,8 @@ where
     Ok(directories)
 }
 
-fn filesystem_descriptor_row_pk(id: &str, kind: &str) -> Result<RowPk, LixError> {
-    RowPk::uuid_from_canonical(id).map_err(|error| {
+fn filesystem_descriptor_entity_pk(id: &str, kind: &str) -> Result<EntityPk, LixError> {
+    EntityPk::uuid_from_canonical(id).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("validated {kind} ID is not a canonical UUID: {error}"),
@@ -446,44 +463,113 @@ fn filesystem_descriptor_row_pk(id: &str, kind: &str) -> Result<RowPk, LixError>
 }
 
 async fn scan_descriptors<S, T>(
-    tracked: &mut TrackedStateStoreReader<S>,
+    historical: &ForkTreeReadFacade<S>,
     commit_id: &str,
     schema_key: &str,
-    row_pks: Vec<RowPk>,
+    entity_pks: Vec<EntityPk>,
 ) -> Result<Vec<T>, LixError>
 where
     S: StorageAdapterRead,
-    T: for<'de> Deserialize<'de>,
+    T: DeserializeOwned,
 {
-    let batch = tracked
-        .scan_batch_at_commit(
+    let rows = historical
+        .scan_state_rows_at_commit(crate::changelog::CommitId::parse_lix(
             commit_id,
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: vec![schema_key.to_string()],
-                    row_pks,
-                    include_tombstones: false,
-                    ..TrackedStateFilter::default()
-                },
-                read_columns: TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_string()],
-                },
-                ..TrackedStateScanRequest::default()
-            },
-        )
+            "working diff snapshot",
+        )?)
         .await?;
-    batch
-        .iter()
-        .filter_map(|row| row.snapshot_content())
-        .map(|snapshot| {
-            serde_json::from_str(snapshot).map_err(|error| {
+    rows.into_iter()
+        .filter(|row| {
+            row.key.schema_key == schema_key
+                && (entity_pks.is_empty() || entity_pks.contains(&row.key.entity_pk))
+        })
+        .map(|row| {
+            let row_id = row.key.entity_pk.as_single_string_owned()?;
+            validate_descriptor_row_identity(&row, schema_key, &row_id)?;
+            if row.deleted {
+                // An authenticated tombstone is logical absence, not a malformed descriptor.
+                if row.snapshot_content.is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("{schema_key} descriptor '{row_id}' tombstone has a payload"),
+                    ));
+                }
+                return Ok(None);
+            }
+            let snapshot = row.snapshot_content.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    format!("invalid {schema_key} snapshot JSON: {error}"),
+                    format!("{schema_key} descriptor '{row_id}' has no authenticated payload"),
+                )
+            })?;
+            let payload: serde_json::Value =
+                serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("invalid {schema_key} snapshot JSON: {error}"),
+                    )
+                })?;
+            let payload_id = payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("{schema_key} descriptor '{row_id}' has no payload identity"),
+                    )
+                })?;
+            if payload_id != row_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "{schema_key} payload identity '{payload_id}' does not match row '{row_id}'"
+                    ),
+                ));
+            }
+            serde_json::from_value(payload).map(Some).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("invalid {schema_key} snapshot shape: {error}"),
                 )
             })
         })
-        .collect()
+        .collect::<Result<Vec<Option<T>>, _>>()
+        .map(|rows| rows.into_iter().flatten().collect())
+}
+
+fn validate_descriptor_row_identity(
+    row: &HistoricalStateRow,
+    schema_key: &str,
+    row_id: &str,
+) -> Result<(), LixError> {
+    let valid = match schema_key {
+        FILE_DESCRIPTOR_SCHEMA_KEY => row.key.file_id.as_deref() == Some(row_id),
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY => row.key.file_id.is_none(),
+        _ => false,
+    };
+    if !valid {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("{schema_key} descriptor row '{row_id}' has a mismatched file identity"),
+        ));
+    }
+    Ok(())
+}
+
+fn historical_rows_differ(
+    before: Option<&HistoricalStateRow>,
+    after: Option<&HistoricalStateRow>,
+) -> bool {
+    match (before, after) {
+        (None, None) => false,
+        (Some(left), Some(right)) => {
+            left.deleted != right.deleted
+                || left.snapshot_content != right.snapshot_content
+                || left.metadata != right.metadata
+                || left.key != right.key
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+    }
 }
 
 fn resolve_directory_path(
@@ -570,5 +656,25 @@ fn batch_error(error: ColumnTableError) -> datafusion::common::DataFusionError {
             datafusion::common::DataFusionError::from(error)
         }
         ColumnTableError::Row(error) => lix_error_to_datafusion_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_entity_pk_value;
+    use crate::entity_pk::EntityPk;
+
+    #[test]
+    fn composite_entity_pk_is_not_reduced_to_its_first_component() {
+        let composite = EntityPk::from_json_array_text(r#"["file-like","other"]"#)
+            .expect("composite entity key should decode");
+        assert_eq!(single_entity_pk_value(&composite), None);
+
+        let single = EntityPk::from_json_array_text(r#"["file-like"]"#)
+            .expect("single entity key should decode");
+        assert_eq!(
+            single_entity_pk_value(&single).as_deref(),
+            Some("file-like")
+        );
     }
 }

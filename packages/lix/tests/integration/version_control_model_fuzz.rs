@@ -225,13 +225,15 @@ simulation_test!(
                         model.delete(&key);
                     }
                     _ => {
-                        main.create_checkpoint()
-                            .await
-                            .unwrap_or_else(|error| panic!("{label}: checkpoint failed: {error:?}"));
+                        main.create_checkpoint().await.unwrap_or_else(|error| {
+                            panic!("{label}: checkpoint failed: {error:?}")
+                        });
                         model.checkpoint();
                         if fault == InjectedFault::History {
-                            if let Some(entries) =
-                                model.history.values_mut().find(|entries| !entries.is_empty())
+                            if let Some(entries) = model
+                                .history
+                                .values_mut()
+                                .find(|entries| !entries.is_empty())
                             {
                                 entries.remove(0);
                             }
@@ -415,82 +417,85 @@ simulation_test!(
 // fence at COMMIT_STATE_MAX_REPLAY_DEPTH = 32.
 // ---------------------------------------------------------------------------
 
-simulation_test!(vc_model_reboot_replays_to_identical_state, |sim| async move {
-    let fault = InjectedFault::from_env();
-    let engine = sim.boot_engine().await;
-    let main = sim.wrap_session(
-        engine.open_session().await.expect("session should open"),
-        &engine,
-    );
-
-    // One commit per write, no checkpoint: this is what pushes the replay debt
-    // past COMMIT_STATE_MAX_REPLAY_DEPTH (32) and exercises the fence rather
-    // than the checkpointed fast path.
-    const UNCHECKPOINTED_COMMITS: usize = 48;
-
-    let prefix = "vcm-replay-";
-    let keys = lane_keys(prefix, "k");
-    let mut model = BranchModel::default();
-    let mut rng = TinyRng::new(0xd1ce_f00d);
-
-    for step in 0..UNCHECKPOINTED_COMMITS {
-        let label = format!("pre-reboot step {step}");
-        let key = keys[rng.usize(keys.len())].clone();
-        if rng.usize(5) == 0 {
-            delete(&main, &key, &label).await;
-            model.delete(&key);
-        } else {
-            let value = random_value(&mut rng);
-            upsert(&main, &key, &value, &label).await;
-            model.upsert(&key, value);
-        }
-    }
-    assert_state(&main, prefix, &model.state, "before reboot").await;
-
-    if fault == InjectedFault::Reboot {
-        model.state.insert(
-            format!("{prefix}k-0"),
-            JsonValue::String("injected".to_string()),
+simulation_test!(
+    vc_model_reboot_replays_to_identical_state,
+    |sim| async move {
+        let fault = InjectedFault::from_env();
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
         );
+
+        // One commit per write, no checkpoint: this is what pushes the replay debt
+        // past COMMIT_STATE_MAX_REPLAY_DEPTH (32) and exercises the fence rather
+        // than the checkpointed fast path.
+        const UNCHECKPOINTED_COMMITS: usize = 48;
+
+        let prefix = "vcm-replay-";
+        let keys = lane_keys(prefix, "k");
+        let mut model = BranchModel::default();
+        let mut rng = TinyRng::new(0xd1ce_f00d);
+
+        for step in 0..UNCHECKPOINTED_COMMITS {
+            let label = format!("pre-reboot step {step}");
+            let key = keys[rng.usize(keys.len())].clone();
+            if rng.usize(5) == 0 {
+                delete(&main, &key, &label).await;
+                model.delete(&key);
+            } else {
+                let value = random_value(&mut rng);
+                upsert(&main, &key, &value, &label).await;
+                model.upsert(&key, value);
+            }
+        }
+        assert_state(&main, prefix, &model.state, "before reboot").await;
+
+        if fault == InjectedFault::Reboot {
+            model.state.insert(
+                format!("{prefix}k-0"),
+                JsonValue::String("injected".to_string()),
+            );
+        }
+
+        // Replay once...
+        let rebooted = sim
+            .reboot_engine_from_current_snapshot()
+            .await
+            .expect("engine should reboot from the current snapshot");
+        let reopened = sim.wrap_session(
+            rebooted
+                .open_session()
+                .await
+                .expect("rebooted session should open"),
+            &rebooted,
+        );
+        assert_state(&reopened, prefix, &model.state, "after first reboot").await;
+
+        // ...and again: replay must be idempotent, not merely correct once.
+        let rebooted_again = sim
+            .reboot_engine_from_current_snapshot()
+            .await
+            .expect("engine should reboot a second time");
+        let reopened_again = sim.wrap_session(
+            rebooted_again
+                .open_session()
+                .await
+                .expect("second rebooted session should open"),
+            &rebooted_again,
+        );
+        assert_state(&reopened_again, prefix, &model.state, "after second reboot").await;
+
+        // A checkpoint after the fence-crossing replay must still land, and the
+        // collapsed history must be the model's.
+        reopened_again
+            .create_checkpoint()
+            .await
+            .expect("checkpoint after replay should succeed");
+        model.checkpoint();
+        assert_history(&reopened_again, prefix, &model, "after replay checkpoint").await;
     }
-
-    // Replay once...
-    let rebooted = sim
-        .reboot_engine_from_current_snapshot()
-        .await
-        .expect("engine should reboot from the current snapshot");
-    let reopened = sim.wrap_session(
-        rebooted
-            .open_session()
-            .await
-            .expect("rebooted session should open"),
-        &rebooted,
-    );
-    assert_state(&reopened, prefix, &model.state, "after first reboot").await;
-
-    // ...and again: replay must be idempotent, not merely correct once.
-    let rebooted_again = sim
-        .reboot_engine_from_current_snapshot()
-        .await
-        .expect("engine should reboot a second time");
-    let reopened_again = sim.wrap_session(
-        rebooted_again
-            .open_session()
-            .await
-            .expect("second rebooted session should open"),
-        &rebooted_again,
-    );
-    assert_state(&reopened_again, prefix, &model.state, "after second reboot").await;
-
-    // A checkpoint after the fence-crossing replay must still land, and the
-    // collapsed history must be the model's.
-    reopened_again
-        .create_checkpoint()
-        .await
-        .expect("checkpoint after replay should succeed");
-    model.checkpoint();
-    assert_history(&reopened_again, prefix, &model, "after replay checkpoint").await;
-});
+);
 
 // ---------------------------------------------------------------------------
 // Property 6: reclaim safety. State and history reachable before a sweep must

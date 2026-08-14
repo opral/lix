@@ -875,6 +875,12 @@ simulation_test!(
             .await
             .expect("missing branch delete should be a no-op");
         assert_eq!(delete_result, ExecuteResult::from_rows_affected(0));
+
+        let invalid_delete = session
+            .execute("DELETE FROM lix_branch WHERE id = 'not-a-branch-id'", &[])
+            .await
+            .expect("noncanonical branch predicate should remain a no-match delete");
+        assert_eq!(invalid_delete, ExecuteResult::from_rows_affected(0));
     }
 );
 

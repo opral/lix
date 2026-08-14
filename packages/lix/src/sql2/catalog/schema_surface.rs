@@ -5,24 +5,24 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit}
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::row_pk::RowPkComponentType;
+use crate::entity_pk::EntityPkComponentType;
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ROW_PK, HISTORY_COL_FILE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
     HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_ORIGIN_KEY, HISTORY_COL_SCHEMA_KEY,
 };
 use crate::sql2::result_metadata::{json_field, mark_json_field};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SchemaSurfaceShape {
+pub(crate) enum EntitySurfaceShape {
     Active,
     ByBranch,
     History,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SchemaColumnType {
+pub(crate) enum EntityColumnType {
     String,
     Json,
     Integer,
@@ -32,20 +32,20 @@ pub(crate) enum SchemaColumnType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SchemaSurfaceColumn {
+pub(crate) struct EntitySurfaceColumn {
     pub(crate) name: String,
-    pub(crate) column_type: SchemaColumnType,
+    pub(crate) column_type: EntityColumnType,
     pub(crate) read_nullable: bool,
     pub(crate) insert_required: bool,
     pub(crate) default_expression: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SchemaSurfaceSpec {
+pub(crate) struct EntitySurfaceSpec {
     pub(crate) schema_key: String,
     pub(crate) primary_key_paths: Vec<Vec<String>>,
-    pub(crate) primary_key_component_types: Vec<RowPkComponentType>,
-    pub(crate) columns: Vec<SchemaSurfaceColumn>,
+    pub(crate) primary_key_component_types: Vec<EntityPkComponentType>,
+    pub(crate) columns: Vec<EntitySurfaceColumn>,
     pub(crate) defaults: crate::catalog::DefaultPlan,
     /// Columns this schema already declares as a foreign key or as unique,
     /// which are therefore the columns the hot index plane can serve.
@@ -54,7 +54,7 @@ pub(crate) struct SchemaSurfaceSpec {
     /// user-facing concept. Order is stable and defines each column's ordinal
     /// in the index key, so it must not be reordered without retiring the
     /// index namespace.
-    pub(crate) indexed_columns: Vec<SchemaIndexedColumn>,
+    pub(crate) indexed_columns: Vec<EntityIndexedColumn>,
     /// Whether changing one row can invalidate another row.
     ///
     /// Homogeneous point updates may be lowered into one physical write batch
@@ -70,42 +70,43 @@ pub(crate) struct SchemaSurfaceSpec {
     pub(crate) columnar_snapshot_bijective: bool,
 }
 
-impl SchemaSurfaceSpec {
+impl EntitySurfaceSpec {
     #[cfg(test)]
     pub(crate) fn visible_column_names(&self) -> impl Iterator<Item = &str> {
         self.columns.iter().map(|column| column.name.as_str())
     }
 
-    pub(crate) fn visible_column(&self, column_name: &str) -> Option<&SchemaSurfaceColumn> {
+    pub(crate) fn visible_column(&self, column_name: &str) -> Option<&EntitySurfaceColumn> {
         self.columns
             .iter()
             .find(|column| column.name == column_name)
     }
 
     /// Stable identity of the registered schema properties that determine an
-    /// row columnar sidecar's physical meaning.
+    /// entity columnar sidecar's physical meaning.
     ///
     /// In particular, String and Json both use Arrow Utf8. A name/type-only
     /// comparison cannot distinguish scalar string bytes from canonical JSON
     /// text after a registered-schema amendment.
+    #[cfg(test)]
     pub(crate) fn columnar_layout_fingerprint(&self) -> String {
         fn update_part(hasher: &mut blake3::Hasher, bytes: &[u8]) {
             hasher.update(&(bytes.len() as u64).to_be_bytes());
             hasher.update(bytes);
         }
 
-        let mut hasher = blake3::Hasher::new_derive_key("lix row columnar layout v1");
+        let mut hasher = blake3::Hasher::new_derive_key("lix entity columnar layout v1");
         update_part(&mut hasher, self.schema_key.as_bytes());
         hasher.update(&(self.columns.len() as u64).to_be_bytes());
         for column in &self.columns {
             update_part(&mut hasher, column.name.as_bytes());
             hasher.update(&[match column.column_type {
-                SchemaColumnType::String => 1,
-                SchemaColumnType::Json => 2,
-                SchemaColumnType::Integer => 3,
-                SchemaColumnType::Number => 4,
-                SchemaColumnType::Boolean => 5,
-                SchemaColumnType::Timestamptz => 6,
+                EntityColumnType::String => 1,
+                EntityColumnType::Json => 2,
+                EntityColumnType::Integer => 3,
+                EntityColumnType::Number => 4,
+                EntityColumnType::Boolean => 5,
+                EntityColumnType::Timestamptz => 6,
             }]);
             hasher.update(&[u8::from(column.read_nullable)]);
         }
@@ -119,19 +120,19 @@ impl SchemaSurfaceSpec {
         hasher.update(&(self.primary_key_component_types.len() as u64).to_be_bytes());
         for component_type in &self.primary_key_component_types {
             hasher.update(&[match component_type {
-                RowPkComponentType::Uuid => 1,
-                RowPkComponentType::Integer => 2,
-                RowPkComponentType::String => 3,
-                RowPkComponentType::Bytes => 4,
+                EntityPkComponentType::Uuid => 1,
+                EntityPkComponentType::Integer => 2,
+                EntityPkComponentType::String => 3,
+                EntityPkComponentType::Bytes => 4,
             }]);
         }
         hasher.finalize().to_hex().to_string()
     }
 }
 
-pub(crate) fn derive_schema_surface_spec_from_schema(
+pub(crate) fn derive_entity_surface_spec_from_schema(
     schema: &JsonValue,
-) -> Result<SchemaSurfaceSpec, LixError> {
+) -> Result<EntitySurfaceSpec, LixError> {
     let parsed = crate::schema::parse_lix_schema(schema)?;
     let schema_key = parsed.key.clone();
     let primary_key_paths = parsed
@@ -150,9 +151,9 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 .find(|column| &column.name == name)
                 .expect("validated primary-key column must exist");
             match column.data_type {
-                lix_schema::DataType::Uuid => RowPkComponentType::Uuid,
-                lix_schema::DataType::Int8 => RowPkComponentType::Integer,
-                lix_schema::DataType::Text => RowPkComponentType::String,
+                lix_schema::DataType::Uuid => EntityPkComponentType::Uuid,
+                lix_schema::DataType::Int8 => EntityPkComponentType::Integer,
+                lix_schema::DataType::Text => EntityPkComponentType::String,
                 _ => unreachable!("validated Schema v1 primary-key type"),
             }
         })
@@ -160,15 +161,15 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
     let columns = parsed
         .columns
         .iter()
-        .map(|column| SchemaSurfaceColumn {
+        .map(|column| EntitySurfaceColumn {
             name: column.name.clone(),
             column_type: match column.data_type {
-                lix_schema::DataType::Text | lix_schema::DataType::Uuid => SchemaColumnType::String,
-                lix_schema::DataType::Int8 => SchemaColumnType::Integer,
-                lix_schema::DataType::Float8 => SchemaColumnType::Number,
-                lix_schema::DataType::Boolean => SchemaColumnType::Boolean,
-                lix_schema::DataType::Jsonb => SchemaColumnType::Json,
-                lix_schema::DataType::Timestamptz => SchemaColumnType::Timestamptz,
+                lix_schema::DataType::Text | lix_schema::DataType::Uuid => EntityColumnType::String,
+                lix_schema::DataType::Int8 => EntityColumnType::Integer,
+                lix_schema::DataType::Float8 => EntityColumnType::Number,
+                lix_schema::DataType::Boolean => EntityColumnType::Boolean,
+                lix_schema::DataType::Jsonb => EntityColumnType::Json,
+                lix_schema::DataType::Timestamptz => EntityColumnType::Timestamptz,
             },
             read_nullable: column.nullable,
             insert_required: !column.nullable
@@ -202,10 +203,10 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
             && column.default_expression.is_none()
             && matches!(
                 column.column_type,
-                SchemaColumnType::String | SchemaColumnType::Integer | SchemaColumnType::Boolean
+                EntityColumnType::String | EntityColumnType::Integer | EntityColumnType::Boolean
             )
     });
-    Ok(SchemaSurfaceSpec {
+    Ok(EntitySurfaceSpec {
         schema_key,
         primary_key_paths,
         primary_key_component_types,
@@ -220,10 +221,10 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
 
 /// One column the hot index plane can serve, and its position in the index key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SchemaIndexedColumn {
+pub(crate) struct EntityIndexedColumn {
     pub(crate) name: String,
     pub(crate) ordinal: u16,
-    pub(crate) column_type: SchemaColumnType,
+    pub(crate) column_type: EntityColumnType,
 }
 
 /// Indexable columns, from declarations the schema already carries.
@@ -239,8 +240,8 @@ pub(crate) struct SchemaIndexedColumn {
 ///   and a second access path to the same rows would be a second mechanism.
 fn derive_indexed_columns(
     schema: &lix_schema::Schema,
-    columns: &[SchemaSurfaceColumn],
-) -> Vec<SchemaIndexedColumn> {
+    columns: &[EntitySurfaceColumn],
+) -> Vec<EntityIndexedColumn> {
     let mut names = Vec::new();
     let mut push = |name: &str| {
         if !names.iter().any(|existing: &String| existing == name) {
@@ -265,16 +266,16 @@ fn derive_indexed_columns(
             let column = columns.iter().find(|column| column.name == name)?;
             matches!(
                 column.column_type,
-                SchemaColumnType::String | SchemaColumnType::Integer
+                EntityColumnType::String | EntityColumnType::Integer
             )
-            .then(|| SchemaIndexedColumn {
+            .then(|| EntityIndexedColumn {
                 name,
                 ordinal: 0,
                 column_type: column.column_type,
             })
         })
         .enumerate()
-        .map(|(ordinal, column)| SchemaIndexedColumn {
+        .map(|(ordinal, column)| EntityIndexedColumn {
             ordinal: u16::try_from(ordinal).unwrap_or(u16::MAX),
             ..column
         })
@@ -293,7 +294,7 @@ fn postgres_literal(value: &JsonValue) -> String {
     }
 }
 
-pub(crate) fn schema_exposed_as_schema_surface(schema_key: &str) -> bool {
+pub(crate) fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
     !matches!(
         schema_key,
         "lix_binary_blob_ref"
@@ -305,16 +306,16 @@ pub(crate) fn schema_exposed_as_schema_surface(schema_key: &str) -> bool {
     )
 }
 
-pub(crate) fn schema_exposed_as_history_surface(schema_key: &str) -> bool {
-    schema_exposed_as_schema_surface(schema_key)
+pub(crate) fn schema_exposed_as_entity_history_surface(schema_key: &str) -> bool {
+    schema_exposed_as_entity_surface(schema_key)
         && !matches!(schema_key, "lix_commit" | "lix_commit_edge")
 }
 
-pub(crate) fn schema_surface_schema(
-    spec: &SchemaSurfaceSpec,
-    shape: SchemaSurfaceShape,
+pub(crate) fn entity_surface_schema(
+    spec: &EntitySurfaceSpec,
+    shape: EntitySurfaceShape,
 ) -> SchemaRef {
-    let history_identity_roots = if shape == SchemaSurfaceShape::History {
+    let history_identity_roots = if shape == EntitySurfaceShape::History {
         spec.primary_key_paths
             .iter()
             .filter_map(|path| path.first())
@@ -327,17 +328,17 @@ pub(crate) fn schema_surface_schema(
         .columns
         .iter()
         .map(|column| {
-            let read_nullable = if shape == SchemaSurfaceShape::History {
+            let read_nullable = if shape == EntitySurfaceShape::History {
                 !history_identity_roots.contains(&column.name)
             } else {
                 column.read_nullable
             };
             let field = Field::new(
                 &column.name,
-                arrow_data_type_for_schema_column_type(column.column_type),
+                arrow_data_type_for_entity_column_type(column.column_type),
                 read_nullable,
             );
-            if column.column_type == SchemaColumnType::Json {
+            if column.column_type == EntityColumnType::Json {
                 mark_json_field(field)
             } else {
                 field
@@ -345,21 +346,14 @@ pub(crate) fn schema_surface_schema(
         })
         .collect::<Vec<_>>();
 
-    fields.extend(row_system_fields(shape));
+    fields.extend(entity_system_fields(shape));
     Arc::new(Schema::new(fields))
 }
 
-pub(crate) fn row_visible_fields(spec: &SchemaSurfaceSpec) -> Vec<Field> {
-    schema_surface_schema(spec, SchemaSurfaceShape::Active).fields()[..spec.columns.len()]
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect()
-}
-
-pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
-    if shape == SchemaSurfaceShape::History {
+pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
+    if shape == EntitySurfaceShape::History {
         return vec![
-            json_field(HISTORY_COL_ROW_PK, false),
+            json_field(HISTORY_COL_ENTITY_PK, false),
             Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
             Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
             json_field(HISTORY_COL_METADATA, true),
@@ -375,7 +369,7 @@ pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
     }
 
     let mut fields = vec![
-        json_field("lixcol_row_pk", true),
+        json_field("lixcol_entity_pk", true),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         json_field("lixcol_metadata", true),
@@ -384,21 +378,20 @@ pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
         Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, true),
     ];
-    if shape == SchemaSurfaceShape::ByBranch {
+    if shape == EntitySurfaceShape::ByBranch {
         fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
     }
     fields
 }
 
-fn arrow_data_type_for_schema_column_type(column_type: SchemaColumnType) -> DataType {
+fn arrow_data_type_for_entity_column_type(column_type: EntityColumnType) -> DataType {
     match column_type {
-        SchemaColumnType::String | SchemaColumnType::Json => DataType::Utf8,
-        SchemaColumnType::Integer => DataType::Int64,
-        SchemaColumnType::Number => DataType::Float64,
-        SchemaColumnType::Boolean => DataType::Boolean,
-        SchemaColumnType::Timestamptz => {
+        EntityColumnType::String | EntityColumnType::Json => DataType::Utf8,
+        EntityColumnType::Integer => DataType::Int64,
+        EntityColumnType::Number => DataType::Float64,
+        EntityColumnType::Boolean => DataType::Boolean,
+        EntityColumnType::Timestamptz => {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         }
     }
@@ -409,7 +402,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SchemaSurfaceShape, derive_schema_surface_spec_from_schema, schema_surface_schema,
+        EntitySurfaceShape, derive_entity_surface_spec_from_schema, entity_surface_schema,
     };
 
     fn path_value_schema(value_type: &str) -> serde_json::Value {
@@ -426,7 +419,7 @@ mod tests {
 
     #[test]
     fn certifies_complete_path_value_rows_when_value_accepts_all_json() {
-        let spec = derive_schema_surface_spec_from_schema(&path_value_schema("jsonb"))
+        let spec = derive_entity_surface_spec_from_schema(&path_value_schema("jsonb"))
         .expect("schema should derive");
 
         assert!(spec.certifies_path_value_replacement);
@@ -434,11 +427,11 @@ mod tests {
 
     #[test]
     fn columnar_snapshot_certificate_requires_exact_reversible_columns() {
-        let strings = derive_schema_surface_spec_from_schema(&path_value_schema("text"))
+        let strings = derive_entity_surface_spec_from_schema(&path_value_schema("text"))
         .expect("string schema should derive");
         assert!(strings.columnar_snapshot_bijective);
 
-        let numbers = derive_schema_surface_spec_from_schema(&path_value_schema("float8"))
+        let numbers = derive_entity_surface_spec_from_schema(&path_value_schema("float8"))
         .expect("number schema should derive");
         assert!(!numbers.columnar_snapshot_bijective);
 
@@ -447,7 +440,7 @@ mod tests {
             .as_array_mut()
             .expect("columns")
             .push(json!({ "name": "lixcol_user_value", "type": "text", "nullable": true }));
-        let reserved = derive_schema_surface_spec_from_schema(&reserved)
+        let reserved = derive_entity_surface_spec_from_schema(&reserved)
             .expect("reserved-name schema should still derive");
         assert!(!reserved.columnar_snapshot_bijective);
     }
@@ -455,13 +448,13 @@ mod tests {
     #[test]
     fn does_not_certify_path_value_rows_with_value_constraints() {
         let schema = path_value_schema("text");
-        let spec = derive_schema_surface_spec_from_schema(&schema).expect("schema should derive");
+        let spec = derive_entity_surface_spec_from_schema(&schema).expect("schema should derive");
         assert!(!spec.certifies_path_value_replacement);
     }
 
     #[test]
     fn history_primary_key_columns_are_non_null() {
-        let spec = derive_schema_surface_spec_from_schema(&json!({
+        let spec = derive_entity_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "localized_document",
             "columns": [
@@ -474,7 +467,7 @@ mod tests {
         }))
         .expect("schema should derive");
 
-        let history = schema_surface_schema(&spec, SchemaSurfaceShape::History);
+        let history = entity_surface_schema(&spec, EntitySurfaceShape::History);
         assert!(
             !history
                 .field_with_name("tenant")
@@ -494,7 +487,7 @@ mod tests {
                 .is_nullable()
         );
 
-        let active = schema_surface_schema(&spec, SchemaSurfaceShape::Active);
+        let active = entity_surface_schema(&spec, EntitySurfaceShape::Active);
         assert!(
             !active
                 .field_with_name("tenant")
@@ -506,7 +499,7 @@ mod tests {
 
     #[test]
     fn columnar_layout_fingerprint_distinguishes_string_from_json_utf8() {
-        let string_spec = derive_schema_surface_spec_from_schema(&json!({
+        let string_spec = derive_entity_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "payload",
             "columns": [
@@ -516,7 +509,7 @@ mod tests {
             "primary_key": ["id"],
         }))
         .expect("string spec");
-        let json_spec = derive_schema_surface_spec_from_schema(&json!({
+        let json_spec = derive_entity_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "payload",
             "columns": [
@@ -595,7 +588,7 @@ mod tests {
             }),
         ];
         for schema in cases {
-            let spec = derive_schema_surface_spec_from_schema(&schema).expect("spec");
+            let spec = derive_entity_surface_spec_from_schema(&schema).expect("spec");
             assert!(
                 spec.indexed_columns.is_empty() || spec.has_inter_row_constraints,
                 "{} declares indexed columns without inter-row constraints",
@@ -603,7 +596,7 @@ mod tests {
             );
         }
 
-        let unique = derive_schema_surface_spec_from_schema(&json!({
+        let unique = derive_entity_surface_spec_from_schema(&json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "bypass_unique",
             "columns": [

@@ -5,10 +5,19 @@ const PLUGIN_STORAGE_ROOT_PREFIX: &str = "/.lix/plugins/";
 pub const PLUGIN_ARCHIVE_FILE_EXTENSION: &str = ".lixplugin";
 const PLUGIN_ARCHIVE_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x6c69782d_706c_7567_696e_2d6172636869);
+const PLUGIN_WASM_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6c69782d_706c_7567_696e_2d7761736d);
 const PLUGIN_ARCHIVE_DELETE_ORIGIN_PREFIX: &str = "plugin_archive_delete:";
 
 pub fn plugin_storage_archive_file_id(plugin_key: &str) -> String {
     uuid::Uuid::new_v5(&PLUGIN_ARCHIVE_ID_NAMESPACE, plugin_key.as_bytes()).to_string()
+}
+
+/// Returns the reserved state identity for the extracted WASM component of a
+/// plugin.  The registry hash remains selection metadata; this identity is
+/// the authenticated BlobRef owner used by every committed and staged load.
+pub fn plugin_storage_wasm_file_id(plugin_key: &str) -> String {
+    uuid::Uuid::new_v5(&PLUGIN_WASM_ID_NAMESPACE, plugin_key.as_bytes()).to_string()
 }
 
 pub fn plugin_storage_archive_path(plugin_key: &str) -> String {
@@ -70,7 +79,7 @@ mod tests {
 
     use super::{
         plugin_archive_file_id_matches, plugin_key_from_archive_path,
-        plugin_storage_archive_file_id, plugin_storage_archive_path,
+        plugin_storage_archive_file_id, plugin_storage_archive_path, plugin_storage_wasm_file_id,
         reject_normal_plugin_storage_mutation,
     };
 
@@ -114,6 +123,15 @@ mod tests {
         ] {
             assert!(!plugin_archive_file_id_matches(file_id, "plugin_json"));
         }
+    }
+
+    #[test]
+    fn wasm_owner_id_is_deterministic_and_distinct_from_archive_id() {
+        let archive = plugin_storage_archive_file_id("plugin_json");
+        let wasm = plugin_storage_wasm_file_id("plugin_json");
+        assert_eq!(wasm, plugin_storage_wasm_file_id("plugin_json"));
+        assert_ne!(archive, wasm);
+        assert_ne!(wasm, plugin_storage_wasm_file_id("plugin_json_replacement"));
     }
 
     #[test]

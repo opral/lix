@@ -21,29 +21,26 @@ pub(crate) fn primary_session_branch_physical_key() -> String {
 const GET_SQL: &str = "SELECT value \
     FROM lix_key_value_by_branch \
     WHERE key = $1 \
-      AND lixcol_branch_id = $2 \
-      AND lixcol_untracked = true";
+      AND lixcol_branch_id = $2";
 
 const ENTRIES_SQL: &str = "SELECT key, value \
     FROM lix_key_value_by_branch \
     WHERE lixcol_branch_id = $1 \
-      AND lixcol_untracked = true \
     ORDER BY key";
 
 const SET_SQL: &str = "INSERT INTO lix_key_value_by_branch \
-    (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-    VALUES ($1, $2, $3, true, true) \
+    (key, value, lixcol_branch_id, lixcol_global) \
+    VALUES ($1, $2, $3, true) \
     ON CONFLICT (key, lixcol_branch_id) \
     DO UPDATE SET value = excluded.value";
 
 const DELETE_SQL: &str = "DELETE FROM lix_key_value_by_branch \
     WHERE key = $1 \
-      AND lixcol_branch_id = $2 \
-      AND lixcol_untracked = true";
+      AND lixcol_branch_id = $2";
 
 /// A borrowed handle to client-local JSON state stored by Lix.
 ///
-/// Client state is represented by ordinary global, untracked
+/// Client state is represented by ordinary global
 /// `lix_key_value` rows in the storage backing this Lix handle. The handle
 /// therefore uses the same SQL transaction, validation, and commit path as
 /// other Lix state while keeping logical client keys separate from built-in KV

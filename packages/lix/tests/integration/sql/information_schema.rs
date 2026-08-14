@@ -3,61 +3,12 @@ use lix::{LixError, Value};
 use super::assert_rows_eq;
 
 simulation_test!(
-    information_schema_never_exposes_raw_snapshot_content,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"snapshot_column_absence\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
-                   false,\
-                   false\
-                 )",
-                &[],
-            )
-            .await
-            .expect("registered schema insert should succeed");
-
-        let table_columns = session
-            .execute(
-                "SELECT table_name \
-                 FROM information_schema.columns \
-                 WHERE column_name = 'lixcol_snapshot_content'",
-                &[],
-            )
-            .await
-            .expect("table column catalog should be readable");
-        assert!(table_columns.rows().is_empty());
-
-        let function_columns = session
-            .execute(
-                "SELECT function_name \
-                 FROM information_schema.table_functions \
-                 WHERE result_column = 'lixcol_snapshot_content'",
-                &[],
-            )
-            .await
-            .expect("table-function column catalog should be readable");
-        assert!(function_columns.rows().is_empty());
-    }
-);
-
-simulation_test!(
     information_schema_columns_select_star_is_safe_for_public_results,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -118,7 +69,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -128,7 +79,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_column_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"title\",\"type\":\"text\",\"nullable\":false},{\"name\":\"note\",\"type\":\"text\",\"nullable\":true},{\"name\":\"count\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"ratio\",\"type\":\"float8\",\"nullable\":false},{\"name\":\"active\",\"type\":\"boolean\",\"nullable\":false},{\"name\":\"metadata\",\"type\":\"jsonb\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                   lix_json('{\"x-lix-key\":\"engine_column_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"title\":{\"type\":\"string\"},\"note\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"},\"active\":{\"type\":\"boolean\"},\"metadata\":{\"type\":\"object\"}},\"required\":[\"id\",\"title\",\"count\",\"ratio\",\"active\",\"metadata\"],\"additionalProperties\":false}'),\
                    false,\
                    false\
                  )",
@@ -140,7 +91,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_no_pk_contract\",\"columns\":[{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"name\"]}' AS JSONB),\
+                   lix_json('{\"x-lix-key\":\"engine_no_pk_contract\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}'),\
                    false,\
                    false\
                  )",
@@ -152,7 +103,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"columns\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"table_name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                   lix_json('{\"x-lix-key\":\"columns\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"table_name\":{\"type\":\"string\"}},\"required\":[\"id\",\"table_name\"],\"additionalProperties\":false}'),\
                    false,\
                    false\
                  )",
@@ -180,7 +131,7 @@ simulation_test!(
             ]],
         );
 
-        let read_only_row_contract = session
+        let read_only_entity_contract = session
             .execute(
                 "SELECT table_name, column_name, lix_insert_policy \
                  FROM information_schema.columns \
@@ -190,9 +141,9 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("read-only generated schema surfaces should introspect");
+            .expect("read-only generated entity surfaces should introspect");
         assert_rows_eq(
-            read_only_row_contract,
+            read_only_entity_contract,
             vec![vec![
                 Value::Text("lix_commit".to_string()),
                 Value::Text("id".to_string()),
@@ -236,7 +187,7 @@ simulation_test!(
                     Value::Text("id".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Text("uuidv7()".to_string()),
+                    Value::Text("lix_uuid_v7()".to_string()),
                     Value::Null,
                     Value::Text("DEFAULT".to_string()),
                 ],
@@ -300,7 +251,7 @@ simulation_test!(
                     Value::Text("id".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Text("uuidv7()".to_string()),
+                    Value::Text("lix_uuid_v7()".to_string()),
                     Value::Text("DEFAULT".to_string()),
                 ],
             ],
@@ -350,18 +301,18 @@ simulation_test!(
                    table_name = 'engine_column_contract' \
                    AND column_name IN (\
                      'lixcol_change_id', 'lixcol_commit_id', 'lixcol_created_at', \
-                     'lixcol_row_pk', 'lixcol_global', 'lixcol_schema_key', \
-                     'lixcol_untracked', 'lixcol_updated_at'\
+                     'lixcol_entity_pk', 'lixcol_global', 'lixcol_schema_key', \
+                     'lixcol_updated_at'\
                    )\
                  ) OR (\
                    table_name = 'engine_no_pk_contract' \
-                   AND column_name = 'lixcol_row_pk'\
+                   AND column_name = 'lixcol_entity_pk'\
                  ) \
                  ORDER BY table_name, column_name",
                 &[],
             )
             .await
-            .expect("row system-column contract query should succeed");
+            .expect("entity system-column contract query should succeed");
         assert_rows_eq(
             identity_contract,
             vec![
@@ -388,17 +339,17 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
+                    Value::Text("lixcol_entity_pk".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                    Value::Text("CONDITIONAL".to_string()),
+                ],
+                vec![
+                    Value::Text("engine_column_contract".to_string()),
                     Value::Text("lixcol_global".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Text("FALSE".to_string()),
                     Value::Text("DEFAULT".to_string()),
-                ],
-                vec![
-                    Value::Text("engine_column_contract".to_string()),
-                    Value::Text("lixcol_row_pk".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
-                    Value::Text("CONDITIONAL".to_string()),
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
@@ -409,13 +360,6 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
-                    Value::Text("lixcol_untracked".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("FALSE".to_string()),
-                    Value::Text("DEFAULT".to_string()),
-                ],
-                vec![
-                    Value::Text("engine_column_contract".to_string()),
                     Value::Text("lixcol_updated_at".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
@@ -423,10 +367,10 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("engine_no_pk_contract".to_string()),
-                    Value::Text("lixcol_row_pk".to_string()),
+                    Value::Text("lixcol_entity_pk".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
-                    Value::Text("CONDITIONAL".to_string()),
+                    Value::Text("REQUIRED".to_string()),
                 ],
             ],
         );
@@ -437,8 +381,7 @@ simulation_test!(
                  FROM information_schema.columns \
                  WHERE table_name IN ('lix_file', 'lix_directory') \
                    AND column_name IN (\
-                     'lixcol_created_at', 'lixcol_global', \
-                     'lixcol_untracked', 'lixcol_updated_at'\
+                     'lixcol_created_at', 'lixcol_global', 'lixcol_updated_at'\
                    ) \
                  ORDER BY table_name, column_name",
                 &[],
@@ -458,13 +401,6 @@ simulation_test!(
                 vec![
                     Value::Text(table_name.to_string()),
                     Value::Text("lixcol_global".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("FALSE".to_string()),
-                    Value::Text("DEFAULT".to_string()),
-                ],
-                vec![
-                    Value::Text(table_name.to_string()),
-                    Value::Text("lixcol_untracked".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Text("FALSE".to_string()),
                     Value::Text("DEFAULT".to_string()),
@@ -493,7 +429,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("row history nullability contract query should succeed");
+            .expect("entity history nullability contract query should succeed");
         assert_rows_eq(
             history_contract,
             vec![
@@ -554,9 +490,9 @@ simulation_test!(
                 ("json_value", Some("JSON")) => (
                     Value::Text("{\"phase\":\"insert\"}".to_string()),
                     Value::Text("{\"phase\":\"insert\"}".to_string()),
-                    Value::Json(serde_json::json!({"phase": "insert"}).into()),
+                    Value::Json(serde_json::json!({"phase": "insert"})),
                     Value::Text("{\"phase\":\"update\"}".to_string()),
-                    Value::Json(serde_json::json!({"phase": "update"}).into()),
+                    Value::Json(serde_json::json!({"phase": "update"})),
                 ),
                 ("content", None) => (
                     Value::Text("before".to_string()),
@@ -572,7 +508,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -582,7 +518,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_scalar_cast_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"text_value\",\"type\":\"text\",\"nullable\":false},{\"name\":\"integer_value\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"number_value\",\"type\":\"float8\",\"nullable\":false},{\"name\":\"boolean_value\",\"type\":\"boolean\",\"nullable\":false},{\"name\":\"json_value\",\"type\":\"jsonb\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                   lix_json('{\"x-lix-key\":\"engine_scalar_cast_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"text_value\":{\"type\":\"string\"},\"integer_value\":{\"type\":\"integer\"},\"number_value\":{\"type\":\"number\"},\"boolean_value\":{\"type\":\"boolean\"},\"json_value\":{\"type\":\"object\"}},\"required\":[\"id\",\"text_value\",\"integer_value\",\"number_value\",\"boolean_value\",\"json_value\"],\"additionalProperties\":false}'),\
                    false,\
                    false\
                  )",
@@ -633,7 +569,7 @@ simulation_test!(
                 }
             })
             .collect::<Vec<_>>();
-        assert_eq!(contracts.len(), 6, "expected five row types plus BYTEA");
+        assert_eq!(contracts.len(), 6, "expected five entity types plus BYTEA");
 
         for contract in &contracts {
             let expected_type = match contract.column_name.as_str() {
@@ -663,19 +599,19 @@ simulation_test!(
             assert_rows_eq(select_cast, vec![vec![select_expected]]);
         }
 
-        let row_contracts = contracts
+        let entity_contracts = contracts
             .iter()
             .filter(|contract| contract.table_name == "engine_scalar_cast_contract")
             .collect::<Vec<_>>();
-        let row_columns = row_contracts
+        let entity_columns = entity_contracts
             .iter()
             .map(|contract| contract.column_name.clone())
             .collect::<Vec<_>>();
-        let insert_params = row_contracts
+        let insert_params = entity_contracts
             .iter()
             .map(|contract| values_for_contract(contract).0)
             .collect::<Vec<_>>();
-        let insert_casts = row_contracts
+        let insert_casts = entity_contracts
             .iter()
             .enumerate()
             .map(|(index, contract)| format!("CAST(${} AS {})", index + 1, contract.data_type))
@@ -684,19 +620,19 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO engine_scalar_cast_contract ({}) VALUES ({})",
-                    row_columns.join(", "),
+                    entity_columns.join(", "),
                     insert_casts.join(", ")
                 ),
                 &insert_params,
             )
             .await
-            .expect("all advertised row casts should work in a bound INSERT");
+            .expect("all advertised entity casts should work in a bound INSERT");
 
         let inserted = session
             .execute(
                 &format!(
                     "SELECT {} FROM engine_scalar_cast_contract",
-                    row_columns.join(", ")
+                    entity_columns.join(", ")
                 ),
                 &[],
             )
@@ -705,18 +641,18 @@ simulation_test!(
         assert_rows_eq(
             inserted,
             vec![
-                row_contracts
+                entity_contracts
                     .iter()
                     .map(|contract| values_for_contract(contract).2)
                     .collect(),
             ],
         );
 
-        let update_params = row_contracts
+        let update_params = entity_contracts
             .iter()
             .map(|contract| values_for_contract(contract).3)
             .collect::<Vec<_>>();
-        let update_casts = row_contracts
+        let update_casts = entity_contracts
             .iter()
             .enumerate()
             .map(|(index, contract)| {
@@ -737,12 +673,12 @@ simulation_test!(
                 &update_params,
             )
             .await
-            .expect("all advertised row casts should work in a bound UPDATE");
+            .expect("all advertised entity casts should work in a bound UPDATE");
         let updated = session
             .execute(
                 &format!(
                     "SELECT {} FROM engine_scalar_cast_contract",
-                    row_columns.join(", ")
+                    entity_columns.join(", ")
                 ),
                 &[],
             )
@@ -751,7 +687,7 @@ simulation_test!(
         assert_rows_eq(
             updated,
             vec![
-                row_contracts
+                entity_contracts
                     .iter()
                     .map(|contract| values_for_contract(contract).4)
                     .collect(),
@@ -871,7 +807,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1066,7 +1002,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_default_identity_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"name\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                   lix_json('{\"x-lix-key\":\"engine_default_identity_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                    false,\
                    false\
                  )",
@@ -1080,7 +1016,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("omitted typed-row primary key should generate");
+            .expect("omitted typed-entity primary key should generate");
 
         let generated = session
             .execute(
@@ -1088,7 +1024,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("generated typed row should be readable");
+            .expect("generated typed entity should be readable");
         let [Value::Text(id)] = generated.rows()[0].values() else {
             panic!("expected generated text identity");
         };
@@ -1202,12 +1138,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_row_upsert_materializes_omitted_defaults_in_excluded,
+    typed_entity_upsert_materializes_omitted_defaults_in_excluded,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1217,7 +1153,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_excluded_typed_default\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"status\",\"type\":\"text\",\"nullable\":false,\"default_value\":\"fresh\"},{\"name\":\"mirror\",\"type\":\"text\",\"nullable\":true},{\"name\":\"identity_copy\",\"type\":\"jsonb\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                   lix_json('{\"x-lix-key\":\"engine_excluded_typed_default\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"status\":{\"type\":\"string\",\"default\":\"fresh\"},\"mirror\":{\"type\":\"string\"},\"identity_copy\":{\"type\":\"array\"}},\"required\":[\"id\",\"status\"],\"additionalProperties\":false}'),\
                    false,\
                    false\
                  )",
@@ -1238,11 +1174,11 @@ simulation_test!(
                 "INSERT INTO engine_excluded_typed_default (id) VALUES ('same') \
                  ON CONFLICT (id) DO UPDATE \
                  SET mirror = excluded.status, \
-                     identity_copy = excluded.lixcol_row_pk",
+                     identity_copy = excluded.lixcol_entity_pk",
                 &[],
             )
             .await
-            .expect("typed row upsert should succeed");
+            .expect("typed entity upsert should succeed");
 
         assert_rows_eq(
             session
@@ -1255,15 +1191,35 @@ simulation_test!(
                 .expect("updated row should be readable"),
             vec![vec![
                 Value::Text("fresh".to_string()),
-                Value::Json(serde_json::json!(["same"]).into()),
+                Value::Json(serde_json::json!(["same"])),
             ]],
         );
+
+        session
+            .execute(
+                "INSERT INTO engine_excluded_typed_default (status) VALUES ('generated') \
+                 ON CONFLICT (id) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect("typed upsert should materialize a defaulted primary key");
+        let generated = session
+            .execute(
+                "SELECT id FROM engine_excluded_typed_default WHERE status = 'generated'",
+                &[],
+            )
+            .await
+            .expect("generated upsert row should be readable");
+        let [Value::Text(id)] = generated.rows()[0].values() else {
+            panic!("expected generated typed-upsert identity");
+        };
+        assert!(!id.is_empty());
 
         let mismatched_identity = session
             .execute(
                 "INSERT INTO engine_excluded_typed_default \
-                 (id, status, lixcol_row_pk) \
-                 VALUES ('different', 'corrupted', CAST('[\"same\"]' AS JSONB)) \
+                 (id, status, lixcol_entity_pk) \
+                 VALUES ('different', 'corrupted', lix_json('[\"same\"]')) \
                  ON CONFLICT (id) DO UPDATE SET status = excluded.status",
                 &[],
             )
@@ -1281,7 +1237,7 @@ simulation_test!(
             vec![vec![Value::Text("old".to_string())]],
         );
 
-        for column_name in ["lixcol_global", "lixcol_untracked"] {
+        for column_name in ["lixcol_global"] {
             let error = session
                 .execute(
                     &format!(
@@ -1303,7 +1259,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("row INSERT RETURNING should expose its final snapshot");
+            .expect("entity INSERT RETURNING should expose its final snapshot");
         assert_eq!(inserted_returning.rows_affected(), 1);
         assert_eq!(inserted_returning.columns(), ["id", "inserted_status"]);
         assert_rows_eq(
@@ -1321,7 +1277,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("row UPDATE RETURNING should expose the post-update snapshot");
+            .expect("entity UPDATE RETURNING should expose the post-update snapshot");
         assert_eq!(updated_returning.rows_affected(), 1);
         assert_eq!(updated_returning.columns(), ["id", "updated_status"]);
         assert_rows_eq(
@@ -1356,12 +1312,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    nullable_columns_are_optional_on_insert,
+    required_nullable_columns_separate_read_and_insert_contracts,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1370,7 +1326,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
-                 VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_required_nullable_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"payload\",\"type\":\"jsonb\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB))",
+                 VALUES (lix_json('{\"x-lix-key\":\"engine_required_nullable_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"payload\":{\"type\":[\"object\",\"null\"]}},\"required\":[\"id\",\"payload\"],\"additionalProperties\":false}'))",
                 &[],
             )
             .await
@@ -1389,21 +1345,25 @@ simulation_test!(
                 .expect("required nullable column should introspect"),
             vec![vec![
                 Value::Text("YES".to_string()),
-                Value::Text("OPTIONAL".to_string()),
+                Value::Text("REQUIRED".to_string()),
             ]],
         );
-        session
+        let omission_error = session
             .execute(
                 "INSERT INTO engine_required_nullable_contract (id) VALUES ('omitted')",
                 &[],
             )
             .await
-            .expect("nullable column may be omitted");
+            .expect_err("required nullable column must not be omittable");
+        assert!(
+            omission_error.message.contains("payload"),
+            "{omission_error:?}"
+        );
 
         session
             .execute(
                 "INSERT INTO engine_required_nullable_contract (id, payload) \
-                 VALUES ('explicit-null', CAST('null' AS JSONB))",
+                 VALUES ('explicit-null', lix_json('null'))",
                 &[],
             )
             .await
@@ -1424,15 +1384,12 @@ simulation_test!(
                 .execute(
                     "DELETE FROM engine_required_nullable_contract \
                      WHERE id = 'explicit-null' \
-                     RETURNING payload, CAST('null' AS JSONB)",
+                     RETURNING payload, lix_json('null')",
                     &[],
                 )
                 .await
                 .expect("DELETE RETURNING should match SELECT null semantics"),
-            vec![vec![
-                Value::Null,
-                Value::Json(serde_json::Value::Null.into()),
-            ]],
+            vec![vec![Value::Null, Value::Json(serde_json::Value::Null)]],
         );
     }
 );
@@ -1443,7 +1400,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1452,7 +1409,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
-                 VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_bigint_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"count\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"ratio\",\"type\":\"float8\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB))",
+                 VALUES (lix_json('{\"x-lix-key\":\"engine_bigint_contract\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"}},\"required\":[\"id\",\"count\"],\"additionalProperties\":false}'))",
                 &[],
             )
             .await
@@ -1498,7 +1455,7 @@ simulation_test!(
             session
                 .execute(
                     "SELECT count FROM engine_bigint_contract_history() \
-                       WHERE lixcol_row_pk = CAST('[\"integral-real\"]' AS JSONB)",
+                       WHERE lixcol_entity_pk = lix_json('[\"integral-real\"]')",
                     &[],
                 )
                 .await
@@ -1647,7 +1604,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session()
+                .open_workspace_session()
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1656,7 +1613,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
-                 VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_arithmetic_update\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"quantity\",\"type\":\"int8\",\"nullable\":true},{\"name\":\"order_key\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"line_number\",\"type\":\"int8\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB))",
+                 VALUES (lix_json('{\"x-lix-key\":\"engine_arithmetic_update\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"quantity\":{\"type\":[\"integer\",\"null\"]},\"order_key\":{\"type\":\"integer\"},\"line_number\":{\"type\":[\"integer\",\"null\"]}},\"required\":[\"id\",\"quantity\",\"order_key\",\"line_number\"],\"additionalProperties\":false}'))",
                 &[],
             )
             .await

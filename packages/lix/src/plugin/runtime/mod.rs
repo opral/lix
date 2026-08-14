@@ -22,14 +22,13 @@ mod create_context;
 mod incremental;
 mod install;
 mod manifest;
-mod materializer;
 mod registry;
 mod storage;
 
 pub(crate) use actor::{
     DEFAULT_MAX_LIVE_PLUGIN_STORES, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
     PluginActorKey, PluginActorLease, PluginActorStagedCheckpoint, PluginActorStore,
-    PluginActorStorePermit, PluginObservation, PluginRowAuthorities, PluginRowAuthorityRange,
+    PluginActorStorePermit, PluginEntityAuthorities, PluginEntityAuthorityRange, PluginObservation,
 };
 pub(crate) use archive::{ParsedPluginArchive, parse_plugin_archive_for_install};
 pub(crate) use component::{DEFAULT_PLUGIN_MEMORY_BYTES, PluginRuntimeHost};
@@ -40,30 +39,31 @@ pub(crate) use create_context::{
     validate_create_changes, validate_create_reservation,
 };
 pub(crate) use incremental::{
-    ArcByteSource, FileBytesSha256, LiveBatchRowSource, SchemaAllowlist,
+    ArcByteSource, FileBytesSha256, SchemaAllowlist, StateRowEntitySource,
     ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
-    VecRowChangeSource, VecRowConflictSource, VecRowSource, build_file_update_splices,
+    VecEntityChangeSource, VecEntityConflictSource, VecEntitySource, build_file_update_splices,
     canonicalize_snapshot, certify_dense_fresh_file, drain_conflict_transition_resolutions,
-    drain_file_transition_changes, drain_row_transition_edits, host_row_change_with_lazy_snapshot,
-    host_row_with_lazy_snapshot, transport_splice_preserves_prefix_exclusion,
+    drain_entity_transition_edits, drain_file_transition_changes,
+    host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
+    materialize_certified_entity_batch, transport_splice_preserves_prefix_exclusion,
     transport_splice_preserves_utf8,
 };
 pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_archive_path};
 pub(crate) use manifest::{
     PluginContentMatcher, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
 };
-pub(crate) use materializer::plugin_state_hot_state_projection;
 pub(crate) use registry::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginCatalogCache,
     PluginFileOwner, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
-    collect_gc_wasm_blob_roots, load_plugin_registry_at_commit,
+    load_plugin_registry_on_historical_view,
 };
 #[cfg(test)]
 pub(crate) use storage::plugin_storage_archive_path;
 pub(crate) use storage::{
     is_plugin_storage_path, plugin_archive_delete_origin, plugin_archive_file_id_matches,
     plugin_key_from_archive_delete_origin, plugin_key_from_archive_path,
-    plugin_storage_archive_file_id, reject_normal_plugin_storage_mutation,
+    plugin_storage_archive_file_id, plugin_storage_wasm_file_id,
+    reject_normal_plugin_storage_mutation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

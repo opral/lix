@@ -12,7 +12,7 @@ const LIX_COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const LIX_FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const LIX_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-const LIX_CHECKPOINT_SCHEMA_KEY: &str = "lix_checkpoint";
+pub(crate) const LIX_CHECKPOINT_SCHEMA_KEY: &str = "lix_checkpoint";
 const LIX_UNDO_REDO_MARKER_SCHEMA_KEY: &str = "lix_undo_redo_marker";
 const LIX_COLLECTION_GENERATION_SCHEMA_KEY: &str = "lix_collection_generation";
 

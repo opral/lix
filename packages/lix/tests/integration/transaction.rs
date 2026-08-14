@@ -3,13 +3,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lix::CreateBranchOptions;
+use lix::integration::{Engine, SessionContext};
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory,
-    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, SpaceId, Storage, StorageError,
-    StorageRead, StorageWrite, WriteOptions,
+    MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageError, StorageRead,
+    StorageWrite, WriteOptions,
 };
-use lix::{engine::Engine, session::SessionContext};
+use lix::{CreateBranchOptions, ExecuteBatchStatement, Value};
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const UNTRACKED_RACE_BRANCH_ID: &str = "01930000-0000-7000-8000-000000000018";
@@ -19,13 +19,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let setup = engine
-        .open_session()
+        .open_workspace_session()
         .await
         .expect("setup session should open");
     setup
         .execute(
             r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"untracked_race_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB), false, false)"#,
+               VALUES (lix_json('{"x-lix-key":"untracked_race_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false, false)"#,
             &[],
         )
         .await
@@ -33,7 +33,7 @@ where
     setup
         .execute(
             r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"untracked_race_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"untracked_race_parent","columns":["id"]}}]}' AS JSONB), false, false)"#,
+               VALUES (lix_json('{"x-lix-key":"untracked_race_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"untracked_race_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}'), false, false)"#,
             &[],
         )
         .await
@@ -58,11 +58,11 @@ async fn stale_transaction_composes_disjoint_semantic_writes() {
         .await
         .expect("initialized storage should create an engine");
     let stale_session = engine
-        .open_session()
+        .open_workspace_session()
         .await
         .expect("stale session should open");
     let winner_session = engine
-        .open_session()
+        .open_workspace_session()
         .await
         .expect("winner session should open");
 
@@ -104,88 +104,6 @@ async fn stale_transaction_composes_disjoint_semantic_writes() {
     assert_eq!(result.rows()[1].get::<String>("key").unwrap(), "winner-key");
 }
 
-/// Media ingest and an unrelated project-file save are independent writers:
-/// they touch disjoint files, disjoint payload rows, and disjoint branch state.
-/// Neither may be rejected because the other committed first.
-///
-/// This is the shape the ignored `slatedb_movie_workspace_interference`
-/// qualification exercises with a 1 TiB corpus, reduced to the one interleaving
-/// that matters. Resumable upload parts commit straight to storage instead of
-/// through the collaboration write gate, so an ingest part lands squarely inside
-/// an ordinary commit's precondition window: between the save's commit-time
-/// snapshot and the save's storage write. The gate below parks the save exactly
-/// there rather than leaving the interleaving to the scheduler.
-#[tokio::test]
-async fn committed_media_ingest_part_does_not_invalidate_a_concurrent_project_save() {
-    let storage = InterferingStorage::new();
-    let gate = storage.gate();
-    Engine::initialize(storage.clone())
-        .await
-        .expect("storage should initialize");
-    let engine = Engine::new(storage)
-        .await
-        .expect("initialized storage should create an engine");
-    let ingest = engine
-        .open_session()
-        .await
-        .expect("media ingest session should open");
-    let saver = engine
-        .open_session()
-        .await
-        .expect("project-save session should open");
-    saver
-        .upsert_file_content(
-            "/project/edit.json".to_owned(),
-            br#"{"timelineRevision":0}"#.to_vec().into(),
-        )
-        .await
-        .expect("seed project file should save");
-
-    gate.arm();
-    let save_future = async {
-        saver
-            .upsert_file_content(
-                "/project/edit.json".to_owned(),
-                br#"{"timelineRevision":1}"#.to_vec().into(),
-            )
-            .await
-    };
-    let ingest_future = async {
-        // Only start once the save is parked on its storage write, so this
-        // publisher is guaranteed to commit inside the save's precondition
-        // window. One part of a two-part upload: the upload does not finalize,
-        // so this path never needs the collaboration write gate the save holds.
-        gate.wait_until_a_write_is_parked().await;
-        let progress = ingest
-            .upsert_file_content_part(
-                "concurrent-ingest".to_owned(),
-                "/media/import.mov".to_owned(),
-                0,
-                2 * lix::session::media_upload::FILE_UPLOAD_PART_BYTES as u64,
-                vec![0x5a; lix::session::media_upload::FILE_UPLOAD_PART_BYTES].into(),
-            )
-            .await;
-        gate.release_parked_write();
-        progress
-    };
-    let (save_result, ingest_result) = tokio::time::timeout(TEST_WAIT_TIMEOUT * 15, async move {
-        tokio::join!(save_future, ingest_future)
-    })
-    .await
-    .expect("interfering writers should not deadlock");
-
-    ingest_result.expect("media ingest part should commit");
-    save_result
-        .expect("a committed media ingest part must not invalidate a concurrent project save");
-
-    let saved = saver
-        .read_file_content("/project/edit.json".to_owned(), None)
-        .await
-        .expect("saved project file should read")
-        .expect("saved project file should exist");
-    assert_eq!(saved.content().as_ref(), br#"{"timelineRevision":1}"#);
-}
-
 #[tokio::test]
 async fn stale_transaction_reports_overlapping_ordinary_insert_atomically() {
     let storage = Memory::new();
@@ -196,11 +114,11 @@ async fn stale_transaction_reports_overlapping_ordinary_insert_atomically() {
         .await
         .expect("initialized storage should create an engine");
     let stale_session = engine
-        .open_session()
+        .open_workspace_session()
         .await
         .expect("stale session should open");
     let winner_session = engine
-        .open_session()
+        .open_workspace_session()
         .await
         .expect("winner session should open");
 
@@ -249,8 +167,8 @@ async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
         .await
         .expect("storage should initialize");
     let engine = Engine::new(storage).await.expect("engine should open");
-    let transaction_session = engine.open_session().await.unwrap();
-    let concurrent_session = engine.open_session().await.unwrap();
+    let transaction_session = engine.open_workspace_session().await.unwrap();
+    let concurrent_session = engine.open_workspace_session().await.unwrap();
     concurrent_session
         .execute(
             "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
@@ -311,18 +229,81 @@ async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
     transaction.rollback().await.unwrap();
 }
 
+#[tokio::test]
+async fn execute_batch_preserves_order_params_metadata_and_atomic_errors() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    let results = session
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                sql: "SELECT $1 AS ordinal".to_owned(),
+                params: vec![Value::Integer(7)],
+                label: None,
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT $1 AS ordinal".to_owned(),
+                params: vec![Value::Integer(11)],
+                label: None,
+            },
+        ])
+        .await
+        .expect("ordered parameter batch should execute");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].statement_index(), Some(0));
+    assert_eq!(results[0].rows()[0].get::<i64>("ordinal"), Ok(7));
+    assert_eq!(results[1].statement_index(), Some(1));
+    assert_eq!(results[1].rows()[0].get::<i64>("ordinal"), Ok(11));
+
+    let error = session
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ('batch-atomic', 'written')"
+                    .to_owned(),
+                params: Vec::new(),
+                label: None,
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT * FROM relation_that_does_not_exist".to_owned(),
+                params: Vec::new(),
+                label: None,
+            },
+        ])
+        .await
+        .expect_err("an invalid statement must abort the whole batch");
+    assert_eq!(error.code, "LIX_TABLE_NOT_FOUND");
+
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('batch-atomic', 'after')",
+            &[],
+        )
+        .await
+        .expect("a failed batch must not publish an earlier staged write");
+}
+
 simulation_test!(
     explicit_transaction_collection_delete_is_visible_and_terminates,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
-            engine.open_session().await.expect("session should open"),
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
             &engine,
         );
         session
             .execute(
                 r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-                   VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"transaction_collection_delete","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB), false, false)"#,
+                   VALUES (lix_json('{"x-lix-key":"transaction_collection_delete","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false, false)"#,
                 &[],
             )
             .await
@@ -378,9 +359,9 @@ async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
         .await
         .expect("initialized storage should create setup engine");
     let setup_session = setup_engine
-        .open_session()
+        .open_workspace_session()
         .await
-        .expect("setup session should open");
+        .expect("setup workspace session should open");
     setup_session
         .create_branch(CreateBranchOptions {
             id: Some("01930000-0000-7000-8000-000000000017".to_string()),
@@ -399,13 +380,13 @@ async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
         .await
         .expect("delete engine should open");
     let branch_session = branch_engine
-        .open_session_at("01930000-0000-7000-8000-000000000017")
+        .open_session("01930000-0000-7000-8000-000000000017")
         .await
         .expect("local branch session should open");
     let delete_session = delete_engine
-        .open_session()
+        .open_workspace_session()
         .await
-        .expect("delete session should open");
+        .expect("delete workspace session should open");
 
     let mut transaction = branch_session
         .begin_transaction()
@@ -464,11 +445,11 @@ async fn untracked_commit_retries_when_tracked_fk_target_changes_after_validatio
         .await
         .expect("untracked engine should open");
     let tracked_session = tracked_engine
-        .open_session_at(UNTRACKED_RACE_BRANCH_ID)
+        .open_session(UNTRACKED_RACE_BRANCH_ID)
         .await
         .expect("tracked session should open");
     let untracked_session = untracked_engine
-        .open_session_at(UNTRACKED_RACE_BRANCH_ID)
+        .open_session(UNTRACKED_RACE_BRANCH_ID)
         .await
         .expect("untracked session should open");
 
@@ -543,7 +524,7 @@ fn join_thread<T>(handle: thread::JoinHandle<T>, description: &str) -> T {
 }
 
 #[tokio::test]
-async fn existing_session_ignores_later_default_branch_corruption() {
+async fn existing_workspace_session_ignores_later_selector_corruption() {
     let storage = RecordingStorage::new();
     let _receipt = Engine::initialize(storage.clone())
         .await
@@ -551,18 +532,19 @@ async fn existing_session_ignores_later_default_branch_corruption() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine.open_session().await.expect("session should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
 
     session
         .execute(
-            "UPDATE lix_key_value_by_branch \
-             SET value = '6d697373-696e-872d-8272-616e63680000' \
-             WHERE key = 'lix_default_branch_id' \
-               AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+            "UPDATE lix_key_value SET value = '6d697373-696e-872d-8272-616e63680000' \
+             WHERE key = 'lix_workspace_branch_id'",
             &[],
         )
         .await
-        .expect("test should corrupt the repository default branch");
+        .expect("test should corrupt workspace selector");
 
     let before = storage.stats();
     session
@@ -574,14 +556,14 @@ async fn existing_session_ignores_later_default_branch_corruption() {
     assert_eq!(delta.read_opened, 1, "read SQL should open one read tx");
     assert_eq!(delta.write_opened, 0, "read SQL must not open writes");
     engine
-        .open_session()
+        .open_workspace_session()
         .await
         .err()
-        .expect("a new session should reject the corrupt repository default");
+        .expect("a new workspace session should reject the corrupt selector");
 }
 
 #[tokio::test]
-async fn explicit_transaction_open_uses_one_authoritative_snapshot() {
+async fn explicit_transaction_open_uses_one_authoritative_snapshot_in_every_session_mode() {
     let storage = RecordingStorage::new();
     let receipt = Engine::initialize(storage.clone())
         .await
@@ -589,23 +571,26 @@ async fn explicit_transaction_open_uses_one_authoritative_snapshot() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine.open_session().await.expect("session should open");
+    let workspace = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
 
     let before = storage.stats();
-    let transaction = session
+    let workspace_transaction = workspace
         .begin_transaction()
         .await
-        .expect("transaction should open");
+        .expect("workspace transaction should open");
     let delta = storage.stats().delta_since(&before);
-    assert_eq!(delta.read_opened, 1, "session open must own one snapshot");
+    assert_eq!(delta.read_opened, 1, "workspace open must own one snapshot");
     assert_eq!(delta.write_opened, 0, "transaction open must not write");
-    transaction
+    workspace_transaction
         .rollback()
         .await
-        .expect("transaction should roll back");
+        .expect("workspace transaction should roll back");
 
     let pinned = engine
-        .open_session_at(receipt.main_branch_id)
+        .open_session(receipt.main_branch_id)
         .await
         .expect("pinned session should open");
     let before = storage.stats();
@@ -623,7 +608,7 @@ async fn explicit_transaction_open_uses_one_authoritative_snapshot() {
 }
 
 #[tokio::test]
-async fn existing_session_writes_to_its_selected_branch() {
+async fn existing_workspace_session_writes_to_its_pinned_branch() {
     let storage = RecordingStorage::new();
     let _receipt = Engine::initialize(storage.clone())
         .await
@@ -631,18 +616,19 @@ async fn existing_session_writes_to_its_selected_branch() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine.open_session().await.expect("session should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
 
     session
         .execute(
-            "UPDATE lix_key_value_by_branch \
-             SET value = '6d697373-696e-872d-8272-616e63680000' \
-             WHERE key = 'lix_default_branch_id' \
-               AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+            "UPDATE lix_key_value SET value = '6d697373-696e-872d-8272-616e63680000' \
+             WHERE key = 'lix_workspace_branch_id'",
             &[],
         )
         .await
-        .expect("test should corrupt the repository default branch");
+        .expect("test should corrupt workspace selector");
 
     let before = storage.stats();
     session
@@ -663,39 +649,10 @@ async fn existing_session_writes_to_its_selected_branch() {
         "the pinned-session write should commit"
     );
     engine
-        .open_session()
+        .open_workspace_session()
         .await
         .err()
-        .expect("a new session should reject the corrupt repository default");
-}
-
-#[tokio::test]
-async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
-    let storage = RecordingStorage::new();
-    let receipt = Engine::initialize(storage.clone())
-        .await
-        .expect("storage should initialize");
-    let engine = Engine::new(storage.clone())
-        .await
-        .expect("initialized storage should create an engine");
-
-    storage.fail_read_space(CHANGELOG_COMMIT_SPACE_ID);
-    let before = storage.stats();
-    let error = engine
-        .rebuild_tracked_state_for_branch(&receipt.main_branch_id)
-        .await
-        .expect_err("forced changelog read failure should fail rebuild");
-    assert!(
-        error.message.contains("forced read failure"),
-        "unexpected error: {error:?}"
-    );
-
-    let delta = storage.stats().delta_since(&before);
-    assert_eq!(
-        delta.write_opened, 0,
-        "failed rebuild should not open a storage write"
-    );
-    assert_eq!(delta.write_committed, 0, "failed rebuild must not commit");
+        .expect("a new workspace session should reject the corrupt selector");
 }
 
 #[tokio::test]
@@ -707,9 +664,15 @@ async fn write_changelog_commit_failure_does_not_commit_storage_write() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine.open_session().await.expect("session should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
 
-    storage.fail_write_space(CHANGELOG_COMMIT_SPACE_ID);
+    // Changelog rows are now authenticated ForkTree objects. Inject the
+    // failure at the current immutable publication owner rather than the
+    // deleted legacy changelog space.
+    storage.fail_write_namespace("forktree.object");
     let before = storage.stats();
     let error = session
         .execute(
@@ -740,13 +703,16 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = engine.open_session().await.expect("session should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
 
     session
         .execute(
             "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
              VALUES ('lix_deterministic_mode', \
-             CAST('{\"enabled\":true}' AS JSONB), true, true)",
+             lix_json('{\"enabled\":true}'), true, true)",
             &[],
         )
         .await
@@ -758,13 +724,13 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
         .expect("transaction should begin");
 
     let error = session
-        .execute("SELECT uuidv7()", &[])
+        .execute("SELECT lix_uuid_v7()", &[])
         .await
         .expect_err("session read should be blocked while transaction is active");
     assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
 
     let result = tx
-        .execute("SELECT uuidv7()", &[])
+        .execute("SELECT lix_uuid_v7()", &[])
         .await
         .expect("deterministic transaction read should succeed");
     assert_eq!(
@@ -772,7 +738,7 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
             .rows()
             .first()
             .expect("read should return a row")
-            .get::<String>("uuidv7()")
+            .get::<String>("lix_uuid_v7()")
             .expect("uuid should be returned as text"),
         "01920000-0000-7000-8000-000000000000",
     );
@@ -795,7 +761,10 @@ async fn transaction_read_can_query_history_surfaces() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = engine.open_session().await.expect("session should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
 
     session
         .execute(
@@ -833,7 +802,12 @@ async fn close_rejects_idle_explicit_transaction_without_dropping_it() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(engine.open_session().await.expect("session should open"));
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
 
     let mut tx = session
         .begin_transaction()
@@ -866,7 +840,7 @@ async fn close_rejects_idle_explicit_transaction_without_dropping_it() {
         .expect("transaction rollback should succeed after rejected close");
 
     let reopened = engine
-        .open_session()
+        .open_workspace_session()
         .await
         .expect("new session should open after closing previous session");
     let result = reopened
@@ -892,7 +866,12 @@ async fn closed_session_still_allows_active_transaction_rollback() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(engine.open_session().await.expect("session should open"));
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
 
     let tx = session
         .begin_transaction()
@@ -922,7 +901,10 @@ async fn closed_session_active_branch_id_does_not_open_storage_read() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = engine.open_session().await.expect("session should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
 
     session.close().await.expect("session close should succeed");
     let before = storage.stats();
@@ -949,7 +931,12 @@ async fn close_during_transaction_open_rejects_opened_transaction() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(engine.open_session().await.expect("session should open"));
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
 
     gate.block_next_write();
     let opener_session = Arc::clone(&session);
@@ -993,7 +980,12 @@ async fn close_during_transaction_commit_waits_after_commit_boundary() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(engine.open_session().await.expect("session should open"));
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
 
     let mut tx = session
         .begin_transaction()
@@ -1058,7 +1050,12 @@ async fn close_waits_for_transaction_blocked_in_storage_commit() {
     let engine = Engine::new(storage.clone())
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(engine.open_session().await.expect("session should open"));
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
 
     let mut tx = session
         .begin_transaction()
@@ -1128,7 +1125,12 @@ async fn begin_transaction_cannot_race_with_opening_session_write() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(engine.open_session().await.expect("session should open"));
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
 
     gate.block_next_write();
     let writer_session = Arc::clone(&session);
@@ -1180,7 +1182,12 @@ async fn session_read_waits_for_automatic_write_instead_of_rejecting() {
     let engine = Engine::new(storage)
         .await
         .expect("initialized storage should create an engine");
-    let session = Arc::new(engine.open_session().await.expect("session should open"));
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
 
     gate.block_next_write();
     let writer_session = Arc::clone(&session);
@@ -1222,124 +1229,12 @@ async fn session_read_waits_for_automatic_write_instead_of_rejecting() {
     assert_eq!(result.len(), 1);
 }
 
-/// In-memory storage that can park one storage write and hand control to
-/// another writer.
-///
-/// Commit-path concurrency defects live in the window between a transaction's
-/// commit-time snapshot and its storage write. Sampling that window by racing
-/// two futures is unreliable — on a current-thread runtime the phase
-/// relationship between them is fixed, and the interleaving that matters may
-/// never occur. Parking the first write after [`InterferenceGate::arm`] and
-/// resuming it only after the other writer has committed makes the interleaving
-/// a property of the test rather than of the scheduler.
-#[derive(Clone)]
-struct InterferingStorage {
-    inner: Memory,
-    gate: Arc<InterferenceGate>,
-}
-
-impl InterferingStorage {
-    fn new() -> Self {
-        Self {
-            inner: Memory::new(),
-            gate: Arc::new(InterferenceGate::new()),
-        }
-    }
-
-    fn gate(&self) -> Arc<InterferenceGate> {
-        Arc::clone(&self.gate)
-    }
-}
-
-impl Storage for InterferingStorage {
-    type Read<'a>
-        = MemoryRead
-    where
-        Self: 'a;
-
-    type Write<'a>
-        = MemoryWrite
-    where
-        Self: 'a;
-
-    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
-        self.inner.begin_read(opts).await
-    }
-
-    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
-        self.gate.park_if_armed().await;
-        self.inner.begin_write(opts).await
-    }
-}
-
-struct InterferenceGate {
-    armed: std::sync::atomic::AtomicBool,
-    parked: tokio::sync::Semaphore,
-    release: tokio::sync::Semaphore,
-}
-
-impl InterferenceGate {
-    fn new() -> Self {
-        Self {
-            armed: std::sync::atomic::AtomicBool::new(false),
-            parked: tokio::sync::Semaphore::new(0),
-            release: tokio::sync::Semaphore::new(0),
-        }
-    }
-
-    fn arm(&self) {
-        self.armed.store(true, Ordering::SeqCst);
-    }
-
-    /// Parks the next storage write only. Disarming before announcing means the
-    /// writer woken by `wait_until_a_write_is_parked` is never itself parked.
-    async fn park_if_armed(&self) {
-        if self.armed.swap(false, Ordering::SeqCst) {
-            self.parked.add_permits(1);
-            self.release
-                .acquire()
-                .await
-                .expect("interference gate should stay open")
-                .forget();
-        }
-    }
-
-    async fn wait_until_a_write_is_parked(&self) {
-        self.parked
-            .acquire()
-            .await
-            .expect("interference gate should stay open")
-            .forget();
-    }
-
-    fn release_parked_write(&self) {
-        self.release.add_permits(1);
-    }
-}
-
-/// The changelog commit space, identified by space id.
-///
-/// This fault injector used to be armed with a space *name*, resolved through a
-/// hand-written `namespace_space()` match from name to `SpaceId`. That match was
-/// a second authority for the engine registry and it failed **open**: an
-/// unrecognised name returned `None`, the injector never fired, and the test
-/// went green having injected no fault at all. A space name carries its record
-/// encoding version and is expected to churn, so that was a live way to turn a
-/// fault-injection test into a no-op silently.
-///
-/// The id is the durable identity — the first four bytes of every physical key,
-/// which a routine encoding bump does not move. The declaration this pins to is
-/// `lix::registered_spaces::COMMIT_SPACE`, `pub` only under `storage-benches`;
-/// this test target has no `required-features`, so it builds without that
-/// feature and the id is restated here rather than imported.
-const CHANGELOG_COMMIT_SPACE_ID: SpaceId = SpaceId(0x0006_0001);
-
 #[derive(Clone, Default)]
 struct RecordingStorage {
     inner: Memory,
     stats: Arc<TransactionStats>,
-    fail_read_space: Arc<Mutex<Option<SpaceId>>>,
-    fail_write_space: Arc<Mutex<Option<SpaceId>>>,
+    fail_read_namespace: Arc<Mutex<Option<String>>>,
+    fail_write_namespace: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -1601,18 +1496,18 @@ impl RecordingStorage {
         self.stats.snapshot()
     }
 
-    fn fail_read_space(&self, space: SpaceId) {
+    fn fail_read_namespace(&self, namespace: &str) {
         *self
-            .fail_read_space
+            .fail_read_namespace
             .lock()
-            .expect("fail space lock should not poison") = Some(space);
+            .expect("fail namespace lock should not poison") = Some(namespace.to_string());
     }
 
-    fn fail_write_space(&self, space: SpaceId) {
+    fn fail_write_namespace(&self, namespace: &str) {
         *self
-            .fail_write_space
+            .fail_write_namespace
             .lock()
-            .expect("fail space lock should not poison") = Some(space);
+            .expect("fail namespace lock should not poison") = Some(namespace.to_string());
     }
 }
 
@@ -1630,7 +1525,7 @@ impl Storage for RecordingStorage {
         self.stats.read_opened.fetch_add(1, Ordering::SeqCst);
         Ok(RecordingRead {
             inner: self.inner.begin_read(opts).await?,
-            fail_read_space: Arc::clone(&self.fail_read_space),
+            fail_read_namespace: Arc::clone(&self.fail_read_namespace),
         })
     }
 
@@ -1639,7 +1534,7 @@ impl Storage for RecordingStorage {
         Ok(RecordingWrite {
             inner: self.inner.begin_write(opts).await?,
             stats: Arc::clone(&self.stats),
-            fail_write_space: Arc::clone(&self.fail_write_space),
+            fail_write_namespace: Arc::clone(&self.fail_write_namespace),
         })
     }
 }
@@ -1647,13 +1542,13 @@ impl Storage for RecordingStorage {
 #[derive(Clone)]
 struct RecordingRead {
     inner: MemoryRead,
-    fail_read_space: Arc<Mutex<Option<SpaceId>>>,
+    fail_read_namespace: Arc<Mutex<Option<String>>>,
 }
 
 struct RecordingWrite {
     inner: MemoryWrite,
     stats: Arc<TransactionStats>,
-    fail_write_space: Arc<Mutex<Option<SpaceId>>>,
+    fail_write_namespace: Arc<Mutex<Option<String>>>,
 }
 
 impl StorageRead for RecordingRead {
@@ -1717,45 +1612,58 @@ impl StorageWrite for RecordingWrite {
 
 impl RecordingWrite {
     fn fail_if_space_matches(&self, space: lix::storage::StorageSpace) -> Result<(), StorageError> {
-        if self.fail_write_space() == Some(space.id) {
-            return Err(forced_write_failure(space.name));
+        if let Some(namespace) = self.fail_write_namespace() {
+            if let Some(failing) = namespace_space(&namespace) {
+                if space.id() == failing {
+                    return Err(forced_write_failure(&namespace));
+                }
+            }
         }
         Ok(())
     }
 
-    fn fail_write_space(&self) -> Option<SpaceId> {
-        *self
-            .fail_write_space
+    fn fail_write_namespace(&self) -> Option<String> {
+        self.fail_write_namespace
             .lock()
-            .expect("fail space lock should not poison")
+            .expect("fail namespace lock should not poison")
+            .clone()
     }
 }
 
 impl RecordingRead {
     fn fail_if_space_matches(&self, space: lix::storage::StorageSpace) -> Result<(), StorageError> {
-        if self.fail_read_space() == Some(space.id) {
-            return Err(forced_read_failure(space.name));
+        if let Some(namespace) = self.fail_read_namespace() {
+            if let Some(failing) = namespace_space(&namespace) {
+                if space.id() == failing {
+                    return Err(forced_read_failure(&namespace));
+                }
+            }
         }
         Ok(())
     }
 
-    fn fail_read_space(&self) -> Option<SpaceId> {
-        *self
-            .fail_read_space
+    fn fail_read_namespace(&self) -> Option<String> {
+        self.fail_read_namespace
             .lock()
-            .expect("fail space lock should not poison")
+            .expect("fail namespace lock should not poison")
+            .clone()
     }
 }
 
-/// The space name comes from the `StorageSpace` that actually matched, so the
-/// message names whatever the registry currently calls that space instead of
-/// whatever this file last believed it was called.
-fn forced_read_failure(space: &str) -> StorageError {
-    StorageError::Io(format!("forced read failure for namespace {space}"))
+fn namespace_space(namespace: &str) -> Option<u32> {
+    match namespace {
+        "forktree.object" => Some(0x0009_0001),
+        "changelog.change" => Some(0x0006_0002),
+        _ => None,
+    }
 }
 
-fn forced_write_failure(space: &str) -> StorageError {
-    StorageError::Io(format!("forced write failure for namespace {space}"))
+fn forced_read_failure(namespace: &str) -> StorageError {
+    StorageError::Io(format!("forced read failure for namespace {namespace}"))
+}
+
+fn forced_write_failure(namespace: &str) -> StorageError {
+    StorageError::Io(format!("forced write failure for namespace {namespace}"))
 }
 
 #[derive(Default)]

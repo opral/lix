@@ -3,30 +3,6 @@ pub(crate) fn compress_zstd_level_1(data: &[u8]) -> Result<Vec<u8>, String> {
     zstd::bulk::compress(data, 1).map_err(|error| error.to_string())
 }
 
-/// Reusable level-1 compressor for page/segment loops.
-///
-/// `zstd::bulk::compress` constructs a fresh context for every call. History
-/// staging emits thousands of bounded segments at scale, so retaining one
-/// context for the batch avoids repeating allocator and dictionary setup while
-/// producing the same independent zstd frames.
-#[cfg(not(target_family = "wasm"))]
-pub(crate) struct ZstdLevel1Compressor {
-    inner: zstd::bulk::Compressor<'static>,
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl ZstdLevel1Compressor {
-    pub(crate) fn new() -> Result<Self, String> {
-        zstd::bulk::Compressor::new(1)
-            .map(|inner| Self { inner })
-            .map_err(|error| error.to_string())
-    }
-
-    pub(crate) fn compress(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
-        self.inner.compress(data).map_err(|error| error.to_string())
-    }
-}
-
 #[cfg(target_family = "wasm")]
 #[expect(
     clippy::unnecessary_wraps,
@@ -37,20 +13,6 @@ pub(crate) fn compress_zstd_level_1(data: &[u8]) -> Result<Vec<u8>, String> {
         data,
         ruzstd::encoding::CompressionLevel::Fastest,
     ))
-}
-
-#[cfg(target_family = "wasm")]
-pub(crate) struct ZstdLevel1Compressor;
-
-#[cfg(target_family = "wasm")]
-impl ZstdLevel1Compressor {
-    pub(crate) fn new() -> Result<Self, String> {
-        Ok(Self)
-    }
-
-    pub(crate) fn compress(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
-        compress_zstd_level_1(data)
-    }
 }
 
 #[cfg(not(target_family = "wasm"))]

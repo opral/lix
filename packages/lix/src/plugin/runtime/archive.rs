@@ -117,7 +117,7 @@ pub(crate) fn parse_plugin_archive_for_install(
     let wasm_bytes = loaded
         .wasm
         .expect("full plugin archive load should include WASM bytes");
-    let wasm_hash = BlobId::from_content(&wasm_bytes);
+    let wasm_hash = BlobId::from_canonical_content(&wasm_bytes);
     Ok(ParsedPluginArchive {
         manifest: loaded.manifest,
         normalized_manifest_json: loaded.normalized_manifest_json,
@@ -145,7 +145,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     let wasm = loaded
         .wasm
         .expect("full plugin archive load should include WASM bytes");
-    let wasm_hash = BlobId::from_content(&wasm);
+    let wasm_hash = BlobId::from_canonical_content(&wasm);
 
     Ok(InstalledPlugin {
         key: loaded.manifest.key,
@@ -925,7 +925,7 @@ mod tests {
             assert_eq!(parsed.schemas.len(), 1);
             assert_eq!(parsed.schema_keys, ["plugin_test_note"]);
             assert_eq!(parsed.wasm_bytes, WASM);
-            assert_eq!(parsed.wasm_hash, BlobId::from_content(WASM));
+            assert_eq!(parsed.wasm_hash, BlobId::from_canonical_content(WASM));
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&parsed.normalized_manifest_json)
                     .expect("normalized manifest should remain JSON")["key"],
@@ -937,7 +937,7 @@ mod tests {
                 &archive,
             )
             .expect("canonical plugin archive should materialize");
-            assert_eq!(installed.wasm_hash, BlobId::from_content(WASM));
+            assert_eq!(installed.wasm_hash, BlobId::from_canonical_content(WASM));
         }
     }
 

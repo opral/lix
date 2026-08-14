@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use smallvec::SmallVec;
-
 use crate::catalog::CatalogFingerprint;
 use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::observe_invalidation::ObserveInvalidation;
@@ -18,8 +16,6 @@ use crate::transaction::{
     CommitBoundaryState, Transaction, TransactionCommitBoundary,
     open_transaction_with_runtime_boundary,
 };
-#[cfg(test)]
-use crate::transaction_types::{RawWriteBatch, TransactionWriteRow};
 
 use super::SessionContext;
 use super::context::{SessionWriteAccess, closed_error};
@@ -37,10 +33,6 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) has_started_statement: bool,
-    /// Reusable storage only for SQL literals containing doubled quote
-    /// escapes. Ordinary warm literals continue to borrow the SQL text.
-    pub(super) prepared_literal_escape_scratch: SmallVec<[String; 4]>,
-    pub(super) prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -62,14 +54,10 @@ where
             .await;
         let (mut opened, deterministic_runtime_guard) =
             match open_transaction_with_runtime_boundary(
-                &self.branch,
+                &self.mode,
                 self.active_account_id.to_string(),
                 self.storage.clone(),
-                Arc::clone(&self.hot_state),
-                Arc::clone(&self.tracked_state),
-                Arc::clone(&self.binary_cas),
                 self.plugin_host.clone(),
-                Arc::clone(&self.branch_ctx),
                 Arc::clone(&self.catalog_context),
                 Arc::clone(&self.sql_planning_cache),
                 self.file_views.clone(),
@@ -106,8 +94,6 @@ where
             commit_coordinator: Arc::clone(&self.commit_coordinator),
             telemetry: self.telemetry.clone(),
             has_started_statement: false,
-            prepared_literal_escape_scratch: SmallVec::new(),
-            prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape::default(),
         })
     }
 }
@@ -121,17 +107,6 @@ where
         self.transaction
             .as_mut()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn stage_test_row(
-        &mut self,
-        row: TransactionWriteRow,
-    ) -> Result<(), LixError> {
-        self.transaction_mut()?
-            .stage_engine_test_rows(RawWriteBatch::from_test_rows(vec![row]))
-            .await?;
-        Ok(())
     }
 
     pub fn active_branch_id(&self) -> Result<&str, LixError> {
