@@ -1,0 +1,82 @@
+{
+  "version": 2,
+  "canonical_types": [
+    "text",
+    "uuid",
+    "int8",
+    "float8",
+    "boolean",
+    "jsonb",
+    "timestamptz"
+  ],
+  "json_owners": [
+    {
+      "owner": "history",
+      "reason": "Immutable commit/change/checkpoint/undo history payloads and SQL history projection.",
+      "globs": [
+        "packages/lix/src/changelog/**",
+        "packages/lix/src/commit_graph/**",
+        "packages/lix/src/checkpoint.rs",
+        "packages/lix/src/undo_redo.rs",
+        "packages/lix/src/session/undo_redo.rs",
+        "packages/lix/src/sql2/*history*.rs",
+        "packages/lix/src/sql2/**/*history*.rs",
+        "packages/lix/src/sql2/change_materialization.rs"
+      ]
+    },
+    {
+      "owner": "plugin",
+      "reason": "Plugin/Wasm public wire payloads and plugin expression evaluation remain canonical JSON by contract.",
+      "globs": [
+        "packages/lix/src/plugin/**",
+        "packages/lix/src/cel/**"
+      ]
+    },
+    {
+      "owner": "declared-jsonb",
+      "reason": "Schema-v1 documents, declared jsonb SQL semantics, and final public JSONB conversion.",
+      "globs": [
+        "packages/lix-schema/**",
+        "packages/lix/src/schema/**",
+        "packages/lix/src/catalog/**",
+        "packages/lix/src/sql2/**",
+        "packages/lix/src/transaction/**",
+        "packages/lix/src/session/execute.rs",
+        "packages/lix/src/state/mod.rs",
+        "packages/lix/src/sql_profile.rs",
+        "packages/lix/src/sql_profile/**",
+        "packages/lix/src/common/types.rs",
+        "packages/lix/src/prepared_dml.rs"
+      ]
+    }
+  ],
+  "production_roots": [
+    "packages/lix/src/account.rs",
+    "packages/lix/src/branch",
+    "packages/lix/src/catalog",
+    "packages/lix/src/changelog",
+    "packages/lix/src/checkpoint.rs",
+    "packages/lix/src/client_state.rs",
+    "packages/lix/src/collection_generation.rs",
+    "packages/lix/src/commit_graph",
+    "packages/lix/src/engine.rs",
+    "packages/lix/src/entity_pk.rs",
+    "packages/lix/src/filesystem",
+    "packages/lix/src/forktree",
+    "packages/lix/src/functions/state.rs",
+    "packages/lix/src/json_store",
+    "packages/lix/src/plugin",
+    "packages/lix/src/schema",
+    "packages/lix/src/session",
+    "packages/lix/src/sql2",
+    "packages/lix/src/state",
+    "packages/lix/src/transaction",
+    "packages/lix/src/undo_redo.rs",
+    "packages/lix-schema/src"
+  ],
+  "carrier_files": [
+    "packages/lix/src/forktree/state.rs",
+    "packages/lix/src/forktree/current_pack.rs",
+    "packages/lix/src/state/mod.rs"
+  ]
+}

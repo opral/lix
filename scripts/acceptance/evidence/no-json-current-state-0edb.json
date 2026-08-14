@@ -1,0 +1,2901 @@
+{
+  "canonical_types": [
+    "boolean",
+    "float8",
+    "int8",
+    "jsonb",
+    "text",
+    "timestamptz",
+    "uuid"
+  ],
+  "compiled_surface_commands": [
+    "cargo check --workspace --all-targets --all-features",
+    "cargo test -p lix --test schema_v1_public_smoke --all-features -- --nocapture",
+    "cargo test -p lix --lib --all-features immutable_objects_and_typed_state_codecs_fail_closed -- --nocapture",
+    "cargo test -p lix --lib --all-features current_state_pack_round_trips_and_rejects_identity_substitution -- --nocapture",
+    "cargo test -p lix --lib --all-features coherent_state_point_and_range_preserve_overlay_semantics -- --nocapture",
+    "cargo test -p lix --test integration --all-features schema:: -- --nocapture",
+    "cargo test -p lix_benchmarks --test checkpoint_gc_replay_reopen --features 'storage-benches slatedb' -- --nocapture"
+  ],
+  "finding_count": 450,
+  "findings": [
+    {
+      "gate": "json-owner",
+      "line": 1,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/branch/stage_rows.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 19,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/branch/stage_rows.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 66,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 88,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 90,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 115,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 157,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 159,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 160,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 161,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 162,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 163,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 170,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 172,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/client_state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/collection_generation.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 44,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/collection_generation.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 52,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/collection_generation.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 68,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/collection_generation.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 317,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/engine.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 317,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/engine.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 323,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/engine.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 9,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 9,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 478,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 490,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 516,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 533,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 540,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 549,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 580,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 580,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 585,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 586,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 611,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 613,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 614,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 635,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 810,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 814,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 815,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 858,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 909,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 909,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 910,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 913,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 913,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 915,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 916,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 918,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 922,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 926,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/entity_pk.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 24,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 160,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 165,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 186,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 187,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 63,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 64,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 64,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 69,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 69,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 84,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 84,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 146,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 279,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 279,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 283,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 284,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 284,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 291,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 302,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 302,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 308,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 308,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 332,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 332,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 563,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 565,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 565,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 569,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 585,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 601,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 603,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 603,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 607,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 662,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 693,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 701,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 710,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 8,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 8,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 295,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 301,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 302,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 304,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 309,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 330,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 336,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 337,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 339,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 344,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 372,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 378,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1442,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1442,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1458,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1458,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1481,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1481,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1636,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1646,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 45,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 45,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 51,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 51,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 65,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 65,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 83,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 83,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 364,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/blob.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 647,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/blob.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1505,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/blob.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1505,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/blob.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1512,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/blob.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1512,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/blob.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1538,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/blob.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1538,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/blob.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 10,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 19,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 54,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 55,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 56,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 96,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 103,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 118,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 129,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 136,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 142,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 159,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 166,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 177,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 185,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 261,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 268,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 269,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 285,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 286,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 287,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 43,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/publication.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 48,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/publication.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 48,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/publication.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 50,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/publication.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4173,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4174,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4175,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4215,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4219,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4220,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4225,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4235,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4248,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4251,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4252,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4255,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4256,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4453,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4454,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4455,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 5138,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 5156,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/serving.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 78,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 607,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 621,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 793,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 793,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 801,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 805,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 807,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 816,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1195,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1198,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1199,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1200,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1352,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1366,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1524,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1538,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1559,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1559,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/view.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 5,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 5,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 83,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 135,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 137,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 150,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 150,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 152,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 152,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 152,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 158,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 189,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 190,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 195,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 198,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 198,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 198,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 204,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 219,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 229,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 236,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 244,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/mod.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 4,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/mod.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 5,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 16,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 25,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 27,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 28,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 29,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 34,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 36,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 42,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 48,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 50,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 58,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 64,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 72,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 80,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 84,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 86,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 91,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 92,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 96,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 6,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 6,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 65,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 70,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 74,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 74,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 74,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 82,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 693,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 99,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/create_branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 99,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/create_branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 106,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/create_branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 185,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/idempotency.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 198,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/idempotency.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 198,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/session/idempotency.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 231,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/idempotency.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 189,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/analysis.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 190,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/analysis.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 194,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/analysis.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 200,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/analysis.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 201,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/analysis.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 5,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 5,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 94,
+      "message": "unowned JSON residue: JsonValue",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 777,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 780,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 781,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1108,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1109,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1170,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1173,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1272,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1487,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1490,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1570,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1701,
+      "message": "unowned JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1865,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1872,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1873,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1885,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1886,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/session/merge/branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 15,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/native.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 115,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/native.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 115,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/native.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 120,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/native.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 120,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/native.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 134,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/native.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 134,
+      "message": "unowned JSON residue: JsonSlot",
+      "path": "packages/lix/src/session/merge/native.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 1,
+      "message": "unowned JSON residue: serde_json",
+      "path": "packages/lix/src/session/switch_branch.rs"
+    },
+    {
+      "gate": "json-owner",
+      "line": 120,
+      "message": "unowned JSON residue: json!(",
+      "path": "packages/lix/src/session/switch_branch.rs"
+    },
+    {
+      "gate": "carrier-authority",
+      "line": 124,
+      "message": "old StateCell string/JSON value remains authoritative",
+      "path": "packages/lix/src/forktree/state.rs"
+    },
+    {
+      "gate": "carrier-authority",
+      "line": 10,
+      "message": "legacy LIXFCV v1 current-row codec remains",
+      "path": "packages/lix/src/forktree/state.rs"
+    },
+    {
+      "gate": "no-compat-carrier",
+      "line": 537,
+      "message": "forbidden carrier residue: serde_json::from_str",
+      "path": "packages/lix/src/state/mod.rs"
+    },
+    {
+      "gate": "no-compat-carrier",
+      "line": 794,
+      "message": "forbidden carrier residue: serde_json::from_str",
+      "path": "packages/lix/src/state/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 317,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/engine.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 24,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 160,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 165,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 186,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 187,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 63,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 84,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 84,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 146,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 279,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 279,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 284,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 284,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 302,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 302,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 308,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 308,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 332,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 332,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 563,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 565,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 585,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 601,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 603,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 662,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 693,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 701,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 710,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/path_index.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1442,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1442,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1458,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1458,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1481,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1481,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/planner.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 45,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 45,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 51,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 51,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 65,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 65,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 83,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 83,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/filesystem/visibility.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 19,
+      "message": "whole-row/current-state JSON residue: json_store",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 19,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 55,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 56,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 103,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 118,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 261,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 268,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 269,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 285,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 286,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 287,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/bootstrap.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 43,
+      "message": "whole-row/current-state JSON residue: json_store",
+      "path": "packages/lix/src/forktree/publication.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 43,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/forktree/publication.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 48,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/forktree/publication.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 990,
+      "message": "whole-row/current-state JSON residue: json_store",
+      "path": "packages/lix/src/forktree/publication.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 78,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/forktree/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 135,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 137,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 150,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 150,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 152,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 152,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 190,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 195,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 198,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 198,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/functions/state.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1,
+      "message": "whole-row/current-state JSON residue: json_store",
+      "path": "packages/lix/src/json_store/fence.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 4,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 4,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 5,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 16,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 25,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 27,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 28,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 29,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 34,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 36,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 42,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 48,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 50,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 58,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 64,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 72,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 80,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 84,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 86,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 91,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 92,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 96,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/json_store/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 65,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 70,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 74,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 74,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/session/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 99,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/session/create_branch.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 537,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/state/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 794,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/state/mod.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 18,
+      "message": "whole-row/current-state JSON residue: json_store",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 18,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 390,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 390,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 391,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 392,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 598,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 606,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1174,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1174,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1175,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1176,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1551,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1559,
+      "message": "whole-row/current-state JSON residue: JsonSlot",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1909,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 2047,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 2178,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/commit.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 553,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context/cohort.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 561,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context/cohort.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 242,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 349,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 352,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 530,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 749,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 755,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1096,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1099,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 2483,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 2542,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 3551,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 6192,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 6294,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 7121,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 7121,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 7176,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 7364,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 8237,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 8904,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 8913,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 8924,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 8955,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 9085,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 9094,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 9127,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 9300,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 9306,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 9398,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 10569,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 10728,
+      "message": "whole-row/current-state JSON residue: serde_json::from_str",
+      "path": "packages/lix/src/transaction/context.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 164,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/normalization.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 187,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/normalization.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 379,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/normalization.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 440,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/normalization.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 980,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/staging.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 3116,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/staging.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 690,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1227,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 1231,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/types.rs"
+    },
+    {
+      "gate": "whole-row-json",
+      "line": 451,
+      "message": "whole-row/current-state JSON residue: snapshot_content",
+      "path": "packages/lix/src/transaction/validation.rs"
+    },
+    {
+      "gate": "dynamic-schema-native-plan",
+      "line": 1,
+      "message": "native row is not bound to and decoded through its trusted SchemaPlan identity",
+      "path": "packages/lix/src/native_row.rs"
+    },
+    {
+      "gate": "system-current-native-row",
+      "line": 545,
+      "message": "lix_commit current projection still passes through removed whole-row JSON",
+      "path": "packages/lix/src/sql2/providers/entity.rs"
+    }
+  ],
+  "head": "0edb80ab9d091b697b455f694685414b42654ac9",
+  "json_owner_inventory": {
+    "declared-jsonb": {
+      "files": {
+        "packages/lix-schema/src/ddl.rs": 2,
+        "packages/lix-schema/src/lib.rs": 4,
+        "packages/lix-schema/src/model.rs": 3,
+        "packages/lix-schema/src/row.rs": 3,
+        "packages/lix-schema/src/validate.rs": 1,
+        "packages/lix-schema/src/value_layout.rs": 17,
+        "packages/lix/src/catalog/context.rs": 15,
+        "packages/lix/src/catalog/snapshot.rs": 80,
+        "packages/lix/src/schema/builtin/mod.rs": 20,
+        "packages/lix/src/schema/compatibility.rs": 4,
+        "packages/lix/src/schema/definition.rs": 10,
+        "packages/lix/src/schema/key.rs": 8,
+        "packages/lix/src/schema/seed.rs": 4,
+        "packages/lix/src/session/execute.rs": 30,
+        "packages/lix/src/sql2/bind/expr.rs": 5,
+        "packages/lix/src/sql2/bind/statement.rs": 9,
+        "packages/lix/src/sql2/catalog/entity_surface.rs": 11,
+        "packages/lix/src/sql2/catalog/registry.rs": 6,
+        "packages/lix/src/sql2/context.rs": 4,
+        "packages/lix/src/sql2/error.rs": 5,
+        "packages/lix/src/sql2/exec/bound_public_write.rs": 199,
+        "packages/lix/src/sql2/exec/datafusion.rs": 8,
+        "packages/lix/src/sql2/exec/write.rs": 4,
+        "packages/lix/src/sql2/parse/mod.rs": 7,
+        "packages/lix/src/sql2/planning_cache.rs": 1,
+        "packages/lix/src/sql2/predicate_typecheck.rs": 3,
+        "packages/lix/src/sql2/providers/branch.rs": 13,
+        "packages/lix/src/sql2/providers/change.rs": 5,
+        "packages/lix/src/sql2/providers/diff.rs": 2,
+        "packages/lix/src/sql2/providers/directory.rs": 4,
+        "packages/lix/src/sql2/providers/entity.rs": 67,
+        "packages/lix/src/sql2/providers/file.rs": 43,
+        "packages/lix/src/sql2/providers/filesystem_working_diff.rs": 8,
+        "packages/lix/src/sql2/script.rs": 2,
+        "packages/lix/src/sql2/udfs/common.rs": 48,
+        "packages/lix/src/sql2/udfs/lix_json_get.rs": 1,
+        "packages/lix/src/sql2/udfs/lix_json_get_text.rs": 6,
+        "packages/lix/src/sql2/udfs/lix_json_predicate.rs": 1,
+        "packages/lix/src/sql2/udfs/lix_jsonb.rs": 5,
+        "packages/lix/src/sql2/udfs/mod.rs": 2,
+        "packages/lix/src/sql2/value_contract.rs": 9,
+        "packages/lix/src/state/mod.rs": 6,
+        "packages/lix/src/transaction/commit.rs": 33,
+        "packages/lix/src/transaction/context.rs": 55,
+        "packages/lix/src/transaction/context/cohort.rs": 4,
+        "packages/lix/src/transaction/normalization.rs": 14,
+        "packages/lix/src/transaction/staging.rs": 15,
+        "packages/lix/src/transaction/types.rs": 33,
+        "packages/lix/src/transaction/validation.rs": 20
+      },
+      "matches": 859,
+      "reason": "Schema-v1 documents, declared jsonb SQL semantics, and final public JSONB conversion."
+    },
+    "history": {
+      "files": {
+        "packages/lix/src/changelog/materialization.rs": 8,
+        "packages/lix/src/changelog/test_support.rs": 2,
+        "packages/lix/src/changelog/types.rs": 11,
+        "packages/lix/src/checkpoint.rs": 2,
+        "packages/lix/src/commit_graph/context.rs": 4,
+        "packages/lix/src/commit_graph/types.rs": 2,
+        "packages/lix/src/session/undo_redo.rs": 3,
+        "packages/lix/src/sql2/change_materialization.rs": 8,
+        "packages/lix/src/sql2/history_projection.rs": 12,
+        "packages/lix/src/sql2/history_route.rs": 16,
+        "packages/lix/src/sql2/providers/directory_history.rs": 11,
+        "packages/lix/src/sql2/providers/entity_history.rs": 6,
+        "packages/lix/src/sql2/providers/file_history.rs": 39,
+        "packages/lix/src/sql2/providers/history_util.rs": 3,
+        "packages/lix/src/undo_redo.rs": 2
+      },
+      "matches": 129,
+      "reason": "Immutable commit/change/checkpoint/undo history payloads and SQL history projection."
+    },
+    "plugin": {
+      "files": {
+        "packages/lix/src/plugin/runtime/archive.rs": 7,
+        "packages/lix/src/plugin/runtime/contract.rs": 15,
+        "packages/lix/src/plugin/runtime/create_context.rs": 11,
+        "packages/lix/src/plugin/runtime/default/component_runtime.rs": 14,
+        "packages/lix/src/plugin/runtime/incremental.rs": 96,
+        "packages/lix/src/plugin/runtime/install.rs": 2,
+        "packages/lix/src/plugin/runtime/manifest.rs": 6,
+        "packages/lix/src/plugin/runtime/registry.rs": 39,
+        "packages/lix/src/plugin/wire/layout.rs": 6
+      },
+      "matches": 196,
+      "reason": "Plugin/Wasm public wire payloads and plugin expression evaluation remain canonical JSON by contract."
+    }
+  },
+  "required_carrier_predicates": {
+    "dynamic_schema_native_plan": "trusted plan-bound native tuple; no missing-plan fallback",
+    "system_current_native_row": "lix_commit/lix_commit_edge derive from authenticated topology; no JSON StateCell"
+  },
+  "system_schemas": {
+    "lix_account.json": [
+      "uuid",
+      "text",
+      "text",
+      "text"
+    ],
+    "lix_binary_blob_ref.json": [
+      "text",
+      "uuid",
+      "int8"
+    ],
+    "lix_branch_descriptor.json": [
+      "boolean",
+      "uuid",
+      "text"
+    ],
+    "lix_branch_ref.json": [
+      "uuid",
+      "uuid"
+    ],
+    "lix_change.json": [
+      "uuid",
+      "text",
+      "jsonb",
+      "text",
+      "uuid",
+      "jsonb",
+      "text",
+      "text",
+      "jsonb"
+    ],
+    "lix_checkpoint.json": [
+      "uuid",
+      "uuid"
+    ],
+    "lix_collection_generation.json": [
+      "text",
+      "int8",
+      "text",
+      "text"
+    ],
+    "lix_commit.json": [
+      "uuid"
+    ],
+    "lix_commit_edge.json": [
+      "uuid",
+      "uuid",
+      "int8"
+    ],
+    "lix_directory_descriptor.json": [
+      "uuid",
+      "text",
+      "uuid"
+    ],
+    "lix_file_descriptor.json": [
+      "uuid",
+      "uuid",
+      "text"
+    ],
+    "lix_key_value.json": [
+      "text",
+      "jsonb"
+    ],
+    "lix_registered_schema.json": [
+      "text",
+      "jsonb"
+    ],
+    "lix_undo_redo_marker.json": [
+      "uuid",
+      "text",
+      "uuid",
+      "uuid",
+      "uuid",
+      "uuid"
+    ]
+  },
+  "tree": "350633e52bb40ec6a37a8b76d685ce5afd6b3329",
+  "verdict": "BLOCK",
+  "version": 2
+}

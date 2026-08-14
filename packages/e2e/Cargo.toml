@@ -241,6 +241,11 @@ path = "tests/corruption_recovery_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
+name = "no_json_current_state_acceptance"
+path = "tests/no_json_current_state_acceptance.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[test]]
 name = "crash_consistency_qualification"
 path = "tests/crash_consistency_qualification.rs"
 required-features = ["rocksdb", "server-protocol"]
