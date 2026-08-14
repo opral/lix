@@ -343,6 +343,48 @@ struct CohortSemanticCandidate {
     rank: ConflictRank,
 }
 
+fn reconcile_native_frontier(
+    base: Option<&StaleConflictPayload>,
+    candidates: &[CohortSemanticCandidate],
+    primary_key_columns: &BTreeSet<String>,
+) -> Result<Option<StaleConflictPayload>, LixError> {
+    if let [candidate] = candidates {
+        return Ok(candidate.payload.clone());
+    }
+    // Host-native column LWW is associative for successors ranked against one
+    // common base. Fold the complete frontier while its rows are decoded so a
+    // large same-base cohort does not repeatedly cross the async batch helper
+    // and decode/encode the evolving row once per writer.
+    let base = decode_stale_payload(base)?;
+    let mut current = decode_stale_payload(
+        candidates
+            .first()
+            .and_then(|candidate| candidate.payload.as_ref()),
+    )?;
+    for candidate in candidates.iter().skip(1) {
+        let next = decode_stale_payload(candidate.payload.as_ref())?;
+        current = reconcile_row(
+            row_version_ref(base.as_ref()),
+            row_version_ref(current.as_ref()),
+            row_version_ref(next.as_ref()),
+            primary_key_columns,
+            |_| Ok(None),
+        )?
+        .map(|row| DecodedStalePayload {
+            snapshot: row.snapshot,
+            metadata: row.metadata,
+        });
+    }
+    current
+        .map(|row| {
+            encoded_stale_payload(crate::plugin::runtime::ReconciledRow {
+                snapshot: row.snapshot,
+                metadata: row.metadata,
+            })
+        })
+        .transpose()
+}
+
 async fn reconcile_cohort_rows<'a, StorageImpl>(
     transaction: &mut Transaction<StorageImpl>,
     prepared: impl Iterator<Item = &'a PreparedWriteSet>,
@@ -410,12 +452,23 @@ where
         }
     }
     // Ordinary rows need replay only when at least two cohort members wrote
-    // the same identity. File-backed rows all participate because their
-    // projection must observe the complete combined delta for the file.
+    // the same identity. File-backed candidates are narrowed to plugin-owned
+    // semantic rows below because their projection must observe the complete
+    // combined semantic delta for the file.
     candidates.retain(|key, values| key.file_id.is_some() || values.len() > 1);
-    let keys = candidates.keys().cloned().collect::<Vec<_>>();
     let read = transaction.opening_read();
     let mut tracked = transaction.tracked_state.reader(&read);
+    let opening_registry =
+        load_plugin_registry_at_commit(&mut tracked, &opening_head.to_string()).await?;
+    // File-internal rows such as `lix_binary_blob_ref` are outputs of the
+    // consolidated projection below, not semantic inputs to it. Replaying
+    // them here would stage the old blob reference and then generate its
+    // successor a second time, forcing the cohort onto the serialized
+    // fallback through a duplicate-primary-key error.
+    candidates.retain(|key, _| {
+        key.file_id.is_none() || registry_owns_schema(&opening_registry, &key.schema_key)
+    });
+    let keys = candidates.keys().cloned().collect::<Vec<_>>();
     let base_rows = tracked
         .load_projected_batch_at_commit(
             &opening_head.to_string(),
@@ -423,8 +476,6 @@ where
             &ChangeRecordProjection::full(),
         )
         .await?;
-    let opening_registry =
-        load_plugin_registry_at_commit(&mut tracked, &opening_head.to_string()).await?;
     drop(tracked);
     struct CohortFrontier {
         base: Option<StaleConflictPayload>,
@@ -451,20 +502,32 @@ where
                     .binary_search_by(|schema| schema.as_str().cmp(key.schema_key.as_str()))
                     .is_ok()
         });
-        frontiers.insert(
-            key.clone(),
-            CohortFrontier {
-                base,
-                current: first.payload.clone(),
-                remaining: versions
+        let primary_key_columns = primary_keys_by_key
+            .get(key)
+            .cloned()
+            .expect("candidate row has primary-key metadata");
+        let (current, remaining) = if plugin.is_none() {
+            (
+                reconcile_native_frontier(base.as_ref(), versions, &primary_key_columns)?,
+                VecDeque::new(),
+            )
+        } else {
+            (
+                first.payload.clone(),
+                versions
                     .iter()
                     .skip(1)
                     .map(|candidate| candidate.payload.clone())
                     .collect(),
-                primary_key_columns: primary_keys_by_key
-                    .get(key)
-                    .cloned()
-                    .expect("candidate row has primary-key metadata"),
+            )
+        };
+        frontiers.insert(
+            key.clone(),
+            CohortFrontier {
+                base,
+                current,
+                remaining,
+                primary_key_columns,
                 plugin: plugin.cloned(),
             },
         );
