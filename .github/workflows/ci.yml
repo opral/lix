@@ -108,7 +108,9 @@ jobs:
 
       - name: Lint Rust workspace
         if: matrix.task == 'clippy'
-        run: cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path tooling/Cargo.toml --profile test --workspace --all-targets --all-features -- -D warnings
 
       # The one supported configuration nothing else here builds: `cfg(test)`
       # with `storage-benches` OFF, which is exactly what a plain
@@ -124,6 +126,19 @@ jobs:
       - name: Check lix test targets with default features
         if: matrix.task == 'clippy'
         run: cargo check -p lix --tests
+
+      - name: Verify stable Cargo can embed the local Rust SDK
+        if: matrix.task == 'clippy'
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal
+          rustup run 1.93.0 cargo metadata --locked --format-version 1 --no-deps --manifest-path packages/lix/Cargo.toml
+          downstream="$(mktemp -d)"
+          rustup run 1.93.0 cargo init --bin --vcs none --name downstream_lix_sdk "$downstream"
+          rustup run 1.93.0 cargo add --manifest-path "$downstream/Cargo.toml" --path "$PWD/packages/lix" --no-default-features lix
+          # Run from the consumer crate. Invoking Cargo from the Lix checkout
+          # would inherit this repository's nightly-only `.cargo/config.toml`,
+          # which a real external path dependency does not inherit.
+          (cd "$downstream" && rustup run 1.93.0 cargo check)
 
       # `--all-features` is deliberate: it is the only thing that compiles
       # feature-gated sources such as `packages/lix/src/storage_bench.rs`
@@ -151,8 +166,9 @@ jobs:
       - name: Compile Rust workspace tests
         if: matrix.task == 'test'
         run: |
-          cargo test --profile test --workspace --exclude lix_e2e --all-features --no-run
-          cargo test --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-run
+          cargo test --profile test --workspace --all-features --no-run
+          cargo test --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-run
+          cargo test --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-run
 
       - name: Run Rust workspace tests
         # Deliberately no RUST_MIN_STACK here. Tests that need more than
@@ -168,8 +184,9 @@ jobs:
         # never ran.
         if: matrix.task == 'test'
         run: |
-          cargo test --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
-          cargo test --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-fail-fast
+          cargo test --profile test --workspace --all-features --no-fail-fast
+          cargo test --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
+          cargo test --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-fail-fast
 
       # The e2e test compilation above already builds the real workspace plugin
       # artifacts. This one external fixture covers the distinct risk: whether

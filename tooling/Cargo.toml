@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+  "../packages/cli",
+  "../packages/e2e",
+]
+
+[workspace.package]
+version = "0.11.0"
+authors = ["Opral"]
+edition = "2024"
+description = "Embeddable version control for apps and AI agents."
+license = "MIT"
+homepage = "https://lix.dev"
+repository = "https://github.com/opral/lix"
+documentation = "https://docs.rs/lix"
+readme = "../README.md"
+keywords = ["version-control", "ai-agents", "semantic-diff", "change-tracking", "embeddable"]
+categories = ["development-tools", "artificial-intelligence", "filesystem"]
+rust-version = "1.93"
+
+[workspace.dependencies]
+lix = { path = "../packages/lix", version = "=0.11.0", default-features = false }
+lix_storage_filesystem = { package = "lix-storage-filesystem", path = "../packages/storage-filesystem", version = "=0.11.0", default-features = false }
+lix_storage_rocksdb = { package = "lix-storage-rocksdb", path = "../packages/storage-rocksdb", version = "=0.11.0" }
+lix_storage_slatedb = { package = "lix-storage-slatedb", path = "../packages/storage-slatedb", version = "=0.11.0" }
+mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
+
+[workspace.lints.rust]
+missing_copy_implementations = "warn"
+missing_debug_implementations = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = [] }
+unused_import_braces = "warn"
+unused_qualifications = "warn"
+unconditional_recursion = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -2 }
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "allow", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+perf = { level = "warn", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+style = { level = "allow", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+large_enum_variant = "allow"
+cargo_common_metadata = "allow"
+redundant_feature_names = "allow"
+multiple_crate_versions = "allow"
+
+[patch.crates-io]
+markdown-syntax = { path = "../vendor/markdown-syntax" }

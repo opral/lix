@@ -1,11 +1,25 @@
 [workspace]
 resolver = "3"
 members = [
-  "packages/*",
+  "packages/collaboration-test-support",
+  "packages/js-sdk",
+  "packages/lix",
+  "packages/lix-schema",
+  "packages/storage-filesystem",
+  "packages/storage-rocksdb",
+  "packages/storage-slatedb",
   "plugins/*",
   # This patched dependency has private parser-equivalence tests that must run
   # with the workspace suite while the upstream optimization is evaluated.
   "vendor/markdown-syntax",
+]
+exclude = [
+  # These application/test packages use Cargo artifact dependencies to build
+  # Wasm plugins. Keeping them outside the SDK workspace lets stable Cargo load
+  # `packages/lix` as a local path dependency without parsing nightly-only
+  # manifests. CI invokes them through `tooling/Cargo.toml` instead.
+  "packages/cli",
+  "packages/e2e",
 ]
 
 [workspace.package]
