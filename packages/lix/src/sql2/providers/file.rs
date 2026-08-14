@@ -34,7 +34,6 @@ use serde::Deserialize;
 use crate::binary_cas::{BlobDataReader, BlobId, BlobRangeBytes};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
-use crate::row_pk::RowPk;
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
     FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
@@ -54,6 +53,7 @@ use crate::plugin::runtime::{
     plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
     plugin_storage_archive_file_id,
 };
+use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
     resolve_write_branch_scope,
@@ -286,10 +286,9 @@ impl LixFileSpec {
         }
         let index = self
             .filesystem_path_index
-            .path_index(
-                &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                    .with_blob_refs(true),
-            )
+            .path_index(&FilesystemPathIndexRequest::new(
+                request.filter.branch_ids.clone(),
+            ))
             .await
             .map_err(lix_error_to_datafusion_error)?;
         Ok(Some(match target_file_ids {
@@ -443,17 +442,23 @@ impl LixFileSpec {
                 let (prepared, path_resolvers, path_index) = if let Some(indexed_matches) =
                     indexed_matches.as_ref()
                 {
-                    let rows = match &target_file_ids {
-                        // Exact DML must still validate a targeted blob ref
-                        // when its descriptor is missing from the path index.
-                        FileIdConstraint::Ids(file_ids) => {
-                            scan_exact_file_blob_batch(hot_state.clone(), &request, file_ids).await
-                        }
-                        FileIdConstraint::All | FileIdConstraint::None => {
-                            scan_indexed_file_batch(indexed_matches, true)
-                        }
-                    }
-                    .map_err(lix_error_to_datafusion_error)?;
+                    // Descriptor selection is answered by the canonical path
+                    // index. Blob references are a distinct authenticated row
+                    // family: load only those belonging to selected files
+                    // instead of hydrating every BlobRef in the repository.
+                    let selected_file_ids = match &target_file_ids {
+                        FileIdConstraint::Ids(file_ids) => file_ids.clone(),
+                        FileIdConstraint::All => indexed_matches
+                            .entries()
+                            .filter(|entry| entry.kind == FilesystemPathKind::File)
+                            .map(|entry| entry.id().to_string())
+                            .collect(),
+                        FileIdConstraint::None => BTreeSet::new(),
+                    };
+                    let rows =
+                        scan_exact_file_blob_batch(hot_state.clone(), &request, &selected_file_ids)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
                     (
                         prepare_indexed_lix_file_rows(indexed_matches, rows),
                         None,
@@ -4144,8 +4149,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         let directory_id = optional_string_value(batch, row_index, "directory_id")?;
         let name = required_string_value(batch, row_index, "name")?;
-        crate::common::validate_lix_path_segment(&name)
-            .map_err(lix_error_to_datafusion_error)?;
+        crate::common::validate_lix_path_segment(&name).map_err(lix_error_to_datafusion_error)?;
         let mut data_path = None;
 
         let id = if data.is_some() {
@@ -4747,11 +4751,7 @@ fn lix_file_record_batch_from_path_selection(
             "lixcol_row_pk" => Arc::new(StringArray::from(
                 entries
                     .iter()
-                    .map(|entry| {
-                        file_id_row_pk(entry.id())?
-                            .as_json_array_text()
-                            .map(Some)
-                    })
+                    .map(|entry| file_id_row_pk(entry.id())?.as_json_array_text().map(Some))
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             "lixcol_schema_key" => {
@@ -7054,6 +7054,7 @@ mod tests {
         HotStateExactBatchRequest, HotStateFilter, HotStateReader, HotStateScanRequest,
         MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
     };
+    use crate::plugin::runtime::UnsupportedWasmRuntime;
     use crate::plugin::runtime::{
         PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentMatcher, PluginFileOwner,
         PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
@@ -7065,7 +7066,6 @@ mod tests {
     use crate::transaction_types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
-    use crate::plugin::runtime::UnsupportedWasmRuntime;
     use crate::{LixError, NullableKeyFilter};
 
     use super::{
@@ -8613,6 +8613,7 @@ mod tests {
         writes: Vec<TransactionWrite>,
         scan_count: usize,
         path_index_count: usize,
+        path_index_requests: Vec<FilesystemPathIndexRequest>,
         exact_load_requests: Vec<HotStateExactBatchRequest>,
     }
 
@@ -8754,9 +8755,10 @@ mod tests {
 
         async fn filesystem_path_index(
             &mut self,
-            _request: &FilesystemPathIndexRequest,
+            request: &FilesystemPathIndexRequest,
         ) -> Result<Arc<FilesystemPathIndex>, LixError> {
             self.path_index_count += 1;
+            self.path_index_requests.push(request.clone());
             Ok(Arc::new(path_index_from_rows(self.rows.clone())?))
         }
 
@@ -8948,11 +8950,7 @@ mod tests {
                         .iter()
                         .map(|row| row.schema_key.clone())
                         .collect(),
-                    row_pks: request
-                        .rows
-                        .iter()
-                        .map(|row| row.row_pk.clone())
-                        .collect(),
+                    row_pks: request.rows.iter().map(|row| row.row_pk.clone()).collect(),
                     file_ids: request
                         .rows
                         .iter()
@@ -11415,11 +11413,65 @@ mod tests {
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(
             write_context.exact_load_requests[0].rows[0].row_pk,
-            crate::row_pk::RowPk::uuid_from_canonical(
-                "01920000-0000-7000-8000-0000000000d2",
-            )
-            .expect("fixture file ID")
+            crate::row_pk::RowPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000d2",)
+                .expect("fixture file ID")
         );
+        assert_eq!(
+            write_context.exact_load_requests[0].rows[0]
+                .file_id
+                .as_deref(),
+            Some("01920000-0000-7000-8000-0000000000d2")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_update_by_exact_path_loads_only_selected_blob_ref() {
+        let mut rows = file_dml_rows();
+        rows.extend([
+            live_file_row(
+                "01920000-0000-7000-8000-000000000482",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-000000000482","directory_id":null,"name":"other.md"}"#,
+            ),
+            live_blob_ref_row(
+                "01920000-0000-7000-8000-000000000482",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-000000000482",
+                &"1".repeat(64),
+                7,
+            ),
+        ]);
+        let mut write_context = CapturingWriteContext {
+            rows,
+            ..CapturingWriteContext::default()
+        };
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let spec = file_dml_spec(write_ctx.clone());
+        let planned = spec
+            .plan_update(
+                write_ctx,
+                vec![literal_assignment(
+                    "name",
+                    ScalarValue::Utf8(Some("README.md".to_string())),
+                )],
+                &[eq_filter("path", "/readme.md")],
+            )
+            .await
+            .expect("plan exact-path file update");
+
+        let source_batch = (planned.source)()
+            .await
+            .expect("load exact-path update candidates");
+        assert_eq!(source_batch.num_rows(), 1);
+        assert_eq!(write_context.path_index_count, 1);
+        assert_eq!(write_context.path_index_requests.len(), 1);
+        assert!(
+            !write_context.path_index_requests[0].include_blob_refs,
+            "path selection must not hydrate every repository BlobRef"
+        );
+        assert_eq!(write_context.scan_count, 0);
+        assert_eq!(write_context.exact_load_requests.len(), 1);
+        assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(
             write_context.exact_load_requests[0].rows[0]
                 .file_id
