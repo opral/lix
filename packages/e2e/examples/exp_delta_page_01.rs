@@ -1,9 +1,9 @@
-//! EXP-DELTA-PAGE-01: authenticated versioned-page layout experiment.
+//! EXP-BEPSILON-11: authenticated root-buffered Bε-tree experiment.
 //!
 //! Compares identical Schema-v1 typed tuple bytes stored as either:
 //! - immutable 64-row slotted snapshot pages with a rewritten page manifest; or
-//! - immutable schema base pages plus authenticated sparse delta pages, with a
-//!   deterministic compaction every `COMPACTION_DEPTH` commits.
+//! - one canonical C2 directory whose authenticated routing root carries a
+//!   bounded sorted mutation buffer and flushes key intervals into C2 leaves.
 //!
 //! The benchmark uses the shipping RocksDB/SlateDB storage traits. There is no
 //! SQL or workload-specific production shortcut: both layouts implement the
@@ -26,9 +26,8 @@ use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use uuid::Uuid;
 
-const LEDGER: &str = "EXP-DELTA-PAGE-01";
+const LEDGER: &str = "EXP-BEPSILON-11";
 const PAGE_ROWS: usize = 64;
-const DEFAULT_COMPACTION_PENDING_PERCENT: u64 = 10;
 const ROOT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00fe_2001), "exp.delta_page.root");
 const PAGE_SPACE: StorageSpace =
@@ -62,21 +61,29 @@ const TUPLE_PLAN: [BodyColumn; 5] = [
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Layout {
     Slotted,
-    Delta,
+    Bepsilon,
 }
 
 impl Layout {
     fn name(self) -> &'static str {
         match self {
             Self::Slotted => "slotted",
-            Self::Delta => "delta",
+            Self::Bepsilon => "bepsilon",
         }
     }
 
     fn tag(self) -> u8 {
         match self {
             Self::Slotted => 1,
-            Self::Delta => 2,
+            Self::Bepsilon => 2,
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "slotted" => Self::Slotted,
+            "bepsilon" => Self::Bepsilon,
+            other => panic!("unknown layout {other}"),
         }
     }
 }
@@ -91,9 +98,9 @@ struct Counters {
     put_bytes: u64,
     decoded_pages: u64,
     decoded_rows: u64,
-    bloom_checks: u64,
-    bloom_positive: u64,
-    bloom_false_positive: u64,
+    buffer_entries: u64,
+    buffer_flushes: u64,
+    flushed_pages: u64,
 }
 
 impl Counters {
@@ -107,9 +114,9 @@ impl Counters {
             put_bytes: self.put_bytes - before.put_bytes,
             decoded_pages: self.decoded_pages - before.decoded_pages,
             decoded_rows: self.decoded_rows - before.decoded_rows,
-            bloom_checks: self.bloom_checks - before.bloom_checks,
-            bloom_positive: self.bloom_positive - before.bloom_positive,
-            bloom_false_positive: self.bloom_false_positive - before.bloom_false_positive,
+            buffer_entries: self.buffer_entries - before.buffer_entries,
+            buffer_flushes: self.buffer_flushes - before.buffer_flushes,
+            flushed_pages: self.flushed_pages - before.flushed_pages,
         }
     }
 
@@ -122,9 +129,9 @@ impl Counters {
         self.put_bytes += other.put_bytes;
         self.decoded_pages += other.decoded_pages;
         self.decoded_rows += other.decoded_rows;
-        self.bloom_checks += other.bloom_checks;
-        self.bloom_positive += other.bloom_positive;
-        self.bloom_false_positive += other.bloom_false_positive;
+        self.buffer_entries += other.buffer_entries;
+        self.buffer_flushes += other.buffer_flushes;
+        self.flushed_pages += other.flushed_pages;
     }
 }
 
@@ -145,26 +152,22 @@ impl ObjectId {
 struct Root {
     layout: Layout,
     count: u64,
-    generation: u64,
-    depth: u32,
-    pending_rows: u64,
-    parent: Option<ObjectId>,
-    /// Immutable schema-partitioned base pages.
+    /// Sole current-state owner: immutable schema-partitioned pages.
     pages: Vec<ObjectId>,
-    /// Binary-leveled sparse deltas. Lower levels are newer; each occupied
-    /// level represents a deterministic power-of-two commit run.
-    levels: Vec<DeltaLevel>,
+    /// Authenticated mutation buffer carried by this routing root object.
+    buffer: BTreeMap<u64, BufferedMutation>,
 }
 
-#[derive(Clone, Debug)]
-struct DeltaLevel {
-    pages: Vec<ObjectId>,
-    blooms: Vec<Vec<u8>>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BufferedMutation {
+    Value(Vec<u8>),
+    Tombstone,
 }
 
 #[derive(Clone, Debug)]
 struct Config {
     backends: Vec<String>,
+    layouts: Vec<Layout>,
     sizes: Vec<usize>,
     histories: Vec<usize>,
     deltas: Vec<DeltaShape>,
@@ -431,10 +434,16 @@ impl<S: Storage + Clone> Store<S> {
 #[tokio::main]
 async fn main() {
     let config = parse_config();
-    emit_bloom_sweep();
+    buffer_codec_controls();
     println!(
-        "{LEDGER},kind=config,page_rows={PAGE_ROWS},compaction_pending_percent={},sizes={:?},histories={:?}",
-        compaction_pending_percent(),
+        "{LEDGER},kind=control,control=buffer_codec_corruption,status=pass,cases=ordering+duplicate+outside_fence+truncation+tombstone+null+canonical_order"
+    );
+    println!(
+        "{LEDGER},kind=config,page_rows={PAGE_ROWS},buffer_entries={},buffer_bytes={},pk_kind={},pattern={},sizes={:?},histories={:?}",
+        buffer_entry_cap(),
+        buffer_byte_cap(),
+        pk_kind(),
+        mutation_pattern(),
         config.sizes,
         config.histories
     );
@@ -443,7 +452,7 @@ async fn main() {
         for &n in &config.sizes {
             for &history in &config.histories {
                 for &delta in &config.deltas {
-                    for layout in [Layout::Slotted, Layout::Delta] {
+                    for &layout in &config.layouts {
                         match backend.as_str() {
                             "rocksdb" => run_rocks(&config, case, n, history, delta, layout).await,
                             "slatedb" => run_slate(&config, case, n, history, delta, layout).await,
@@ -532,6 +541,7 @@ async fn run_case<S: Storage + Clone>(
     let mut ever_touched = BTreeSet::new();
     let mut last_touched = 0u64;
     let mut update_wall_us = 0u128;
+    let mut update_samples = Vec::with_capacity(h);
     let mut update_counters = Counters::default();
     let d = delta.rows(n);
     for generation in 1..=h as u64 {
@@ -552,6 +562,7 @@ async fn run_case<S: Storage + Clone>(
             .unwrap();
         store.publish_selector(0, root).await.unwrap();
         let elapsed = started.elapsed().as_micros();
+        update_samples.push(elapsed);
         let operation_counters = store.counters.delta(before);
         update_wall_us += elapsed;
         update_counters.accumulate(operation_counters);
@@ -582,6 +593,7 @@ async fn run_case<S: Storage + Clone>(
         update_wall_us,
         update_counters,
     );
+    emit_latency_summary(backend, layout, n, h, d, "update", &update_samples);
 
     let point_key = (n / 2) as u64;
     let before = store.counters;
@@ -619,7 +631,48 @@ async fn run_case<S: Storage + Clone>(
             started.elapsed().as_micros(),
             store.counters.delta(before),
         );
+        let mut samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = Instant::now();
+            let sampled = point(&mut store, root, key).await.unwrap();
+            assert_eq!(sampled.as_ref(), expected.get(&key));
+            samples.push(started.elapsed().as_micros());
+        }
+        emit_latency_summary(backend, layout, n, h, d, operation, &samples);
     }
+
+    let missing_key = n as u64 + 1;
+    let before = store.counters;
+    let started = Instant::now();
+    assert!(
+        point(&mut store, root, missing_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    emit(
+        backend,
+        path,
+        layout,
+        n,
+        h,
+        d,
+        "point_miss",
+        started.elapsed().as_micros(),
+        store.counters.delta(before),
+    );
+    let mut miss_samples = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let started = Instant::now();
+        assert!(
+            point(&mut store, root, missing_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        miss_samples.push(started.elapsed().as_micros());
+    }
+    emit_latency_summary(backend, layout, n, h, d, "point_miss", &miss_samples);
 
     for (operation, keys) in [
         ("point_hot_series", history_hot_keys.clone()),
@@ -656,6 +709,32 @@ async fn run_case<S: Storage + Clone>(
         h,
         d,
         "readback",
+        started.elapsed().as_micros(),
+        store.counters.delta(before),
+    );
+
+    let range_start = (n / 4) as u64;
+    let range_end = (range_start + 100).min(n as u64);
+    let before = store.counters;
+    let started = Instant::now();
+    let ranged = range(&mut store, root, range_start, range_end)
+        .await
+        .unwrap();
+    assert_eq!(
+        ranged,
+        expected
+            .range(range_start..range_end)
+            .map(|(key, value)| (*key, value.clone()))
+            .collect()
+    );
+    emit(
+        backend,
+        path,
+        layout,
+        n,
+        h,
+        d,
+        "range_100",
         started.elapsed().as_micros(),
         store.counters.delta(before),
     );
@@ -744,6 +823,10 @@ async fn run_case<S: Storage + Clone>(
     );
 
     corruption_control(&mut store, root).await.unwrap();
+    println!(
+        "{LEDGER},kind=control,backend={backend},layout={},n={n},control=authenticated_corruption,status=pass,cases=missing_object+wrong_child+root_substitution",
+        layout.name()
+    );
     let (root_objects, root_bytes) = store.raw_scan_bytes(ROOT_SPACE).await.unwrap();
     let (page_objects, page_bytes) = store.raw_scan_bytes(PAGE_SPACE).await.unwrap();
     println!(
@@ -795,7 +878,7 @@ fn emit(
     c: Counters,
 ) {
     println!(
-        "{LEDGER},kind=operation,backend={backend},layout={},n={n},h={h},d={d},operation={operation},wall_us={wall_us},get_calls={},get_keys={},get_bytes={},put_calls={},puts={},put_bytes={},decoded_pages={},decoded_rows={},bloom_checks={},bloom_positive={},bloom_false_positive={},settled_bytes={}",
+        "{LEDGER},kind=operation,backend={backend},layout={},n={n},h={h},d={d},operation={operation},wall_us={wall_us},get_calls={},get_keys={},get_bytes={},put_calls={},puts={},put_bytes={},decoded_pages={},decoded_rows={},buffer_entries={},buffer_flushes={},flushed_pages={},settled_bytes={}",
         layout.name(),
         c.get_calls,
         c.get_keys,
@@ -805,10 +888,34 @@ fn emit(
         c.put_bytes,
         c.decoded_pages,
         c.decoded_rows,
-        c.bloom_checks,
-        c.bloom_positive,
-        c.bloom_false_positive,
+        c.buffer_entries,
+        c.buffer_flushes,
+        c.flushed_pages,
         directory_bytes(path)
+    );
+}
+
+fn emit_latency_summary(
+    backend: &str,
+    layout: Layout,
+    n: usize,
+    h: usize,
+    d: usize,
+    operation: &str,
+    samples: &[u128],
+) {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let percentile = |numerator: usize| {
+        let index = (sorted.len() * numerator).div_ceil(100).saturating_sub(1);
+        sorted[index.min(sorted.len() - 1)]
+    };
+    println!(
+        "{LEDGER},kind=latency_summary,backend={backend},layout={},n={n},h={h},d={d},operation={operation},samples={},p50_us={},p95_us={}",
+        layout.name(),
+        sorted.len(),
+        percentile(50),
+        percentile(95)
     );
 }
 
@@ -817,17 +924,27 @@ async fn build_initial<S: Storage + Clone>(
     layout: Layout,
     rows: &BTreeMap<u64, Vec<u8>>,
 ) -> Result<ObjectId, String> {
-    let pages = encode_pages(rows);
-    store.put_objects(PAGE_SPACE, &pages).await?;
-    let root = Root {
-        layout,
-        count: rows.len() as u64,
-        generation: 0,
-        depth: 0,
-        pending_rows: 0,
-        parent: None,
-        pages: pages.iter().map(|(id, _)| *id).collect(),
-        levels: Vec::new(),
+    let root = match layout {
+        Layout::Slotted => {
+            let pages = encode_pages(rows);
+            store.put_objects(PAGE_SPACE, &pages).await?;
+            Root {
+                layout,
+                count: rows.len() as u64,
+                pages: pages.iter().map(|(id, _)| *id).collect(),
+                buffer: BTreeMap::new(),
+            }
+        }
+        Layout::Bepsilon => {
+            let pages = encode_pages(rows);
+            store.put_objects(PAGE_SPACE, &pages).await?;
+            Root {
+                layout,
+                count: rows.len() as u64,
+                pages: pages.iter().map(|(id, _)| *id).collect(),
+                buffer: BTreeMap::new(),
+            }
+        }
     };
     put_root(store, &root).await
 }
@@ -837,7 +954,7 @@ async fn commit<S: Storage + Clone>(
     current: ObjectId,
     full: &mut BTreeMap<u64, Vec<u8>>,
     mutations: &BTreeMap<u64, Vec<u8>>,
-    generation: u64,
+    _generation: u64,
 ) -> Result<ObjectId, String> {
     let root = load_root(store, current).await?;
     match root.layout {
@@ -871,90 +988,80 @@ async fn commit<S: Storage + Clone>(
                 &Root {
                     layout: root.layout,
                     count: full.len() as u64,
-                    generation,
-                    depth: 0,
-                    pending_rows: 0,
-                    parent: None,
                     pages: page_ids,
-                    levels: Vec::new(),
+                    buffer: BTreeMap::new(),
                 },
             )
             .await
         }
-        Layout::Delta
-            if root.pending_rows + (mutations.len() as u64)
-                < compaction_row_threshold(full.len()) =>
-        {
-            let mut levels = root.levels.clone();
-            let mut carry = mutations.clone();
-            let mut level_index = 0usize;
-            loop {
-                if levels.len() <= level_index {
-                    levels.push(DeltaLevel {
-                        pages: Vec::new(),
-                        blooms: Vec::new(),
-                    });
-                }
-                if levels[level_index].pages.is_empty() {
-                    break;
-                }
-                let level = &levels[level_index];
-                let encoded = store.get_many(PAGE_SPACE, &level.pages).await?;
-                let mut older = BTreeMap::new();
-                for (index, bytes) in encoded.into_iter().enumerate() {
-                    let page = decode_page_counted(&mut store.counters, &bytes)?;
-                    validate_level_page_bloom(level, index, &page)?;
-                    older.extend(page);
-                }
-                older.extend(carry);
-                carry = older;
-                levels[level_index] = DeltaLevel {
-                    pages: Vec::new(),
-                    blooms: Vec::new(),
-                };
-                level_index += 1;
+        Layout::Bepsilon => {
+            let mut next = root.clone();
+            for (key, value) in mutations {
+                next.buffer
+                    .insert(*key, BufferedMutation::Value(value.clone()));
             }
-            let pages = encode_pages(&carry);
-            let blooms = encoded_page_blooms(&pages)?;
-            store.put_objects(PAGE_SPACE, &pages).await?;
-            levels[level_index] = DeltaLevel {
-                pages: pages.iter().map(|(id, _)| *id).collect(),
-                blooms,
-            };
-            put_root(
-                store,
-                &Root {
-                    layout: root.layout,
-                    count: full.len() as u64,
-                    generation,
-                    depth: root.depth + 1,
-                    pending_rows: root.pending_rows + mutations.len() as u64,
-                    parent: Some(current),
-                    pages: root.pages,
-                    levels,
-                },
-            )
-            .await
-        }
-        Layout::Delta => {
-            let pages = encode_pages(full);
-            store.put_objects(PAGE_SPACE, &pages).await?;
-            put_root(
-                store,
-                &Root {
-                    layout: root.layout,
-                    count: full.len() as u64,
-                    generation,
-                    depth: 0,
-                    pending_rows: 0,
-                    parent: Some(current),
-                    pages: pages.iter().map(|(id, _)| *id).collect(),
-                    levels: Vec::new(),
-                },
-            )
-            .await
+            store.counters.buffer_entries += next.buffer.len() as u64;
+            if should_flush_buffer(&next.buffer) {
+                flush_root_buffer(store, &mut next).await?;
+            }
+            put_root(store, &next).await
         }
     }
+}
+
+async fn flush_root_buffer<S: Storage + Clone>(
+    store: &mut Store<S>,
+    root: &mut Root,
+) -> Result<(), String> {
+    if root.buffer.is_empty() {
+        return Ok(());
+    }
+    let touched = root
+        .buffer
+        .keys()
+        .map(|key| *key as usize / PAGE_ROWS)
+        .collect::<BTreeSet<_>>();
+    if touched
+        .last()
+        .is_some_and(|index| *index >= root.pages.len())
+    {
+        return Err("buffer flush key lies outside the root child fences".to_owned());
+    }
+    let page_ids = touched
+        .iter()
+        .map(|index| root.pages[*index])
+        .collect::<Vec<_>>();
+    let objects = store.get_many(PAGE_SPACE, &page_ids).await?;
+    let mut staged = Vec::new();
+    for (page_index, bytes) in touched.into_iter().zip(objects) {
+        let mut page = decode_page_counted(&mut store.counters, &bytes)?;
+        validate_page_index(&page, page_index)?;
+        let start = (page_index * PAGE_ROWS) as u64;
+        let end = start + PAGE_ROWS as u64;
+        let mut changed = false;
+        for (key, mutation) in root.buffer.range(start..end) {
+            changed = true;
+            match mutation {
+                BufferedMutation::Value(value) => {
+                    page.insert(*key, value.clone());
+                }
+                BufferedMutation::Tombstone => {
+                    page.remove(key);
+                }
+            }
+        }
+        if changed {
+            let encoded = encode_page(&page);
+            let id = ObjectId::of(&encoded);
+            root.pages[page_index] = id;
+            staged.push((id, encoded));
+        }
+    }
+    store.put_objects(PAGE_SPACE, &staged).await?;
+    root.buffer.clear();
+    store.counters.buffer_flushes += 1;
+    store.counters.flushed_pages += staged.len() as u64;
+    Ok(())
 }
 
 async fn point<S: Storage + Clone>(
@@ -972,18 +1079,11 @@ async fn point_on_read<R: StorageRead>(
     key: u64,
 ) -> Result<Option<Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
-    if root.layout == Layout::Delta {
-        for level in &root.levels {
-            for page_index in delta_page_indexes(level, key, store.counters)? {
-                let bytes = store.get_one(PAGE_SPACE, level.pages[page_index]).await?;
-                let page = decode_page_counted(store.counters, &bytes)?;
-                validate_level_page_bloom(level, page_index, &page)?;
-                if let Some(value) = page.get(&key) {
-                    return Ok(Some(value.clone()));
-                }
-                store.counters.bloom_false_positive += 1;
-            }
-        }
+    if let Some(mutation) = root.buffer.get(&key) {
+        return Ok(match mutation {
+            BufferedMutation::Value(value) => Some(value.clone()),
+            BufferedMutation::Tombstone => None,
+        });
     }
     let page_index = key as usize / PAGE_ROWS;
     let Some(page_id) = root.pages.get(page_index).copied() else {
@@ -991,29 +1091,8 @@ async fn point_on_read<R: StorageRead>(
     };
     let bytes = store.get_one(PAGE_SPACE, page_id).await?;
     let page = decode_page_counted(store.counters, &bytes)?;
+    validate_page_index(&page, page_index)?;
     Ok(page.get(&key).cloned())
-}
-
-fn delta_page_indexes(
-    level: &DeltaLevel,
-    key: u64,
-    counters: &mut Counters,
-) -> Result<Vec<usize>, String> {
-    if level.pages.is_empty() {
-        return Ok(Vec::new());
-    }
-    if level.blooms.len() != level.pages.len() {
-        return Err("delta root page-bound cardinality mismatch".to_owned());
-    }
-    let mut indexes = Vec::new();
-    for (index, bloom) in level.blooms.iter().enumerate() {
-        counters.bloom_checks += 1;
-        if bloom_might_contain(bloom, key) {
-            counters.bloom_positive += 1;
-            indexes.push(index);
-        }
-    }
-    Ok(indexes)
 }
 
 async fn materialize<S: Storage + Clone>(
@@ -1024,27 +1103,46 @@ async fn materialize<S: Storage + Clone>(
     materialize_on_read(&mut read, root_id).await
 }
 
+async fn range<S: Storage + Clone>(
+    store: &mut Store<S>,
+    root_id: ObjectId,
+    start: u64,
+    end: u64,
+) -> Result<BTreeMap<u64, Vec<u8>>, String> {
+    let mut read = store.reader().await?;
+    let root = load_root_on_read(&mut read, root_id).await?;
+    if start >= end {
+        return Ok(BTreeMap::new());
+    }
+    let first = start as usize / PAGE_ROWS;
+    let last = (end.saturating_sub(1) as usize / PAGE_ROWS).min(root.pages.len() - 1);
+    let objects = read.get_many(PAGE_SPACE, &root.pages[first..=last]).await?;
+    let mut rows = BTreeMap::new();
+    for (offset, bytes) in objects.iter().enumerate() {
+        let page = decode_page_counted(read.counters, bytes)?;
+        validate_page_index(&page, first + offset)?;
+        rows.extend(page);
+    }
+    apply_buffer_range(&mut rows, &root.buffer, start, end);
+    Ok(rows
+        .range(start..end)
+        .map(|(k, v)| (*k, v.clone()))
+        .collect())
+}
+
 async fn materialize_on_read<R: StorageRead>(
     store: &mut Reader<'_, R>,
     root_id: ObjectId,
 ) -> Result<BTreeMap<u64, Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
     let mut rows = BTreeMap::new();
-    for bytes in store.get_many(PAGE_SPACE, &root.pages).await? {
-        rows.extend(decode_page_counted(store.counters, &bytes)?);
+    let objects = store.get_many(PAGE_SPACE, &root.pages).await?;
+    for (index, bytes) in objects.iter().enumerate() {
+        let page = decode_page_counted(store.counters, bytes)?;
+        validate_page_index(&page, index)?;
+        rows.extend(page);
     }
-    for level in root.levels.iter().rev() {
-        for (index, bytes) in store
-            .get_many(PAGE_SPACE, &level.pages)
-            .await?
-            .into_iter()
-            .enumerate()
-        {
-            let page = decode_page_counted(store.counters, &bytes)?;
-            validate_level_page_bloom(level, index, &page)?;
-            rows.extend(page);
-        }
-    }
+    apply_buffer_range(&mut rows, &root.buffer, 0, u64::MAX);
     Ok(rows)
 }
 
@@ -1071,12 +1169,12 @@ async fn diff_on_read<R: StorageRead>(
         return Err("cannot diff roots from different layouts".to_owned());
     }
     match before_root.layout {
-        Layout::Slotted => diff_slotted(store, &before_root, &after_root).await,
-        Layout::Delta => diff_delta(store, before, after).await,
+        Layout::Slotted => diff_pages(store, &before_root, &after_root).await,
+        Layout::Bepsilon => diff_buffered(store, &before_root, &after_root).await,
     }
 }
 
-async fn diff_slotted<R: StorageRead>(
+async fn diff_pages<R: StorageRead>(
     store: &mut Reader<'_, R>,
     before: &Root,
     after: &Root,
@@ -1085,13 +1183,13 @@ async fn diff_slotted<R: StorageRead>(
         return Err("slotted roots have incompatible page geometry".to_owned());
     }
     let mut changed = BTreeSet::new();
-    for (before_id, after_id) in before.pages.iter().zip(&after.pages) {
+    for (index, (before_id, after_id)) in before.pages.iter().zip(&after.pages).enumerate() {
         if before_id == after_id {
             continue;
         }
         let bytes = store.get_many(PAGE_SPACE, &[*before_id, *after_id]).await?;
-        let before_page = decode_page_counted(store.counters, &bytes[0])?;
-        let after_page = decode_page_counted(store.counters, &bytes[1])?;
+        let before_page = decode_visible_page_counted(store.counters, &bytes[0], index)?;
+        let after_page = decode_visible_page_counted(store.counters, &bytes[1], index)?;
         changed.extend(
             before_page
                 .keys()
@@ -1103,19 +1201,86 @@ async fn diff_slotted<R: StorageRead>(
     Ok(changed)
 }
 
-async fn diff_delta<R: StorageRead>(
+async fn diff_buffered<R: StorageRead>(
     store: &mut Reader<'_, R>,
-    before: ObjectId,
-    after: ObjectId,
+    before: &Root,
+    after: &Root,
 ) -> Result<BTreeSet<u64>, String> {
-    let before_rows = materialize_on_read(store, before).await?;
-    let after_rows = materialize_on_read(store, after).await?;
-    Ok(before_rows
-        .keys()
-        .chain(after_rows.keys())
-        .copied()
-        .filter(|key| before_rows.get(key) != after_rows.get(key))
-        .collect())
+    if before.pages.len() != after.pages.len() {
+        return Err("buffered roots have incompatible child geometry".to_owned());
+    }
+    let mut page_indices = before
+        .pages
+        .iter()
+        .zip(&after.pages)
+        .enumerate()
+        .filter_map(|(index, (left, right))| (left != right).then_some(index))
+        .collect::<BTreeSet<_>>();
+    page_indices.extend(
+        before
+            .buffer
+            .keys()
+            .chain(after.buffer.keys())
+            .map(|key| *key as usize / PAGE_ROWS),
+    );
+
+    let mut object_ids = BTreeSet::new();
+    for index in &page_indices {
+        let before_id = before
+            .pages
+            .get(*index)
+            .ok_or_else(|| "before buffer key lies outside child geometry".to_owned())?;
+        let after_id = after
+            .pages
+            .get(*index)
+            .ok_or_else(|| "after buffer key lies outside child geometry".to_owned())?;
+        object_ids.insert(*before_id);
+        object_ids.insert(*after_id);
+    }
+    let object_ids = object_ids.into_iter().collect::<Vec<_>>();
+    let objects = store.get_many(PAGE_SPACE, &object_ids).await?;
+    let decoded = object_ids
+        .into_iter()
+        .zip(objects)
+        .map(|(id, bytes)| Ok((id, decode_page_counted(store.counters, &bytes)?)))
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+
+    let mut changed = BTreeSet::new();
+    for index in page_indices {
+        let before_page = decoded.get(&before.pages[index]).unwrap();
+        let after_page = decoded.get(&after.pages[index]).unwrap();
+        validate_page_index(before_page, index)?;
+        validate_page_index(after_page, index)?;
+        let start = (index * PAGE_ROWS) as u64;
+        let end = start + PAGE_ROWS as u64;
+        let candidates = before_page
+            .keys()
+            .chain(after_page.keys())
+            .chain(before.buffer.range(start..end).map(|(key, _)| key))
+            .chain(after.buffer.range(start..end).map(|(key, _)| key))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for key in candidates {
+            let before_value = visible_value(before_page, &before.buffer, key);
+            let after_value = visible_value(after_page, &after.buffer, key);
+            if before_value != after_value {
+                changed.insert(key);
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn visible_value<'a>(
+    page: &'a BTreeMap<u64, Vec<u8>>,
+    buffer: &'a BTreeMap<u64, BufferedMutation>,
+    key: u64,
+) -> Option<&'a Vec<u8>> {
+    match buffer.get(&key) {
+        Some(BufferedMutation::Value(value)) => Some(value),
+        Some(BufferedMutation::Tombstone) => None,
+        None => page.get(&key),
+    }
 }
 
 async fn history_values<S: Storage + Clone>(
@@ -1145,11 +1310,13 @@ async fn corruption_control<S: Storage + Clone>(
 ) -> Result<(), String> {
     let root_bytes = store.get_one(ROOT_SPACE, root).await?;
     let decoded = decode_root(&root_bytes)?;
-    let Some(page) = decoded.pages.first().copied() else {
-        return Err("root has no page".to_owned());
-    };
     let wrong = ObjectId([0x55; 32]);
-    let mut corrupted = decoded;
+    let mut corrupted = decoded.clone();
+    let retained = decoded
+        .pages
+        .first()
+        .copied()
+        .ok_or_else(|| "state root has no page".to_owned())?;
     corrupted.pages[0] = wrong;
     let corrupt_bytes = encode_root(&corrupted);
     let corrupt_id = ObjectId::of(&corrupt_bytes);
@@ -1157,7 +1324,17 @@ async fn corruption_control<S: Storage + Clone>(
         .put_objects(ROOT_SPACE, &[(corrupt_id, corrupt_bytes)])
         .await?;
     assert!(materialize(store, corrupt_id).await.is_err());
-    assert!(store.get_one(PAGE_SPACE, page).await.is_ok());
+    assert!(store.get_one(PAGE_SPACE, retained).await.is_ok());
+    if decoded.layout == Layout::Bepsilon && decoded.pages.len() >= 2 {
+        let mut substituted = decoded.clone();
+        substituted.pages[0] = substituted.pages[1];
+        let root_bytes = encode_root(&substituted);
+        let root_id = ObjectId::of(&root_bytes);
+        store
+            .put_objects(ROOT_SPACE, &[(root_id, root_bytes)])
+            .await?;
+        assert!(materialize(store, root_id).await.is_err());
+    }
     Ok(())
 }
 
@@ -1201,6 +1378,9 @@ fn encode_page(rows: &BTreeMap<u64, Vec<u8>>) -> Vec<u8> {
     let mut out = b"EDP1".to_vec();
     out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
     for (key, value) in rows {
+        let encoded_key = state_key(*key);
+        out.extend_from_slice(&(encoded_key.len() as u32).to_be_bytes());
+        out.extend_from_slice(&encoded_key);
         out.extend_from_slice(&key.to_be_bytes());
         out.extend_from_slice(&(value.len() as u32).to_be_bytes());
         out.extend_from_slice(value);
@@ -1224,7 +1404,12 @@ fn decode_page(bytes: &[u8]) -> Result<BTreeMap<u64, Vec<u8>>, String> {
     let count = input.u32()? as usize;
     let mut rows = BTreeMap::new();
     for _ in 0..count {
+        let key_len = input.u32()? as usize;
+        let encoded_key = input.bytes(key_len)?.to_vec();
         let key = input.u64()?;
+        if encoded_key != state_key(key) {
+            return Err("slotted encoded StateKey/ordinal binding mismatch".to_owned());
+        }
         let len = input.u32()? as usize;
         let value = input.bytes(len)?.to_vec();
         decode_body(&TUPLE_PLAN, &value).map_err(|e| e.to_string())?;
@@ -1237,189 +1422,245 @@ fn decode_page(bytes: &[u8]) -> Result<BTreeMap<u64, Vec<u8>>, String> {
 }
 
 fn encode_root(root: &Root) -> Vec<u8> {
-    let mut out = b"EDR1".to_vec();
+    let mut out = b"BER1".to_vec();
     out.push(root.layout.tag());
     out.extend_from_slice(&root.count.to_be_bytes());
-    out.extend_from_slice(&root.generation.to_be_bytes());
-    out.extend_from_slice(&root.depth.to_be_bytes());
-    out.extend_from_slice(&root.pending_rows.to_be_bytes());
-    match root.parent {
-        Some(parent) => {
-            out.push(1);
-            out.extend_from_slice(&parent.0);
-        }
-        None => out.push(0),
-    }
     out.extend_from_slice(&(root.pages.len() as u32).to_be_bytes());
     for page in &root.pages {
         out.extend_from_slice(&page.0);
     }
-    out.extend_from_slice(&(root.levels.len() as u32).to_be_bytes());
-    for level in &root.levels {
-        out.extend_from_slice(&(level.pages.len() as u32).to_be_bytes());
-        for (page, bloom) in level.pages.iter().zip(&level.blooms) {
-            out.extend_from_slice(&page.0);
-            out.extend_from_slice(&(bloom.len() as u32).to_be_bytes());
-            out.extend_from_slice(bloom);
-        }
+    out.extend_from_slice(&(root.buffer.len() as u16).to_be_bytes());
+    for (key, mutation) in &root.buffer {
+        encode_buffered_mutation(&mut out, *key, mutation);
     }
     out
 }
 
 fn decode_root(bytes: &[u8]) -> Result<Root, String> {
     let mut input = Decoder::new(bytes);
-    input.magic(b"EDR1")?;
+    input.magic(b"BER1")?;
     let layout = match input.u8()? {
         1 => Layout::Slotted,
-        2 => Layout::Delta,
+        2 => Layout::Bepsilon,
         _ => return Err("unknown root layout".to_owned()),
     };
     let count = input.u64()?;
-    let generation = input.u64()?;
-    let depth = input.u32()?;
-    let pending_rows = input.u64()?;
-    let parent = match input.u8()? {
-        0 => None,
-        1 => Some(ObjectId(input.fixed_32()?)),
-        _ => return Err("invalid parent tag".to_owned()),
-    };
-    if layout == Layout::Slotted && (depth != 0 || parent.is_some()) {
-        return Err("slotted root has delta ancestry".to_owned());
-    }
-    if layout == Layout::Delta && generation == 0 && parent.is_some() {
-        return Err("initial delta root has parent".to_owned());
-    }
-    if layout == Layout::Delta && generation > 0 && parent.is_none() {
-        return Err("versioned delta root is missing chronology parent".to_owned());
-    }
-    if depth == 0 && pending_rows != 0 {
-        return Err("compacted root has pending delta rows".to_owned());
-    }
-    if depth > 0 && pending_rows == 0 {
-        return Err("delta root has no pending row accounting".to_owned());
-    }
     let count_pages = input.u32()? as usize;
     let mut pages = Vec::with_capacity(count_pages);
     for _ in 0..count_pages {
         pages.push(ObjectId(input.fixed_32()?));
     }
-    let count_levels = input.u32()? as usize;
-    let mut levels = Vec::with_capacity(count_levels);
-    for _ in 0..count_levels {
-        let page_count = input.u32()? as usize;
-        let mut level_pages = Vec::with_capacity(page_count);
-        let mut blooms = Vec::with_capacity(page_count);
-        for _ in 0..page_count {
-            level_pages.push(ObjectId(input.fixed_32()?));
-            let bloom_len = input.u32()? as usize;
-            if !matches!(bloom_len, 16 | 32 | 64) {
-                return Err("noncanonical delta bloom size class".to_owned());
-            }
-            blooms.push(input.bytes(bloom_len)?.to_vec());
+    if pages.is_empty() && count != 0 {
+        return Err("state root is missing its sole page owner".to_owned());
+    }
+    let buffer_count = u16::from_be_bytes(input.bytes(2)?.try_into().unwrap()) as usize;
+    if buffer_count > 512 {
+        return Err("root mutation buffer exceeds format bound".to_owned());
+    }
+    if layout == Layout::Slotted && buffer_count != 0 {
+        return Err("slotted root carries a mutation buffer".to_owned());
+    }
+    let mut buffer = BTreeMap::new();
+    let mut previous = None;
+    for _ in 0..buffer_count {
+        let (key, mutation) = decode_buffered_mutation(&mut input)?;
+        if previous.is_some_and(|previous| previous >= key) {
+            return Err("duplicate or noncanonical root buffer order".to_owned());
         }
-        levels.push(DeltaLevel {
-            pages: level_pages,
-            blooms,
-        });
-    }
-    if layout == Layout::Slotted && !levels.is_empty() {
-        return Err("slotted root has delta levels".to_owned());
-    }
-    if depth == 0 && levels.iter().any(|level| !level.pages.is_empty()) {
-        return Err("compacted delta root has sparse levels".to_owned());
-    }
-    if depth > 0 && !levels.iter().any(|level| !level.pages.is_empty()) {
-        return Err("uncompacted delta root has no sparse levels".to_owned());
+        if key as usize / PAGE_ROWS >= pages.len() {
+            return Err("buffer key lies outside the root child fences".to_owned());
+        }
+        previous = Some(key);
+        buffer.insert(key, mutation);
     }
     input.finish()?;
     Ok(Root {
         layout,
         count,
-        generation,
-        depth,
-        pending_rows,
-        parent,
         pages,
-        levels,
+        buffer,
     })
 }
 
-fn encoded_page_blooms(pages: &[(ObjectId, Vec<u8>)]) -> Result<Vec<Vec<u8>>, String> {
-    pages
-        .iter()
-        .map(|(_, bytes)| Ok(page_bloom(&decode_page(bytes)?)))
-        .collect()
+fn state_key(ordinal: u64) -> Vec<u8> {
+    let mut out = b"schema-v1/entity/".to_vec();
+    match pk_kind().as_str() {
+        "uuid" => {
+            out.push(b'u');
+            out.extend_from_slice(&Uuid::from_u128(ordinal as u128 + 1).into_bytes());
+        }
+        "text" => {
+            let value = format!("pk-{ordinal:020}");
+            out.push(b't');
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        "composite" => {
+            let value = format!("pk-{ordinal:020}");
+            out.push(b'c');
+            out.extend_from_slice(&ordinal.to_be_bytes());
+            out.extend_from_slice(&Uuid::from_u128(ordinal as u128 + 1).into_bytes());
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        _ => {
+            out.push(b'i');
+            out.extend_from_slice(&ordinal.to_be_bytes());
+        }
+    }
+    out
 }
 
-fn validate_level_page_bloom(
-    level: &DeltaLevel,
-    index: usize,
-    page: &BTreeMap<u64, Vec<u8>>,
-) -> Result<(), String> {
-    if level.blooms.get(index) != Some(&page_bloom(page)) {
-        return Err("authenticated delta page bloom does not match page".to_owned());
+fn pk_kind() -> String {
+    std::env::var("EXP_BEPSILON_PK_KIND").unwrap_or_else(|_| "integer".to_owned())
+}
+
+fn buffer_entry_cap() -> usize {
+    std::env::var("EXP_BEPSILON_ENTRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| matches!(*value, 32 | 128 | 512))
+        .unwrap_or(128)
+}
+
+fn buffer_byte_cap() -> usize {
+    std::env::var("EXP_BEPSILON_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| matches!(*value, 4096 | 16384 | 65536))
+        .unwrap_or(16_384)
+}
+
+fn encode_buffered_mutation(out: &mut Vec<u8>, key: u64, mutation: &BufferedMutation) {
+    let encoded_key = state_key(key);
+    out.extend_from_slice(&(encoded_key.len() as u32).to_be_bytes());
+    out.extend_from_slice(&encoded_key);
+    out.extend_from_slice(&key.to_be_bytes());
+    match mutation {
+        BufferedMutation::Tombstone => out.push(0),
+        BufferedMutation::Value(value) => {
+            out.push(1);
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            out.extend_from_slice(value);
+        }
+    }
+}
+
+fn decode_buffered_mutation(input: &mut Decoder<'_>) -> Result<(u64, BufferedMutation), String> {
+    let key_len = input.u32()? as usize;
+    let encoded_key = input.bytes(key_len)?.to_vec();
+    let key = input.u64()?;
+    if encoded_key != state_key(key) {
+        return Err("buffer StateKey/ordinal binding mismatch".to_owned());
+    }
+    let mutation = match input.u8()? {
+        0 => BufferedMutation::Tombstone,
+        1 => {
+            let value_len = input.u32()? as usize;
+            let value = input.bytes(value_len)?.to_vec();
+            decode_body(&TUPLE_PLAN, &value).map_err(|error| error.to_string())?;
+            BufferedMutation::Value(value)
+        }
+        _ => return Err("malformed buffered mutation tag".to_owned()),
+    };
+    Ok((key, mutation))
+}
+
+fn buffer_encoded_bytes(buffer: &BTreeMap<u64, BufferedMutation>) -> usize {
+    let mut bytes = Vec::new();
+    for (key, mutation) in buffer {
+        encode_buffered_mutation(&mut bytes, *key, mutation);
+    }
+    bytes.len()
+}
+
+fn should_flush_buffer(buffer: &BTreeMap<u64, BufferedMutation>) -> bool {
+    buffer.len() >= buffer_entry_cap() || buffer_encoded_bytes(buffer) >= buffer_byte_cap()
+}
+
+fn apply_buffer_range(
+    rows: &mut BTreeMap<u64, Vec<u8>>,
+    buffer: &BTreeMap<u64, BufferedMutation>,
+    start: u64,
+    end: u64,
+) {
+    for (key, mutation) in buffer.range(start..end) {
+        match mutation {
+            BufferedMutation::Value(value) => {
+                rows.insert(*key, value.clone());
+            }
+            BufferedMutation::Tombstone => {
+                rows.remove(key);
+            }
+        }
+    }
+}
+
+fn validate_page_index(rows: &BTreeMap<u64, Vec<u8>>, expected: usize) -> Result<(), String> {
+    if rows.keys().any(|key| *key as usize / PAGE_ROWS != expected) {
+        return Err("state page/root directory position mismatch".to_owned());
     }
     Ok(())
 }
 
-fn page_bloom(page: &BTreeMap<u64, Vec<u8>>) -> Vec<u8> {
-    let bytes = match page.len() {
-        0..=2 => 16,
-        3..=16 => 32,
-        _ => 64,
+fn decode_visible_page_counted(
+    counters: &mut Counters,
+    bytes: &[u8],
+    expected_index: usize,
+) -> Result<BTreeMap<u64, Vec<u8>>, String> {
+    let rows = decode_page_counted(counters, bytes)?;
+    validate_page_index(&rows, expected_index)?;
+    Ok(rows)
+}
+
+fn buffer_codec_controls() {
+    let pages = vec![ObjectId([1; 32]), ObjectId([2; 32])];
+    let first = Root {
+        layout: Layout::Bepsilon,
+        count: 128,
+        pages: pages.clone(),
+        buffer: BTreeMap::from([
+            (1, BufferedMutation::Value(tuple(1, 2))),
+            (65, BufferedMutation::Tombstone),
+        ]),
     };
-    let mut bloom = vec![0u8; bytes];
-    for key in page.keys() {
-        let hash = blake3::hash(&key.to_be_bytes());
-        for pair in hash.as_bytes()[..8].chunks_exact(2) {
-            let bit = u16::from_be_bytes([pair[0], pair[1]]) as usize % (bloom.len() * 8);
-            bloom[bit / 8] |= 1 << (bit % 8);
-        }
-    }
-    bloom
-}
+    let reverse = Root {
+        buffer: BTreeMap::from([
+            (65, BufferedMutation::Tombstone),
+            (1, BufferedMutation::Value(tuple(1, 2))),
+        ]),
+        ..first.clone()
+    };
+    let encoded = encode_root(&first);
+    assert_eq!(encoded, encode_root(&reverse));
+    assert_eq!(decode_root(&encoded).unwrap().buffer, first.buffer);
 
-fn bloom_might_contain(bloom: &[u8], key: u64) -> bool {
-    let hash = blake3::hash(&key.to_be_bytes());
-    hash.as_bytes()[..8].chunks_exact(2).all(|pair| {
-        let bit = u16::from_be_bytes([pair[0], pair[1]]) as usize % (bloom.len() * 8);
-        bloom[bit / 8] & (1 << (bit % 8)) != 0
-    })
-}
+    let mut malformed = encoded.clone();
+    malformed.pop();
+    assert!(decode_root(&malformed).is_err());
 
-fn emit_bloom_sweep() {
-    for entries in [1usize, 10, 64] {
-        let keys = (0..entries)
-            .map(|index| index as u64 * 997)
-            .collect::<Vec<_>>();
-        for bytes in [16usize, 32, 64, 128] {
-            let mut bloom = vec![0u8; bytes];
-            for key in &keys {
-                let hash = blake3::hash(&key.to_be_bytes());
-                for pair in hash.as_bytes()[..8].chunks_exact(2) {
-                    let bit = u16::from_be_bytes([pair[0], pair[1]]) as usize % (bytes * 8);
-                    bloom[bit / 8] |= 1 << (bit % 8);
-                }
-            }
-            let probes = 100_000u64;
-            let false_positives = (1_000_000..1_000_000 + probes)
-                .filter(|key| {
-                    let hash = blake3::hash(&key.to_be_bytes());
-                    hash.as_bytes()[..8].chunks_exact(2).all(|pair| {
-                        let bit = u16::from_be_bytes([pair[0], pair[1]]) as usize % (bytes * 8);
-                        bloom[bit / 8] & (1 << (bit % 8)) != 0
-                    })
-                })
-                .count();
-            println!(
-                "{LEDGER},kind=bloom_sweep,entries={entries},bloom_bytes={bytes},page_ref_bytes={},probes={probes},false_positives={false_positives},false_positive_ppm={}",
-                36 + bytes,
-                false_positives as u64 * 1_000_000 / probes
-            );
-        }
-    }
-}
+    let mut outside = first.clone();
+    outside
+        .buffer
+        .insert(128, BufferedMutation::Value(tuple(128, 2)));
+    assert!(decode_root(&encode_root(&outside)).is_err());
 
+    // Forge a duplicate/noncanonical buffer entry without BTreeMap sorting.
+    let mut duplicate = encode_root(&Root {
+        buffer: BTreeMap::new(),
+        ..first.clone()
+    });
+    duplicate.truncate(duplicate.len() - 2);
+    duplicate.extend_from_slice(&2u16.to_be_bytes());
+    encode_buffered_mutation(&mut duplicate, 1, &BufferedMutation::Tombstone);
+    encode_buffered_mutation(&mut duplicate, 1, &BufferedMutation::Value(tuple(1, 3)));
+    assert!(decode_root(&duplicate).is_err());
+
+    let mut visible = (0..128).map(|key| (key, tuple(key, 0))).collect();
+    apply_buffer_range(&mut visible, &first.buffer, 0, 128);
+    assert_eq!(visible.get(&1), Some(&tuple(1, 2)));
+    assert!(!visible.contains_key(&65));
+}
 fn tuple(key: u64, generation: u64) -> Vec<u8> {
     let mut out = Vec::new();
     encode_body(
@@ -1441,26 +1682,36 @@ fn tuple(key: u64, generation: u64) -> Vec<u8> {
     out
 }
 
-fn compaction_pending_percent() -> u64 {
-    std::env::var("EXP_DELTA_PAGE_COMPACTION_PERCENT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value >= 1 && *value <= 100)
-        .unwrap_or(DEFAULT_COMPACTION_PENDING_PERCENT)
-}
-
-fn compaction_row_threshold(row_count: usize) -> u64 {
-    (row_count as u64)
-        .saturating_mul(compaction_pending_percent())
-        .div_ceil(100)
-        .max(1)
-}
-
 fn mutation_keys(n: usize, d: usize, generation: u64) -> Vec<u64> {
-    let stride = (n / d.max(1)).max(1);
-    (0..d)
-        .map(|index| ((index * stride + generation as usize) % n) as u64)
-        .collect()
+    match mutation_pattern().as_str() {
+        "repeated" => vec![(n / 2) as u64],
+        "random" => {
+            let mut keys = BTreeSet::new();
+            let mut state = generation ^ 0x9e37_79b9_7f4a_7c15;
+            while keys.len() < d {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut value = state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                keys.insert((value ^ (value >> 31)) % n as u64);
+            }
+            keys.into_iter().collect()
+        }
+        "prefix" => {
+            let start = (generation as usize * d.max(1)) % n;
+            (0..d).map(|offset| ((start + offset) % n) as u64).collect()
+        }
+        _ => {
+            let stride = (n / d.max(1)).max(1);
+            (0..d)
+                .map(|index| ((index * stride + generation as usize) % n) as u64)
+                .collect()
+        }
+    }
+}
+
+fn mutation_pattern() -> String {
+    std::env::var("EXP_BEPSILON_PATTERN").unwrap_or_else(|_| "uniform".to_owned())
 }
 
 fn map_digest(rows: &BTreeMap<u64, Vec<u8>>) -> ObjectId {
@@ -1477,6 +1728,10 @@ fn parse_config() -> Config {
     let quick = std::env::var("EXP_DELTA_PAGE_QUICK").ok().as_deref() == Some("1");
     Config {
         backends: list_env("EXP_DELTA_PAGE_BACKENDS", "rocksdb,slatedb"),
+        layouts: list_env("EXP_DELTA_PAGE_LAYOUTS", "slotted,bepsilon")
+            .iter()
+            .map(|value| Layout::parse(value))
+            .collect(),
         sizes: usize_env(
             "EXP_DELTA_PAGE_SIZES",
             if quick { "1000" } else { "1000,10000,50000" },
