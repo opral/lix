@@ -90,13 +90,25 @@ where
     }
 
     pub async fn new(storage: StorageAdapter<StorageImpl>, rows: Vec<BenchTransactionRow>) -> Self {
+        Self::new_with_schema_definition(storage, rows, None).await
+    }
+
+    /// Opens the real transaction/current-state benchmark seam with one
+    /// additional schema definition installed in the authenticated catalog
+    /// root. This avoids SQL provider-registration behavior in physical
+    /// storage probes while exercising the production transaction publisher.
+    pub async fn new_with_schema_definition(
+        storage: StorageAdapter<StorageImpl>,
+        rows: Vec<BenchTransactionRow>,
+        schema: Option<JsonValue>,
+    ) -> Self {
         let tracked_state = Arc::new(TrackedStateContext::new());
         let hot_state = Arc::new(HotStateContext::new(
             tracked_state.as_ref().clone(),
             crate::commit_graph::CommitGraphContext::new(),
         ));
         let branch_ctx = Arc::new(BranchContext::new());
-        seed_visible_schema_rows(storage.clone(), tracked_state.as_ref()).await;
+        seed_visible_schema_rows(storage.clone(), tracked_state.as_ref(), schema).await;
         Self {
             storage,
             hot_state,
@@ -122,6 +134,36 @@ where
         for row in &self.rows {
             rows.push(transaction_row(row, &row.value));
         }
+        self.commit_rows(rows).await
+    }
+
+    /// Publishes one Schema-v1 row through the real transaction path with a
+    /// canonical typed UUID primary key.
+    pub async fn insert_native_uuid_row(
+        &mut self,
+        schema_key: &str,
+        entity_pk: &str,
+        value: Arc<JsonValue>,
+    ) -> BenchWriteAccounting {
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push(TransactionWriteRow {
+            entity_pk: Some(
+                EntityPk::uuid_from_canonical(entity_pk)
+                    .expect("native-row probe UUID should be canonical"),
+            ),
+            schema_key: schema_key.into(),
+            file_id: None,
+            snapshot: Some(TransactionJson::from_shared_value_unchecked(value)),
+            metadata: None,
+            origin: None,
+            created_at: None,
+            updated_at: None,
+            global: false,
+            change_id: None,
+            commit_id: None,
+            untracked: false,
+            branch_id: BENCH_BRANCH_ID.into(),
+        });
         self.commit_rows(rows).await
     }
 
@@ -226,6 +268,112 @@ where
         self.read_one(&self.rows[self.rows.len() / 2]).await
     }
 
+    /// Reopens the production retained-read seam over an existing backend and
+    /// reports whether the selected current-state row carries a native tuple.
+    pub async fn reopen_native_row(
+        storage: StorageAdapter<StorageImpl>,
+        schema_key: &str,
+        entity_pk: &str,
+    ) -> Result<bool, crate::LixError> {
+        let hot_state = HotStateContext::new(
+            TrackedStateContext::new(),
+            crate::commit_graph::CommitGraphContext::new(),
+        );
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("begin reopened native-row read"),
+        );
+        let rows = hot_state
+            .reader(read)
+            .load_exact_batch(&crate::hot_state::HotStateExactBatchRequest {
+                rows: vec![crate::hot_state::HotStateExactRowRequest {
+                    schema_key: schema_key.to_owned(),
+                    branch_id: BENCH_BRANCH_ID.to_owned(),
+                    entity_pk: EntityPk::uuid_from_canonical(entity_pk)
+                        .expect("reopened native-row UUID should be canonical"),
+                    file_id: None,
+                }],
+                projection: HotStateProjection::default(),
+                untracked: Some(false),
+                include_tombstones: false,
+            })
+            .await?;
+        Ok(rows
+            .row(0)
+            .is_some_and(|row| row.native_snapshot().is_some()))
+    }
+
+    /// Returns the exact physical HOT key for a canonical typed UUID row at
+    /// the currently retained branch generation.
+    pub async fn native_uuid_physical_key(
+        storage: StorageAdapter<StorageImpl>,
+        schema_key: &str,
+        entity_pk: &str,
+    ) -> Vec<u8> {
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("begin native-row physical-key read"),
+        );
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(BENCH_BRANCH_ID)
+            .await
+            .expect("load native-row physical-key branch")
+            .expect("native-row physical-key branch should exist");
+        crate::hot_state::encoded_hot_row_key_for_probe(
+            BENCH_BRANCH_ID,
+            control.tracked_generation,
+            schema_key,
+            EntityPk::uuid_from_canonical(entity_pk)
+                .expect("native-row physical-key UUID should be canonical"),
+        )
+    }
+
+    /// Replaces the requested current-state row with a correctly encoded
+    /// native tuple certified for a different same-shaped owner. The next
+    /// production retained read must reject it at the StateKey boundary.
+    pub async fn substitute_native_uuid_owner(
+        storage: StorageAdapter<StorageImpl>,
+        requested_entity_pk: &str,
+        substituted_entity_pk: &str,
+    ) {
+        let requested = EntityPk::uuid_from_canonical(requested_entity_pk)
+            .expect("requested native-row UUID should be canonical");
+        let substituted = EntityPk::uuid_from_canonical(substituted_entity_pk)
+            .expect("substituted native-row UUID should be canonical");
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("begin native-row substitution read"),
+        );
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(BENCH_BRANCH_ID)
+            .await
+            .expect("load native-row substitution branch")
+            .expect("native-row substitution branch should exist");
+        let mut writes = storage.new_write_set();
+        crate::hot_state::stage_native_owner_substitution_for_probe(
+            &read,
+            &mut writes,
+            BENCH_BRANCH_ID,
+            control.tracked_generation,
+            "native_carrier_probe",
+            &requested,
+            &substituted,
+        )
+        .await
+        .expect("stage native-row owner substitution");
+        crate::storage_bench::commit_write_set_for_bench(&storage, writes)
+            .await
+            .expect("commit native-row owner substitution");
+    }
+
     /// Returns every visible row's identity and snapshot content, sorted by
     /// identity. Unlike the timed read helpers this materializes contents,
     /// so equivalence tests can compare logical state across storage implementations.
@@ -282,7 +430,7 @@ where
             .hot_state
             .reader(read)
             .load_row(&HotStateRowRequest {
-                schema_key: "json_pointer".to_string(),
+                schema_key: row.schema_key.clone(),
                 branch_id: BENCH_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(row.entity_pk.clone()),
                 file_id: NullableKeyFilter::Null,
@@ -397,6 +545,7 @@ where
                 created_at: timestamp,
                 updated_at: timestamp,
                 snapshot: snapshot.as_ref_slot(),
+                native_snapshot: None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 columnar_base_coordinate: None,
             }],
@@ -455,6 +604,7 @@ fn transaction_delete_row(row: &BenchTransactionRow) -> TransactionWriteRow {
 async fn seed_visible_schema_rows<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
     tracked_state: &TrackedStateContext,
+    extra_schema: Option<JsonValue>,
 ) where
     StorageImpl: Storage + Clone,
 {
@@ -464,13 +614,19 @@ async fn seed_visible_schema_rows<StorageImpl>(
         .cloned()
         .collect::<Vec<_>>();
     schemas.push(json_pointer_schema());
+    if let Some(schema) = extra_schema {
+        schemas.push(schema);
+    }
     let rows = schemas
         .iter()
-        .map(|schema| {
-            let key = crate::schema::schema_key_from_definition(schema)
-                .expect("seed schema key should derive");
-            let snapshot_content = json!({ "value": schema }).to_string();
-            crate::tracked_state::MaterializedTrackedStateRow {
+        .filter_map(|schema| {
+            let key = crate::schema::schema_key_from_definition(schema).ok()?;
+            let snapshot_content = json!({
+                "schema_key": key.schema_key.as_str(),
+                "value": schema,
+            })
+            .to_string();
+            Some(crate::tracked_state::MaterializedTrackedStateRow {
                 entity_pk: crate::schema::registered_schema_entity_pk(&key.schema_key)
                     .expect("registered schema identity should derive"),
                 schema_key: "lix_registered_schema".to_string(),
@@ -482,7 +638,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
                 updated_at: TIMESTAMP.to_string(),
                 change_id: ChangeId::for_test_label(&format!("schema-fixture-{}", key.schema_key)),
                 commit_id: CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
-            }
+            })
         })
         .collect::<Vec<_>>();
     let mut read = SharedStorageAdapterRead::new(

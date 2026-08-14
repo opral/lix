@@ -1000,6 +1000,43 @@ pub fn certified_current_state_publication_counters() -> CertifiedCurrentStatePu
     }
 }
 
+/// Physical engagement counters for Schema-v1 native scalar tuples.
+///
+/// These count the authoritative current-state encoder and retained-read
+/// decoder, not transaction preparation. A zero-jsonb Schema-v1 row must
+/// increase `native_writes`/`native_reads` while both whole-row JSON counters
+/// stay zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeRowDurableCounters {
+    pub native_writes: u64,
+    pub native_reads: u64,
+    pub native_write_bytes: u64,
+    pub native_read_bytes: u64,
+    pub whole_row_json_writes: u64,
+    pub whole_row_json_reads: u64,
+    pub whole_row_json_write_bytes: u64,
+    pub whole_row_json_read_bytes: u64,
+}
+
+pub fn native_row_durable_counters() -> NativeRowDurableCounters {
+    NativeRowDurableCounters {
+        native_writes: crate::hot_state::NATIVE_ROW_DURABLE_WRITES.load(Ordering::Relaxed),
+        native_reads: crate::hot_state::NATIVE_ROW_DURABLE_READS.load(Ordering::Relaxed),
+        native_write_bytes: crate::hot_state::NATIVE_ROW_DURABLE_WRITE_BYTES
+            .load(Ordering::Relaxed),
+        native_read_bytes: crate::hot_state::NATIVE_ROW_DURABLE_READ_BYTES
+            .load(Ordering::Relaxed),
+        whole_row_json_writes: crate::hot_state::NATIVE_ROW_WHOLE_JSON_WRITES
+            .load(Ordering::Relaxed),
+        whole_row_json_reads: crate::hot_state::NATIVE_ROW_WHOLE_JSON_READS
+            .load(Ordering::Relaxed),
+        whole_row_json_write_bytes: crate::hot_state::NATIVE_ROW_WHOLE_JSON_WRITE_BYTES
+            .load(Ordering::Relaxed),
+        whole_row_json_read_bytes: crate::hot_state::NATIVE_ROW_WHOLE_JSON_READ_BYTES
+            .load(Ordering::Relaxed),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Commit-root replay accounting (experiment AA).
 //

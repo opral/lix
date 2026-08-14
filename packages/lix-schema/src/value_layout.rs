@@ -41,6 +41,83 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::{DataType, Schema};
+
+/// Domain-separated identifier for the complete durable row-value layout.
+///
+/// This is deliberately not just `Schema::fingerprint()`: the digest names
+/// the physical row contract, including the fact that primary-key columns are
+/// carried by the authenticated state key and the exact order of the remaining
+/// value columns.
+pub fn layout_id(schema: &Schema) -> Result<[u8; 32], EncodeError> {
+    schema
+        .validate()
+        .map_err(|error| EncodeError(error.to_string()))?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"lix.schema-v1.native-row-layout.v1\0");
+    hash.update(&(schema.key.len() as u64).to_be_bytes());
+    hash.update(schema.key.as_bytes());
+    hash.update(&(schema.columns.len() as u64).to_be_bytes());
+    for column in &schema.columns {
+        hash.update(&(column.name.len() as u64).to_be_bytes());
+        hash.update(column.name.as_bytes());
+        let kind = match column.data_type {
+            DataType::Text => 0,
+            DataType::Uuid => 1,
+            DataType::Int8 => 2,
+            DataType::Float8 => 3,
+            DataType::Boolean => 4,
+            DataType::Jsonb => 5,
+            DataType::Timestamptz => 6,
+        };
+        hash.update(&[kind, u8::from(column.nullable)]);
+        let pk = schema
+            .primary_key
+            .iter()
+            .position(|name| name == &column.name)
+            .and_then(|ordinal| u32::try_from(ordinal).ok())
+            .unwrap_or(u32::MAX);
+        hash.update(&pk.to_be_bytes());
+    }
+    hash.update(&(schema.primary_key.len() as u64).to_be_bytes());
+    for name in &schema.primary_key {
+        hash.update(&(name.len() as u64).to_be_bytes());
+        hash.update(name.as_bytes());
+    }
+    let value_columns = schema
+        .columns
+        .iter()
+        .filter(|column| !schema.primary_key.contains(&column.name))
+        .collect::<Vec<_>>();
+    hash.update(&(value_columns.len() as u64).to_be_bytes());
+    for column in value_columns {
+        hash.update(&(column.name.len() as u64).to_be_bytes());
+        hash.update(column.name.as_bytes());
+    }
+    Ok(*hash.finalize().as_bytes())
+}
+
+/// Non-primary-key body plan in canonical schema declaration order.
+pub fn body_plan(schema: &Schema) -> Vec<BodyColumn> {
+    schema
+        .columns
+        .iter()
+        .filter(|column| !schema.primary_key.contains(&column.name))
+        .map(|column| BodyColumn {
+            kind: match column.data_type {
+                DataType::Text => BodyKind::Text,
+                DataType::Uuid => BodyKind::Uuid,
+                DataType::Int8 => BodyKind::Int8,
+                DataType::Float8 => BodyKind::Float8,
+                DataType::Boolean => BodyKind::Boolean,
+                DataType::Jsonb => BodyKind::Jsonb,
+                DataType::Timestamptz => BodyKind::Timestamptz,
+            },
+            nullable: column.nullable,
+        })
+        .collect()
+}
+
 /// Body format version carried in the high nibble of the header byte.
 pub const BODY_VERSION: u8 = 1;
 const HEADER_WIDE_OFFSETS: u8 = 0b0000_1000;

@@ -14,7 +14,9 @@ use crate::schema::{
 use crate::sql2::PublicCatalog;
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
-use crate::transaction_types::{PreparedRowFacts, RawWriteBatch, RawWriteRowRef, TransactionJson};
+use crate::transaction_types::{
+    NativeRowPayload, PreparedRowFacts, RawWriteBatch, RawWriteRowRef, TransactionJson,
+};
 
 pub(crate) const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -114,6 +116,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
                 row_index,
                 Some(TransactionJson::from_certified_shared_normalized_row_content(normalized)),
             );
+            attach_native_schema_v1_row(rows, row_index, schema_plan)?;
             canonicalize_descriptor_file_id(rows, row_index)?;
             return Ok(NormalizedRowFacts {
                 schema_plan_id,
@@ -136,6 +139,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
                 "certified replacement row is missing its proven entity identity",
             ));
         }
+        attach_native_schema_v1_row(rows, row_index, schema_plan)?;
         canonicalize_descriptor_file_id(rows, row_index)?;
         return Ok(NormalizedRowFacts {
             schema_plan_id,
@@ -146,7 +150,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
         });
     }
 
-    let normalized_snapshot = if let Some(snapshot) = rows.take_snapshot(row_index) {
+    let mut normalized_snapshot = if let Some(snapshot) = rows.take_snapshot(row_index) {
         let row = rows.row(row_index);
         let snapshot_object = snapshot.value().as_object().ok_or_else(|| {
             LixError::new(
@@ -203,6 +207,21 @@ pub(crate) fn normalize_raw_write_row_in_place(
             .has_committed_checks()
     } && !row.constraints_unchanged;
 
+    if let Some(snapshot) = normalized_snapshot.as_mut() {
+        let row = rows.row(row_index);
+        if let Some(native_row) = native_schema_v1_row(
+            schema_plan,
+            row.entity_pk,
+            row.branch_id,
+            row.file_id.map(AsRef::as_ref),
+            row.untracked,
+            snapshot.value(),
+        )?
+        {
+            snapshot.set_native_row(native_row);
+        }
+    }
+
     if row.schema_key == REGISTERED_SCHEMA_KEY {
         if row.file_id.is_some() {
             return Err(LixError::new(
@@ -228,6 +247,175 @@ pub(crate) fn normalize_raw_write_row_in_place(
             row_content_validated: true,
             requires_transaction_validation,
         },
+    })
+}
+
+fn attach_native_schema_v1_row(
+    rows: &mut RawWriteBatch,
+    row_index: usize,
+    schema_plan: &SchemaPlan,
+) -> Result<(), LixError> {
+    let row = rows.row(row_index);
+    let entity_pk = row
+        .entity_pk
+        .cloned()
+        .ok_or_else(|| LixError::new(LixError::CODE_INTERNAL_ERROR, "native row lacks identity"))?;
+    let branch_id = row.branch_id.to_owned();
+    let file_id = row.file_id.map(ToOwned::to_owned);
+    let untracked = row.untracked;
+    let native = {
+        let snapshot = rows
+            .row(row_index)
+            .snapshot
+            .ok_or_else(|| LixError::new(LixError::CODE_INTERNAL_ERROR, "native row lacks payload"))?;
+        native_schema_v1_row(
+            schema_plan,
+            Some(&entity_pk),
+            &branch_id,
+            file_id.as_deref(),
+            untracked,
+            snapshot.value(),
+        )?
+    };
+    if let Some(native) = native {
+        rows.snapshot_mut(row_index)
+            .expect("snapshot was checked above")
+            .set_native_row(native);
+    }
+    Ok(())
+}
+
+fn native_schema_v1_row(
+    schema_plan: &SchemaPlan,
+    entity_pk: Option<&EntityPk>,
+    branch_id: &str,
+    file_id: Option<&str>,
+    untracked: bool,
+    snapshot: &JsonValue,
+) -> Result<Option<NativeRowPayload>, LixError> {
+    let Ok(schema) = lix_schema::from_value(schema_plan.schema.as_ref().clone()) else {
+        return Ok(None);
+    };
+    let entity_pk = entity_pk.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "normalized Schema v1 row is missing its typed primary key",
+        )
+    })?;
+    native_schema_v1_payload(
+        &schema,
+        entity_pk,
+        branch_id,
+        file_id,
+        untracked,
+        snapshot,
+    )
+    .map(Some)
+}
+
+fn native_schema_v1_payload(
+    schema: &lix_schema::Schema,
+    entity_pk: &EntityPk,
+    branch_id: &str,
+    file_id: Option<&str>,
+    untracked: bool,
+    snapshot: &JsonValue,
+) -> Result<NativeRowPayload, LixError> {
+    let object = snapshot.as_object().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("Schema v1 row '{}' must be an object", schema.key),
+        )
+    })?;
+    let mut values = Vec::with_capacity(schema.columns.len() - schema.primary_key.len());
+    for column in schema
+        .columns
+        .iter()
+        .filter(|column| !schema.primary_key.contains(&column.name))
+    {
+        let value = object.get(&column.name).unwrap_or(&JsonValue::Null);
+        let value = match (column.data_type, value) {
+            (_, JsonValue::Null) => lix_schema::value_layout::BodyValue::Null,
+            (lix_schema::DataType::Text, JsonValue::String(value)) => {
+                lix_schema::value_layout::BodyValue::Text(value.clone())
+            }
+            (lix_schema::DataType::Uuid, JsonValue::String(value)) => {
+                lix_schema::value_layout::BodyValue::Uuid(uuid::Uuid::parse_str(value).map_err(
+                    |error| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_VALIDATION,
+                            format!("{}.{} contains invalid uuid: {error}", schema.key, column.name),
+                        )
+                    },
+                )?)
+            }
+            (lix_schema::DataType::Int8, JsonValue::Number(value)) => {
+                lix_schema::value_layout::BodyValue::Int8(value.as_i64().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!("{}.{} is not int8", schema.key, column.name),
+                    )
+                })?)
+            }
+            (lix_schema::DataType::Float8, JsonValue::Number(value)) => {
+                lix_schema::value_layout::BodyValue::Float8(value.as_f64().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!("{}.{} is not float8", schema.key, column.name),
+                    )
+                })?)
+            }
+            (lix_schema::DataType::Boolean, JsonValue::Bool(value)) => {
+                lix_schema::value_layout::BodyValue::Boolean(*value)
+            }
+            (lix_schema::DataType::Jsonb, value) => {
+                lix_schema::value_layout::BodyValue::Jsonb(value.clone())
+            }
+            (lix_schema::DataType::Timestamptz, JsonValue::String(value)) => {
+                let micros = chrono::DateTime::parse_from_rfc3339(value)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_VALIDATION,
+                            format!(
+                                "{}.{} contains invalid timestamptz: {error}",
+                                schema.key, column.name
+                            ),
+                        )
+                    })?
+                    .timestamp_micros();
+                lix_schema::value_layout::BodyValue::Timestamptz(micros)
+            }
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "{}.{} does not match declared type {}",
+                        schema.key,
+                        column.name,
+                        column.data_type.postgres_name()
+                    ),
+                ));
+            }
+        };
+        values.push(value);
+    }
+    let layout_id = lix_schema::value_layout::layout_id(&schema)
+        .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?;
+    let plan = lix_schema::value_layout::body_plan(&schema);
+    let mut body = Vec::new();
+    lix_schema::value_layout::encode_body(&plan, &values, &mut body)
+        .map_err(|error| LixError::new(LixError::CODE_SCHEMA_VALIDATION, error.to_string()))?;
+    Ok(NativeRowPayload {
+        layout_id,
+        owner_digest: crate::entity_pk::native_row_owner_digest(
+            branch_id,
+            None,
+            &schema.key,
+            entity_pk,
+            file_id,
+            untracked,
+        ),
+        body: bytes::Bytes::from(body),
     })
 }
 

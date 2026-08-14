@@ -471,6 +471,7 @@ where
                 created_at: change.created_at,
                 updated_at: change.created_at,
                 snapshot: change.snapshot.as_ref_slot(),
+                native_snapshot: None,
                 metadata: change.metadata.as_ref_slot(),
                 columnar_base_coordinate: None,
             })

@@ -5201,6 +5201,7 @@ mod tests {
                     created_at: timestamp,
                     updated_at: timestamp,
                     snapshot: JsonSlot::Ref(corrupt_snapshot).as_ref_slot(),
+                    native_snapshot: None,
                     metadata: JsonSlotRef::None,
                     columnar_base_coordinate: None,
                 }],

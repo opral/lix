@@ -32,6 +32,13 @@ pub(crate) use reader::load_exact_batch_via_scan_for_test;
 pub(crate) use reader::{HotStateReadDomain, HotStateReader};
 #[cfg(test)]
 pub(crate) use tracked_head::TrackedHeadDeltaRef;
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use tracked_head::{
+    NATIVE_ROW_DURABLE_READ_BYTES, NATIVE_ROW_DURABLE_READS, NATIVE_ROW_DURABLE_WRITE_BYTES,
+    NATIVE_ROW_DURABLE_WRITES, NATIVE_ROW_WHOLE_JSON_READ_BYTES, NATIVE_ROW_WHOLE_JSON_READS,
+    NATIVE_ROW_WHOLE_JSON_WRITE_BYTES, NATIVE_ROW_WHOLE_JSON_WRITES,
+    encoded_hot_row_key_for_probe, stage_native_owner_substitution_for_probe,
+};
 #[cfg(test)]
 pub(crate) use tracked_head::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
@@ -77,7 +84,7 @@ pub(crate) use types::{
     HotStateProjection, HotStateRowFilter, HotStateRowIdentityRef, HotStateRowRequest,
     HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateBatchBuilder,
     MaterializedHotStateExactBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
-    ScanConstraint, ScanField, ScanOperator,
+    NativeRowSnapshot, ScanConstraint, ScanField, ScanOperator,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{

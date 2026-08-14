@@ -2054,6 +2054,7 @@ fn current_state_delta_from_state_row(
             crate::json_store::JsonSlotRef::None,
             crate::transaction_types::StageJson::slot_ref,
         ),
+        native_snapshot: row.snapshot.and_then(crate::transaction_types::StageJson::native_row),
         metadata: row.metadata.map_or(
             crate::json_store::JsonSlotRef::None,
             crate::transaction_types::StageJson::slot_ref,
@@ -2101,6 +2102,9 @@ impl crate::hot_state::DeferredFreshHotRows for PreparedStateBatch {
                     crate::json_store::JsonSlotRef::None,
                     crate::transaction_types::StageJson::slot_ref,
                 ),
+                native_snapshot: row
+                    .snapshot
+                    .and_then(crate::transaction_types::StageJson::native_row),
                 metadata: row.metadata.map_or(
                     crate::json_store::JsonSlotRef::None,
                     crate::transaction_types::StageJson::slot_ref,
@@ -2128,6 +2132,7 @@ fn current_state_delta_from_engine_row(
         created_at: row.created_at,
         updated_at: row.updated_at,
         snapshot: row.change.snapshot.as_ref_slot(),
+        native_snapshot: None,
         metadata: row.change.metadata.as_ref_slot(),
         columnar_base_coordinate: None,
     }
@@ -4260,6 +4265,7 @@ async fn stage_tracked_head(
                             created_at: change_ref.created_at,
                             updated_at: change_ref.updated_at,
                             snapshot: snapshot.as_ref_slot(),
+                            native_snapshot: None,
                             metadata: metadata.as_ref_slot(),
                             columnar_base_coordinate: None,
                         }
@@ -7287,6 +7293,7 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
             snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"value":1}"#),
+            native_snapshot: None,
             metadata: crate::json_store::JsonSlotRef::None,
             columnar_base_coordinate: None,
         };

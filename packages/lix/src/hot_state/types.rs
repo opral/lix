@@ -84,6 +84,7 @@ pub(crate) struct MaterializedHotStateBatch {
     branch_ids: Vec<BranchIdId>,
     entity_pks: Vec<EntityPk>,
     snapshot_content: Vec<Option<SharedStr>>,
+    native_snapshot: Vec<Option<NativeRowSnapshot>>,
     metadata: Vec<Option<SharedStr>>,
     deleted: Vec<bool>,
     created_at: Vec<LixTimestamp>,
@@ -110,8 +111,16 @@ pub(crate) struct MaterializedHotStateBatch {
 #[derive(Debug, Clone)]
 struct MaterializedHotStateSingleton {
     row: MaterializedHotStateRow,
+    native_snapshot: Option<NativeRowSnapshot>,
     durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeRowSnapshot {
+    pub(crate) layout_id: [u8; 32],
+    pub(crate) owner_digest: [u8; 32],
+    pub(crate) body: Bytes,
 }
 
 impl MaterializedHotStateBatch {
@@ -471,6 +480,13 @@ impl<'a> MaterializedHotStateRowRef<'a> {
         )
     }
 
+    pub(crate) fn native_snapshot(self) -> Option<&'a NativeRowSnapshot> {
+        self.singleton().map_or_else(
+            || self.batch.native_snapshot[self.index].as_ref(),
+            |singleton| singleton.native_snapshot.as_ref(),
+        )
+    }
+
     pub(crate) fn metadata(self) -> Option<&'a SharedStr> {
         self.singleton().map_or_else(
             || self.batch.metadata[self.index].as_ref(),
@@ -799,6 +815,7 @@ pub(crate) struct MaterializedHotStateBatchBuilder {
     branch_ids: Vec<BranchIdId>,
     entity_pks: Vec<EntityPk>,
     snapshot_content: Vec<Option<SharedStr>>,
+    native_snapshot: Vec<Option<NativeRowSnapshot>>,
     metadata: Vec<Option<SharedStr>>,
     deleted: Vec<bool>,
     created_at: Vec<LixTimestamp>,
@@ -866,6 +883,7 @@ impl MaterializedHotStateBatchBuilder {
             branch_ids: Vec::with_capacity(column_capacity),
             entity_pks: Vec::with_capacity(column_capacity),
             snapshot_content: Vec::with_capacity(column_capacity),
+            native_snapshot: Vec::with_capacity(column_capacity),
             metadata: Vec::with_capacity(column_capacity),
             deleted: Vec::with_capacity(column_capacity),
             created_at: Vec::with_capacity(column_capacity),
@@ -897,13 +915,14 @@ impl MaterializedHotStateBatchBuilder {
         if self.singleton_capacity && self.singleton.is_none() && self.entity_pks.is_empty() {
             self.singleton = Some(Box::new(MaterializedHotStateSingleton {
                 row,
+                native_snapshot: None,
                 durable_predecessor: None,
                 columnar_base_coordinate: None,
             }));
             return;
         }
         self.promote_singleton();
-        self.push_owned_columnar(row, None, None);
+        self.push_owned_columnar(row, None, None, None);
     }
 
     fn promote_singleton(&mut self) {
@@ -914,6 +933,7 @@ impl MaterializedHotStateBatchBuilder {
         self.singleton_capacity = false;
         self.push_owned_columnar(
             singleton.row,
+            singleton.native_snapshot,
             singleton.durable_predecessor,
             singleton.columnar_base_coordinate,
         );
@@ -922,6 +942,7 @@ impl MaterializedHotStateBatchBuilder {
     fn push_owned_columnar(
         &mut self,
         row: MaterializedHotStateRow,
+        native_snapshot: Option<NativeRowSnapshot>,
         durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
         columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     ) {
@@ -958,6 +979,10 @@ impl MaterializedHotStateBatchBuilder {
             commit_id,
             untracked,
         );
+        *self
+            .native_snapshot
+            .last_mut()
+            .expect("pushed live-state row has a native snapshot slot") = native_snapshot;
         *self
             .durable_predecessor
             .last_mut()
@@ -1022,6 +1047,16 @@ impl MaterializedHotStateBatchBuilder {
             untracked,
         );
         ordinal
+    }
+
+
+    pub(crate) fn set_native_snapshot(&mut self, row: usize, value: NativeRowSnapshot) {
+        if let Some(singleton) = self.singleton.as_mut() {
+            debug_assert_eq!(row, 0);
+            singleton.native_snapshot = Some(value);
+            return;
+        }
+        self.native_snapshot[row] = Some(value);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1144,9 +1179,13 @@ impl MaterializedHotStateBatchBuilder {
         let ordinal = self.len();
         if self.singleton_capacity {
             let branch_id = branch_override.map_or_else(|| row.branch_owner(), Arc::from);
+            let native_snapshot = row.native_snapshot().cloned();
             let durable_predecessor = row.durable_predecessor().cloned();
             let columnar_base_coordinate = row.columnar_base_coordinate();
             self.push_owned(row.to_owned_with_branch(branch_id));
+            if let Some(native_snapshot) = native_snapshot {
+                self.set_native_snapshot(ordinal, native_snapshot);
+            }
             if let Some(durable_predecessor) = durable_predecessor {
                 self.set_durable_predecessor(ordinal, durable_predecessor);
             }
@@ -1176,6 +1215,10 @@ impl MaterializedHotStateBatchBuilder {
             row.commit_id(),
             row.untracked(),
         );
+        self.native_snapshot
+            .last_mut()
+            .expect("pushed live-state row has a native snapshot slot")
+            .clone_from(&row.native_snapshot().cloned());
         self.durable_predecessor
             .last_mut()
             .expect("pushed live-state row has a predecessor slot")
@@ -1208,6 +1251,7 @@ impl MaterializedHotStateBatchBuilder {
         self.branch_ids.push(branch_id);
         self.entity_pks.push(entity_pk);
         self.snapshot_content.push(snapshot_content);
+        self.native_snapshot.push(None);
         self.metadata.push(metadata);
         self.deleted.push(deleted);
         self.created_at.push(created_at);
@@ -1278,6 +1322,7 @@ impl MaterializedHotStateBatchBuilder {
             branch_ids: self.branch_ids,
             entity_pks: self.entity_pks,
             snapshot_content: self.snapshot_content,
+            native_snapshot: self.native_snapshot,
             metadata: self.metadata,
             deleted: self.deleted,
             created_at: self.created_at,

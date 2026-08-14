@@ -5453,14 +5453,18 @@ fn append_entity_insert_row(
     }
     let global = global.unwrap_or(false);
     let branch_id = entity_row_branch_id(plan, explicit_branch_id, global)?;
+    let entity_pk = entity_pk.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("INSERT into {} did not produce a primary key", layout.schema_key),
+        )
+    })?;
+    let snapshot = TransactionJson::from_value(snapshot, &layout.snapshot_context)?;
     rows.push_parts(
-        entity_pk,
+        Some(entity_pk),
         layout.schema_key.as_str().into(),
         file_id.map(Into::into),
-        Some(TransactionJson::from_value(
-            snapshot,
-            &layout.snapshot_context,
-        )?),
+        Some(snapshot),
         metadata,
         None,
         None,

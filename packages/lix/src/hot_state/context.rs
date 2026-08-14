@@ -2887,6 +2887,7 @@ mod tests {
                     created_at: ts(&row.created_at),
                     updated_at: ts(&row.updated_at),
                     snapshot: snapshot.as_ref_slot(),
+                    native_snapshot: None,
                     metadata: metadata.as_ref_slot(),
                     columnar_base_coordinate: None,
                 })
@@ -2970,6 +2971,7 @@ mod tests {
                     created_at: ts(&row.created_at),
                     updated_at: ts(&row.updated_at),
                     snapshot: snapshot.as_ref_slot(),
+                    native_snapshot: None,
                     metadata: metadata.as_ref_slot(),
                     columnar_base_coordinate: None,
                 })

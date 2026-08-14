@@ -530,6 +530,8 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
                 append_head_value(
                     &mut value_bytes,
                     &delta.value_ref(
+                        &self.plan.branch_id,
+                        self.plan.generation,
                         delta.created_at,
                         if let Some(checkpoint_commit_id) = self.plan.checkpoint_commit_id {
                             WorkingDiffBaseline::BeforeAbsent {
@@ -5928,6 +5930,7 @@ where
             entries,
             ChangeRecordProjection::from_columns(&["snapshot_content".to_owned()]),
             branch_id,
+            control.tracked_generation,
             control.working_diff_checkpoint_commit_id,
         )
         .await?;
@@ -6179,6 +6182,7 @@ where
             entries,
             projection,
             branch_id,
+            generation,
             active_checkpoint_commit_id,
         )
         .await?;
@@ -6490,6 +6494,7 @@ where
             entries,
             *projection,
             branch_id,
+            generation,
             active_checkpoint_commit_id,
         )
         .await?;
@@ -6846,6 +6851,7 @@ impl HotTrackedSnapshot {
                     .snapshot_content
                     .as_deref()
                     .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
+                native_snapshot: None,
                 metadata: row
                     .metadata
                     .as_deref()
@@ -8779,7 +8785,12 @@ where
                     if delta.physically_deletes() || compacted_row || interval_local_row {
                         None
                     } else {
-                        let mut value = delta.value_ref(*created_at, working_diff_baseline);
+                        let mut value = delta.value_ref(
+                            branch_id,
+                            generation,
+                            *created_at,
+                            working_diff_baseline,
+                        );
                         value.columnar_base_coordinate = next_columnar_base_coordinate(
                             reset_working_diff_baselines,
                             delta,
@@ -8902,11 +8913,23 @@ where
         reject_lifecycle_retention_collisions(&sorted_untracked, &sorted_tracked)?;
 
         for delta in &sorted_untracked {
-            apply_complete_hot_snapshot_delta(&mut untracked_rows, delta, absence_guards)?;
+            apply_complete_hot_snapshot_delta(
+                &mut untracked_rows,
+                branch_id,
+                generation,
+                delta,
+                absence_guards,
+            )?;
         }
         merge_final_untracked_rows(&mut rows, untracked_rows)?;
         for delta in &sorted_tracked {
-            apply_complete_hot_snapshot_delta(&mut rows, delta, absence_guards)?;
+            apply_complete_hot_snapshot_delta(
+                &mut rows,
+                branch_id,
+                generation,
+                delta,
+                absence_guards,
+            )?;
         }
 
         // A replacement generation cannot inherit a checkpoint baseline from
@@ -9092,6 +9115,7 @@ async fn stage_incremental_file_delete_cascades(
                 created_at: existing.created_at,
                 updated_at: cascade.updated_at,
                 snapshot: JsonSlotRef::None,
+                native_snapshot: None,
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: existing.columnar_base_coordinate,
                 working_diff_baseline: baseline,
@@ -9431,6 +9455,8 @@ fn reject_lifecycle_retention_collisions(
 
 fn apply_complete_hot_snapshot_delta(
     rows: &mut HotRowMap,
+    branch_id: &str,
+    generation: CommitId,
     delta: &CurrentStateDeltaRef<'_>,
     absence_guards: &BTreeSet<TrackedStateKey>,
 ) -> Result<(), LixError> {
@@ -9456,7 +9482,12 @@ fn apply_complete_hot_snapshot_delta(
         rows.insert(
             identity,
             Bytes::from(encode_head_value(&{
-                let mut value = delta.value_ref(created_at, WorkingDiffBaseline::Disabled);
+                let mut value = delta.value_ref(
+                    branch_id,
+                    generation,
+                    created_at,
+                    WorkingDiffBaseline::Disabled,
+                );
                 value.columnar_base_coordinate = None;
                 value
             })?),
@@ -9502,6 +9533,7 @@ fn apply_complete_file_delete_cascade(
                 created_at: existing.created_at,
                 updated_at: delta.updated_at,
                 snapshot: JsonSlotRef::None,
+                native_snapshot: None,
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: existing.columnar_base_coordinate,
                 working_diff_baseline: WorkingDiffBaseline::Disabled,
@@ -10441,6 +10473,7 @@ fn stage_hot_bootstrap(
                 .snapshot_content
                 .as_deref()
                 .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
+            native_snapshot: None,
             metadata: row
                 .metadata
                 .as_deref()
@@ -10491,6 +10524,7 @@ fn stage_hot_bootstrap(
                 .snapshot_content
                 .as_deref()
                 .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
+            native_snapshot: None,
             metadata: row
                 .metadata
                 .as_deref()
@@ -10532,6 +10566,8 @@ fn stage_hot_bootstrap(
                 identity,
                 Bytes::from(encode_head_value(&{
                     let mut value = delta.value_ref(
+                        branch_id,
+                        generation,
                         created_at,
                         if delta.untracked {
                             WorkingDiffBaseline::Disabled
@@ -10881,6 +10917,22 @@ impl Ord for HotScanIdentity {
 }
 
 impl LiveMaterializationIdentity for HotScanIdentity {
+    fn native_owner_digest(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        untracked: bool,
+    ) -> [u8; 32] {
+        crate::entity_pk::native_row_owner_digest(
+            branch_id,
+            Some(*generation.as_uuid().as_bytes()),
+            self.schema_key(),
+            &self.entity_pk,
+            self.file_id(),
+            untracked,
+        )
+    }
+
     fn push_materialized(
         self,
         rows: &mut MaterializedHotStateBatchBuilder,
@@ -11075,6 +11127,7 @@ async fn materialize_hot_scan_entries(
     entries: HotScanEntries<'_>,
     projection: ChangeRecordProjection,
     branch_id: &str,
+    generation: CommitId,
     active_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<MaterializedHotStateBatch, LixError> {
     match entries {
@@ -11084,6 +11137,7 @@ async fn materialize_hot_scan_entries(
                 entries,
                 projection,
                 branch_id,
+                generation,
                 active_checkpoint_commit_id,
             )
             .await
@@ -11108,6 +11162,7 @@ async fn materialize_hot_scan_entries(
                 entries,
                 projection,
                 branch_id,
+                generation,
                 active_checkpoint_commit_id,
             )
             .await
@@ -12495,7 +12550,7 @@ fn hot_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
     encode_scope_prefix(branch_id, generation)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(super) fn encode_hot_row_key(identity: &HeadIdentity) -> Vec<u8> {
     encode_hot_row_key_parts(
         &identity.branch_id,
@@ -14333,6 +14388,7 @@ mod tests {
                 created_at: timestamp(),
                 updated_at: timestamp(),
                 snapshot: JsonSlotRef::None,
+                native_snapshot: None,
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
                 working_diff_baseline: WorkingDiffBaseline::Disabled,
@@ -15405,6 +15461,7 @@ mod tests {
                 created_at,
                 updated_at: created_at,
                 snapshot: JsonSlotRef::Inline(r#"{"replacement":true}"#),
+                native_snapshot: None,
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
             })
@@ -15552,6 +15609,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             snapshot: JsonSlotRef::Inline(snapshot),
+            native_snapshot: None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
         };
@@ -17132,6 +17190,7 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{}"),
+            native_snapshot: None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: Some(coordinate),
             working_diff_baseline: WorkingDiffBaseline::Disabled,
@@ -17159,6 +17218,7 @@ mod tests {
                 created_at: timestamp(),
                 updated_at: timestamp(),
                 snapshot: JsonSlotRef::Inline("{\"updated\":true}"),
+                native_snapshot: None,
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
             };
@@ -17170,7 +17230,12 @@ mod tests {
                     .expect("clear coordinate for new base"),
                 None
             );
-            let mut next = delta.value_ref(timestamp(), WorkingDiffBaseline::Disabled);
+            let mut next = delta.value_ref(
+                "branch",
+                CommitId::for_test_label("coordinate-generation"),
+                timestamp(),
+                WorkingDiffBaseline::Disabled,
+            );
             next.columnar_base_coordinate = inherited;
             predecessor = CertifiedCurrentStatePredecessor::Encoded(Bytes::from(
                 encode_head_value(&next).expect("encode repeated coordinated mutation"),
@@ -17278,6 +17343,7 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{}"),
+            native_snapshot: None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
         };
@@ -17292,6 +17358,7 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{}"),
+            native_snapshot: None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
         };
@@ -17382,6 +17449,7 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{\"tracked\":true}"),
+            native_snapshot: None,
             metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
             columnar_base_coordinate: None,
         };
@@ -17397,6 +17465,7 @@ mod tests {
             updated_at: timestamp(),
             // Deleted values deliberately ignore both supplied slots.
             snapshot: JsonSlotRef::Inline("{\"ignored\":true}"),
+            native_snapshot: None,
             metadata: JsonSlotRef::Ref(&snapshot_ref),
             columnar_base_coordinate: None,
         };
@@ -17411,6 +17480,7 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Ref(&snapshot_ref),
+            native_snapshot: None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
         };
@@ -17425,6 +17495,7 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             snapshot: JsonSlotRef::None,
+            native_snapshot: None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
         };
@@ -17444,7 +17515,12 @@ mod tests {
             if delta.physically_deletes() {
                 continue;
             }
-            let value = delta.value_ref(delta.created_at, WorkingDiffBaseline::Disabled);
+            let value = delta.value_ref(
+                "branch",
+                CommitId::for_test_label("planned-generation"),
+                delta.created_at,
+                WorkingDiffBaseline::Disabled,
+            );
             ordinary_expected.extend_from_slice(
                 &encode_head_value(&value).expect("encode ordinary expected value"),
             );
@@ -17508,7 +17584,12 @@ mod tests {
             if delta.physically_deletes() {
                 continue;
             }
-            let value = delta.value_ref(delta.created_at, baseline);
+            let value = delta.value_ref(
+                "branch",
+                CommitId::for_test_label("planned-generation"),
+                delta.created_at,
+                baseline,
+            );
             checkpoint_expected.extend_from_slice(
                 &encode_head_value(&value).expect("encode checkpoint expected value"),
             );
@@ -17520,6 +17601,8 @@ mod tests {
         assert_eq!(checkpoint.as_ptr(), checkpoint_allocation);
 
         let before_absent = tracked.value_ref(
+            "branch",
+            CommitId::for_test_label("planned-generation"),
             tracked.created_at,
             WorkingDiffBaseline::BeforeAbsent {
                 checkpoint_commit_id: CommitId::for_test_label("checkpoint"),
@@ -17606,6 +17689,7 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             snapshot: JsonSlotRef::None,
+            native_snapshot: None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::BeforePresent {
@@ -17743,6 +17827,7 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
             snapshot: JsonSlotRef::Inline("{}"),
+            native_snapshot: None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
         };
@@ -17794,6 +17879,7 @@ mod tests {
                 created_at: timestamp,
                 updated_at: timestamp,
                 snapshot: JsonSlotRef::Inline("{}"),
+                native_snapshot: None,
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
             })
@@ -18233,6 +18319,7 @@ mod tests {
                 created_at,
                 updated_at: created_at,
                 snapshot: JsonSlotRef::None,
+                native_snapshot: None,
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
             },
@@ -18247,6 +18334,7 @@ mod tests {
                 created_at,
                 updated_at: created_at,
                 snapshot: JsonSlotRef::None,
+                native_snapshot: None,
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
             },

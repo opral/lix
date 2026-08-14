@@ -151,6 +151,7 @@ pub(crate) async fn seed_branch_head_with_rows(
             created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
             updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
             snapshot: snapshot.as_ref_slot(),
+            native_snapshot: None,
             metadata: metadata.as_ref_slot(),
             columnar_base_coordinate: None,
         })

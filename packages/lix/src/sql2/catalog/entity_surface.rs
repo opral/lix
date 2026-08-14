@@ -40,9 +40,10 @@ pub(crate) struct EntitySurfaceColumn {
     pub(crate) default_expression: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EntitySurfaceSpec {
     pub(crate) schema_key: String,
+    pub(crate) native_schema: Arc<lix_schema::Schema>,
     pub(crate) primary_key_paths: Vec<Vec<String>>,
     pub(crate) primary_key_component_types: Vec<EntityPkComponentType>,
     pub(crate) columns: Vec<EntitySurfaceColumn>,
@@ -205,14 +206,16 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
                 EntityColumnType::String | EntityColumnType::Integer | EntityColumnType::Boolean
             )
     });
+    let has_inter_row_constraints = !parsed.unique.is_empty() || !parsed.foreign_keys.is_empty();
     Ok(EntitySurfaceSpec {
         schema_key,
+        native_schema: Arc::new(parsed),
         primary_key_paths,
         primary_key_component_types,
         indexed_columns,
         columns,
         defaults: crate::catalog::DefaultPlan::from_schema(schema),
-        has_inter_row_constraints: !parsed.unique.is_empty() || !parsed.foreign_keys.is_empty(),
+        has_inter_row_constraints,
         certifies_path_value_replacement,
         columnar_snapshot_bijective,
     })

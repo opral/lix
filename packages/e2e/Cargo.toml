@@ -516,6 +516,11 @@ name = "exppth2_txn_probe"
 path = "examples/exppth2_txn_probe.rs"
 required-features = ["storage-benches"]
 
+[[example]]
+name = "native_row_carrier_probe"
+path = "examples/native_row_carrier_probe.rs"
+required-features = ["storage-benches", "slatedb"]
+
 [[test]]
 name = "hot_scan_refcount_census"
 path = "tests/hot_scan_refcount_census.rs"

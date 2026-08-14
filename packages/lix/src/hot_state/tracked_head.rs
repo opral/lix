@@ -53,6 +53,8 @@ pub(crate) struct ColumnarBaseCoordinate {
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+#[cfg(any(test, feature = "storage-benches"))]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -223,6 +225,105 @@ struct HeadIdentity {
     file_id: Option<String>,
 }
 
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn encoded_hot_row_key_for_probe(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    entity_pk: EntityPk,
+) -> Vec<u8> {
+    hot::encode_hot_row_key(&HeadIdentity {
+        branch_id: branch_id.to_owned(),
+        generation,
+        schema_key: schema_key.to_owned(),
+        entity_pk,
+        file_id: None,
+    })
+}
+
+/// Test-only adversarial rewrite of one authoritative HOT value. This keeps
+/// the physical StateKey fixed while replacing only the native owner proof,
+/// so retained-read authentication—not a writer-side normalization check—is
+/// what must reject the row.
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) async fn stage_native_owner_substitution_for_probe(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    requested_entity_pk: &EntityPk,
+    substituted_entity_pk: &EntityPk,
+) -> Result<(), LixError> {
+    let key = StorageKey(Bytes::from(encoded_hot_row_key_for_probe(
+        branch_id,
+        generation,
+        schema_key,
+        requested_entity_pk.clone(),
+    )));
+    let value = PointReadPlan::new(ROW_SPACE, std::slice::from_ref(&key))
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| head_value_error("native owner substitution row is missing"))?;
+    let StorageProjectedValue::FullValue(value) = value else {
+        return Err(head_value_error(
+            "native owner substitution requires a full HOT value",
+        ));
+    };
+    let decoded = decode_head_value(&value)?;
+    let HeadSlotView::Native {
+        layout_id, body, ..
+    } = decoded.snapshot
+    else {
+        return Err(head_value_error(
+            "native owner substitution row has no native tuple",
+        ));
+    };
+    let replacement = HeadValueRef {
+        change_id: decoded.change_id,
+        commit_id: decoded.commit_id,
+        untracked: decoded.untracked,
+        deleted: decoded.deleted,
+        created_at: decoded.created_at,
+        updated_at: decoded.updated_at,
+        snapshot: JsonSlotRef::None,
+        native_snapshot: Some(NativeHeadValueRef {
+            layout_id,
+            owner_digest: crate::entity_pk::native_row_owner_digest(
+                branch_id,
+                Some(*generation.as_uuid().as_bytes()),
+                schema_key,
+                substituted_entity_pk,
+                None,
+                decoded.untracked,
+            ),
+            body,
+        }),
+        metadata: match decoded.metadata {
+            HeadSlotView::None => JsonSlotRef::None,
+            _ => {
+                return Err(head_value_error(
+                    "native owner substitution probe requires absent metadata",
+                ));
+            }
+        },
+        columnar_base_coordinate: decoded.columnar_base_coordinate,
+        working_diff_baseline: decoded.working_diff_baseline,
+    };
+    writes.put(
+        ROW_SPACE,
+        key,
+        StorageValue {
+            bytes: Bytes::from(encode_head_value(&replacement)?),
+        },
+    );
+    Ok(())
+}
+
 /// The portion of a head-row key that varies within one branch generation.
 ///
 /// A full table scan already constrains `branch_id` and `generation` in the
@@ -275,6 +376,7 @@ impl HeadValue {
             created_at: self.created_at,
             updated_at: self.updated_at,
             snapshot: self.snapshot.as_ref_slot(),
+            native_snapshot: None,
             metadata: self.metadata.as_ref_slot(),
             columnar_base_coordinate: self.columnar_base_coordinate,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
@@ -291,9 +393,17 @@ struct HeadValueRef<'a> {
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
     snapshot: JsonSlotRef<'a>,
+    native_snapshot: Option<NativeHeadValueRef<'a>>,
     metadata: JsonSlotRef<'a>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeHeadValueRef<'a> {
+    layout_id: [u8; 32],
+    owner_digest: [u8; 32],
+    body: &'a [u8],
 }
 
 #[derive(Debug, Clone, Copy, musli::Encode)]
@@ -343,6 +453,7 @@ impl<'a> TrackedHeadDeltaRef<'a> {
             created_at: self.created_at,
             updated_at: self.updated_at,
             snapshot: self.snapshot,
+            native_snapshot: None,
             metadata: self.metadata,
             columnar_base_coordinate: None,
         }
@@ -367,6 +478,7 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
     pub(crate) snapshot: JsonSlotRef<'a>,
+    pub(crate) native_snapshot: Option<&'a crate::transaction_types::NativeRowPayload>,
     pub(crate) metadata: JsonSlotRef<'a>,
     pub(crate) columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
@@ -425,6 +537,8 @@ pub(crate) enum PackedWorkingDiffBaseline {
 impl<'a> CurrentStateDeltaRef<'a> {
     fn value_ref(
         &self,
+        branch_id: &str,
+        generation: CommitId,
         created_at: LixTimestamp,
         working_diff_baseline: WorkingDiffBaseline,
     ) -> HeadValueRef<'a> {
@@ -439,6 +553,22 @@ impl<'a> CurrentStateDeltaRef<'a> {
                 JsonSlotRef::None
             } else {
                 self.snapshot
+            },
+            native_snapshot: if self.deleted {
+                None
+            } else {
+                self.native_snapshot.map(|native| NativeHeadValueRef {
+                    layout_id: native.layout_id,
+                    owner_digest: crate::entity_pk::native_row_owner_digest(
+                        branch_id,
+                        Some(*generation.as_uuid().as_bytes()),
+                        self.schema_key,
+                        self.entity_pk,
+                        self.file_id,
+                        self.untracked,
+                    ),
+                    body: native.body.as_ref(),
+                })
             },
             metadata: if self.deleted {
                 JsonSlotRef::None
@@ -1350,6 +1480,25 @@ const HEAD_WORKING_DIFF_BEFORE_ABSENT: u8 = 2;
 const HEAD_WORKING_DIFF_BEFORE_PRESENT: u8 = 3;
 const UUID_BYTES: usize = 16;
 const JSON_REF_BYTES: usize = 32;
+const NATIVE_ROW_MAGIC: &[u8; 8] = b"LIXROW01";
+const NATIVE_ROW_HEADER_BYTES: usize = 8 + 32 + 32;
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static NATIVE_ROW_DURABLE_WRITES: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static NATIVE_ROW_DURABLE_READS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static NATIVE_ROW_DURABLE_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static NATIVE_ROW_DURABLE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static NATIVE_ROW_WHOLE_JSON_WRITES: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static NATIVE_ROW_WHOLE_JSON_READS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static NATIVE_ROW_WHOLE_JSON_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) static NATIVE_ROW_WHOLE_JSON_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeadSlotView<'a> {
@@ -1357,6 +1506,11 @@ enum HeadSlotView<'a> {
     Ref(JsonRef),
     Inline(&'a str),
     InlineFingerprinted { json_ref: JsonRef, json: &'a str },
+    Native {
+        layout_id: [u8; 32],
+        owner_digest: [u8; 32],
+        body: &'a [u8],
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1558,6 +1712,14 @@ fn working_diff_slot_fingerprint(slot: HeadSlotView<'_>) -> WorkingDiffSlotFinge
             kind: WORKING_DIFF_SLOT_INLINE,
             hash: *json_ref.as_hash_array(),
         },
+        HeadSlotView::Native {
+            layout_id,
+            owner_digest,
+            body,
+        } => WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_INLINE,
+            hash: native_row_payload_hash(layout_id, owner_digest, body),
+        },
     }
 }
 
@@ -1568,6 +1730,11 @@ enum HeadSlotEncode<'a> {
     Inline {
         json_ref: Option<JsonRef>,
         json: &'a str,
+    },
+    Native {
+        layout_id: [u8; 32],
+        owner_digest: [u8; 32],
+        body: &'a [u8],
     },
 }
 
@@ -1596,6 +1763,15 @@ impl<'a> From<HeadSlotView<'a>> for HeadSlotEncode<'a> {
             HeadSlotView::InlineFingerprinted { json_ref, json } => Self::Inline {
                 json_ref: Some(json_ref),
                 json,
+            },
+            HeadSlotView::Native {
+                layout_id,
+                owner_digest,
+                body,
+            } => Self::Native {
+                layout_id,
+                owner_digest,
+                body,
             },
         }
     }
@@ -1634,7 +1810,14 @@ fn append_head_value(
             deleted: value.deleted,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            snapshot: value.snapshot.into(),
+            snapshot: value.native_snapshot.map_or_else(
+                || value.snapshot.into(),
+                |native| HeadSlotEncode::Native {
+                    layout_id: native.layout_id,
+                    owner_digest: native.owner_digest,
+                    body: native.body,
+                },
+            ),
             metadata: value.metadata.into(),
             columnar_base_coordinate: value.columnar_base_coordinate,
             working_diff_baseline: value.working_diff_baseline,
@@ -1781,6 +1964,17 @@ fn append_head_value_parts(
             .to_be_bytes(),
     );
     bytes.push(u8::from(value.columnar_base_coordinate.is_some()));
+    #[cfg(any(test, feature = "storage-benches"))]
+    if matches!(
+        value.snapshot,
+        HeadSlotEncode::Ref(_) | HeadSlotEncode::Inline { .. }
+    ) {
+        NATIVE_ROW_WHOLE_JSON_WRITES.fetch_add(1, AtomicOrdering::Relaxed);
+        NATIVE_ROW_WHOLE_JSON_WRITE_BYTES.fetch_add(
+            u64::try_from(snapshot_len).unwrap_or(u64::MAX),
+            AtomicOrdering::Relaxed,
+        );
+    }
     append_slot_payload(bytes, value.snapshot, fingerprint_inline);
     append_slot_payload(bytes, value.metadata, fingerprint_inline);
     match value.working_diff_baseline {
@@ -1820,6 +2014,7 @@ fn encoded_slot_kind(slot: HeadSlotEncode<'_>, fingerprint_inline: bool) -> u8 {
         HeadSlotEncode::Ref(_) => HEAD_SLOT_REF,
         HeadSlotEncode::Inline { .. } if fingerprint_inline => HEAD_SLOT_INLINE_FINGERPRINTED,
         HeadSlotEncode::Inline { .. } => HEAD_SLOT_INLINE,
+        HeadSlotEncode::Native { .. } => HEAD_SLOT_INLINE_FINGERPRINTED,
     }
 }
 
@@ -1831,6 +2026,9 @@ fn encoded_slot_len(slot: HeadSlotEncode<'_>, fingerprint_inline: bool) -> usize
             JSON_REF_BYTES.saturating_add(json.len())
         }
         HeadSlotEncode::Inline { json, .. } => json.len(),
+        HeadSlotEncode::Native { body, .. } => JSON_REF_BYTES
+            .saturating_add(NATIVE_ROW_HEADER_BYTES)
+            .saturating_add(body.len()),
     }
 }
 
@@ -1844,7 +2042,40 @@ fn append_slot_payload(bytes: &mut Vec<u8>, slot: HeadSlotEncode<'_>, fingerprin
             bytes.extend_from_slice(json.as_bytes());
         }
         HeadSlotEncode::Inline { json, .. } => bytes.extend_from_slice(json.as_bytes()),
+        HeadSlotEncode::Native {
+            layout_id,
+            owner_digest,
+            body,
+        } => {
+            #[cfg(any(test, feature = "storage-benches"))]
+            {
+                NATIVE_ROW_DURABLE_WRITES.fetch_add(1, AtomicOrdering::Relaxed);
+                NATIVE_ROW_DURABLE_WRITE_BYTES.fetch_add(
+                    u64::try_from(NATIVE_ROW_HEADER_BYTES.saturating_add(body.len()))
+                        .unwrap_or(u64::MAX),
+                    AtomicOrdering::Relaxed,
+                );
+            }
+            bytes.extend_from_slice(&native_row_payload_hash(layout_id, owner_digest, body));
+            bytes.extend_from_slice(NATIVE_ROW_MAGIC);
+            bytes.extend_from_slice(&layout_id);
+            bytes.extend_from_slice(&owner_digest);
+            bytes.extend_from_slice(body);
+        }
     }
+}
+
+fn native_row_payload_hash(
+    layout_id: [u8; 32],
+    owner_digest: [u8; 32],
+    body: &[u8],
+) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"lix.current-state.native-row.v1\0");
+    hash.update(&layout_id);
+    hash.update(&owner_digest);
+    hash.update(body);
+    *hash.finalize().as_bytes()
 }
 
 fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
@@ -2067,13 +2298,35 @@ fn decode_slot<'a>(kind: u8, bytes: &'a [u8], field: &str) -> Result<HeadSlotVie
                 head_value_error(&format!("{field} inline payload is not UTF-8: {error}"))
             }),
         HEAD_SLOT_INLINE_FINGERPRINTED if bytes.len() >= JSON_REF_BYTES => {
-            let (hash, json) = bytes.split_at(JSON_REF_BYTES);
+            let (hash, payload) = bytes.split_at(JSON_REF_BYTES);
             let hash: [u8; JSON_REF_BYTES] = hash.try_into().map_err(|_| {
                 head_value_error(&format!(
                     "{field} inline fingerprint must have {JSON_REF_BYTES} bytes"
                 ))
             })?;
-            std::str::from_utf8(json)
+            if field == "snapshot" && payload.starts_with(NATIVE_ROW_MAGIC) {
+                if payload.len() < NATIVE_ROW_HEADER_BYTES {
+                    return Err(head_value_error("native snapshot header is truncated"));
+                }
+                let layout_id: [u8; 32] = payload[8..40]
+                    .try_into()
+                    .map_err(|_| head_value_error("native snapshot layout id is truncated"))?;
+                let owner_digest: [u8; 32] = payload[40..72]
+                    .try_into()
+                    .map_err(|_| head_value_error("native snapshot owner is truncated"))?;
+                let body = &payload[NATIVE_ROW_HEADER_BYTES..];
+                if native_row_payload_hash(layout_id, owner_digest, body) != hash {
+                    return Err(head_value_error(
+                        "native snapshot authentication fingerprint does not match payload",
+                    ));
+                }
+                return Ok(HeadSlotView::Native {
+                    layout_id,
+                    owner_digest,
+                    body,
+                });
+            }
+            std::str::from_utf8(payload)
                 .map(|json| HeadSlotView::InlineFingerprinted {
                     json_ref: JsonRef::from_hash_bytes(hash),
                     json,
@@ -2111,6 +2364,13 @@ struct DeferredJson {
 }
 
 trait LiveMaterializationIdentity {
+    fn native_owner_digest(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        untracked: bool,
+    ) -> [u8; 32];
+
     #[allow(clippy::too_many_arguments)]
     fn push_materialized(
         self,
@@ -2129,6 +2389,22 @@ trait LiveMaterializationIdentity {
 }
 
 impl LiveMaterializationIdentity for HeadRowIdentity {
+    fn native_owner_digest(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        untracked: bool,
+    ) -> [u8; 32] {
+        crate::entity_pk::native_row_owner_digest(
+            branch_id,
+            Some(*generation.as_uuid().as_bytes()),
+            &self.schema_key,
+            &self.entity_pk,
+            self.file_id.as_deref(),
+            untracked,
+        )
+    }
+
     fn push_materialized(
         self,
         rows: &mut MaterializedHotStateBatchBuilder,
@@ -2162,6 +2438,22 @@ impl LiveMaterializationIdentity for HeadRowIdentity {
 }
 
 impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
+    fn native_owner_digest(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        untracked: bool,
+    ) -> [u8; 32] {
+        crate::entity_pk::native_row_owner_digest(
+            branch_id,
+            Some(*generation.as_uuid().as_bytes()),
+            self.schema_key,
+            self.entity_pk,
+            self.file_id,
+            untracked,
+        )
+    }
+
     fn push_materialized(
         self,
         rows: &mut MaterializedHotStateBatchBuilder,
@@ -2203,6 +2495,7 @@ async fn materialize_live_entries<I>(
     entries: Vec<(I, Bytes)>,
     projection: ChangeRecordProjection,
     branch_id: &str,
+    generation: CommitId,
     active_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<MaterializedHotStateBatch, LixError>
 where
@@ -2215,6 +2508,54 @@ where
     for (identity, bytes) in entries {
         let value = decode_head_value(&bytes)?;
         let row_index = rows.len();
+        let native_snapshot = match value.snapshot {
+            HeadSlotView::Native {
+                layout_id,
+                owner_digest,
+                body,
+            } => {
+                if identity.native_owner_digest(branch_id, generation, value.untracked)
+                    != owner_digest
+                {
+                    return Err(head_value_error(
+                        "native snapshot owner does not match its authenticated state key",
+                    ));
+                }
+                #[cfg(any(test, feature = "storage-benches"))]
+                {
+                    NATIVE_ROW_DURABLE_READS.fetch_add(1, AtomicOrdering::Relaxed);
+                    NATIVE_ROW_DURABLE_READ_BYTES.fetch_add(
+                        u64::try_from(NATIVE_ROW_HEADER_BYTES.saturating_add(body.len()))
+                            .unwrap_or(u64::MAX),
+                        AtomicOrdering::Relaxed,
+                    );
+                }
+                Some(crate::hot_state::NativeRowSnapshot {
+                    layout_id,
+                    owner_digest,
+                    body: Bytes::copy_from_slice(body),
+                })
+            }
+            _ => None,
+        };
+        #[cfg(any(test, feature = "storage-benches"))]
+        if projection.snapshot_content {
+            let json_bytes = match value.snapshot {
+                HeadSlotView::Ref(_) => Some(JSON_REF_BYTES),
+                HeadSlotView::Inline(json) => Some(json.len()),
+                HeadSlotView::InlineFingerprinted { json, .. } => {
+                    Some(JSON_REF_BYTES.saturating_add(json.len()))
+                }
+                HeadSlotView::None | HeadSlotView::Native { .. } => None,
+            };
+            if let Some(json_bytes) = json_bytes {
+            NATIVE_ROW_WHOLE_JSON_READS.fetch_add(1, AtomicOrdering::Relaxed);
+                NATIVE_ROW_WHOLE_JSON_READ_BYTES.fetch_add(
+                    u64::try_from(json_bytes).unwrap_or(u64::MAX),
+                    AtomicOrdering::Relaxed,
+                );
+            }
+        }
         let snapshot_content = materialize_live_slot(
             !value.deleted && projection.snapshot_content,
             &bytes,
@@ -2246,6 +2587,9 @@ where
             value.untracked,
             branch_id,
         );
+        if let Some(native_snapshot) = native_snapshot {
+            rows.set_native_snapshot(row_index, native_snapshot);
+        }
         if let Some(coordinate) = value.columnar_base_coordinate {
             rows.set_columnar_base_coordinate(row_index, coordinate);
         }
@@ -2319,6 +2663,7 @@ fn materialize_live_slot(
             });
             None
         }
+        HeadSlotView::Native { .. } => None,
     }
 }
 
@@ -2506,6 +2851,7 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
+            native_snapshot: None,
             metadata: JsonSlotRef::Ref(&snapshot_ref),
             columnar_base_coordinate: Some(columnar_base_coordinate),
             working_diff_baseline: WorkingDiffBaseline::Disabled,
@@ -2546,6 +2892,7 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
+            native_snapshot: None,
             metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
             columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
@@ -2608,6 +2955,7 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"current\":true}"),
+            native_snapshot: None,
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::BeforePresent {
@@ -3641,6 +3989,115 @@ mod tests {
                 .is_none(),
             "bad index coverage must select canonical replay"
         );
+    }
+
+    #[tokio::test]
+    async fn native_scalar_tuple_rejects_corruption_and_same_size_owner_substitution() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open native tuple read");
+        let requested = HeadRowIdentity {
+            schema_key: "native_schema".to_string(),
+            entity_pk: EntityPk::single("requested"),
+            file_id: Some("owner.bin".to_string()),
+        };
+        let substituted = EntityPk::single("elsewhere");
+        let body = Bytes::from_static(b"typed-body");
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let generation = CommitId::for_test_label("native-owner-generation");
+
+        let payload = crate::transaction_types::NativeRowPayload {
+            layout_id: [0x31; 32],
+            owner_digest: crate::entity_pk::native_row_owner_digest(
+                "branch",
+                Some(*generation.as_uuid().as_bytes()),
+                "native_schema",
+                &requested.entity_pk,
+                requested.file_id.as_deref(),
+                false,
+            ),
+            body: body.clone(),
+        };
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("native-corruption-change")),
+            commit_id: Some(CommitId::for_test_label("native-corruption-commit")),
+            untracked: false,
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            snapshot: JsonSlotRef::None,
+            native_snapshot: Some(NativeHeadValueRef {
+                layout_id: payload.layout_id,
+                owner_digest: payload.owner_digest,
+                body: payload.body.as_ref(),
+            }),
+            metadata: JsonSlotRef::None,
+            columnar_base_coordinate: None,
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+        let mut corrupt = encode_head_value(&value).expect("encode native tuple");
+        *corrupt.last_mut().expect("native tuple has a body") ^= 0x01;
+        let error = decode_head_value(&corrupt).expect_err("same-size corruption must fail");
+        assert!(error.message.contains("fingerprint"), "{error:?}");
+
+        let wrong_generation = CommitId::for_test_label("wrong-native-owner-generation");
+        let wrong_owners = [
+            ("entity", crate::entity_pk::native_row_owner_digest(
+                "branch", Some(*generation.as_uuid().as_bytes()), "native_schema",
+                &substituted, requested.file_id.as_deref(), false,
+            )),
+            ("branch", crate::entity_pk::native_row_owner_digest(
+                "other-branch", Some(*generation.as_uuid().as_bytes()), "native_schema",
+                &requested.entity_pk, requested.file_id.as_deref(), false,
+            )),
+            ("generation", crate::entity_pk::native_row_owner_digest(
+                "branch", Some(*wrong_generation.as_uuid().as_bytes()), "native_schema",
+                &requested.entity_pk, requested.file_id.as_deref(), false,
+            )),
+            ("schema", crate::entity_pk::native_row_owner_digest(
+                "branch", Some(*generation.as_uuid().as_bytes()), "other_schema",
+                &requested.entity_pk, requested.file_id.as_deref(), false,
+            )),
+            ("file", crate::entity_pk::native_row_owner_digest(
+                "branch", Some(*generation.as_uuid().as_bytes()), "native_schema",
+                &requested.entity_pk, Some("other.bin"), false,
+            )),
+            ("retention", crate::entity_pk::native_row_owner_digest(
+                "branch", Some(*generation.as_uuid().as_bytes()), "native_schema",
+                &requested.entity_pk, requested.file_id.as_deref(), true,
+            )),
+        ];
+        for (dimension, owner_digest) in wrong_owners {
+            let wrong_owner = HeadValueRef {
+                native_snapshot: Some(NativeHeadValueRef {
+                    layout_id: payload.layout_id,
+                    owner_digest,
+                    body: body.as_ref(),
+                }),
+                ..value
+            };
+            let error = materialize_live_entries(
+                &read,
+                vec![(
+                    requested.clone(),
+                    Bytes::from(
+                        encode_head_value(&wrong_owner).expect("encode substituted tuple"),
+                    ),
+                )],
+                ChangeRecordProjection::full(),
+                "branch",
+                generation,
+                None,
+            )
+            .await
+            .expect_err("same-size owner substitution must fail before returning cells");
+            assert!(
+                error.message.contains("authenticated state key"),
+                "{dimension}: {error:?}"
+            );
+        }
     }
 
     #[tokio::test]

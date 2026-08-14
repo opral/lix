@@ -385,6 +385,7 @@ mod tests {
                     created_at: timestamp,
                     updated_at: timestamp,
                     snapshot: snapshot.as_ref_slot(),
+                    native_snapshot: None,
                     metadata: crate::json_store::JsonSlotRef::None,
                     columnar_base_coordinate: None,
                 }],

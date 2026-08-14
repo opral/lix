@@ -25,6 +25,32 @@ pub(crate) struct EntityPk {
 }
 
 impl EntityPk {
+    /// Adds the canonical typed key image to an authenticated owner digest.
+    pub(crate) fn update_owner_digest(&self, hash: &mut blake3::Hasher) {
+        hash.update(&(self.components.len() as u64).to_be_bytes());
+        for component in &self.components {
+            match component {
+                EntityPkComponent::Uuid(value) => {
+                    hash.update(&[0]);
+                    hash.update(value);
+                }
+                EntityPkComponent::Integer(value) => {
+                    hash.update(&[1]);
+                    hash.update(&value.to_be_bytes());
+                }
+                EntityPkComponent::String(value) => {
+                    hash.update(&[2]);
+                    hash.update(&(value.len() as u64).to_be_bytes());
+                    hash.update(value.as_bytes());
+                }
+                EntityPkComponent::Bytes(value) => {
+                    hash.update(&[3]);
+                    hash.update(&(value.len() as u64).to_be_bytes());
+                    hash.update(value);
+                }
+            }
+        }
+    }
     /// How many refcounted buffer handles one `clone` of this key duplicates.
     ///
     /// A composite key shares one `Arc` over its component slice, so it costs
@@ -41,6 +67,44 @@ impl EntityPk {
             EntityPkComponents::Shared(_) => 1,
         }
     }
+}
+
+pub(crate) fn native_row_owner_digest(
+    branch_id: &str,
+    generation: Option<[u8; 16]>,
+    schema_key: &str,
+    entity_pk: &EntityPk,
+    file_id: Option<&str>,
+    untracked: bool,
+) -> [u8; 32] {
+    let mut owner = blake3::Hasher::new();
+    owner.update(b"lix.schema-v1.native-row-owner.v2\0");
+    owner.update(&(branch_id.len() as u64).to_be_bytes());
+    owner.update(branch_id.as_bytes());
+    match generation {
+        Some(generation) => {
+            owner.update(&[1]);
+            owner.update(&generation);
+        }
+        None => {
+            owner.update(&[0]);
+        }
+    }
+    owner.update(&(schema_key.len() as u64).to_be_bytes());
+    owner.update(schema_key.as_bytes());
+    owner.update(&[u8::from(untracked)]);
+    match file_id {
+        Some(file_id) => {
+            owner.update(&[1]);
+            owner.update(&(file_id.len() as u64).to_be_bytes());
+            owner.update(file_id.as_bytes());
+        }
+        None => {
+            owner.update(&[0]);
+        }
+    }
+    entity_pk.update_owner_digest(&mut owner);
+    *owner.finalize().as_bytes()
 }
 
 /// A single primary-key component stays inline; composite tuples share one

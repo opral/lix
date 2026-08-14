@@ -26,6 +26,14 @@ use serde_json::Value as JsonValue;
 #[derive(Debug, Clone)]
 pub(crate) struct TransactionJson {
     storage: TransactionJsonStorage,
+    native_row: Option<Arc<NativeRowPayload>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeRowPayload {
+    pub(crate) layout_id: [u8; 32],
+    pub(crate) owner_digest: [u8; 32],
+    pub(crate) body: Bytes,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +78,7 @@ impl TransactionJson {
                 value,
                 normalized: OnceLock::new(),
             },
+            native_row: None,
         })
     }
 
@@ -97,6 +106,7 @@ impl TransactionJson {
     pub(crate) fn from_canonical_batch(value: WasmCanonicalJson) -> Self {
         Self {
             storage: TransactionJsonStorage::CanonicalBatch(value),
+            native_row: None,
         }
     }
 
@@ -111,6 +121,7 @@ impl TransactionJson {
     pub(crate) fn from_certified_normalized_row_content(normalized: Arc<str>) -> Self {
         Self {
             storage: TransactionJsonStorage::Certified { normalized },
+            native_row: None,
         }
     }
 
@@ -124,6 +135,7 @@ impl TransactionJson {
                 normalized,
                 certificate: TransactionJsonCertificate::RowContent,
             },
+            native_row: None,
         }
     }
 
@@ -206,6 +218,7 @@ impl TransactionJson {
                 normalized,
                 certificate: TransactionJsonCertificate::Metadata,
             },
+            native_row: None,
         }
     }
 
@@ -222,7 +235,12 @@ impl TransactionJson {
                 value: OnceLock::new(),
                 normalized,
             },
+            native_row: None,
         }
+    }
+
+    pub(crate) fn set_native_row(&mut self, native_row: NativeRowPayload) {
+        self.native_row = Some(Arc::new(native_row));
     }
 
     pub(crate) fn row_content_certified(&self) -> bool {
@@ -253,7 +271,8 @@ impl TransactionJson {
     /// transport remains useful, but transaction normalization must decode
     /// and validate it against the amended plan.
     fn revoke_row_content_certificate(self) -> Self {
-        match self.storage {
+        let native_row = self.native_row;
+        let mut value = match self.storage {
             TransactionJsonStorage::CertifiedShared {
                 normalized,
                 certificate: TransactionJsonCertificate::RowContent,
@@ -261,8 +280,13 @@ impl TransactionJson {
             TransactionJsonStorage::Certified { normalized } => {
                 Self::from_unvalidated_shared_normalized_content(normalized.as_ref().into())
             }
-            storage => Self { storage },
-        }
+            storage => Self {
+                storage,
+                native_row: None,
+            },
+        };
+        value.native_row = native_row;
+        value
     }
 
     pub(crate) fn canonical_batch_certificate(
@@ -365,7 +389,7 @@ impl TransactionJson {
 
 impl PartialEq for TransactionJson {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.storage, &other.storage) {
+        self.native_row == other.native_row && match (&self.storage, &other.storage) {
             (
                 TransactionJsonStorage::Decoded { value: left, .. },
                 TransactionJsonStorage::Decoded { value: right, .. },
@@ -1438,6 +1462,11 @@ impl RawWriteBatch {
         self.snapshots[index] = value;
     }
 
+    pub(crate) fn snapshot_mut(&mut self, index: usize) -> Option<&mut TransactionJson> {
+        self.certified_preparation = None;
+        self.snapshots[index].as_mut()
+    }
+
     pub(crate) fn take_metadata(&mut self, index: usize) -> Option<TransactionJson> {
         self.metadata[index].take()
     }
@@ -2275,6 +2304,7 @@ pub(crate) struct TransactionWriteOutcome {
 pub(crate) struct StageJson {
     storage: StageJsonStorage,
     pub(crate) json_ref: JsonRef,
+    native_row: Option<Arc<NativeRowPayload>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2418,6 +2448,11 @@ impl StageJson {
             crate::json_store::JsonSlotRef::Ref(&self.json_ref)
         }
     }
+
+
+    pub(crate) fn native_row(&self) -> Option<&NativeRowPayload> {
+        self.native_row.as_deref()
+    }
 }
 
 impl PartialEq for StageJson {
@@ -2443,6 +2478,7 @@ pub(crate) fn stage_json_from_value(
     } else {
         JsonRef::for_content(value.normalized().as_bytes())
     };
+    let native_row = value.native_row;
     let storage = match value.storage {
         TransactionJsonStorage::Decoded { value, normalized } => StageJsonStorage::Owned {
             value: OnceLock::from(value),
@@ -2467,7 +2503,11 @@ pub(crate) fn stage_json_from_value(
         }
         TransactionJsonStorage::CanonicalBatch(value) => StageJsonStorage::CanonicalBatch(value),
     };
-    Ok(StageJson { storage, json_ref })
+    Ok(StageJson {
+        storage,
+        json_ref,
+        native_row,
+    })
 }
 
 /// Coalesces decoded JSON values into one Arrow-style values column plus one
@@ -2518,10 +2558,12 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
     let mut all_values_uniquely_owned = true;
     let mut cached_normalized = Vec::with_capacity(decoded_count);
     let mut positions = Vec::with_capacity(decoded_count);
+    let mut native_rows = Vec::with_capacity(decoded_count);
     for (position, slot) in slots.iter_mut().enumerate() {
         let Some(json) = slot.take() else {
             continue;
         };
+        let native_row = json.native_row;
         match json.storage {
             TransactionJsonStorage::Decoded { value, normalized } => {
                 let value = match Arc::try_unwrap(value) {
@@ -2534,10 +2576,12 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
                 positions.push(position);
                 values.push(value);
                 cached_normalized.push(normalized.into_inner());
+                native_rows.push(native_row);
             }
             TransactionJsonStorage::Certified { normalized } => {
                 **slot = Some(TransactionJson {
                     storage: TransactionJsonStorage::Certified { normalized },
+                    native_row,
                 });
             }
             TransactionJsonStorage::CertifiedShared {
@@ -2549,15 +2593,20 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
                         normalized,
                         certificate,
                     },
+                    native_row,
                 });
             }
             TransactionJsonStorage::CanonicalShared { value, normalized } => {
                 **slot = Some(TransactionJson {
                     storage: TransactionJsonStorage::CanonicalShared { value, normalized },
+                    native_row,
                 });
             }
             TransactionJsonStorage::CanonicalBatch(value) => {
-                **slot = Some(TransactionJson::from_canonical_batch(value));
+                **slot = Some(TransactionJson {
+                    storage: TransactionJsonStorage::CanonicalBatch(value),
+                    native_row,
+                });
             }
         }
     }
@@ -2645,16 +2694,29 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
             positions.len(),
             serialize_count,
         )?;
-        for ((position, row), expected_row) in positions.into_iter().zip(rows).zip(0..) {
+        for (((position, row), native_row), expected_row) in positions
+            .into_iter()
+            .zip(rows)
+            .zip(native_rows)
+            .zip(0..)
+        {
             debug_assert_eq!(row.row_index(), expected_row);
-            *slots[position] = Some(TransactionJson::from_canonical_batch(row));
+            *slots[position] = Some(TransactionJson {
+                storage: TransactionJsonStorage::CanonicalBatch(row),
+                native_row,
+            });
         }
     } else {
         // SAFETY: every uncached row was written by serde_json and every
         // cached row came from a previously validated TransactionJson.
         let normalized =
             unsafe { SharedStr::from_utf8_unchecked(Bytes::from(normalized.into_bytes())) };
-        for ((position, value), (start, end)) in positions.into_iter().zip(values).zip(offsets) {
+        for (((position, value), (start, end)), native_row) in positions
+            .into_iter()
+            .zip(values)
+            .zip(offsets)
+            .zip(native_rows)
+        {
             let normalized = normalized
                 .slice(start as usize..end as usize)
                 .ok_or_else(|| {
@@ -2668,6 +2730,7 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
                     value: OnceLock::from(value.into_shared()),
                     normalized,
                 },
+                native_row,
             });
         }
     }

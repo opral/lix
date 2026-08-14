@@ -3475,7 +3475,7 @@ fn entity_record_batch(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
     rows: &MaterializedHotStateBatch,
-    projection: EntityBatchProjection,
+    _projection: EntityBatchProjection,
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
@@ -3483,20 +3483,137 @@ fn entity_record_batch(
             .map_err(DataFusionError::from);
     }
 
-    match projection {
-        EntityBatchProjection::ParsedSnapshots => {
-            entity_record_batch_from_snapshots(spec, schema, rows)
+    // Schema-v1 current-state rows have one durable representation. A missing
+    // tuple is corruption, not permission to reinterpret a historical JSON
+    // snapshot as current authority.
+    entity_record_batch_from_native_rows(spec, schema, rows)
+}
+
+fn entity_record_batch_from_native_rows(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    rows: &MaterializedHotStateBatch,
+) -> Result<RecordBatch> {
+    let expected_layout = lix_schema::value_layout::layout_id(&spec.native_schema)
+        .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+    let plan = lix_schema::value_layout::body_plan(&spec.native_schema);
+    let decoded = rows
+        .iter()
+        .map(|row| {
+            let native = row.native_snapshot().ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Schema v1 current-state row '{}' is missing its native scalar tuple",
+                    spec.schema_key
+                ))
+            })?;
+            if native.layout_id != expected_layout {
+                return Err(DataFusionError::Execution(format!(
+                    "Schema v1 current-state row '{}' has a mismatched native layout",
+                    spec.schema_key
+                )));
+            }
+            lix_schema::value_layout::decode_body(&plan, &native.body)
+                .map_err(|error| DataFusionError::Execution(error.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if let Some(system) = field.name().strip_prefix("lixcol_") {
+                return entity_system_column_array(system, rows);
+            }
+            entity_native_column_array(spec, field.name(), rows, &decoded)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+#[expect(trivial_casts)]
+fn entity_native_column_array(
+    spec: &EntitySurfaceSpec,
+    column_name: &str,
+    rows: &MaterializedHotStateBatch,
+    decoded: &[Vec<lix_schema::value_layout::BodyValue>],
+) -> Result<ArrayRef> {
+    let schema = spec.native_schema.as_ref();
+    let column = schema
+        .columns
+        .iter()
+        .find(|column| column.name == column_name)
+        .ok_or_else(|| DataFusionError::Execution(format!("unknown native column {column_name}")))?;
+    let pk_ordinal = schema.primary_key.iter().position(|name| name == column_name);
+    let value_ordinal = schema
+        .columns
+        .iter()
+        .filter(|candidate| !schema.primary_key.contains(&candidate.name))
+        .position(|candidate| candidate.name == column_name);
+    let values = rows.iter().enumerate().map(|(row_index, row)| {
+        if let Some(pk_ordinal) = pk_ordinal {
+            return Ok(Some(NativeCellRef::Pk(
+                row.entity_pk()
+                    .components
+                    .get(pk_ordinal)
+                    .ok_or_else(|| DataFusionError::Execution("native primary key arity mismatch".into()))?,
+            )));
         }
-        EntityBatchProjection::RawTrackedProjection if rows.iter().all(|row| !row.untracked()) => {
-            entity_record_batch_from_raw_projection(spec, schema, rows)
+        let value_ordinal = value_ordinal.ok_or_else(|| {
+            DataFusionError::Execution(format!("native value column '{column_name}' is not in layout"))
+        })?;
+        Ok(Some(NativeCellRef::Body(&decoded[row_index][value_ordinal])))
+    }).collect::<Result<Vec<_>>>()?;
+    use lix_schema::DataType;
+    Ok(match column.data_type {
+        DataType::Text | DataType::Uuid | DataType::Jsonb => Arc::new(StringArray::from(
+            values.iter().map(|value| native_cell_text(value.as_ref().copied(), column.data_type)).collect::<Result<Vec<_>>>()?
+        )) as ArrayRef,
+        DataType::Int8 => Arc::new(Int64Array::from(values.iter().map(|value| match value.as_ref().copied() {
+            Some(NativeCellRef::Pk(crate::entity_pk::EntityPkComponent::Integer(value))) => Ok(Some(*value)),
+            Some(NativeCellRef::Body(lix_schema::value_layout::BodyValue::Int8(value))) => Ok(Some(*value)),
+            Some(NativeCellRef::Body(lix_schema::value_layout::BodyValue::Null)) | None => Ok(None),
+            _ => Err(DataFusionError::Execution("native int8 cell kind mismatch".into())),
+        }).collect::<Result<Vec<_>>>()?)) as ArrayRef,
+        DataType::Float8 => Arc::new(Float64Array::from(values.iter().map(|value| match value.as_ref().copied() {
+            Some(NativeCellRef::Body(lix_schema::value_layout::BodyValue::Float8(value))) => Ok(Some(*value)),
+            Some(NativeCellRef::Body(lix_schema::value_layout::BodyValue::Null)) | None => Ok(None),
+            _ => Err(DataFusionError::Execution("native float8 cell kind mismatch".into())),
+        }).collect::<Result<Vec<_>>>()?)) as ArrayRef,
+        DataType::Boolean => Arc::new(BooleanArray::from(values.iter().map(|value| match value.as_ref().copied() {
+            Some(NativeCellRef::Body(lix_schema::value_layout::BodyValue::Boolean(value))) => Ok(Some(*value)),
+            Some(NativeCellRef::Body(lix_schema::value_layout::BodyValue::Null)) | None => Ok(None),
+            _ => Err(DataFusionError::Execution("native boolean cell kind mismatch".into())),
+        }).collect::<Result<Vec<_>>>()?)) as ArrayRef,
+        DataType::Timestamptz => Arc::new(TimestampMicrosecondArray::from(values.iter().map(|value| match value.as_ref().copied() {
+            Some(NativeCellRef::Body(lix_schema::value_layout::BodyValue::Timestamptz(value))) => Ok(Some(*value)),
+            Some(NativeCellRef::Body(lix_schema::value_layout::BodyValue::Null)) | None => Ok(None),
+            _ => Err(DataFusionError::Execution("native timestamptz cell kind mismatch".into())),
+        }).collect::<Result<Vec<_>>>()?).with_timezone("UTC")) as ArrayRef,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum NativeCellRef<'a> {
+    Pk(&'a crate::entity_pk::EntityPkComponent),
+    Body(&'a lix_schema::value_layout::BodyValue),
+}
+
+fn native_cell_text(
+    value: Option<NativeCellRef<'_>>,
+    kind: lix_schema::DataType,
+) -> Result<Option<String>> {
+    use lix_schema::value_layout::BodyValue;
+    Ok(match value {
+        None | Some(NativeCellRef::Body(BodyValue::Null)) => None,
+        Some(NativeCellRef::Pk(value)) => Some(value.external_string()),
+        Some(NativeCellRef::Body(BodyValue::Text(value))) => Some(value.clone()),
+        Some(NativeCellRef::Body(BodyValue::Uuid(value))) => Some(value.to_string()),
+        Some(NativeCellRef::Body(BodyValue::Jsonb(value))) if kind == lix_schema::DataType::Jsonb => {
+            Some(serde_json::to_string(value).map_err(|error| {
+                DataFusionError::Execution(format!("native jsonb encoding failed: {error}"))
+            })?)
         }
-        // Raw projection depends on the tracked write invariant: compact
-        // TransactionJson bytes with no duplicate-key recovery semantics.
-        // Keep every mixed-retention batch on the established parser path.
-        EntityBatchProjection::RawTrackedProjection => {
-            entity_record_batch_from_snapshots(spec, schema, rows)
-        }
-    }
+        _ => return Err(DataFusionError::Execution("native text cell kind mismatch".into())),
+    })
 }
 
 fn entity_primary_key_record_batch(
@@ -3529,161 +3646,6 @@ fn entity_primary_key_record_batch(
         })
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
-}
-
-fn entity_record_batch_from_snapshots(
-    spec: &EntitySurfaceSpec,
-    schema: SchemaRef,
-    rows: &MaterializedHotStateBatch,
-) -> Result<RecordBatch> {
-    let snapshots = rows
-        .iter()
-        .map(|row| parse_snapshot(row.snapshot_content().map(AsRef::<str>::as_ref)))
-        .collect::<Result<Vec<_>>>()?;
-
-    entity_record_batch_from_parsed_snapshots(spec, schema, rows, &snapshots)
-}
-
-fn entity_record_batch_from_parsed_snapshots(
-    spec: &EntitySurfaceSpec,
-    schema: SchemaRef,
-    rows: &MaterializedHotStateBatch,
-    snapshots: &[Option<JsonValue>],
-) -> Result<RecordBatch> {
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| entity_column_array(spec, field.name(), rows, snapshots))
-        .collect::<Result<Vec<_>>>()?;
-
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
-}
-
-fn entity_record_batch_from_raw_projection(
-    spec: &EntitySurfaceSpec,
-    schema: SchemaRef,
-    rows: &MaterializedHotStateBatch,
-) -> Result<RecordBatch> {
-    let decoder = EntityProjectionDecoder::new(
-        spec,
-        schema.fields().iter().filter_map(|field| {
-            (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
-        }),
-    )
-    .map_err(entity_projection_error_to_datafusion_error)?;
-    // The tracked write path persists TransactionJson-normalized bytes.
-    // Visibility is resolved by the existing live-state reader first.
-    let mut visible_columns = decoder
-        .decode_arrow_columns(rows.iter().map(|row| {
-            row.snapshot_content()
-                .map(AsRef::<str>::as_ref)
-                .map(str::as_bytes)
-        }))
-        .map_err(entity_projection_error_to_datafusion_error)?
-        .into_iter();
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            field.name().strip_prefix("lixcol_").map_or_else(
-                || {
-                    visible_columns.next().ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "entity projection decoder did not return a visible column".to_string(),
-                        )
-                    })
-                },
-                |property_name| entity_system_column_array(property_name, rows),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
-}
-
-#[expect(trivial_casts)]
-fn entity_column_array(
-    spec: &EntitySurfaceSpec,
-    column_name: &str,
-    rows: &MaterializedHotStateBatch,
-    snapshots: &[Option<JsonValue>],
-) -> Result<ArrayRef> {
-    if let Some(property_name) = column_name.strip_prefix("lixcol_") {
-        return entity_system_column_array(property_name, rows);
-    }
-
-    let column_type = spec
-        .visible_column(column_name)
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "sql2 entity provider '{}' does not expose column '{}'",
-                spec.schema_key, column_name
-            ))
-        })?
-        .column_type;
-
-    let values = snapshots
-        .iter()
-        .map(|snapshot| snapshot.as_ref().and_then(|value| value.get(column_name)))
-        .collect::<Vec<_>>();
-    Ok(match column_type {
-        EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
-            values
-                .iter()
-                .map(|value| entity_json_text_value(*value, column_type))
-                .collect::<Result<Vec<_>>>()?,
-        )) as ArrayRef,
-        EntityColumnType::Integer => Arc::new(Int64Array::from(
-            values
-                .iter()
-                .map(|value| entity_i64_value(*value, &spec.schema_key, column_name))
-                .collect::<Result<Vec<_>>>()?,
-        )) as ArrayRef,
-        EntityColumnType::Number => Arc::new(Float64Array::from(
-            values
-                .iter()
-                .map(|value| entity_f64_value(*value, &spec.schema_key, column_name))
-                .collect::<Result<Vec<_>>>()?,
-        )) as ArrayRef,
-        EntityColumnType::Boolean => Arc::new(BooleanArray::from(
-            values
-                .iter()
-                .map(|value| value.and_then(JsonValue::as_bool))
-                .collect::<Vec<_>>(),
-        )) as ArrayRef,
-        EntityColumnType::Timestamptz => Arc::new(
-            TimestampMicrosecondArray::from(
-                values
-                    .iter()
-                    .map(|value| entity_timestamptz_value(*value, &spec.schema_key, column_name))
-                    .collect::<Result<Vec<_>>>()?,
-            )
-            .with_timezone("UTC"),
-        ) as ArrayRef,
-    })
-}
-
-fn entity_timestamptz_value(
-    value: Option<&JsonValue>,
-    schema_key: &str,
-    column_name: &str,
-) -> Result<Option<i64>> {
-    let Some(value) = value else { return Ok(None) };
-    if value.is_null() {
-        return Ok(None);
-    }
-    let text = value.as_str().ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "{schema_key}.{column_name} expected timestamptz text"
-        ))
-    })?;
-    chrono::DateTime::parse_from_rfc3339(text)
-        .map(|timestamp| Some(timestamp.timestamp_micros()))
-        .map_err(|error| {
-            DataFusionError::Execution(format!(
-                "{schema_key}.{column_name} contains invalid timestamptz: {error}"
-            ))
-        })
 }
 
 /// Materialize `lixcol_*` system columns from borrowed batch rows.
@@ -5033,12 +4995,16 @@ mod tests {
     }
 
     #[test]
-    fn broad_raw_projection_keeps_invalid_snapshot_errors_on_the_execution_path() {
+    fn schema_v1_current_state_missing_native_tuple_fails_closed() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "project_message",
-                "type": "object",
-                "properties": { "body": { "type": "string" } }
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "project_message",
+                "columns": [
+                    {"name": "id", "type": "text", "nullable": false},
+                    {"name": "body", "type": "text", "nullable": true}
+                ],
+                "primary_key": ["id"]
             }))
             .expect("schema should derive entity surface spec"),
         );
@@ -5051,7 +5017,7 @@ mod tests {
             }]),
             super::EntityBatchProjection::RawTrackedProjection,
         )
-        .expect_err("malformed snapshot must fail");
+        .expect_err("a JSON snapshot must not substitute for a missing native tuple");
 
         assert!(matches!(
             error,
@@ -5060,7 +5026,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("sql2 entity provider expected valid snapshot_content JSON"),
+                .contains("missing its native scalar tuple"),
             "unexpected error: {error}"
         );
     }
