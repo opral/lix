@@ -122,6 +122,119 @@ impl TrackedStateTree {
         storage::load_root(store, commit_id).await
     }
 
+    /// Returns the distinct schema identities that are physically present in
+    /// this authenticated root. Each schema run is discovered with one
+    /// lower-bound descent, so callers can plan schema/file-bounded work
+    /// without trusting the public registration catalog or materializing the
+    /// full tree.
+    pub(crate) async fn distinct_schema_keys(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+    ) -> Result<Vec<String>, LixError> {
+        let mut schema_keys = Vec::new();
+        let mut lower = Vec::new();
+        while let Some(encoded_key) = self
+            .first_key_at_or_after(store, root_id, &lower)
+            .await?
+        {
+            let key = decode_key(&encoded_key)?;
+            let schema_key = key.schema_key;
+            let Some(next_lower) =
+                lexicographic_successor(&encode_schema_key_prefix(&schema_key))
+            else {
+                schema_keys.push(schema_key);
+                break;
+            };
+            if next_lower <= lower {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "tracked-state schema inventory did not advance",
+                ));
+            }
+            schema_keys.push(schema_key);
+            lower = next_lower;
+        }
+        Ok(schema_keys)
+    }
+
+    async fn first_key_at_or_after(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        lower: &[u8],
+    ) -> Result<Option<Bytes>, LixError> {
+        let mut current = *root_id.as_bytes();
+        let mut expected_summary = None;
+        loop {
+            let node = self.load_node(store, &current).await?;
+            if let Some(expected) = expected_summary.take() {
+                validate_decoded_node_summary(&node, &expected)?;
+            }
+            match node {
+                DecodedNode::Leaf(leaf) => {
+                    let mut low = 0usize;
+                    let mut high = leaf.len();
+                    while low < high {
+                        let mid = low + (high - low) / 2;
+                        let key = leaf.key(mid)?.ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                "tracked-state leaf key disappeared during lower-bound seek",
+                            )
+                        })?;
+                        if key < lower {
+                            low = mid + 1;
+                        } else {
+                            high = mid;
+                        }
+                    }
+                    return Ok(leaf.entry_owned(low).map(|entry| entry.key));
+                }
+                DecodedNode::Internal(internal) => {
+                    let children = internal.into_children();
+                    for child in &children {
+                        self.authenticate_subtree_right_edge(store, child).await?;
+                    }
+                    let Some(child) = children
+                        .into_iter()
+                        .find(|child| child.last_key.as_ref() >= lower)
+                    else {
+                        return Ok(None);
+                    };
+                    current = child.child_hash;
+                    expected_summary = Some(child);
+                }
+            }
+        }
+    }
+
+    async fn authenticate_subtree_right_edge(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        summary: &ChildSummary,
+    ) -> Result<(), LixError> {
+        let mut current = summary.child_hash;
+        let mut expected = summary.clone();
+        loop {
+            let node = self.load_node(store, &current).await?;
+            validate_decoded_node_summary(&node, &expected)?;
+            match node {
+                DecodedNode::Leaf(_) => return Ok(()),
+                DecodedNode::Internal(internal) => {
+                    let Some(child) = internal.children().last().cloned() else {
+                        return Err(LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "tracked-state internal node has no right edge",
+                        ));
+                    };
+                    current = child.child_hash;
+                    expected = child;
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn get(
         &self,
@@ -208,6 +321,17 @@ impl TrackedStateTree {
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
         if request.limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        if !request.row_pks.is_empty()
+            && request.row_pks.iter().all(|row_pk| {
+                !crate::tracked_state::row_pk_satisfies_bounds(
+                    row_pk,
+                    request.row_pk_lower.as_ref(),
+                    request.row_pk_upper.as_ref(),
+                )
+            })
+        {
             return Ok(Vec::new());
         }
 
@@ -2513,6 +2637,46 @@ fn decoded_leaf_summary(
     }
 }
 
+fn validate_decoded_node_summary(
+    node: &DecodedNode,
+    expected: &ChildSummary,
+) -> Result<(), LixError> {
+    let (first_key, last_key, subtree_count) = match node {
+        DecodedNode::Leaf(leaf) => (
+            leaf.first_key().unwrap_or_default(),
+            leaf.last_key().unwrap_or_default(),
+            leaf.len() as u64,
+        ),
+        DecodedNode::Internal(internal) => {
+            let children = internal.children();
+            let first_key = children.first().map(|child| child.first_key.as_ref());
+            let last_key = children.last().map(|child| child.last_key.as_ref());
+            let subtree_count = children
+                .iter()
+                .try_fold(0_u64, |total, child| total.checked_add(child.subtree_count));
+            let (Some(first_key), Some(last_key), Some(subtree_count)) =
+                (first_key, last_key, subtree_count)
+            else {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "tracked-state internal child summary is invalid",
+                ));
+            };
+            (first_key, last_key, subtree_count)
+        }
+    };
+    if first_key != expected.first_key.as_ref()
+        || last_key != expected.last_key.as_ref()
+        || subtree_count != expected.subtree_count
+    {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "tracked-state child summary does not match authenticated child contents",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn internal_summary(
     hash: [u8; TRACKED_STATE_HASH_BYTES],
@@ -2574,6 +2738,13 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
                     NullableKeyFilter::Any => unreachable!("filtered above"),
                 };
                 for row_pk in &request.row_pks {
+                    if !crate::tracked_state::row_pk_satisfies_bounds(
+                        row_pk,
+                        request.row_pk_lower.as_ref(),
+                        request.row_pk_upper.as_ref(),
+                    ) {
+                        continue;
+                    }
                     let key = TrackedStateKey {
                         schema_key: schema_key.clone(),
                         file_id: file_id.clone(),
@@ -2596,14 +2767,21 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
         }
 
         for file_filter in &request.file_ids {
-            let prefix = match file_filter {
-                NullableKeyFilter::Null => encode_schema_file_prefix(schema_key, None),
-                NullableKeyFilter::Value(file_id) => {
-                    encode_schema_file_prefix(schema_key, Some(file_id))
-                }
+            let (prefix, file_id) = match file_filter {
+                NullableKeyFilter::Null => (encode_schema_file_prefix(schema_key, None), None),
+                NullableKeyFilter::Value(file_id) => (
+                    encode_schema_file_prefix(schema_key, Some(file_id)),
+                    Some(file_id.clone()),
+                ),
                 NullableKeyFilter::Any => unreachable!("handled above"),
             };
-            ranges.push(prefix_scan_range(prefix));
+            ranges.push(row_pk_scan_range(
+                schema_key,
+                file_id,
+                prefix,
+                request.row_pk_lower.as_ref(),
+                request.row_pk_upper.as_ref(),
+            ));
         }
     }
     ranges
@@ -2627,7 +2805,7 @@ fn scan_key_decode_hint<'a>(
     Some(ScanKeyDecodeHint {
         schema_key: request.schema_keys.first()?.as_str(),
         file_id,
-        prefix_len: ranges.first()?.start.len(),
+        prefix_len: encode_schema_file_prefix(request.schema_keys.first()?, file_id).len(),
     })
 }
 
@@ -2643,6 +2821,46 @@ fn exact_scan_range(key: Vec<u8>) -> EncodedScanRange {
         end: lexicographic_successor(&key),
         start: key,
     }
+}
+
+fn row_pk_scan_range(
+    schema_key: &str,
+    file_id: Option<String>,
+    prefix: Vec<u8>,
+    lower: Option<&crate::tracked_state::RowPkRangeBound>,
+    upper: Option<&crate::tracked_state::RowPkRangeBound>,
+) -> EncodedScanRange {
+    let start = lower.map_or_else(
+        || prefix.clone(),
+        |bound| {
+            let key = encode_key(&TrackedStateKey {
+                schema_key: schema_key.to_owned(),
+                file_id: file_id.clone(),
+                row_pk: bound.row_pk.clone(),
+            });
+            if bound.inclusive {
+                key
+            } else {
+                lexicographic_successor(&key).unwrap_or(key)
+            }
+        },
+    );
+    let end = upper.map_or_else(
+        || lexicographic_successor(&prefix),
+        |bound| {
+            let key = encode_key(&TrackedStateKey {
+                schema_key: schema_key.to_owned(),
+                file_id,
+                row_pk: bound.row_pk.clone(),
+            });
+            if bound.inclusive {
+                lexicographic_successor(&key)
+            } else {
+                Some(key)
+            }
+        },
+    );
+    EncodedScanRange { start, end }
 }
 
 fn lexicographic_successor(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -2681,6 +2899,13 @@ fn key_matches_scan_filters(request: &TrackedStateTreeScanRequest, key: &Tracked
         return false;
     }
     if !request.row_pks.is_empty() && !request.row_pks.contains(&key.row_pk) {
+        return false;
+    }
+    if !crate::tracked_state::row_pk_satisfies_bounds(
+        &key.row_pk,
+        request.row_pk_lower.as_ref(),
+        request.row_pk_upper.as_ref(),
+    ) {
         return false;
     }
     if !request.file_ids.is_empty()
@@ -2742,6 +2967,32 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageAdapterReadScope};
     use crate::tracked_state::codec::{encode_value, hash_bytes};
+
+    #[test]
+    fn schema_inventory_rejects_too_low_routing_boundary() {
+        let key = encode_key(&TrackedStateKey {
+            schema_key: "private_schema".to_string(),
+            file_id: Some("file-a".to_string()),
+            row_pk: RowPk::single("row-a"),
+        });
+        let value = encode_value(&value("change-a", Some("present")));
+        let bytes = Bytes::from(encode_leaf_node(&[EncodedLeafEntry {
+            key: Bytes::from(key.clone()),
+            value: Bytes::from(value),
+        }]));
+        let node = decode_node(&bytes).expect("fixture leaf should decode");
+        let error = validate_decoded_node_summary(
+            &node,
+            &ChildSummary {
+                first_key: Bytes::from(key),
+                last_key: Bytes::from_static(b"forged-too-low"),
+                child_hash: hash_bytes(&bytes),
+                subtree_count: 1,
+            },
+        )
+        .expect_err("hash-valid child with substituted boundary must fail closed");
+        assert!(error.message.contains("child summary does not match"));
+    }
 
     struct CountingChunkRead {
         hash: [u8; TRACKED_STATE_HASH_BYTES],
@@ -2851,6 +3102,42 @@ mod tests {
         ));
 
         assert_eq!(storage_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_candidates_outside_primary_key_bounds_do_zero_tree_reads() {
+        let bytes = encode_leaf_node(&[]);
+        let hash = hash_bytes(&bytes);
+        let storage_reads = Arc::new(AtomicUsize::new(0));
+        let store = StorageAdapterReadScope::new(CountingChunkRead {
+            hash,
+            bytes,
+            storage_reads: Arc::clone(&storage_reads),
+            corrupt_first_read: false,
+        });
+        let rows = TrackedStateTree::new()
+            .scan(
+                &store,
+                &TrackedStateRootId::new(hash),
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema".to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    row_pks: vec![RowPk::single("a"), RowPk::single("b")],
+                    row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("c"),
+                        inclusive: true,
+                    }),
+                    row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("d"),
+                        inclusive: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("empty exact/range intersection should short circuit");
+        assert!(rows.is_empty());
+        assert_eq!(storage_reads.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -3577,6 +3864,39 @@ mod tests {
             Some("01920000-0000-7000-8000-0000000000a2")
         );
 
+        let bounded_exact_rows = tree
+            .scan(
+                &store,
+                &result.root_id,
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema-a".to_string()],
+                    row_pks: vec![RowPk::single("row-a"), RowPk::single("row-b")],
+                    file_ids: vec![NullableKeyFilter::Value(
+                        "01920000-0000-7000-8000-0000000000a2".to_string(),
+                    )],
+                    row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("row-b"),
+                        inclusive: true,
+                    }),
+                    row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: RowPk::single("row-b"),
+                        inclusive: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("exact candidates must intersect range bounds");
+        assert_eq!(bounded_exact_rows.len(), 1);
+        assert_eq!(
+            bounded_exact_rows[0]
+                .0
+                .row_pk
+                .as_single_string_owned()
+                .expect("identity"),
+            "row-b"
+        );
+
         // With no schema predicate there is no encoded scan range or trusted
         // prefix. This exercises the decoded-key filter path directly.
         let row_only_rows = tree
@@ -3674,6 +3994,79 @@ mod tests {
                 .map(|(key, _)| key.row_pk.as_single_string_owned().expect("identity"))
                 .collect::<Vec<_>>(),
             vec!["row-a", "row-c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_schema_file_primary_key_range_honors_open_closed_and_empty_bounds() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::new();
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let result = apply_mutations_for_test(
+            &tree,
+            &storage,
+            None,
+            ["row-a", "row-b", "row-c", "row-d"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, row_pk)| {
+                    mutation_owned(
+                        key("schema-a", Some(file_id), row_pk),
+                        value(&format!("range-c{index}"), Some("{}")),
+                    )
+                })
+                .collect(),
+            None,
+        )
+        .await
+        .expect("range fixture should apply");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("range read should open");
+        let request = |lower: (&str, bool), upper: (&str, bool)| {
+            TrackedStateTreeScanRequest {
+                schema_keys: vec!["schema-a".to_owned()],
+                file_ids: vec![NullableKeyFilter::Value(file_id.to_owned())],
+                row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                    row_pk: RowPk::single(lower.0),
+                    inclusive: lower.1,
+                }),
+                row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                    row_pk: RowPk::single(upper.0),
+                    inclusive: upper.1,
+                }),
+                ..Default::default()
+            }
+        };
+
+        let rows = tree
+            .scan(&store, &result.root_id, &request(("row-a", false), ("row-d", false)))
+            .await
+            .expect("open range should scan");
+        assert_eq!(
+            rows.into_iter()
+                .map(|(key, _)| key.row_pk.into_parts())
+                .collect::<Vec<_>>(),
+            vec![vec!["row-b"], vec!["row-c"]]
+        );
+
+        let rows = tree
+            .scan(&store, &result.root_id, &request(("row-b", true), ("row-c", true)))
+            .await
+            .expect("closed range should scan");
+        assert_eq!(
+            rows.into_iter()
+                .map(|(key, _)| key.row_pk.into_parts())
+                .collect::<Vec<_>>(),
+            vec![vec!["row-b"], vec!["row-c"]]
+        );
+
+        assert!(
+            tree.scan(&store, &result.root_id, &request(("row-d", true), ("row-a", true)))
+                .await
+                .expect("empty inverted range should not fail")
+                .is_empty()
         );
     }
 

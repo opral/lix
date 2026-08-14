@@ -35,8 +35,6 @@ use super::derived::{
 };
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
-const ROW_POINT_SNAPSHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
-const ROW_POINT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4_096;
 const ROW_COLUMNAR_LAYOUT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const ROW_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES: usize = 16;
 const TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES: usize = 64;
@@ -111,27 +109,6 @@ impl GlobalKeyValueRowCache {
         }
         entries.push((control, key.to_string(), row));
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct RowPointSnapshotCacheKey {
-    branch_id: String,
-    generation: CommitId,
-    current_state_revision: u64,
-    schema_key: String,
-    row_pk: RowPk,
-}
-
-#[derive(Debug)]
-struct RowPointSnapshotCacheEntry {
-    key: RowPointSnapshotCacheKey,
-    snapshots: Vec<Option<Bytes>>,
-    bytes: usize,
-}
-
-#[derive(Debug, Default)]
-struct RowPointSnapshotCache {
-    entries: std::sync::Mutex<Vec<RowPointSnapshotCacheEntry>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -282,75 +259,6 @@ fn estimated_row_columnar_layout_bytes(
         )
 }
 
-impl RowPointSnapshotCache {
-    fn get(&self, key: &RowPointSnapshotCacheKey) -> Option<Vec<Option<Bytes>>> {
-        if row_point_snapshot_cache_disabled_for_profile() {
-            return None;
-        }
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("row point snapshot cache lock poisoned");
-        let position = entries.iter().position(|entry| entry.key == *key)?;
-        let entry = entries.remove(position);
-        let result = entry.snapshots.clone();
-        entries.push(entry);
-        Some(result)
-    }
-
-    fn insert(
-        &self,
-        key: RowPointSnapshotCacheKey,
-        snapshots: Vec<Option<Bytes>>,
-    ) -> Vec<Option<Bytes>> {
-        if row_point_snapshot_cache_disabled_for_profile() {
-            return snapshots;
-        }
-        let bytes = size_of::<RowPointSnapshotCacheEntry>()
-            + key.branch_id.capacity()
-            + key.schema_key.capacity()
-            + snapshots.capacity() * size_of::<Option<Bytes>>()
-            + snapshots.iter().flatten().map(Bytes::len).sum::<usize>();
-        let result = snapshots.clone();
-        if bytes > ROW_POINT_SNAPSHOT_CACHE_MAX_BYTES {
-            return result;
-        }
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("row point snapshot cache lock poisoned");
-        entries.retain(|entry| {
-            entry.key.branch_id != key.branch_id
-                || entry.key.schema_key != key.schema_key
-                || entry.key.row_pk != key.row_pk
-        });
-        entries.push(RowPointSnapshotCacheEntry {
-            key,
-            snapshots,
-            bytes,
-        });
-        let mut resident_bytes = entries.iter().map(|entry| entry.bytes).sum::<usize>();
-        while resident_bytes > ROW_POINT_SNAPSHOT_CACHE_MAX_BYTES
-            || entries.len() > ROW_POINT_SNAPSHOT_CACHE_MAX_ENTRIES
-        {
-            resident_bytes = resident_bytes.saturating_sub(entries.remove(0).bytes);
-        }
-        result
-    }
-}
-
-#[cfg(feature = "storage-benches")]
-fn row_point_snapshot_cache_disabled_for_profile() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED
-        .get_or_init(|| std::env::var_os("LIX_TRACKED_STATE_CRUD_DISABLE_POINT_CACHE").is_some())
-}
-
-#[cfg(not(feature = "storage-benches"))]
-const fn row_point_snapshot_cache_disabled_for_profile() -> bool {
-    false
-}
-
 /// Serving facade for visible live-state reads.
 ///
 /// Normal rows are resolved from one durable hot-state projection. Each row
@@ -360,7 +268,6 @@ pub(crate) struct HotStateContext {
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
-    row_point_snapshot_cache: std::sync::Arc<RowPointSnapshotCache>,
     row_columnar_layout_cache: std::sync::Arc<RowColumnarLayoutCache>,
     row_columnar_scan_cache:
         std::sync::Arc<std::sync::Mutex<crate::hot_state::RowColumnarShadowMaskCache>>,
@@ -386,7 +293,6 @@ impl HotStateContext {
             tracked_head: TrackedHeadContext::new(),
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
-            row_point_snapshot_cache: std::sync::Arc::new(RowPointSnapshotCache::default()),
             row_columnar_layout_cache: std::sync::Arc::new(RowColumnarLayoutCache::default()),
             row_columnar_scan_cache: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::hot_state::RowColumnarShadowMaskCache::with_array_budget(
@@ -422,7 +328,6 @@ impl HotStateContext {
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
-            row_point_snapshot_cache: std::sync::Arc::clone(&self.row_point_snapshot_cache),
             row_columnar_layout_cache: std::sync::Arc::clone(&self.row_columnar_layout_cache),
             branch_head_control_cache: None,
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
@@ -444,7 +349,6 @@ impl HotStateContext {
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
-            row_point_snapshot_cache: std::sync::Arc::clone(&self.row_point_snapshot_cache),
             row_columnar_layout_cache: std::sync::Arc::clone(&self.row_columnar_layout_cache),
             branch_head_control_cache: Some(branch_head_control_cache),
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
@@ -476,7 +380,6 @@ impl HotStateContext {
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
-            row_point_snapshot_cache: std::sync::Arc::new(RowPointSnapshotCache::default()),
             row_columnar_layout_cache: std::sync::Arc::new(RowColumnarLayoutCache::default()),
             branch_head_control_cache: None,
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
@@ -500,7 +403,6 @@ pub(crate) struct HotStateContextReader<S> {
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
-    row_point_snapshot_cache: std::sync::Arc<RowPointSnapshotCache>,
     row_columnar_layout_cache: std::sync::Arc<RowColumnarLayoutCache>,
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
     root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
@@ -545,27 +447,6 @@ where
         else {
             return Ok(None);
         };
-        let point_key = match (request.filter.row_pks.as_slice(), request.limit) {
-            ([row_pk], None | Some(1..)) => Some(RowPointSnapshotCacheKey {
-                branch_id: requested_branch_id.clone(),
-                generation: requested_control.tracked_generation,
-                current_state_revision: requested_control.current_state_revision,
-                schema_key: schema_key.clone(),
-                row_pk: row_pk.clone(),
-            }),
-            _ => None,
-        };
-        if let Some(key) = point_key.as_ref()
-            && let Some(snapshots) = self.row_point_snapshot_cache.get(key)
-        {
-            #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_row_point_snapshot_cache_hit();
-            return Ok(Some(snapshots));
-        }
-        if point_key.is_some() {
-            #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_row_point_snapshot_cache_miss();
-        }
         let snapshots = self
             .tracked_head
             .reader(&self.store)
@@ -578,10 +459,7 @@ where
                 request.limit,
             )
             .await?;
-        Ok(Some(match point_key {
-            Some(key) => self.row_point_snapshot_cache.insert(key, snapshots),
-            None => snapshots,
-        }))
+        Ok(Some(snapshots))
     }
 
     /// Returns committed row identities under the same narrow visibility
@@ -1148,7 +1026,7 @@ where
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
 
-        let mut storage_identities = Vec::with_capacity(request.rows.len().saturating_mul(2));
+        let mut storage_identities = Vec::with_capacity(request.rows.len());
         for row in &request.rows {
             if !visible_branch_ids.contains(&row.branch_id) {
                 continue;
@@ -1159,14 +1037,6 @@ where
                 row_pk: &row.row_pk,
                 file_id: row.file_id.as_deref(),
             });
-            if row.branch_id != GLOBAL_BRANCH_ID {
-                storage_identities.push(crate::hot_state::HotStateRowIdentityRef {
-                    branch_id: GLOBAL_BRANCH_ID,
-                    schema_key: row.schema_key.as_str(),
-                    row_pk: &row.row_pk,
-                    file_id: row.file_id.as_deref(),
-                });
-            }
         }
         storage_identities.sort_unstable();
         storage_identities.dedup();
@@ -1186,7 +1056,7 @@ where
         }
         let projection =
             crate::changelog::ChangeRecordProjection::from_columns(&request.projection.columns);
-        let current_batches = stream::iter(branch_ranges)
+        let mut current_batches = stream::iter(branch_ranges)
             .map(|range| {
                 let identities = &storage_identities[range.clone()];
                 let branch_id = identities[0].branch_id;
@@ -1237,9 +1107,81 @@ where
                 }
             }
         }
-        // `storage_identities` and branch ranges are sorted, and `buffered`
-        // preserves input order, so candidate slots are already identity
-        // ordered. Keep the assertion close to the binary-search contract.
+        // Resolve the branch-local plane first. A local value or tombstone is
+        // authoritative and suppresses the global row; only a genuinely
+        // absent (or retention-mismatched) local identity needs a global
+        // point. This preserves aligned overlay semantics while avoiding the
+        // eager 2*K multiget paid by every ordinary exact batch.
+        let mut global_identities = Vec::new();
+        for requested in &request.rows {
+            if requested.branch_id == GLOBAL_BRANCH_ID
+                || !visible_branch_ids.contains(&requested.branch_id)
+            {
+                continue;
+            }
+            let local_identity = crate::hot_state::HotStateRowIdentityRef {
+                branch_id: requested.branch_id.as_str(),
+                schema_key: requested.schema_key.as_str(),
+                row_pk: &requested.row_pk,
+                file_id: requested.file_id.as_deref(),
+            };
+            let local = candidate_slots
+                .binary_search_by_key(&local_identity, |candidate| candidate.0)
+                .ok()
+                .and_then(|index| {
+                    let (_, batch_index, slot) = candidate_slots[index];
+                    current_batches[batch_index].1.row(slot)
+                })
+                .filter(|row| current_row_matches_retention(*row, request.untracked));
+            if local.is_none() {
+                global_identities.push(crate::hot_state::HotStateRowIdentityRef {
+                    branch_id: GLOBAL_BRANCH_ID,
+                    ..local_identity
+                });
+            }
+        }
+        global_identities.sort_unstable();
+        global_identities.dedup();
+        if !global_identities.is_empty()
+            && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
+        {
+            let keys = global_identities
+                .iter()
+                .map(|identity| crate::tracked_state::TrackedStateKeyRef {
+                    schema_key: identity.schema_key,
+                    row_pk: identity.row_pk,
+                    file_id: identity.file_id,
+                })
+                .collect::<Vec<_>>();
+            let domain = request
+                .untracked
+                .map_or(HotStateReadDomain::Combined, |untracked| {
+                    if untracked {
+                        HotStateReadDomain::Untracked
+                    } else {
+                        HotStateReadDomain::Tracked
+                    }
+                });
+            let rows = self
+                .tracked_head
+                .reader(&self.store)
+                .load_projected_live_batch_refs_for_domain(
+                    GLOBAL_BRANCH_ID,
+                    global_control,
+                    &keys,
+                    &projection,
+                    domain,
+                )
+                .await?;
+            let batch_index = current_batches.len();
+            for (slot, identity) in global_identities.iter().copied().enumerate() {
+                if rows.row(slot).is_some() {
+                    candidate_slots.push((identity, batch_index, slot));
+                }
+            }
+            current_batches.push((0..global_identities.len(), rows));
+        }
+        candidate_slots.sort_unstable_by_key(|candidate| candidate.0);
         debug_assert!(candidate_slots.windows(2).all(|pair| pair[0].0 < pair[1].0));
 
         let mut builder = MaterializedHotStateBatchBuilder::with_capacity(request.rows.len());
@@ -1544,6 +1486,8 @@ fn tracked_scan_request_from_live(request: &HotStateScanRequest) -> TrackedState
         filter: TrackedStateFilter {
             schema_keys: request.filter.schema_keys.clone(),
             row_pks: request.filter.row_pks.clone(),
+            row_pk_lower: request.filter.row_pk_lower.clone(),
+            row_pk_upper: request.filter.row_pk_upper.clone(),
             file_ids: request.filter.file_ids.clone(),
             // Scan tombstones internally so branch-local tombstones can hide
             // global fallback rows before the serving facade filters them.

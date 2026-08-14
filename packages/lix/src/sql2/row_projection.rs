@@ -107,6 +107,21 @@ impl RowProjectionDecoder {
             .collect())
     }
 
+    /// Decodes one exact point result directly into the public scalar row.
+    ///
+    /// This is deliberately narrower than the Arrow path: callers must have
+    /// already proved a unique registered-schema point query. Keeping the
+    /// same decoder and raw-value coercions makes the native result an output
+    /// boundary only, not a second row interpretation authority.
+    pub(crate) fn decode_public_values(
+        &self,
+        snapshot: Option<&[u8]>,
+    ) -> Result<Vec<crate::Value>, LixError> {
+        let mut sink = PublicProjectionSink { values: Vec::new() };
+        self.decode_into(snapshot, &mut sink)?;
+        Ok(sink.values)
+    }
+
     fn decode_into<S>(&self, snapshot: Option<&[u8]>, sink: &mut S) -> Result<(), LixError>
     where
         S: RowProjectionSink,
@@ -277,6 +292,68 @@ where
 
 struct ArrowProjectionSink {
     columns: Vec<RowProjectionColumn>,
+}
+
+struct PublicProjectionSink {
+    values: Vec<crate::Value>,
+}
+
+impl RowProjectionSink for PublicProjectionSink {
+    fn begin_row(&mut self, field_count: usize) {
+        self.values = vec![crate::Value::Null; field_count];
+    }
+
+    fn project_raw(
+        &mut self,
+        decoder: &RowProjectionDecoder,
+        indices: &[usize],
+        raw: &RawValue,
+    ) -> Result<(), LixError> {
+        for index in indices {
+            let field = &decoder.fields[*index];
+            let value = match field.column_type {
+                SchemaColumnType::String => raw_string_text(raw)?
+                    .map(crate::Value::Text)
+                    .unwrap_or(crate::Value::Null),
+                SchemaColumnType::Json => raw_json_text(raw)
+                    .map(|json| crate::Value::Json(crate::Json::from_canonical_text(json)))
+                    .unwrap_or(crate::Value::Null),
+                SchemaColumnType::Integer => {
+                    let value = parse_json_value(raw)?;
+                    json_bigint_value(Some(&value), &decoder.schema_key, &field.name)?
+                        .map(crate::Value::Integer)
+                        .unwrap_or(crate::Value::Null)
+                }
+                SchemaColumnType::Number => {
+                    let value = parse_json_value(raw)?;
+                    json_double_value(Some(&value), &decoder.schema_key, &field.name)?
+                        .map(crate::Value::Real)
+                        .unwrap_or(crate::Value::Null)
+                }
+                SchemaColumnType::Boolean => raw_bool(raw)
+                    .map(crate::Value::Boolean)
+                    .unwrap_or(crate::Value::Null),
+                SchemaColumnType::Timestamptz => raw_string_text(raw)?
+                    .map(|value| {
+                        chrono::DateTime::parse_from_rfc3339(&value)
+                            .map(|timestamp| crate::Value::Timestamp(timestamp.timestamp_micros()))
+                            .map_err(|error| {
+                                LixError::new(
+                                    LixError::CODE_TYPE_MISMATCH,
+                                    format!(
+                                        "invalid timestamptz value for {}.{}: {error}",
+                                        decoder.schema_key, field.name
+                                    ),
+                                )
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or(crate::Value::Null),
+            };
+            self.values[*index] = value;
+        }
+        Ok(())
+    }
 }
 
 impl RowProjectionSink for ArrowProjectionSink {
@@ -471,6 +548,34 @@ mod tests {
 
     fn canonical_json(canonical: &str) -> Json {
         Json::from_canonical_text(canonical)
+    }
+
+    #[test]
+    fn direct_public_projection_preserves_json_null_and_timestamptz() {
+        let mut spec = spec();
+        spec.columns
+            .push(crate::sql2::catalog::schema_surface::SchemaSurfaceColumn {
+            name: "stamp".to_string(),
+            column_type: crate::sql2::catalog::SchemaColumnType::Timestamptz,
+            read_nullable: true,
+            insert_required: false,
+            default_expression: None,
+        });
+        let decoder = RowProjectionDecoder::new(&spec, ["json", "null_text", "stamp"])
+            .expect("direct decoder should build");
+        let values = decoder
+            .decode_public_values(Some(
+                br#"{"json":{"a":[true,null]},"null_text":null,"stamp":"2025-01-01T00:00:00.123456Z"}"#,
+            ))
+            .expect("direct values should decode");
+        assert_eq!(
+            values,
+            vec![
+                Value::Json(canonical_json(r#"{"a":[true,null]}"#)),
+                Value::Null,
+                Value::Timestamp(1_735_689_600_123_456),
+            ]
+        );
     }
 
     fn spec() -> crate::sql2::catalog::SchemaSurfaceSpec {

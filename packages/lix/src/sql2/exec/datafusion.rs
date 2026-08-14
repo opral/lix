@@ -4363,8 +4363,7 @@ mod tests {
             .filter(|row| {
                 (request.filter.schema_keys.is_empty()
                     || request.filter.schema_keys.contains(&row.schema_key))
-                    && (request.filter.row_pks.is_empty()
-                        || request.filter.row_pks.contains(&row.row_pk))
+                    && request.filter.matches_row_pk(&row.row_pk)
                     && (request.filter.branch_ids.is_empty()
                         || request
                             .filter

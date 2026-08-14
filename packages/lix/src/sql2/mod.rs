@@ -41,7 +41,7 @@ pub(crate) use bind::{
     statement_has_durable_runtime_function,
 };
 pub(crate) use catalog::{
-    SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec, PublicCatalog,
+    PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec, PublicCatalog,
     derive_schema_surface_spec_from_schema, row_visible_fields,
 };
 pub(crate) use change_materialization::MaterializedChange;
@@ -105,7 +105,9 @@ pub(crate) use providers::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
-    execute_exact_lix_file_root_listing, execute_fast_lix_file_path_writes,
+    execute_exact_lix_file_root_listing, execute_exact_schema_batch_read,
+    execute_exact_schema_point_read,
+    execute_fast_lix_file_path_writes,
     execute_fast_lix_file_prepared_path_write,
 };
 pub use script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};

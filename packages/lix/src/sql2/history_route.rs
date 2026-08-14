@@ -459,6 +459,8 @@ where
                     .cloned()
                     .map(NullableKeyFilter::Value)
                     .collect(),
+                row_pk_lower: None,
+                row_pk_upper: None,
                 include_tombstones: true,
             },
             read_columns: TrackedStateReadColumns {

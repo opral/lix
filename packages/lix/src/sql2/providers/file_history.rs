@@ -1358,6 +1358,8 @@ where
                         .collect()
                 })
                 .unwrap_or_default(),
+            row_pk_lower: None,
+            row_pk_upper: None,
             include_tombstones: true,
         },
     )
@@ -1395,6 +1397,8 @@ where
             ],
             row_pks,
             file_ids: file_ids.clone(),
+            row_pk_lower: None,
+            row_pk_upper: None,
             include_tombstones: true,
         },
     )
@@ -1460,6 +1464,8 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 file_ids: file_ids.clone(),
+                row_pk_lower: None,
+                row_pk_upper: None,
                 include_tombstones: true,
             },
         )
@@ -1514,6 +1520,8 @@ where
                     schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
                     row_pks: vec![RowPk::single(PLUGIN_REGISTRY_KEY)],
                     file_ids: vec![NullableKeyFilter::Null],
+                    row_pk_lower: None,
+                    row_pk_upper: None,
                     include_tombstones: true,
                 },
                 read_columns: TrackedStateReadColumns {

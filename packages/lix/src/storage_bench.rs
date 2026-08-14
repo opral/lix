@@ -70,8 +70,6 @@ static MATERIALIZE_OWNED_KEY_BUILDS: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_OWNED_KEY_BYTES: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_REVERIFY_ROWS: AtomicU64 = AtomicU64::new(0);
 static COMMIT_DELTA_COLUMNAR_ROWS: AtomicU64 = AtomicU64::new(0);
-static ROW_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static ROW_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -516,12 +514,6 @@ pub fn take_certified_row_update_value_batch_accounting() -> CrudCertificateAcco
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RowPointSnapshotCacheAccounting {
-    pub hits: u64,
-    pub misses: u64,
-}
-
 pub(crate) fn record_root_base_batch_cache_hit() {
     ROOT_BASE_BATCH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
 }
@@ -832,21 +824,6 @@ pub fn take_hot_index_probe_census() -> HotIndexProbeCensus {
             .swap(0, Ordering::Relaxed),
         probes_refused_over_budget: HOT_INDEX_PROBES_REFUSED_OVER_BUDGET
             .swap(0, Ordering::Relaxed),
-    }
-}
-
-pub(crate) fn record_row_point_snapshot_cache_hit() {
-    ROW_POINT_SNAPSHOT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_row_point_snapshot_cache_miss() {
-    ROW_POINT_SNAPSHOT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn take_row_point_snapshot_cache_accounting() -> RowPointSnapshotCacheAccounting {
-    RowPointSnapshotCacheAccounting {
-        hits: ROW_POINT_SNAPSHOT_CACHE_HITS.swap(0, Ordering::Relaxed),
-        misses: ROW_POINT_SNAPSHOT_CACHE_MISSES.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -4207,6 +4184,11 @@ mod tests {
         assert_eq!(
             first.delete_counts_by_space,
             vec![
+                (crate::hot_state::DIFF_SPACE.id.0, 100), // retired checkpoint working-diff rows
+                (
+                    crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE.id.0,
+                    1,
+                ), // retired checkpoint epoch marker
                 (
                     crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
                         .id
@@ -4241,11 +4223,23 @@ mod tests {
         const FENCE_KEY_BYTES: usize =
             crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
         assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
-        // Every canonical-record delete is UUID keyed, so each descriptor is
-        // exactly 16 bytes.
+        // Canonical-record deletes are UUID keyed. Checkpoint rotation also
+        // retires the fixture's fixed-width working-diff identities and the
+        // branch-ref marker through their authenticated physical encodings.
+        const UUID_KEY_BYTES: usize = 16;
+        const WORKING_DIFF_KEY_BYTES: usize = 121;
+        const WORKING_DIFF_MARKER_KEY_BYTES: usize = 37;
+        let working_diff_deletes = 100;
+        let marker_deletes = 1;
+        let uuid_deletes = first.staged_deletes as usize
+            - working_diff_deletes
+            - marker_deletes;
         assert_eq!(
             first.key_shared_bytes,
-            first.staged_deletes as usize * 16 + FENCE_KEY_BYTES
+            uuid_deletes * UUID_KEY_BYTES
+                + working_diff_deletes * WORKING_DIFF_KEY_BYTES
+                + marker_deletes * WORKING_DIFF_MARKER_KEY_BYTES
+                + FENCE_KEY_BYTES
         );
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.delete_counts_by_space, first.delete_counts_by_space);

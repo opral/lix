@@ -1487,6 +1487,8 @@ pub(crate) async fn load_certified_rows_at_commit(
                 schema_keys,
                 row_pks,
                 file_ids,
+                row_pk_lower: None,
+                row_pk_upper: None,
                 include_tombstones: true,
             },
             read_columns: TrackedStateReadColumns {
@@ -1605,6 +1607,8 @@ struct CertifiedScanFilterIndex {
     schema_keys: Option<HashSet<String>>,
     file_ids: Option<HashSet<String>>,
     row_pks: Option<HashSet<RowPk>>,
+    row_pk_lower: Option<crate::tracked_state::RowPkRangeBound>,
+    row_pk_upper: Option<crate::tracked_state::RowPkRangeBound>,
 }
 
 impl CertifiedScanFilterIndex {
@@ -1636,6 +1640,8 @@ impl CertifiedScanFilterIndex {
             file_ids,
             row_pks: (!request.filter.row_pks.is_empty())
                 .then(|| request.filter.row_pks.iter().cloned().collect()),
+            row_pk_lower: request.filter.row_pk_lower.clone(),
+            row_pk_upper: request.filter.row_pk_upper.clone(),
         }
     }
 
@@ -1663,6 +1669,11 @@ impl CertifiedScanFilterIndex {
         self.row_pks
             .as_ref()
             .is_none_or(|selected| selected.contains(row_pk))
+            && crate::tracked_state::row_pk_satisfies_bounds(
+                row_pk,
+                self.row_pk_lower.as_ref(),
+                self.row_pk_upper.as_ref(),
+            )
     }
 }
 
@@ -3468,7 +3479,7 @@ fn packed_identity_matches_filter(
             .schema_keys
             .iter()
             .any(|requested| requested == schema_key))
-        && (filter.row_pks.is_empty() || filter.row_pks.contains(row_pk))
+        && filter.matches_row_pk(row_pk)
         && (filter.file_ids.is_empty()
             || filter.file_ids.iter().any(|filter| match filter {
                 NullableKeyFilter::Any => true,
@@ -3496,6 +3507,16 @@ fn packed_exact_keys_for_filter(filter: &TrackedStateFilter) -> Option<Vec<Track
             filter
                 .row_pks
                 .iter()
+                // These rows already come from `filter.row_pks`; checking
+                // membership again makes an exact K-key lookup O(K^2).
+                // Only the independent range conjunction remains here.
+                .filter(|row_pk| {
+                    crate::tracked_state::row_pk_satisfies_bounds(
+                        row_pk,
+                        filter.row_pk_lower.as_ref(),
+                        filter.row_pk_upper.as_ref(),
+                    )
+                })
                 .map(move |row_pk| TrackedStateKey {
                     schema_key: schema_key.clone(),
                     file_id: None,
@@ -6590,6 +6611,8 @@ where
                     file_ids: vec![file_id.map_or(NullableKeyFilter::Null, |file_id| {
                         NullableKeyFilter::Value(file_id)
                     })],
+                    row_pk_lower: None,
+                    row_pk_upper: None,
                     include_tombstones: true,
                 },
                 read_columns: TrackedStateReadColumns {
@@ -7936,6 +7959,27 @@ where
         Ok(generation)
     }
 
+    /// Whether a checkpoint can rotate its working-diff epoch without
+    /// materializing current-state base rows first.
+    ///
+    /// Immutable packed bases encode interval-relative absent-at-checkpoint
+    /// facts and must take the existing materializing route once. Root bases
+    /// are already the branch's checkpoint state and remain clean under a new
+    /// epoch, so they do not prevent lazy rotation.
+    pub(crate) async fn can_rotate_checkpoint_epoch(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+    ) -> Result<bool, LixError> {
+        if !packed_current_base_refs(self.store, branch_id, generation)
+            .await?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Stages deltas whose absence was already validated against the coherent
     /// transaction snapshot. The caller must publish the corresponding branch
     /// control with a compare-and-swap precondition from that same snapshot.
@@ -8502,7 +8546,7 @@ where
                 // for modified/removed rows.
                 delta.created_at
             } else {
-                existing.created_at
+                effective_hot_created_at(existing, working_diff_capture_checkpoint_commit_id)
             });
         }
         // A checkpoint often selects immutable change records whose HOT row
@@ -9204,6 +9248,7 @@ fn next_cascade_working_diff_baseline(
             let mut before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked cascade member has no version"))?;
+            before.created_at = effective_hot_created_at(previous, Some(active_checkpoint_commit_id));
             before.commit_id = active_checkpoint_commit_id;
             Ok((
                 WorkingDiffBaseline::BeforePresent {
@@ -9283,6 +9328,7 @@ fn next_hot_working_diff_baseline(
             let mut before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked mutation has no working-diff version"))?;
+            before.created_at = effective_hot_created_at(previous, Some(active_checkpoint_commit_id));
             before.commit_id = active_checkpoint_commit_id;
             Ok((
                 WorkingDiffBaseline::BeforePresent {
@@ -10821,7 +10867,7 @@ impl HotScanIdentity {
                 .schema_keys
                 .iter()
                 .any(|schema_key| schema_key == self.schema_key()))
-            && (filter.row_pks.is_empty() || filter.row_pks.contains(&self.row_pk))
+            && filter.matches_row_pk(&self.row_pk)
             && (filter.file_ids.is_empty()
                 || filter.file_ids.iter().any(|filter| match filter {
                     NullableKeyFilter::Any => true,
@@ -10986,7 +11032,11 @@ fn hot_exact_identity_batches<'a>(
         .collect::<Vec<_>>();
     schema_keys.sort_unstable();
     schema_keys.dedup();
-    let row_pks = filter.row_pks.iter().collect::<Vec<_>>();
+    let row_pks = filter
+        .row_pks
+        .iter()
+        .filter(|row_pk| filter.matches_row_pk(row_pk))
+        .collect::<Vec<_>>();
     let file_ids = if filter.file_ids.is_empty() {
         vec![None]
     } else {
@@ -12360,19 +12410,22 @@ fn hot_file_scan_prefixes(
         || filter
             .file_ids
             .iter()
-            .any(|file_id| !matches!(file_id, NullableKeyFilter::Value(_)))
+            .any(|file_id| matches!(file_id, NullableKeyFilter::Any))
     {
         return None;
     }
     let mut prefixes = Vec::with_capacity(filter.schema_keys.len() * filter.file_ids.len());
     for schema_key in &filter.schema_keys {
         for file_id in &filter.file_ids {
-            let NullableKeyFilter::Value(file_id) = file_id else {
-                unreachable!("file-id projection predicate was checked above");
-            };
             let mut prefix = hot_scope_prefix(branch_id, generation);
             write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
-            write_file_id(&mut prefix, Some(file_id));
+            match file_id {
+                NullableKeyFilter::Null => write_file_id(&mut prefix, None),
+                NullableKeyFilter::Value(file_id) => write_file_id(&mut prefix, Some(file_id)),
+                NullableKeyFilter::Any => {
+                    unreachable!("file-id projection predicate was checked above")
+                }
+            }
             prefixes.push(prefix);
         }
     }
@@ -12392,10 +12445,9 @@ async fn scan_hot_file_entries(
     let scope = hot_scope_prefix(branch_id, generation);
     let mut rows = Vec::new();
     for prefix in prefixes {
-        let range = StoragePrefix {
-            bytes: Bytes::from(prefix),
-        }
-        .to_range()?;
+        let Some(range) = hot_file_row_pk_range(prefix, filter)? else {
+            continue;
+        };
         let mut cursor = store
             .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
             .await?;
@@ -12449,6 +12501,51 @@ async fn scan_hot_file_entries(
     // Physical rows are ordered `(schema, file_id, row_pk)`, while SQL rows
     // are ordered `(schema, row_pk, file_id)`.
     canonicalize_hot_scan_rows(rows, limit)
+}
+
+/// Narrows one canonical `(branch, generation, schema, file)` partition to
+/// the requested typed primary-key interval. The row-key codec is the same
+/// sole-writer codec used for point keys, so these are storage bounds over the
+/// authority itself rather than a secondary locator.
+fn hot_file_row_pk_range(
+    prefix: Vec<u8>,
+    filter: &TrackedStateFilter,
+) -> Result<Option<crate::storage_adapter::StorageKeyRange>, LixError> {
+    let mut range = StoragePrefix {
+        bytes: Bytes::copy_from_slice(&prefix),
+    }
+    .to_range()?;
+    if let Some(lower) = filter.row_pk_lower.as_ref() {
+        let mut key = prefix.clone();
+        write_row_pk(&mut key, &lower.row_pk);
+        if !lower.inclusive {
+            let Some(successor) = hot_index_key_successor(&key) else {
+                return Ok(None);
+            };
+            key = successor;
+        }
+        range.lower = std::ops::Bound::Included(StorageKey(Bytes::from(key)));
+    }
+    if let Some(upper) = filter.row_pk_upper.as_ref() {
+        let mut key = prefix;
+        write_row_pk(&mut key, &upper.row_pk);
+        if upper.inclusive {
+            let Some(successor) = hot_index_key_successor(&key) else {
+                return Ok(None);
+            };
+            key = successor;
+        }
+        range.upper = std::ops::Bound::Excluded(StorageKey(Bytes::from(key)));
+    }
+    if let (
+        std::ops::Bound::Included(lower),
+        std::ops::Bound::Excluded(upper),
+    ) = (&range.lower, &range.upper)
+        && lower >= upper
+    {
+        return Ok(None);
+    }
+    Ok(Some(range))
 }
 
 async fn hot_schema_has_file_members(
@@ -13309,7 +13406,6 @@ fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
     key
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 struct HotDiffSegmentScope {
     branch_id: String,
     checkpoint_commit_id: CommitId,
@@ -13425,7 +13521,6 @@ fn visit_hot_diff_segment(
     Ok(())
 }
 
-#[cfg(test)]
 fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -13587,7 +13682,6 @@ where
     Ok(deleted)
 }
 
-#[cfg(test)]
 pub(crate) async fn stage_collect_stale_hot_diff_records<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -13641,51 +13735,6 @@ where
                 writes.delete(DIFF_SPACE, entry.key);
             }
         }
-        if !page_has_more {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Reclaims one superseded working-diff epoch without scanning any other
-/// branch or checkpoint. A checkpoint already performs work linear in its
-/// selected dirty set; this prefix-local scan keeps reclamation on the same
-/// bound while preventing unreachable epochs from accumulating until GC.
-pub(super) async fn stage_delete_hot_diff_scope<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    branch_id: &str,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let range = StoragePrefix {
-        bytes: Bytes::from(encode_working_diff_scope_prefix(
-            branch_id,
-            checkpoint_commit_id,
-            generation,
-        )),
-    }
-    .to_range()?;
-    let mut cursor = store
-        .begin_scan(
-            DIFF_SPACE,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
-                ..StorageBeginScanOptions::default()
-            },
-        )
-        .await?;
-    loop {
-        let (page, page_has_more) = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?
-            .into_parts();
-        writes.delete_batch(DIFF_SPACE, page.into_iter().map(|entry| entry.key));
         if !page_has_more {
             break;
         }
@@ -16706,6 +16755,33 @@ mod tests {
                     row_pk: RowPk::single("second"),
                 },
             ]
+        );
+
+        let bounded = TrackedStateFilter {
+            schema_keys: vec!["schema".to_owned()],
+            row_pks: vec![
+                RowPk::single("first"),
+                RowPk::single("second"),
+                RowPk::single("second"),
+                RowPk::single("third"),
+            ],
+            row_pk_lower: Some(crate::tracked_state::RowPkRangeBound {
+                row_pk: RowPk::single("second"),
+                inclusive: true,
+            }),
+            row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                row_pk: RowPk::single("third"),
+                inclusive: false,
+            }),
+            ..TrackedStateFilter::default()
+        };
+        assert_eq!(
+            packed_exact_keys_for_filter(&bounded).expect("bounded filter is finite"),
+            vec![TrackedStateKey {
+                schema_key: "schema".to_owned(),
+                file_id: None,
+                row_pk: RowPk::single("second"),
+            }]
         );
     }
 

@@ -505,9 +505,43 @@ pub(crate) struct TrackedStateFilter {
     #[serde(default)]
     pub(crate) row_pks: Vec<RowPk>,
     #[serde(default)]
+    pub(crate) row_pk_lower: Option<RowPkRangeBound>,
+    #[serde(default)]
+    pub(crate) row_pk_upper: Option<RowPkRangeBound>,
+    #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
+}
+
+/// One canonical bound over the typed primary-key ordering.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RowPkRangeBound {
+    pub(crate) row_pk: RowPk,
+    pub(crate) inclusive: bool,
+}
+
+impl TrackedStateFilter {
+    pub(crate) fn matches_row_pk(&self, row_pk: &RowPk) -> bool {
+        (self.row_pks.is_empty() || self.row_pks.contains(row_pk))
+            && row_pk_satisfies_bounds(
+                row_pk,
+                self.row_pk_lower.as_ref(),
+                self.row_pk_upper.as_ref(),
+            )
+    }
+}
+
+pub(crate) fn row_pk_satisfies_bounds(
+    row_pk: &RowPk,
+    lower: Option<&RowPkRangeBound>,
+    upper: Option<&RowPkRangeBound>,
+) -> bool {
+    lower.is_none_or(|bound| {
+        row_pk > &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk)
+    }) && upper.is_none_or(|bound| {
+        row_pk < &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk)
+    })
 }
 
 /// Requested property set for a tracked-state scan.
@@ -591,6 +625,8 @@ impl TrackedStateMutationBatch {
 pub(crate) struct TrackedStateTreeScanRequest {
     pub(crate) schema_keys: Vec<String>,
     pub(crate) row_pks: Vec<RowPk>,
+    pub(crate) row_pk_lower: Option<RowPkRangeBound>,
+    pub(crate) row_pk_upper: Option<RowPkRangeBound>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     pub(crate) include_tombstones: bool,
     pub(crate) limit: Option<usize>,
@@ -601,6 +637,8 @@ impl Default for TrackedStateTreeScanRequest {
         Self {
             schema_keys: Vec::new(),
             row_pks: Vec::new(),
+            row_pk_lower: None,
+            row_pk_upper: None,
             file_ids: Vec::new(),
             include_tombstones: true,
             limit: None,
@@ -641,6 +679,13 @@ impl TrackedStateTreeScanRequest {
             return false;
         }
         if !self.row_pks.is_empty() && !self.row_pks.contains(key.row_pk) {
+            return false;
+        }
+        if !row_pk_satisfies_bounds(
+            key.row_pk,
+            self.row_pk_lower.as_ref(),
+            self.row_pk_upper.as_ref(),
+        ) {
             return false;
         }
         if !self.file_ids.is_empty()

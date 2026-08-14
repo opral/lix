@@ -8106,6 +8106,8 @@ pub(crate) async fn load_retained_commit_snapshots_for_schemas(
             schema_keys: schema_keys.to_vec(),
             row_pks: Vec::new(),
             file_ids: Vec::new(),
+            row_pk_lower: None,
+            row_pk_upper: None,
             include_tombstones: true,
             limit: None,
         };

@@ -70,6 +70,221 @@ async fn slatedb_current_untracked_blob_survives_sweep_and_cold_reopen() {
         .await;
 }
 
+#[tokio::test]
+async fn rocksdb_shared_blob_survives_replace_rollback_delete_gc_and_reopen() {
+    let temp = tempfile::tempdir().expect("create RocksDB shared-blob fixture");
+    shared_blob_replacement_lifecycle(&temp.path().join("database"), |path| {
+        RocksDB::open(path)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn slatedb_shared_blob_survives_replace_rollback_delete_gc_and_reopen() {
+    let temp = tempfile::tempdir().expect("create SlateDB shared-blob fixture");
+    shared_blob_replacement_lifecycle(&temp.path().join("database"), |path| SlateDB::open(path))
+        .await;
+}
+
+async fn shared_blob_replacement_lifecycle<S, O>(path: &std::path::Path, open: O)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    O: Fn(&std::path::Path) -> Result<S, lix::storage::StorageError>,
+{
+    const OLD: &[u8] = b"shared-old-content";
+    const NEW: &[u8] = b"replacement-content";
+    const ROLLED_BACK: &[u8] = b"rolled-back-content";
+    let storage = open(path).expect("open shared-blob fixture");
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("initialize shared-blob repository");
+    let session = lix
+        .open_another_session()
+        .await
+        .expect("open shared-blob session");
+    let branch = session
+        .create_branch(lix::CreateBranchOptions {
+            id: Some("01990000-0000-7000-8000-00000000000c".to_owned()),
+            name: "shared-blob-disposable".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create shared-blob disposable branch");
+    let branch_id = branch.id;
+    session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: branch_id.clone(),
+        })
+        .await
+        .expect("switch shared-blob session branch");
+    for path in ["/shared-a.bin", "/shared-b.bin"] {
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[Value::Text(path.to_owned()), Value::Blob(OLD.to_vec().into())],
+            )
+            .await
+            .expect("insert shared blob owner");
+    }
+
+    let mut rollback = session
+        .begin_transaction()
+        .await
+        .expect("begin shared replacement rollback");
+    rollback
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/shared-a.bin'",
+            &[Value::Blob(ROLLED_BACK.to_vec().into())],
+        )
+        .await
+        .expect("stage shared replacement rollback");
+    rollback.rollback().await.expect("rollback shared replacement");
+    assert_eq!(read_file_at(&session, "/shared-a.bin").await, Some(OLD.to_vec()));
+    assert_eq!(read_file_at(&session, "/shared-b.bin").await, Some(OLD.to_vec()));
+    let rolled_back_hash = blake3::hash(ROLLED_BACK).to_hex().to_string();
+    collect_repository_gc_for_bench(&StorageAdapter::new(storage.clone()))
+        .await
+        .expect("collect rolled-back replacement");
+    assert!(
+        read_binary_cas_for_bench(
+            &StorageAdapter::new(storage.clone()),
+            &rolled_back_hash,
+        )
+        .await
+        .expect("rolled-back CAS lookup should succeed")
+        .is_none(),
+        "rolled-back replacement must not become a current or historical owner",
+    );
+
+    session
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/shared-a.bin'",
+            &[Value::Blob(NEW.to_vec().into())],
+        )
+        .await
+        .expect("commit one shared owner replacement");
+    assert_eq!(read_file_at(&session, "/shared-a.bin").await, Some(NEW.to_vec()));
+    session
+        .execute("DELETE FROM lix_file WHERE path = '/shared-a.bin'", &[])
+        .await
+        .expect("delete replaced shared owner");
+    collect_repository_gc_for_bench(&StorageAdapter::new(storage.clone()))
+        .await
+        .expect("collect while second shared owner remains");
+    assert_eq!(read_file_at(&session, "/shared-b.bin").await, Some(OLD.to_vec()));
+    let old_hash = blake3::hash(OLD).to_hex().to_string();
+    let new_hash = blake3::hash(NEW).to_hex().to_string();
+    assert_eq!(
+        read_binary_cas_for_bench(&StorageAdapter::new(storage.clone()), &old_hash)
+            .await
+            .expect("shared old CAS lookup should succeed")
+            .as_deref(),
+        Some(OLD),
+    );
+    assert_eq!(
+        read_binary_cas_for_bench(&StorageAdapter::new(storage.clone()), &new_hash)
+            .await
+            .expect("historical replacement CAS lookup should succeed")
+            .as_deref(),
+        Some(NEW),
+        "deleted replacement must remain while branch history still reaches it",
+    );
+    drop(session);
+    drop(lix);
+    drop(storage);
+
+    let reopened_storage = open(path).expect("cold reopen shared-blob fixture");
+    let reopened = open_lix()
+        .with_storage(reopened_storage.clone())
+        .await
+        .expect("open shared-blob repository after reopen");
+    let reopened_session = reopened
+        .open_another_session()
+        .await
+        .expect("open shared-blob session after reopen");
+    reopened_session
+        .switch_branch(lix::SwitchBranchOptions {
+            branch_id: branch_id.clone(),
+        })
+        .await
+        .expect("switch reopened shared-blob branch");
+    assert_eq!(
+        read_file_at(&reopened_session, "/shared-b.bin").await,
+        Some(OLD.to_vec())
+    );
+    let reopened_adapter = StorageAdapter::new(reopened_storage.clone());
+    assert_eq!(
+        read_binary_cas_for_bench(&reopened_adapter, &old_hash)
+            .await
+            .expect("reopened old CAS lookup should succeed")
+            .as_deref(),
+        Some(OLD),
+    );
+    assert_eq!(
+        read_binary_cas_for_bench(&reopened_adapter, &new_hash)
+            .await
+            .expect("reopened replacement CAS lookup should succeed")
+            .as_deref(),
+        Some(NEW),
+    );
+    reopened_session
+        .execute("DELETE FROM lix_file WHERE path = '/shared-b.bin'", &[])
+        .await
+        .expect("delete final shared owner");
+    assert_eq!(read_file_at(&reopened_session, "/shared-a.bin").await, None);
+    assert_eq!(read_file_at(&reopened_session, "/shared-b.bin").await, None);
+    drop(reopened_session);
+
+    let main = reopened
+        .open_another_session()
+        .await
+        .expect("open shared-blob main session");
+    main.execute(
+        "DELETE FROM lix_branch WHERE id = $1",
+        &[Value::Text(branch_id)],
+    )
+    .await
+    .expect("release shared-blob branch history");
+    drop(main);
+
+    let adapter = StorageAdapter::new(reopened_storage);
+    let sweep = collect_repository_gc_for_bench(&adapter)
+        .await
+        .expect("collect after final owner and history release");
+    assert_ne!(sweep.swept_commits, 0, "shared history release must sweep commits");
+    assert!(
+        read_binary_cas_for_bench(&adapter, &old_hash)
+            .await
+            .expect("released old CAS lookup should succeed")
+            .is_none(),
+        "old shared content must reclaim after every current and historical owner is released",
+    );
+    assert!(
+        read_binary_cas_for_bench(&adapter, &new_hash)
+            .await
+            .expect("released replacement CAS lookup should succeed")
+            .is_none(),
+        "replacement content must reclaim after its branch history is released",
+    );
+}
+
+async fn read_file_at<S>(session: &lix::Lix<S>, path: &str) -> Option<Vec<u8>>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    session
+        .execute(
+            "SELECT content FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_owned())],
+        )
+        .await
+        .expect("read shared blob owner")
+        .rows()
+        .first()
+        .map(|row| row.get::<Vec<u8>>("content").expect("blob content"))
+}
+
 async fn prepare_current_untracked<S>(storage: S)
 where
     S: Storage + Clone + Send + Sync + 'static,

@@ -39,6 +39,7 @@ use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::TableSource;
 
 pub(crate) use directory::execute_exact_lix_directory_root_listing;
+pub(crate) use schema::{execute_exact_schema_batch_read, execute_exact_schema_point_read};
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_file_batch_read, execute_exact_lix_file_id_manifest_batch_read,
