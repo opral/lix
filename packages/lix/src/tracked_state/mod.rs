@@ -15,6 +15,8 @@ mod current_state_data_part;
 pub(crate) mod current_state_envelope;
 mod diff;
 mod diff_id;
+#[cfg(test)]
+mod history_directory_v2_model;
 mod merge;
 pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
