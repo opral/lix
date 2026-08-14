@@ -13,16 +13,9 @@
 //! cannot falsify this claim: moving a filter earlier in the plan changes
 //! `scan_rows` while the collection is still being read end to end.
 
-use std::future::Future;
-
 use crate::engine::Engine;
 use crate::session::SessionContext;
 use crate::{Memory, Value};
-
-/// See the identical note in `e2e`'s `tracked_state_crud_public_result`:
-/// building and optimizing real DataFusion plans recurses per plan node and
-/// overflows libtest's 2 MiB worker stack in the `test` profile.
-const POINT_JOIN_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 const NESTED_BUNDLE_SQL: &str = r#"SELECT bundle.id AS "bundle_id", bundle.declarations AS "bundleDeclarations", message.id AS "message_id", message.locale AS "messageLocale", variant.id AS "variantId", variant.pattern AS "variantPattern" FROM bundle LEFT JOIN message ON message."bundle_id" = bundle.id LEFT JOIN variant ON variant."message_id" = message.id WHERE bundle.id = $1"#;
 
@@ -30,29 +23,8 @@ const NESTED_BUNDLE_SQL: &str = r#"SELECT bundle.id AS "bundle_id", bundle.decla
 /// variant each: one bundle row, two message rows, two variant rows.
 const ANSWER_SIZED_ROWS: u64 = 5;
 
-fn run_on_sized_stack<Body, Fut>(name: &str, body: Body)
-where
-    Body: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = ()>,
-{
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .stack_size(POINT_JOIN_TEST_STACK_SIZE)
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build point-join test runtime")
-                .block_on(body());
-        })
-        .expect("spawn point-join test thread")
-        .join()
-        .expect("point-join test body panicked");
-}
-
-#[test]
-fn nested_bundle_point_lookup_reads_rows_proportional_to_its_answer() {
-    run_on_sized_stack("point_join_scan_scaling", || async {
+#[tokio::test]
+async fn nested_bundle_point_lookup_reads_rows_proportional_to_its_answer() {
         let mut examined_by_size = Vec::new();
         for bundles in [10_usize, 500] {
             let session = seeded_session(bundles).await;
@@ -88,12 +60,10 @@ fn nested_bundle_point_lookup_reads_rows_proportional_to_its_answer() {
             small, large,
             "rows examined must not grow with the collections being joined"
         );
-    });
 }
 
-#[test]
-fn nested_bundle_point_lookup_preserves_left_join_null_extension() {
-    run_on_sized_stack("point_join_null_extension", || async {
+#[tokio::test]
+async fn nested_bundle_point_lookup_preserves_left_join_null_extension() {
         let session = seeded_session(4).await;
         // A bundle with no message at all, and a message with no variant. Both
         // are rows the probe-key restriction must not be able to remove.
@@ -160,7 +130,6 @@ fn nested_bundle_point_lookup_preserves_left_join_null_extension() {
             ],
             "a fully populated bundle must produce both of its rows"
         );
-    });
 }
 
 type NestedRow = (String, Option<String>, Option<String>);

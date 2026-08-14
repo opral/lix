@@ -9476,28 +9476,8 @@ mod tests {
         })
     }
 
-    fn run_async_test_with_large_stack(
-        test: impl FnOnce() -> futures_util::future::LocalBoxFuture<'static, ()> + Send + 'static,
-    ) {
-        std::thread::Builder::new()
-            .name("sql2-execute-test".to_string())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("test runtime should build")
-                    .block_on(test());
-            })
-            .expect("test thread should spawn")
-            .join()
-            .expect("test thread should join");
-    }
-
-    #[test]
-    fn execute_sql_reads_row_view_from_active_branch() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_row_view_from_active_branch() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -9515,14 +9495,10 @@ mod tests {
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
                 assert_eq!(result.rows[0][1], Value::Json(json!(["row-a"]).into()));
-            })
-        });
     }
 
-    #[test]
-    fn execute_sql_reads_row_by_branch_view() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_row_by_branch_view() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -9544,14 +9520,10 @@ mod tests {
                     result.rows[0][1],
                     Value::Text("01920000-0000-7000-8000-0000000000b1".to_string())
                 );
-            })
-        });
     }
 
-    #[test]
-    fn execute_sql_reads_lix_directory_by_branch_view() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_lix_directory_by_branch_view() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -9574,14 +9546,10 @@ mod tests {
                     result.rows[0][2],
                     Value::Text("01920000-0000-7000-8000-0000000000a1".to_string())
                 );
-            })
-        });
     }
 
-    #[test]
-    fn execute_sql_reads_lix_directory_from_active_branch() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_lix_directory_from_active_branch() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -9600,14 +9568,10 @@ mod tests {
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("/docs".to_string()));
                 assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
-            })
-        });
     }
 
-    #[test]
-    fn execute_sql_reads_lix_file_by_branch_view() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_lix_file_by_branch_view() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -9637,14 +9601,10 @@ mod tests {
                     result.rows[0][3],
                     Value::Text("01920000-0000-7000-8000-0000000000a1".to_string())
                 );
-            })
-        });
     }
 
-    #[test]
-    fn execute_sql_reads_lix_file_from_active_branch() {
-        run_async_test_with_large_stack(|| {
-            Box::pin(async move {
+    #[tokio::test]
+    async fn execute_sql_reads_lix_file_from_active_branch() {
                 let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
@@ -9667,7 +9627,5 @@ mod tests {
                 );
                 assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
                 assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42].into()));
-            })
-        });
     }
 }
