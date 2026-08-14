@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -331,11 +332,16 @@ enum FilesystemEvent {
 
 impl FilesystemStorage {
     /// Starts bidirectional filesystem synchronization owned by this storage.
-    pub async fn start_sync(&self, lix: &Lix<FilesystemStorage>) -> Result<(), LixError> {
-        let startup = FilesystemSyncStartup::begin(Arc::clone(&self.sync_lifecycle))?;
-        let supervisor = self.open_supervisor(lix).await?;
-        startup.complete(supervisor);
-        Ok(())
+    pub fn start_sync<'a>(
+        &'a self,
+        lix: &'a Lix<FilesystemStorage>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>> {
+        Box::pin(async move {
+            let startup = FilesystemSyncStartup::begin(Arc::clone(&self.sync_lifecycle))?;
+            let supervisor = self.open_supervisor(lix).await?;
+            startup.complete(supervisor);
+            Ok(())
+        })
     }
 
     /// Stops synchronization and waits for its worker and internal Lix session.

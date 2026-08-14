@@ -261,21 +261,9 @@ where
 /// Clones share the active branch, transaction exclusion, file-view state,
 /// and close lifecycle.
 ///
-/// # Spawning a query onto a runtime
-///
-/// `tokio::spawn` on a future that contains [`Lix::execute`] can fail to
-/// compile with `overflow evaluating the requirement ...: Send`. The query
-/// futures nest deeply enough that proving the `Send` obligation exceeds
-/// rustc's default recursion limit. This is a compile-time limit, not a
-/// soundness problem, and the limit is per-crate — so it has to be raised in
-/// **your** crate, at the top of its root module:
-///
-/// ```ignore
-/// #![recursion_limit = "2048"]
-/// ```
-///
-/// Awaiting the query directly, or driving it with `futures::join!`, does not
-/// hit this.
+/// Public operation builders erase their internal future type, so embedding
+/// applications can spawn composed Lix flows without raising rustc's
+/// recursion limit.
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct Lix<StorageImpl = Memory>
