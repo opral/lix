@@ -92,6 +92,10 @@ const MODULE_LAYERS: &[&[&str]] = &[
 /// `hot_state`, and the two upward references `transaction_types` still makes
 /// of its own — into `sql2` and `collection_generation`.
 const UNLAYERED_MODULES: &[(&str, &str)] = &[
+    (
+        "background_task",
+        "executor-neutral engine worker plumbing, no repository semantics",
+    ),
     ("catalog", "not yet analysed"),
     ("client_state", "entry-point plumbing, no layer semantics"),
     ("domain", "pure predicates, no owned invariant"),
