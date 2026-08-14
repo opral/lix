@@ -46,6 +46,7 @@ system-allocation-profiler = []
 
 [dependencies]
 lix = { workspace = true }
+lix_schema.workspace = true
 lix_storage_filesystem = { workspace = true }
 lix_storage_rocksdb = { workspace = true, optional = true }
 lix_storage_slatedb = { workspace = true, optional = true }
@@ -515,6 +516,11 @@ required-features = ["sdk-tests", "storage-benches", "slatedb"]
 name = "exppth2_txn_probe"
 path = "examples/exppth2_txn_probe.rs"
 required-features = ["storage-benches"]
+
+[[example]]
+name = "exp_key_order_15"
+path = "examples/exp_key_order_15.rs"
+required-features = ["rocksdb", "slatedb", "storage-benches"]
 
 [[test]]
 name = "hot_scan_refcount_census"
