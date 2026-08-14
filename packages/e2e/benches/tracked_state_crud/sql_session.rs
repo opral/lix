@@ -117,6 +117,7 @@ fn empty_parameter_batch() -> SharedParameterBatch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OlapReadShape {
     Scan,
+    Selective,
     Filter,
     Sort,
     Group,
@@ -125,8 +126,9 @@ pub(crate) enum OlapReadShape {
 }
 
 impl OlapReadShape {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Scan,
+        Self::Selective,
         Self::Filter,
         Self::Sort,
         Self::Group,
@@ -137,6 +139,7 @@ impl OlapReadShape {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Scan => "olap_scan",
+            Self::Selective => "olap_selective",
             Self::Filter => "olap_filter",
             Self::Sort => "olap_sort",
             Self::Group => "olap_group",
@@ -149,6 +152,9 @@ impl OlapReadShape {
         match self {
             Self::Scan => {
                 "SELECT id, ordinal, lane, score, active FROM olap_row WHERE ordinal >= 0"
+            }
+            Self::Selective => {
+                "SELECT id, ordinal, lane, score, active FROM olap_row WHERE ordinal = 87"
             }
             Self::Filter => {
                 "SELECT ordinal, lane, score FROM olap_row \
@@ -532,7 +538,7 @@ impl SqlFixture {
             Ok("general_aggregate") => return self.general_aggregate().await,
             Ok("full_result") | Err(_) => {}
             Ok(other) => panic!(
-                "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result, aggregate_count, general_filter_sort, general_aggregate, olap_scan, olap_filter, olap_sort, olap_group, or olap_aggregate"
+                "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result, aggregate_count, general_filter_sort, general_aggregate, olap_scan, olap_selective, olap_filter, olap_sort, olap_group, or olap_aggregate"
             ),
         }
         match self {
@@ -994,6 +1000,7 @@ where
         let result = std::hint::black_box(execute(&self.session, shape.sql()).await);
         match shape {
             OlapReadShape::Scan => assert_olap_scan(&result, expected),
+            OlapReadShape::Selective => assert_eq!(result.len(), 1),
             OlapReadShape::Filter => assert_olap_filter(&result, expected),
             OlapReadShape::Sort => assert_olap_sort(&result, expected),
             OlapReadShape::Group => assert_olap_group(&result, expected),
@@ -1011,6 +1018,7 @@ where
         let result = std::hint::black_box(execute(&self.session, shape.sql()).await);
         let expected_len = match shape {
             OlapReadShape::Scan => expected.visible_rows,
+            OlapReadShape::Selective => 1,
             OlapReadShape::Filter => expected.filtered_rows,
             OlapReadShape::Sort => 10_000.min(expected.active_rows as usize),
             OlapReadShape::Group => expected.groups.len(),
