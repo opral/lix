@@ -1,9 +1,9 @@
-//! EXP-DELTA-PAGE-01: authenticated versioned-page layout experiment.
+//! EXP-LOCAL-PATCH-04: authenticated page-local patch layout experiment.
 //!
 //! Compares identical Schema-v1 typed tuple bytes stored as either:
 //! - immutable 64-row slotted snapshot pages with a rewritten page manifest; or
-//! - immutable schema base pages plus authenticated sparse delta pages, with a
-//!   deterministic compaction every `COMPACTION_DEPTH` commits.
+//! - immutable schema base pages with at most one authenticated sparse patch
+//!   per leaf, deterministically compacted by patch entries/encoded bytes.
 //!
 //! The benchmark uses the shipping RocksDB/SlateDB storage traits. There is no
 //! SQL or workload-specific production shortcut: both layouts implement the
@@ -26,9 +26,10 @@ use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use uuid::Uuid;
 
-const LEDGER: &str = "EXP-DELTA-PAGE-01";
+const LEDGER: &str = "EXP-LOCAL-PATCH-04";
 const PAGE_ROWS: usize = 64;
-const DEFAULT_COMPACTION_PENDING_PERCENT: u64 = 10;
+const DEFAULT_PATCH_MAX_ENTRIES: usize = 32;
+const DEFAULT_PATCH_MAX_BYTES: usize = 2 * 1024;
 const ROOT_SPACE: StorageSpace =
     StorageSpace::immutable(SpaceId(0x00fe_2001), "exp.delta_page.root");
 const PAGE_SPACE: StorageSpace =
@@ -91,9 +92,9 @@ struct Counters {
     put_bytes: u64,
     decoded_pages: u64,
     decoded_rows: u64,
-    bloom_checks: u64,
-    bloom_positive: u64,
-    bloom_false_positive: u64,
+    patch_reads: u64,
+    patch_compactions: u64,
+    patched_leaves: u64,
 }
 
 impl Counters {
@@ -107,9 +108,9 @@ impl Counters {
             put_bytes: self.put_bytes - before.put_bytes,
             decoded_pages: self.decoded_pages - before.decoded_pages,
             decoded_rows: self.decoded_rows - before.decoded_rows,
-            bloom_checks: self.bloom_checks - before.bloom_checks,
-            bloom_positive: self.bloom_positive - before.bloom_positive,
-            bloom_false_positive: self.bloom_false_positive - before.bloom_false_positive,
+            patch_reads: self.patch_reads - before.patch_reads,
+            patch_compactions: self.patch_compactions - before.patch_compactions,
+            patched_leaves: self.patched_leaves - before.patched_leaves,
         }
     }
 
@@ -122,9 +123,9 @@ impl Counters {
         self.put_bytes += other.put_bytes;
         self.decoded_pages += other.decoded_pages;
         self.decoded_rows += other.decoded_rows;
-        self.bloom_checks += other.bloom_checks;
-        self.bloom_positive += other.bloom_positive;
-        self.bloom_false_positive += other.bloom_false_positive;
+        self.patch_reads += other.patch_reads;
+        self.patch_compactions += other.patch_compactions;
+        self.patched_leaves += other.patched_leaves;
     }
 }
 
@@ -146,20 +147,12 @@ struct Root {
     layout: Layout,
     count: u64,
     generation: u64,
-    depth: u32,
-    pending_rows: u64,
     parent: Option<ObjectId>,
     /// Immutable schema-partitioned base pages.
     pages: Vec<ObjectId>,
-    /// Binary-leveled sparse deltas. Lower levels are newer; each occupied
-    /// level represents a deterministic power-of-two commit run.
-    levels: Vec<DeltaLevel>,
-}
-
-#[derive(Clone, Debug)]
-struct DeltaLevel {
-    pages: Vec<ObjectId>,
-    blooms: Vec<Vec<u8>>,
+    /// At most one sparse patch per base leaf. The root authenticates both the
+    /// base page and its optional patch; no global delta structure exists.
+    patches: Vec<Option<ObjectId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -431,10 +424,11 @@ impl<S: Storage + Clone> Store<S> {
 #[tokio::main]
 async fn main() {
     let config = parse_config();
-    emit_bloom_sweep();
     println!(
-        "{LEDGER},kind=config,page_rows={PAGE_ROWS},compaction_pending_percent={},sizes={:?},histories={:?}",
-        compaction_pending_percent(),
+        "{LEDGER},kind=config,page_rows={PAGE_ROWS},patch_max_entries={},patch_max_bytes={},pattern={},sizes={:?},histories={:?}",
+        patch_max_entries(),
+        patch_max_bytes(),
+        mutation_pattern(),
         config.sizes,
         config.histories
     );
@@ -532,6 +526,7 @@ async fn run_case<S: Storage + Clone>(
     let mut ever_touched = BTreeSet::new();
     let mut last_touched = 0u64;
     let mut update_wall_us = 0u128;
+    let mut update_samples = Vec::with_capacity(h);
     let mut update_counters = Counters::default();
     let d = delta.rows(n);
     for generation in 1..=h as u64 {
@@ -552,6 +547,7 @@ async fn run_case<S: Storage + Clone>(
             .unwrap();
         store.publish_selector(0, root).await.unwrap();
         let elapsed = started.elapsed().as_micros();
+        update_samples.push(elapsed);
         let operation_counters = store.counters.delta(before);
         update_wall_us += elapsed;
         update_counters.accumulate(operation_counters);
@@ -582,6 +578,7 @@ async fn run_case<S: Storage + Clone>(
         update_wall_us,
         update_counters,
     );
+    emit_latency_summary(backend, layout, n, h, d, "update", &update_samples);
 
     let point_key = (n / 2) as u64;
     let before = store.counters;
@@ -619,6 +616,14 @@ async fn run_case<S: Storage + Clone>(
             started.elapsed().as_micros(),
             store.counters.delta(before),
         );
+        let mut samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = Instant::now();
+            let sampled = point(&mut store, root, key).await.unwrap();
+            assert_eq!(sampled.as_ref(), expected.get(&key));
+            samples.push(started.elapsed().as_micros());
+        }
+        emit_latency_summary(backend, layout, n, h, d, operation, &samples);
     }
 
     for (operation, keys) in [
@@ -656,6 +661,32 @@ async fn run_case<S: Storage + Clone>(
         h,
         d,
         "readback",
+        started.elapsed().as_micros(),
+        store.counters.delta(before),
+    );
+
+    let range_start = (n / 4) as u64;
+    let range_end = (range_start + 1_000).min(n as u64);
+    let before = store.counters;
+    let started = Instant::now();
+    let ranged = range(&mut store, root, range_start, range_end)
+        .await
+        .unwrap();
+    assert_eq!(
+        ranged,
+        expected
+            .range(range_start..range_end)
+            .map(|(key, value)| (*key, value.clone()))
+            .collect()
+    );
+    emit(
+        backend,
+        path,
+        layout,
+        n,
+        h,
+        d,
+        "range_1k",
         started.elapsed().as_micros(),
         store.counters.delta(before),
     );
@@ -795,7 +826,7 @@ fn emit(
     c: Counters,
 ) {
     println!(
-        "{LEDGER},kind=operation,backend={backend},layout={},n={n},h={h},d={d},operation={operation},wall_us={wall_us},get_calls={},get_keys={},get_bytes={},put_calls={},puts={},put_bytes={},decoded_pages={},decoded_rows={},bloom_checks={},bloom_positive={},bloom_false_positive={},settled_bytes={}",
+        "{LEDGER},kind=operation,backend={backend},layout={},n={n},h={h},d={d},operation={operation},wall_us={wall_us},get_calls={},get_keys={},get_bytes={},put_calls={},puts={},put_bytes={},decoded_pages={},decoded_rows={},patch_reads={},patch_compactions={},patched_leaves={},settled_bytes={}",
         layout.name(),
         c.get_calls,
         c.get_keys,
@@ -805,10 +836,34 @@ fn emit(
         c.put_bytes,
         c.decoded_pages,
         c.decoded_rows,
-        c.bloom_checks,
-        c.bloom_positive,
-        c.bloom_false_positive,
+        c.patch_reads,
+        c.patch_compactions,
+        c.patched_leaves,
         directory_bytes(path)
+    );
+}
+
+fn emit_latency_summary(
+    backend: &str,
+    layout: Layout,
+    n: usize,
+    h: usize,
+    d: usize,
+    operation: &str,
+    samples: &[u128],
+) {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let percentile = |numerator: usize| {
+        let index = (sorted.len() * numerator).div_ceil(100).saturating_sub(1);
+        sorted[index.min(sorted.len() - 1)]
+    };
+    println!(
+        "{LEDGER},kind=latency_summary,backend={backend},layout={},n={n},h={h},d={d},operation={operation},samples={},p50_us={},p95_us={}",
+        layout.name(),
+        sorted.len(),
+        percentile(50),
+        percentile(95)
     );
 }
 
@@ -823,11 +878,9 @@ async fn build_initial<S: Storage + Clone>(
         layout,
         count: rows.len() as u64,
         generation: 0,
-        depth: 0,
-        pending_rows: 0,
         parent: None,
         pages: pages.iter().map(|(id, _)| *id).collect(),
-        levels: Vec::new(),
+        patches: vec![None; pages.len()],
     };
     put_root(store, &root).await
 }
@@ -872,84 +925,76 @@ async fn commit<S: Storage + Clone>(
                     layout: root.layout,
                     count: full.len() as u64,
                     generation,
-                    depth: 0,
-                    pending_rows: 0,
                     parent: None,
                     pages: page_ids,
-                    levels: Vec::new(),
-                },
-            )
-            .await
-        }
-        Layout::Delta
-            if root.pending_rows + (mutations.len() as u64)
-                < compaction_row_threshold(full.len()) =>
-        {
-            let mut levels = root.levels.clone();
-            let mut carry = mutations.clone();
-            let mut level_index = 0usize;
-            loop {
-                if levels.len() <= level_index {
-                    levels.push(DeltaLevel {
-                        pages: Vec::new(),
-                        blooms: Vec::new(),
-                    });
-                }
-                if levels[level_index].pages.is_empty() {
-                    break;
-                }
-                let level = &levels[level_index];
-                let encoded = store.get_many(PAGE_SPACE, &level.pages).await?;
-                let mut older = BTreeMap::new();
-                for (index, bytes) in encoded.into_iter().enumerate() {
-                    let page = decode_page_counted(&mut store.counters, &bytes)?;
-                    validate_level_page_bloom(level, index, &page)?;
-                    older.extend(page);
-                }
-                older.extend(carry);
-                carry = older;
-                levels[level_index] = DeltaLevel {
-                    pages: Vec::new(),
-                    blooms: Vec::new(),
-                };
-                level_index += 1;
-            }
-            let pages = encode_pages(&carry);
-            let blooms = encoded_page_blooms(&pages)?;
-            store.put_objects(PAGE_SPACE, &pages).await?;
-            levels[level_index] = DeltaLevel {
-                pages: pages.iter().map(|(id, _)| *id).collect(),
-                blooms,
-            };
-            put_root(
-                store,
-                &Root {
-                    layout: root.layout,
-                    count: full.len() as u64,
-                    generation,
-                    depth: root.depth + 1,
-                    pending_rows: root.pending_rows + mutations.len() as u64,
-                    parent: Some(current),
-                    pages: root.pages,
-                    levels,
+                    patches: vec![None; root.pages.len()],
                 },
             )
             .await
         }
         Layout::Delta => {
-            let pages = encode_pages(full);
-            store.put_objects(PAGE_SPACE, &pages).await?;
+            if root.patches.len() != root.pages.len() {
+                return Err("page-local patch/root geometry mismatch".to_owned());
+            }
+            let touched = mutations
+                .keys()
+                .map(|key| (*key as usize) / PAGE_ROWS)
+                .collect::<BTreeSet<_>>();
+            let existing_patch_ids = touched
+                .iter()
+                .filter_map(|index| root.patches.get(*index).copied().flatten())
+                .collect::<Vec<_>>();
+            let existing_patch_bytes = store.get_many(PAGE_SPACE, &existing_patch_ids).await?;
+            let mut existing_patches = existing_patch_ids
+                .into_iter()
+                .zip(existing_patch_bytes)
+                .map(|(id, bytes)| Ok((id, decode_page_counted(&mut store.counters, &bytes)?)))
+                .collect::<Result<BTreeMap<_, _>, String>>()?;
+            let mut page_ids = root.pages;
+            let mut patch_ids = root.patches;
+            let mut staged = Vec::new();
+            for index in touched {
+                let mut patch = match patch_ids[index] {
+                    Some(id) => existing_patches
+                        .remove(&id)
+                        .ok_or_else(|| "missing authenticated page-local patch".to_owned())?,
+                    None => BTreeMap::new(),
+                };
+                let start = (index * PAGE_ROWS) as u64;
+                let end = start + PAGE_ROWS as u64 - 1;
+                patch.extend(
+                    mutations
+                        .range(start..=end)
+                        .map(|(key, value)| (*key, value.clone())),
+                );
+                let patch_bytes = encode_page(&patch);
+                if patch.len() >= patch_max_entries() || patch_bytes.len() >= patch_max_bytes() {
+                    let base_bytes = store.get_one(PAGE_SPACE, page_ids[index]).await?;
+                    let mut base = decode_page_counted(&mut store.counters, &base_bytes)?;
+                    base.extend(patch);
+                    let bytes = encode_page(&base);
+                    let id = ObjectId::of(&bytes);
+                    page_ids[index] = id;
+                    patch_ids[index] = None;
+                    staged.push((id, bytes));
+                    store.counters.patch_compactions += 1;
+                } else {
+                    let id = ObjectId::of(&patch_bytes);
+                    patch_ids[index] = Some(id);
+                    staged.push((id, patch_bytes));
+                }
+                store.counters.patched_leaves += 1;
+            }
+            store.put_objects(PAGE_SPACE, &staged).await?;
             put_root(
                 store,
                 &Root {
                     layout: root.layout,
                     count: full.len() as u64,
                     generation,
-                    depth: 0,
-                    pending_rows: 0,
                     parent: Some(current),
-                    pages: pages.iter().map(|(id, _)| *id).collect(),
-                    levels: Vec::new(),
+                    pages: page_ids,
+                    patches: patch_ids,
                 },
             )
             .await
@@ -972,48 +1017,29 @@ async fn point_on_read<R: StorageRead>(
     key: u64,
 ) -> Result<Option<Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
-    if root.layout == Layout::Delta {
-        for level in &root.levels {
-            for page_index in delta_page_indexes(level, key, store.counters)? {
-                let bytes = store.get_one(PAGE_SPACE, level.pages[page_index]).await?;
-                let page = decode_page_counted(store.counters, &bytes)?;
-                validate_level_page_bloom(level, page_index, &page)?;
-                if let Some(value) = page.get(&key) {
-                    return Ok(Some(value.clone()));
-                }
-                store.counters.bloom_false_positive += 1;
-            }
-        }
-    }
     let page_index = key as usize / PAGE_ROWS;
     let Some(page_id) = root.pages.get(page_index).copied() else {
         return Ok(None);
     };
+    if root.layout == Layout::Delta {
+        let patch_id = *root
+            .patches
+            .get(page_index)
+            .ok_or_else(|| "page-local patch/root geometry mismatch".to_owned())?;
+        if let Some(patch_id) = patch_id {
+            let objects = store.get_many(PAGE_SPACE, &[patch_id, page_id]).await?;
+            let patch = decode_page_counted(store.counters, &objects[0])?;
+            store.counters.patch_reads += 1;
+            if let Some(value) = patch.get(&key) {
+                return Ok(Some(value.clone()));
+            }
+            let page = decode_page_counted(store.counters, &objects[1])?;
+            return Ok(page.get(&key).cloned());
+        }
+    }
     let bytes = store.get_one(PAGE_SPACE, page_id).await?;
     let page = decode_page_counted(store.counters, &bytes)?;
     Ok(page.get(&key).cloned())
-}
-
-fn delta_page_indexes(
-    level: &DeltaLevel,
-    key: u64,
-    counters: &mut Counters,
-) -> Result<Vec<usize>, String> {
-    if level.pages.is_empty() {
-        return Ok(Vec::new());
-    }
-    if level.blooms.len() != level.pages.len() {
-        return Err("delta root page-bound cardinality mismatch".to_owned());
-    }
-    let mut indexes = Vec::new();
-    for (index, bloom) in level.blooms.iter().enumerate() {
-        counters.bloom_checks += 1;
-        if bloom_might_contain(bloom, key) {
-            counters.bloom_positive += 1;
-            indexes.push(index);
-        }
-    }
-    Ok(indexes)
 }
 
 async fn materialize<S: Storage + Clone>(
@@ -1024,26 +1050,58 @@ async fn materialize<S: Storage + Clone>(
     materialize_on_read(&mut read, root_id).await
 }
 
+async fn range<S: Storage + Clone>(
+    store: &mut Store<S>,
+    root_id: ObjectId,
+    start: u64,
+    end: u64,
+) -> Result<BTreeMap<u64, Vec<u8>>, String> {
+    let mut read = store.reader().await?;
+    let root = load_root_on_read(&mut read, root_id).await?;
+    if start >= end {
+        return Ok(BTreeMap::new());
+    }
+    let first = start as usize / PAGE_ROWS;
+    let last = (end.saturating_sub(1) as usize / PAGE_ROWS).min(root.pages.len() - 1);
+    let mut ids = root.pages[first..=last].to_vec();
+    let patch_ids = root.patches[first..=last]
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    ids.extend(&patch_ids);
+    let objects = read.get_many(PAGE_SPACE, &ids).await?;
+    let base_count = last - first + 1;
+    let mut rows = BTreeMap::new();
+    for bytes in &objects[..base_count] {
+        rows.extend(decode_page_counted(read.counters, bytes)?);
+    }
+    for bytes in &objects[base_count..] {
+        rows.extend(decode_page_counted(read.counters, bytes)?);
+        read.counters.patch_reads += 1;
+    }
+    Ok(rows
+        .range(start..end)
+        .map(|(k, v)| (*k, v.clone()))
+        .collect())
+}
+
 async fn materialize_on_read<R: StorageRead>(
     store: &mut Reader<'_, R>,
     root_id: ObjectId,
 ) -> Result<BTreeMap<u64, Vec<u8>>, String> {
     let root = load_root_on_read(store, root_id).await?;
     let mut rows = BTreeMap::new();
-    for bytes in store.get_many(PAGE_SPACE, &root.pages).await? {
+    let patch_ids = root.patches.iter().flatten().copied().collect::<Vec<_>>();
+    let mut ids = root.pages.clone();
+    ids.extend(&patch_ids);
+    let objects = store.get_many(PAGE_SPACE, &ids).await?;
+    for bytes in &objects[..root.pages.len()] {
         rows.extend(decode_page_counted(store.counters, &bytes)?);
     }
-    for level in root.levels.iter().rev() {
-        for (index, bytes) in store
-            .get_many(PAGE_SPACE, &level.pages)
-            .await?
-            .into_iter()
-            .enumerate()
-        {
-            let page = decode_page_counted(store.counters, &bytes)?;
-            validate_level_page_bloom(level, index, &page)?;
-            rows.extend(page);
-        }
+    for bytes in &objects[root.pages.len()..] {
+        rows.extend(decode_page_counted(store.counters, &bytes)?);
+        store.counters.patch_reads += 1;
     }
     Ok(rows)
 }
@@ -1072,7 +1130,7 @@ async fn diff_on_read<R: StorageRead>(
     }
     match before_root.layout {
         Layout::Slotted => diff_slotted(store, &before_root, &after_root).await,
-        Layout::Delta => diff_delta(store, before, after).await,
+        Layout::Delta => diff_delta(store, &before_root, &after_root).await,
     }
 }
 
@@ -1105,17 +1163,50 @@ async fn diff_slotted<R: StorageRead>(
 
 async fn diff_delta<R: StorageRead>(
     store: &mut Reader<'_, R>,
-    before: ObjectId,
-    after: ObjectId,
+    before: &Root,
+    after: &Root,
 ) -> Result<BTreeSet<u64>, String> {
-    let before_rows = materialize_on_read(store, before).await?;
-    let after_rows = materialize_on_read(store, after).await?;
-    Ok(before_rows
-        .keys()
-        .chain(after_rows.keys())
-        .copied()
-        .filter(|key| before_rows.get(key) != after_rows.get(key))
-        .collect())
+    if before.pages.len() != after.pages.len()
+        || before.patches.len() != before.pages.len()
+        || after.patches.len() != after.pages.len()
+    {
+        return Err("page-local roots have incompatible geometry".to_owned());
+    }
+    let mut changed = BTreeSet::new();
+    for index in 0..before.pages.len() {
+        if before.pages[index] == after.pages[index]
+            && before.patches[index] == after.patches[index]
+        {
+            continue;
+        }
+        let before_page = load_local_leaf(store, before, index).await?;
+        let after_page = load_local_leaf(store, after, index).await?;
+        changed.extend(
+            before_page
+                .keys()
+                .chain(after_page.keys())
+                .copied()
+                .filter(|key| before_page.get(key) != after_page.get(key)),
+        );
+    }
+    Ok(changed)
+}
+
+async fn load_local_leaf<R: StorageRead>(
+    store: &mut Reader<'_, R>,
+    root: &Root,
+    index: usize,
+) -> Result<BTreeMap<u64, Vec<u8>>, String> {
+    let mut ids = vec![root.pages[index]];
+    ids.extend(root.patches[index]);
+    let objects = store.get_many(PAGE_SPACE, &ids).await?;
+    let mut page = decode_page_counted(store.counters, &objects[0])?;
+    if objects.len() == 2 {
+        let patch = decode_page_counted(store.counters, &objects[1])?;
+        store.counters.patch_reads += 1;
+        page.extend(patch);
+    }
+    Ok(page)
 }
 
 async fn history_values<S: Storage + Clone>(
@@ -1149,7 +1240,7 @@ async fn corruption_control<S: Storage + Clone>(
         return Err("root has no page".to_owned());
     };
     let wrong = ObjectId([0x55; 32]);
-    let mut corrupted = decoded;
+    let mut corrupted = decoded.clone();
     corrupted.pages[0] = wrong;
     let corrupt_bytes = encode_root(&corrupted);
     let corrupt_id = ObjectId::of(&corrupt_bytes);
@@ -1158,6 +1249,26 @@ async fn corruption_control<S: Storage + Clone>(
         .await?;
     assert!(materialize(store, corrupt_id).await.is_err());
     assert!(store.get_one(PAGE_SPACE, page).await.is_ok());
+    if let Some((index, patch)) = decoded
+        .patches
+        .iter()
+        .enumerate()
+        .find_map(|(index, patch)| patch.map(|id| (index, id)))
+    {
+        let mut corrupted = decoded;
+        corrupted.patches[index] = Some(wrong);
+        let corrupt_bytes = encode_root(&corrupted);
+        let corrupt_id = ObjectId::of(&corrupt_bytes);
+        store
+            .put_objects(ROOT_SPACE, &[(corrupt_id, corrupt_bytes)])
+            .await?;
+        assert!(
+            point(store, corrupt_id, (index * PAGE_ROWS) as u64)
+                .await
+                .is_err()
+        );
+        assert!(store.get_one(PAGE_SPACE, patch).await.is_ok());
+    }
     Ok(())
 }
 
@@ -1237,12 +1348,10 @@ fn decode_page(bytes: &[u8]) -> Result<BTreeMap<u64, Vec<u8>>, String> {
 }
 
 fn encode_root(root: &Root) -> Vec<u8> {
-    let mut out = b"EDR1".to_vec();
+    let mut out = b"ELP1".to_vec();
     out.push(root.layout.tag());
     out.extend_from_slice(&root.count.to_be_bytes());
     out.extend_from_slice(&root.generation.to_be_bytes());
-    out.extend_from_slice(&root.depth.to_be_bytes());
-    out.extend_from_slice(&root.pending_rows.to_be_bytes());
     match root.parent {
         Some(parent) => {
             out.push(1);
@@ -1254,13 +1363,14 @@ fn encode_root(root: &Root) -> Vec<u8> {
     for page in &root.pages {
         out.extend_from_slice(&page.0);
     }
-    out.extend_from_slice(&(root.levels.len() as u32).to_be_bytes());
-    for level in &root.levels {
-        out.extend_from_slice(&(level.pages.len() as u32).to_be_bytes());
-        for (page, bloom) in level.pages.iter().zip(&level.blooms) {
-            out.extend_from_slice(&page.0);
-            out.extend_from_slice(&(bloom.len() as u32).to_be_bytes());
-            out.extend_from_slice(bloom);
+    out.extend_from_slice(&(root.patches.len() as u32).to_be_bytes());
+    for patch in &root.patches {
+        match patch {
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(&id.0);
+            }
+            None => out.push(0),
         }
     }
     out
@@ -1268,7 +1378,7 @@ fn encode_root(root: &Root) -> Vec<u8> {
 
 fn decode_root(bytes: &[u8]) -> Result<Root, String> {
     let mut input = Decoder::new(bytes);
-    input.magic(b"EDR1")?;
+    input.magic(b"ELP1")?;
     let layout = match input.u8()? {
         1 => Layout::Slotted,
         2 => Layout::Delta,
@@ -1276,15 +1386,13 @@ fn decode_root(bytes: &[u8]) -> Result<Root, String> {
     };
     let count = input.u64()?;
     let generation = input.u64()?;
-    let depth = input.u32()?;
-    let pending_rows = input.u64()?;
     let parent = match input.u8()? {
         0 => None,
         1 => Some(ObjectId(input.fixed_32()?)),
         _ => return Err("invalid parent tag".to_owned()),
     };
-    if layout == Layout::Slotted && (depth != 0 || parent.is_some()) {
-        return Err("slotted root has delta ancestry".to_owned());
+    if layout == Layout::Slotted && parent.is_some() {
+        return Err("slotted root has page-local ancestry".to_owned());
     }
     if layout == Layout::Delta && generation == 0 && parent.is_some() {
         return Err("initial delta root has parent".to_owned());
@@ -1292,132 +1400,35 @@ fn decode_root(bytes: &[u8]) -> Result<Root, String> {
     if layout == Layout::Delta && generation > 0 && parent.is_none() {
         return Err("versioned delta root is missing chronology parent".to_owned());
     }
-    if depth == 0 && pending_rows != 0 {
-        return Err("compacted root has pending delta rows".to_owned());
-    }
-    if depth > 0 && pending_rows == 0 {
-        return Err("delta root has no pending row accounting".to_owned());
-    }
     let count_pages = input.u32()? as usize;
     let mut pages = Vec::with_capacity(count_pages);
     for _ in 0..count_pages {
         pages.push(ObjectId(input.fixed_32()?));
     }
-    let count_levels = input.u32()? as usize;
-    let mut levels = Vec::with_capacity(count_levels);
-    for _ in 0..count_levels {
-        let page_count = input.u32()? as usize;
-        let mut level_pages = Vec::with_capacity(page_count);
-        let mut blooms = Vec::with_capacity(page_count);
-        for _ in 0..page_count {
-            level_pages.push(ObjectId(input.fixed_32()?));
-            let bloom_len = input.u32()? as usize;
-            if !matches!(bloom_len, 16 | 32 | 64) {
-                return Err("noncanonical delta bloom size class".to_owned());
-            }
-            blooms.push(input.bytes(bloom_len)?.to_vec());
-        }
-        levels.push(DeltaLevel {
-            pages: level_pages,
-            blooms,
+    let patch_count = input.u32()? as usize;
+    let mut patches = Vec::with_capacity(patch_count);
+    for _ in 0..patch_count {
+        patches.push(match input.u8()? {
+            0 => None,
+            1 => Some(ObjectId(input.fixed_32()?)),
+            _ => return Err("invalid page-local patch tag".to_owned()),
         });
     }
-    if layout == Layout::Slotted && !levels.is_empty() {
-        return Err("slotted root has delta levels".to_owned());
+    if patches.len() != pages.len() {
+        return Err("page-local patch/root geometry mismatch".to_owned());
     }
-    if depth == 0 && levels.iter().any(|level| !level.pages.is_empty()) {
-        return Err("compacted delta root has sparse levels".to_owned());
-    }
-    if depth > 0 && !levels.iter().any(|level| !level.pages.is_empty()) {
-        return Err("uncompacted delta root has no sparse levels".to_owned());
+    if layout == Layout::Slotted && patches.iter().any(Option::is_some) {
+        return Err("slotted root has page-local patches".to_owned());
     }
     input.finish()?;
     Ok(Root {
         layout,
         count,
         generation,
-        depth,
-        pending_rows,
         parent,
         pages,
-        levels,
+        patches,
     })
-}
-
-fn encoded_page_blooms(pages: &[(ObjectId, Vec<u8>)]) -> Result<Vec<Vec<u8>>, String> {
-    pages
-        .iter()
-        .map(|(_, bytes)| Ok(page_bloom(&decode_page(bytes)?)))
-        .collect()
-}
-
-fn validate_level_page_bloom(
-    level: &DeltaLevel,
-    index: usize,
-    page: &BTreeMap<u64, Vec<u8>>,
-) -> Result<(), String> {
-    if level.blooms.get(index) != Some(&page_bloom(page)) {
-        return Err("authenticated delta page bloom does not match page".to_owned());
-    }
-    Ok(())
-}
-
-fn page_bloom(page: &BTreeMap<u64, Vec<u8>>) -> Vec<u8> {
-    let bytes = match page.len() {
-        0..=2 => 16,
-        3..=16 => 32,
-        _ => 64,
-    };
-    let mut bloom = vec![0u8; bytes];
-    for key in page.keys() {
-        let hash = blake3::hash(&key.to_be_bytes());
-        for pair in hash.as_bytes()[..8].chunks_exact(2) {
-            let bit = u16::from_be_bytes([pair[0], pair[1]]) as usize % (bloom.len() * 8);
-            bloom[bit / 8] |= 1 << (bit % 8);
-        }
-    }
-    bloom
-}
-
-fn bloom_might_contain(bloom: &[u8], key: u64) -> bool {
-    let hash = blake3::hash(&key.to_be_bytes());
-    hash.as_bytes()[..8].chunks_exact(2).all(|pair| {
-        let bit = u16::from_be_bytes([pair[0], pair[1]]) as usize % (bloom.len() * 8);
-        bloom[bit / 8] & (1 << (bit % 8)) != 0
-    })
-}
-
-fn emit_bloom_sweep() {
-    for entries in [1usize, 10, 64] {
-        let keys = (0..entries)
-            .map(|index| index as u64 * 997)
-            .collect::<Vec<_>>();
-        for bytes in [16usize, 32, 64, 128] {
-            let mut bloom = vec![0u8; bytes];
-            for key in &keys {
-                let hash = blake3::hash(&key.to_be_bytes());
-                for pair in hash.as_bytes()[..8].chunks_exact(2) {
-                    let bit = u16::from_be_bytes([pair[0], pair[1]]) as usize % (bytes * 8);
-                    bloom[bit / 8] |= 1 << (bit % 8);
-                }
-            }
-            let probes = 100_000u64;
-            let false_positives = (1_000_000..1_000_000 + probes)
-                .filter(|key| {
-                    let hash = blake3::hash(&key.to_be_bytes());
-                    hash.as_bytes()[..8].chunks_exact(2).all(|pair| {
-                        let bit = u16::from_be_bytes([pair[0], pair[1]]) as usize % (bytes * 8);
-                        bloom[bit / 8] & (1 << (bit % 8)) != 0
-                    })
-                })
-                .count();
-            println!(
-                "{LEDGER},kind=bloom_sweep,entries={entries},bloom_bytes={bytes},page_ref_bytes={},probes={probes},false_positives={false_positives},false_positive_ppm={}",
-                36 + bytes,
-                false_positives as u64 * 1_000_000 / probes
-            );
-        }
-    }
 }
 
 fn tuple(key: u64, generation: u64) -> Vec<u8> {
@@ -1441,26 +1452,48 @@ fn tuple(key: u64, generation: u64) -> Vec<u8> {
     out
 }
 
-fn compaction_pending_percent() -> u64 {
-    std::env::var("EXP_DELTA_PAGE_COMPACTION_PERCENT")
+fn patch_max_entries() -> usize {
+    std::env::var("EXP_LOCAL_PATCH_MAX_ENTRIES")
         .ok()
         .and_then(|value| value.parse().ok())
-        .filter(|value| *value >= 1 && *value <= 100)
-        .unwrap_or(DEFAULT_COMPACTION_PENDING_PERCENT)
+        .filter(|value| *value > 0 && *value <= PAGE_ROWS)
+        .unwrap_or(DEFAULT_PATCH_MAX_ENTRIES)
 }
 
-fn compaction_row_threshold(row_count: usize) -> u64 {
-    (row_count as u64)
-        .saturating_mul(compaction_pending_percent())
-        .div_ceil(100)
-        .max(1)
+fn patch_max_bytes() -> usize {
+    std::env::var("EXP_LOCAL_PATCH_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value >= 128 && *value <= 64 * 1024)
+        .unwrap_or(DEFAULT_PATCH_MAX_BYTES)
 }
 
 fn mutation_keys(n: usize, d: usize, generation: u64) -> Vec<u64> {
-    let stride = (n / d.max(1)).max(1);
-    (0..d)
-        .map(|index| ((index * stride + generation as usize) % n) as u64)
-        .collect()
+    match mutation_pattern().as_str() {
+        "repeated" => vec![(n / 2) as u64],
+        "random" => {
+            let mut keys = BTreeSet::new();
+            let mut state = generation ^ 0x9e37_79b9_7f4a_7c15;
+            while keys.len() < d {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut value = state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                keys.insert((value ^ (value >> 31)) % n as u64);
+            }
+            keys.into_iter().collect()
+        }
+        _ => {
+            let stride = (n / d.max(1)).max(1);
+            (0..d)
+                .map(|index| ((index * stride + generation as usize) % n) as u64)
+                .collect()
+        }
+    }
+}
+
+fn mutation_pattern() -> String {
+    std::env::var("EXP_LOCAL_PATCH_PATTERN").unwrap_or_else(|_| "uniform".to_owned())
 }
 
 fn map_digest(rows: &BTreeMap<u64, Vec<u8>>) -> ObjectId {
