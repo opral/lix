@@ -1,0 +1,128 @@
+{
+  "checks": [
+    {
+      "detail": "transaction normalization resolves the operation catalog plan before native lowering",
+      "name": "trusted-plan-before-lowering",
+      "ok": true
+    },
+    {
+      "detail": "prepared current rows lower only to NativeRow or Tombstone",
+      "name": "prepared-live-row-is-native",
+      "ok": true
+    },
+    {
+      "detail": "commit publication has no JSON/null current-cell writer",
+      "name": "commit-current-writer-is-native",
+      "ok": true
+    },
+    {
+      "detail": "bootstrap publication has no JSON/null current-cell writer",
+      "name": "bootstrap-current-writer-is-native",
+      "ok": true
+    },
+    {
+      "detail": "LIXFCV envelope cannot encode old Value/Null cells",
+      "name": "current-encoder-rejects-removed-tags",
+      "ok": true
+    },
+    {
+      "detail": "LIXFCV tags 0/1 fail closed; only tombstone/native tags decode",
+      "name": "current-decoder-rejects-removed-tags",
+      "ok": true
+    },
+    {
+      "detail": "current packs use the one binary current-value codec",
+      "name": "current-pack-single-codec",
+      "ok": true
+    },
+    {
+      "detail": "layout digest binds schema key, ordered columns/types/nullability, and PK layout",
+      "name": "layout-binding",
+      "ok": true
+    },
+    {
+      "detail": "owner digest binds repository-visible domain identity: branch/schema/typed PK/file",
+      "name": "owner-binding",
+      "ok": true
+    },
+    {
+      "detail": "native logical bytes are cross-checked against authenticated change history",
+      "name": "semantic-binding",
+      "ok": true
+    },
+    {
+      "detail": "body uses one fail-closed typed value-layout codec",
+      "name": "canonical-body-decode",
+      "ok": true
+    },
+    {
+      "detail": "lix_commit JSON is transient public projection input, then native-encoded in-memory; it is never a current-pack writer",
+      "name": "derived-commit-is-not-durable-json",
+      "ok": true
+    },
+    {
+      "detail": "production current-pack encoder callers=['packages/lix/src/forktree/bootstrap.rs', 'packages/lix/src/forktree/current_pack.rs', 'packages/lix/src/transaction/commit.rs']",
+      "name": "current-writer-callers-closed",
+      "ok": true
+    }
+  ],
+  "classifications": {
+    "A_current_durable_authority": [
+      {
+        "chain": "RawWriteBatch -> normalize_raw_write_row_in_place -> trusted TransactionCatalog plan -> native_row::encode -> PreparedStateRow.native_row -> staged_cell/commit StateCell::NativeRow -> encode_current_state_packs -> encode_current_state_value(tag=3)",
+        "verdict": "single writer"
+      },
+      {
+        "chain": "ForkTree current pack -> decode_current_state_value -> StateCell::NativeRow -> authenticated_current_cell_for_history semantic digest -> native_row::decode layout/owner/body checks",
+        "verdict": "single fail-closed decoder"
+      },
+      {
+        "concern": "StateCell::Value/Null",
+        "verdict": "not current durable ingress: encoder rejects both and decoder rejects legacy tags 0/1"
+      },
+      {
+        "concern": "LIXFCV v1 magic",
+        "verdict": "one envelope marker only, not compatibility: old tag payloads fail closed and no fallback decoder exists"
+      },
+      {
+        "concern": "SchemaPlan identity",
+        "verdict": "equivalently authenticated without persisting a plan object: trusted plan selected before write; StateKey schema plus layout digest plus branch/schema/typed-PK/file owner digest plus semantic digest bind decode; owner/layout substitution fails"
+      }
+    ],
+    "B_deferred_history_plugin_public_json": [
+      {
+        "chain": "ChangeRecord JsonSlot -> logical_history_cell -> StateCell::Value/Null -> HistoricalStateRow/merge/blob/history consumers",
+        "note": "logical historical projection only; current encoder rejects it",
+        "owner": "history"
+      },
+      {
+        "chain": "historical/plugin wire snapshots -> serde_json at plugin boundary",
+        "note": "explicitly deferred plugin/history JSON contract",
+        "owner": "plugin"
+      },
+      {
+        "chain": "authenticated CommitGraph load_commit_records -> commit_row_snapshot_json transient value -> commit_projection_row -> in-memory NativeRow -> Arrow/public output",
+        "note": "avoidable transient conversion, but no durable JSON bytes or second authority",
+        "owner": "public lix_commit projection"
+      }
+    ],
+    "C_dead_or_test_vocabulary": [
+      {
+        "detail": "StateCellRef and direct StateCell::Value/Null constructors in forktree/tests.rs and trailing cfg(test) modules",
+        "owner": "test fixtures"
+      },
+      {
+        "detail": "matches on Value/Null in current consumers are fail-closed guards, not constructors/writers",
+        "owner": "production rejection arms"
+      }
+    ]
+  },
+  "failed_checks": [],
+  "head": "c9e97a1724c29d5ace366410d5271c0e9926cdd8",
+  "separate_non_json_findings": [
+    "transaction validation currently decodes a StateRowSource::Global row using the selected branch owner; this is a branch-owner propagation defect, not a JSON/current-carrier authority defect"
+  ],
+  "tree": "87e3024d549308b2878be19d5ad5799072887d3d",
+  "verdict": "APPROVE",
+  "version": 3
+}
