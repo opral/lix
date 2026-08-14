@@ -330,6 +330,31 @@ fn canonical_json_text(input: &str) -> String {
     output
 }
 
+fn canonical_row_pk_text(input: &JsonValue) -> String {
+    fn replace_generated_uuid(value: &mut JsonValue) {
+        match value {
+            JsonValue::String(text) if uuid::Uuid::parse_str(text).is_ok() => {
+                *text = "<generated-uuid>".to_owned();
+            }
+            JsonValue::Array(values) => {
+                for child in values {
+                    replace_generated_uuid(child);
+                }
+            }
+            JsonValue::Object(values) => {
+                for child in values.values_mut() {
+                    replace_generated_uuid(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut value = input.clone();
+    replace_generated_uuid(&mut value);
+    serde_json::to_string(&value).expect("serialize canonical row PK")
+}
+
 fn directory_bytes(path: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
@@ -524,29 +549,67 @@ where
         .rows()[0]
         .get::<String>("id")
         .expect("after commit id");
-    let diff = measure(backend, "historical_diff", 1, async {
-        lix.execute(
+    let (diff_count, diff_digest) = measure(backend, "historical_diff", 1, async {
+        let result = lix
+            .execute(
             "SELECT schema_key, row_pk, diff_type FROM lix_diff($1, $2) \
              WHERE schema_key = 'markdown_node' ORDER BY row_pk",
             &[Value::Text(before_commit), Value::Text(after_commit)],
         )
         .await
-        .expect("historical diff")
+        .expect("historical diff");
+        let expected_row_pk = json!([paragraph_id]);
+        assert!(result.rows().iter().any(|row| {
+            row.get::<JsonValue>("row_pk").expect("diff row PK") == expected_row_pk
+        }));
+        let mut rows = result
+            .rows()
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}\0{}\0{}",
+                    row.get::<String>("schema_key").expect("diff schema"),
+                    canonical_row_pk_text(
+                        &row.get::<JsonValue>("row_pk").expect("diff row PK")
+                    ),
+                    row.get::<String>("diff_type").expect("diff type")
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        (rows.len(), digest(rows.join("\n").as_bytes()))
     })
     .await;
-    assert!(!diff.rows().is_empty());
+    assert!(diff_count > 0);
 
-    let history = measure(backend, "history_depth_one", 1, async {
-        lix.execute(
+    let (history_count, history_digest) = measure(backend, "history_depth_one", 1, async {
+        let result = lix
+            .execute(
             "SELECT id, kind, payload_json FROM markdown_node_history() \
              WHERE lixcol_file_id = $1 AND lixcol_depth = 1 ORDER BY kind, id",
             &[Value::Text(file_id.clone())],
         )
         .await
-        .expect("history query")
+        .expect("history query");
+        let mut rows = result
+            .rows()
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}\0{}",
+                    row.get::<String>("kind").expect("history kind"),
+                    canonical_json_text(
+                        &row.get::<String>("payload_json")
+                            .expect("history payload")
+                    )
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        (rows.len(), digest(rows.join("\n").as_bytes()))
     })
     .await;
-    assert!(!history.rows().is_empty());
+    assert!(history_count > 0);
 
     measure(backend, "transaction_insert_17_files", 17, async {
         let mut transaction = lix.begin_transaction().await.expect("begin transaction");
@@ -646,6 +709,10 @@ where
             "exact_row_digest": exact_digest,
             "range_row_digest": range_digest,
             "full_row_digest": full_digest,
+            "diff_row_count": diff_count,
+            "diff_digest": diff_digest,
+            "history_row_count": history_count,
+            "history_digest": history_digest,
             "batch_17_digest": batch_digest,
             "settled_disk_bytes": directory_bytes(&root),
             "row_count_after_reopen": reopened_rows,

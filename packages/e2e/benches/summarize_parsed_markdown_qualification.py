@@ -68,6 +68,10 @@ def main() -> None:
             "exact_row_digest",
             "range_row_digest",
             "full_row_digest",
+            "diff_row_count",
+            "diff_digest",
+            "history_row_count",
+            "history_digest",
             "batch_17_digest",
             "row_count_after_reopen",
         )
