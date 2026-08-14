@@ -542,24 +542,31 @@ where
         if schema_keys.is_empty() || file_ids.is_empty() {
             return Ok(FilesystemStateRows::default());
         }
-        self.scan_file_plan(&FileQueryPlan {
-            filter: FileQueryFilter {
-                schema_keys,
-                branch_ids: vec![branch_id.to_owned()],
-                file_ids: file_ids
-                    .iter()
-                    .cloned()
-                    .map(crate::NullableKeyFilter::Value)
-                    .collect(),
-                untracked: Some(false),
-                include_tombstones: false,
-                ..FileQueryFilter::default()
-            },
-            projection: FileQueryProjection::default(),
-            limit: None,
-            full_surface: false,
-        })
-        .await
+        let file_ids = file_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let mut rows = Vec::new();
+        for schema_key in schema_keys {
+            let bounds = schema_range_bounds(&schema_key);
+            for row in self
+                .range_for_branch(
+                    branch_id,
+                    Some(&bounds.0),
+                    bounds.1.as_deref(),
+                    None,
+                    false,
+                )
+                .await?
+            {
+                let row = FilesystemStateRow::from_state_row_identity(row, branch_id, false)?;
+                if row
+                    .file_id
+                    .as_deref()
+                    .is_some_and(|file_id| file_ids.contains(file_id))
+                {
+                    rows.push(row);
+                }
+            }
+        }
+        Ok(FilesystemStateRows::from_rows(rows))
     }
 
     async fn load_exact_batch(

@@ -1034,11 +1034,28 @@ where
         // separate until the canonical filesystem-key merge below so an
         // untracked tombstone can shadow a tracked row without resurrection.
         let mut rows = Vec::new();
+        let empty_pk = crate::entity_pk::EntityPk {
+            components: crate::entity_pk::EntityPkComponents::Empty,
+        };
         for branch_id in &request.branch_ids {
-            let tracked_rows = self
-                .branch_range(branch_id, None, None, None, true)
-                .await
-                .map_err(|error| LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string()))?;
+            let mut tracked_rows = Vec::new();
+            for schema_key in crate::filesystem::filesystem_schema_keys() {
+                let lower = crate::forktree::encode_state_entity_prefix(&schema_key, &empty_pk);
+                let upper = crate::forktree::exclusive_prefix_upper_bound(&lower);
+                tracked_rows.extend(
+                    self.branch_range(
+                        branch_id,
+                        Some(&lower),
+                        upper.as_deref(),
+                        None,
+                        true,
+                    )
+                    .await
+                    .map_err(|error| {
+                        LixError::new(LixError::CODE_STORAGE_ERROR, error.to_string())
+                    })?,
+                );
+            }
             rows.extend(FilesystemStateRows::from_view_rows(
                 tracked_rows,
                 branch_id,
@@ -1101,9 +1118,8 @@ where
     }
     let mut rows = Vec::new();
     for branch_id in &request.branch_ids {
-        let tracked_rows = state
-            .branch_range(branch_id, None, None, None, true)
-            .await?;
+        let tracked_rows =
+            crate::filesystem::filesystem_state_rows_for_branch(state, branch_id, true).await?;
         rows.extend(FilesystemStateRows::from_view_rows(
             tracked_rows,
             branch_id,

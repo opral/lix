@@ -110,3 +110,91 @@ async fn seven_types_register_write_and_read_through_public_api() {
 
     lix.close().await.expect("memory Lix closes");
 }
+
+#[tokio::test]
+async fn dynamically_registered_rows_coexist_with_native_file_and_commit_surfaces() {
+    let lix = open_lix().await.expect("memory Lix opens");
+    let schema = json!({
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "qualification_row",
+        "columns": [
+            {"name": "id", "type": "uuid", "nullable": false},
+            {"name": "value", "type": "text", "nullable": false}
+        ],
+        "primary_key": ["id"]
+    });
+    lix.execute(
+        "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, CAST($2 AS JSONB))",
+        &[
+            Value::Text("qualification_row".into()),
+            Value::Text(schema.to_string()),
+        ],
+    )
+    .await
+    .expect("dynamic Schema-v1 registration succeeds");
+    let id = "01920000-0000-7000-8000-0000000000a1";
+    lix.execute(
+        "INSERT INTO qualification_row (id, value) VALUES ($1, 'native')",
+        &[Value::Text(id.into())],
+    )
+    .await
+    .expect("dynamic native row writes");
+    assert_eq!(
+        lix.execute(
+            "SELECT value FROM qualification_row WHERE id = $1",
+            &[Value::Text(id.into())],
+        )
+        .await
+        .expect("dynamic native row reads")
+        .rows()[0]
+            .values()[0],
+        Value::Text("native".into())
+    );
+
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ('/carrier.txt', CAST('payload' AS BYTEA))",
+        &[],
+    )
+    .await
+    .expect("filesystem planning ignores unrelated dynamic state");
+    assert_eq!(
+        lix.execute("SELECT path FROM lix_file WHERE path = '/carrier.txt'", &[])
+            .await
+            .expect("native file row reads")
+            .rows()
+            .len(),
+        1
+    );
+    assert!(
+        !lix.execute("SELECT id FROM lix_commit ORDER BY id", &[])
+            .await
+            .expect("derived lix_commit rows use native tuples")
+            .rows()
+            .is_empty()
+    );
+    assert!(
+        !lix.execute("SELECT id, commit_id FROM lix_branch_ref", &[])
+            .await
+            .expect("derived branch-ref rows use native tuples")
+            .rows()
+            .is_empty()
+    );
+    let branch_id = lix.active_branch_id().await.expect("active branch");
+    let reopened = lix
+        .open_session(branch_id)
+        .await
+        .expect("open retained repository session");
+    assert_eq!(
+        reopened
+            .execute(
+                "SELECT value FROM qualification_row WHERE id = $1",
+                &[Value::Text(id.into())],
+            )
+            .await
+            .expect("retained dynamic row reopens")
+            .rows()
+            .len(),
+        1
+    );
+    lix.close().await.expect("memory Lix closes");
+}
