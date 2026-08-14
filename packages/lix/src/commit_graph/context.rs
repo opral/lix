@@ -80,7 +80,7 @@ where
     // SQL statement. File-history shaping asks the same reader for distinct
     // schema slices of that history, so retain immutable change records here.
     member_changes_cache:
-        HashMap<(Vec<String>, Vec<String>), HashMap<CommitId, Vec<CommitGraphChange>>>,
+        HashMap<(Vec<String>, Vec<String>, bool), HashMap<CommitId, Vec<CommitGraphChange>>>,
 }
 
 enum LinearMergeBase {
@@ -580,6 +580,7 @@ where
                 node.commit_id,
                 &shaping.member_schema_keys,
                 &shaping.member_file_ids,
+                request.hydrate_member_payloads,
             )
             .await?
         {
@@ -603,8 +604,13 @@ where
         commit_id: CommitId,
         schema_keys: &[String],
         file_ids: &[String],
+        hydrate_member_payloads: bool,
     ) -> Result<Vec<CommitGraphChange>, LixError> {
-        let cache_key = (schema_keys.to_vec(), file_ids.to_vec());
+        let cache_key = (
+            schema_keys.to_vec(),
+            file_ids.to_vec(),
+            hydrate_member_payloads,
+        );
         if let Some(changes) = self
             .member_changes_cache
             .get(&cache_key)
@@ -612,18 +618,21 @@ where
         {
             return Ok(changes.clone());
         }
-        let members = crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
+        let members = crate::tracked_state::load_commit_delta_members_for_schemas(
             &self.store,
             commit_id,
             schema_keys,
             file_ids,
             usize::MAX,
+            hydrate_member_payloads,
         )
         .await?
         .expect("unbounded commit member load cannot exceed its segment limit");
         let mut changes = members
             .into_iter()
-            .map(|member| commit_graph_change_from_change_record(member.change))
+            .map(|member| {
+                commit_graph_change_from_change_record(member.change, member.value.deleted)
+            })
             .collect::<Vec<_>>();
         changes.sort_by_key(|change| change.id);
         self.member_changes_cache
@@ -689,13 +698,17 @@ struct HistoryCollection {
     seen_changes: BTreeSet<(ChangeId, String, Option<String>, RowPk)>,
 }
 
-fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphChange {
+fn commit_graph_change_from_change_record(
+    change: ChangeRecord,
+    deleted: bool,
+) -> CommitGraphChange {
     CommitGraphChange {
         id: change.change_id,
         account_id: change.account_id,
         row_pk: change.row_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
+        deleted,
         snapshot: change.snapshot,
         metadata: change.metadata,
         created_at: change.created_at,
@@ -950,6 +963,7 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
             .expect("commit IDs are canonical UUIDs"),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
+        deleted: false,
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
         metadata: crate::json_store::JsonSlot::None,
         created_at: node.created_at,
@@ -1961,6 +1975,7 @@ mod tests {
                     row_pk: crate::row_pk::RowPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
+                    deleted: false,
                     snapshot: crate::json_store::JsonSlot::None,
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: ts("2026-01-01T00:00:00Z"),
@@ -1992,6 +2007,7 @@ mod tests {
                     row_pk: crate::row_pk::RowPk::single(row_pk),
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
+                    deleted: snapshot_content.is_none(),
                     snapshot: snapshot_content
                         .map_or(crate::json_store::JsonSlot::None, |content| {
                             crate::json_store::JsonSlot::from_json(content)

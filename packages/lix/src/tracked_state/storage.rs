@@ -3357,7 +3357,7 @@ pub(crate) async fn certify_authored_current_state_body<'a>(
             file_id: member.key.file_id.as_deref(),
             row_pk: &member.key.row_pk,
         });
-        let delta = deltas.next().ok_or_else(|| {
+        let mut delta = deltas.next().ok_or_else(|| {
             replacement_payload_error(
                 "authored current-state certification omitted an authored member",
             )
@@ -3367,24 +3367,29 @@ pub(crate) async fn certify_authored_current_state_body<'a>(
             file_id: delta.delta.file_id,
             row_pk: delta.delta.row_pk,
         };
+        // Authored history owns the change lifecycle timestamp, while the
+        // current row retains its original creation timestamp across updates.
+        let member_matches_current_identity = member.value.change_id == delta.delta.change_id
+            && member.value.commit_id == delta.delta.commit_id
+            && member.value.deleted == delta.delta.deleted
+            && member.value.updated_at == delta.delta.updated_at;
+        // The sealed staged member is the base-coordinate authority. A caller
+        // may omit that coordinate, but may never substitute another one.
+        let coordinate_matches = delta
+            .base_coordinate
+            .is_none_or(|coordinate| Some(coordinate) == member.base_coordinate);
         if !delta.authored
             || encode_key_ref(key) != member_key
-            || member.value
-                != (TrackedStateIndexValue {
-                    change_id: delta.delta.change_id,
-                    commit_id: delta.delta.commit_id,
-                    deleted: delta.delta.deleted,
-                    created_at: delta.delta.created_at,
-                    updated_at: delta.delta.updated_at,
-                })
+            || !member_matches_current_identity
             || member.body_digest != history_body_digest(delta.snapshot, delta.metadata)
             || member.change.origin_key.as_deref() != delta.origin_key
-            || member.base_coordinate != delta.base_coordinate
+            || !coordinate_matches
         {
             return Err(replacement_payload_error(
                 "authored current-state body disagrees with its exact staged member closure",
             ));
         }
+        delta.base_coordinate = member.base_coordinate;
         authored_deltas.push(delta);
     }
     if deltas.next().is_some() {
@@ -8266,6 +8271,27 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     file_ids: &[String],
     max_segment_count: usize,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
+    load_commit_delta_members_for_schemas(
+        store,
+        commit_id,
+        schema_keys,
+        file_ids,
+        max_segment_count,
+        true,
+    )
+    .await
+}
+
+/// Loads authenticated member identities, hydrating native bodies only when
+/// the terminal consumer projects payload columns.
+pub(crate) async fn load_commit_delta_members_for_schemas(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+    file_ids: &[String],
+    max_segment_count: usize,
+    hydrate_payloads: bool,
+) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
     let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
         return Ok(Some(Vec::new()));
     };
@@ -8276,13 +8302,15 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
             schema_keys,
             file_ids,
             max_segment_count,
-            true,
+            hydrate_payloads,
         )
         .await?
     else {
         return Ok(None);
     };
-    hydrate_authored_history_members(store, &state, &mut local).await?;
+    if hydrate_payloads {
+        hydrate_authored_history_members(store, &state, &mut local).await?;
+    }
     let Some(source_commit_id) = state.mutations.selected_source_commit_id() else {
         return Ok(Some(local));
     };
@@ -8304,13 +8332,15 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         schema_keys,
         file_ids,
         max_segment_count.saturating_sub(local_segment_count),
-        true,
+        hydrate_payloads,
     )
     .await?
     else {
         return Ok(None);
     };
-    hydrate_authored_history_members(store, &source, &mut members).await?;
+    if hydrate_payloads {
+        hydrate_authored_history_members(store, &source, &mut members).await?;
+    }
     for member in &mut members {
         member.value.commit_id = commit_id;
         member.authored = false;
@@ -10466,8 +10496,15 @@ pub(crate) async fn commit_delta_contains_schema(
 pub(crate) async fn scan_change_records_from_commit_deltas(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    scan_change_records_from_commit_deltas_projected(store, true).await
+}
+
+pub(crate) async fn scan_change_records_from_commit_deltas_projected(
+    store: &(impl StorageAdapterRead + ?Sized),
+    hydrate_authored_payloads: bool,
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
     let mut records = Vec::new();
-    visit_change_records_from_commit_deltas(store, |record| {
+    visit_change_records_from_commit_deltas_projected(store, hydrate_authored_payloads, |record| {
         records.push(record);
         Ok(())
     })
@@ -10484,6 +10521,14 @@ pub(crate) async fn scan_change_records_from_commit_deltas(
 /// skipped; authored rows require no secondary read.
 pub(crate) async fn visit_change_records_from_commit_deltas(
     store: &(impl StorageAdapterRead + ?Sized),
+    visit: impl FnMut(crate::changelog::ChangeRecord) -> Result<(), LixError>,
+) -> Result<usize, LixError> {
+    visit_change_records_from_commit_deltas_projected(store, true, visit).await
+}
+
+async fn visit_change_records_from_commit_deltas_projected(
+    store: &(impl StorageAdapterRead + ?Sized),
+    hydrate_authored_payloads: bool,
     mut visit: impl FnMut(crate::changelog::ChangeRecord) -> Result<(), LixError>,
 ) -> Result<usize, LixError> {
     let range = StorageKeyRange {
@@ -10551,9 +10596,14 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     );
                     continue;
                 }
-                let mut members =
-                    load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[], true)
-                        .await?;
+                let mut members = load_commit_delta_members_from_manifest(
+                    store,
+                    commit_id,
+                    &manifest,
+                    &[],
+                    hydrate_authored_payloads,
+                )
+                .await?;
                 let replay_state = load_point_replay_commit_state(store, commit_id)
                     .await?
                     .ok_or_else(|| {
@@ -10561,7 +10611,9 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                             "commit-delta scan lost its authenticated replay state",
                         )
                     })?;
-                hydrate_authored_history_members(store, &replay_state, &mut members).await?;
+                if hydrate_authored_payloads {
+                    hydrate_authored_history_members(store, &replay_state, &mut members).await?;
+                }
                 for member in members {
                     if member.authored {
                         visit(member.change)?;
@@ -19069,6 +19121,70 @@ mod tests {
         .err()
         .expect("duplicate caller members must fail before certification");
         assert!(error.message.contains("without duplicates"));
+    }
+
+    #[tokio::test]
+    async fn authored_body_certification_adopts_only_the_sealed_member_coordinate() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("authored-certification-coordinate");
+        let fixture = [CommitDeltaFixture {
+            schema_key: "schema".to_owned(),
+            file_id: None,
+            row_pk: RowPk::single("row"),
+            change_id: ChangeId::for_test_label("authored-coordinate-change"),
+            deleted: false,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+        }];
+        let caller = commit_delta_refs(commit_id, &fixture);
+        let coordinate = TrackedStateBaseCoordinate {
+            base_commit_id: commit_id,
+            group_index: 2,
+            row_index: 7,
+        };
+        let mut staged_member = caller[0];
+        staged_member.base_coordinate = Some(coordinate);
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_commit_deltas_for_commit_state(&mut writes, &[staged_member])
+            .expect("coordinate-bearing member should stage");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certification read should open");
+
+        let certificate = super::certify_authored_current_state_body(
+            &read,
+            &mut writes,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            staged.mutation_inventory(),
+            true,
+            caller.iter().copied(),
+        )
+        .await
+        .expect("an absent caller coordinate should use the sealed member authority")
+        .expect("authored closure should produce a certificate");
+        assert_eq!(certificate.members[0].base_coordinate, Some(coordinate));
+
+        let mut foreign = caller[0];
+        foreign.base_coordinate = Some(TrackedStateBaseCoordinate {
+            base_commit_id: CommitId::for_test_label("foreign-coordinate-owner"),
+            group_index: coordinate.group_index,
+            row_index: coordinate.row_index,
+        });
+        let error = super::certify_authored_current_state_body(
+            &read,
+            &mut writes,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            staged.mutation_inventory(),
+            true,
+            [foreign],
+        )
+        .await
+        .err()
+        .expect("a caller-supplied foreign coordinate must fail closed");
+        assert!(error.message.contains("exact staged member closure"));
     }
 
     #[tokio::test]

@@ -1868,6 +1868,7 @@ where
                     min_depth: None,
                     max_depth,
                     include_tombstones: true,
+                    hydrate_member_payloads: true,
                     limit,
                 },
             )

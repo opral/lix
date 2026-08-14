@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use crate::LixError;
 use crate::commit_graph::CommitGraphReader;
 use crate::serialize_row_metadata;
-use crate::sql2::change_materialization::MaterializedChange;
+use crate::sql2::change_materialization::{ChangePayloadProjection, MaterializedChange};
 
 use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::WriteAccess;
@@ -29,8 +29,9 @@ use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_IS_DELETED,
-    HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
-    parse_history_filter, validate_history_anchor_filter,
+    HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor,
+    load_history_entries_with_payload_projection, parse_history_filter,
+    validate_history_anchor_filter,
 };
 use crate::sql2::providers::schema::{
     parse_snapshot, row_f64_value, row_i64_value, row_json_text_value,
@@ -126,6 +127,7 @@ where
         route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
         let schema = projected_schema(&self.schema, projection);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
+        let payload_projection = schema_history_payload_projection(&schema, filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -138,8 +140,17 @@ where
                     route,
                     schema,
                     metadata_projection,
+                    payload_projection,
                 ),
-                move |(spec, commit_graph, query_source, route, schema, metadata_projection)| async move {
+                move |(
+                    spec,
+                    commit_graph,
+                    query_source,
+                    route,
+                    schema,
+                    metadata_projection,
+                    payload_projection,
+                )| async move {
                     let rows = load_row_history_rows(
                         &spec,
                         commit_graph,
@@ -147,6 +158,7 @@ where
                         &route,
                         limit,
                         metadata_projection,
+                        payload_projection,
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
@@ -192,12 +204,13 @@ async fn load_row_history_rows<S>(
     route: &HistoryRoute,
     limit: Option<usize>,
     metadata_projection: HistoryMetadataProjection,
+    payload_projection: ChangePayloadProjection,
 ) -> Result<Vec<SchemaHistoryRow>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let history_view_name = format!("{}_history", spec.schema_key);
-    let entries = load_history_entries(
+    let entries = load_history_entries_with_payload_projection(
         HistoryViewDescriptor {
             view_name: history_view_name.as_str(),
             as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
@@ -208,6 +221,7 @@ where
         vec![spec.schema_key.clone()],
         metadata_projection,
         limit,
+        payload_projection,
     )
     .await?;
     let mut rows = entries
@@ -224,6 +238,39 @@ where
         rows.truncate(limit);
     }
     Ok(rows)
+}
+
+fn schema_history_payload_projection(
+    projected_schema: &SchemaRef,
+    filters: &[Expr],
+) -> ChangePayloadProjection {
+    let needs_payload = |name: &str| {
+        !name.starts_with("lixcol_") || matches!(name, "lixcol_metadata" | "lixcol_source_changes")
+    };
+    let snapshot_content = projected_schema
+        .fields()
+        .iter()
+        .any(|field| !field.name().starts_with("lixcol_"))
+        || filters.iter().any(|filter| {
+            filter
+                .column_refs()
+                .iter()
+                .any(|column| !column.name.starts_with("lixcol_"))
+        });
+    let metadata = projected_schema
+        .fields()
+        .iter()
+        .any(|field| needs_payload(field.name()))
+        || filters.iter().any(|filter| {
+            filter
+                .column_refs()
+                .iter()
+                .any(|column| needs_payload(column.name.as_str()))
+        });
+    ChangePayloadProjection {
+        snapshot_content,
+        metadata,
+    }
 }
 
 /// The `lixcol_*` system-column tail every schema history surface shares.
@@ -282,7 +329,7 @@ static ROW_HISTORY_SYSTEM_COLS: ColumnTable<SchemaHistoryRow> = ColumnTable {
         ("lixcol_depth", Col::I64(|row| Some(i64::from(row.depth)))),
         (
             HISTORY_COL_IS_DELETED,
-            Col::Bool(|row| Some(row.change.snapshot_content.is_none())),
+            Col::Bool(|row| Some(row.change.deleted)),
         ),
     ],
 };
