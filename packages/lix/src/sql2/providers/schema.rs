@@ -5534,15 +5534,24 @@ mod tests {
         assert!(request.filter.file_ids.is_empty());
         assert_eq!(request.filter.rows, HotStateRowFilter::None);
 
-        // Shapes the seek cannot represent stay unsupported so DataFusion keeps
-        // its residual instead of silently widening the scan.
+        // A NULL file owner is an exact physical fence too.
+        let null_file_owner = Expr::IsNull(Box::new(column("lixcol_file_id")));
         assert_eq!(
             <super::SchemaSpec as super::super::spec::TableSpec>::filter_pushdown(
                 &provider,
-                &Expr::IsNull(Box::new(column("lixcol_file_id")))
+                &null_file_owner
             ),
-            datafusion::logical_expr::TableProviderFilterPushDown::Unsupported
+            datafusion::logical_expr::TableProviderFilterPushDown::Exact
         );
+        let (_schema, request, row_filters) = provider
+            .plan_scan_parts(None, &[null_file_owner], None)
+            .await
+            .expect("NULL file-owner scan should plan");
+        assert_eq!(request.filter.file_ids, vec![crate::NullableKeyFilter::Null]);
+        assert!(row_filters.is_empty());
+
+        // Shapes the seek cannot represent stay unsupported so DataFusion keeps
+        // its residual instead of silently widening the scan.
         assert_eq!(
             <super::SchemaSpec as super::super::spec::TableSpec>::filter_pushdown(
                 &provider,
