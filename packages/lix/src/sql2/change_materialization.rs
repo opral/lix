@@ -225,5 +225,18 @@ mod tests {
                 "native history route contains forbidden JSON hydration call {forbidden}"
             );
         }
+
+        let serving = include_str!("../forktree/serving.rs");
+        let historical_start = serving
+            .find("pub(crate) async fn state_points_on_read_with_historical_auth")
+            .expect("historical state point authority");
+        let historical_end = serving[historical_start..]
+            .find("fn validate_resolved_member_pack_binding")
+            .map(|offset| historical_start + offset)
+            .expect("historical state point authority terminator");
+        assert!(
+            serving[historical_start..historical_end].contains("crate::native_row::decode("),
+            "historical state authority must authenticate native bodies before diff/history callers receive them"
+        );
     }
 }
