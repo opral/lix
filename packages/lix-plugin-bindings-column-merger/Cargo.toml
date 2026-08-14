@@ -9,7 +9,6 @@ homepage.workspace = true
 repository.workspace = true
 documentation.workspace = true
 rust-version.workspace = true
-publish = false
 
 [dependencies]
 wit-bindgen = "0.57"

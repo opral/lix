@@ -197,18 +197,38 @@ jobs:
         if: matrix.task == 'test'
         run: |
           rustup target add wasm32-wasip2
-          cargo package --locked -p lix-schema -p lix --no-verify
+          cargo package --locked \
+            -p lix-plugin-bindings-column-merger \
+            -p lix-plugin-bindings-combined \
+            -p lix-plugin-bindings-file-projection \
+            -p lix-schema \
+            -p lix \
+            --no-verify
           package_archive="$(find target/package -maxdepth 1 -type f -name 'lix-[0-9]*.crate' | head -n 1)"
           schema_archive="$(find target/package -maxdepth 1 -type f -name 'lix-schema-*.crate' | head -n 1)"
+          column_merger_archive="$(find target/package -maxdepth 1 -type f -name 'lix-plugin-bindings-column-merger-*.crate' | head -n 1)"
+          combined_archive="$(find target/package -maxdepth 1 -type f -name 'lix-plugin-bindings-combined-*.crate' | head -n 1)"
+          file_projection_archive="$(find target/package -maxdepth 1 -type f -name 'lix-plugin-bindings-file-projection-*.crate' | head -n 1)"
           tar -tf "$package_archive" |
             rg '^[^/]+/wit/lix-plugin\.wit$'
           packaged_lix="$(mktemp -d)"
           packaged_schema="$(mktemp -d)"
+          packaged_column_merger="$(mktemp -d)"
+          packaged_combined="$(mktemp -d)"
+          packaged_file_projection="$(mktemp -d)"
           tar -xf "$package_archive" -C "$packaged_lix" --strip-components=1
           tar -xf "$schema_archive" -C "$packaged_schema" --strip-components=1
+          tar -xf "$column_merger_archive" -C "$packaged_column_merger" --strip-components=1
+          tar -xf "$combined_archive" -C "$packaged_combined" --strip-components=1
+          tar -xf "$file_projection_archive" -C "$packaged_file_projection" --strip-components=1
           downstream="$(mktemp -d)"
           cargo init --lib --name downstream_lix_plugin "$downstream"
-          printf '\n[patch.crates-io]\nlix-schema = { path = "%s" }\n' "$packaged_schema" >> "$downstream/Cargo.toml"
+          printf '\n[patch.crates-io]\nlix-schema = { path = "%s" }\nlix-plugin-bindings-column-merger = { path = "%s" }\nlix-plugin-bindings-combined = { path = "%s" }\nlix-plugin-bindings-file-projection = { path = "%s" }\n' \
+            "$packaged_schema" \
+            "$packaged_column_merger" \
+            "$packaged_combined" \
+            "$packaged_file_projection" \
+            >> "$downstream/Cargo.toml"
           cargo add --manifest-path "$downstream/Cargo.toml" --path "$packaged_lix" lix
           cp packages/lix/examples/plugin_minimal.rs "$downstream/src/lib.rs"
           cargo build --manifest-path "$downstream/Cargo.toml" --target wasm32-wasip2

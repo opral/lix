@@ -315,6 +315,9 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/publish-crate.mjs lix-schema "$EXPECTED_VERSION"
+          node scripts/publish-crate.mjs lix-plugin-bindings-column-merger "$EXPECTED_VERSION"
+          node scripts/publish-crate.mjs lix-plugin-bindings-combined "$EXPECTED_VERSION"
+          node scripts/publish-crate.mjs lix-plugin-bindings-file-projection "$EXPECTED_VERSION"
           node scripts/publish-crate.mjs lix "$EXPECTED_VERSION"
           node scripts/publish-crate.mjs lix-storage-rocksdb "$EXPECTED_VERSION"
           node scripts/publish-crate.mjs lix-storage-slatedb "$EXPECTED_VERSION"
