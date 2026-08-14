@@ -744,7 +744,6 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
 
     let Some(mut touched) = touched else {
         if let Some(parent_root) = parent_root
-            && inventory.selected_source_commit_id.is_some()
             && certified_rows.is_empty()
         {
             return Ok(CertifiedCommitStatePhysicalPublication {
@@ -760,6 +759,11 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
                 touched_scope_filter,
             });
         }
+        if inventory.member_count != 0 || inventory.selected_source_commit_id.is_some() {
+            return Err(scoped_state_error(
+                "non-empty LXCD17 history cannot publish without a current-state root",
+            ));
+        }
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             commit_id,
@@ -769,6 +773,11 @@ pub(super) async fn stage_current_state_scoped_ranges_from_topology_refs(
         });
     };
     let Some(parent_root) = parent_root else {
+        if inventory.member_count != 0 || inventory.selected_source_commit_id.is_some() {
+            return Err(scoped_state_error(
+                "non-empty LXCD17 history has no authenticated serving root",
+            ));
+        }
         return Ok(CertifiedCommitStatePhysicalPublication {
             write_set_id: writes.identity(),
             commit_id,
@@ -2074,6 +2083,7 @@ mod tests {
             merge_commit,
             crate::ANONYMOUS_ACCOUNT_ID,
             &merge_inventory,
+            None,
         )
         .await
         .unwrap();
@@ -2097,6 +2107,7 @@ mod tests {
             alias_commit,
             crate::ANONYMOUS_ACCOUNT_ID,
             &alias_inventory,
+            None,
         )
         .await
         .unwrap();

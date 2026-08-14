@@ -544,6 +544,7 @@ where
             merge_id,
             crate::ANONYMOUS_ACCOUNT_ID,
             &mutations,
+            None,
         )
         .await
         .expect("stage benchmark merge serving root");

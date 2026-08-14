@@ -30,7 +30,8 @@ use crate::storage_adapter::{
 };
 use crate::tracked_state::{
     CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, stage_commit_deltas_for_commit_state,
+    TrackedStateDeltaRef, TrackedStateKeyRef, encode_key_ref,
+    stage_commit_deltas_for_commit_state,
 };
 use bytes::Bytes;
 use serde_json::json;
@@ -400,7 +401,7 @@ where
                 updated_at: change.created_at,
             })
             .collect::<Vec<_>>();
-        let commit_deltas = authored_changes
+        let mut commit_deltas = authored_changes
             .iter()
             .zip(root_deltas.iter().copied())
             .map(|(change, delta)| TrackedStateCommitDeltaRef {
@@ -412,6 +413,13 @@ where
                 authored: true,
             })
             .collect::<Vec<_>>();
+        commit_deltas.sort_by_key(|delta| {
+            encode_key_ref(TrackedStateKeyRef {
+                schema_key: delta.delta.schema_key,
+                file_id: delta.delta.file_id,
+                row_pk: delta.delta.row_pk,
+            })
+        });
         let staged_delta = stage_commit_deltas_for_commit_state(&mut writes, &commit_deltas)?;
         crate::tracked_state::stage_change_locators(&mut writes, &staged_delta.locators);
         let mut tracked_writer = tracked_state.writer(&read, &mut writes);

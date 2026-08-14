@@ -6192,7 +6192,7 @@ where
                 .get(&record.commit_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let deltas = indices
+            let mut deltas = indices
                 .iter()
                 .map(|&index| tracked_commit_delta_from_state_row(state_rows.row(index)))
                 .chain(
@@ -6202,13 +6202,27 @@ where
                         .map(|(row, refs)| tracked_commit_delta_from_certified_root_row(row, refs)),
                 )
                 .collect::<Result<Vec<_>, LixError>>()?;
+            deltas.sort_by_key(|delta| {
+                encode_key_ref(TrackedStateKeyRef {
+                    schema_key: delta.delta.schema_key,
+                    file_id: delta.delta.file_id,
+                    row_pk: delta.delta.row_pk,
+                })
+            });
+            let serving_root_missing = staged_parent
+                .map(|parent| parent.current_state_scoped_ranges.is_none())
+                .or_else(|| {
+                    external_parent
+                        .map(|parent| parent.current_state_scoped_ranges().is_none())
+                })
+                .unwrap_or(true);
             let certified_body = crate::tracked_state::certify_authored_current_state_body(
                 read,
                 writes,
                 record.commit_id,
                 &record.account_id,
                 &mutations,
-                false,
+                serving_root_missing,
                 deltas,
             )
             .await?;
@@ -6315,6 +6329,7 @@ where
                         record.commit_id,
                         &record.account_id,
                         &mutations,
+                        certified_body,
                     )
                     .await?,
                 )

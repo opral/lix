@@ -2850,6 +2850,7 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_topology(
     commit_id: CommitId,
     account_id: &str,
     inventory: &CommitStateMutationInventory,
+    certified_body: Option<CertifiedAuthoredCurrentStateBody>,
 ) -> Result<super::scoped_current_state::CertifiedCommitStatePhysicalPublication, LixError> {
     let parents = parents
         .iter()
@@ -2869,7 +2870,7 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_topology(
         commit_id,
         account_id,
         inventory,
-        None,
+        certified_body,
     )
     .await
 }
@@ -3305,31 +3306,27 @@ pub(crate) async fn certify_authored_current_state_body<'a>(
     };
     use crate::tracked_state::scoped_range::{ScopedRangeCoverageMarker, stage_scoped_range_tree};
 
-    let mut deltas = deltas.into_iter().collect::<Vec<_>>();
-    deltas.sort_by_key(|delta| {
-        encode_key_ref(TrackedStateKeyRef {
+    let deltas = deltas.into_iter().collect::<Vec<_>>();
+    let delta_keys = deltas
+        .iter()
+        .map(|delta| {
+            encode_key_ref(TrackedStateKeyRef {
             schema_key: delta.delta.schema_key,
             file_id: delta.delta.file_id,
             row_pk: delta.delta.row_pk,
         })
-    });
+        })
+        .collect::<Vec<_>>();
+    if delta_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(replacement_payload_error(
+            "authored current-state certification requires exact canonical member order without duplicates",
+        ));
+    }
     let staged_segments = staged_commit_delta_segment_bytes(writes, commit_id, inventory)?;
     let staged_members =
         staged_commit_delta_members(store, commit_id, account_id, inventory, staged_segments)
             .await?;
-    let mut deltas_by_key = deltas
-        .drain(..)
-        .map(|delta| {
-            (
-                encode_key_ref(TrackedStateKeyRef {
-                    schema_key: delta.delta.schema_key,
-                    file_id: delta.delta.file_id,
-                    row_pk: delta.delta.row_pk,
-                }),
-                delta,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut deltas = deltas.into_iter();
     let mut authored_deltas = Vec::new();
     for member in &staged_members {
         if !member.authored {
@@ -3340,7 +3337,7 @@ pub(crate) async fn certify_authored_current_state_body<'a>(
             file_id: member.key.file_id.as_deref(),
             row_pk: &member.key.row_pk,
         });
-        let delta = deltas_by_key.remove(&member_key).ok_or_else(|| {
+        let delta = deltas.next().ok_or_else(|| {
             replacement_payload_error(
                 "authored current-state certification omitted an authored member",
             )
@@ -3370,7 +3367,7 @@ pub(crate) async fn certify_authored_current_state_body<'a>(
         }
         authored_deltas.push(delta);
     }
-    if !deltas_by_key.is_empty() {
+    if deltas.next().is_some() {
         return Err(replacement_payload_error(
             "authored current-state certification contains a foreign member",
         ));
@@ -4651,6 +4648,13 @@ pub(crate) fn stage_commit_state_manifest(
     writes: &mut StorageWriteSet,
     manifest: &CommitStateManifest,
 ) -> Result<(), LixError> {
+    if manifest.mutations.member_count != 0
+        || manifest.mutations.selected_source_commit_id().is_some()
+    {
+        return Err(replacement_payload_error(
+            "non-empty LXCD17 history requires certified current-state publication",
+        ));
+    }
     if manifest.current_state_scoped_ranges.is_some() {
         return Err(replacement_payload_error(
             "current-state scoped ranges require canonical publication certification",
@@ -4700,6 +4704,14 @@ pub(crate) fn stage_certified_commit_state_manifest(
     if manifest.current_state_scoped_ranges != publication.root() {
         return Err(replacement_payload_error(
             "commit manifest disagrees with its canonical scoped-range publication proof",
+        ));
+    }
+    if (manifest.mutations.member_count != 0
+        || manifest.mutations.selected_source_commit_id().is_some())
+        && publication.root().is_none()
+    {
+        return Err(replacement_payload_error(
+            "non-empty LXCD17 history is missing its authenticated current-state root",
         ));
     }
     if &manifest.touched_scope_filter != publication.touched_scope_filter() {
@@ -13811,6 +13823,14 @@ fn validate_commit_state_manifest_header(
             "tracked_state rooted commit_state_manifest is missing its snapshot root",
         ));
     }
+    if (stored.mutation_member_count != 0 || stored.selected_source_commit_id.is_some())
+        && stored.current_state_scoped_ranges.is_none()
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state non-empty LXCD17 manifest is missing its authenticated current-state root",
+        ));
+    }
     if let Some(root) = stored.snapshot_root.as_ref()
         && (root.commit_id != stored.commit_id || stored.replay_debt.depth != 0)
     {
@@ -13888,6 +13908,15 @@ fn validate_commit_state_manifest_inner(
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "tracked_state rooted commit_state_manifest is missing its snapshot root",
+        ));
+    }
+    if (manifest.mutations.member_count != 0
+        || manifest.mutations.selected_source_commit_id().is_some())
+        && manifest.current_state_scoped_ranges.is_none()
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state non-empty LXCD17 manifest is missing its authenticated current-state root",
         ));
     }
     if let Some(root) = manifest.snapshot_root.as_ref() {
@@ -14492,6 +14521,23 @@ mod tests {
             crate::tracked_state::types::CurrentStateScopedRangeRoot,
         >,
     ) -> CommitStateManifest {
+        let current_state_scoped_ranges = current_state_scoped_ranges.or_else(|| {
+            (mutations.member_count != 0 || mutations.selected_source_commit_id().is_some())
+                .then(|| {
+                    let tree = crate::tracked_state::scoped_range::ScopedRangeRoot {
+                        root_id: *blake3::hash(commit_id.as_uuid().as_bytes()).as_bytes(),
+                        root_digest: *blake3::hash(b"fixture current-state root").as_bytes(),
+                        marker_count: 1,
+                        part_count: 1,
+                        row_count: u64::from(mutations.member_count),
+                        tree_height: 1,
+                    };
+                    crate::tracked_state::scoped_current_state::attest_scoped_range_root(
+                        commit_id, None, &mutations, tree,
+                    )
+                    .expect("fixture current-state root should attest")
+                })
+        });
         CommitStateManifest {
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
@@ -18642,15 +18688,7 @@ mod tests {
             })
             .into(),
         };
-        CommitStateManifest {
-            commit_id,
-            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            replay_debt: CommitStateReplayDebt {
-                depth: 2,
-                rows: 1,
-                bytes: 64,
-            },
-            mutations: CommitStateMutationInventory {
+        let mutations = CommitStateMutationInventory {
                 selected_source_commit_id: None,
                 member_count: 1,
                 selection_fingerprint: [3; 32],
@@ -18666,11 +18704,14 @@ mod tests {
                 columnar_parts: None,
                 inline_part: encode_commit_delta_segment(&[entry]),
                 parts: Vec::new(),
-            },
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
-            snapshot_root: None,
-        }
+            };
+        let mut manifest = fixture_commit_state_manifest(commit_id, mutations, None);
+        manifest.replay_debt = CommitStateReplayDebt {
+            depth: 2,
+            rows: 1,
+            bytes: 64,
+        };
+        manifest
     }
 
     fn external_commit_state_manifest_fixture(
@@ -18698,15 +18739,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        CommitStateManifest {
-            commit_id,
-            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            replay_debt: CommitStateReplayDebt {
-                depth: 1,
-                rows: part_count as u64,
-                bytes: part_count as u64,
-            },
-            mutations: CommitStateMutationInventory {
+        let mutations = CommitStateMutationInventory {
                 selected_source_commit_id: None,
                 member_count: part_count as u32,
                 selection_fingerprint: [4; 32],
@@ -18722,11 +18755,8 @@ mod tests {
                 columnar_parts: None,
                 inline_part: Vec::new(),
                 parts,
-            },
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
-            snapshot_root: None,
-        }
+            };
+        fixture_commit_state_manifest(commit_id, mutations, None)
     }
 
     /// The point-replay authority cache must never return a manifest the
@@ -18923,6 +18953,80 @@ mod tests {
     }
 
     #[test]
+    fn raw_manifest_constructor_rejects_member_bearing_lxcd17_authority() {
+        let manifest = commit_state_manifest_fixture();
+        let mut writes = StorageWriteSet::new();
+        let error = stage_commit_state_manifest(&mut writes, &manifest)
+            .expect_err("member-bearing LXCD17 manifests require the opaque publication proof");
+        assert!(error.message.contains("certified current-state publication"));
+    }
+
+    #[tokio::test]
+    async fn authored_body_certification_rejects_reordered_and_duplicate_callers() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("authored-certification-order");
+        let fixtures = [
+            CommitDeltaFixture {
+                schema_key: "schema".to_owned(),
+                file_id: None,
+                row_pk: RowPk::single("a"),
+                change_id: ChangeId::for_test_label("authored-order-a"),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+            },
+            CommitDeltaFixture {
+                schema_key: "schema".to_owned(),
+                file_id: None,
+                row_pk: RowPk::single("b"),
+                change_id: ChangeId::for_test_label("authored-order-b"),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+            },
+        ];
+        let canonical = commit_delta_refs(commit_id, &fixtures);
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_commit_deltas_for_commit_state(&mut writes, &canonical)
+            .expect("canonical members should stage");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certification read should open");
+
+        let mut reordered = canonical.clone();
+        reordered.swap(0, 1);
+        let error = super::certify_authored_current_state_body(
+            &read,
+            &mut writes,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            staged.mutation_inventory(),
+            true,
+            reordered,
+        )
+        .await
+        .err()
+        .expect("reordered caller members must fail before certification");
+        assert!(error.message.contains("canonical member order"));
+
+        let duplicate = [canonical[0], canonical[0]];
+        let error = super::certify_authored_current_state_body(
+            &read,
+            &mut writes,
+            commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            staged.mutation_inventory(),
+            true,
+            duplicate,
+        )
+        .await
+        .err()
+        .expect("duplicate caller members must fail before certification");
+        assert!(error.message.contains("without duplicates"));
+    }
+
+    #[test]
     fn commit_state_manifest_codec_authenticates_scoped_range_root() {
         let mut manifest = commit_state_manifest_fixture();
         let serving_base_commit_id = None;
@@ -18993,7 +19097,8 @@ mod tests {
         let manifest = external_commit_state_manifest_fixture("header-only-topology", 700);
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
-        stage_commit_state_manifest(&mut writes, &manifest).expect("fixture should stage");
+        super::stage_commit_state_manifest_bytes(&mut writes, &manifest)
+            .expect("fixture should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -19054,7 +19159,8 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let expected = commit_state_manifest_fixture();
         let mut writes = storage.new_write_set();
-        stage_commit_state_manifest(&mut writes, &expected).expect("manifest should stage");
+        super::stage_commit_state_manifest_bytes(&mut writes, &expected)
+            .expect("manifest should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -19081,7 +19187,8 @@ mod tests {
         );
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
-        stage_commit_state_manifest(&mut writes, &manifest).expect("split authority should stage");
+        super::stage_commit_state_manifest_bytes(&mut writes, &manifest)
+            .expect("split authority should stage");
         assert_eq!(
             writes
                 .staged_values_in_space(super::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE)
@@ -19160,7 +19267,8 @@ mod tests {
             .root_id;
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
-        stage_commit_state_manifest(&mut writes, &manifest).expect("fixture should stage");
+        super::stage_commit_state_manifest_bytes(&mut writes, &manifest)
+            .expect("fixture should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -19235,7 +19343,8 @@ mod tests {
         };
         let mut writes = storage.new_write_set();
         manifest.snapshot_root = Some(Box::new(authoritative.clone()));
-        stage_commit_state_manifest(&mut writes, &manifest).expect("authority should stage");
+        super::stage_commit_state_manifest_bytes(&mut writes, &manifest)
+            .expect("authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
