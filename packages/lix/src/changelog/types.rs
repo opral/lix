@@ -673,9 +673,101 @@ pub(crate) struct ChangeRecord {
     pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: JsonSlot,
+    /// Schema-bound native history payload. This is populated only when the
+    /// authenticated commit inventory points at a columnar mutation group;
+    /// it is never encoded by the legacy change-record codec.
+    pub(crate) typed_snapshot: Option<TypedHistorySnapshot>,
     pub(crate) metadata: JsonSlot,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct TypedHistorySnapshot {
+    pub(crate) schema_layout_fingerprint: String,
+    pub(crate) deleted: bool,
+    /// Names only; primary-key values remain exclusively in the authenticated
+    /// member key and are never duplicated in this payload.
+    pub(crate) primary_key_paths: Vec<Vec<String>>,
+    pub(crate) fields: Vec<TypedHistoryField>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
+pub(crate) struct TypedHistoryField {
+    pub(crate) name: String,
+    #[musli(with = typed_history_scalar_storage)]
+    pub(crate) value: Option<TypedHistoryScalar>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TypedHistoryScalar {
+    String(String),
+    Jsonb(String),
+    Int64(i64),
+    Float64Bits(u64),
+    Boolean(bool),
+    TimestampMicros(i64),
+}
+
+mod typed_history_scalar_storage {
+    use musli::Context;
+    use musli::de::SequenceDecoder;
+    use musli::en::SequenceEncoder;
+
+    use super::TypedHistoryScalar;
+
+    pub(super) fn encode<E>(value: &Option<TypedHistoryScalar>, encoder: E) -> Result<(), E::Error>
+    where
+        E: musli::Encoder,
+    {
+        encoder.encode_pack_fn(|pack| match value {
+            None => pack.push(0u8),
+            Some(TypedHistoryScalar::String(value)) => {
+                pack.push(1u8)?;
+                pack.push(value)
+            }
+            Some(TypedHistoryScalar::Jsonb(value)) => {
+                pack.push(2u8)?;
+                pack.push(value)
+            }
+            Some(TypedHistoryScalar::Int64(value)) => {
+                pack.push(3u8)?;
+                pack.push(*value)
+            }
+            Some(TypedHistoryScalar::Float64Bits(value)) => {
+                pack.push(4u8)?;
+                pack.push(*value)
+            }
+            Some(TypedHistoryScalar::Boolean(value)) => {
+                pack.push(5u8)?;
+                pack.push(*value)
+            }
+            Some(TypedHistoryScalar::TimestampMicros(value)) => {
+                pack.push(6u8)?;
+                pack.push(*value)
+            }
+        })
+    }
+
+    pub(super) fn decode<'de, D>(decoder: D) -> Result<Option<TypedHistoryScalar>, D::Error>
+    where
+        D: musli::Decoder<'de>,
+    {
+        let cx = decoder.cx();
+        decoder.decode_pack(|pack| match pack.next::<u8>()? {
+            0 => Ok(None),
+            1 => Ok(Some(TypedHistoryScalar::String(pack.next()?))),
+            2 => Ok(Some(TypedHistoryScalar::Jsonb(pack.next()?))),
+            3 => Ok(Some(TypedHistoryScalar::Int64(pack.next()?))),
+            4 => Ok(Some(TypedHistoryScalar::Float64Bits(pack.next()?))),
+            5 => Ok(Some(TypedHistoryScalar::Boolean(pack.next()?))),
+            6 => Ok(Some(TypedHistoryScalar::TimestampMicros(pack.next()?))),
+            tag => Err(cx.message(format_args!(
+                "typed history scalar has unknown tag {tag}"
+            ))),
+        })
+    }
 }
 
 #[derive(musli::Encode)]

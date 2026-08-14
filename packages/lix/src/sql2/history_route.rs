@@ -43,6 +43,7 @@ pub(crate) struct HistoryRoute {
     /// because anchor-free queries default to the pinned active head.
     pub(crate) invalid_as_of_commit_filter: bool,
     pub(crate) contradictory: bool,
+    pub(crate) typed_entity_payloads: bool,
 }
 
 impl HistoryRoute {
@@ -332,6 +333,7 @@ pub(crate) fn commit_graph_history_request(
         min_depth: route.min_depth.and_then(nonnegative_u32),
         max_depth: route.max_depth.and_then(nonnegative_u32),
         include_tombstones: true,
+        typed_entity_payloads: route.typed_entity_payloads,
     })
 }
 
@@ -408,7 +410,12 @@ where
             .collect::<BTreeMap<_, _>>();
 
         for entry in entries {
-            let change = materialize_located_history_change(&mut json_reader, entry.change).await?;
+            let change = materialize_located_history_change(
+                &mut json_reader,
+                entry.change,
+                request.typed_entity_payloads,
+            )
+            .await?;
             let commit_created_at = if metadata_projection.commit_created_at {
                 Some(
                     reachable_by_id
@@ -1143,6 +1150,7 @@ mod tests {
             schema_key: "message".to_string(),
             file_id: None,
             snapshot: JsonSlot::None,
+            typed_snapshot: None,
             metadata: JsonSlot::None,
             created_at,
             origin_key: None,

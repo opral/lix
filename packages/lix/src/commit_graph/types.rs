@@ -13,6 +13,7 @@ pub(crate) struct CommitGraphChange {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: crate::json_store::JsonSlot,
+    pub(crate) typed_snapshot: Option<crate::changelog::TypedHistorySnapshot>,
     pub(crate) metadata: crate::json_store::JsonSlot,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<String>,
@@ -95,6 +96,7 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
     pub(crate) min_depth: Option<u32>,
     pub(crate) max_depth: Option<u32>,
     pub(crate) include_tombstones: bool,
+    pub(crate) typed_entity_payloads: bool,
     /// Maximum number of history rows the caller will consume.
     ///
     /// Only set this when the caller returns the produced entries 1:1 as its

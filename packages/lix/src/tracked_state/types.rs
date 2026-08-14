@@ -77,6 +77,7 @@ pub(crate) struct TrackedStateCommitDeltaRef<'a> {
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
     pub(crate) origin_key: Option<&'a str>,
+    pub(crate) typed_snapshot: Option<&'a crate::changelog::TypedHistorySnapshot>,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     pub(crate) authored: bool,
 }
@@ -206,6 +207,8 @@ pub(crate) struct ColumnarMutationPartSet {
     pub(crate) row_group_set_id: [u8; 16],
     pub(crate) manifest_digest: [u8; 32],
     pub(crate) schema_key: String,
+    pub(crate) schema_layout_fingerprint: String,
+    pub(crate) ordered_identity_digest: [u8; 32],
     pub(crate) row_count: u32,
     pub(crate) group_row_counts: Vec<u32>,
     #[musli(bytes)]

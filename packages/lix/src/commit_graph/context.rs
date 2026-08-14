@@ -80,7 +80,7 @@ where
     // SQL statement. File-history shaping asks the same reader for distinct
     // schema slices of that history, so retain immutable change records here.
     member_changes_cache:
-        HashMap<(Vec<String>, Vec<String>), HashMap<CommitId, Vec<CommitGraphChange>>>,
+        HashMap<(Vec<String>, Vec<String>, bool), HashMap<CommitId, Vec<CommitGraphChange>>>,
 }
 
 enum LinearMergeBase {
@@ -580,6 +580,7 @@ where
                 node.commit_id,
                 &shaping.member_schema_keys,
                 &shaping.member_file_ids,
+                request.typed_entity_payloads,
             )
             .await?
         {
@@ -603,8 +604,9 @@ where
         commit_id: CommitId,
         schema_keys: &[String],
         file_ids: &[String],
+        typed_entity_payloads: bool,
     ) -> Result<Vec<CommitGraphChange>, LixError> {
-        let cache_key = (schema_keys.to_vec(), file_ids.to_vec());
+        let cache_key = (schema_keys.to_vec(), file_ids.to_vec(), typed_entity_payloads);
         if let Some(changes) = self
             .member_changes_cache
             .get(&cache_key)
@@ -612,14 +614,17 @@ where
         {
             return Ok(changes.clone());
         }
-        let members = crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
-            &self.store,
-            commit_id,
-            schema_keys,
-            file_ids,
-            usize::MAX,
-        )
-        .await?
+        let members = if typed_entity_payloads {
+            crate::tracked_state::load_commit_delta_members_with_typed_payloads_for_schemas(
+                &self.store, commit_id, schema_keys, file_ids, usize::MAX,
+            )
+            .await?
+        } else {
+            crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
+                &self.store, commit_id, schema_keys, file_ids, usize::MAX,
+            )
+            .await?
+        }
         .expect("unbounded commit member load cannot exceed its segment limit");
         let mut changes = members
             .into_iter()
@@ -697,6 +702,7 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot: change.snapshot,
+        typed_snapshot: change.typed_snapshot,
         metadata: change.metadata,
         created_at: change.created_at,
         origin_key: change.origin_key,
@@ -951,6 +957,7 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+        typed_snapshot: None,
         metadata: crate::json_store::JsonSlot::None,
         created_at: node.created_at,
         origin_key: None,
@@ -1578,6 +1585,7 @@ mod tests {
             .expect("commit should stage");
         let deltas = [
             TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta: TrackedStateDeltaRef {
                     schema_key: "alpha",
                     file_id: None,
@@ -1595,6 +1603,7 @@ mod tests {
                 authored: false,
             },
             TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta: TrackedStateDeltaRef {
                     schema_key: "beta",
                     file_id: None,
@@ -1612,6 +1621,7 @@ mod tests {
                 authored: false,
             },
             TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta: TrackedStateDeltaRef {
                     schema_key: "alpha",
                     file_id: None,
@@ -1962,6 +1972,7 @@ mod tests {
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: crate::json_store::JsonSlot::None,
+                    typed_snapshot: None,
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     origin_key: None,
@@ -1996,6 +2007,7 @@ mod tests {
                         .map_or(crate::json_store::JsonSlot::None, |content| {
                             crate::json_store::JsonSlot::from_json(content)
                         }),
+                    typed_snapshot: None,
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: ts(created_at),
                     origin_key: None,
@@ -2127,6 +2139,7 @@ mod tests {
             let deltas = members
                 .iter()
                 .map(|change| TrackedStateCommitDeltaRef {
+                    typed_snapshot: None,
                     delta: TrackedStateDeltaRef {
                         schema_key: &change.schema_key,
                         file_id: change.file_id.as_deref(),
@@ -2209,6 +2222,7 @@ mod tests {
             schema_key: change.change.schema_key.clone(),
             file_id: change.change.file_id.clone(),
             snapshot: change.change.snapshot.clone(),
+            typed_snapshot: change.change.typed_snapshot.clone(),
             metadata: change.change.metadata.clone(),
             created_at: change.change.created_at,
             origin_key: change.change.origin_key.clone(),

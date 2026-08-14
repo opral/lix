@@ -12,10 +12,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
+    TimestampMicrosecondArray,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::compute::{concat, concat_batches};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::LixError;
@@ -98,6 +99,7 @@ pub(crate) enum RowGroupDataType {
     Int64 = 2,
     Float64 = 3,
     Boolean = 4,
+    TimestampMicros = 5,
 }
 
 impl RowGroupDataType {
@@ -107,6 +109,7 @@ impl RowGroupDataType {
             DataType::Int64 => Ok(Self::Int64),
             DataType::Float64 => Ok(Self::Float64),
             DataType::Boolean => Ok(Self::Boolean),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(Self::TimestampMicros),
             other => Err(row_group_error(format!(
                 "unsupported row-group Arrow type {other}"
             ))),
@@ -119,6 +122,7 @@ impl RowGroupDataType {
             Self::Int64 => DataType::Int64,
             Self::Float64 => DataType::Float64,
             Self::Boolean => DataType::Boolean,
+            Self::TimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         }
     }
 
@@ -128,6 +132,7 @@ impl RowGroupDataType {
             2 => Ok(Self::Int64),
             3 => Ok(Self::Float64),
             4 => Ok(Self::Boolean),
+            5 => Ok(Self::TimestampMicros),
             _ => Err(row_group_error(
                 "row-group manifest has an unknown column type",
             )),
@@ -141,6 +146,7 @@ pub(crate) enum RowGroupScalar {
     Int64(i64),
     Float64(f64),
     Boolean(bool),
+    TimestampMicros(i64),
 }
 
 impl PartialEq for RowGroupScalar {
@@ -240,7 +246,8 @@ impl RowGroupManifest {
                 Some(
                     RowGroupScalar::Int64(_)
                     | RowGroupScalar::Float64(_)
-                    | RowGroupScalar::Boolean(_),
+                    | RowGroupScalar::Boolean(_)
+                    | RowGroupScalar::TimestampMicros(_),
                 )
                 | None => 0,
             }
@@ -987,6 +994,15 @@ fn encode_column(array: &ArrayRef, data_type: RowGroupDataType) -> Result<Vec<u8
                 raw.extend_from_slice(&values.value(index).to_le_bytes());
             }
         }
+        RowGroupDataType::TimestampMicros => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| row_group_error("row-group Timestamp column downcast failed"))?;
+            for index in 0..values.len() {
+                raw.extend_from_slice(&values.value(index).to_le_bytes());
+            }
+        }
         RowGroupDataType::Float64 => {
             let values = array
                 .as_any()
@@ -1080,6 +1096,16 @@ fn decode_column(
                 values.push(cursor.i64_le()?);
             }
             Arc::new(Int64Array::new(ScalarBuffer::from(values), nulls))
+        }
+        RowGroupDataType::TimestampMicros => {
+            let mut values = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
+                values.push(cursor.i64_le()?);
+            }
+            Arc::new(
+                TimestampMicrosecondArray::new(ScalarBuffer::from(values), nulls)
+                    .with_timezone("UTC"),
+            )
         }
         RowGroupDataType::Float64 => {
             let mut values = Vec::with_capacity(row_count);
@@ -1206,6 +1232,26 @@ fn column_statistics(
                 Some(RowGroupScalar::Int64(min)),
                 Some(RowGroupScalar::Int64(max)),
                 sum.map(RowGroupScalar::Int64),
+            )
+        }
+        RowGroupDataType::TimestampMicros => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| row_group_error("row-group Timestamp statistics downcast failed"))?;
+            let mut observed = values.iter().flatten();
+            let Some(first) = observed.next() else {
+                return Ok(RowGroupColumnStatistics { null_count, min: None, max: None, sum: None });
+            };
+            let (mut min, mut max) = (first, first);
+            for value in observed {
+                min = min.min(value);
+                max = max.max(value);
+            }
+            (
+                Some(RowGroupScalar::TimestampMicros(min)),
+                Some(RowGroupScalar::TimestampMicros(max)),
+                None,
             )
         }
         RowGroupDataType::Float64 => {
@@ -1494,6 +1540,9 @@ fn put_optional_scalar(
         (RowGroupDataType::Int64, RowGroupScalar::Int64(value)) => {
             output.extend_from_slice(&value.to_le_bytes());
         }
+        (RowGroupDataType::TimestampMicros, RowGroupScalar::TimestampMicros(value)) => {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
         (RowGroupDataType::Float64, RowGroupScalar::Float64(value)) => {
             output.extend_from_slice(&value.to_bits().to_le_bytes());
         }
@@ -1631,6 +1680,9 @@ impl<'a> Cursor<'a> {
             1 => Ok(Some(match data_type {
                 RowGroupDataType::String => RowGroupScalar::String(self.string()?),
                 RowGroupDataType::Int64 => RowGroupScalar::Int64(self.i64_le()?),
+                RowGroupDataType::TimestampMicros => {
+                    RowGroupScalar::TimestampMicros(self.i64_le()?)
+                }
                 RowGroupDataType::Float64 => {
                     RowGroupScalar::Float64(f64::from_bits(self.u64_le()?))
                 }

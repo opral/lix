@@ -4681,7 +4681,7 @@ fn validate_diff_row_against_changelog(
         )));
     };
     tracked_state_winner_identity_for_diff_row(row, change)?;
-    if row.deleted != change.snapshot.is_none() {
+    if row.deleted != authenticated_change_deleted(change)? {
         return Err(LixError::unknown(format!(
             "tracked-state diff row for change '{}' deleted flag does not match changelog snapshot",
             row.change_id
@@ -4714,7 +4714,7 @@ fn validate_tree_diff_row_against_changelog(
         change_id,
         change,
     )?;
-    if row.deleted() != change.snapshot.is_none() {
+    if row.deleted() != authenticated_change_deleted(change)? {
         return Err(LixError::unknown(format!(
             "tracked-state diff row for change '{change_id}' deleted flag does not match changelog snapshot"
         )));
@@ -4725,6 +4725,18 @@ fn validate_tree_diff_row_against_changelog(
         )));
     }
     Ok(())
+}
+
+fn authenticated_change_deleted(change: &ChangeRecord) -> Result<bool, LixError> {
+    match (change.snapshot.is_some(), change.typed_snapshot.as_ref()) {
+        (true, None) => Ok(false),
+        (false, Some(typed)) => Ok(typed.deleted),
+        (false, None) => Ok(true),
+        (true, Some(_)) => Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "change member has duplicate JSON and typed snapshot authorities",
+        )),
+    }
 }
 
 fn tracked_state_winner_identity_for_diff_row(
@@ -9140,6 +9152,7 @@ mod tests {
         let staged = crate::tracked_state::stage_commit_deltas_for_commit_state(
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta: TrackedStateDeltaRef {
                     schema_key: SCHEMA_KEY,
                     file_id: Some(FILE_ID),

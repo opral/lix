@@ -10,6 +10,7 @@ pub(crate) fn test_change_record() -> ChangeRecord {
         entity_pk: EntityPk::single("entity-1"),
         file_id: Some("file-1".to_string()),
         snapshot: crate::json_store::JsonSlot::None,
+        typed_snapshot: None,
         metadata: crate::json_store::JsonSlot::None,
         created_at: crate::common::LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
         origin_key: None,

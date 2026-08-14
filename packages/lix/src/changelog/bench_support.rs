@@ -515,6 +515,7 @@ fn direct_append_with_shape(
                 snapshot: crate::json_store::JsonSlot::from_json(&format!(
                     "{{\"value\":{next_change}}}"
                 )),
+                typed_snapshot: None,
                 metadata: crate::json_store::JsonSlot::None,
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",

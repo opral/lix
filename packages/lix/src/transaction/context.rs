@@ -200,6 +200,7 @@ where
                     schema_key: row.schema_key,
                     file_id: row.file_id,
                     snapshot_content: row.snapshot_content,
+                    typed_snapshot: None,
                     metadata: row.metadata,
                     created_at: row.created_at.to_string(),
                     origin_key: None,

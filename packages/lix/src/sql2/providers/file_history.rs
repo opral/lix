@@ -2635,6 +2635,7 @@ mod tests {
                 schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 file_id: Some(file_id.to_string()),
                 snapshot_content: snapshot_content.map(Into::into),
+                typed_snapshot: None,
                 metadata: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 origin_key: None,

@@ -7,14 +7,17 @@ use crate::columnar_row_group::{RowGroupRowLocation, RowGroupSetId};
 
 pub(crate) const ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY: &str =
     "lix.entity_columnar.lossless_snapshot.v1";
+pub(crate) const ENTITY_COLUMNAR_TYPED_HISTORY_METADATA_KEY: &str =
+    "lix.entity_columnar.typed_history.v1";
 pub(crate) const ENTITY_COLUMNAR_ENTITY_PK_FIELD: &str = "lixcol_entity_pk";
+pub(crate) const ENTITY_COLUMNAR_DELETED_FIELD: &str = "lixcol_is_deleted";
 
 pub(crate) fn entity_identity_column_index(
     manifest: &crate::columnar_row_group::RowGroupManifest,
 ) -> Option<usize> {
     (manifest
         .metadata
-        .get(ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
+        .get(ENTITY_COLUMNAR_TYPED_HISTORY_METADATA_KEY)
         .map(String::as_str)
         == Some("true"))
     .then(|| manifest.fields.len().checked_sub(1))
@@ -25,6 +28,7 @@ pub(crate) fn entity_identity_column_index(
 pub(crate) struct EntityColumnarWriteSets {
     sets: BTreeMap<(CommitId, String), crate::columnar_row_group::EncodedRowGroupSet>,
     state_row_locations: StateRowLocations,
+    typed_history_snapshots: Vec<Option<crate::changelog::TypedHistorySnapshot>>,
 }
 
 enum StateRowLocations {
@@ -38,6 +42,7 @@ impl EntityColumnarWriteSets {
         Self {
             sets: BTreeMap::new(),
             state_row_locations: StateRowLocations::None,
+            typed_history_snapshots: Vec::new(),
         }
     }
 
@@ -45,6 +50,7 @@ impl EntityColumnarWriteSets {
         Self {
             sets: BTreeMap::new(),
             state_row_locations: StateRowLocations::Explicit(vec![None; row_count]),
+            typed_history_snapshots: vec![None; row_count],
         }
     }
 
@@ -52,14 +58,14 @@ impl EntityColumnarWriteSets {
         Self {
             sets: BTreeMap::new(),
             state_row_locations: StateRowLocations::Dense { row_count },
+            typed_history_snapshots: vec![None; row_count],
         }
     }
 
-    pub(crate) fn dense_state_row_count(&self) -> Option<usize> {
-        match &self.state_row_locations {
-            StateRowLocations::Dense { row_count } => Some(*row_count),
-            StateRowLocations::None | StateRowLocations::Explicit(_) => None,
-        }
+    pub(crate) fn covers_state_rows(&self, state_row_indices: &[usize]) -> bool {
+        state_row_indices
+            .iter()
+            .all(|&index| self.state_row_location(index).is_some())
     }
 
     pub(crate) fn get(
@@ -97,6 +103,23 @@ impl EntityColumnarWriteSets {
                 panic!("explicit entity row location requires an explicit location column")
             }
         }
+    }
+
+    pub(crate) fn set_typed_history_snapshot(
+        &mut self,
+        state_row_index: usize,
+        snapshot: crate::changelog::TypedHistorySnapshot,
+    ) {
+        self.typed_history_snapshots[state_row_index] = Some(snapshot);
+    }
+
+    pub(crate) fn typed_history_snapshot(
+        &self,
+        state_row_index: usize,
+    ) -> Option<&crate::changelog::TypedHistorySnapshot> {
+        self.typed_history_snapshots
+            .get(state_row_index)
+            .and_then(Option::as_ref)
     }
 
     pub(crate) fn state_row_location(&self, state_row_index: usize) -> Option<RowGroupRowLocation> {

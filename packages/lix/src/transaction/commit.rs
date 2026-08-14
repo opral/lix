@@ -356,7 +356,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let mut insert_selection = prepared_writes.insert_selection;
     let mut entity_columnar_write_sets = prepare_entity_columnar_write_sets(
         &mut state_rows,
-        &insert_selection,
         entity_schema_catalog,
     )?;
     release_validated_canonical_value_columns(&mut state_rows);
@@ -613,11 +612,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         }
     }
 
-    let checkpoint_commit_ids = prepared_writes
-        .checkpoint_publications
-        .iter()
-        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
-        .collect::<BTreeSet<_>>();
     let staged_delta_index = Box::pin(stage_tracked_commit_delta_index(
         read,
         &mut writes,
@@ -632,7 +626,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &insert_selection,
         &replacement_generations,
         &ordered_replacements,
-        &checkpoint_commit_ids,
     ))
     .await?;
 
@@ -1758,6 +1751,7 @@ fn branch_ref_change_record(
         })?,
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+        typed_snapshot: None,
         metadata: crate::json_store::JsonSlot::None,
         created_at: root.ref_updated_at,
         origin_key: None,
@@ -1791,6 +1785,7 @@ fn deterministic_sequence_current_row(
             entity_pk,
             file_id: None,
             snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+            typed_snapshot: None,
             metadata: crate::json_store::JsonSlot::None,
             created_at: timestamp,
             origin_key: None,
@@ -1832,20 +1827,27 @@ fn tracked_delta_from_state_row(
     })
 }
 
-fn tracked_commit_delta_from_state_row(
-    row: PreparedStateRowRef<'_>,
-) -> Result<TrackedStateCommitDeltaRef<'_>, LixError> {
+fn tracked_commit_delta_from_state_row<'a>(
+    row: PreparedStateRowRef<'a>,
+    typed_snapshot: Option<&'a crate::changelog::TypedHistorySnapshot>,
+) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
     Ok(TrackedStateCommitDeltaRef {
         delta: tracked_delta_from_state_row(row)?,
-        snapshot: row.snapshot.map_or(
-            crate::json_store::JsonSlotRef::None,
-            crate::transaction_types::StageJson::slot_ref,
+        snapshot: typed_snapshot.map_or_else(
+            || {
+                row.snapshot.map_or(
+                    crate::json_store::JsonSlotRef::None,
+                    crate::transaction_types::StageJson::slot_ref,
+                )
+            },
+            |_| crate::json_store::JsonSlotRef::None,
         ),
         metadata: row.metadata.map_or(
             crate::json_store::JsonSlotRef::None,
             crate::transaction_types::StageJson::slot_ref,
         ),
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
+        typed_snapshot,
         base_coordinate: None,
         authored: true,
     })
@@ -1899,8 +1901,9 @@ fn tracked_commit_delta_from_certified_root_row<'a>(
                     crate::json_store::JsonSlotRef::Inline(metadata.as_str()),
                     crate::json_store::JsonSlotRef::Ref,
                 )
-            }),
+        }),
         origin_key: None,
+        typed_snapshot: None,
         base_coordinate: None,
         authored: true,
     })
@@ -1919,6 +1922,21 @@ fn tracked_delta_from_selected_change_ref(
         deleted: change_ref.deleted,
         created_at: change_ref.created_at,
         updated_at: change_ref.updated_at,
+    })
+}
+
+fn selected_change_is_shadowed_by_authored_row(
+    change_ref: StagedCommitChangeRef<'_>,
+    commit_id: CommitId,
+    state_rows: &PreparedStateBatch,
+    state_row_indices: &[RowIndex],
+) -> bool {
+    state_row_indices.iter().any(|&row_index| {
+        let row = state_rows.row(row_index);
+        row.commit_id == Some(commit_id)
+            && row.schema_key == change_ref.schema_key()
+            && row.file_id.map(crate::common::SharedStr::as_str) == change_ref.file_id()
+            && row.entity_pk == change_ref.entity_pk()
     })
 }
 
@@ -1957,6 +1975,7 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
             record.metadata.as_ref_slot()
         }),
         origin_key: record.and_then(|record| record.origin_key.as_deref()),
+        typed_snapshot: None,
         base_coordinate: None,
         authored: false,
     })
@@ -2258,7 +2277,6 @@ async fn stage_tracked_commit_delta_index(
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
-    checkpoint_commit_ids: &BTreeSet<CommitId>,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let mut inventories = BTreeMap::new();
@@ -2411,14 +2429,14 @@ async fn stage_tracked_commit_delta_index(
                 )
                 .entered();
                 let state_rows = &*state_rows;
-                let order_certified = state_rows.certified_tracked_keys_strictly_ordered()
+                let order_certified = (state_row_indices.len() <= 1
+                    || state_rows.certified_tracked_keys_strictly_ordered())
                     && state_row_indices.len() == state_rows.len()
                     && state_row_indices
                         .iter()
                         .enumerate()
                         .all(|(index, &row_index)| index == row_index);
                 if replacement_generation.is_none()
-                    && order_certified
                     && let Some(stage) = try_stage_lossless_columnar_mutations(
                         writes,
                         root.commit_id,
@@ -2431,7 +2449,10 @@ async fn stage_tracked_commit_delta_index(
                 } else {
                     let make_delta = |row_index| {
                         let row = state_rows.row(row_index);
-                        let mut delta = tracked_commit_delta_from_state_row(row)?;
+                        let mut delta = tracked_commit_delta_from_state_row(
+                            row,
+                            entity_columnar_write_sets.typed_history_snapshot(row_index),
+                        )?;
                         if let Some(created_at) = lifecycle_created_at {
                             delta.delta.created_at = created_at;
                         }
@@ -2495,7 +2516,10 @@ async fn stage_tracked_commit_delta_index(
         for &row_index in state_row_indices {
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
-            let mut delta = tracked_commit_delta_from_state_row(row)?;
+            let mut delta = tracked_commit_delta_from_state_row(
+                row,
+                entity_columnar_write_sets.typed_history_snapshot(row_index),
+            )?;
             delta.base_coordinate = entity_columnar_write_sets
                 .state_row_location(row_index)
                 .map(
@@ -2515,7 +2539,14 @@ async fn stage_tracked_commit_delta_index(
             // not need standalone change locators in the public ledger.
             addressable.push(false);
         }
-        for change_ref in selected_changes(&staged.selected_change_batches) {
+        for change_ref in selected_changes(&staged.selected_change_batches).filter(|change_ref| {
+            !selected_change_is_shadowed_by_authored_row(
+                *change_ref,
+                root.commit_id,
+                state_rows,
+                state_row_indices,
+            )
+        }) {
             *selected_members_by_source
                 .entry(change_ref.source_commit_id)
                 .or_default() += 1;
@@ -2542,10 +2573,7 @@ async fn stage_tracked_commit_delta_index(
                 "lix.perf.commit_delta_selected_sources"
             );
         }
-        let is_checkpoint_commit = checkpoint_commit_ids.contains(&root.commit_id);
         let selected_source_alias = if certified_root_rows.is_empty()
-            && !state_row_indices.is_empty()
-            && is_checkpoint_commit
             && selected_members_by_source.len() == 1
         {
             let source_commit_id = *selected_members_by_source
@@ -2679,7 +2707,7 @@ fn try_stage_lossless_columnar_mutations(
     entity_columnar_write_sets: &mut crate::hot_state::EntityColumnarWriteSets,
 ) -> Result<Option<crate::tracked_state::OrderedAddressableCommitDeltaStage>, LixError> {
     if state_row_indices.is_empty()
-        || entity_columnar_write_sets.dense_state_row_count() != Some(state_row_indices.len())
+        || !entity_columnar_write_sets.covers_state_rows(state_row_indices)
     {
         return Ok(None);
     }
@@ -2691,7 +2719,7 @@ fn try_stage_lossless_columnar_mutations(
     if encoded
         .manifest
         .metadata
-        .get(crate::sql2::ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
+        .get(crate::sql2::ENTITY_COLUMNAR_TYPED_HISTORY_METADATA_KEY)
         .map(String::as_str)
         != Some("true")
         || encoded.manifest.row_count()
@@ -2699,12 +2727,33 @@ fn try_stage_lossless_columnar_mutations(
     {
         return Ok(None);
     }
-    let mut identity_digest = blake3::Hasher::new();
+
+    let mut group_offsets = Vec::with_capacity(encoded.manifest.groups.len());
+    let mut next_group_offset = 0_usize;
+    for group in &encoded.manifest.groups {
+        group_offsets.push(next_group_offset);
+        next_group_offset = next_group_offset
+            .checked_add(usize::try_from(group.row_count).expect("u32 row count fits usize"))
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "columnar mutation physical row count overflowed usize",
+                )
+            })?;
+    }
+    if next_group_offset != state_row_indices.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "columnar mutation physical row count does not match authored rows",
+        ));
+    }
+
+    let mut source_to_physical_row = Vec::with_capacity(state_row_indices.len());
+    let mut physical_rows = Vec::with_capacity(state_row_indices.len());
     for &row_index in state_row_indices {
         let row = state_rows.row(row_index);
         if row.schema_key != first.schema_key
             || row.file_id.is_some()
-            || row.snapshot.is_none()
             || row.metadata.is_some()
             || row.created_at != first.created_at
             || row.updated_at != first.updated_at
@@ -2715,28 +2764,67 @@ fn try_stage_lossless_columnar_mutations(
         {
             return Ok(None);
         }
-        let Ok(identity) = row.entity_pk.as_single_string() else {
-            return Ok(None);
-        };
+        let location = entity_columnar_write_sets
+            .state_row_location(row_index)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "typed columnar mutation omitted an authored row location",
+                )
+            })?;
+        let group_index = usize::try_from(location.group_index).expect("u32 group index fits usize");
+        let group_offset = group_offsets.get(group_index).copied().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "typed columnar mutation row location references a missing group",
+            )
+        })?;
+        let group_row_count = usize::try_from(encoded.manifest.groups[group_index].row_count)
+            .expect("u32 row count fits usize");
+        let row_in_group = usize::try_from(location.row_index).expect("u32 row index fits usize");
+        if row_in_group >= group_row_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "typed columnar mutation row location exceeds its group",
+            ));
+        }
+        let physical_row = group_offset + row_in_group;
+        source_to_physical_row.push(physical_row);
+        let identity = row.entity_pk.as_json_array_text()?;
+        physical_rows.push((
+            physical_row,
+            encode_key_ref(TrackedStateKeyRef {
+                schema_key: row.schema_key.as_str(),
+                file_id: None,
+                entity_pk: row.entity_pk,
+            }),
+            identity,
+        ));
+    }
+    physical_rows.sort_by_key(|(physical_row, _, _)| *physical_row);
+    let physical_is_complete = physical_rows
+        .iter()
+        .enumerate()
+        .all(|(expected, (actual, _, _))| expected == *actual);
+    let keys_are_canonical_distinct = physical_rows
+        .windows(2)
+        .all(|rows| rows[0].1 < rows[1].1);
+    if !physical_is_complete || !keys_are_canonical_distinct {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "typed columnar mutation rows are not a canonical distinct StateKey sequence",
+        ));
+    }
+    let mut identity_digest = blake3::Hasher::new();
+    for (_, _, identity) in &physical_rows {
         identity_digest.update(&(identity.len() as u64).to_le_bytes());
         identity_digest.update(identity.as_bytes());
     }
-    let last = state_rows.row(*state_row_indices.last().expect("non-empty rows"));
     let mut page_first_keys = Vec::new();
     let mut page_last_keys = Vec::new();
-    for page in state_row_indices.chunks(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS) {
-        let page_first = state_rows.row(page[0]);
-        let page_last = state_rows.row(*page.last().expect("non-empty mutation page"));
-        page_first_keys.push(encode_key_ref(TrackedStateKeyRef {
-            schema_key: page_first.schema_key.as_str(),
-            file_id: None,
-            entity_pk: page_first.entity_pk,
-        }));
-        page_last_keys.push(encode_key_ref(TrackedStateKeyRef {
-            schema_key: page_last.schema_key.as_str(),
-            file_id: None,
-            entity_pk: page_last.entity_pk,
-        }));
+    for page in physical_rows.chunks(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS) {
+        page_first_keys.push(page[0].1.clone());
+        page_last_keys.push(page.last().expect("non-empty mutation page").1.clone());
     }
     let parts = crate::tracked_state::ColumnarMutationPartSet {
         owner_commit_id: *commit_id.as_uuid().as_bytes(),
@@ -2747,6 +2835,18 @@ fn try_stage_lossless_columnar_mutations(
         .as_bytes(),
         manifest_digest: encoded.manifest.content_digest()?,
         schema_key: first.schema_key.to_string(),
+        schema_layout_fingerprint: encoded
+            .manifest
+            .metadata
+            .get(crate::sql2::ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+            .cloned()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "lossless columnar mutation manifest is missing its schema layout fingerprint",
+                )
+            })?,
+        ordered_identity_digest: *identity_digest.finalize().as_bytes(),
         row_count: u32::try_from(state_row_indices.len()).map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -2759,16 +2859,12 @@ fn try_stage_lossless_columnar_mutations(
             .iter()
             .map(|group| group.row_count)
             .collect(),
-        first_key: encode_key_ref(TrackedStateKeyRef {
-            schema_key: first.schema_key.as_str(),
-            file_id: None,
-            entity_pk: first.entity_pk,
-        }),
-        last_key: encode_key_ref(TrackedStateKeyRef {
-            schema_key: last.schema_key.as_str(),
-            file_id: None,
-            entity_pk: last.entity_pk,
-        }),
+        first_key: physical_rows[0].1.clone(),
+        last_key: physical_rows
+            .last()
+            .expect("non-empty physical rows")
+            .1
+            .clone(),
         page_first_keys,
         page_last_keys,
         uniform_created_at: first.created_at,
@@ -2783,10 +2879,12 @@ fn try_stage_lossless_columnar_mutations(
         crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id),
         &encoded,
     )?;
+    let ordered_identity_digest = parts.ordered_identity_digest;
     crate::tracked_state::stage_ordered_columnar_mutations(
         commit_id,
         parts,
-        *identity_digest.finalize().as_bytes(),
+        ordered_identity_digest,
+        source_to_physical_row,
     )
     .map(Some)
 }
@@ -3340,7 +3438,14 @@ async fn build_lifecycle_tracked_snapshots(
                 ),
             )
         })?;
-        for change_ref in selected_changes(&staged.selected_change_batches) {
+        for change_ref in selected_changes(&staged.selected_change_batches).filter(|change_ref| {
+            !selected_change_is_shadowed_by_authored_row(
+                *change_ref,
+                root.commit_id,
+                state_rows,
+                row_indices,
+            )
+        }) {
             let key = selected_change_key(change_ref);
             let source = prepared_by_identity.get(&key.identity);
             let payload = selected_payloads.get(&key);
@@ -3742,6 +3847,14 @@ async fn stage_tracked_head(
             && !tracked_snapshots.contains_key(&root.commit_id)
         {
             let selected_rows = selected_changes(&staged.selected_change_batches)
+                .filter(|change_ref| {
+                    !selected_change_is_shadowed_by_authored_row(
+                        *change_ref,
+                        root.commit_id,
+                        state_rows,
+                        state_row_indices,
+                    )
+                })
                 .map(|change_ref| {
                     let key = selected_change_key(change_ref);
                     lifecycle_selected_tracked_row(
@@ -5430,17 +5543,12 @@ fn release_validated_canonical_value_columns(state_rows: &mut PreparedStateBatch
 
 fn prepare_entity_columnar_write_sets(
     state_rows: &mut PreparedStateBatch,
-    insert_selection: &PreparedInsertSelection,
     entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<crate::hot_state::EntityColumnarWriteSets, LixError> {
-    if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS {
-        return Ok(crate::hot_state::EntityColumnarWriteSets::new());
-    }
-    let publishes_ordered_insert =
-        insert_selection.len() == state_rows.len() && insert_selection.covers_all(state_rows.len());
-    if !publishes_ordered_insert {
-        return Ok(crate::hot_state::EntityColumnarWriteSets::new());
-    }
+    // History post-images use the registered schema's canonical typed row
+    // layout for every eligible authored batch. Keeping this behind the old
+    // large-insert threshold would leave ordinary UPDATE/DELETE history on the
+    // JSON LXCD payload authority and create two durable representations.
     if let Some((commit_id, schema_key, row_groups)) = state_rows.take_dense_entity_columnar() {
         let layout_is_current = entity_schema_catalog
             .and_then(|catalog| catalog.schema(&schema_key))
@@ -5455,8 +5563,14 @@ fn prepare_entity_columnar_write_sets(
                             fingerprint == &spec.columnar_layout_fingerprint()
                         })
                     && row_groups.input_locations.len() == state_rows.len()
+                    && (state_rows.len() <= 1
+                        || state_rows.certified_tracked_keys_strictly_ordered())
             });
         if layout_is_current {
+            let spec = entity_schema_catalog
+                .and_then(|catalog| catalog.schema(&schema_key))
+                .and_then(|schema| crate::sql2::derive_entity_surface_spec_from_schema(schema).ok())
+                .expect("accepted dense entity layout retains its registered schema");
             let (row_group_set, input_locations) = row_groups.into_parts();
             let mut encoded = match input_locations {
                 crate::sql2::EntityRowGroupLocations::Dense { row_count } => {
@@ -5474,6 +5588,15 @@ fn prepare_entity_columnar_write_sets(
                 }
             };
             encoded.insert((commit_id, schema_key), row_group_set);
+            for state_row_index in 0..state_rows.len() {
+                let row = state_rows.row(state_row_index);
+                let snapshot = crate::sql2::encode_registered_entity_history_snapshot(
+                    &spec,
+                    row.snapshot
+                        .map(|snapshot| snapshot.normalized().as_bytes()),
+                )?;
+                encoded.set_typed_history_snapshot(state_row_index, snapshot);
+            }
             return Ok(encoded);
         }
     }
@@ -5488,8 +5611,7 @@ fn prepare_entity_columnar_write_sets(
         let rows = state_rows.iter().zip(snapshots).map(|(row, snapshot)| {
             crate::sql2::EntityColumnarRowRef {
                 entity_pk: row.entity_pk,
-                snapshot_bytes: snapshot.normalized().as_bytes(),
-                snapshot_value: snapshot.value(),
+                snapshot_bytes: Some(snapshot.normalized().as_bytes()),
             }
         });
         let mut encoded =
@@ -5501,14 +5623,20 @@ fn prepare_entity_columnar_write_sets(
             }
             encoded.insert((commit_id, schema_key.to_string()), row_group_set);
         }
+        for state_row_index in 0..state_rows.len() {
+            let row = state_rows.row(state_row_index);
+            let snapshot = crate::sql2::encode_registered_entity_history_snapshot(
+                &spec,
+                row.snapshot
+                    .map(|snapshot| snapshot.normalized().as_bytes()),
+            )?;
+            encoded.set_typed_history_snapshot(state_row_index, snapshot);
+        }
         return Ok(encoded);
     }
     let mut indices = BTreeMap::<(CommitId, String), Vec<usize>>::new();
     for (index, row) in state_rows.iter().enumerate() {
-        if !insert_selection.contains(index) {
-            return Ok(crate::hot_state::EntityColumnarWriteSets::new());
-        }
-        let (Some(commit_id), Some(_snapshot)) = (row.commit_id, row.snapshot) else {
+        let Some(commit_id) = row.commit_id else {
             continue;
         };
         if row.untracked || row.global || row.file_id.is_some() {
@@ -5522,9 +5650,6 @@ fn prepare_entity_columnar_write_sets(
     let mut encoded =
         crate::hot_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
     for ((commit_id, schema_key), row_indices) in indices {
-        if row_indices.len() < PACKED_CURRENT_BASE_MIN_ROWS {
-            continue;
-        }
         let Some(schema) = entity_schema_catalog.and_then(|catalog| catalog.schema(&schema_key))
         else {
             continue;
@@ -5532,24 +5657,39 @@ fn prepare_entity_columnar_write_sets(
         let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
             continue;
         };
+        for &state_row_index in &row_indices {
+            let row = state_rows.row(state_row_index);
+            let snapshot = crate::sql2::encode_registered_entity_history_snapshot(
+                &spec,
+                row.snapshot
+                    .map(|snapshot| snapshot.normalized().as_bytes()),
+            )?;
+            encoded.set_typed_history_snapshot(state_row_index, snapshot);
+        }
+        // A columnar group is itself the complete authenticated member
+        // authority only when it owns the entire commit inventory. Mixed
+        // entity/system commits retain one generic member per row, with the
+        // entity member carrying its single typed tuple; staging this group as
+        // well would create a duplicate durable columnar copy.
+        if row_indices.len() != state_rows.len() {
+            continue;
+        }
         let rows = row_indices.iter().map(|&index| {
             let row = state_rows.row(index);
-            let snapshot = row
-                .snapshot
-                .expect("columnar row index retained a snapshot");
             crate::sql2::EntityColumnarRowRef {
                 entity_pk: row.entity_pk,
-                snapshot_bytes: snapshot.normalized().as_bytes(),
-                snapshot_value: snapshot.value(),
+                snapshot_bytes: row
+                    .snapshot
+                    .map(|snapshot| snapshot.normalized().as_bytes()),
             }
         });
-        if let Some(row_groups) = crate::sql2::encode_registered_entity_row_groups(&spec, rows)? {
-            let (row_group_set, input_locations) = row_groups.into_parts();
-            for (&state_row_index, location) in row_indices.iter().zip(input_locations.iter()) {
-                encoded.set_state_row_location(state_row_index, location);
-            }
-            encoded.insert((commit_id, schema_key), row_group_set);
+        let row_groups =
+            crate::sql2::encode_registered_entity_history_row_groups(&spec, rows)?;
+        let (row_group_set, input_locations) = row_groups.into_parts();
+        for (&state_row_index, location) in row_indices.iter().zip(input_locations.iter()) {
+            encoded.set_state_row_location(state_row_index, location);
         }
+        encoded.insert((commit_id, schema_key), row_group_set);
     }
     Ok(encoded)
 }
@@ -5939,9 +6079,18 @@ async fn stage_tracked_roots(
                     .map(tracked_delta_from_certified_root_row),
             )
             .chain(
-                selected_changes(&staged.selected_change_batches).map(|change_ref| {
-                    tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
-                }),
+                selected_changes(&staged.selected_change_batches)
+                    .filter(|change_ref| {
+                        !selected_change_is_shadowed_by_authored_row(
+                            *change_ref,
+                            root.commit_id,
+                            state_rows,
+                            state_row_indices,
+                        )
+                    })
+                    .map(|change_ref| {
+                        tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
+                    }),
             )
             .collect::<Result<Vec<_>, _>>()?;
         let absence_guards = if insert_selection.is_empty() {
@@ -7519,7 +7668,6 @@ mod tests {
             &PreparedInsertSelection::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeSet::new(),
         )
         .await
         .expect("mixed certified delta should stage");

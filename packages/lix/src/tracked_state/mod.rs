@@ -75,6 +75,8 @@ pub(crate) use storage::decode_change_locator;
 pub(crate) use storage::stage_commit_state_manifest;
 #[cfg(test)]
 pub(crate) use storage::stage_sweep_unreachable_content_nodes;
+#[cfg(test)]
+pub(crate) use storage::take_columnar_history_json_projections;
 pub(crate) use storage::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
@@ -83,6 +85,7 @@ pub(crate) use storage::{
     direct_change_locator,
     load_change_record_by_id, load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
+    load_commit_delta_members_with_typed_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
     load_commit_mutation_directory_roots, load_commit_state_manifest, load_commit_state_manifests,
     load_local_selected_change_owner_commit_ids, load_owned_commit_delta_entries,

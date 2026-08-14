@@ -66,7 +66,7 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// `CHECKPOINT_GC_STATE_FORMAT_VERSION` 1 -> 2. Every record is
 /// `#[musli(packed)]`, so one bump carries any number of shape changes at no
 /// extra cost to the user, who recreates the repository once either way.
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v68";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v69";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -404,6 +404,7 @@ where
             .iter()
             .zip(root_deltas.iter().copied())
             .map(|(change, delta)| TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
@@ -562,6 +563,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
         schema_key: change.schema_key.clone(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&change.snapshot_content),
+        typed_snapshot: None,
         metadata: crate::json_store::JsonSlot::None,
         created_at: change.created_at,
         origin_key: None,
@@ -577,6 +579,7 @@ fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord
         schema_key: row.schema_key.clone(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&row.snapshot_content),
+        typed_snapshot: None,
         metadata: crate::json_store::JsonSlot::None,
         created_at: row.updated_at,
         origin_key: None,

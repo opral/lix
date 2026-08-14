@@ -42,6 +42,21 @@ simulation_test!(schema_v1_seven_types_have_a_runnable_entity_surface, |sim| asy
     assert_eq!(values[4], Value::Boolean(true));
     assert_eq!(values[5], Value::Json(json!({"answer": 42}).into()));
     assert!(matches!(values[6], Value::Timestamp(_)));
+
+    let history = session.execute(
+        "SELECT id, label, count, ratio, active, metadata, created_at \
+         FROM seven_type_probe_history() WHERE lixcol_is_deleted = FALSE",
+        &[],
+    ).await.unwrap();
+    assert_eq!(history.len(), 1);
+    let history_values = history.rows()[0].values();
+    assert_eq!(history_values[0], values[0]);
+    assert_eq!(history_values[1], values[1]);
+    assert_eq!(history_values[2], values[2]);
+    assert_eq!(history_values[3], values[3]);
+    assert_eq!(history_values[4], values[4]);
+    assert_eq!(history_values[5], values[5]);
+    assert_eq!(history_values[6], values[6]);
 });
 
 simulation_test!(timestamptz_is_native_and_current_timestamp_is_stable, |sim| async move {

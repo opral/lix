@@ -1471,6 +1471,9 @@ fn entity_columnar_scalar_precision(
         Some(crate::columnar_row_group::RowGroupScalar::Boolean(value)) => {
             ScalarValue::Boolean(Some(*value))
         }
+        Some(crate::columnar_row_group::RowGroupScalar::TimestampMicros(value)) => {
+            ScalarValue::TimestampMicrosecond(Some(*value), Some("UTC".into()))
+        }
         None => return Precision::Absent,
     };
     Precision::Exact(value)
@@ -5643,10 +5646,9 @@ mod tests {
         let encoded = crate::sql2::encode_registered_entity_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
+                |((entity_pk, _snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
                     entity_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 },
             ),
         )
@@ -5721,10 +5723,9 @@ mod tests {
         let encoded = crate::sql2::encode_registered_entity_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
+                |((entity_pk, _snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
                     entity_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 },
             ),
         )
@@ -5797,10 +5798,9 @@ mod tests {
         let encoded = crate::sql2::encode_registered_entity_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
+                |((entity_pk, _snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
                     entity_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 },
             ),
         )
@@ -5867,8 +5867,7 @@ mod tests {
             &spec,
             std::iter::once(crate::sql2::EntityColumnarRowRef {
                 entity_pk: &identity,
-                snapshot_bytes: canonical.as_bytes(),
-                snapshot_value: &snapshot,
+                snapshot_bytes: Some(canonical.as_bytes()),
             }),
         )
         .expect("encode")
@@ -6058,10 +6057,9 @@ mod tests {
         let encoded = crate::sql2::encode_registered_entity_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
+                |((entity_pk, _snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
                     entity_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 },
             ),
         )

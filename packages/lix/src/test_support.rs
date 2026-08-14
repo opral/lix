@@ -107,6 +107,7 @@ pub(crate) async fn seed_branch_head_with_rows(
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: crate::json_store::JsonSlot::from_json(&branch_ref_snapshot),
+                    typed_snapshot: None,
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: test_timestamp(),
                     origin_key: None,
@@ -273,6 +274,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
         .map(|((row_index, _), delta)| {
             let change = &changes[*row_index];
             TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
@@ -356,6 +358,7 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
         .map(|((row_index, _), delta)| {
             let change = &changes[*row_index];
             TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
@@ -426,6 +429,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         .map(|((row_index, _), delta)| {
             let change = &changes[*row_index];
             TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
@@ -810,6 +814,7 @@ pub(crate) fn tracked_change_from_materialized(
             .map_or(crate::json_store::JsonSlot::None, |content| {
                 crate::json_store::JsonSlot::from_json(content)
             }),
+        typed_snapshot: None,
         metadata: row
             .metadata
             .as_ref()

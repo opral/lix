@@ -32,7 +32,7 @@ use crate::sql2::history_route::{
     parse_history_filter, validate_history_anchor_filter,
 };
 use crate::sql2::providers::entity::{
-    entity_f64_value, entity_i64_value, entity_json_text_value, parse_snapshot,
+    entity_f64_value, entity_i64_value, entity_json_text_value,
 };
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -122,6 +122,7 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let mut route = entity_history_route_from_filters(&self.spec, filters)?;
+        route.typed_entity_payloads = true;
         route.default_to_as_of_commit_id(&self.query_source.default_as_of_commit_id);
         let schema = projected_schema(&self.schema, projection);
         let metadata_projection = HistoryMetadataProjection::from_scan(&schema, filters);
@@ -281,7 +282,16 @@ static ENTITY_HISTORY_SYSTEM_COLS: ColumnTable<EntityHistoryRow> = ColumnTable {
         ("lixcol_depth", Col::I64(|row| Some(i64::from(row.depth)))),
         (
             HISTORY_COL_IS_DELETED,
-            Col::Bool(|row| Some(row.change.snapshot_content.is_none())),
+            Col::Bool(|row| {
+                Some(
+                    row.change
+                        .typed_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.deleted)
+                        || (row.change.snapshot_content.is_none()
+                            && row.change.typed_snapshot.is_none()),
+                )
+            }),
         ),
     ],
 };
@@ -303,6 +313,9 @@ fn entity_history_record_batch(
     spec: &EntitySurfaceSpec,
     rows: &[EntityHistoryRow],
 ) -> Result<RecordBatch> {
+    for row in rows {
+        validate_typed_history_row(row, spec)?;
+    }
     let system_fields = schema
         .fields()
         .iter()
@@ -329,6 +342,105 @@ fn entity_history_record_batch(
     )?)
 }
 
+fn validate_typed_history_row(row: &EntityHistoryRow, spec: &EntitySurfaceSpec) -> Result<()> {
+    let Some(snapshot) = row.change.typed_snapshot.as_ref() else {
+        if row.change.snapshot_content.is_some() {
+            return Err(DataFusionError::Execution(format!(
+                "{} registered entity history row omitted its authenticated typed payload",
+                spec.schema_key
+            )));
+        }
+        return Ok(());
+    };
+    if snapshot.schema_layout_fingerprint != spec.columnar_layout_fingerprint() {
+        return Err(DataFusionError::Execution(format!(
+            "{} typed history schema fingerprint mismatch",
+            spec.schema_key
+        )));
+    }
+    if snapshot.deleted {
+        if !snapshot.fields.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "{} typed history tombstone contains payload fields",
+                spec.schema_key
+            )));
+        }
+        return Ok(());
+    }
+    let primary_key_roots = spec
+        .primary_key_paths
+        .iter()
+        .filter_map(|path| path.first().map(String::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = spec
+        .columns
+        .iter()
+        .filter(|column| !primary_key_roots.contains(column.name.as_str()))
+        .map(|column| (column.name.as_str(), column))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut seen = std::collections::BTreeSet::new();
+    for field in &snapshot.fields {
+        let Some(column) = expected.get(field.name.as_str()) else {
+            return Err(DataFusionError::Execution(format!(
+                "{}.{} typed history payload contains an undeclared or duplicated identity field",
+                spec.schema_key, field.name
+            )));
+        };
+        if !seen.insert(field.name.as_str()) {
+            return Err(DataFusionError::Execution(format!(
+                "{}.{} typed history payload contains a duplicate field",
+                spec.schema_key, field.name
+            )));
+        }
+        if field.value.is_none() && !column.read_nullable {
+            return Err(DataFusionError::Execution(format!(
+                "{}.{} typed history payload contains NULL for a non-null column",
+                spec.schema_key, field.name
+            )));
+        }
+        let type_matches = match (&field.value, column.column_type) {
+            (None, _) => true,
+            (Some(crate::changelog::TypedHistoryScalar::String(_)), EntityColumnType::String)
+            | (Some(crate::changelog::TypedHistoryScalar::Jsonb(_)), EntityColumnType::Json)
+            | (Some(crate::changelog::TypedHistoryScalar::Int64(_)), EntityColumnType::Integer)
+            | (
+                Some(crate::changelog::TypedHistoryScalar::Float64Bits(_)),
+                EntityColumnType::Number,
+            )
+            | (
+                Some(crate::changelog::TypedHistoryScalar::Boolean(_)),
+                EntityColumnType::Boolean,
+            )
+            | (
+                Some(crate::changelog::TypedHistoryScalar::TimestampMicros(_)),
+                EntityColumnType::Timestamptz,
+            ) => true,
+            _ => false,
+        };
+        if !type_matches {
+            return Err(DataFusionError::Execution(format!(
+                "{}.{} has the wrong typed history scalar",
+                spec.schema_key, field.name
+            )));
+        }
+        if let Some(crate::changelog::TypedHistoryScalar::Jsonb(value)) = &field.value {
+            serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "{}.{} typed history JSONB is malformed: {error}",
+                    spec.schema_key, field.name
+                ))
+            })?;
+        }
+    }
+    if seen.len() != expected.len() {
+        return Err(DataFusionError::Execution(format!(
+            "{} typed history payload omitted a declared field",
+            spec.schema_key
+        )));
+    }
+    Ok(())
+}
+
 #[expect(trivial_casts)]
 fn entity_history_column_array(
     column_name: &str,
@@ -344,41 +456,76 @@ fn entity_history_column_array(
             ))
         })?
         .column_type;
-    let projected_values = rows
+    let typed_values = rows
         .iter()
-        .map(|row| entity_history_column_value(row, spec, column_name))
+        .map(|row| typed_history_column_value(row, spec, column_name))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(match column_type {
         EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
-            projected_values
+            typed_values
                 .iter()
-                .map(|snapshot| entity_json_text_value(snapshot.as_ref(), column_type))
+                .map(|value| match value {
+                    ProjectedHistoryValue::Typed(Some(
+                        crate::changelog::TypedHistoryScalar::String(value)
+                        | crate::changelog::TypedHistoryScalar::Jsonb(value),
+                    )) => Ok(Some(value.clone())),
+                    ProjectedHistoryValue::Typed(None) => Ok(None),
+                    ProjectedHistoryValue::Identity(value) => {
+                        entity_json_text_value(value.as_ref(), column_type)
+                    }
+                    ProjectedHistoryValue::Typed(Some(_)) => Err(DataFusionError::Execution(
+                        format!("{}.{} has the wrong typed history scalar", spec.schema_key, column_name),
+                    )),
+                })
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Integer => Arc::new(Int64Array::from(
-            projected_values
+            typed_values
                 .iter()
-                .map(|snapshot| entity_i64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .map(|value| match value {
+                    ProjectedHistoryValue::Typed(Some(crate::changelog::TypedHistoryScalar::Int64(value))) => Ok(Some(*value)),
+                    ProjectedHistoryValue::Typed(None) => Ok(None),
+                    ProjectedHistoryValue::Identity(value) => entity_i64_value(value.as_ref(), &spec.schema_key, column_name),
+                    ProjectedHistoryValue::Typed(Some(_)) => Err(DataFusionError::Execution(format!("{}.{} has the wrong typed history scalar", spec.schema_key, column_name))),
+                })
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Number => Arc::new(Float64Array::from(
-            projected_values
+            typed_values
                 .iter()
-                .map(|snapshot| entity_f64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .map(|value| match value {
+                    ProjectedHistoryValue::Typed(Some(crate::changelog::TypedHistoryScalar::Float64Bits(value))) => Ok(Some(f64::from_bits(*value))),
+                    ProjectedHistoryValue::Typed(None) => Ok(None),
+                    ProjectedHistoryValue::Identity(value) => entity_f64_value(value.as_ref(), &spec.schema_key, column_name),
+                    ProjectedHistoryValue::Typed(Some(_)) => Err(DataFusionError::Execution(format!("{}.{} has the wrong typed history scalar", spec.schema_key, column_name))),
+                })
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Boolean => Arc::new(BooleanArray::from(
-            projected_values
+            typed_values
                 .iter()
-                .map(|snapshot| snapshot.as_ref().and_then(JsonValue::as_bool))
-                .collect::<Vec<_>>(),
+                .map(|value| match value {
+                    ProjectedHistoryValue::Typed(Some(crate::changelog::TypedHistoryScalar::Boolean(value))) => Ok(Some(*value)),
+                    ProjectedHistoryValue::Typed(None) => Ok(None),
+                    ProjectedHistoryValue::Identity(value) => Ok(value.as_ref().and_then(JsonValue::as_bool)),
+                    ProjectedHistoryValue::Typed(Some(_)) => Err(DataFusionError::Execution(format!("{}.{} has the wrong typed history scalar", spec.schema_key, column_name))),
+                })
+                .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Timestamptz => Arc::new(
             TimestampMicrosecondArray::from(
-                projected_values
+                typed_values
                     .iter()
-                    .map(|snapshot| {
+                    .map(|projected| {
+                        if let ProjectedHistoryValue::Typed(value) = projected {
+                            return match value {
+                                Some(crate::changelog::TypedHistoryScalar::TimestampMicros(value)) => Ok(Some(*value)),
+                                None => Ok(None),
+                                Some(_) => Err(DataFusionError::Execution(format!("{}.{} has the wrong typed history scalar", spec.schema_key, column_name))),
+                            };
+                        }
+                        let ProjectedHistoryValue::Identity(snapshot) = projected else { unreachable!() };
                         let Some(value) = snapshot.as_ref() else {
                             return Ok(None);
                         };
@@ -407,16 +554,65 @@ fn entity_history_column_array(
     })
 }
 
-fn entity_history_column_value(
+#[derive(Debug)]
+enum ProjectedHistoryValue<'a> {
+    Typed(Option<&'a crate::changelog::TypedHistoryScalar>),
+    Identity(Option<JsonValue>),
+}
+
+fn typed_history_column_value<'a>(
+    row: &'a EntityHistoryRow,
+    spec: &EntitySurfaceSpec,
+    column_name: &str,
+) -> Result<ProjectedHistoryValue<'a>> {
+    let Some(snapshot) = row.change.typed_snapshot.as_ref() else {
+        if row.change.snapshot_content.is_some() {
+            return Err(DataFusionError::Execution(format!(
+                "{}.{} registered entity history row omitted its authenticated typed payload",
+                spec.schema_key, column_name
+            )));
+        }
+        if spec
+            .primary_key_paths
+            .iter()
+            .any(|path| path.first().is_some_and(|root| root == column_name))
+        {
+            return entity_history_identity_column_value(row, spec, column_name)
+                .map(ProjectedHistoryValue::Identity);
+        }
+        return Ok(ProjectedHistoryValue::Typed(None));
+    };
+    if snapshot.schema_layout_fingerprint != spec.columnar_layout_fingerprint() {
+        return Err(DataFusionError::Execution(format!(
+            "{}.{} typed history schema fingerprint mismatch",
+            spec.schema_key, column_name
+        )));
+    }
+    if spec
+        .primary_key_paths
+        .iter()
+        .any(|path| path.first().is_some_and(|root| root == column_name))
+    {
+        return entity_history_identity_column_value(row, spec, column_name)
+            .map(ProjectedHistoryValue::Identity);
+    }
+    if snapshot.deleted {
+        return Ok(ProjectedHistoryValue::Typed(None));
+    }
+    if let Some(field) = snapshot.fields.iter().find(|field| field.name == column_name) {
+        return Ok(ProjectedHistoryValue::Typed(field.value.as_ref()));
+    }
+    Err(DataFusionError::Execution(format!(
+        "{}.{} typed history payload omitted a declared field",
+        spec.schema_key, column_name
+    )))
+}
+
+fn entity_history_identity_column_value(
     row: &EntityHistoryRow,
     spec: &EntitySurfaceSpec,
     column_name: &str,
 ) -> Result<Option<JsonValue>> {
-    let snapshot = parse_snapshot(row.change.snapshot_content.as_deref())?;
-    if let Some(snapshot) = snapshot {
-        return Ok(snapshot.get(column_name).cloned());
-    }
-
     let entity_pk = row.change.entity_pk.as_json_array_text().map_err(|error| {
         DataFusionError::Execution(format!(
             "sql2 entity history provider failed to project entity pk: {error}"
@@ -438,7 +634,244 @@ mod tests {
 
     use crate::sql2::catalog::derive_entity_surface_spec_from_schema;
 
-    use super::entity_history_route_from_filters;
+    use super::{
+        EntityHistoryRow, ProjectedHistoryValue, entity_history_route_from_filters,
+        typed_history_column_value,
+    };
+
+    fn seven_type_spec() -> crate::sql2::catalog::EntitySurfaceSpec {
+        derive_entity_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "seven_type_history",
+            "columns": [
+                {"name":"id", "type":"uuid", "nullable":false},
+                {"name":"label", "type":"text", "nullable":false},
+                {"name":"count", "type":"int8", "nullable":false},
+                {"name":"ratio", "type":"float8", "nullable":false},
+                {"name":"active", "type":"boolean", "nullable":false},
+                {"name":"metadata", "type":"jsonb", "nullable":false},
+                {"name":"created_at", "type":"timestamptz", "nullable":false}
+            ],
+            "primary_key": ["id"]
+        }))
+        .expect("seven-type history schema should derive")
+    }
+
+    fn typed_history_row(
+        fingerprint: String,
+        fields: Vec<crate::changelog::TypedHistoryField>,
+    ) -> EntityHistoryRow {
+        EntityHistoryRow {
+            change: crate::sql2::change_materialization::MaterializedChange {
+                id: "change-1".to_owned(),
+                account_id: "account-1".to_owned(),
+                entity_pk: crate::entity_pk::EntityPk::from_json_array_value(&json!([
+                    "01900000-0000-7000-8000-000000000001"
+                ]))
+                .expect("typed history identity"),
+                schema_key: "seven_type_history".to_owned(),
+                file_id: None,
+                snapshot_content: None,
+            typed_snapshot: Some(crate::changelog::TypedHistorySnapshot {
+                schema_layout_fingerprint: fingerprint,
+                deleted: false,
+                primary_key_paths: vec![vec!["id".to_owned()]],
+                fields,
+            }),
+                metadata: None,
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                origin_key: None,
+            },
+            observed_commit_id: "commit-1".to_owned(),
+            commit_created_at: Some("2026-01-01T00:00:00Z".to_owned()),
+            as_of_commit_id: "commit-1".to_owned(),
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn typed_history_projects_native_scalars_and_authenticated_identity_without_json() {
+        use crate::changelog::{TypedHistoryField, TypedHistoryScalar};
+
+        let spec = seven_type_spec();
+        let row = typed_history_row(
+            spec.columnar_layout_fingerprint(),
+            vec![
+                TypedHistoryField { name: "label".to_owned(), value: Some(TypedHistoryScalar::String("ready".to_owned())) },
+                TypedHistoryField { name: "count".to_owned(), value: Some(TypedHistoryScalar::Int64(42)) },
+                TypedHistoryField { name: "ratio".to_owned(), value: Some(TypedHistoryScalar::Float64Bits(1.5_f64.to_bits())) },
+                TypedHistoryField { name: "active".to_owned(), value: Some(TypedHistoryScalar::Boolean(true)) },
+                TypedHistoryField { name: "metadata".to_owned(), value: Some(TypedHistoryScalar::Jsonb(r#"{"answer":42}"#.to_owned())) },
+                TypedHistoryField { name: "created_at".to_owned(), value: Some(TypedHistoryScalar::TimestampMicros(1_767_225_600_000_000)) },
+            ],
+        );
+
+        assert!(matches!(
+            typed_history_column_value(&row, &spec, "label").expect("label"),
+            ProjectedHistoryValue::Typed(Some(TypedHistoryScalar::String(value))) if value == "ready"
+        ));
+        assert!(matches!(
+            typed_history_column_value(&row, &spec, "metadata").expect("metadata"),
+            ProjectedHistoryValue::Typed(Some(TypedHistoryScalar::Jsonb(value))) if value == r#"{"answer":42}"#
+        ));
+        assert!(matches!(
+            typed_history_column_value(&row, &spec, "id").expect("authenticated identity"),
+            ProjectedHistoryValue::Identity(Some(serde_json::Value::String(value)))
+                if value == "01900000-0000-7000-8000-000000000001"
+        ));
+    }
+
+    #[test]
+    fn typed_history_rejects_wrong_fingerprint_and_missing_declared_field() {
+        let spec = seven_type_spec();
+        let wrong = typed_history_row("wrong-layout".to_owned(), Vec::new());
+        assert!(typed_history_column_value(&wrong, &spec, "label")
+            .expect_err("wrong schema fingerprint must fail")
+            .to_string()
+            .contains("schema fingerprint mismatch"));
+
+        let missing = typed_history_row(spec.columnar_layout_fingerprint(), Vec::new());
+        assert!(typed_history_column_value(&missing, &spec, "label")
+            .expect_err("missing typed field must fail")
+            .to_string()
+            .contains("omitted a declared field"));
+
+        let mut legacy = typed_history_row(spec.columnar_layout_fingerprint(), Vec::new());
+        legacy.change.typed_snapshot = None;
+        legacy.change.snapshot_content = Some(r#"{"label":"legacy"}"#.into());
+        assert!(typed_history_column_value(&legacy, &spec, "label")
+            .expect_err("registered entity history must not fall back to JSON")
+            .to_string()
+            .contains("omitted its authenticated typed payload"));
+    }
+
+    #[tokio::test]
+    async fn registered_entity_write_publishes_typed_history_as_sole_commit_payload() {
+        use crate::engine::Engine;
+        use crate::storage_adapter::{Memory, StorageReadOptions};
+
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("repository should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("engine should open");
+        let session = engine.open_session().await.expect("session should open");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('typed-history-authority', 'one')",
+                &[],
+            )
+            .await
+            .expect("tracked entity write should succeed");
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+        let commit_id = engine
+            .load_branch_head_commit_id(&branch_id)
+            .await
+            .expect("head should load")
+            .expect("head should exist");
+        let commit_id = crate::changelog::CommitId::parse_lix(&commit_id, "typed history head")
+            .expect("head should be canonical");
+        let read = engine
+            .storage()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("retained history read should open");
+        let manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+            .await
+            .expect("commit authority should load")
+            .expect("commit authority should exist");
+        let parts = manifest
+            .mutations
+            .columnar_parts
+            .as_ref()
+            .unwrap_or_else(|| {
+                panic!(
+                    "registered entity history must publish the typed group as sole authority: {:?}",
+                    manifest.mutations
+                )
+            });
+        assert_eq!(parts.schema_key, "lix_key_value");
+        assert!(manifest.mutations.inline_part.is_empty());
+        assert!(manifest.mutations.parts.is_empty());
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('typed-z', 'z'), ('typed-a', 'a')",
+                &[],
+            )
+            .await
+            .expect("reversed authored keys should canonicalize before publication");
+        let reversed_head = engine
+            .load_branch_head_commit_id(&branch_id)
+            .await
+            .expect("reversed head should load")
+            .expect("reversed head should exist");
+        let reversed_head = crate::changelog::CommitId::parse_lix(
+            &reversed_head,
+            "reversed typed history head",
+        )
+        .expect("reversed head should be canonical");
+        let read = engine
+            .storage()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reversed history read should open");
+        let reversed = crate::tracked_state::load_commit_state_manifest(&read, reversed_head)
+            .await
+            .expect("reversed commit authority should load")
+            .expect("reversed commit authority should exist");
+        let reversed_parts = reversed
+            .mutations
+            .columnar_parts
+            .as_ref()
+            .expect("reversed batch must retain one typed authority");
+        assert_eq!(reversed_parts.row_count, 2);
+        assert!(reversed_parts.first_key < reversed_parts.last_key);
+        assert!(reversed.mutations.inline_part.is_empty());
+        assert!(reversed.mutations.parts.is_empty());
+
+        let duplicate = session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('typed-duplicate', 'one'), ('typed-duplicate', 'two')",
+                &[],
+            )
+            .await
+            .expect_err("duplicate authored keys must fail before publication");
+        assert!(!duplicate.code.is_empty());
+
+        session
+            .execute(
+                "DELETE FROM lix_key_value WHERE key = 'typed-history-authority'",
+                &[],
+            )
+            .await
+            .expect("typed tombstone should publish");
+        assert_eq!(
+            crate::tracked_state::take_columnar_history_json_projections(),
+            0
+        );
+        let deleted = session
+            .execute(
+                "SELECT key, lixcol_is_deleted FROM lix_key_value_history() \
+                 WHERE key = 'typed-history-authority' ORDER BY lixcol_depth",
+                &[],
+            )
+            .await
+            .expect("typed tombstone history should project");
+        assert!(deleted.rows().iter().any(|row| {
+            row.get::<bool>("lixcol_is_deleted").unwrap_or(false)
+        }));
+        assert_eq!(
+            crate::tracked_state::take_columnar_history_json_projections(),
+            0,
+            "scalar-only public history must not reconstruct JSON snapshots"
+        );
+    }
 
     #[test]
     fn public_composite_key_filters_route_in_schema_order() {

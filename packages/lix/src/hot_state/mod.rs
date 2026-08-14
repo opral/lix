@@ -15,8 +15,10 @@ pub(crate) mod visibility;
 /// below both state planes; this facade only exists so the move did not have to
 /// touch every call site at once and can be dropped as those are migrated.
 pub(crate) use crate::entity_columnar::{
-    ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
-    EntityColumnarWriteSets, entity_row_group_set_id,
+    ENTITY_COLUMNAR_DELETED_FIELD, ENTITY_COLUMNAR_ENTITY_PK_FIELD,
+    ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
+    ENTITY_COLUMNAR_TYPED_HISTORY_METADATA_KEY, EntityColumnarWriteSets,
+    entity_row_group_set_id,
 };
 #[allow(unused_imports)]
 pub(crate) use context::{

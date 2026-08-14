@@ -1529,6 +1529,7 @@ mod tests {
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
                 snapshot: crate::json_store::JsonSlot::None,
+                typed_snapshot: None,
                 metadata: crate::json_store::JsonSlot::None,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 origin_key: None,

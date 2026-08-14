@@ -220,8 +220,25 @@ where
 
     let mut json_refs = Vec::new();
     let mut plans = Vec::with_capacity(changes.len());
-    for change in changes {
+    for mut change in changes {
         let change_id = change.change_id;
+        if projection.snapshot_content {
+            match (change.snapshot.is_some(), change.typed_snapshot.take()) {
+                (true, Some(_)) => {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "change member has duplicate JSON and typed snapshot authorities",
+                    ));
+                }
+                (false, Some(snapshot)) if !snapshot.deleted => {
+                    change.snapshot = JsonSlot::Inline(
+                        materialize_typed_snapshot_json(&change.entity_pk, &snapshot)?
+                            .into_boxed_str(),
+                    );
+                }
+                (false, Some(_)) | (_, None) => {}
+            }
+        }
         plans.push((
             change_id,
             MaterializedChangeIdentity {
@@ -252,6 +269,113 @@ where
             ))
         })
         .collect()
+}
+
+/// Terminal current-state adapter for lifecycle callers that still consume
+/// JSON objects. Durable history remains the schema-bound typed tuple; this
+/// conversion is never stored and public entity history projects typed cells
+/// directly.
+fn materialize_typed_snapshot_json(
+    entity_pk: &crate::entity_pk::EntityPk,
+    snapshot: &super::TypedHistorySnapshot,
+) -> Result<String, LixError> {
+    let pk_values = entity_pk.as_json_array_value()?;
+    let serde_json::Value::Array(pk_values) = pk_values else {
+        unreachable!("EntityPk always projects as a JSON array")
+    };
+    if snapshot.primary_key_paths.len() != pk_values.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "typed history primary-key layout disagrees with its authenticated member key",
+        ));
+    }
+    let mut object = serde_json::Map::new();
+    for (path, value) in snapshot.primary_key_paths.iter().zip(pk_values) {
+        insert_typed_json_path(&mut object, path, value)?;
+    }
+    for field in &snapshot.fields {
+        let value = match &field.value {
+            None => serde_json::Value::Null,
+            Some(super::TypedHistoryScalar::String(value)) => {
+                serde_json::Value::String(value.clone())
+            }
+            Some(super::TypedHistoryScalar::Jsonb(value)) => serde_json::from_str(value)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("typed history jsonb cell is malformed: {error}"),
+                    )
+                })?,
+            Some(super::TypedHistoryScalar::Int64(value)) => (*value).into(),
+            Some(super::TypedHistoryScalar::Float64Bits(value)) => {
+                serde_json::Number::from_f64(f64::from_bits(*value))
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "typed history float8 cell is not finite JSON",
+                        )
+                    })?
+            }
+            Some(super::TypedHistoryScalar::Boolean(value)) => (*value).into(),
+            Some(super::TypedHistoryScalar::TimestampMicros(value)) => {
+                let timestamp = chrono::DateTime::from_timestamp_micros(*value).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "typed history timestamptz cell is out of range",
+                    )
+                })?;
+                serde_json::Value::String(timestamp.to_rfc3339_opts(
+                    chrono::SecondsFormat::Micros,
+                    true,
+                ))
+            }
+        };
+        if object.insert(field.name.clone(), value).is_some() {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "typed history payload duplicates a primary-key root",
+            ));
+        }
+    }
+    serde_json::to_string(&object).map_err(|error| {
+        LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            format!("typed current-state terminal projection failed: {error}"),
+        )
+    })
+}
+
+fn insert_typed_json_path(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[String],
+    value: serde_json::Value,
+) -> Result<(), LixError> {
+    let Some((first, rest)) = path.split_first() else {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "typed history primary-key path is empty",
+        ));
+    };
+    if rest.is_empty() {
+        if object.insert(first.clone(), value).is_some() {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "typed history primary-key paths overlap",
+            ));
+        }
+        return Ok(());
+    }
+    let entry = object
+        .entry(first.clone())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let serde_json::Value::Object(child) = entry else {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "typed history primary-key paths overlap",
+        ));
+    };
+    insert_typed_json_path(child, rest, value)
 }
 
 enum MaterializedJsonSlot {

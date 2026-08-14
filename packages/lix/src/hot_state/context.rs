@@ -3469,6 +3469,7 @@ mod tests {
                 .iter()
                 .zip(&root_deltas)
                 .map(|((change, _, _), delta)| TrackedStateCommitDeltaRef {
+                    typed_snapshot: None,
                     delta: *delta,
                     snapshot: change.snapshot.as_ref_slot(),
                     metadata: change.metadata.as_ref_slot(),

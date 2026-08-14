@@ -539,6 +539,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: crate::json_store::JsonSlot::from_json(snapshot),
+                    typed_snapshot: None,
                     metadata: crate::json_store::JsonSlot::None,
                     created_at: timestamp,
                     origin_key: None,

@@ -1171,6 +1171,7 @@ mod tests {
         let inserted = EntityPk::single("entity-003");
         let changes = [
             TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta: TrackedStateDeltaRef {
                     schema_key: "scoped-publication",
                     file_id: None,
@@ -1188,6 +1189,7 @@ mod tests {
                 authored: true,
             },
             TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta: TrackedStateDeltaRef {
                     schema_key: "scoped-publication",
                     file_id: None,
@@ -1326,6 +1328,7 @@ mod tests {
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
         let change = TrackedStateCommitDeltaRef {
+            typed_snapshot: None,
             delta: TrackedStateDeltaRef {
                 schema_key: "certified-new-scope",
                 file_id: None,
@@ -1431,6 +1434,7 @@ mod tests {
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
         let changes = ["alpha", "beta"].map(|schema_key| TrackedStateCommitDeltaRef {
+            typed_snapshot: None,
             delta: TrackedStateDeltaRef {
                 schema_key,
                 file_id: None,
@@ -1527,6 +1531,7 @@ mod tests {
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
         let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
         let first_change = TrackedStateCommitDeltaRef {
+            typed_snapshot: None,
             delta: TrackedStateDeltaRef {
                 schema_key: "staged",
                 file_id: None,
@@ -1544,6 +1549,7 @@ mod tests {
             authored: true,
         };
         let second_change = TrackedStateCommitDeltaRef {
+            typed_snapshot: None,
             delta: TrackedStateDeltaRef {
                 schema_key: "staged",
                 file_id: None,

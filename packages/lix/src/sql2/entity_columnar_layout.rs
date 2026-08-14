@@ -5,14 +5,13 @@
 //! projection decoder remains the single value-conversion contract; this
 //! module only chooses physical row groups and delegates their encoding.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, StringArray};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use serde_json::Value as JsonValue;
 
 use crate::LixError;
 use crate::columnar_row_group::{
@@ -28,23 +27,19 @@ pub(crate) const ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
     "lix.entity_columnar.layout_fingerprint.v1";
 pub(crate) const ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.entity_columnar.base_coordinates.v1";
+pub(crate) const ENTITY_COLUMNAR_PRIMARY_KEY_PATHS_METADATA_KEY: &str =
+    "lix.entity_columnar.primary_key_paths.v1";
 pub(crate) use crate::hot_state::{
-    ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
+    ENTITY_COLUMNAR_DELETED_FIELD, ENTITY_COLUMNAR_ENTITY_PK_FIELD,
+    ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
+    ENTITY_COLUMNAR_TYPED_HISTORY_METADATA_KEY,
 };
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
-const LOW_CARDINALITY_CLUSTER_MAX_BUCKETS: usize = 8;
-const ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS: usize = 64;
-
-enum ClusterField<'a> {
-    Boolean(&'a str),
-    String(&'a str, BTreeMap<String, u8>),
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct EntityColumnarRowRef<'a> {
     pub(crate) entity_pk: &'a EntityPk,
-    pub(crate) snapshot_bytes: &'a [u8],
-    pub(crate) snapshot_value: &'a JsonValue,
+    pub(crate) snapshot_bytes: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +126,136 @@ where
     ))
 }
 
+/// Encodes the sole durable payload for qualifying registered entity history.
+/// Unlike the optional current-state acceleration wrapper, this path must
+/// propagate every encoding failure rather than silently selecting JSON.
+pub(crate) fn encode_registered_entity_history_row_groups<'a, I>(
+    spec: &EntitySurfaceSpec,
+    rows: I,
+) -> Result<EncodedEntityRowGroups, LixError>
+where
+    I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>>,
+{
+    encode_registered_entity_row_groups_impl(spec, rows)
+}
+
+/// Encodes one schema-bound typed history tuple for a mixed commit whose
+/// native system members prevent the entity rows from owning the commit's
+/// sole columnar group. The canonical member key owns the primary key, so the
+/// payload contains only non-PK scalar cells. This is the same durable D1
+/// scalar contract as a columnar group, not a JSON compatibility snapshot.
+pub(crate) fn encode_registered_entity_history_snapshot(
+    spec: &EntitySurfaceSpec,
+    snapshot_bytes: Option<&[u8]>,
+) -> Result<crate::changelog::TypedHistorySnapshot, LixError> {
+    let Some(snapshot_bytes) = snapshot_bytes else {
+        return Ok(crate::changelog::TypedHistorySnapshot {
+            schema_layout_fingerprint: spec.columnar_layout_fingerprint(),
+            deleted: true,
+            primary_key_paths: spec.primary_key_paths.clone(),
+            fields: Vec::new(),
+        });
+    };
+    let snapshot: serde_json::Value = serde_json::from_slice(snapshot_bytes)
+        .map_err(|error| entity_columnar_error(format!("typed history snapshot is invalid JSON: {error}")))?;
+    let object = snapshot.as_object().ok_or_else(|| {
+        entity_columnar_error("typed history snapshot is not a JSON object")
+    })?;
+    let primary_key_roots = spec
+        .primary_key_paths
+        .iter()
+        .filter_map(|path| path.first().map(String::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let fields = spec
+        .columns
+        .iter()
+        .filter(|column| !primary_key_roots.contains(column.name.as_str()))
+        .map(|column| {
+            let value = object.get(&column.name).ok_or_else(|| {
+                entity_columnar_error(format!(
+                    "typed history snapshot omitted declared column '{}'",
+                    column.name
+                ))
+            })?;
+            let value = if value.is_null() {
+                None
+            } else {
+                Some(match column.column_type {
+                    EntityColumnType::String => crate::changelog::TypedHistoryScalar::String(
+                        value.as_str().ok_or_else(|| {
+                            entity_columnar_error(format!(
+                                "typed history column '{}' is not text",
+                                column.name
+                            ))
+                        })?.to_owned(),
+                    ),
+                    EntityColumnType::Json => crate::changelog::TypedHistoryScalar::Jsonb(
+                        serde_json::to_string(value).map_err(|error| {
+                            entity_columnar_error(format!(
+                                "typed history jsonb column '{}' cannot encode: {error}",
+                                column.name
+                            ))
+                        })?,
+                    ),
+                    EntityColumnType::Integer => crate::changelog::TypedHistoryScalar::Int64(
+                        value.as_i64().ok_or_else(|| {
+                            entity_columnar_error(format!(
+                                "typed history column '{}' is not int8",
+                                column.name
+                            ))
+                        })?,
+                    ),
+                    EntityColumnType::Number => {
+                        crate::changelog::TypedHistoryScalar::Float64Bits(
+                            value.as_f64().ok_or_else(|| {
+                                entity_columnar_error(format!(
+                                    "typed history column '{}' is not float8",
+                                    column.name
+                                ))
+                            })?.to_bits(),
+                        )
+                    }
+                    EntityColumnType::Boolean => crate::changelog::TypedHistoryScalar::Boolean(
+                        value.as_bool().ok_or_else(|| {
+                            entity_columnar_error(format!(
+                                "typed history column '{}' is not boolean",
+                                column.name
+                            ))
+                        })?,
+                    ),
+                    EntityColumnType::Timestamptz => {
+                        let text = value.as_str().ok_or_else(|| {
+                            entity_columnar_error(format!(
+                                "typed history column '{}' is not timestamptz text",
+                                column.name
+                            ))
+                        })?;
+                        let micros = chrono::DateTime::parse_from_rfc3339(text)
+                            .map_err(|error| {
+                                entity_columnar_error(format!(
+                                    "typed history column '{}' is not canonical timestamptz: {error}",
+                                    column.name
+                                ))
+                            })?
+                            .timestamp_micros();
+                        crate::changelog::TypedHistoryScalar::TimestampMicros(micros)
+                    }
+                })
+            };
+            Ok(crate::changelog::TypedHistoryField {
+                name: column.name.clone(),
+                value,
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    Ok(crate::changelog::TypedHistorySnapshot {
+        schema_layout_fingerprint: spec.columnar_layout_fingerprint(),
+        deleted: false,
+        primary_key_paths: spec.primary_key_paths.clone(),
+        fields,
+    })
+}
+
 /// Encodes frontend-owned Arrow columns without reconstructing them from
 /// canonical snapshot JSON. The fast contract is deliberately limited to
 /// layouts whose established encoder would not reorder rows for clustering;
@@ -181,7 +306,28 @@ pub(crate) fn encode_unclustered_registered_entity_row_groups(
         }
     }
 
-    let mut fields = entity_visible_fields(spec);
+    columns = spec
+        .columns
+        .iter()
+        .zip(columns)
+        .filter_map(|(column, values)| {
+            (!primary_key_roots.contains(column.name.as_str())).then_some(values)
+        })
+        .collect();
+
+    // Physical history groups must represent tombstones as NULL payload cells.
+    // Logical nullability remains schema-authenticated and is enforced when a
+    // non-deleted tuple is decoded/projected.
+    let mut fields = entity_visible_fields(spec)
+        .into_iter()
+        .filter(|field| !primary_key_roots.contains(field.name().as_str()))
+        .map(|field| field.with_nullable(true))
+        .collect::<Vec<_>>();
+    fields.push(Field::new(
+        ENTITY_COLUMNAR_DELETED_FIELD,
+        DataType::Boolean,
+        false,
+    ));
     fields.push(Field::new(
         ENTITY_COLUMNAR_ENTITY_PK_FIELD,
         DataType::Utf8,
@@ -189,6 +335,7 @@ pub(crate) fn encode_unclustered_registered_entity_row_groups(
     ));
     let metadata = entity_columnar_metadata(spec);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+    columns.push(Arc::new(BooleanArray::from(vec![false; row_count])));
     columns.push(entity_pks);
     let mut batches = Vec::with_capacity(row_count.div_ceil(ROW_GROUP_MAX_ROWS));
     for offset in (0..row_count).step_by(ROW_GROUP_MAX_ROWS) {
@@ -218,7 +365,27 @@ fn encode_registered_entity_row_groups_impl<'a, I>(
 where
     I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>>,
 {
-    let mut fields = entity_visible_fields(spec);
+    let primary_key_roots = spec
+        .primary_key_paths
+        .iter()
+        .filter_map(|path| path.first().map(String::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let payload_columns = spec
+        .columns
+        .iter()
+        .filter(|column| !primary_key_roots.contains(column.name.as_str()))
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    let mut fields = entity_visible_fields(spec)
+        .into_iter()
+        .filter(|field| !primary_key_roots.contains(field.name().as_str()))
+        .map(|field| field.with_nullable(true))
+        .collect::<Vec<_>>();
+    fields.push(Field::new(
+        ENTITY_COLUMNAR_DELETED_FIELD,
+        DataType::Boolean,
+        false,
+    ));
     fields.push(Field::new(
         ENTITY_COLUMNAR_ENTITY_PK_FIELD,
         DataType::Utf8,
@@ -226,97 +393,31 @@ where
     ));
     let metadata = entity_columnar_metadata(spec);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
-    let decoder =
-        EntityProjectionDecoder::new(spec, spec.columns.iter().map(|column| column.name.as_str()))?;
+    let decoder = EntityProjectionDecoder::new(spec, payload_columns)?;
 
-    let rows = rows.enumerate().collect::<Vec<_>>();
-    let primary_key_roots = spec
-        .primary_key_paths
-        .iter()
-        .filter_map(|path| path.first().map(String::as_str))
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut cluster_fields = Vec::new();
-    let mut partition_budget = 1_usize;
-    for column in &spec.columns {
-        if column.column_type == EntityColumnType::Boolean
-            && partition_budget.saturating_mul(3) <= ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS
-        {
-            cluster_fields.push(ClusterField::Boolean(column.name.as_str()));
-            partition_budget *= 3;
-        }
+    let mut rows = rows
+        .enumerate()
+        .map(|(input_index, row)| {
+            let key = crate::tracked_state::encode_key_ref(
+                crate::tracked_state::TrackedStateKeyRef {
+                    schema_key: spec.schema_key.as_str(),
+                    file_id: None,
+                    entity_pk: row.entity_pk,
+                },
+            );
+            (key, input_index, row)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    if rows.windows(2).any(|rows| rows[0].0 == rows[1].0) {
+        return Err(entity_columnar_error(
+            "typed history batch contains duplicate canonical StateKeys",
+        ));
     }
-    for column in &spec.columns {
-        if column.column_type != EntityColumnType::String
-            || primary_key_roots.contains(column.name.as_str())
-        {
-            continue;
-        }
-        let mut values = std::collections::BTreeSet::new();
-        for (_, row) in &rows {
-            if let Some(value) = row
-                .snapshot_value
-                .get(&column.name)
-                .and_then(JsonValue::as_str)
-            {
-                values.insert(value.to_owned());
-                if values.len() > LOW_CARDINALITY_CLUSTER_MAX_VALUES {
-                    break;
-                }
-            }
-        }
-        if (2..=LOW_CARDINALITY_CLUSTER_MAX_VALUES).contains(&values.len()) {
-            let value_count = values.len();
-            let bucket_count = value_count.min(LOW_CARDINALITY_CLUSTER_MAX_BUCKETS);
-            // Reserve one state for null, missing, or non-string values. Even
-            // when none are present in this generation, charging the full
-            // key domain keeps the global budget independent of row shape.
-            let partition_count = bucket_count + 1;
-            if partition_budget.saturating_mul(partition_count)
-                > ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS
-            {
-                continue;
-            }
-            partition_budget *= partition_count;
-            cluster_fields.push(ClusterField::String(
-                column.name.as_str(),
-                values
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        let bucket = index.saturating_mul(bucket_count) / value_count;
-                        (value, bucket as u8)
-                    })
-                    .collect(),
-            ));
-        }
-    }
-    let partitions = if cluster_fields.is_empty() {
-        vec![rows]
-    } else {
-        let mut partitions = BTreeMap::<Vec<u8>, Vec<(usize, EntityColumnarRowRef<'_>)>>::new();
-        for (input_index, row) in rows {
-            let key = cluster_fields
-                .iter()
-                .map(|field| match field {
-                    ClusterField::Boolean(name) => {
-                        match row.snapshot_value.get(*name).and_then(JsonValue::as_bool) {
-                            Some(false) => 0,
-                            Some(true) => 1,
-                            None => 2,
-                        }
-                    }
-                    ClusterField::String(name, dictionary) => row
-                        .snapshot_value
-                        .get(*name)
-                        .and_then(JsonValue::as_str)
-                        .and_then(|value| dictionary.get(value).copied())
-                        .unwrap_or(u8::MAX),
-                })
-                .collect();
-            partitions.entry(key).or_default().push((input_index, row));
-        }
-        partitions.into_values().collect()
-    };
+    let partitions = vec![rows
+        .into_iter()
+        .map(|(_, input_index, row)| (input_index, row))
+        .collect::<Vec<_>>()];
 
     let input_count = partitions.iter().map(Vec::len).sum();
     let mut input_locations = vec![None; input_count];
@@ -333,7 +434,12 @@ where
                 });
             }
             let mut columns = decoder
-                .decode_arrow_columns(rows.iter().map(|(_, row)| Some(row.snapshot_bytes)))?;
+                .decode_arrow_columns(rows.iter().map(|(_, row)| row.snapshot_bytes))?;
+            columns.push(Arc::new(BooleanArray::from(
+                rows.iter()
+                    .map(|(_, row)| row.snapshot_bytes.is_none())
+                    .collect::<Vec<_>>(),
+            )));
             let entity_pks = rows
                 .iter()
                 .map(|(_, row)| row.entity_pk.as_json_array_text())
@@ -376,6 +482,15 @@ fn entity_columnar_metadata(spec: &EntitySurfaceSpec) -> HashMap<String, String>
             ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY.to_string(),
             "true".to_owned(),
         ),
+        (
+            ENTITY_COLUMNAR_PRIMARY_KEY_PATHS_METADATA_KEY.to_string(),
+            serde_json::to_string(&spec.primary_key_paths)
+            .expect("entity primary-key field names serialize"),
+        ),
+        (
+            ENTITY_COLUMNAR_TYPED_HISTORY_METADATA_KEY.to_string(),
+            "true".to_owned(),
+        ),
     ]);
     if spec.columnar_snapshot_bijective {
         metadata.insert(
@@ -395,7 +510,7 @@ fn entity_columnar_error(message: impl Into<String>) -> LixError {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value as JsonValue, json};
 
     use super::*;
     use crate::columnar_row_group::RowGroupScalar;
@@ -405,17 +520,16 @@ mod tests {
     #[test]
     fn registered_types_and_hidden_identity_round_trip() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "typed_sidecar",
-            "x-lix-primary-key": ["/id", "/ordinal"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "ordinal": { "type": "integer" },
-                "score": { "type": "number" },
-                "active": { "type": "boolean" },
-                "payload": { "type": ["object", "null"] }
-            },
-            "required": ["id", "ordinal", "score", "active"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "typed_sidecar",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "ordinal", "type": "int8", "nullable": false },
+                { "name": "score", "type": "float8", "nullable": false },
+                { "name": "active", "type": "boolean", "nullable": false },
+                { "name": "payload", "type": "jsonb", "nullable": true }
+            ],
+            "primary_key": ["id", "ordinal"]
         }))
         .expect("spec");
         let snapshots = [
@@ -433,10 +547,9 @@ mod tests {
         let encoded = encode_registered_entity_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
+                |((entity_pk, _snapshot), canonical)| EntityColumnarRowRef {
                     entity_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 },
             ),
         )
@@ -457,6 +570,22 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+        assert_eq!(
+            encoded
+                .manifest
+                .metadata
+                .get(ENTITY_COLUMNAR_PRIMARY_KEY_PATHS_METADATA_KEY)
+                .map(String::as_str),
+            Some(r#"[["id"],["ordinal"]]"#)
+        );
+        assert_eq!(
+            encoded
+                .manifest
+                .metadata
+                .get(ENTITY_COLUMNAR_TYPED_HISTORY_METADATA_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
         let identity_index = encoded
             .manifest
             .fields
@@ -467,34 +596,26 @@ mod tests {
             encoded.manifest.fields[identity_index].data_type.to_arrow(),
             DataType::Utf8
         );
-        let identities = encoded
-            .manifest
-            .groups
-            .iter()
-            .filter_map(|group| group.columns[identity_index].min.as_ref())
-            .map(|value| match value {
-                RowGroupScalar::String(value) => value.as_str(),
-                _ => panic!("identity must have string statistics"),
-            })
-            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            identities,
-            std::collections::BTreeSet::from([r#"["a",1]"#, r#"["b",2]"#])
+            encoded.manifest.groups[0].columns[identity_index].min,
+            Some(RowGroupScalar::String(r#"["a",1]"#.to_owned()))
+        );
+        assert_eq!(
+            encoded.manifest.groups[0].columns[identity_index].max,
+            Some(RowGroupScalar::String(r#"["b",2]"#.to_owned()))
         );
     }
 
     #[test]
     fn frontend_columns_match_canonical_encoding_when_clustering_is_absent() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "direct_columns",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "direct_columns",
+            "columns": [
+                {"name":"id", "type":"text", "nullable":false},
+                {"name":"value", "type":"text", "nullable":false}
+            ],
+            "primary_key": ["id"]
         }))
         .expect("schema should derive");
         let ids = (0..128)
@@ -520,10 +641,9 @@ mod tests {
         let canonical_encoding = encode_registered_entity_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
+                |((entity_pk, _snapshot), canonical)| EntityColumnarRowRef {
                     entity_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 },
             ),
         )
@@ -559,17 +679,13 @@ mod tests {
     #[test]
     fn frontend_json_columns_match_canonical_path_value_encoding() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "path_value_columns",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "path_value_columns",
+            "columns": [
+                {"name":"path", "type":"text", "nullable":false},
+                {"name":"value", "type":"jsonb", "nullable":false}
+            ],
+            "primary_key": ["path"]
         }))
         .expect("schema should derive");
         let paths = (0..128)
@@ -595,10 +711,9 @@ mod tests {
         let canonical_encoding = encode_registered_entity_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
+                |((entity_pk, _snapshot), canonical)| EntityColumnarRowRef {
                     entity_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 },
             ),
         )
@@ -634,28 +749,27 @@ mod tests {
     }
 
     #[test]
-    fn input_coordinates_follow_the_clustered_physical_permutation() {
+    fn input_coordinates_follow_canonical_state_key_order() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "coordinate_fixture",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "active": { "type": "boolean" },
-                "lane": { "type": "string" }
-            },
-            "required": ["id", "active", "lane"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "coordinate_fixture",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "active", "type": "boolean", "nullable": false },
+                { "name": "lane", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["id"]
         }))
         .expect("spec");
-        // Deliberately interleave clustering values so physical order differs
-        // from authoritative input order.
+        // Deliberately reverse identities so physical order differs from
+        // statement order while the input-location map preserves RETURNING.
         let snapshots = [
-            json!({"id":"a","active":true,"lane":"z"}),
+            json!({"id":"d","active":true,"lane":"z"}),
             json!({"id":"b","active":false,"lane":"a"}),
             json!({"id":"c","active":true,"lane":"y"}),
-            json!({"id":"d","active":false,"lane":"b"}),
+            json!({"id":"a","active":false,"lane":"b"}),
         ];
-        let identities = ["a", "b", "c", "d"].map(EntityPk::single);
+        let identities = ["d", "b", "c", "a"].map(EntityPk::single);
         let canonical = snapshots
             .iter()
             .map(JsonValue::to_string)
@@ -663,49 +777,21 @@ mod tests {
         let encoded = encode_registered_entity_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
+                |((entity_pk, _snapshot), canonical)| EntityColumnarRowRef {
                     entity_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 },
             ),
         )
         .expect("encode")
         .expect("registered sidecar");
-        let identity_index = encoded
-            .manifest
-            .fields
-            .iter()
-            .position(|field| field.name == ENTITY_COLUMNAR_ENTITY_PK_FIELD)
-            .expect("hidden identity field");
-
         assert_eq!(encoded.input_locations.len(), identities.len());
-        assert_ne!(
-            encoded
-                .input_locations
-                .location(0)
-                .expect("first input coordinate")
-                .group_index,
-            encoded
-                .input_locations
-                .location(1)
-                .expect("second input coordinate")
-                .group_index
-        );
-        for (input_index, location) in encoded.input_locations.iter().enumerate() {
-            let group = &encoded.manifest.groups[location.group_index as usize];
-            let expected = identities[input_index]
-                .as_json_array_text()
-                .expect("identity text");
-            assert_eq!(
-                group.columns[identity_index].min,
-                Some(RowGroupScalar::String(expected.clone()))
-            );
-            assert_eq!(
-                group.columns[identity_index].max,
-                Some(RowGroupScalar::String(expected))
-            );
-        }
+        let physical_rows = encoded
+            .input_locations
+            .iter()
+            .map(|location| (location.group_index, location.row_index))
+            .collect::<Vec<_>>();
+        assert_eq!(physical_rows, vec![(0, 3), (0, 1), (0, 2), (0, 0)]);
     }
 
     #[test]
@@ -718,18 +804,13 @@ mod tests {
     #[test]
     fn any_json_property_encodes_in_registered_layout() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "json_layout",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_layout",
+            "columns": [
+                {"name":"path", "type":"text", "nullable":false},
+                {"name":"value", "type":"jsonb", "nullable":false}
+            ],
+            "primary_key": ["path"]
         }))
         .expect("spec");
         let snapshot = json!({"path":"a","value":"value-a"});
@@ -740,8 +821,7 @@ mod tests {
                 &spec,
                 std::iter::once(EntityColumnarRowRef {
                     entity_pk: &identity,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: &snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 }),
             )
             .expect("encode")
@@ -750,24 +830,19 @@ mod tests {
     }
 
     #[test]
-    fn clustering_has_a_global_partition_budget_for_wide_low_cardinality_schemas() {
-        let mut properties = serde_json::Map::new();
-        properties.insert("id".to_string(), json!({ "type": "string" }));
+    fn canonical_layout_does_not_partition_on_low_cardinality_values() {
+        let mut columns = vec![json!({"name":"id", "type":"text", "nullable":false})];
         for index in 0..2 {
-            properties.insert(format!("flag_{index}"), json!({ "type": "boolean" }));
+            columns.push(json!({"name":format!("flag_{index}"), "type":"boolean", "nullable":true}));
         }
         for index in 0..4 {
-            properties.insert(
-                format!("lane_{index}"),
-                json!({ "type": ["string", "null"] }),
-            );
+            columns.push(json!({"name":format!("lane_{index}"), "type":"text", "nullable":true}));
         }
         let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "wide_low_cardinality",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": properties,
-            "required": ["id"]
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "wide_low_cardinality",
+            "columns": columns,
+            "primary_key": ["id"]
         }))
         .expect("spec");
         let snapshots = (0..1_024)
@@ -803,22 +878,15 @@ mod tests {
         let encoded = encode_registered_entity_row_groups(
             &spec,
             identities.iter().zip(&snapshots).zip(&canonical).map(
-                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
+                |((entity_pk, _snapshot), canonical)| EntityColumnarRowRef {
                     entity_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
                 },
             ),
         )
         .expect("encode")
         .expect("registered sidecar");
 
-        assert!(encoded.manifest.groups.len() > 1);
-        assert!(
-            encoded.manifest.groups.len() <= ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS,
-            "wide independent dimensions created {} groups despite a {}-partition budget",
-            encoded.manifest.groups.len(),
-            ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS
-        );
+        assert_eq!(encoded.manifest.groups.len(), 1);
     }
 }

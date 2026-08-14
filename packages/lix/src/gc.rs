@@ -6149,6 +6149,7 @@ mod tests {
             schema_key: "authority_gc".to_string(),
             file_id: None,
             snapshot,
+            typed_snapshot: None,
             metadata: JsonSlot::None,
             created_at: LixTimestamp::expect_parse(
                 "authority GC change timestamp",
@@ -6542,6 +6543,7 @@ mod tests {
         changes
             .iter()
             .map(|change| TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta: TrackedStateDeltaRef {
                     schema_key: &change.schema_key,
                     file_id: change.file_id.as_deref(),

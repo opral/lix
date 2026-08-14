@@ -1051,10 +1051,6 @@ impl PreparedInsertSelection {
         self.count == 0
     }
 
-    pub(crate) fn covers_all(&self, row_count: usize) -> bool {
-        self.row_count == row_count && self.count == row_count
-    }
-
     pub(crate) fn contains(&self, row_index: usize) -> bool {
         if row_index >= self.row_count {
             return false;

@@ -5999,20 +5999,20 @@ mod tests {
             .await
             .expect("repository branch should resolve");
         let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "columnar_lifecycle_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "columnar_lifecycle_probe",
+            "columns": [
+                {"name":"id", "type":"text", "nullable":false},
+                {"name":"value", "type":"text", "nullable":false}
+            ],
+            "primary_key": ["id"]
         });
         main.execute(
-            "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'x-lix-key', CAST($1 AS JSONB))",
-            &[Value::Text(schema.to_string())],
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, CAST($2 AS JSONB))",
+            &[
+                Value::Text("columnar_lifecycle_probe".to_owned()),
+                Value::Text(schema.to_string()),
+            ],
         )
         .await
         .expect("typed lifecycle schema should register");
@@ -6339,6 +6339,51 @@ mod tests {
             .redo()
             .await
             .expect("draft update should redo");
+        let same_engine_after_redo = engine
+            .open_session_at(draft.id.clone())
+            .await
+            .expect("redo branch should open from the same engine");
+        assert_columnar_lifecycle_current(
+            &same_engine_after_redo,
+            ROW_COUNT,
+            "draft-0000",
+            "base-1023",
+        )
+        .await;
+        let reopened_engine = Engine::new(storage.clone())
+            .await
+            .expect("redo storage should cold reopen");
+        let reopened_after_redo = reopened_engine
+            .open_session_at(draft.id.clone())
+            .await
+            .expect("redo branch should reopen");
+        assert_columnar_lifecycle_current(
+            &reopened_after_redo,
+            ROW_COUNT,
+            "draft-0000",
+            "base-1023",
+        )
+        .await;
+
+        let merge_source = main
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-0000000000c2".to_owned()),
+                name: "columnar-lifecycle-merge-source".to_owned(),
+                from_commit_id: Some(checkpoint.commit_id.clone()),
+            })
+            .await
+            .expect("merge source branch should create");
+        let merge_source_session = engine
+            .open_session_at(merge_source.id.clone())
+            .await
+            .expect("merge source session should open");
+        merge_source_session
+            .execute(
+                "UPDATE columnar_lifecycle_probe SET value = 'merge-0000' WHERE id = '00000'",
+                &[],
+            )
+            .await
+            .expect("merge source update should commit");
 
         main.execute(
             "UPDATE columnar_lifecycle_probe SET value = 'main-1023' WHERE id = '01023'",
@@ -6348,21 +6393,21 @@ mod tests {
         .expect("main update should commit");
         let merge = main
             .merge_branch(crate::MergeBranchOptions {
-                source_branch_id: draft.id,
+                source_branch_id: merge_source.id,
             })
             .await
             .expect("disjoint typed updates should merge");
         assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
+        assert_columnar_lifecycle_current(&main, ROW_COUNT, "merge-0000", "main-1023").await;
 
         let merged_head = engine
             .load_branch_head_commit_id(&main_branch_id)
             .await
             .expect("merged head should load")
             .expect("merged head should exist");
-        let merged_diff = main
+        let merged_diff_rows = main
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                "SELECT entity_pk, diff_type FROM lix_diff($1, $2) \
                  WHERE schema_key = 'columnar_lifecycle_probe' AND diff_type = 'modified'",
                 &[
                     Value::Text(checkpoint.commit_id.to_string()),
@@ -6371,7 +6416,13 @@ mod tests {
             )
             .await
             .expect("merged lifecycle diff should remain queryable");
-        assert_eq!(merged_diff.rows()[0].get::<i64>("entries").unwrap(), 2);
+        assert_eq!(merged_diff_rows.len(), 1);
+        assert_eq!(
+            merged_diff_rows.rows()[0]
+                .get::<serde_json::Value>("entity_pk")
+                .unwrap(),
+            serde_json::json!(["01023"])
+        );
         let merged_history = main
             .execute(
                 &format!(
@@ -6385,7 +6436,7 @@ mod tests {
             .expect("merged typed history should remain queryable");
         assert_eq!(
             merged_history.rows()[0].get::<String>("value").unwrap(),
-            "draft-0000"
+            "merge-0000"
         );
         assert!(
             merged_history
@@ -6412,7 +6463,7 @@ mod tests {
             restored.rows()[0].get::<String>("value").unwrap(),
             "base-0512"
         );
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
+        assert_columnar_lifecycle_current(&main, ROW_COUNT, "merge-0000", "main-1023").await;
 
         let mut corrupt = engine.storage().new_write_set();
         corrupt.delete(

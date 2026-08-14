@@ -177,6 +177,8 @@ struct CommitDeltaPayloadRef<'a> {
     #[musli(with = storage_codec::option)]
     origin_key: Option<&'a str>,
     #[musli(with = storage_codec::option)]
+    typed_snapshot: Option<&'a crate::changelog::TypedHistorySnapshot>,
+    #[musli(with = storage_codec::option)]
     base_coordinate: Option<TrackedStateBaseCoordinate>,
     authored: bool,
 }
@@ -190,6 +192,8 @@ struct CommitDeltaAuthoredPayloadRef<'a> {
     metadata: crate::json_store::JsonSlotRef<'a>,
     #[musli(with = storage_codec::option)]
     origin_key: Option<&'a str>,
+    #[musli(with = storage_codec::option)]
+    typed_snapshot: Option<&'a crate::changelog::TypedHistorySnapshot>,
     #[musli(with = storage_codec::option)]
     base_coordinate: Option<TrackedStateBaseCoordinate>,
 }
@@ -207,6 +211,8 @@ struct CommitDeltaAuthoredPayload {
     metadata: crate::json_store::JsonSlot,
     #[musli(with = storage_codec::option)]
     origin_key: Option<String>,
+    #[musli(with = storage_codec::option)]
+    typed_snapshot: Option<crate::changelog::TypedHistorySnapshot>,
     #[musli(with = storage_codec::option)]
     base_coordinate: Option<TrackedStateBaseCoordinate>,
 }
@@ -294,6 +300,7 @@ where
                     snapshot: crate::json_store::JsonSlot::Inline(json.into()),
                     metadata: crate::json_store::JsonSlot::None,
                     origin_key: None,
+                    typed_snapshot: None,
                     base_coordinate: None,
                 }));
             }
@@ -452,6 +459,10 @@ impl AddressableCommitDeltaStage {
 pub(crate) struct OrderedAddressableCommitDeltaStage {
     commit_id: CommitId,
     change_addresses: OrderedChangeAddresses,
+    /// Prepared-row ordinal to canonical physical-row ordinal. Ordinary
+    /// ordered packs are identity-mapped; typed groups may sort input rows by
+    /// authenticated StateKey while RETURNING retains statement order.
+    source_to_physical_row: Option<Vec<usize>>,
     row_count: usize,
     mutation_inventory: CommitStateMutationInventory,
 }
@@ -483,6 +494,10 @@ impl OrderedAddressableCommitDeltaStage {
         if row_index >= self.row_count {
             return None;
         }
+        let row_index = self
+            .source_to_physical_row
+            .as_ref()
+            .map_or(row_index, |rows| rows[row_index]);
         let packed = match &self.change_addresses {
             OrderedChangeAddresses::Dense => u32::try_from(row_index)
                 .expect("ordered commit-delta row index fits direct address space")
@@ -517,6 +532,7 @@ impl OrderedAddressableCommitDeltaStage {
         Self {
             commit_id,
             change_addresses: OrderedChangeAddresses::Dense,
+            source_to_physical_row: None,
             row_count,
             mutation_inventory: CommitStateMutationInventory::default(),
         }
@@ -3402,6 +3418,19 @@ async fn load_scoped_current_state_descriptor_rows(
                 row_group_set_id: source.source_id,
                 manifest_digest: descriptor.content_digest,
                 schema_key: manifest.namespace.clone(),
+                schema_layout_fingerprint: manifest
+                    .metadata
+                    .get(crate::sql2::ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+                    .cloned()
+                    .ok_or_else(|| {
+                        replacement_payload_error(
+                            "columnar current-state manifest is missing its schema layout fingerprint",
+                        )
+                    })?,
+                // Current-state descriptors authenticate the manifest and
+                // identity column directly; commit history carries the
+                // additional ordered digest in its persisted inventory.
+                ordered_identity_digest: [0; 32],
                 row_count: manifest.groups.iter().map(|group| group.row_count).sum(),
                 group_row_counts: manifest
                     .groups
@@ -3443,6 +3472,7 @@ async fn load_scoped_current_state_descriptor_rows(
                         &synthetic_parts,
                         change_id,
                         "",
+                        true,
                     )?;
                     Ok(CurrentStateDataRow {
                         encoded_key: encode_key_ref(TrackedStateKeyRef {
@@ -4362,6 +4392,7 @@ where
         return Ok(Some(OrderedAddressableCommitDeltaStage {
             commit_id: CommitId::default(),
             change_addresses: OrderedChangeAddresses::Dense,
+            source_to_physical_row: None,
             row_count: 0,
             mutation_inventory: CommitStateMutationInventory::default(),
         }));
@@ -4565,6 +4596,7 @@ where
     Ok(Some(OrderedAddressableCommitDeltaStage {
         commit_id,
         change_addresses,
+        source_to_physical_row: None,
         row_count,
         mutation_inventory: commit_state_inventory_from_delta_manifest(&manifest),
     }))
@@ -4578,6 +4610,7 @@ pub(crate) fn stage_ordered_columnar_mutations(
     commit_id: CommitId,
     parts: crate::tracked_state::types::ColumnarMutationPartSet,
     ordered_identity_digest: [u8; 32],
+    source_to_physical_row: Vec<usize>,
 ) -> Result<OrderedAddressableCommitDeltaStage, LixError> {
     let row_count = usize::try_from(parts.row_count).expect("u32 row count fits usize");
     if row_count == 0
@@ -4593,6 +4626,12 @@ pub(crate) fn stage_ordered_columnar_mutations(
         || parts.page_first_keys.len()
             != row_count.div_ceil(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS)
         || parts.page_first_keys.len() != parts.page_last_keys.len()
+        || source_to_physical_row.len() != row_count
+        || {
+            let mut physical = source_to_physical_row.clone();
+            physical.sort_unstable();
+            physical != (0..row_count).collect::<Vec<_>>()
+        }
     {
         return Err(replacement_payload_error(
             "columnar mutation inventory has invalid row topology",
@@ -4616,6 +4655,7 @@ pub(crate) fn stage_ordered_columnar_mutations(
     Ok(OrderedAddressableCommitDeltaStage {
         commit_id,
         change_addresses: OrderedChangeAddresses::Dense,
+        source_to_physical_row: Some(source_to_physical_row),
         row_count,
         mutation_inventory: CommitStateMutationInventory {
             selected_source_commit_id: None,
@@ -5077,6 +5117,7 @@ pub(crate) fn stage_preencoded_ordered_addressable_replacement_parts(
     Ok(OrderedAddressableCommitDeltaStage {
         commit_id,
         change_addresses,
+        source_to_physical_row: None,
         row_count,
         mutation_inventory: commit_state_inventory_from_delta_manifest(&manifest),
     })
@@ -5248,6 +5289,7 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
             snapshot: delta.snapshot,
             metadata: delta.metadata,
             origin_key: delta.origin_key,
+            typed_snapshot: delta.typed_snapshot,
             base_coordinate: delta.base_coordinate,
             authored: delta.authored,
         });
@@ -5312,6 +5354,7 @@ fn stage_commit_deltas_inner(
             snapshot: delta.snapshot,
             metadata: delta.metadata,
             origin_key: delta.origin_key,
+            typed_snapshot: delta.typed_snapshot,
             base_coordinate: delta.base_coordinate,
             authored: delta.authored,
         });
@@ -6142,6 +6185,7 @@ async fn load_columnar_direct_change_records(
                     parts,
                     locator.change_id,
                     &state.change_account_id,
+                    false,
                 )?);
             }
             Ok(())
@@ -6373,6 +6417,7 @@ fn hydrate_compact_replacement_direct_run(
                 entity_pk: key.entity_pk,
                 file_id: key.file_id,
                 snapshot,
+                typed_snapshot: None,
                 metadata,
                 created_at: lifecycle.uniform_created_at,
                 origin_key: None,
@@ -6753,9 +6798,11 @@ where
         ));
     }
     let key = decode_key(entry.key)?;
-    let (snapshot, metadata, origin_key, base_coordinate) = match payloads.decode(ordinal)? {
+    let (snapshot, typed_snapshot, metadata, origin_key, base_coordinate) =
+        match payloads.decode(ordinal)? {
         CommitDeltaPayload::Authored(payload) => (
             payload.snapshot,
+            payload.typed_snapshot,
             payload.metadata,
             payload.origin_key,
             payload.base_coordinate,
@@ -6780,6 +6827,7 @@ where
             entity_pk: key.entity_pk,
             file_id: key.file_id,
             snapshot,
+            typed_snapshot,
             metadata,
             created_at: updated_at,
             origin_key,
@@ -6970,6 +7018,7 @@ async fn load_columnar_change_record_at_locator(
         parts,
         locator.change_id,
         account_id,
+        false,
     )
 }
 
@@ -6982,7 +7031,14 @@ pub(crate) fn validate_columnar_mutation_manifest(
         != parts.row_group_set_id
         || manifest.content_digest()? != parts.manifest_digest
         || manifest.namespace != parts.schema_key
+        || manifest
+            .metadata
+            .get(crate::sql2::ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+            != Some(&parts.schema_layout_fingerprint)
         || crate::entity_columnar::entity_identity_column_index(manifest).is_none()
+        || manifest.fields.len() < 2
+        || manifest.fields[manifest.fields.len() - 2].name
+            != crate::entity_columnar::ENTITY_COLUMNAR_DELETED_FIELD
         || manifest
             .groups
             .iter()
@@ -7004,9 +7060,29 @@ fn decode_columnar_change_record(
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
     change_id: crate::changelog::ChangeId,
     account_id: &str,
+    materialize_json_snapshot: bool,
 ) -> Result<crate::changelog::ChangeRecord, LixError> {
     use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 
+    let deletion_column_index = batch.num_columns().checked_sub(2).ok_or_else(|| {
+        replacement_payload_error("columnar mutation omitted deletion and identity columns")
+    })?;
+    if manifest.fields[deletion_column_index].name
+        != crate::entity_columnar::ENTITY_COLUMNAR_DELETED_FIELD
+    {
+        return Err(replacement_payload_error(
+            "columnar mutation deletion field is missing or misplaced",
+        ));
+    }
+    let deletion_column = batch
+        .column(deletion_column_index)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| replacement_payload_error("columnar mutation deletion field is not boolean"))?;
+    if deletion_column.is_null(row_index) {
+        return Err(replacement_payload_error("columnar mutation deletion field is null"));
+    }
+    let deleted = deletion_column.value(row_index);
     let identity_column = batch
         .column(batch.num_columns() - 1)
         .as_any()
@@ -7019,18 +7095,18 @@ fn decode_columnar_change_record(
     }
     let entity_pk = EntityPk::from_json_array_text(identity_column.value(row_index))
         .map_err(|error| replacement_payload_error(&error.to_string()))?;
-    let mut snapshot = serde_json::Map::new();
+    let mut typed_fields = Vec::with_capacity(manifest.fields.len() - 1);
     for (column_index, field) in manifest
         .fields
         .iter()
-        .take(manifest.fields.len() - 1)
+        .take(deletion_column_index)
         .enumerate()
     {
         let column = batch.column(column_index);
         let value = if column.is_null(row_index) {
-            serde_json::Value::Null
+            None
         } else {
-            match field.data_type {
+            Some(match field.data_type {
                 crate::columnar_row_group::RowGroupDataType::String => {
                     let value = column
                         .as_any()
@@ -7038,46 +7114,103 @@ fn decode_columnar_change_record(
                         .ok_or_else(|| replacement_payload_error("columnar string type drift"))?
                         .value(row_index);
                     if field.metadata.get("lix.value_type").map(String::as_str) == Some("json") {
-                        serde_json::from_str(value).map_err(|error| {
+                        serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
                             replacement_payload_error(&format!(
                                 "columnar JSON value is invalid: {error}"
                             ))
-                        })?
+                        })?;
+                        crate::changelog::TypedHistoryScalar::Jsonb(value.to_owned())
                     } else {
-                        serde_json::Value::String(value.to_owned())
+                        crate::changelog::TypedHistoryScalar::String(value.to_owned())
                     }
                 }
-                crate::columnar_row_group::RowGroupDataType::Int64 => serde_json::Value::Number(
-                    column
+                crate::columnar_row_group::RowGroupDataType::Int64 => {
+                    crate::changelog::TypedHistoryScalar::Int64(column
                         .as_any()
                         .downcast_ref::<Int64Array>()
                         .ok_or_else(|| replacement_payload_error("columnar integer type drift"))?
-                        .value(row_index)
-                        .into(),
-                ),
+                        .value(row_index))
+                }
+                crate::columnar_row_group::RowGroupDataType::TimestampMicros => {
+                    let value = column
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>()
+                        .ok_or_else(|| replacement_payload_error("columnar timestamp type drift"))?
+                        .value(row_index);
+                    crate::changelog::TypedHistoryScalar::TimestampMicros(value)
+                }
                 crate::columnar_row_group::RowGroupDataType::Float64 => {
                     let value = column
                         .as_any()
                         .downcast_ref::<Float64Array>()
                         .ok_or_else(|| replacement_payload_error("columnar number type drift"))?
                         .value(row_index);
-                    serde_json::Number::from_f64(value)
-                        .map(serde_json::Value::Number)
-                        .ok_or_else(|| replacement_payload_error("columnar number is non-finite"))?
+                    if !value.is_finite() {
+                        return Err(replacement_payload_error("columnar number is non-finite"));
+                    }
+                    crate::changelog::TypedHistoryScalar::Float64Bits(value.to_bits())
                 }
-                crate::columnar_row_group::RowGroupDataType::Boolean => serde_json::Value::Bool(
-                    column
+                crate::columnar_row_group::RowGroupDataType::Boolean => {
+                    crate::changelog::TypedHistoryScalar::Boolean(column
                         .as_any()
                         .downcast_ref::<BooleanArray>()
                         .ok_or_else(|| replacement_payload_error("columnar boolean type drift"))?
-                        .value(row_index),
-                ),
-            }
+                        .value(row_index))
+                }
+            })
         };
-        snapshot.insert(field.name.clone(), value);
+        typed_fields.push(crate::changelog::TypedHistoryField {
+            name: field.name.clone(),
+            value,
+        });
     }
-    let snapshot = serde_json::to_string(&snapshot)
-        .map_err(|error| replacement_payload_error(&error.to_string()))?;
+    let primary_key_paths = manifest
+        .metadata
+        .get(crate::sql2::ENTITY_COLUMNAR_PRIMARY_KEY_PATHS_METADATA_KEY)
+        .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing its primary-key inventory"))
+        .and_then(|encoded| {
+            serde_json::from_str::<Vec<Vec<String>>>(encoded).map_err(|error| {
+                replacement_payload_error(&format!("columnar primary-key inventory is malformed: {error}"))
+            })
+        })?;
+    let expected_identity = serde_json::from_str::<Vec<serde_json::Value>>(
+        &entity_pk.as_json_array_text()?,
+    )
+    .map_err(|error| replacement_payload_error(&format!("columnar identity is invalid JSON: {error}")))?;
+    if expected_identity.len() != primary_key_paths.len()
+        || primary_key_paths.iter().any(Vec::is_empty)
+    {
+        return Err(replacement_payload_error(
+            "columnar mutation primary-key inventory disagrees with its authenticated identity",
+        ));
+    }
+    let snapshot = if materialize_json_snapshot && !deleted {
+        let mut object = serde_json::Map::with_capacity(typed_fields.len());
+        for field in &typed_fields {
+            object.insert(
+                field.name.clone(),
+                typed_history_value_as_json(field.value.as_ref())?,
+            );
+        }
+        let mut value = serde_json::Value::Object(object);
+        for (path, identity) in primary_key_paths.iter().zip(expected_identity) {
+            insert_columnar_identity_path(&mut value, path, identity)?;
+        }
+        crate::json_store::JsonSlot::from_json(
+            &serde_json::to_string(&value)
+                .map_err(|error| replacement_payload_error(&error.to_string()))?,
+        )
+    } else {
+        crate::json_store::JsonSlot::None
+    };
+    let typed_fields = typed_fields
+        .into_iter()
+        .filter(|field| {
+            !primary_key_paths
+                .iter()
+                .any(|path| path.as_slice() == [field.name.as_str()])
+        })
+        .collect();
     Ok(crate::changelog::ChangeRecord {
         account_id: account_id.to_string(),
         format_version: 2,
@@ -7085,10 +7218,79 @@ fn decode_columnar_change_record(
         schema_key: parts.schema_key.clone(),
         entity_pk,
         file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+        snapshot,
+        typed_snapshot: (!materialize_json_snapshot).then(|| {
+            crate::changelog::TypedHistorySnapshot {
+                schema_layout_fingerprint: parts.schema_layout_fingerprint.clone(),
+                deleted,
+                primary_key_paths: primary_key_paths.to_vec(),
+                fields: if deleted { Vec::new() } else { typed_fields },
+            }
+        }),
         metadata: crate::json_store::JsonSlot::None,
         created_at: parts.uniform_updated_at,
         origin_key: parts.origin_key.clone(),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn take_columnar_history_json_projections() -> usize {
+    0
+}
+
+fn insert_columnar_identity_path(
+    target: &mut serde_json::Value,
+    path: &[String],
+    value: serde_json::Value,
+) -> Result<(), LixError> {
+    let Some((segment, remaining)) = path.split_first() else {
+        if !target.is_null() && target != &value {
+            return Err(replacement_payload_error(
+                "columnar primary-key paths conflict",
+            ));
+        }
+        *target = value;
+        return Ok(());
+    };
+    if target.is_null() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let object = target.as_object_mut().ok_or_else(|| {
+        replacement_payload_error("columnar primary-key path crosses a non-object")
+    })?;
+    insert_columnar_identity_path(
+        object
+            .entry(segment.clone())
+            .or_insert(serde_json::Value::Null),
+        remaining,
+        value,
+    )
+}
+
+fn typed_history_value_as_json(
+    value: Option<&crate::changelog::TypedHistoryScalar>,
+) -> Result<serde_json::Value, LixError> {
+    Ok(match value {
+        None => serde_json::Value::Null,
+        Some(crate::changelog::TypedHistoryScalar::String(value)) => {
+            serde_json::Value::String(value.clone())
+        }
+        Some(crate::changelog::TypedHistoryScalar::Jsonb(value)) => serde_json::from_str(value)
+            .map_err(|error| {
+                replacement_payload_error(&format!("columnar JSON value is invalid: {error}"))
+            })?,
+        Some(crate::changelog::TypedHistoryScalar::Int64(value)) => (*value).into(),
+        Some(crate::changelog::TypedHistoryScalar::Float64Bits(value)) => {
+            serde_json::Number::from_f64(f64::from_bits(*value))
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| replacement_payload_error("columnar number is non-finite"))?
+        }
+        Some(crate::changelog::TypedHistoryScalar::Boolean(value)) => (*value).into(),
+        Some(crate::changelog::TypedHistoryScalar::TimestampMicros(value)) => {
+            let timestamp = chrono::DateTime::from_timestamp_micros(*value)
+                .ok_or_else(|| replacement_payload_error("columnar timestamp is out of range"))?;
+            serde_json::Value::String(timestamp.to_rfc3339())
+        }
     })
 }
 
@@ -7772,7 +7974,7 @@ async fn load_columnar_owned_entries(
                     updated_at: parts.uniform_updated_at,
                 },
                 change_record: decode_columnar_change_record(
-                    &manifest, &batch, row_index, parts, change_id, account_id,
+                    &manifest, &batch, row_index, parts, change_id, account_id, true,
                 )?,
                 base_coordinate: Some(TrackedStateBaseCoordinate {
                     base_commit_id: commit_id,
@@ -7845,6 +8047,35 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     file_ids: &[String],
     max_segment_count: usize,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
+    load_commit_delta_members_with_payloads_for_schemas_inner(
+        store, commit_id, schema_keys, file_ids, max_segment_count, true,
+    )
+    .await
+}
+
+/// History-only member load. Columnar members retain their authenticated typed
+/// cells and never construct a JSON post-image.
+pub(crate) async fn load_commit_delta_members_with_typed_payloads_for_schemas(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+    file_ids: &[String],
+    max_segment_count: usize,
+) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
+    load_commit_delta_members_with_payloads_for_schemas_inner(
+        store, commit_id, schema_keys, file_ids, max_segment_count, false,
+    )
+    .await
+}
+
+async fn load_commit_delta_members_with_payloads_for_schemas_inner(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+    file_ids: &[String],
+    max_segment_count: usize,
+    materialize_columnar_json: bool,
+) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
     let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
         return Ok(Some(Vec::new()));
     };
@@ -7856,6 +8087,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
             file_ids,
             max_segment_count,
             true,
+            materialize_columnar_json,
         )
         .await?
     else {
@@ -7883,6 +8115,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         file_ids,
         max_segment_count.saturating_sub(local_segment_count),
         true,
+        materialize_columnar_json,
     )
     .await?
     else {
@@ -7920,6 +8153,7 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
         &[],
         usize::MAX,
         false,
+        true,
     )
     .await?
     else {
@@ -8202,6 +8436,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     file_ids: &[String],
     max_segment_count: usize,
     hydrate_selected_payloads: bool,
+    materialize_columnar_json: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
     let Some(root) = state.mutation_directory_root.as_ref() else {
         let manifest = commit_delta_manifest_from_commit_state(state);
@@ -8216,6 +8451,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
                 &manifest,
                 schema_keys,
                 hydrate_selected_payloads,
+                materialize_columnar_json,
             )
             .await?,
             segment_count,
@@ -8231,6 +8467,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             file_ids,
             max_segment_count,
             hydrate_selected_payloads,
+            materialize_columnar_json,
         )
         .await;
     }
@@ -8243,6 +8480,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
                 &manifest,
                 schema_keys,
                 hydrate_selected_payloads,
+                materialize_columnar_json,
             )
             .await?,
             0,
@@ -8295,6 +8533,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             &manifest,
             schema_keys,
             hydrate_selected_payloads,
+            materialize_columnar_json,
         )
         .await?,
         segment_count,
@@ -8365,6 +8604,7 @@ async fn load_bounded_commit_delta_members_for_schemas(
     file_ids: &[String],
     max_segment_count: usize,
     hydrate_selected_payloads: bool,
+    _materialize_columnar_json: bool,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
     let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
         replacement_payload_error("bounded payload scan omitted its mutation-directory root")
@@ -8519,13 +8759,21 @@ async fn load_commit_delta_members_from_manifest(
     manifest: &CommitDeltaManifest,
     schema_keys: &[String],
     hydrate_selected_payloads: bool,
+    _materialize_columnar_json: bool,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     if let Some(parts) = manifest.columnar_parts.as_ref() {
         if !schema_keys.is_empty() && !schema_keys.iter().any(|schema| schema == &parts.schema_key)
         {
             return Ok(Vec::new());
         }
-        return load_columnar_mutation_members(store, commit_id, parts, &manifest.account_id).await;
+        return load_columnar_mutation_members(
+            store,
+            commit_id,
+            parts,
+            &manifest.account_id,
+            _materialize_columnar_json,
+        )
+        .await;
     }
     let requested_schemas = schema_keys
         .iter()
@@ -8591,6 +8839,7 @@ async fn load_columnar_mutation_members(
     commit_id: CommitId,
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
     account_id: &str,
+    materialize_json_snapshot: bool,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
     let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
@@ -8599,6 +8848,7 @@ async fn load_columnar_mutation_members(
     validate_columnar_mutation_manifest(&manifest, parts)?;
     let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
     let mut members = Vec::with_capacity(parts.row_count as usize);
+    let mut identity_digest = blake3::Hasher::new();
     for group_index in 0..manifest.groups.len() {
         let batch = crate::columnar_row_group::load_row_group_batch(
             store,
@@ -8616,13 +8866,26 @@ async fn load_columnar_mutation_members(
                 .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
             let change_id = change_id_from_packed_address(commit_id, packed);
             let change = decode_columnar_change_record(
-                &manifest, &batch, row_index, parts, change_id, account_id,
+                &manifest,
+                &batch,
+                row_index,
+                parts,
+                change_id,
+                account_id,
+                materialize_json_snapshot,
             )?;
             let key = TrackedStateKey {
                 schema_key: parts.schema_key.clone(),
                 file_id: None,
                 entity_pk: change.entity_pk.clone(),
             };
+            let identity = key.entity_pk.as_json_array_text().map_err(|error| {
+                replacement_payload_error(&format!(
+                    "columnar mutation inventory contains an invalid identity: {error}"
+                ))
+            })?;
+            identity_digest.update(&(identity.len() as u64).to_le_bytes());
+            identity_digest.update(identity.as_bytes());
             members.push(CommitDeltaMember {
                 key,
                 value: TrackedStateIndexValue {
@@ -8653,6 +8916,13 @@ async fn load_columnar_mutation_members(
             "columnar mutation rows disagree with commit authority",
         ));
     }
+    if parts.ordered_identity_digest == [0; 32]
+        || identity_digest.finalize().as_bytes() != &parts.ordered_identity_digest
+    {
+        return Err(replacement_payload_error(
+            "columnar mutation identities disagree with commit authority",
+        ));
+    }
     validate_commit_delta_member_order_and_ids(commit_id, &members)?;
     Ok(members)
 }
@@ -8664,7 +8934,12 @@ async fn hydrate_selected_members(
     let selected = members
         .iter()
         .enumerate()
-        .filter(|(_, member)| !member.authored && !member.selected_tombstone)
+        // Typed history tombstones carry authenticated schema identity and an
+        // explicit deleted marker in their source columnar row. They are
+        // payload-free only in the selecting commit's compact delta, so the
+        // history member scan must resolve them through the same canonical
+        // source change authority as live selected members.
+        .filter(|(_, member)| !member.authored)
         .map(|(index, member)| (index, member.value.change_id))
         .collect::<Vec<_>>();
     let change_ids = selected
@@ -8687,6 +8962,7 @@ async fn hydrate_selected_members(
             ));
         }
         member.change.snapshot = change_record.snapshot;
+        member.change.typed_snapshot = change_record.typed_snapshot;
         member.change.metadata = change_record.metadata;
         member.change.origin_key = change_record.origin_key;
     }
@@ -9469,6 +9745,7 @@ async fn hydrate_selected_loaded_entries(
             ));
         }
         entry.change_record.snapshot = change_record.snapshot;
+        entry.change_record.typed_snapshot = change_record.typed_snapshot;
         entry.change_record.metadata = change_record.metadata;
         entry.change_record.origin_key = change_record.origin_key;
         entry.selected_ref = false;
@@ -10102,7 +10379,9 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     continue;
                 }
                 let members =
-                    load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[], true)
+                    load_commit_delta_members_from_manifest(
+                        store, commit_id, &manifest, &[], true, true,
+                    )
                         .await?;
                 for member in members {
                     if member.authored {
@@ -10189,7 +10468,7 @@ async fn visit_columnar_mutation_change_records(
                     })?;
                 let change_id = change_id_from_packed_address(commit_id, packed);
                 visit(decode_columnar_change_record(
-                    &manifest, &batch, row_index, parts, change_id, account_id,
+                    &manifest, &batch, row_index, parts, change_id, account_id, true,
                 )?)?;
                 global_ordinal += 1;
             }
@@ -10314,8 +10593,14 @@ pub(crate) async fn scan_commit_delta_inventory(
                     "columnar mutation inventory has legacy external segments",
                 ));
             }
-            members = load_columnar_mutation_members(store, commit_id, parts, &manifest.account_id)
-                .await?;
+            members = load_columnar_mutation_members(
+                store,
+                commit_id,
+                parts,
+                &manifest.account_id,
+                true,
+            )
+            .await?;
             parts.group_row_counts.len()
         } else if let Some(inline_segment) = manifest.inline_segment() {
             if !physical_segments.is_empty() {
@@ -10837,6 +11122,7 @@ pub(crate) async fn collect_local_commit_delta_json_refs(
         &[],
         usize::MAX,
         false,
+        true,
     ))
     .await?
     else {
@@ -11163,10 +11449,19 @@ fn collect_strict_commit_delta_members(
         }
         let payload = payloads.decode(entry_index)?;
         let key = decode_key(entry.key)?;
-        let (snapshot, metadata, origin_key, base_coordinate, authored, selected_tombstone) =
+        let (
+            snapshot,
+            typed_snapshot,
+            metadata,
+            origin_key,
+            base_coordinate,
+            authored,
+            selected_tombstone,
+        ) =
             match payload {
                 CommitDeltaPayload::Authored(payload) => (
                     payload.snapshot,
+                    payload.typed_snapshot,
                     payload.metadata,
                     payload.origin_key,
                     payload.base_coordinate,
@@ -11175,6 +11470,7 @@ fn collect_strict_commit_delta_members(
                 ),
                 CommitDeltaPayload::SelectedRef(base_coordinate) => (
                     crate::json_store::JsonSlot::None,
+                    None,
                     crate::json_store::JsonSlot::None,
                     None,
                     base_coordinate,
@@ -11183,6 +11479,7 @@ fn collect_strict_commit_delta_members(
                 ),
                 CommitDeltaPayload::SelectedTombstone(base_coordinate) => (
                     crate::json_store::JsonSlot::None,
+                    None,
                     crate::json_store::JsonSlot::None,
                     None,
                     base_coordinate,
@@ -11198,6 +11495,7 @@ fn collect_strict_commit_delta_members(
             entity_pk: key.entity_pk.clone(),
             file_id: key.file_id.clone(),
             snapshot,
+            typed_snapshot,
             metadata,
             created_at: value.updated_at,
             origin_key,
@@ -11778,6 +12076,7 @@ fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
             snapshot: crate::json_store::JsonSlotRef::None,
             metadata: crate::json_store::JsonSlotRef::None,
             origin_key: None,
+            typed_snapshot: None,
             base_coordinate: None,
             authored: true,
         };
@@ -11825,6 +12124,7 @@ fn encode_commit_delta_segment_layout(
             && matches!(payload.snapshot, crate::json_store::JsonSlotRef::Inline(_))
             && matches!(payload.metadata, crate::json_store::JsonSlotRef::None)
             && payload.origin_key.is_none()
+            && payload.typed_snapshot.is_none()
             && payload.base_coordinate.is_none()
     });
     if authored_inline {
@@ -11892,6 +12192,7 @@ fn encode_commit_delta_segment_layout(
                 snapshot: payload.snapshot,
                 metadata: payload.metadata,
                 origin_key: payload.origin_key,
+                typed_snapshot: payload.typed_snapshot,
                 base_coordinate: payload.base_coordinate,
             };
             storage_codec::append(
@@ -12339,6 +12640,7 @@ fn decode_replacement_part_as_commit_delta(
                 snapshot,
                 metadata,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
             },
         )?;
@@ -12567,9 +12869,11 @@ where
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_row_loaded(account_id.len());
     let key = decode_key(entry.key)?;
-    let (snapshot, metadata, origin_key, base_coordinate, selected_ref) = match payload {
+    let (snapshot, typed_snapshot, metadata, origin_key, base_coordinate, selected_ref) =
+        match payload {
         CommitDeltaPayload::Authored(payload) => (
             payload.snapshot,
+            payload.typed_snapshot,
             payload.metadata,
             payload.origin_key,
             payload.base_coordinate,
@@ -12577,6 +12881,7 @@ where
         ),
         CommitDeltaPayload::SelectedRef(base_coordinate) => (
             crate::json_store::JsonSlot::None,
+            None,
             crate::json_store::JsonSlot::None,
             None,
             base_coordinate,
@@ -12584,6 +12889,7 @@ where
         ),
         CommitDeltaPayload::SelectedTombstone(base_coordinate) => (
             crate::json_store::JsonSlot::None,
+            None,
             crate::json_store::JsonSlot::None,
             None,
             base_coordinate,
@@ -12598,6 +12904,7 @@ where
         entity_pk: key.entity_pk,
         file_id: key.file_id,
         snapshot,
+        typed_snapshot,
         metadata,
         created_at: value.updated_at,
         origin_key,
@@ -14481,6 +14788,7 @@ mod tests {
         origin_key: Option<&'a str>,
     ) -> TrackedStateCommitDeltaRef<'a> {
         TrackedStateCommitDeltaRef {
+            typed_snapshot: None,
             delta: TrackedStateDeltaRef {
                 schema_key: &fixture.schema_key,
                 file_id: fixture.file_id.as_deref(),
@@ -15588,6 +15896,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             }],
@@ -16659,6 +16968,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             }],
@@ -16761,6 +17071,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[0]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("first"),
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             },
@@ -16768,6 +17079,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[1]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             },
@@ -16775,6 +17087,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[2]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("last"),
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             },
@@ -16887,6 +17200,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"authored":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: Some(coordinates[0]),
                 authored: true,
             },
@@ -16894,6 +17208,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: Some(coordinates[1]),
                 authored: false,
             },
@@ -16901,6 +17216,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"authored":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: Some(coordinates[2]),
                 authored: true,
             },
@@ -16965,6 +17281,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&first_snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             },
@@ -16972,6 +17289,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&second_snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             },
@@ -17050,6 +17368,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             }],
@@ -17099,6 +17418,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             },
@@ -17106,6 +17426,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"second":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             },
@@ -17253,6 +17574,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"ok":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                typed_snapshot: None,
                 base_coordinate: None,
                 authored: true,
             }],

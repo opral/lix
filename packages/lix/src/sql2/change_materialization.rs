@@ -19,6 +19,7 @@ pub(crate) struct MaterializedChange {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
+    pub(crate) typed_snapshot: Option<crate::changelog::TypedHistorySnapshot>,
     pub(crate) metadata: Option<SharedStr>,
     pub(crate) created_at: String,
     pub(crate) origin_key: Option<String>,
@@ -45,11 +46,29 @@ impl ChangePayloadProjection {
 pub(crate) async fn materialize_located_history_change<S>(
     json_reader: &mut JsonStoreReader<S>,
     change: crate::commit_graph::CommitGraphChange,
+    typed_entity_payloads: bool,
 ) -> Result<MaterializedChange, LixError>
 where
     S: StorageAdapterRead,
 {
-    materialize_commit_graph_change(json_reader, change, ChangePayloadProjection::ALL).await
+    if typed_entity_payloads && change.typed_snapshot.is_none() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "registered entity history change '{}' for schema '{}' omitted its authenticated typed payload",
+                change.id, change.schema_key
+            ),
+        ));
+    }
+    materialize_commit_graph_change(
+        json_reader,
+        change,
+        ChangePayloadProjection {
+            snapshot_content: !typed_entity_payloads,
+            metadata: true,
+        },
+    )
+    .await
 }
 
 pub(crate) async fn materialize_changelog_change_record<S>(
@@ -69,6 +88,7 @@ where
             schema_key: change.schema_key,
             file_id: change.file_id,
             snapshot: change.snapshot,
+            typed_snapshot: change.typed_snapshot,
             metadata: change.metadata,
             created_at: change.created_at,
             origin_key: change.origin_key,
@@ -86,7 +106,7 @@ pub(crate) async fn materialize_commit_graph_change<S>(
 where
     S: StorageAdapterRead,
 {
-    let snapshot_content = if payload_projection.snapshot_content {
+    let snapshot_content = if payload_projection.snapshot_content && change.typed_snapshot.is_none() {
         load_changelog_json_slot(json_reader, &change.snapshot, "snapshot").await?
     } else {
         None
@@ -108,6 +128,7 @@ where
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot_content,
+        typed_snapshot: change.typed_snapshot,
         metadata,
         created_at: change.created_at.to_string(),
         origin_key: change.origin_key,
@@ -163,7 +184,10 @@ mod tests {
     };
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
-    use super::{ChangePayloadProjection, materialize_commit_graph_change};
+    use super::{
+        ChangePayloadProjection, materialize_commit_graph_change,
+        materialize_located_history_change,
+    };
 
     fn change(snapshot: JsonSlot, metadata: JsonSlot) -> CommitGraphChange {
         CommitGraphChange {
@@ -173,6 +197,7 @@ mod tests {
             schema_key: "example".to_string(),
             file_id: Some("file-1".to_string()),
             snapshot,
+            typed_snapshot: None,
             metadata,
             created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
             origin_key: Some("origin-1".to_string()),
@@ -271,5 +296,38 @@ mod tests {
 
         assert_eq!(row.snapshot_content.as_deref(), Some(snapshot));
         assert_eq!(row.metadata.as_deref(), Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn typed_entity_history_never_reads_or_falls_back_to_json_snapshot() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("begin read");
+        let mut json_reader = JsonStoreContext::new().reader(read);
+        let missing_ref = JsonRef::for_content(b"missing legacy snapshot");
+        let mut typed = change(JsonSlot::Ref(missing_ref), JsonSlot::None);
+        typed.typed_snapshot = Some(crate::changelog::TypedHistorySnapshot {
+            schema_layout_fingerprint: "layout".to_owned(),
+            deleted: false,
+            primary_key_paths: vec![vec!["id".to_owned()]],
+            fields: Vec::new(),
+        });
+        let row = materialize_located_history_change(&mut json_reader, typed, true)
+            .await
+            .expect("typed payload must bypass the legacy JSON slot");
+        assert!(row.snapshot_content.is_none());
+        assert!(row.typed_snapshot.is_some());
+
+        let error = materialize_located_history_change(
+            &mut json_reader,
+            change(JsonSlot::Ref(missing_ref), JsonSlot::None),
+            true,
+        )
+        .await
+        .expect_err("qualifying entity history without typed authority must fail closed");
+        assert!(error.message.contains("omitted its authenticated typed payload"));
+        assert!(!error.message.contains(&missing_ref.to_hex()));
     }
 }

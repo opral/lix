@@ -424,7 +424,7 @@ where
                 || record.schema_key != key.schema_key
                 || record.file_id != key.file_id
                 || record.entity_pk != key.entity_pk
-                || record.snapshot.is_none()
+                || record.snapshot.is_some() == record.typed_snapshot.is_some()
                 || record.created_at != updated_at
             {
                 return Err(LixError::new(

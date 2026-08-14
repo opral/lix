@@ -171,6 +171,7 @@ where
         .iter()
         .enumerate()
         .map(|(index, entity_pk)| TrackedStateCommitDeltaRef {
+            typed_snapshot: None,
             delta: TrackedStateDeltaRef {
                 schema_key: "bench_current_state_alpha",
                 file_id: None,
@@ -226,6 +227,7 @@ where
             },
         };
         let row = TrackedStateCommitDeltaRef {
+            typed_snapshot: None,
             delta: TrackedStateDeltaRef {
                 schema_key: &schema_key,
                 file_id: Some(&file_id),
@@ -304,6 +306,7 @@ where
             &beta_pk
         };
         let row = TrackedStateCommitDeltaRef {
+            typed_snapshot: None,
             delta: TrackedStateDeltaRef {
                 schema_key: &schema_key,
                 file_id: file_id.as_deref(),
@@ -1131,6 +1134,7 @@ impl PackedHistoryDelta {
             }
         };
         TrackedStateCommitDeltaRef {
+            typed_snapshot: None,
             delta: TrackedStateDeltaRef {
                 schema_key: &self.schema_key,
                 file_id: None,

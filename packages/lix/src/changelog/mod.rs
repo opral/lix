@@ -34,7 +34,8 @@ pub(crate) use types::COMMIT_RECORD_FORMAT_VERSION;
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitRecord, CommitScanBatch,
-    CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
+    CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend, TypedHistoryField,
+    TypedHistoryScalar, TypedHistorySnapshot,
     commit_row_snapshot_json, next_first_parent_jump,
 };
 pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};

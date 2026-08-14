@@ -1891,6 +1891,7 @@ where
                     min_depth: None,
                     max_depth,
                     include_tombstones: true,
+                    typed_entity_payloads: false,
                     limit,
                 },
             )
@@ -1993,6 +1994,7 @@ where
         stage_bench_commit_deltas(
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
+                typed_snapshot: None,
                 delta: crate::tracked_state::TrackedStateDeltaRef {
                     schema_key: COMMIT_GRAPH_BENCH_MEMBER_SCHEMA_KEY,
                     file_id: None,
