@@ -2453,13 +2453,15 @@ where
                     exact.output_columns,
                 )
                 .await?;
-                return Ok((
-                    sql2::SessionReadSqlResult {
-                        runtime_functions: None,
-                        query: sql2::SessionReadResult::Rows(query),
-                    },
-                    Vec::new(),
-                ));
+                if let Some(query) = query {
+                    return Ok((
+                        sql2::SessionReadSqlResult {
+                            runtime_functions: None,
+                            query: sql2::SessionReadResult::Rows(query),
+                        },
+                        Vec::new(),
+                    ));
+                }
             }
         }
         let hot_state: Arc<dyn crate::hot_state::HotStateReader> =

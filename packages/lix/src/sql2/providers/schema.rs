@@ -80,7 +80,7 @@ pub(crate) async fn execute_exact_schema_point_read(
     row_pk: RowPk,
     projected_columns: &[String],
     output_columns: Vec<String>,
-) -> Result<crate::SqlQueryResult, LixError> {
+) -> Result<Option<crate::SqlQueryResult>, LixError> {
     let mut request = row_hot_state_scan_request(
         &spec.schema_key,
         Some(active_branch_id),
@@ -89,12 +89,9 @@ pub(crate) async fn execute_exact_schema_point_read(
         true,
     );
     request.filter.row_pks = vec![row_pk];
-    let snapshots = reader.scan_row_snapshots(request).await?.ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "exact schema point route lost its retained snapshot capability",
-        )
-    })?;
+    let Some(snapshots) = reader.scan_row_snapshots(request).await? else {
+        return Ok(None);
+    };
     if snapshots.len() > 1 {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -110,11 +107,11 @@ pub(crate) async fn execute_exact_schema_point_read(
         .transpose()?
         .into_iter()
         .collect();
-    Ok(crate::SqlQueryResult {
+    Ok(Some(crate::SqlQueryResult {
         rows,
         columns: output_columns,
         notices: Vec::new(),
-    })
+    }))
 }
 
 pub(crate) async fn register_row_providers<S>(
