@@ -6,15 +6,17 @@
 //! authenticated rolling schema root, commit ordinal references, and one
 //! repository head.
 
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use blake3::Hasher;
 use bytes::Bytes;
 use lix::storage::{
-    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, PutBatch,
-    PutEntry, ReadOptions, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
+    BeginScanOptions, CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue,
+    PutBatch, PutEntry, ReadOptions, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
     WriteOptions,
 };
 use lix_storage_rocksdb::RocksDB;
@@ -22,6 +24,8 @@ use lix_storage_slatedb::{SlateDB, SlateDBIoCounters};
 
 const SCHEMAS: usize = 8;
 const DESCRIPTOR_BYTES: usize = 96;
+const REPOSITORY_ID: [u8; 16] = *b"lix-model-repo-1";
+static ACTIVE_SCHEMAS: OnceLock<usize> = OnceLock::new();
 const CURRENT_META: StorageSpace =
     StorageSpace::immutable(lix::storage::SpaceId(0x7f20_0001), "model.current.meta");
 const CURRENT_SEGMENT: StorageSpace =
@@ -52,6 +56,7 @@ struct Metrics {
 }
 
 fn main() {
+    run_corruption_controls();
     let args = std::env::args().collect::<Vec<_>>();
     let histories = args
         .get(1)
@@ -77,6 +82,74 @@ fn main() {
             }
         }
     });
+}
+
+fn active_schemas() -> usize {
+    *ACTIVE_SCHEMAS.get_or_init(|| {
+        std::env::var("LIX_SCHEMA_HISTORY_SCHEMAS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(SCHEMAS)
+            .clamp(1, SCHEMAS)
+    })
+}
+
+fn run_corruption_controls() {
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(b"LXCHK2");
+    chunk.extend_from_slice(&REPOSITORY_ID);
+    chunk.push(0);
+    chunk.extend_from_slice(&0u64.to_be_bytes());
+    chunk.extend_from_slice(&1u32.to_be_bytes());
+    chunk.extend_from_slice(&[7u8; DESCRIPTOR_BYTES]);
+    let parsed = parse_chunk(&chunk).expect("valid corruption-control chunk");
+    assert_eq!(parsed.row_count, 1);
+    let digest = *blake3::hash(&chunk).as_bytes();
+
+    let mut directory = Vec::new();
+    directory.extend_from_slice(b"LXORD3");
+    directory.extend_from_slice(&REPOSITORY_ID);
+    directory.extend_from_slice(&1u32.to_be_bytes());
+    directory.extend_from_slice(&1u16.to_be_bytes());
+    directory.push(0);
+    directory.extend_from_slice(&0u64.to_be_bytes());
+    directory.extend_from_slice(&digest);
+    directory.extend_from_slice(&0u16.to_be_bytes());
+    directory.extend_from_slice(&0u32.to_be_bytes());
+    assert_eq!(
+        parse_ordinal_directory(&directory)
+            .expect("valid corruption-control directory")
+            .len(),
+        1
+    );
+
+    let mut truncated = directory.clone();
+    truncated.pop();
+    assert!(parse_ordinal_directory(&truncated).is_err());
+    let mut wrong_repository = directory.clone();
+    wrong_repository[6] ^= 1;
+    assert!(parse_ordinal_directory(&wrong_repository).is_err());
+    let mut bad_chunk_index = directory.clone();
+    let last_ref = bad_chunk_index.len() - 6;
+    bad_chunk_index[last_ref..last_ref + 2].copy_from_slice(&1u16.to_be_bytes());
+    assert!(parse_ordinal_directory(&bad_chunk_index).is_err());
+
+    let mut substituted = chunk.clone();
+    let last = substituted.len() - 1;
+    substituted[last] ^= 1;
+    assert_ne!(*blake3::hash(&substituted).as_bytes(), digest);
+    assert!(parse_chunk(&chunk[..chunk.len() - 1]).is_err());
+
+    let mut commit = Vec::new();
+    commit.extend_from_slice(b"LXSCH2");
+    commit.extend_from_slice(&REPOSITORY_ID);
+    commit.extend_from_slice(&7u64.to_be_bytes());
+    commit.extend_from_slice(&[9u8; 32]);
+    assert_eq!(parse_commit(&commit, Some(7)).unwrap(), [9u8; 32]);
+    assert!(parse_commit(&commit, Some(8)).is_err());
+    assert!(parse_commit(&commit[..commit.len() - 1], Some(7)).is_err());
+
+    println!("schema_history_corruption_controls,status=pass");
 }
 
 async fn run_rocks(history: usize, width: usize, samples: usize) {
@@ -159,23 +232,30 @@ async fn run_case<S: Storage>(
     let mut checksum = 0u64;
     for _ in 0..samples {
         let started = Instant::now();
-        checksum ^= load_commit(storage, layout, history / 2).await;
+        checksum = checksum
+            .wrapping_mul(0x100_0000_01b3)
+            .wrapping_add(load_commit(storage, layout, history / 2).await);
         commit_lookup.push(started.elapsed());
     }
     for _ in 0..samples {
         let started = Instant::now();
-        checksum ^= scan_schema(storage, layout, 0).await;
+        checksum = checksum
+            .wrapping_mul(0x100_0000_01b3)
+            .wrapping_add(scan_schema(storage, layout, 0).await);
         schema_history.push(started.elapsed());
     }
     for _ in 0..samples {
         let started = Instant::now();
-        checksum ^= scan_key_history(storage, layout, 0, 0).await;
+        checksum = checksum
+            .wrapping_mul(0x100_0000_01b3)
+            .wrapping_add(scan_key_history(storage, layout, 0, 0).await);
         key_history.push(started.elapsed());
     }
     schema_history.sort_unstable();
     key_history.sort_unstable();
     commit_lookup.sort_unstable();
     metrics.publication.sort_unstable();
+    assert_ne!(checksum, 0, "model checksum must not cancel");
     let cpu_us = process_cpu_us().saturating_sub(cpu_before);
     let io = io_counters
         .zip(io_before)
@@ -273,24 +353,25 @@ async fn stage_chunks<S: Storage>(
         .await
         .expect("begin chunk write");
     let mut commit_body = Vec::with_capacity(64);
-    let mut ordinal_directory = Vec::with_capacity(16 + width * 41);
-    let mut chunk_entries = Vec::with_capacity(SCHEMAS.min(width) + 1);
-    commit_body.extend_from_slice(b"LXSCH1");
+    let schema_count = active_schemas();
+    let mut directory_chunks = Vec::with_capacity(schema_count.min(width));
+    let mut chunk_entries = Vec::with_capacity(schema_count.min(width) + 1);
+    commit_body.extend_from_slice(b"LXSCH2");
+    commit_body.extend_from_slice(&REPOSITORY_ID);
     commit_body.extend_from_slice(&(commit as u64).to_be_bytes());
-    ordinal_directory.extend_from_slice(b"LXORD1");
-    ordinal_directory.extend_from_slice(&(width as u32).to_be_bytes());
-    for schema in 0..SCHEMAS.min(width) {
-        let rows = (schema..width).step_by(SCHEMAS).collect::<Vec<_>>();
+    for schema in 0..schema_count.min(width) {
+        let rows = (schema..width).step_by(schema_count).collect::<Vec<_>>();
         if rows.is_empty() {
             continue;
         }
         let ordinal = ordinals[schema];
         let mut chunk = Vec::with_capacity(24 + rows.len() * DESCRIPTOR_BYTES);
-        chunk.extend_from_slice(b"LXCHK1");
+        chunk.extend_from_slice(b"LXCHK2");
+        chunk.extend_from_slice(&REPOSITORY_ID);
         chunk.push(schema as u8);
         chunk.extend_from_slice(&ordinal.to_be_bytes());
         chunk.extend_from_slice(&(rows.len() as u32).to_be_bytes());
-        for row in rows {
+        for &row in &rows {
             chunk.extend_from_slice(&descriptor(commit, row));
         }
         let digest = *blake3::hash(&chunk).as_bytes();
@@ -299,9 +380,23 @@ async fn stage_chunks<S: Storage>(
         push_entry(&mut chunk_entries, chunk_key, chunk, metrics);
         schema_roots[schema] = hash_append(schema, ordinal, schema_roots[schema], digest);
         ordinals[schema] += 1;
+        directory_chunks.push((schema, ordinal, digest));
+    }
+    let mut ordinal_directory = Vec::with_capacity(28 + directory_chunks.len() * 41 + width * 6);
+    ordinal_directory.extend_from_slice(b"LXORD3");
+    ordinal_directory.extend_from_slice(&REPOSITORY_ID);
+    ordinal_directory.extend_from_slice(&(width as u32).to_be_bytes());
+    ordinal_directory.extend_from_slice(&(directory_chunks.len() as u16).to_be_bytes());
+    for &(schema, ordinal, digest) in &directory_chunks {
         ordinal_directory.push(schema as u8);
         ordinal_directory.extend_from_slice(&ordinal.to_be_bytes());
         ordinal_directory.extend_from_slice(&digest);
+    }
+    for row in 0..width {
+        let chunk_index = row % schema_count;
+        let row_index = row / schema_count;
+        ordinal_directory.extend_from_slice(&(chunk_index as u16).to_be_bytes());
+        ordinal_directory.extend_from_slice(&(row_index as u32).to_be_bytes());
     }
     let ordinal_directory_id = *blake3::hash(&ordinal_directory).as_bytes();
     let mut ordinal_directory_key = Vec::with_capacity(33);
@@ -314,7 +409,8 @@ async fn stage_chunks<S: Storage>(
         metrics,
     );
     let mut root_directory = Vec::with_capacity(48 + SCHEMAS * 41);
-    root_directory.extend_from_slice(b"LXRHR1");
+    root_directory.extend_from_slice(b"LXRHR2");
+    root_directory.extend_from_slice(&REPOSITORY_ID);
     root_directory.extend_from_slice(&ordinal_directory_id);
     for schema in 0..SCHEMAS {
         root_directory.push(schema as u8);
@@ -351,11 +447,16 @@ async fn stage_chunks<S: Storage>(
         metrics,
     )
     .await;
+    let mut selected_head = Vec::with_capacity(62);
+    selected_head.extend_from_slice(b"LXHED2");
+    selected_head.extend_from_slice(&REPOSITORY_ID);
+    selected_head.extend_from_slice(&(commit as u64).to_be_bytes());
+    selected_head.extend_from_slice(&repository_root_id);
     put(
         &mut write,
         PACKED_HEAD,
         b"head".to_vec(),
-        repository_root_id.to_vec(),
+        selected_head,
         metrics,
     )
     .await;
@@ -402,26 +503,382 @@ async fn put<W: StorageWrite>(
         .expect("put model object");
 }
 
-async fn scan_schema<S: Storage>(storage: &S, layout: Layout, schema: usize) -> u64 {
+struct SelectedClosure {
+    schema_counts: [u64; SCHEMAS],
+    schema_roots: [[u8; 32]; SCHEMAS],
+}
+
+struct ParsedChunk {
+    schema: usize,
+    ordinal: u64,
+    row_count: usize,
+    payload_bytes: usize,
+}
+
+async fn load_selected_closure<S: Storage>(storage: &S) -> SelectedClosure {
+    let head = get_exact(storage, PACKED_HEAD, b"head").await;
+    assert_eq!(head.len(), 62, "selected head length mismatch");
+    assert_eq!(&head[..6], b"LXHED2", "selected head domain mismatch");
+    assert_eq!(
+        &head[6..22],
+        &REPOSITORY_ID,
+        "selected head repository mismatch"
+    );
+    let commit = read_u64(&head[22..30]);
+    let expected_commit_digest: [u8; 32] = head[30..62].try_into().unwrap();
+    let commit_bytes = get_exact(storage, PACKED_COMMIT, &commit_key(commit as usize)).await;
+    assert_eq!(
+        *blake3::hash(&commit_bytes).as_bytes(),
+        expected_commit_digest,
+        "selected commit substitution"
+    );
+    let root_id =
+        parse_commit(&commit_bytes, Some(commit as usize)).expect("authenticate selected commit");
+    let mut root_key = Vec::with_capacity(33);
+    root_key.push(0xfe);
+    root_key.extend_from_slice(&root_id);
+    let root_bytes = get_exact(storage, CHUNK, &root_key).await;
+    assert_eq!(
+        *blake3::hash(&root_bytes).as_bytes(),
+        root_id,
+        "root-directory substitution"
+    );
+    let (ordinal_directory_id, schema_counts, schema_roots) =
+        parse_root_directory(&root_bytes).expect("authenticate root directory");
+    let mut ordinal_key = Vec::with_capacity(33);
+    ordinal_key.push(0xff);
+    ordinal_key.extend_from_slice(&ordinal_directory_id);
+    let ordinal_bytes = get_exact(storage, CHUNK, &ordinal_key).await;
+    assert_eq!(
+        *blake3::hash(&ordinal_bytes).as_bytes(),
+        ordinal_directory_id,
+        "ordinal-directory substitution"
+    );
+    let references =
+        parse_ordinal_directory(&ordinal_bytes).expect("authenticate ordinal directory");
+    authenticate_referenced_chunks(storage, &references).await;
+    SelectedClosure {
+        schema_counts,
+        schema_roots,
+    }
+}
+
+async fn authenticate_referenced_chunks<S: Storage>(
+    storage: &S,
+    references: &[(usize, u64, usize, [u8; 32])],
+) {
+    let mut unique = BTreeMap::<(usize, u64), ([u8; 32], usize)>::new();
+    for &(schema, ordinal, row_index, digest) in references {
+        let entry = unique.entry((schema, ordinal)).or_insert((digest, 0));
+        assert_eq!(
+            entry.0, digest,
+            "conflicting chunk digest in ordinal directory"
+        );
+        entry.1 = entry.1.max(row_index + 1);
+    }
+    let keys = unique
+        .keys()
+        .map(|&(schema, ordinal)| {
+            let mut key = vec![schema as u8];
+            key.extend_from_slice(&ordinal.to_be_bytes());
+            Key(Bytes::from(key))
+        })
+        .collect::<Vec<_>>();
     let read = storage
         .begin_read(ReadOptions::default())
         .await
-        .expect("begin schema scan");
-    let (space, range) = match layout {
-        Layout::Current => (CURRENT_SEGMENT, KeyRange::unbounded()),
-        Layout::SchemaChunks => (CHUNK, prefix_range(&[schema as u8])),
-    };
-    let mut cursor = read
-        .begin_scan(space, range, BeginScanOptions::default())
+        .expect("begin member-directory validation read");
+    let result = read
+        .get_many(&[GetManyRequest {
+            space: CHUNK,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
         .await
-        .expect("open schema scan");
-    let rows = cursor.collect_all().await.expect("collect schema scan");
-    rows.iter()
-        .map(|row| match &row.value {
-            lix::storage::ProjectedValue::FullValue(value) => value.len() as u64,
-            lix::storage::ProjectedValue::KeyOnly => 0,
-        })
-        .sum()
+        .expect("load ordinal-directory chunks");
+    for (((schema, ordinal), (digest, referenced_rows)), value) in
+        unique.into_iter().zip(result.values.into_iter())
+    {
+        let Some(ProjectedValue::FullValue(value)) = value else {
+            panic!("missing ordinal-directory chunk");
+        };
+        assert_eq!(
+            *blake3::hash(&value).as_bytes(),
+            digest,
+            "chunk substitution"
+        );
+        let parsed = parse_chunk(&value).expect("authenticate referenced chunk");
+        assert_eq!(parsed.schema, schema, "referenced chunk schema mismatch");
+        assert_eq!(parsed.ordinal, ordinal, "referenced chunk ordinal mismatch");
+        assert!(
+            referenced_rows <= parsed.row_count,
+            "ordinal-directory row index out of bounds"
+        );
+    }
+}
+
+async fn get_exact<S: Storage>(storage: &S, space: StorageSpace, key: &[u8]) -> Bytes {
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("begin exact model read");
+    let keys = [Key(Bytes::copy_from_slice(key))];
+    let result = read
+        .get_many(&[GetManyRequest {
+            space,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("load exact model object");
+    let Some(ProjectedValue::FullValue(value)) = result.values[0].clone() else {
+        panic!("missing exact model object");
+    };
+    value
+}
+
+fn parse_commit(bytes: &[u8], expected_commit: Option<usize>) -> Result<[u8; 32], &'static str> {
+    if bytes.len() != 62 || &bytes[..6] != b"LXSCH2" {
+        return Err("commit envelope is malformed");
+    }
+    if bytes[6..22] != REPOSITORY_ID {
+        return Err("commit repository mismatch");
+    }
+    if expected_commit.is_some_and(|expected| read_u64(&bytes[22..30]) != expected as u64) {
+        return Err("commit ordinal mismatch");
+    }
+    Ok(bytes[30..62].try_into().unwrap())
+}
+
+fn parse_root_directory(
+    bytes: &[u8],
+) -> Result<([u8; 32], [u64; SCHEMAS], [[u8; 32]; SCHEMAS]), &'static str> {
+    if bytes.len() != 54 + SCHEMAS * 41 || &bytes[..6] != b"LXRHR2" {
+        return Err("root directory is malformed");
+    }
+    if bytes[6..22] != REPOSITORY_ID {
+        return Err("root directory repository mismatch");
+    }
+    let ordinal_id = bytes[22..54].try_into().unwrap();
+    let mut counts = [0u64; SCHEMAS];
+    let mut roots = [[0u8; 32]; SCHEMAS];
+    for schema in 0..SCHEMAS {
+        let offset = 54 + schema * 41;
+        if bytes[offset] as usize != schema {
+            return Err("root directory schema order mismatch");
+        }
+        counts[schema] = read_u64(&bytes[offset + 1..offset + 9]);
+        roots[schema].copy_from_slice(&bytes[offset + 9..offset + 41]);
+    }
+    Ok((ordinal_id, counts, roots))
+}
+
+fn parse_ordinal_directory(
+    bytes: &[u8],
+) -> Result<Vec<(usize, u64, usize, [u8; 32])>, &'static str> {
+    if bytes.len() < 28 || &bytes[..6] != b"LXORD3" {
+        return Err("ordinal directory is malformed");
+    }
+    if bytes[6..22] != REPOSITORY_ID {
+        return Err("ordinal directory repository mismatch");
+    }
+    let count = read_u32(&bytes[22..26]) as usize;
+    let chunk_count = u16::from_be_bytes(bytes[26..28].try_into().unwrap()) as usize;
+    let expected_len = 28usize
+        .checked_add(chunk_count.checked_mul(41).ok_or("chunk table overflow")?)
+        .and_then(|value| value.checked_add(count.checked_mul(6)?))
+        .ok_or("ordinal directory length overflow")?;
+    if bytes.len() != expected_len || chunk_count == 0 || chunk_count > SCHEMAS {
+        return Err("ordinal directory count mismatch");
+    }
+    let mut chunks = Vec::with_capacity(chunk_count);
+    let mut previous_chunk = None;
+    for index in 0..chunk_count {
+        let offset = 28 + index * 41;
+        let schema = bytes[offset] as usize;
+        if schema >= SCHEMAS {
+            return Err("ordinal directory schema is invalid");
+        }
+        let ordinal = read_u64(&bytes[offset + 1..offset + 9]);
+        let identity = (schema, ordinal);
+        if previous_chunk.is_some_and(|value| value >= identity) {
+            return Err("ordinal chunk table order or duplicate mismatch");
+        }
+        previous_chunk = Some(identity);
+        chunks.push((
+            schema,
+            ordinal,
+            bytes[offset + 9..offset + 41].try_into().unwrap(),
+        ));
+    }
+    let mut result = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = 28 + chunk_count * 41 + index * 6;
+        let chunk_index =
+            u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+        let row_index = read_u32(&bytes[offset + 2..offset + 6]) as usize;
+        if chunk_index != index % chunk_count || row_index != index / chunk_count {
+            return Err("ordinal directory row order or duplicate mismatch");
+        }
+        let Some(&(schema, ordinal, digest)) = chunks.get(chunk_index) else {
+            return Err("ordinal directory chunk index is invalid");
+        };
+        result.push((schema, ordinal, row_index, digest));
+    }
+    Ok(result)
+}
+
+fn parse_chunk(bytes: &[u8]) -> Result<ParsedChunk, &'static str> {
+    if bytes.len() < 35 || &bytes[..6] != b"LXCHK2" {
+        return Err("chunk is malformed");
+    }
+    if bytes[6..22] != REPOSITORY_ID {
+        return Err("chunk repository mismatch");
+    }
+    let schema = bytes[22] as usize;
+    if schema >= SCHEMAS {
+        return Err("chunk schema is invalid");
+    }
+    let ordinal = read_u64(&bytes[23..31]);
+    let row_count = read_u32(&bytes[31..35]) as usize;
+    let payload_bytes = row_count
+        .checked_mul(DESCRIPTOR_BYTES)
+        .ok_or("chunk length overflow")?;
+    if bytes.len() != 35 + payload_bytes {
+        return Err("chunk row count mismatch");
+    }
+    Ok(ParsedChunk {
+        schema,
+        ordinal,
+        row_count,
+        payload_bytes,
+    })
+}
+
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes(bytes.try_into().expect("four-byte integer"))
+}
+
+fn read_u64(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes(bytes.try_into().expect("eight-byte integer"))
+}
+
+async fn scan_schema<S: Storage>(storage: &S, layout: Layout, schema: usize) -> u64 {
+    if matches!(layout, Layout::SchemaChunks) {
+        return scan_authenticated_schema(storage, schema).await;
+    }
+    scan_authenticated_current(storage).await
+}
+
+async fn scan_authenticated_current<S: Storage>(storage: &S) -> u64 {
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("begin current authenticated scan");
+    let mut cursor = read
+        .begin_scan(
+            CURRENT_SEGMENT,
+            KeyRange::unbounded(),
+            BeginScanOptions::default(),
+        )
+        .await
+        .expect("open current authenticated scan");
+    let rows = cursor
+        .collect_all()
+        .await
+        .expect("collect current segments");
+    let mut commits = BTreeMap::<usize, Vec<(usize, Bytes)>>::new();
+    for row in rows {
+        assert_eq!(row.key.0.len(), 12, "current segment key is malformed");
+        let commit = read_u64(&row.key.0[..8]) as usize;
+        let segment = read_u32(&row.key.0[8..12]) as usize;
+        let ProjectedValue::FullValue(value) = row.value else {
+            panic!("current authenticated scan requires full values");
+        };
+        commits.entry(commit).or_default().push((segment, value));
+    }
+    let keys = commits
+        .keys()
+        .map(|&commit| Key(Bytes::from(commit_key(commit))))
+        .collect::<Vec<_>>();
+    let result = read
+        .get_many(&[GetManyRequest {
+            space: CURRENT_META,
+            keys: &keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .expect("load current commit metadata");
+    let mut total = 0u64;
+    for ((commit, mut segments), metadata) in commits.into_iter().zip(result.values.into_iter()) {
+        let Some(ProjectedValue::FullValue(metadata)) = metadata else {
+            panic!("missing current commit metadata");
+        };
+        assert_eq!(metadata.len(), 46, "current commit metadata is malformed");
+        assert_eq!(&metadata[..6], b"LXCUR1", "current commit domain mismatch");
+        let width = read_u64(&metadata[6..14]) as usize;
+        segments.sort_unstable_by_key(|(segment, _)| *segment);
+        let mut descriptors = Vec::with_capacity(width * DESCRIPTOR_BYTES);
+        for (expected, (segment, body)) in segments.into_iter().enumerate() {
+            assert_eq!(
+                segment, expected,
+                "current segment order gap at commit {commit}"
+            );
+            descriptors.extend_from_slice(&body);
+        }
+        assert_eq!(descriptors.len(), width * DESCRIPTOR_BYTES);
+        assert_eq!(
+            blake3::hash(&descriptors).as_bytes(),
+            &metadata[14..46],
+            "current segment substitution"
+        );
+        total += descriptors.len() as u64;
+    }
+    total
+}
+
+async fn scan_authenticated_schema<S: Storage>(storage: &S, schema: usize) -> u64 {
+    let selected = load_selected_closure(storage).await;
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .expect("begin authenticated schema scan");
+    let mut cursor = read
+        .begin_scan(
+            CHUNK,
+            prefix_range(&[schema as u8]),
+            BeginScanOptions::default(),
+        )
+        .await
+        .expect("open authenticated schema scan");
+    let rows = cursor.collect_all().await.expect("collect schema chunks");
+    let mut root = [0u8; 32];
+    let mut expected_ordinal = 0u64;
+    let mut payload_bytes = 0u64;
+    for row in rows {
+        let ProjectedValue::FullValue(value) = row.value else {
+            panic!("authenticated schema scan requires full values");
+        };
+        let parsed = parse_chunk(&value).expect("authenticate schema chunk");
+        assert_eq!(parsed.schema, schema, "schema chunk owner mismatch");
+        assert_eq!(parsed.ordinal, expected_ordinal, "schema chunk ordinal gap");
+        let digest = *blake3::hash(&value).as_bytes();
+        root = hash_append(schema, parsed.ordinal, root, digest);
+        expected_ordinal += 1;
+        payload_bytes += parsed.payload_bytes as u64;
+    }
+    assert_eq!(
+        expected_ordinal, selected.schema_counts[schema],
+        "schema chunk count mismatch"
+    );
+    assert_eq!(root, selected.schema_roots[schema], "schema root mismatch");
+    payload_bytes
 }
 
 async fn scan_key_history<S: Storage>(
@@ -455,8 +912,13 @@ async fn load_commit<S: Storage>(storage: &S, layout: Layout, commit: usize) -> 
         .await
         .expect("load commit");
     result.values[0].as_ref().map_or(0, |value| match value {
-        lix::storage::ProjectedValue::FullValue(value) => value.len() as u64,
-        lix::storage::ProjectedValue::KeyOnly => 0,
+        ProjectedValue::FullValue(value) => {
+            if matches!(layout, Layout::SchemaChunks) {
+                parse_commit(value, Some(commit)).expect("authenticate exact commit metadata");
+            }
+            value.len() as u64
+        }
+        ProjectedValue::KeyOnly => 0,
     })
 }
 
@@ -470,6 +932,7 @@ async fn measure_reopen<S: Storage>(
 ) {
     let started = Instant::now();
     let checksum = scan_schema(storage, layout, 0).await;
+    assert_ne!(checksum, 0, "reopen checksum must be nonzero");
     println!(
         "schema_history_reopen,backend={backend},layout={},H={history},D={width},elapsed_us={},settled_bytes={},checksum={checksum}",
         layout_name(layout),
