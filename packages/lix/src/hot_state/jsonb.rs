@@ -8,8 +8,9 @@ use serde_json::{Map, Number, Value};
 const MAGIC: &[u8; 4] = b"LJCI";
 const VERSION: u8 = 1;
 const HEADER_BYTES: usize = 41;
-const SMALL_LIMIT: usize = 12;
 const INDEX_PAGE_ENTRIES: usize = 32;
+const SMALL_ARRAY_LIMIT: usize = INDEX_PAGE_ENTRIES;
+const SMALL_OBJECT_LIMIT: usize = 8;
 const MAX_ENCODED_BYTES: usize = u32::MAX as usize;
 // A number frame needs a tag, sign, and at most ten bytes for its zigzag i64
 // scale. The remaining envelope-addressable bytes are canonical coefficient
@@ -209,7 +210,7 @@ fn encode_number(number: &Number, output: &mut Vec<u8>) -> Result<(), String> {
 
 fn encode_array(children: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
-    if children.len() <= SMALL_LIMIT {
+    if children.len() <= SMALL_ARRAY_LIMIT {
         output.push(SMALL_ARRAY);
         put_varint(children.len() as u64, &mut output);
         for child in children {
@@ -237,7 +238,7 @@ fn encode_array(children: &[Vec<u8>]) -> Result<Vec<u8>, String> {
 
 fn encode_object(entries: &[(&[u8], Vec<u8>)]) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
-    if entries.len() <= SMALL_LIMIT {
+    if entries.len() <= SMALL_OBJECT_LIMIT {
         output.push(SMALL_OBJECT);
         put_varint(entries.len() as u64, &mut output);
         for (key, child) in entries {
@@ -331,7 +332,7 @@ fn decode_number(mut payload: &[u8]) -> Result<Value, String> {
 
 fn decode_small_array(mut bytes: &[u8]) -> Result<Value, String> {
     let count = take_varint(&mut bytes, "small array count")? as usize;
-    if count > SMALL_LIMIT {
+    if count > SMALL_ARRAY_LIMIT {
         return Err("small array exceeds canonical count".into());
     }
     let mut values = Vec::with_capacity(count);
@@ -345,7 +346,7 @@ fn decode_small_array(mut bytes: &[u8]) -> Result<Value, String> {
 
 fn decode_indexed_array(bytes: &[u8]) -> Result<Value, String> {
     let count = read_u32(bytes, 0, "array count")?;
-    if count <= SMALL_LIMIT {
+    if count <= SMALL_ARRAY_LIMIT {
         return Err("indexed array is not canonical for its count".into());
     }
     let pages = read_u32(bytes, 4, "array page count")?;
@@ -373,7 +374,7 @@ fn decode_indexed_array(bytes: &[u8]) -> Result<Value, String> {
 
 fn decode_small_object(mut bytes: &[u8]) -> Result<Value, String> {
     let count = take_varint(&mut bytes, "small object count")? as usize;
-    if count > SMALL_LIMIT {
+    if count > SMALL_OBJECT_LIMIT {
         return Err("small object exceeds canonical count".into());
     }
     let mut object = Map::new();
@@ -394,7 +395,7 @@ fn decode_small_object(mut bytes: &[u8]) -> Result<Value, String> {
 
 fn decode_indexed_object(bytes: &[u8]) -> Result<Value, String> {
     let count = read_u32(bytes, 0, "object count")?;
-    if count <= SMALL_LIMIT {
+    if count <= SMALL_OBJECT_LIMIT {
         return Err("indexed object is not canonical for its count".into());
     }
     let table = (count + 1).checked_mul(4).ok_or("object table overflow")?;
@@ -613,7 +614,7 @@ mod tests {
 
     #[test]
     fn containers_have_one_canonical_size_class() {
-        for count in [0, 1, 12, 13, 32, 33, 1000] {
+        for count in [0, 1, 8, 9, 32, 33, 1000] {
             let value = Value::Array((0..count).map(Value::from).collect());
             let encoded = encode(&value).unwrap();
             let decoded = decode(&encoded).unwrap();
@@ -622,12 +623,17 @@ mod tests {
 
         let mut object = Map::new();
         object.insert(String::new(), Value::from("empty"));
-        for index in 0..12 {
+        for index in 0..8 {
             object.insert(format!("key-{index:02}"), Value::from(index));
         }
         let value = Value::Object(object);
         let encoded = encode(&value).unwrap();
         let decoded = decode(&encoded).unwrap();
         assert_eq!(encode(&decoded).unwrap(), encoded);
+
+        assert!(decode_small_object(&[9]).is_err());
+        assert!(decode_indexed_object(&8_u32.to_le_bytes()).is_err());
+        assert!(decode_small_array(&[33]).is_err());
+        assert!(decode_indexed_array(&32_u32.to_le_bytes()).is_err());
     }
 }
