@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,7 +33,7 @@ use crate::sql2::history_route::{
     parse_history_filter, validate_history_anchor_filter,
 };
 use crate::sql2::providers::schema::{
-    row_f64_value, row_i64_value, row_json_text_value, parse_snapshot,
+    parse_snapshot, row_f64_value, row_i64_value, row_json_text_value,
 };
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -303,6 +304,13 @@ fn row_history_record_batch(
     spec: &SchemaSurfaceSpec,
     rows: &[SchemaHistoryRow],
 ) -> Result<RecordBatch> {
+    // Parse each authenticated history payload once for the complete Arrow
+    // projection. The former per-column path reparsed the same whole-row JSON
+    // for every projected field.
+    let snapshots = rows
+        .iter()
+        .map(|row| parse_snapshot(row.change.snapshot_content.as_deref()))
+        .collect::<Result<Vec<_>>>()?;
     let system_fields = schema
         .fields()
         .iter()
@@ -317,7 +325,7 @@ fn row_history_record_batch(
         .iter()
         .map(|field| {
             system_batch.column_by_name(field.name()).map_or_else(
-                || row_history_column_array(field.name(), spec, rows),
+                || row_history_column_array(field.name(), spec, rows, &snapshots),
                 |array| Ok(Arc::clone(array)),
             )
         })
@@ -334,6 +342,7 @@ fn row_history_column_array(
     column_name: &str,
     spec: &SchemaSurfaceSpec,
     rows: &[SchemaHistoryRow],
+    snapshots: &[Option<JsonValue>],
 ) -> Result<ArrayRef> {
     let column_type = spec
         .visible_column(column_name)
@@ -346,32 +355,33 @@ fn row_history_column_array(
         .column_type;
     let projected_values = rows
         .iter()
-        .map(|row| row_history_column_value(row, spec, column_name))
+        .zip(snapshots)
+        .map(|(row, snapshot)| row_history_column_value(row, snapshot.as_ref(), spec, column_name))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(match column_type {
         SchemaColumnType::String | SchemaColumnType::Json => Arc::new(StringArray::from(
             projected_values
                 .iter()
-                .map(|snapshot| row_json_text_value(snapshot.as_ref(), column_type))
+                .map(|snapshot| row_json_text_value(snapshot.as_deref(), column_type))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         SchemaColumnType::Integer => Arc::new(Int64Array::from(
             projected_values
                 .iter()
-                .map(|snapshot| row_i64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .map(|snapshot| row_i64_value(snapshot.as_deref(), &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         SchemaColumnType::Number => Arc::new(Float64Array::from(
             projected_values
                 .iter()
-                .map(|snapshot| row_f64_value(snapshot.as_ref(), &spec.schema_key, column_name))
+                .map(|snapshot| row_f64_value(snapshot.as_deref(), &spec.schema_key, column_name))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         SchemaColumnType::Boolean => Arc::new(BooleanArray::from(
             projected_values
                 .iter()
-                .map(|snapshot| snapshot.as_ref().and_then(JsonValue::as_bool))
+                .map(|snapshot| snapshot.as_deref().and_then(JsonValue::as_bool))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
         SchemaColumnType::Timestamptz => Arc::new(
@@ -379,7 +389,7 @@ fn row_history_column_array(
                 projected_values
                     .iter()
                     .map(|snapshot| {
-                        let Some(value) = snapshot.as_ref() else {
+                        let Some(value) = snapshot.as_deref() else {
                             return Ok(None);
                         };
                         if value.is_null() {
@@ -407,14 +417,14 @@ fn row_history_column_array(
     })
 }
 
-fn row_history_column_value(
+fn row_history_column_value<'a>(
     row: &SchemaHistoryRow,
+    snapshot: Option<&'a JsonValue>,
     spec: &SchemaSurfaceSpec,
     column_name: &str,
-) -> Result<Option<JsonValue>> {
-    let snapshot = parse_snapshot(row.change.snapshot_content.as_deref())?;
+) -> Result<Option<Cow<'a, JsonValue>>> {
     if let Some(snapshot) = snapshot {
-        return Ok(snapshot.get(column_name).cloned());
+        return Ok(snapshot.get(column_name).map(Cow::Borrowed));
     }
 
     let row_pk = row.change.row_pk.as_json_array_text().map_err(|error| {
@@ -427,6 +437,7 @@ fn row_history_column_value(
         &row_pk,
         HistoryIdentityProjection::PrimaryKeyPaths(&spec.primary_key_paths),
     )
+    .map(|value| value.map(Cow::Owned))
     .map_err(|error| DataFusionError::Execution(error.to_string()))
 }
 
@@ -460,8 +471,8 @@ mod tests {
             eq("locale", "en"),
         ];
 
-        let route = row_history_route_from_filters(&spec, &filters)
-            .expect("history route should derive");
+        let route =
+            row_history_route_from_filters(&spec, &filters).expect("history route should derive");
 
         assert_eq!(route.as_of_commit_ids, vec!["commit-head"]);
         assert_eq!(route.row_pks, vec![r#"["en","welcome"]"#]);
@@ -486,8 +497,8 @@ mod tests {
             eq("lixcol_row_pk", r#"["fr","welcome"]"#),
         ];
 
-        let route = row_history_route_from_filters(&spec, &filters)
-            .expect("history route should derive");
+        let route =
+            row_history_route_from_filters(&spec, &filters).expect("history route should derive");
 
         assert!(route.is_contradictory());
 
