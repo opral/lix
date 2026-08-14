@@ -11168,7 +11168,13 @@ async fn hot_load_primary_identity_bytes(
     let keys = (0..identities.len())
         .map(|index| encoded.primary_key(index))
         .collect::<Vec<_>>();
-    PointReadPlan::new(ROW_SPACE, &keys)
+    let plan = PointReadPlan::new(ROW_SPACE, &keys);
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_working_diff_current_row_batch(
+        plan.len(),
+        plan.logical_unique_keys.len(),
+    );
+    plan
         .materialize(store, StorageGetOptions::default())
         .await?
         .value

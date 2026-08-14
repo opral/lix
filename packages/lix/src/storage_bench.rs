@@ -49,6 +49,9 @@ static WORKING_DIFF_INDEX_NS: AtomicU64 = AtomicU64::new(0);
 static WORKING_DIFF_CURRENT_ROW_NS: AtomicU64 = AtomicU64::new(0);
 static WORKING_DIFF_HISTORY_NS: AtomicU64 = AtomicU64::new(0);
 static WORKING_DIFF_PROJECTION_NS: AtomicU64 = AtomicU64::new(0);
+static WORKING_DIFF_CURRENT_ROW_BATCHES: AtomicU64 = AtomicU64::new(0);
+static WORKING_DIFF_CURRENT_ROW_REQUESTED_KEYS: AtomicU64 = AtomicU64::new(0);
+static WORKING_DIFF_CURRENT_ROW_UNIQUE_KEYS: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
@@ -2641,6 +2644,15 @@ pub struct WorkingDiffProfileAccounting {
     pub current_row_ns: u64,
     pub history_ns: u64,
     pub projection_ns: u64,
+    pub current_row_batches: u64,
+    pub current_row_requested_keys: u64,
+    pub current_row_unique_keys: u64,
+}
+
+pub(crate) fn record_working_diff_current_row_batch(requested: usize, unique: usize) {
+    WORKING_DIFF_CURRENT_ROW_BATCHES.fetch_add(1, Ordering::Relaxed);
+    WORKING_DIFF_CURRENT_ROW_REQUESTED_KEYS.fetch_add(requested as u64, Ordering::Relaxed);
+    WORKING_DIFF_CURRENT_ROW_UNIQUE_KEYS.fetch_add(unique as u64, Ordering::Relaxed);
 }
 
 pub fn take_working_diff_profile_accounting() -> WorkingDiffProfileAccounting {
@@ -2650,6 +2662,10 @@ pub fn take_working_diff_profile_accounting() -> WorkingDiffProfileAccounting {
         current_row_ns: WORKING_DIFF_CURRENT_ROW_NS.swap(0, Ordering::Relaxed),
         history_ns: WORKING_DIFF_HISTORY_NS.swap(0, Ordering::Relaxed),
         projection_ns: WORKING_DIFF_PROJECTION_NS.swap(0, Ordering::Relaxed),
+        current_row_batches: WORKING_DIFF_CURRENT_ROW_BATCHES.swap(0, Ordering::Relaxed),
+        current_row_requested_keys: WORKING_DIFF_CURRENT_ROW_REQUESTED_KEYS
+            .swap(0, Ordering::Relaxed),
+        current_row_unique_keys: WORKING_DIFF_CURRENT_ROW_UNIQUE_KEYS.swap(0, Ordering::Relaxed),
     }
 }
 

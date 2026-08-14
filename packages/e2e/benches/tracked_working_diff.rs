@@ -431,7 +431,8 @@ async fn measure_cold<StorageImpl>(
     println!(
         "tracked_working_diff measure-cold backend={} working_diffs={count} \
          open_ms={:.3} query_ms={:.3} topology_ms={:.3} index_ms={:.3} \
-         current_row_ms={:.3} history_ms={:.3} projection_ms={:.3}",
+         current_row_ms={:.3} history_ms={:.3} projection_ms={:.3} \
+         current_row_batches={} current_row_requested_keys={} current_row_unique_keys={}",
         backend.name(),
         millis(open_elapsed),
         millis(query_elapsed),
@@ -440,6 +441,9 @@ async fn measure_cold<StorageImpl>(
         phases.current_row_ns as f64 / 1_000_000.0,
         phases.history_ns as f64 / 1_000_000.0,
         phases.projection_ns as f64 / 1_000_000.0,
+        phases.current_row_batches,
+        phases.current_row_requested_keys,
+        phases.current_row_unique_keys,
     );
 }
 
@@ -575,7 +579,8 @@ async fn measure<StorageImpl>(
     println!(
         "tracked_working_diff measure backend={} working_diffs={expected_changes} \
          repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3} \
-         topology_ms={:.3} index_ms={:.3} current_row_ms={:.3} history_ms={:.3} projection_ms={:.3}",
+         topology_ms={:.3} index_ms={:.3} current_row_ms={:.3} history_ms={:.3} projection_ms={:.3} \
+         current_row_batches={} current_row_requested_keys={} current_row_unique_keys={}",
         backend.name(),
         millis(sorted[sorted.len() / 2]),
         mean_millis(&latencies),
@@ -586,6 +591,9 @@ async fn measure<StorageImpl>(
         phases.current_row_ns as f64 / 1_000_000.0,
         phases.history_ns as f64 / 1_000_000.0,
         phases.projection_ns as f64 / 1_000_000.0,
+        phases.current_row_batches,
+        phases.current_row_requested_keys,
+        phases.current_row_unique_keys,
     );
 }
 
